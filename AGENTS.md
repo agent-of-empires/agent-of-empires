@@ -14,8 +14,8 @@
 ## Commands
 
 ```sh
-cargo build                         # TUI only
-cargo build --features serve        # web dashboard, requires Node and npm
+cargo build                         # TUI + daemon, no Node needed
+cargo build --features web          # web dashboard, requires Node and npm
 cargo build --profile dev-release   # optimized local build without LTO
 cargo test
 cargo fmt
@@ -82,7 +82,7 @@ for the harness API.
 - Follow `.github/pull_request_template.md`; include what changed, why, tests,
   and screenshots or recordings for UI changes.
 - Before review, run `cargo fmt`, `cargo clippy`, and `cargo test`, adding
-  `--features serve` when relevant.
+  `--features web` when relevant.
 - For `web/` changes also run its format, lint, type, and applicable test checks
   from `web/AGENTS.md`, including the coverage matrix requirement.
 

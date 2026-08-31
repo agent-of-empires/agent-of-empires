@@ -11,8 +11,6 @@
 //! DNS-rebinding gate and auth, so the only 403 source under test is the
 //! CityHall boundary (asserted via the body).
 
-#![cfg(feature = "serve")]
-
 use agent_of_empires::server::test_support::{
     build_router_for_test, build_test_app_state_cityhall,
 };

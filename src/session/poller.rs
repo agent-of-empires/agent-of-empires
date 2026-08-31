@@ -431,7 +431,7 @@ impl SessionPoller {
         }
     }
 
-    #[cfg(any(test, all(feature = "test-support", feature = "serve")))]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn inject_test_update(&self, instance_id: &str, session_id: &str) {
         self.result_tx
             .send((

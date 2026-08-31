@@ -360,7 +360,6 @@ pub async fn update_settings(
             }
             // Tell each touched plugin's worker its settings changed (#2897),
             // after the durable write. Best-effort; config.get is the fallback.
-            #[cfg(feature = "serve")]
             if !plugin_changes.is_empty() {
                 if let Some(host) = &state.plugin_host {
                     host.emit_settings_changed(&plugin_changes).await;

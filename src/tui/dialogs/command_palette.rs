@@ -89,14 +89,11 @@ pub struct PaletteCommand {
 /// keyboard dispatcher. Pure-navigation keys (j/k, arrows, h/l) are excluded.
 /// `Enter` (attach) and `Tab` (live-send) aren't relocatable keybindings, so
 /// they're appended explicitly rather than pulled from the registry.
-pub fn builtin_commands(serve_enabled: bool, strict_hotkeys: bool) -> Vec<PaletteCommand> {
+pub fn builtin_commands(strict_hotkeys: bool) -> Vec<PaletteCommand> {
     let mut cmds: Vec<PaletteCommand> = bindings::BINDINGS
         .iter()
         .filter_map(|b| {
             let meta = b.palette.as_ref()?;
-            if meta.serve_only && !serve_enabled {
-                return None;
-            }
             // Drop the unread toggle entirely when the feature is off, so the
             // palette can't invoke a removed binding.
             if b.id == bindings::ActionId::ToggleUnread && !crate::session::unread_enabled() {
@@ -502,7 +499,7 @@ mod tests {
     }
 
     fn make_dialog() -> CommandPaletteDialog {
-        CommandPaletteDialog::new(builtin_commands(false, false))
+        CommandPaletteDialog::new(builtin_commands(false))
     }
 
     #[test]
@@ -536,7 +533,7 @@ mod tests {
         // (e.g., moving Tab elsewhere) or accidentally regressing the
         // payload to `Key(Tab)` would break strict-mode users who reach
         // live-send only through the palette.
-        let cmds = builtin_commands(false, false);
+        let cmds = builtin_commands(false);
         let entry = cmds
             .iter()
             .find(|c| c.id == "live-send")
@@ -554,7 +551,7 @@ mod tests {
         // `Invoke(ActionId::…)` so `run_action` opens the picker directly.
         // Previously these synthesized `Key('o')` / `Key('g')`, which the
         // strict-mode typing-guard would have swallowed.
-        let cmds = builtin_commands(false, true);
+        let cmds = builtin_commands(true);
         let sort = cmds
             .iter()
             .find(|c| c.id == "pick-sort")
@@ -650,20 +647,12 @@ mod tests {
     }
 
     #[test]
-    fn serve_command_only_with_feature() {
-        let with = builtin_commands(true, false);
-        let without = builtin_commands(false, false);
-        assert!(with.iter().any(|c| c.id == "serve"));
-        assert!(!without.iter().any(|c| c.id == "serve"));
-    }
-
-    #[test]
     fn hotkey_labels_follow_strict_mode() {
         // Picks one entry whose label moves under strict mode and one whose
         // binding gets relocated to Ctrl. Catches regressions where strict
         // mode was forgotten when adding a new entry.
-        let normal = builtin_commands(false, false);
-        let strict = builtin_commands(false, true);
+        let normal = builtin_commands(false);
+        let strict = builtin_commands(true);
 
         let new_normal = normal.iter().find(|c| c.id == "new-session").unwrap();
         let new_strict = strict.iter().find(|c| c.id == "new-session").unwrap();

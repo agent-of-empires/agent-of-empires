@@ -589,7 +589,6 @@ mod tests {
         std::fs::write(dir.join(format!("{sid}.jsonl")), "seed\n").expect("write transcript");
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     #[serial]
     fn restart_outcome_for_acp_session_is_fresh() {

@@ -49,10 +49,8 @@
 
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
-#[cfg(feature = "serve")]
 use std::sync::Arc;
 use std::time::Duration;
-#[cfg(feature = "serve")]
 use std::time::Instant;
 
 use anyhow::Result;
@@ -213,10 +211,8 @@ pub fn orphaned_agents_alive(insts: &[Instance]) -> Vec<bool> {
 /// Callers on an async runtime must invoke this inside `spawn_blocking`: it
 /// walks the process table and would otherwise stall the executor.
 ///
-/// The TUI path scans in a batch via [`orphaned_agents_alive`], so this
-/// single-instance convenience is compiled only where it is actually used: the
-/// serve-gated daemon Phase B re-check and the unit tests.
-#[cfg(any(feature = "serve", test))]
+/// The TUI path scans in a batch via [`orphaned_agents_alive`]; this
+/// single-instance convenience serves the daemon's Phase B re-check.
 pub fn orphaned_agent_process_alive(inst: &Instance) -> bool {
     orphaned_agents_alive(std::slice::from_ref(inst))
         .first()
@@ -350,14 +346,12 @@ pub const STARTUP_RECOVERY_CONCURRENCY: usize = 3;
 /// confirmed-Dead pane, so the typical bound holds; if production telemetry
 /// shows the absolute case occurring, raise this to 11s rather than relying
 /// on early abort.
-#[cfg(feature = "serve")]
 pub const RECENTLY_RESTARTED_TTL: Duration = Duration::from_secs(8);
 
 /// Periodic GC interval for `recently_restarted`. Long-running daemons may
 /// accumulate thousands of entries over a session if they never GC; the TTL
 /// check on read filters but does not remove. Sweeping every 60s keeps the
 /// map bounded by `O(recoveries_in_last_60s)` rather than total uptime.
-#[cfg(feature = "serve")]
 pub const RECENTLY_RESTARTED_GC_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Shared `recently_restarted` map: instance id → time of last successful
@@ -365,11 +359,9 @@ pub const RECENTLY_RESTARTED_GC_INTERVAL: Duration = Duration::from_secs(60);
 /// `Status::Error` transition while a freshly-restarted agent is still
 /// settling. Entries older than `RECENTLY_RESTARTED_TTL` are ignored on read
 /// and removed by the GC task.
-#[cfg(feature = "serve")]
 pub type RecentlyRestarted = Arc<std::sync::RwLock<std::collections::HashMap<String, Instant>>>;
 
 /// Construct an empty `recently_restarted` map.
-#[cfg(feature = "serve")]
 pub fn new_recently_restarted() -> RecentlyRestarted {
     Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()))
 }
@@ -381,7 +373,6 @@ pub fn new_recently_restarted() -> RecentlyRestarted {
 /// (after the pane scrape, before the decision) cannot combine stale
 /// pane-missing metadata with a cleared mark and re-emit the phantom
 /// `Status::Error` the suppression is there to prevent.
-#[cfg(feature = "serve")]
 pub fn snapshot_recently_restarted(map: &RecentlyRestarted) -> std::collections::HashSet<String> {
     let guard = match map.read() {
         Ok(g) => g,
@@ -394,7 +385,6 @@ pub fn snapshot_recently_restarted(map: &RecentlyRestarted) -> std::collections:
         .collect()
 }
 
-#[cfg(feature = "serve")]
 pub fn mark_recently_restarted(map: &RecentlyRestarted, id: &str) {
     if let Ok(mut guard) = map.write() {
         guard.insert(id.to_string(), Instant::now());
@@ -404,7 +394,6 @@ pub fn mark_recently_restarted(map: &RecentlyRestarted, id: &str) {
 /// Inverse of `mark_recently_restarted`. Called when a pre-marked
 /// candidate turns out not to need recovery (post-lock re-check fails),
 /// to avoid suppressing the real status for the full TTL.
-#[cfg(feature = "serve")]
 pub fn unmark_recently_restarted(map: &RecentlyRestarted, id: &str) {
     if let Ok(mut guard) = map.write() {
         guard.remove(id);
@@ -415,7 +404,6 @@ pub fn unmark_recently_restarted(map: &RecentlyRestarted, id: &str) {
 /// avoids a tight read-vs-GC race where a reader observes an entry just
 /// before GC removes it; with 2x, a reader that saw the entry at age T has
 /// at least T more time before GC reaps it.
-#[cfg(feature = "serve")]
 pub fn gc_recently_restarted(map: &RecentlyRestarted) {
     let cutoff = RECENTLY_RESTARTED_TTL * 2;
     if let Ok(mut guard) = map.write() {
@@ -432,11 +420,9 @@ pub fn gc_recently_restarted(map: &RecentlyRestarted) {
 /// `STARTUP_RECOVERY_CONCURRENCY` semaphore queue past the TTL does not age
 /// out of suppression and trip a phantom `Status::Error` before its worker
 /// even begins.
-#[cfg(feature = "serve")]
 pub type RecoveryPending = Arc<std::sync::RwLock<std::collections::HashSet<String>>>;
 
 /// Construct an empty `recovery_pending` set.
-#[cfg(feature = "serve")]
 pub fn new_recovery_pending() -> RecoveryPending {
     Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()))
 }
@@ -444,7 +430,6 @@ pub fn new_recovery_pending() -> RecoveryPending {
 /// Seed the pending set with every scheduled candidate id. Called by Phase A
 /// alongside the initial `mark_recently_restarted` so the refresher has the
 /// full work set before the cascade (and the refresher) start.
-#[cfg(feature = "serve")]
 pub fn seed_recovery_pending(pending: &RecoveryPending, ids: impl IntoIterator<Item = String>) {
     if let Ok(mut guard) = pending.write() {
         guard.extend(ids);
@@ -463,7 +448,6 @@ pub fn seed_recovery_pending(pending: &RecoveryPending, ids: impl IntoIterator<I
 /// never re-stamped) or it blocks until this read releases (its later unmark
 /// strictly succeeds this stamp). No mark-after-unmark resurrection is
 /// possible. See [`drain_recovery_pending`].
-#[cfg(feature = "serve")]
 pub fn refresh_recovery_pending(
     pending: &RecoveryPending,
     recently_restarted: &RecentlyRestarted,
@@ -485,7 +469,6 @@ pub fn refresh_recovery_pending(
 /// stops re-stamping it, *then* clear its suppression mark. The ordering
 /// (`W(pending)` before unmarking `recently_restarted`) is what makes the
 /// unmark stick against a racing refresher; see [`refresh_recovery_pending`].
-#[cfg(feature = "serve")]
 pub fn drain_recovery_pending(
     pending: &RecoveryPending,
     recently_restarted: &RecentlyRestarted,
@@ -609,7 +592,6 @@ impl Drop for HookTimeoutScope {
 mod tests {
     use super::*;
 
-    #[cfg(feature = "serve")]
     #[test]
     fn snapshot_recently_restarted_includes_fresh_excludes_missing() {
         let map = new_recently_restarted();
@@ -619,7 +601,6 @@ mod tests {
         assert!(!snap.contains("other"));
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn snapshot_recently_restarted_excludes_expired() {
         let map = new_recently_restarted();
@@ -634,7 +615,6 @@ mod tests {
         assert!(snap.contains("fresh"));
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn recently_restarted_gc_removes_stale_entries() {
         let map = new_recently_restarted();
@@ -658,7 +638,6 @@ mod tests {
     /// pending set and leaves `recently_restarted` clear. Without the drain,
     /// the refresher would re-stamp the id forever and suppress its real
     /// status for the rest of the cascade.
-    #[cfg(feature = "serve")]
     #[test]
     fn refresher_does_not_resurrect_drained_worker_mark() {
         let recently = new_recently_restarted();
@@ -699,7 +678,6 @@ mod tests {
 
     /// The refresher keeps a still-queued candidate marked while a *different*
     /// candidate finishes. Draining one id must not stop refreshing the rest.
-    #[cfg(feature = "serve")]
     #[test]
     fn refresher_keeps_remaining_candidates_after_partial_drain() {
         let recently = new_recently_restarted();
@@ -735,7 +713,6 @@ mod tests {
     /// This fails if [`drain_recovery_pending`] is reordered to unmark before
     /// taking `W(pending)`: the premature unmark would race ahead of the
     /// stamp and the id would be resurrected.
-    #[cfg(feature = "serve")]
     #[test]
     fn refresher_mark_loses_to_concurrent_drain_under_lock_overlap() {
         use std::thread;

@@ -9,14 +9,11 @@
 
 mod contrast;
 mod palette;
-#[cfg(feature = "serve")]
 mod resolved;
 mod themes;
 
 pub use contrast::has_min_contrast;
-#[cfg(feature = "serve")]
 pub use resolved::{resolve_theme, ResolvedTheme};
-#[cfg(any(feature = "serve", test))]
 pub use themes::ThemeAppearance;
 pub use themes::{idle_decay_window, Theme};
 

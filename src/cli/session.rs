@@ -123,7 +123,6 @@ pub struct ImportArgs {
     /// Import as structured-view sessions (rendered in the web dashboard and
     /// the structured TUI view) instead of terminal/tmux sessions. Structured
     /// sessions replay their transcript under `aoe serve`.
-    #[cfg(feature = "serve")]
     #[arg(long)]
     pub structured: bool,
 
@@ -879,11 +878,6 @@ async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
 /// of the session appearing on disk). Calling `start`/`stop`/`restart`
 /// from the CLI silently no-ops, which previously misled users into
 /// thinking the session was up. Bail loudly with the actual remediation.
-///
-/// `structured_view` is gated behind the `serve` feature; without it the
-/// field doesn't exist on `Instance` and no session can be in structured view
-/// mode, so this is a no-op shim.
-#[cfg(feature = "serve")]
 fn bail_if_acp(inst: &crate::session::Instance, verb: &str) -> Result<()> {
     if inst.is_structured() {
         bail!(
@@ -894,11 +888,6 @@ fn bail_if_acp(inst: &crate::session::Instance, verb: &str) -> Result<()> {
              To control an structured-view session, use the web dashboard or the REST API."
         );
     }
-    Ok(())
-}
-
-#[cfg(not(feature = "serve"))]
-fn bail_if_acp(_inst: &crate::session::Instance, _verb: &str) -> Result<()> {
     Ok(())
 }
 
@@ -920,7 +909,7 @@ fn resolve_import_roots(paths: &[String]) -> Result<Vec<std::path::PathBuf>> {
 
 /// True when `id` is already imported by some instance, so a re-run does not
 /// create duplicates. Checks the terminal resume target, the poller-observed
-/// id, and (serve builds) the structured-view id.
+/// id, and the structured-view id.
 fn already_imported(instances: &[Instance], id: &str) -> bool {
     instances.iter().any(|inst| {
         if inst.agent_session_id.as_deref() == Some(id) {
@@ -929,7 +918,6 @@ fn already_imported(instances: &[Instance], id: &str) -> bool {
         if matches!(&inst.resume_intent, ResumeIntent::Use(s) if s == id) {
             return true;
         }
-        #[cfg(feature = "serve")]
         if inst.acp_session_id.as_deref() == Some(id) {
             return true;
         }
@@ -959,7 +947,6 @@ fn build_import_instance(
     inst
 }
 
-#[cfg(feature = "serve")]
 fn apply_import_mode(
     inst: &mut Instance,
     s: &crate::session::claude_import::ClaudeSessionSummary,
@@ -974,22 +961,10 @@ fn apply_import_mode(
     }
 }
 
-#[cfg(not(feature = "serve"))]
-fn apply_import_mode(
-    inst: &mut Instance,
-    s: &crate::session::claude_import::ClaudeSessionSummary,
-    _structured: bool,
-) {
-    inst.resume_intent = ResumeIntent::Use(s.session_id.clone());
-}
-
 async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
     use crate::session::claude_import::{scan_sessions, sessions_under_paths, MAX_SESSIONS};
 
-    #[cfg(feature = "serve")]
     let structured = args.structured;
-    #[cfg(not(feature = "serve"))]
-    let structured = false;
 
     // Discover, then narrow to the requested paths unless --all.
     let mut discovered = scan_sessions();
@@ -1398,16 +1373,7 @@ fn pick_targets_for_restart_all(instances: &[crate::session::Instance]) -> Vec<S
     instances
         .iter()
         .filter(|i| !matches!(i.status, Status::Deleting | Status::Creating))
-        .filter(|_i| {
-            #[cfg(feature = "serve")]
-            {
-                !_i.is_structured()
-            }
-            #[cfg(not(feature = "serve"))]
-            {
-                true
-            }
-        })
+        .filter(|i| !i.is_structured())
         .map(|i| i.id.clone())
         .collect()
 }
@@ -2385,7 +2351,6 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
         .context("failed to acquire instance resume-target lock")?;
     let (title, tool) = storage.update(|instances, _groups| {
         super::patch_instance(instances, &target_id, |inst| {
-            #[cfg(feature = "serve")]
             if inst.is_structured() {
                 anyhow::bail!(
                     "cannot set resume target on structured view-mode session '{}'; structured view manages its own conversation lifecycle via ACP",
@@ -3048,7 +3013,7 @@ mod set_color_tests {
     }
 }
 
-#[cfg(all(test, feature = "serve"))]
+#[cfg(test)]
 mod acp_reject_tests {
     use super::{set_session_id, SetSessionIdArgs};
     use crate::session::{Instance, Storage};
@@ -3145,7 +3110,6 @@ mod import_tests {
         assert_eq!(inst.group_path, "team/imports");
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn structured_import_seeds_replay_fields() {
         let s = summary("sid-1", "/home/me/proj", Some("x"));

@@ -1245,8 +1245,8 @@ pub struct SessionConfig {
     /// Hold an OS assertion preventing user-idle system sleep while any
     /// session is active. Released once every session has been idle past
     /// `prevent_sleep_idle_grace_minutes`. Global toggle, daemon only: the
-    /// `aoe serve` status loop owns the assertion, so a TUI-only user
-    /// without a running daemon gets no inhibition.
+    /// `aoe serve` status loop owns the assertion, so a user without a
+    /// running daemon gets no inhibition.
     ///
     /// `global_only`: the status loop reads only the global config to drive a
     /// single process-wide assertion, so a per-profile override would be

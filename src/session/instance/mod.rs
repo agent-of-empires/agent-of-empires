@@ -345,21 +345,17 @@ pub struct Instance {
     /// store and are reloaded at drain time. Empty for create-time initial
     /// turns (those are text-only). `#[serde(default)]` + skip-when-empty keeps
     /// pre-existing rows deserialising unchanged, so no migration is needed.
-    /// Serve-only: `PromptAttachmentRef` lives in the serve-gated `acp` module,
-    /// and only the structured-view resume path (serve) ever populates it.
-    #[cfg(feature = "serve")]
+    /// Only the structured-view resume path populates it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_initial_turn_attachments: Vec<crate::acp::state::PromptAttachmentRef>,
 
     /// Server-owned follow-ups, ordered by `QueuedPromptEntry::seq`. Persisted
     /// here so the daemon can drain them without a connected client.
-    #[cfg(feature = "serve")]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queued_prompts: Vec<crate::acp::state::QueuedPromptEntry>,
 
     /// Monotonic counter for `QueuedPromptEntry::seq`, so ordering is stable
     /// even after rows drain or are removed. Never reused within a session.
-    #[cfg(feature = "serve")]
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub queued_prompt_next_seq: u64,
 

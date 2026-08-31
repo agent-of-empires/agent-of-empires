@@ -1365,10 +1365,9 @@ environment = ["THING=$REPO_THING"]
 
     dialog.path = Input::new(repo.path().to_string_lossy().to_string());
     // Field order (no profile picker, single tool): path 0, title 1, then
-    // the Structured row only when the serve build makes claude
-    // ACP-capable (reload_config_defaults recomputed it), then yolo,
-    // worktree, sandbox. Derive the offset so both feature builds target
-    // the sandbox row.
+    // the Structured row when claude is ACP-capable
+    // (reload_config_defaults recomputed it), then yolo, worktree,
+    // sandbox. Derive the offset so this targets the sandbox row.
     dialog.focused_field = 4 + usize::from(dialog.structured_capable);
     let result = dialog.handle_key(ctrl_key(KeyCode::Char('p')));
 

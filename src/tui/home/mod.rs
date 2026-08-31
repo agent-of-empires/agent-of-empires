@@ -49,7 +49,6 @@ use crate::tmux::AvailableTools;
 
 use super::creation_poller::{CreatedWorktreeInfo, CreationPoller, CreationRequest};
 use super::deletion_poller::DeletionPoller;
-#[cfg(feature = "serve")]
 use super::dialogs::ServeView;
 use super::dialogs::{
     AttachProjectDialog, ChangelogDialog, CommandPaletteDialog, ConfirmDialog, ContextMenuDialog,
@@ -273,7 +272,6 @@ pub struct HomeView {
     pub(super) plugin_manager_dialog: Option<crate::tui::dialogs::PluginManagerDialog>,
     pub(super) skills_manager_dialog: Option<crate::tui::dialogs::SkillsManagerDialog>,
     pub(super) command_palette: Option<CommandPaletteDialog>,
-    #[cfg(feature = "serve")]
     pub(super) serve_view: Option<ServeView>,
     pub(super) update_confirm_dialog: Option<UpdateConfirmDialog>,
     /// One-time opt-in popup for users who finished the walkthrough before
@@ -426,7 +424,6 @@ pub struct HomeView {
     pub(super) pending_switch_view_session: Option<String>,
     /// Session whose structured-view open is waiting on the "start a
     /// local daemon?" confirm (see `prompt_start_daemon_for_structured`).
-    #[cfg(feature = "serve")]
     pub(super) pending_daemon_start_session: Option<String>,
     /// The structured-view session mounted in the preview pane, if any:
     /// a streaming transcript that `render_preview` paints as the
@@ -435,7 +432,6 @@ pub struct HomeView {
     /// preview renderer, info header, and drag-select all compose with
     /// it; the `App` loop drives its async sides (connect, WS pump,
     /// active-mode key routing).
-    #[cfg(feature = "serve")]
     pub(in crate::tui) structured_preview:
         Option<crate::tui::structured_view::embedded::EmbeddedView>,
     /// True while the App's preview-on-select reconcile has picked a
@@ -443,7 +439,6 @@ pub struct HomeView {
     /// preview renderer shows a quiet placeholder instead of the wordy
     /// "press Enter" page, which otherwise flashes for the connect
     /// window on every selection.
-    #[cfg(feature = "serve")]
     pub(in crate::tui) structured_preview_pending: bool,
     /// Session to force-remove after the confirmation dialog is accepted
     pub(super) pending_force_remove_session: Option<String>,
@@ -486,9 +481,7 @@ pub struct HomeView {
 
     // Structured (ACP) rows: the tmux poller above bails on them, so their
     // status comes from the daemon instead. See `daemon_status_poller`.
-    #[cfg(feature = "serve")]
     pub(super) daemon_status_poller: super::daemon_status_poller::DaemonStatusPoller,
-    #[cfg(feature = "serve")]
     pub(super) pending_daemon_status_refresh: bool,
 
     // Performance: background deletion

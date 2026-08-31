@@ -2,8 +2,8 @@
 //!
 //! AoE assembles an effective MCP server set from up to four layers
 //! (`agent-native` -> `global` -> `per-profile` -> `project-local`, higher wins
-//! per server name). The serve-gated `acp::mcp_config` used to own both the
-//! parsing and the merge, but it returned ACP `McpServer` wire types and dropped
+//! per server name). `acp::mcp_config` used to own both the parsing and the
+//! merge, but it returned ACP `McpServer` wire types and dropped
 //! the layer label on merge, so the unified management surface had nowhere to
 //! read the merged set, its provenance, or its shadowing.
 //!

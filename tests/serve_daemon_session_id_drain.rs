@@ -1,7 +1,5 @@
 //! Integration coverage for the daemon-side session-id drain wiring.
 
-#![cfg(feature = "serve")]
-
 use std::path::Path;
 
 use agent_of_empires::server::test_support::{

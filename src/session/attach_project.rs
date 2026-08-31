@@ -931,7 +931,6 @@ pub fn quiesce_for_conversion(storage: &Storage, instance: &super::Instance) -> 
 
     // The worker registry only exists in a build with the structured view, and
     // without it there is no ACP worker to stop.
-    #[cfg(feature = "serve")]
     if let Ok(Some(record)) = crate::process::worker_registry::load(&instance.id) {
         crate::process::worker_registry::delete(&instance.id).ok();
         crate::process::worker::terminate_process_group(record.pid);
@@ -1013,7 +1012,6 @@ pub fn resume_after_conversion(
         }
     }
 
-    #[cfg(feature = "serve")]
     if quiesced.worker_was_running {
         crate::process::worker_registry::mark_restart_pending(session_id);
     }

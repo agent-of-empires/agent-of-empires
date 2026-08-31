@@ -15,8 +15,6 @@
 //! exposed for this test (the merge invariants live below the HTTP API and
 //! cannot be observed end-to-end through `GET /api/sessions`).
 
-#![cfg(feature = "serve")]
-
 use agent_of_empires::server::test_support::build_test_app_state;
 use agent_of_empires::server::test_support::{
     reload_disk_only_for_test, reload_tmux_applied_for_test,

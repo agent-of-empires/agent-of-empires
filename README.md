@@ -139,7 +139,7 @@ cargo build
 cargo test
 cargo fmt
 cargo clippy
-cargo build --features serve
+cargo build --features web
 ```
 
 See [Development](docs/development.md) for the full reference.

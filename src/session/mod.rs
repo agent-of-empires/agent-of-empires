@@ -7,15 +7,13 @@ pub(crate) mod capture;
 pub mod cityhall_bundle;
 pub mod civilizations;
 pub(crate) mod claim;
-// Discovery of on-disk Claude Code sessions. Lives here (not under the
-// serve-gated `acp` module) because terminal/tmux import via the CLI works in
-// every build; only the structured-view import path needs `serve`.
+// Discovery of on-disk Claude Code sessions. Lives here rather than under
+// `acp` because terminal/tmux import via the CLI does not involve ACP.
 pub mod claude_import;
 pub mod config;
 pub(crate) mod container_config;
 // Depends on `crate::acp` (Event / event store) and is only driven from the
-// serve daemon, both of which are serve-gated. See #2808.
-#[cfg(feature = "serve")]
+// serve daemon. See #2808.
 pub mod conversation_summary;
 pub mod deletion;
 pub(crate) mod environment;

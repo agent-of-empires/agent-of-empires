@@ -11,30 +11,24 @@ use clap::Args;
 pub struct KillallArgs {
     /// Grace period in seconds before force-killing agent workers. tmux
     /// sessions and the daemon use their own built-in grace.
-    #[cfg(feature = "serve")]
     #[arg(long, default_value_t = 5)]
     pub timeout_secs: u64,
 
     /// Leave the `aoe serve` daemon running; stop only workers and tmux
     /// sessions.
-    #[cfg(feature = "serve")]
     #[arg(long)]
     pub keep_daemon: bool,
 }
 
 pub async fn run(args: KillallArgs) -> Result<()> {
     // Every surface is best-effort: each is attempted independently and its
-    // failure is collected here rather than aborting the rest. In a TUI-only
-    // build only the tmux sweep runs, so `args` carries no fields.
-    #[cfg(not(feature = "serve"))]
-    let _ = args;
+    // failure is collected here rather than aborting the rest.
 
     let mut errors: Vec<String> = Vec::new();
 
     // Daemon first. Removing the orchestrator means the worker sweep below
     // cannot race a daemon-driven respawn; any orphaned workers still die via
     // their recorded process group in that sweep.
-    #[cfg(feature = "serve")]
     if !args.keep_daemon {
         if crate::cli::serve::daemon_pid().is_some() {
             match crate::cli::serve::stop_daemon().await {
@@ -46,7 +40,6 @@ pub async fn run(args: KillallArgs) -> Result<()> {
         }
     }
 
-    #[cfg(feature = "serve")]
     match crate::cli::acp::stop_all_workers(args.timeout_secs).await {
         Ok(n) => println!("Stopped {n} agent worker(s)."),
         Err(e) => errors.push(format!("workers: {e}")),

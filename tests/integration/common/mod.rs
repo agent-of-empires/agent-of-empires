@@ -29,12 +29,6 @@ pub fn tmux_socket() -> PathBuf {
 }
 
 /// Path to the Node ACP test shim used by acp_* integration tests.
-///
-/// Gated on `feature = "serve"` because its only consumers are the
-/// structured view modules, which themselves only compile under that feature.
-/// Without the gate, `cargo clippy --all-targets` builds the integration
-/// suite WITHOUT serve and these helpers register as dead code.
-#[cfg(feature = "serve")]
 pub fn shim_path() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("acp-worker")
@@ -47,7 +41,6 @@ pub fn shim_path() -> std::path::PathBuf {
 /// that callers print before skipping. CI installs deps via `npm ci` in
 /// `acp-worker/test-shim/` before running the integration leg; local
 /// runs need the same one-shot setup, which the message points at.
-#[cfg(feature = "serve")]
 pub fn shim_ready() -> Result<(), String> {
     let node_ok = std::process::Command::new("node")
         .arg("--version")

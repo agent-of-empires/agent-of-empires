@@ -141,12 +141,9 @@ impl CreationPoller {
         // pick the right profile's overrides; if it's left blank they'd silently
         // fall back to the global default profile.
         instance.source_profile = profile.clone();
-        #[cfg(feature = "serve")]
         if structured {
             builder::structured::apply_structured_choice(&mut instance);
         }
-        #[cfg(not(feature = "serve"))]
-        let _ = structured;
         let created_worktree = build_result.created_worktree;
         let created_workspace_worktrees = build_result.created_workspace_worktrees;
         let warnings = build_result.warnings;

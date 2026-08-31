@@ -5,18 +5,12 @@
 //! `$APP_DIR/serve.{pid,url,log,mode}` files, and runs `aoe serve --stop`
 //! to tear down. The daemon survives across TUI quits, just like tmux
 //! sessions or the CLI-invoked daemon path.
-//!
-//! Only compiled with the `serve` feature, since the tunnel integration
-//! (and the qrcode crate it needs) lives there.
-#![cfg(feature = "serve")]
 
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent};
-use qrcode::render::unicode::Dense1x2;
-use qrcode::QrCode;
 use rand::prelude::IndexedRandom;
 use rand::RngExt;
 use ratatui::prelude::*;
@@ -1979,6 +1973,29 @@ fn looks_like_iso_year(s: &str) -> bool {
     matches!(iter.next(), Some('-'))
 }
 
+/// The scannable block for `url`, as terminal rows. Empty without the
+/// dashboard bundle: a phone that scanned it would reach no page.
+#[cfg(feature = "web")]
+fn render_qr(url: &str) -> String {
+    use qrcode::render::unicode::Dense1x2;
+    use qrcode::QrCode;
+
+    match QrCode::new(url.as_bytes()) {
+        Ok(code) => code
+            .render::<Dense1x2>()
+            .quiet_zone(true)
+            .dark_color(Dense1x2::Dark)
+            .light_color(Dense1x2::Light)
+            .build(),
+        Err(_) => String::from("(QR unavailable; use the URL below)"),
+    }
+}
+
+#[cfg(not(feature = "web"))]
+fn render_qr(_url: &str) -> String {
+    String::new()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_active(
     frame: &mut Frame,
@@ -1999,16 +2016,7 @@ fn render_active(
     let url = &active_url.url;
     let kind_label = active_url.label.as_deref();
 
-    let qr_text = match QrCode::new(url.as_bytes()) {
-        Ok(code) => code
-            .render::<Dense1x2>()
-            .quiet_zone(true)
-            .dark_color(Dense1x2::Dark)
-            .light_color(Dense1x2::Light)
-            .build(),
-        Err(_) => String::from("(QR unavailable; use the URL below)"),
-    };
-
+    let qr_text = render_qr(url);
     let qr_lines: Vec<&str> = qr_text.lines().collect();
     let qr_height = qr_lines.len() as u16;
 

@@ -14,8 +14,6 @@
 //! Before this change the control socket did not exist, so the control
 //! connect below fails outright; that is the red state the fix turns green.
 
-#![cfg(feature = "serve")]
-
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;

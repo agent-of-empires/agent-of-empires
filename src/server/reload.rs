@@ -334,7 +334,7 @@ impl PriorById {
 pub(crate) async fn reload_state_instances_from_disk(
     state: &Arc<AppState>,
     fresh: Vec<Instance>,
-    #[cfg(feature = "serve")] live_worker_records: Vec<LiveStructuredWorkerRecord>,
+    live_worker_records: Vec<LiveStructuredWorkerRecord>,
     status_source: StatusSource,
     read_epoch: u64,
 ) {
@@ -416,16 +416,13 @@ pub(crate) async fn reload_state_instances_from_disk(
         merged.push(row);
     }
 
-    #[cfg(feature = "serve")]
     let repairs = repair_structured_rows_from_live_workers(&mut merged, live_worker_records);
 
-    #[cfg(feature = "serve")]
     apply_acp_overlay_inplace(&prior_by_id, &mut merged);
 
     *current = merged;
     drop(current);
 
-    #[cfg(feature = "serve")]
     persist_structured_row_repairs(state, repairs);
 }
 
@@ -449,7 +446,6 @@ pub(crate) async fn reload_state_instances_from_disk(
 /// event handlers are responsible for any post-restart re-emission that
 /// updates these fields for structured sessions; the passive-status
 /// writer at `status_poll_loop` deliberately does not.
-#[cfg(feature = "serve")]
 pub(super) fn apply_acp_overlay_inplace(prior_by_id: &PriorById, merged: &mut [Instance]) {
     for inst in merged.iter_mut() {
         if !inst.is_structured() {

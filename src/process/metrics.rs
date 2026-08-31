@@ -279,7 +279,6 @@ fn aggregate_agents(
         .filter(|i| eligible_instance(i))
         .cloned()
         .collect();
-    #[cfg(feature = "serve")]
     let worker_records: Vec<crate::process::worker_registry::WorkerRecord> =
         crate::process::worker_registry::list()
             .unwrap_or_default()
@@ -290,14 +289,11 @@ fn aggregate_agents(
     // Structured sessions are excluded from `eligible`, so their sandboxes
     // have to be counted here or a host whose only sandbox runs under a
     // structured worker would never fetch the map its row needs.
-    #[cfg(feature = "serve")]
     let sandboxed_worker = worker_records.iter().any(|rec| {
         instances
             .iter()
             .any(|i| i.id == rec.session_id && sandbox_container_name(i).is_some())
     });
-    #[cfg(not(feature = "serve"))]
-    let sandboxed_worker = false;
 
     // Skip the runtime's stats pass unless a sandbox session is loaded;
     // `cached_stats` then hands back the last completed map without blocking.
@@ -343,7 +339,6 @@ fn aggregate_agents(
         });
     }
 
-    #[cfg(feature = "serve")]
     for rec in worker_records {
         let Some(root) = by_pid.get(&rec.pid) else {
             continue;
