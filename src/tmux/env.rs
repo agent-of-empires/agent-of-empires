@@ -499,7 +499,7 @@ mod tests {
             (
                 format!(
                     "{m}s1\n{}{m}s2\n{}",
-                    entry("ZZZ", "x\n@s2\nAOE_INSTANCE_ID=spoofed-id"),
+                    entry("ZZZ", &format!("x\n{m}s2\nAOE_INSTANCE_ID=spoofed-id")),
                     entry(key, "s2-id"),
                 ),
                 &["s1", "s2"][..],
@@ -528,22 +528,20 @@ mod tests {
         }
     }
 
-    /// The batch is worthless if its own markers do not survive tmux. tmux
-    /// rewrites bytes outside printable ASCII to `_` for a client whose
-    /// locale is not UTF-8, so pin that client and require full coverage:
-    /// without it every session silently falls through to a sequential read.
+    /// Both halves of the framing, against a real tmux, with the client
+    /// locale pinned because each half only exists under one of them.
+    ///
+    /// Under `C` tmux rewrites every byte outside printable ASCII to `_`, so
+    /// the marker has to be printable or the batch covers nothing and every
+    /// session silently falls through to a sequential read. That same rewrite
+    /// flattens a value's newline, so the #3616 spoof can only be reproduced
+    /// under a UTF-8 client; the raw output is asserted to carry the
+    /// continuation before the parse is trusted to have rejected it.
     #[test]
-    fn test_batch_output_covers_sessions_for_a_non_utf8_client() {
-        struct KillSession(&'static str);
-        impl Drop for KillSession {
-            fn drop(&mut self) {
-                let _ = crate::tmux::tmux_command()
-                    .args(["kill-session", "-t", self.0])
-                    .output();
-            }
-        }
-
-        let name = "aoe_env_batch_marker_probe";
+    #[serial_test::serial]
+    fn test_batch_output_frames_records_against_a_real_tmux() {
+        let session = crate::tmux::test_helpers::TmuxTestSession::new("aoe_env_batch_probe");
+        let name = session.name();
         let created = crate::tmux::tmux_command()
             .args(["new-session", "-d", "-s", name, "sh"])
             .output();
@@ -551,24 +549,31 @@ mod tests {
             eprintln!("skipping: tmux unavailable");
             return;
         }
-        let _cleanup = KillSession(name);
 
         set_hidden_env(name, AOE_INSTANCE_ID_KEY, "real-id").unwrap();
         set_hidden_env(name, "ZZZ", "unrelated\nAOE_INSTANCE_ID=spoofed-id").unwrap();
 
-        let output = crate::tmux::tmux_command()
-            .env("LC_ALL", "C")
-            .args(batch_args(&[name]))
-            .output()
-            .unwrap();
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let parsed = parse_batch_output(&stdout, &[name], AOE_INSTANCE_ID_KEY);
-        assert_eq!(
-            parsed.get(name).map(|v| v.as_deref()),
-            Some(Some("real-id")),
-            "batch output: {stdout:?}"
-        );
+        // (locale, must the raw output carry the spoofing continuation)
+        for (locale, expect_continuation) in [("C", false), ("C.UTF-8", true)] {
+            let output = crate::tmux::tmux_command()
+                .env("LC_ALL", locale)
+                .args(batch_args(&[name]))
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let spoofed = stdout.contains("\nAOE_INSTANCE_ID=spoofed-id");
+            if expect_continuation && !spoofed {
+                eprintln!("skipping {locale} leg: locale unavailable, tmux flattened the value");
+                continue;
+            }
+            assert_eq!(spoofed, expect_continuation, "{locale}: {stdout:?}");
+            let parsed = parse_batch_output(&stdout, &[name], AOE_INSTANCE_ID_KEY);
+            assert_eq!(
+                parsed.get(name).map(|v| v.as_deref()),
+                Some(Some("real-id")),
+                "{locale}: {stdout:?}"
+            );
+        }
     }
 
     #[test]
