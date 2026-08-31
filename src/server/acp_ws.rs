@@ -506,49 +506,10 @@ async fn seed_identity(state: &AppState, session_id: &str) -> (AgentName, Option
         .unwrap_or_else(|| (AgentName(String::new()), None))
 }
 
-/// The daemon's current control state for a session.
-///
-/// HTTP handlers read the live control projection, hydrating it from the log on
-/// a cache miss because WebSocket folds are per connection.
-///
-/// The rebuild is the reason this is cached rather than folded per call. It
-/// measured 68ms at 20k events and 342ms at 100k, on a store whose retention
-/// default is unlimited, and it holds the event store's connection mutex for
-/// the whole scan, so a prompt on one long session would stall event recording
-/// for every session. Cached, that cost is paid once per session per daemon
-/// life instead of on every prompt.
+/// The daemon's current control state for a session, for HTTP handlers that
+/// hold `AppState`. See [`crate::server::session_service::SessionService::fold_control_state`].
 pub(crate) async fn fold_control_state(state: &AppState, session_id: &str) -> AcpState {
-    let (agent, model) = seed_identity(state, session_id).await;
-    let store = Arc::clone(&state.acp_event_store);
-    let cache = Arc::clone(&state.acp_control_cache);
-    let sid = session_id.to_string();
-    // The hydrate closure runs under the cache's per-session lock and does a
-    // locking SQLite scan, so the whole thing goes off the runtime rather than
-    // just the scan.
-    tokio::task::spawn_blocking(move || {
-        cache.get_or_hydrate(&sid.clone(), || {
-            let mut reduced = AcpState::new(AcpSessionId(sid.clone()), agent, model);
-            let mut last_seq = 0;
-            for (seq, event) in store.replay_from(&sid, 0) {
-                let _ = reduced.apply_event(event);
-                last_seq = seq;
-            }
-            (reduced, last_seq)
-        })
-    })
-    .await
-    .unwrap_or_else(|_| {
-        // The blocking pool panicked or shut down. An empty state reads as
-        // "idle", and dispatch's fall-through would then send into whatever
-        // turn is running, so hand back one that parks instead.
-        let mut fallback = AcpState::new(
-            AcpSessionId(session_id.to_string()),
-            AgentName(String::new()),
-            None,
-        );
-        fallback.turn_active = true;
-        fallback
-    })
+    state.session_service.fold_control_state(session_id).await
 }
 
 fn fold_connect_history(
