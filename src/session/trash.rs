@@ -131,6 +131,15 @@ fn is_protected_default_branch_cached(inst: &Instance, cache: &mut ProtectedBran
 /// repo. Pruning that admin dir (or deleting the file) strands the checkout:
 /// the directory is still there, git no longer knows about it, and no retry
 /// changes that. Two `stat`s, no spawn, no error-string sniffing.
+///
+/// The target is resolved against the worktree, not the process directory:
+/// under `worktree.useRelativePaths` git writes it relative (`gitdir:
+/// ../repo/.git/worktrees/x`), and resolving that from the cwd would read a
+/// live checkout as stranded and refuse to relocate it.
+///
+/// Anything unreadable is treated as present. This decides whether to stop
+/// retrying, so guessing "stranded" from a transient read error is the
+/// expensive mistake.
 fn is_orphaned_checkout(worktree: &Path) -> bool {
     let link = worktree.join(".git");
     let Ok(metadata) = std::fs::symlink_metadata(&link) else {
@@ -143,10 +152,16 @@ fn is_orphaned_checkout(worktree: &Path) -> bool {
     let Ok(contents) = std::fs::read_to_string(&link) else {
         return false;
     };
-    match contents.split_once("gitdir:") {
-        Some((_, target)) => !Path::new(target.trim()).exists(),
-        None => false,
-    }
+    let Some((_, target)) = contents.split_once("gitdir:") else {
+        return false;
+    };
+    let target = Path::new(target.trim());
+    let admin = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        worktree.join(target)
+    };
+    !admin.exists()
 }
 
 fn is_sandboxed(inst: &Instance) -> bool {
@@ -1247,6 +1262,71 @@ mod tests {
             assert!(inst.pre_trash_project_path.is_none());
             assert!(original.exists());
         }
+    }
+
+    /// A worktree git wrote with a relative `gitdir:` (the
+    /// `worktree.useRelativePaths` layout) is still live. Resolving that target
+    /// from the process directory instead of the worktree would read it as
+    /// stranded and refuse to relocate it for good.
+    #[test]
+    fn a_relative_gitdir_link_is_not_mistaken_for_a_stranded_checkout() {
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let main_repo = tmp.path().join("main");
+        let worktree = tmp.path().join("wt");
+        std::fs::create_dir_all(&main_repo).unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main", "."],
+            vec![
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        ] {
+            let out = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&main_repo)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        }
+        let out = std::process::Command::new("git")
+            .args([
+                "-c",
+                "worktree.useRelativePaths=true",
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feat",
+                worktree.to_str().unwrap(),
+            ])
+            .current_dir(&main_repo)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git worktree add failed");
+
+        let link = std::fs::read_to_string(worktree.join(".git")).unwrap();
+        let target = link.split_once("gitdir:").unwrap().1.trim().to_string();
+        if Path::new(&target).is_absolute() {
+            // This git predates `worktree.useRelativePaths`; nothing to assert.
+            return;
+        }
+        assert!(
+            !is_orphaned_checkout(&worktree),
+            "a live checkout with a relative gitdir link must not read as stranded"
+        );
+        // And the real thing still does, relative link or not.
+        std::fs::remove_dir_all(worktree.join(&target)).unwrap();
+        assert!(is_orphaned_checkout(&worktree));
     }
 
     /// #3611: only a stranded checkout is terminal. A move that fails while the
