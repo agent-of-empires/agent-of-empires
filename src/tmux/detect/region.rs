@@ -19,6 +19,7 @@ pub(super) struct Screen<'a> {
     osc_title: &'a str,
     joined: OnceLock<String>,
     collapsed: OnceLock<String>,
+    concatenated: OnceLock<String>,
     above_input_box: OnceLock<Option<String>>,
     prompt_box_body: OnceLock<Option<String>>,
     after_last_rule: OnceLock<String>,
@@ -124,6 +125,9 @@ pub(super) enum Region {
     /// Recent lines with runs of ASCII whitespace collapsed to one space, so a
     /// footer hint that word-wrapped mid-phrase still reads as one string.
     CollapsedRecent,
+    /// Recent lines trimmed and concatenated with no separator, so a word a
+    /// Textual TUI renders one character per line reads as one word.
+    ConcatenatedRecent,
     /// The last `n` non-empty lines.
     BottomLines(usize),
     /// The transcript line the input box's status slot sits on: the live
@@ -191,6 +195,7 @@ impl Region {
         Some(match raw {
             "whole_recent" => Region::WholeRecent,
             "collapsed_recent" => Region::CollapsedRecent,
+            "concatenated_recent" => Region::ConcatenatedRecent,
             "last_non_empty_above_prompt_box" => Region::AboveInputBox,
             "prompt_box_body" => Region::PromptBoxBody,
             "after_last_horizontal_rule" => Region::AfterLastRule,
@@ -214,6 +219,7 @@ impl<'a> Screen<'a> {
             osc_title,
             joined: OnceLock::new(),
             collapsed: OnceLock::new(),
+            concatenated: OnceLock::new(),
             above_input_box: OnceLock::new(),
             prompt_box_body: OnceLock::new(),
             after_last_rule: OnceLock::new(),
@@ -236,6 +242,9 @@ impl<'a> Screen<'a> {
             Region::CollapsedRecent => self
                 .collapsed
                 .get_or_init(|| collapse_ascii_whitespace(self.joined())),
+            Region::ConcatenatedRecent => self
+                .concatenated
+                .get_or_init(|| self.recent.iter().map(|l| l.trim()).collect()),
             Region::BottomLines(n) => {
                 // Bottom-n is a suffix of the joined recent window, so it is
                 // sliced from it rather than joined again per rule.

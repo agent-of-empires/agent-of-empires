@@ -169,6 +169,11 @@ mod tests {
         super::super::detect::rule_matches("claude", rule, &strip_ansi(content), "", None)
     }
 
+    /// Whether one of Vibe's manifest rules matches a fixture.
+    fn vibe_rule_matches(rule: &str, content: &str) -> bool {
+        super::super::detect::rule_matches("vibe", rule, content, "", None)
+    }
+
     /// A `waiting` write left behind by a prompt the user cancelled: the write
     /// nothing clears, which is why the screen has to be able to outrank it.
     fn stale_wait() -> Option<super::super::detect::HookObservation> {
@@ -2252,11 +2257,14 @@ Do you want to proceed?\n\
         assert_eq!(detect_vibe_status("Writing changes"), Status::Running);
         assert_eq!(detect_vibe_status("Generating code"), Status::Running);
 
-        // Vertical text (Vibe's Textual TUI renders one char per line)
-        assert_eq!(
-            detect_vibe_status("⠋\nR\nu\nn\nn\ni\nn\ng\nb\na\ns\nh\n…"),
-            Status::Running
-        );
+        // Vertical text (Vibe's Textual TUI renders one char per line). No
+        // spinner and no trailing ellipsis, so the activity word alone has to
+        // carry it.
+        let vertical = "R\nu\nn\nn\ni\nn\ng";
+        assert_eq!(detect_vibe_status(vertical), Status::Running);
+        assert!(vibe_rule_matches("activity_word", vertical));
+        assert!(!vibe_rule_matches("spinner", vertical));
+        assert!(!vibe_rule_matches("trailing_ellipsis", vertical));
 
         // Ellipsis indicates ongoing activity
         assert_eq!(detect_vibe_status("Working…"), Status::Running);
@@ -2289,6 +2297,10 @@ Do you want to proceed?\n\
         assert_eq!(detect_vibe_status("some random output"), Status::Idle);
         assert_eq!(detect_vibe_status("file saved successfully"), Status::Idle);
         assert_eq!(detect_vibe_status("Done!"), Status::Idle);
+
+        // A middle dot is separator punctuation in parked output; Vibe's
+        // Textual spinner is braille and draws no other frame.
+        assert_eq!(detect_vibe_status("main · 3 files changed"), Status::Idle);
     }
 
     #[test]
