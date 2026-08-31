@@ -6,11 +6,9 @@
 //! Highest matching priority wins.
 //!
 //! The hook file is a rule like any other, so its authority is declared next
-//! to the screen rules it competes with instead of wrapping them. Two things
-//! fall out of that. A blocking prompt on screen outranks a `running` write
-//! without a reconciler to special-case it, and a `running` write carries a
-//! freshness bound, so a lost terminating hook stops pinning a parked session
-//! on Running once the bound passes.
+//! to the screen rules it competes with. A blocking prompt on screen outranks
+//! a `running` write, and a `running` write carries a freshness bound, so a
+//! lost terminating hook cannot pin a parked session on Running.
 
 mod manifest;
 mod region;

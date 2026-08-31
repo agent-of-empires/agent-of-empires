@@ -452,12 +452,11 @@ const SHARED_HOOK_RULES: &str = r#"
 #
 # Several agents write `waiting` the moment a prompt appears, and
 # Esc-cancelling that prompt fires no clearing hook, so the file sticks on
-# `waiting` until the next turn (#2937). The screen is what releases it: a
-# prompt still up matches a blocking-prompt rule, a parked pane matches an idle
-# one, and a pane showing something this table has no rule for is still better
-# evidence than a write nothing will ever clear, so it falls to the default
-# rather than to the write. That leaves the write speaking for the one case the
-# screen cannot: a capture that came back empty.
+# `waiting` until the next turn (#2937). The screen releases it: a prompt still
+# up matches a blocking-prompt rule, a parked pane matches an idle one, and an
+# unrecognised pane is still better evidence than a write nothing will clear,
+# so it falls to the default. The write speaks for the one case the screen
+# cannot, a capture that came back empty.
 #
 # Only one hook rule can fire for a given write, so the ranking among the hook
 # rules is inert; every number here is a ranking against the screen.

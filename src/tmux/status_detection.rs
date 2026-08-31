@@ -47,26 +47,8 @@ pub fn detect_status_from_content(content: &str, tool: &str) -> Status {
         .unwrap_or(Status::Idle)
 }
 
-/// Claude Code status is primarily detected via hooks (file-based) installed
-/// in `~/.claude/settings.json`. When hooks aren't reachable (first few
-/// seconds before a hook fires, custom `--cmd` wrappers, `docker exec` into
-/// a user-managed container that aoe didn't provision), the dispatcher falls
-/// back to this pane-based detector.
-///
-/// The dispatcher strips ANSI before calling us, so we only match on
-/// human-readable text shapes:
-///   1. The interrupt hint ("esc to interrupt" / "ctrl+c to interrupt").
-///   2. The live token counter ("(4s · ↓ 88 tokens)") that only renders
-///      while a turn is generating.
-///   3. The spinner+verb shape ("✶ Working…") on a recent line.
-///   4. The parked background-agent wait line ("✻ Waiting for 1 background
-///      agent to finish").
-///
-/// The `…` in shape (3) is what distinguishes active from completed lines.
-/// Claude renders active verbs as gerunds with a trailing `…` (`Working…`)
-/// and past-tense completions without one (`Worked for 1m 52s`), so we
-/// don't need a separate past-tense verb list. Shape (4) is the one active
-/// state rendered without an ellipsis; it gets its own structural match.
+/// Claude Code pane detection. The rules, and the reasoning behind each, are
+/// in `detect/manifests/claude.toml`.
 pub fn detect_claude_status(content: &str) -> Status {
     detect_claude(content, "", None)
 }
@@ -93,22 +75,7 @@ pub fn detect_vibe_status(raw_content: &str) -> Status {
     detect_via_manifest("vibe", raw_content, "", None)
 }
 
-/// Fallback Codex status detection from pane text. Strategy, in priority order:
-///
-///   1. Structured Plan-mode radio prompts win immediately, since Codex
-///      sometimes renders these alongside a stale spinner from earlier in the
-///      turn.
-///   2. Running is detected from the *current turn block* only, i.e. the lines
-///      below the most recent `─ Worked for ... ─` divider. This stops stale
-///      `• Working ...` markers from a previous turn leaking into a turn that
-///      has already completed.
-///   3. Within the current block we look for two shapes: a bullet-prefixed
-///      live status line carrying an `esc to interrupt` hint (anywhere in the
-///      block), or a bare activity verb / spinner+verb in the last ~10 lines.
-///   4. Waiting is detected from approval prompts and numbered `›`/`❯`
-///      choices. A normal free-form prompt means the turn is done.
-///
-/// All comparisons are case-insensitive (content is lowercased on entry).
+/// Codex pane detection. See `detect/manifests/codex.toml`.
 pub fn detect_codex_status(raw_content: &str) -> Status {
     detect_via_manifest("codex", raw_content, "", None)
 }
@@ -142,83 +109,14 @@ pub fn detect_copilot_status(raw_content: &str) -> Status {
     detect_via_manifest("copilot", raw_content, "", None)
 }
 
-/// Pi coding agent status detection via tmux pane parsing.
-///
-/// Pi has no status hooks (`hook_config: None`), so this pane detector is the
-/// only status signal, and it always auto-approves tool use (no approval
-/// gates), so we only distinguish Running from Idle/Waiting-for-input.
-///
-/// Pi renders its live status as a spinner+verb line (`⠹ Working...`) sitting
-/// directly above its input box (two `────` rules), with a
-/// `<pct>%/<ctx>k (auto)  <model> • <thinking>` status line at the very
-/// bottom. When a turn finishes that spinner line is removed and pi renders no
-/// `>` prompt at rest, so the pane's only difference from the running frame is
-/// the absent spinner line.
-///
-/// That is why the spinner and activity-word signals are scoped to pi's own
-/// footer (`PI_FOOTER_WINDOW`) rather than the whole capture: a finished
-/// turn's response prose routinely contains activity words ("now working on
-/// #443", "reading the file") and a scrollback frame can still hold a
-/// spinner glyph, so scanning the last 30 lines for those substrings pinned
-/// the session on Running forever. The `esc to interrupt` hint is bound to
-/// the input box instead of a line count: the scan covers the
-/// `PI_HINT_BAND_ABOVE_BOX` non-empty lines above the box's rule anchor,
-/// where plain pi puts its busy line (directly above the rule) and where
-/// derivatives aliased via `agent_detect_as = pi` stack theirs behind up to
-/// two tip lines (#3475), so response prose above the box top stays out of
-/// reach. An anchor deeper
-/// than the footer is treated as transcript content and falls back to the
-/// footer window, so a response drawing its own rules with the input box
-/// off-capture cannot float the band to unbounded depth. The footer
-/// scoping mirrors the approach already used by `detect_omp_status` and
-/// `detect_copilot_status`.
+/// Pi pane detection. Pi has no hooks and always auto-approves, so the pane is
+/// the only signal it has. See `detect/manifests/pi.toml`.
 pub fn detect_pi_status(raw_content: &str) -> Status {
     detect_via_manifest("pi", raw_content, "", None)
 }
 
-/// Oh My Pi status detection via its live pane output.
-///
-/// OMP keeps a bordered composer visible both while running and while idle.
-/// Status is decided by the lowest pane signal, where position 1 is the
-/// bottom non-empty line: the live loader row, the retry countdown
-/// (`Retrying (N/M) in Ns…`), the pinned error banner (matched by its anchor
-/// line "Dismissed when you send your next message."), the terminal retry
-/// lines (`Error: Retry budget exhausted` / `Error: Retry failed after`),
-/// sub-agent retry labels (`retrying N/M …`, the rule-repair
-/// `Attempt N/M ·`), the tool-approval prompt, the Plan Review overlay, and
-/// the ask tool's option dialog. Each signal has a freshness window; beyond
-/// it the signal is ignored, so a completed turn's loader or a dismissed
-/// banner in scrollback cannot pin the session.
-///
-/// A live loader has a built-in activity frame or configured symbolic frame,
-/// or an ASCII preset frame (`- \ | /`), plus its marker on the same row. A
-/// wrapped marker must be physically adjacent and indented beneath an
-/// unfinished frame row. This matches OMP's text layout and rejects prose
-/// separated by blank output. Known braille frames retain the historical
-/// `Working` marker; other symbolic and ASCII
-/// frames require an esc hint (`⟦esc⟧`, `⟨esc⟩`, `[esc]`, or `(esc to cancel)`).
-/// OMP intents are arbitrary, so hint-bearing ASCII or symbolic prose can be
-/// textually identical to a direct loader row. The bottom-three-line window
-/// favors the active direction for that irreducible case, avoiding a false
-/// Idle while a turn runs.
-///
-/// A tool approval replaces the composer with a selector panel. Exact
-/// bordered `Approve`/`Deny` option rows corroborate its navigation footer;
-/// the title text is not used because real detail rows can push it outside
-/// the freshness window. Plan Review additionally requires a cursor-marked
-/// option in a bordered row, exact bordered option labels, and its live
-/// bordered footer (`tab regions`, `esc cancel`), which disappears after
-/// submission.
-///
-/// The ask tool's option dialog swaps into the composer slot the same way;
-/// its footer phrases (`Enter select · n note`, `Space toggle · Enter …`,
-/// `Enter submit · ↑/↓ scroll`, input guard) count only on bordered rows.
-///
-/// When no signal matched, the frame reads as healthy idle rather than
-/// Waiting. In practice it is parked on the always-visible `╭── π`/`╰─`
-/// composer box, though the fallback itself does not require the box to be
-/// present. The heuristic cannot see structured turn events; the structured
-/// error/retry path (herdr-style extension) is tracked in #3380.
+/// omp pane detection. Its markers stack, so the rules are arbitrated by
+/// position rather than rank. See `detect/manifests/omp.toml`.
 pub fn detect_omp_status(raw_content: &str) -> Status {
     detect_via_manifest("omp", raw_content, "", None)
 }

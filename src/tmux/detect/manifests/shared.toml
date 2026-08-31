@@ -1,8 +1,6 @@
-# Rule templates several agents share, so the shapes that were shared helpers
-# in the detectors this table replaced stay shared here. A manifest names one
-# with `extends` and adds its own priority and whatever phrases its CLI uses;
-# list fields concatenate, so a template is a base to build on rather than a
-# thing to copy.
+# Rule shapes several agents share. A manifest names one with `extends` and
+# adds its own priority and whatever phrases its CLI uses; list fields
+# concatenate, so a template is a base to build on rather than a thing to copy.
 
 # The stock approval phrasings. Each agent adds its own on top: `continue?`,
 # `run command?`, `allow this tool`, and so on.
