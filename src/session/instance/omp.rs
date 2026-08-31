@@ -316,13 +316,9 @@ impl Instance {
             launched_at_ms: u64,
         }
 
-        let bootstrap_generation = || {
-            crate::tmux::env::get_env_uncached(
-                session_name,
-                crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY,
-            )
-        };
-        if let Some(encoded) = crate::tmux::env::get_hidden_env_uncached(
+        let bootstrap_generation =
+            || crate::tmux::env::get_env(session_name, crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY);
+        if let Some(encoded) = crate::tmux::env::get_hidden_env(
             session_name,
             crate::tmux::env::AOE_OMP_CAPTURE_META_KEY,
         ) {
@@ -344,7 +340,7 @@ impl Instance {
                     return None;
                 }
                 let ready_generation = || {
-                    crate::tmux::env::get_hidden_env_uncached(
+                    crate::tmux::env::get_hidden_env(
                         session_name,
                         crate::tmux::env::AOE_OMP_CAPTURE_READY_KEY,
                     )
@@ -411,7 +407,7 @@ impl Instance {
         let metadata = self.resolve_legacy_omp_capture_metadata(options, legacy_watermark_ms)?;
         if bootstrap_generation().is_some()
             || self.omp_capture_generation.is_some()
-            || crate::tmux::env::get_hidden_env_uncached(
+            || crate::tmux::env::get_hidden_env(
                 session_name,
                 crate::tmux::env::AOE_OMP_CAPTURE_META_KEY,
             )

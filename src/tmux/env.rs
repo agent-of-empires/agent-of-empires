@@ -6,28 +6,12 @@
 
 use anyhow::bail;
 use std::collections::HashMap;
-use std::sync::RwLock;
-use std::time::{Duration, Instant};
 
 pub const AOE_INSTANCE_ID_KEY: &str = "AOE_INSTANCE_ID";
 pub const AOE_CAPTURED_SESSION_ID_KEY: &str = "AOE_CAPTURED_SESSION_ID";
 pub const AOE_OMP_CAPTURE_META_KEY: &str = "AOE_OMP_CAPTURE_META";
 pub const AOE_OMP_LAUNCH_ID_KEY: &str = "AOE_OMP_LAUNCH_ID";
 pub const AOE_OMP_CAPTURE_READY_KEY: &str = "AOE_OMP_CAPTURE_READY";
-
-const ENV_CACHE_TTL: Duration = Duration::from_secs(30);
-const ENV_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(5);
-
-struct EnvCacheEntry {
-    value: Option<String>,
-    fetched_at: Instant,
-}
-
-struct EnvCache {
-    entries: Option<HashMap<(String, String), EnvCacheEntry>>,
-}
-
-static ENV_CACHE: RwLock<EnvCache> = RwLock::new(EnvCache { entries: None });
 
 /// Set a hidden environment variable in a tmux session
 ///
@@ -48,64 +32,19 @@ pub fn set_hidden_env(session_name: &str, key: &str, value: &str) -> anyhow::Res
         );
     }
 
-    invalidate_cache_entry(session_name, key);
     Ok(())
 }
 
 /// Get a hidden environment variable from a tmux session.
-///
-/// Both hits and misses are cached to reduce subprocess spawns: positive
-/// results use [`ENV_CACHE_TTL`] (30s), negative results (var not set)
-/// use [`ENV_NEGATIVE_CACHE_TTL`] (5s).
 pub fn get_hidden_env(session_name: &str, key: &str) -> Option<String> {
-    let cache_key = (session_name.to_string(), key.to_string());
-
-    if let Ok(cache) = ENV_CACHE.read() {
-        if let Some(entries) = &cache.entries {
-            if let Some(entry) = entries.get(&cache_key) {
-                let ttl = if entry.value.is_some() {
-                    ENV_CACHE_TTL
-                } else {
-                    ENV_NEGATIVE_CACHE_TTL
-                };
-                if entry.fetched_at.elapsed() < ttl {
-                    return entry.value.clone();
-                }
-            }
-        }
-    }
-
-    if let Ok(mut cache) = ENV_CACHE.write() {
-        if let Some(entries) = &mut cache.entries {
-            entries.remove(&cache_key);
-        }
-    }
-
-    let value = get_hidden_env_uncached(session_name, key);
-
-    if let Ok(mut cache) = ENV_CACHE.write() {
-        let entries = cache.entries.get_or_insert_with(HashMap::new);
-        entries.insert(
-            cache_key,
-            EnvCacheEntry {
-                value: value.clone(),
-                fetched_at: Instant::now(),
-            },
-        );
-    }
-
-    value
+    fetch_env(session_name, key, true)
 }
 
-pub(crate) fn get_hidden_env_uncached(session_name: &str, key: &str) -> Option<String> {
-    fetch_env_uncached(session_name, key, true)
+pub(crate) fn get_env(session_name: &str, key: &str) -> Option<String> {
+    fetch_env(session_name, key, false)
 }
 
-pub(crate) fn get_env_uncached(session_name: &str, key: &str) -> Option<String> {
-    fetch_env_uncached(session_name, key, false)
-}
-
-fn fetch_env_uncached(session_name: &str, key: &str, hidden: bool) -> Option<String> {
+fn fetch_env(session_name: &str, key: &str, hidden: bool) -> Option<String> {
     let mut command = crate::tmux::tmux_command();
     command.arg("show-environment");
     if hidden {
@@ -136,7 +75,6 @@ pub fn remove_hidden_env(session_name: &str, key: &str) -> anyhow::Result<()> {
         bail!("Failed to remove hidden env var: {}", stderr);
     }
 
-    invalidate_cache_entry(session_name, key);
     Ok(())
 }
 
@@ -167,12 +105,7 @@ pub fn remove_hidden_env_batch(entries: &[(&str, &str)]) -> anyhow::Result<()> {
     let output = crate::tmux::tmux_command().args(&str_args).output();
 
     match output {
-        Ok(out) if out.status.success() => {
-            for (session_name, key) in entries {
-                invalidate_cache_entry(session_name, key);
-            }
-            Ok(())
-        }
+        Ok(out) if out.status.success() => Ok(()),
         Ok(out) => {
             tracing::debug!(target: "tmux.command",
                 "Batch tmux set-environment -u failed (exit {}), falling back to sequential unsets",
@@ -232,12 +165,7 @@ pub fn set_hidden_env_batch(entries: &[(&str, &str, &str)]) -> anyhow::Result<()
     let output = crate::tmux::tmux_command().args(&str_args).output();
 
     match output {
-        Ok(out) if out.status.success() => {
-            for (session_name, key, _) in entries {
-                invalidate_cache_entry(session_name, key);
-            }
-            Ok(())
-        }
+        Ok(out) if out.status.success() => Ok(()),
         Ok(out) => {
             tracing::debug!(target: "tmux.command",
                 "Batch tmux set-environment failed (exit {}), falling back to sequential writes",
@@ -266,14 +194,6 @@ fn sequential_set_fallback(entries: &[(&str, &str, &str)]) {
                 session_name,
                 e
             );
-        }
-    }
-}
-
-fn invalidate_cache_entry(session_name: &str, key: &str) {
-    if let Ok(mut cache) = ENV_CACHE.write() {
-        if let Some(entries) = &mut cache.entries {
-            entries.remove(&(session_name.to_string(), key.to_string()));
         }
     }
 }
@@ -338,7 +258,7 @@ pub fn get_hidden_env_batch(session_names: &[&str], key: &str) -> Vec<(String, O
                 Some(value) => value,
                 None => {
                     repaired += 1;
-                    get_hidden_env_uncached(name, key)
+                    get_hidden_env(name, key)
                 }
             };
             (name.to_string(), value)
@@ -350,20 +270,6 @@ pub fn get_hidden_env_batch(session_names: &[&str], key: &str) -> Vec<(String, O
             session_names.len() - repaired,
             session_names.len()
         );
-    }
-
-    if let Ok(mut cache) = ENV_CACHE.write() {
-        let entries = cache.entries.get_or_insert_with(HashMap::new);
-        let now = Instant::now();
-        for (session_name, value) in &results {
-            entries.insert(
-                (session_name.clone(), key.to_string()),
-                EnvCacheEntry {
-                    value: value.clone(),
-                    fetched_at: now,
-                },
-            );
-        }
     }
 
     results
@@ -401,105 +307,8 @@ fn parse_batch_output<'a>(
 }
 
 #[cfg(test)]
-fn clear_env_cache() {
-    if let Ok(mut cache) = ENV_CACHE.write() {
-        cache.entries = None;
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
-
-    #[test]
-    #[serial]
-    fn test_cache_populate_and_lookup() {
-        clear_env_cache();
-        let key = ("cache_test_sess".to_string(), "MY_KEY".to_string());
-
-        if let Ok(mut cache) = ENV_CACHE.write() {
-            let entries = cache.entries.get_or_insert_with(HashMap::new);
-            entries.insert(
-                key.clone(),
-                EnvCacheEntry {
-                    value: Some("cached_val".to_string()),
-                    fetched_at: Instant::now(),
-                },
-            );
-        }
-
-        let hit = ENV_CACHE.read().ok().and_then(|c| {
-            c.entries
-                .as_ref()?
-                .get(&key)
-                .filter(|e| e.fetched_at.elapsed() < ENV_CACHE_TTL)
-                .and_then(|e| e.value.clone())
-        });
-        assert_eq!(hit, Some("cached_val".to_string()));
-        clear_env_cache();
-    }
-
-    #[test]
-    #[serial]
-    fn test_cache_stale_entry_not_returned() {
-        clear_env_cache();
-        let key = ("stale_sess".to_string(), "MY_KEY".to_string());
-
-        if let Ok(mut cache) = ENV_CACHE.write() {
-            let entries = cache.entries.get_or_insert_with(HashMap::new);
-            entries.insert(
-                key.clone(),
-                EnvCacheEntry {
-                    value: Some("old_val".to_string()),
-                    fetched_at: Instant::now() - Duration::from_secs(60),
-                },
-            );
-        }
-
-        let hit = ENV_CACHE.read().ok().and_then(|c| {
-            c.entries
-                .as_ref()?
-                .get(&key)
-                .filter(|e| e.fetched_at.elapsed() < ENV_CACHE_TTL)
-                .and_then(|e| e.value.clone())
-        });
-        assert_eq!(hit, None);
-        clear_env_cache();
-    }
-
-    #[test]
-    #[serial]
-    fn test_invalidate_cache_entry_removes_key() {
-        clear_env_cache();
-        let session = "inv_test_sess";
-        let key = "MY_KEY";
-
-        if let Ok(mut cache) = ENV_CACHE.write() {
-            let entries = cache.entries.get_or_insert_with(HashMap::new);
-            entries.insert(
-                (session.to_string(), key.to_string()),
-                EnvCacheEntry {
-                    value: Some("val".to_string()),
-                    fetched_at: Instant::now(),
-                },
-            );
-        }
-
-        invalidate_cache_entry(session, key);
-
-        let exists = ENV_CACHE
-            .read()
-            .ok()
-            .and_then(|c| {
-                c.entries
-                    .as_ref()
-                    .map(|e| e.contains_key(&(session.to_string(), key.to_string())))
-            })
-            .unwrap_or(false);
-        assert!(!exists);
-        clear_env_cache();
-    }
 
     fn marked(name: &str, body: &str) -> String {
         format!("{BATCH_MARKER}{name}\n{body}")
