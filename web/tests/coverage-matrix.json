@@ -3089,9 +3089,9 @@
     },
     {
       "id": "acp.story.queue-recall-arrow",
-      "kind": "live-playwright",
+      "kind": "vitest",
       "risk": "medium",
-      "specs": ["tests/live/acp-stories/queue-recall-arrow.spec.ts"],
+      "specs": ["src/components/acp/recallNav.test.ts", "src/components/acp/Composer.recall.dom.test.tsx"],
       "components": ["web/src/components/acp/Composer.tsx", "web/src/components/acp/StructuredView.tsx"]
     },
     {
@@ -3114,9 +3114,9 @@
     },
     {
       "id": "acp.story.queue-fold-unfold",
-      "kind": "live-playwright",
+      "kind": "vitest",
       "risk": "low",
-      "specs": ["tests/live/acp-stories/queue-fold-unfold.spec.ts"],
+      "specs": ["src/components/acp/QueuedPromptsStrip.test.tsx", "src/components/acp/queuedPromptsLayout.test.ts"],
       "components": ["web/src/components/acp/StructuredView.tsx"]
     },
     {
