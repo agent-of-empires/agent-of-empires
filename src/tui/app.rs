@@ -3112,12 +3112,14 @@ impl App {
             .is_some_and(|v| v.session_id() == session_id)
         {
             self.activate_embedded();
+            self.drain_pending_paste_for_structured_view();
             return Ok(());
         }
         match require_daemon().await {
             Ok(endpoint) => {
                 self.connect_embedded_structured(endpoint, session_id).await;
                 self.activate_embedded();
+                self.drain_pending_paste_for_structured_view();
             }
             Err(ManagerError::NoDaemonRunning(_)) => {
                 self.home.prompt_start_daemon_for_structured(session_id);
@@ -3136,6 +3138,23 @@ impl App {
         self.home.exit_live_send_if_active();
         if let Some(v) = self.home.structured_preview.as_mut() {
             v.activate();
+        }
+    }
+
+    /// Drain buffered paste text into the structured composer after the view
+    /// activates.  Leaves the text in `pending_paste_for_structured_view`
+    /// when there is no mounted view (activation failed), so the next 'm'
+    /// press can still surface it.
+    #[cfg(feature = "serve")]
+    fn drain_pending_paste_for_structured_view(&mut self) {
+        if let Some(buf) = self.home.pending_paste_for_structured_view.take() {
+            if let Some(view) = self.home.structured_preview.as_mut() {
+                view.paste_text(&buf);
+            } else {
+                // No mounted view: activation failed or was interrupted.
+                // Put the text back so the next 'm' press can drain it.
+                self.home.pending_paste_for_structured_view = Some(buf);
+            }
         }
     }
 

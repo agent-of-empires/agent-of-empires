@@ -226,4 +226,10 @@ impl EmbeddedView {
     pub fn selection_text(&self, width: u16) -> ratatui::text::Text<'static> {
         render::wrapped_transcript(&self.state, &crate::tui::styles::Theme::default(), width)
     }
+
+    /// Paste text into the composer, focusing it if needed.
+    /// Used to forward buffered paste into the structured composer.
+    pub fn paste_text(&mut self, text: &str) {
+        super::paste_into_composer(&mut self.state, text);
+    }
 }

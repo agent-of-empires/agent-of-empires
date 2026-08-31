@@ -1387,7 +1387,7 @@ fn open_link_picker(state: &mut StructuredViewState, links: Vec<(String, String)
 /// post-edit bookkeeping as typed input (slash-picker highlight reset,
 /// `@`-mention recompute). A modal approval or choice keeps focus while
 /// the paste is safely retained as a composer draft.
-fn paste_into_composer(state: &mut StructuredViewState, text: &str) {
+pub(super) fn paste_into_composer(state: &mut StructuredViewState, text: &str) {
     let text = text.replace("\r\n", "\n").replace('\r', "\n");
     if state.focus != Focus::Composer
         && state.choice.is_none()

@@ -16320,6 +16320,26 @@ mod default_attach_mode {
         );
     }
 
+    /// Pressing 'm' on a structured session drains buffered paste into
+    /// `pending_paste_for_structured_view` so the async open path can
+    /// forward it into the composer instead of losing it.
+    #[cfg(feature = "serve")]
+    #[test]
+    #[serial]
+    fn send_message_drains_pending_paste_for_structured_view() {
+        let (mut env, _id) = structured_session_env();
+        env.view.pending_paste = Some("cached text".to_string());
+        env.view.handle_key(key(KeyCode::Char('m')), None);
+        assert_eq!(
+            env.view.pending_paste, None,
+            "pending_paste must be drained when routing to structured view"
+        );
+        assert_eq!(
+            env.view.pending_paste_for_structured_view,
+            Some("cached text".to_string()),
+            "drained text must land in pending_paste_for_structured_view"
+        );
+    }
     /// Render the whole home screen into a string for placeholder /
     /// badge assertions.
     fn render_home(env: &mut TestEnv) -> String {
