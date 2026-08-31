@@ -2476,7 +2476,9 @@ pub(super) async fn run_connection_task<W, R>(
                             // A cancel acknowledgement ends prompt_fut before the
                             // escalation timer can close the connection. Close it
                             // here so the supervisor can perform the promised
-                            // worker restart; preserve the late-cost recovery above.
+                            // worker restart. Only cost without active
+                            // off-protocol work is authoritative completion
+                            // evidence, preserving the late-cost recovery above.
                             shutdown = true;
                         }
                         if profile.key == "opencode"
