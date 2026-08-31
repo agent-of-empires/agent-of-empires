@@ -1313,7 +1313,7 @@ fn load_omp_capture_metadata(tmux_session_name: &str) -> Result<OmpCaptureMetada
         serde_json::from_str(encoded).context("tmux returned invalid OMP capture metadata")?;
     validate_omp_capture_metadata(&metadata)?;
     if !metadata.launch_marker.is_empty() {
-        let ready = crate::tmux::env::get_hidden_env_uncached(
+        let ready = crate::tmux::env::get_hidden_env(
             tmux_session_name,
             crate::tmux::env::AOE_OMP_CAPTURE_READY_KEY,
         );

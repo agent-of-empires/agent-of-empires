@@ -37,6 +37,8 @@ pub mod test_support {
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -258,6 +260,25 @@ pub struct PaneMetadata {
 }
 
 static SESSION_REFRESH_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+static FORCED_SESSION_CACHE_GUARDS: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether a test owns SESSION_CACHE through a live SessionCacheGuard, in
+/// which case refresh_session_cache must leave the forced snapshot alone.
+/// serial_test only orders serial tests against each other, so a parallel test
+/// can already be past its staleness check and blocked on the list-sessions
+/// fork when the guard forces a snapshot, then land its write mid-test. On a
+/// host with no tmux server that write is data: None, which reads back as
+/// SessionExistence::Unknown and flips the assertion the guard meant to pin.
+#[cfg(test)]
+fn forced_session_cache_active() -> bool {
+    FORCED_SESSION_CACHE_GUARDS.load(Ordering::SeqCst) > 0
+}
+
+#[cfg(not(test))]
+fn forced_session_cache_active() -> bool {
+    false
+}
 static SESSION_CACHE: RwLock<SessionCache> = RwLock::new(SessionCache {
     data: None,
     time: None,
@@ -400,10 +421,14 @@ fn publish_session_cache(
     refresh_id: u64,
     data: Option<HashMap<String, i64>>,
     outcome: SessionCacheRefresh,
+    respect_forced_guard: bool,
 ) -> SessionCacheRefresh {
     let Ok(mut cache) = SESSION_CACHE.write() else {
         return SessionCacheRefresh::Unknown;
     };
+    if respect_forced_guard && forced_session_cache_active() {
+        return outcome;
+    }
     if refresh_id <= cache.refresh_id {
         return cache.outcome;
     }
@@ -460,7 +485,7 @@ pub fn refresh_session_cache() -> SessionCacheRefresh {
         "session cache refreshed",
     );
 
-    publish_session_cache(refresh_id, new_data, outcome)
+    publish_session_cache(refresh_id, new_data, outcome, true)
 }
 
 /// Classify the currently selected agent session without letting an
@@ -954,29 +979,39 @@ fn session_name_from_cache(derived: &str, shape: &NameShape) -> Option<String> {
 /// for a panic button with a handful of sessions; if counts grow, batch the
 /// SIGTERM across all pids, wait once, then SIGKILL survivors.
 pub fn stop_all_sessions() -> anyhow::Result<usize> {
-    let output = tmux_command()
+    let output = tmux_query_command()
         .args(["list-sessions", "-F", "#{session_name}"])
         .output()
         .map_err(|e| anyhow::anyhow!("tmux list-sessions spawn failed: {e}"))?;
 
-    let mut killed = 0;
-    if output.status.success() {
+    let mut matched = false;
+    let killed = if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            if is_aoe_session(line) {
-                if let Some(pid) = crate::process::get_pane_pid(line) {
-                    crate::process::kill_process_tree(pid);
-                }
-                let _ = tmux_command().args(["kill-session", "-t", line]).output();
-                killed += 1;
+        stop_aoe_sessions(stdout.lines(), |name| {
+            matched = true;
+            if let Some(pid) = crate::process::get_pane_pid(name) {
+                crate::process::kill_process_tree(pid);
             }
-        }
-    }
+            utils::kill_session_if_present(name).is_ok()
+        })
+    } else {
+        0
+    };
 
-    if killed > 0 {
+    if matched {
         refresh_session_cache();
     }
     Ok(killed)
+}
+
+fn stop_aoe_sessions<'a>(
+    names: impl Iterator<Item = &'a str>,
+    mut stop: impl FnMut(&str) -> bool,
+) -> usize {
+    names
+        .filter(|name| is_aoe_session(name))
+        .filter(|name| stop(name))
+        .count()
 }
 
 /// Batch-fetch pane metadata for all aoe sessions in a single tmux subprocess call.
@@ -1289,17 +1324,33 @@ pub(crate) struct SessionCacheGuard {
     prev_time: Option<Instant>,
     prev_refresh_id: u64,
     prev_outcome: SessionCacheRefresh,
+    forced_snapshot: bool,
 }
 
 #[cfg(test)]
 impl SessionCacheGuard {
     pub(crate) fn capture() -> Self {
-        let cache = SESSION_CACHE.read().expect("session cache lock");
+        Self::capture_inner(true)
+    }
+
+    /// Save and restore the cache without suppressing refresh publication.
+    pub(crate) fn capture_restore_only() -> Self {
+        Self::capture_inner(false)
+    }
+
+    fn capture_inner(forced_snapshot: bool) -> Self {
+        // The lock makes guard registration and the state snapshot atomic
+        // against a concurrent refresh publisher.
+        let cache = SESSION_CACHE.write().expect("session cache lock");
+        if forced_snapshot {
+            FORCED_SESSION_CACHE_GUARDS.fetch_add(1, Ordering::SeqCst);
+        }
         Self {
             prev_data: cache.data.clone(),
             prev_time: cache.time,
             prev_refresh_id: cache.refresh_id,
             prev_outcome: cache.outcome,
+            forced_snapshot,
         }
     }
 
@@ -1335,11 +1386,18 @@ impl SessionCacheGuard {
 #[cfg(test)]
 impl Drop for SessionCacheGuard {
     fn drop(&mut self) {
-        if let Ok(mut cache) = SESSION_CACHE.write() {
+        // Deregistered under the same lock the restore takes, mirroring
+        // `capture`: a refresh arriving mid-drop is either suppressed or lands
+        // on top of the restored snapshot, never dropped on the floor.
+        let mut cache = SESSION_CACHE.write();
+        if let Ok(cache) = cache.as_mut() {
             cache.data = self.prev_data.take();
             cache.time = self.prev_time;
             cache.refresh_id = self.prev_refresh_id;
             cache.outcome = self.prev_outcome;
+        }
+        if self.forced_snapshot {
+            FORCED_SESSION_CACHE_GUARDS.fetch_sub(1, Ordering::SeqCst);
         }
     }
 }
@@ -1901,7 +1959,7 @@ pub fn spawn_snapshot_poller() {
     }
 }
 pub fn get_current_session_name() -> Option<String> {
-    let output = tmux_command()
+    let output = tmux_query_command()
         .args(["display-message", "-p", "#{session_name}"])
         .output()
         .ok()?;
@@ -2291,7 +2349,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn later_started_snapshot_publication_wins() {
-        let _session_guard = SessionCacheGuard::capture();
+        let _session_guard = SessionCacheGuard::capture_restore_only();
         let _pane_guard = PaneMetaCacheGuard::capture();
 
         let session_older = next_refresh_id(&SESSION_REFRESH_ID);
@@ -2301,11 +2359,12 @@ mod tests {
                 session_newer,
                 Some(HashMap::from([("new-session".to_string(), 0)])),
                 SessionCacheRefresh::Populated,
+                false,
             ),
             SessionCacheRefresh::Populated,
         );
         assert_eq!(
-            publish_session_cache(session_older, None, SessionCacheRefresh::NoServer,),
+            publish_session_cache(session_older, None, SessionCacheRefresh::NoServer, false,),
             SessionCacheRefresh::Populated,
             "the superseded caller must observe the newer committed outcome",
         );
@@ -2369,7 +2428,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn live_snapshot_warms_display_cache_without_second_fork() {
-        let cache = SessionCacheGuard::capture();
+        let cache = SessionCacheGuard::capture_restore_only();
         cache.force_stale();
         let _ = fork_probe::take();
         let probe = fork_probe::arm();
@@ -2384,6 +2443,22 @@ mod tests {
             1,
             "startup liveness and display warmup must share one list-sessions observation",
         );
+    }
+
+    #[test]
+    fn stop_aoe_sessions_counts_only_successful_kills() {
+        let successful = format!("{P}unicode_会话");
+        let failed = format!("{P}failed");
+        let names = [successful.as_str(), "unrelated", failed.as_str()];
+        let mut attempted = Vec::new();
+
+        let killed = stop_aoe_sessions(names.into_iter(), |name| {
+            attempted.push(name.to_string());
+            name == successful
+        });
+
+        assert_eq!(attempted, [successful, failed]);
+        assert_eq!(killed, 1);
     }
 
     #[cfg(unix)]
@@ -2813,6 +2888,24 @@ mod tests {
         let name = format!("{P}exists_probe_cache_hit");
         test_inject_session_into_cache(&name);
         assert!(session_exists(&name));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_forced_cache_snapshot_survives_a_concurrent_refresh() {
+        // See `forced_session_cache_active`: a refresh a parallel test
+        // started must not land inside a guarded window.
+        let guard = SessionCacheGuard::capture();
+        let name = format!("{P}forced_snapshot_survives_refresh");
+        guard.force_present(&[name.as_str()]);
+
+        refresh_session_cache();
+
+        assert_eq!(
+            probe_session_existence(&name),
+            SessionExistence::Present,
+            "a live SessionCacheGuard must own the snapshot"
+        );
     }
 
     #[test]

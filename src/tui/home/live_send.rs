@@ -811,16 +811,46 @@ const VT_REARM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3)
 /// keystroke batch triggers an immediate capture of the typed echo rather
 /// than waiting up to a full fast-cadence cycle. Backed by the same condvar
 /// `set_live` / `set_target` use, so a wake just runs one capture early.
+type CaptureWake = std::sync::Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>;
+
+fn signal_capture_wake(wakeup: &CaptureWake) {
+    if let Ok(mut generation) = wakeup.0.lock() {
+        *generation = generation.wrapping_add(1);
+        wakeup.1.notify_one();
+    }
+}
+
+fn wait_for_capture_wake(
+    wakeup: &CaptureWake,
+    observed: &mut u64,
+    timeout: std::time::Duration,
+) -> bool {
+    let previous = *observed;
+    let Ok(mut generation) = wakeup.0.lock() else {
+        return false;
+    };
+    let pending_before_park = *generation != previous;
+    if !pending_before_park {
+        let Ok((next, _)) = wakeup
+            .1
+            .wait_timeout_while(generation, timeout, |current| *current == previous)
+        else {
+            return false;
+        };
+        generation = next;
+    }
+    *observed = *generation;
+    pending_before_park
+}
+
 #[derive(Clone)]
 pub(in crate::tui) struct LiveCaptureWake {
-    nudge: std::sync::Arc<(std::sync::Mutex<()>, std::sync::Condvar)>,
+    nudge: CaptureWake,
 }
 
 impl LiveCaptureWake {
     fn wake(&self) {
-        if let Ok(_guard) = self.nudge.0.lock() {
-            self.nudge.1.notify_one();
-        }
+        signal_capture_wake(&self.nudge);
     }
 }
 
@@ -924,7 +954,7 @@ pub(in crate::tui) struct LiveCaptureWorker {
     /// change takes effect immediately instead of after the current (up to
     /// 250ms idle) sleep. Without this, entering live-send mid-idle-sleep
     /// would lag the first fast capture by ~250ms.
-    nudge: std::sync::Arc<(std::sync::Mutex<()>, std::sync::Condvar)>,
+    nudge: CaptureWake,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Newest OSC 52 clipboard write the displayed pane has emitted. A VT grid
     /// extracts it from the live byte stream; terminal capture uses a separate
@@ -1174,7 +1204,7 @@ impl LiveCaptureWorker {
         let interval_ms = Arc::new(AtomicU64::new(LIVE_CAPTURE_INTERVAL_IDLE_MS));
         let live = Arc::new(AtomicBool::new(false));
         let forward_empty = Arc::new(AtomicBool::new(false));
-        let nudge: Arc<(Mutex<()>, Condvar)> = Arc::new((Mutex::new(()), Condvar::new()));
+        let nudge: CaptureWake = Arc::new((Mutex::new(0), Condvar::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let clipboard: Arc<Mutex<Option<ClipboardFrame>>> = Arc::new(Mutex::new(None));
         let generation = Arc::new(AtomicU64::new(0));
@@ -1205,6 +1235,7 @@ impl LiveCaptureWorker {
         let thread = std::thread::spawn(move || {
             let mut last_target = String::new();
             let mut last_generation = 0;
+            let mut observed_wake = 0;
 
             #[cfg(unix)]
             let mut last_authoritative_capture: Option<std::time::Instant> = None;
@@ -1635,10 +1666,9 @@ impl LiveCaptureWorker {
                 // rather than after the current sleep, and on the VT path the
                 // channel's reader thread notifies it on every grid change,
                 // so fresh output samples immediately instead of waiting out
-                // the interval (the interval is then only the fallback for a
-                // notify that fired while this thread wasn't parked). Spurious
-                // wakeups just run an extra capture cycle, which the dedup
-                // makes harmless.
+                // the interval. A generation under the condvar mutex preserves
+                // a wake that arrives before this thread parks; multiple wakes
+                // may coalesce into one extra cycle, which dedup makes harmless.
                 //
                 // A live in-process vt channel samples the grid cheaply (no
                 // `capture-pane` fork) and dedups unchanged frames, so the idle
@@ -1662,11 +1692,11 @@ impl LiveCaptureWorker {
                     Some(wait) => ms.min(wait),
                     None => ms,
                 };
-                if let Ok(guard) = nudge_thread.0.lock() {
-                    let _ = nudge_thread
-                        .1
-                        .wait_timeout(guard, std::time::Duration::from_millis(ms));
-                }
+                let _ = wait_for_capture_wake(
+                    &nudge_thread,
+                    &mut observed_wake,
+                    std::time::Duration::from_millis(ms),
+                );
             }
             #[cfg(unix)]
             {
@@ -1758,9 +1788,7 @@ impl LiveCaptureWorker {
     /// Wake the worker out of its inter-capture wait so a just-changed
     /// cadence or target applies immediately.
     fn nudge(&self) {
-        if let Ok(_guard) = self.nudge.0.lock() {
-            self.nudge.1.notify_one();
-        }
+        signal_capture_wake(&self.nudge);
     }
 
     /// Point the worker at a different pane (its tmux session name; empty to
@@ -3478,6 +3506,21 @@ mod tests {
             Some("current copy"),
         );
     }
+    #[test]
+    fn capture_wake_before_park_stays_pending() {
+        let wake: CaptureWake =
+            std::sync::Arc::new((std::sync::Mutex::new(0), std::sync::Condvar::new()));
+        let mut observed = 0;
+        signal_capture_wake(&wake);
+
+        assert!(wait_for_capture_wake(
+            &wake,
+            &mut observed,
+            std::time::Duration::from_secs(1),
+        ));
+        assert_eq!(observed, 1);
+    }
+
     #[test]
     fn authoritative_capture_reopens_at_trust_ceiling() {
         let t0 = std::time::Instant::now();

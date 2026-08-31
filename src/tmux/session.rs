@@ -1775,22 +1775,15 @@ impl Session {
             return true;
         }
 
-        let verify_deadline = crate::tmux::TmuxCommandDeadline::new();
         if matches!(
-            self.owner_at_result_with_deadline(opt, hb_opt, &verify_deadline),
+            self.owner_at_result_with_deadline(opt, hb_opt, deadline),
             Ok(Some((id, _))) if id == owner_id
         ) {
             return true;
         }
         if replaced.is_err() {
-            let cleanup_deadline = crate::tmux::TmuxCommandDeadline::new();
             self.release_owner_pair_at_with_deadline(
-                opt,
-                hb_opt,
-                owner_id,
-                heartbeat,
-                false,
-                &cleanup_deadline,
+                opt, hb_opt, owner_id, heartbeat, false, deadline,
             );
         }
         false

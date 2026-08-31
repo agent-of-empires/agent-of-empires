@@ -273,7 +273,7 @@ fn new_pipe_owner_id() -> String {
 /// [`VtChannel::set_change_wakeup`]; the reader thread pokes it after every
 /// grid change (and on death) so the poller samples the moment output lands
 /// instead of after the remainder of a fixed poll interval.
-pub(crate) type ChangeWakeup = Arc<(Mutex<()>, Condvar)>;
+pub(crate) type ChangeWakeup = Arc<(Mutex<u64>, Condvar)>;
 
 /// Poke a registered change wakeup, if any. The slot lock is held only to
 /// clone the pair; the pair's own mutex is then taken so the notify
@@ -285,7 +285,8 @@ fn notify_change_wakeup(slot: &Mutex<Option<ChangeWakeup>>) {
         Err(_) => None,
     };
     if let Some(pair) = pair {
-        if let Ok(_g) = pair.0.lock() {
+        if let Ok(mut generation) = pair.0.lock() {
+            *generation = generation.wrapping_add(1);
             pair.1.notify_one();
         }
     }
@@ -3023,7 +3024,7 @@ mod tests {
         let reader = std::thread::spawn(move || run_reader(listener, ctx));
         let mut conn = UnixStream::connect(&sock).expect("connect");
 
-        let pair: ChangeWakeup = Arc::new((Mutex::new(()), Condvar::new()));
+        let pair: ChangeWakeup = Arc::new((Mutex::new(0), Condvar::new()));
         *wakeup_slot.lock().unwrap() = Some(pair.clone());
         // Hold the parker's mutex BEFORE writing: the reader's notify takes
         // the same lock, so the wakeup cannot fire into the gap between this

@@ -3,7 +3,7 @@
 use super::*;
 
 pub(super) fn tmux_env_session_name_for_instance_id(instance_id: &str) -> Option<String> {
-    let output = crate::tmux::tmux_command()
+    let output = crate::tmux::tmux_query_command()
         .args(["list-sessions", "-F", "#{session_name}"])
         .output()
         .ok()?;
