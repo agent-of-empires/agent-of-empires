@@ -60,7 +60,6 @@ pub enum RelocateOutcome {
     /// The move could not run safely (sandbox container still mounting the
     /// dir, locked, cross-device, git error). `project_path` is untouched;
     /// the caller trashes in place and surfaces `reason`. Never blocks trash.
-    ///
     Failed { reason: String },
 }
 
@@ -138,13 +137,14 @@ fn is_protected_default_branch_cached(inst: &Instance, cache: &mut ProtectedBran
 /// it against the process directory instead of the worktree would read a live
 /// checkout as stranded and refuse to relocate it for good.
 ///
-/// Anything unreadable is treated as present. This decides whether to stop
-/// retrying, so guessing "stranded" from a transient read error is the
-/// expensive mistake.
+/// Only an absent `.git` entry counts as gone. Anything else unreadable is
+/// treated as present, since this decides whether to stop retrying and guessing
+/// "stranded" from a transient stat error is the expensive mistake.
 fn is_orphaned_checkout(worktree: &Path) -> bool {
     let link = worktree.join(".git");
-    let Ok(metadata) = std::fs::symlink_metadata(&link) else {
-        return true;
+    let metadata = match std::fs::symlink_metadata(&link) {
+        Ok(metadata) => metadata,
+        Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
     };
     if metadata.is_dir() {
         // A repo of its own, not a linked worktree; nothing to strand.
@@ -578,6 +578,12 @@ fn plan_trashed_reconcile_cached(
                 path = %current.display(),
                 "trashed worktree is no longer registered with its repo; leaving it in place"
             );
+            return ReconcilePlan::Nothing;
+        }
+        // A default branch's checkout is never relocated (#3215), so planning
+        // the move would reserve the row, take its flock, and write twice on
+        // every sweep for a relocation that always answers Skipped.
+        if is_protected_default_branch_cached(inst, cache) {
             return ReconcilePlan::Nothing;
         }
         return ReconcilePlan::Relocate;
@@ -1093,6 +1099,21 @@ mod tests {
         assert_eq!(inst.project_path, original);
         assert!(inst.pre_trash_project_path.is_none());
         assert!(PathBuf::from(&original).exists());
+    }
+
+    /// #3611: the relocation refuses a default branch's checkout (#3215), so
+    /// planning it costs a reservation, a flock, and two writes on every sweep
+    /// for work that can never make progress. The plan step has to refuse it
+    /// too.
+    #[test]
+    fn a_default_branch_checkout_is_never_planned_for_relocation() {
+        if !git_available() {
+            return;
+        }
+        let (_tmp, mut inst) = default_branch_worktree_instance();
+        inst.trash();
+        assert_eq!(plan_trashed_reconcile(&inst), ReconcilePlan::Nothing);
+        assert!(!reconcile_trashed_location(&mut inst));
     }
 
     /// Upgrade path for #3215: a row relocated by an earlier version. The purge

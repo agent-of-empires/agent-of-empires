@@ -222,10 +222,6 @@ impl HomeView {
         }
     }
 
-    /// Reload once the background load-time healing sweeps land, so a row the
-    /// worker repointed is shown at its real path. Nothing to merge field by
-    /// field: the sweeps only rewrite durable state, so a storage reload is
-    /// both sufficient and cheaper than mirroring each repair. See #3611.
     /// How long startup recovery waits for the first reconcile sweep before
     /// starting without it.
     ///
@@ -266,6 +262,10 @@ impl HomeView {
         self.maybe_start_startup_recovery();
     }
 
+    /// Reload once the background load-time healing sweeps land, so a row the
+    /// worker repointed is shown at its real path. Nothing to merge field by
+    /// field: the sweeps only rewrite durable state, so a storage reload is
+    /// both sufficient and cheaper than mirroring each repair. See #3611.
     pub fn apply_reconcile_results(&mut self) -> bool {
         use std::sync::mpsc::TryRecvError;
 

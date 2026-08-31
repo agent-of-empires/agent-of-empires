@@ -28,9 +28,10 @@ impl HomeView {
                 inst.source_profile = profile_name.clone();
             }
             // Clear expired lifecycle reservations in one write, under the same
-            // per-instance flocks live transitions take. Locks are acquired in
-            // sorted id order; peers take one at a time, so an ordered
-            // multi-lock holder cannot close a cycle with them.
+            // per-instance flocks live transitions take. Acquired in sorted id
+            // order, matching the only other multi-lock holder
+            // (`Storage::move_instance_between_profiles`), which sorts too, so
+            // the two cannot close a cycle.
             let ttl = crate::session::Instance::LIFECYCLE_RESERVATION_TTL;
             let now = chrono::Utc::now();
             let mut expired: Vec<String> = instances

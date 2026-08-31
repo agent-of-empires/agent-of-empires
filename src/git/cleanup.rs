@@ -353,7 +353,6 @@ pub fn deinit_submodules_if_present(worktree_path: &Path) {
     }
 }
 
-/// Read the `gitdir:` target from a linked worktree's `.git` file.
 /// Resolve a linked worktree's `.git` pointer to its admin dir.
 ///
 /// The target is resolved against the worktree, since aoe rewrites every
