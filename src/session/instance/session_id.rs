@@ -489,22 +489,38 @@ impl Instance {
     /// `pi_sandbox_dir`, the container side from `PI_SIDECAR_DIR_IN_CONTAINER`.
     /// A directory the user named is mounted by their own `extra_volumes`
     /// entry, whose container path AoE never sees, so neither side can be
-    /// derived and the launch declines the sidecar instead of publishing into
-    /// a bind that pane does not read.
+    /// derived and such a session neither publishes a sidecar nor reads one
+    /// (see `pi_config_bind_dir`).
     fn declares_agent_config_dir(&self) -> bool {
-        dirs::home_dir().is_some_and(|home| {
-            crate::session::profile_config::resolve_config_or_warn(&self.effective_profile())
-                .session
-                .agent_config_dir_for(&self.tool, &home)
-                .is_some()
+        *self.agent_config_dir_declared.get_or_init(|| {
+            dirs::home_dir().is_some_and(|home| {
+                crate::session::profile_config::resolve_config_or_warn(&self.effective_profile())
+                    .session
+                    .agent_config_dir_for(&self.tool, &home)
+                    .is_some()
+            })
         })
+    }
+
+    /// Host side of the Pi config bind for this sandboxed pane, or `None` when
+    /// the session declares its own config dir.
+    ///
+    /// The gate belongs here rather than only at launch: the bind is writable
+    /// from the container and a sidecar can outlive the config change that
+    /// declared the directory, so a read of the staged dir could attribute a
+    /// conversation this pane never published.
+    fn pi_config_bind_dir(&self) -> Option<std::path::PathBuf> {
+        if self.declares_agent_config_dir() {
+            return None;
+        }
+        crate::session::container_config::pi_sandbox_dir()
     }
 
     /// Host directory backing this sandboxed pane's sidecar.
     fn pi_sandbox_sidecar(&self) -> Option<std::path::PathBuf> {
         crate::session::validate_instance_id(&self.id).ok()?;
         Some(
-            crate::session::container_config::pi_sandbox_dir()?
+            self.pi_config_bind_dir()?
                 .join("aoe-session")
                 .join(&self.id),
         )
@@ -519,7 +535,7 @@ impl Instance {
             return Some(std::path::PathBuf::from(published));
         }
         let rest = published.strip_prefix("/root/.pi/")?;
-        Some(crate::session::container_config::pi_sandbox_dir()?.join(rest))
+        Some(self.pi_config_bind_dir()?.join(rest))
     }
 
     /// The transcript to resume by path, when the pane published one that
@@ -1151,34 +1167,56 @@ mod tests {
         );
     }
 
-    /// A Pi session pointed at a config dir the user named gets no sidecar.
+    /// A Pi session pointed at a config dir the user named gets no sidecar,
+    /// neither writing one nor reading one.
+    ///
     /// Both halves of the path (the discovered extension, the published file)
     /// live in the bind AoE mounts itself; the user's own dir reaches the
     /// container through their `extra_volumes` entry, at a path AoE cannot
-    /// see, so publishing there would report into a directory the pane in the
-    /// container never opens.
+    /// see. The read gate is the half that matters after the fact: the bind
+    /// stays mounted and writable from the container, so a sidecar left there
+    /// by an earlier launch (or written by the pane itself) would otherwise
+    /// resume this session onto a conversation it never published.
     #[test]
     #[serial_test::serial]
     fn sandboxed_pi_with_its_own_config_dir_declines_the_sidecar() {
+        const STALE_ID: &str = "01a053b6-c470-78de-9d8f-bc00ef05332a";
         let _guard = crate::session::test_support::isolate_app_dir();
         let app_dir = crate::session::get_app_dir().unwrap();
 
-        let mut inst = Instance::new("pi-own-config", "/tmp/pi-own-config");
-        inst.tool = "pi".to_string();
-        inst.sandbox_info = Some(crate::session::SandboxInfo {
-            enabled: true,
-            container_id: None,
-            image: "test:latest".to_string(),
-            container_name: "aoe-pi-own-config".to_string(),
-            extra_env: None,
-            custom_instruction: None,
-            container_workdir: None,
-            before_start_env: Vec::new(),
-        });
+        let sandboxed_pi = |id: &str| {
+            let mut inst = Instance::new(id, "/tmp/pi-own-config");
+            inst.tool = "pi".to_string();
+            inst.sandbox_info = Some(crate::session::SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: "test:latest".to_string(),
+                container_name: "aoe-pi-own-config".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                container_workdir: None,
+                before_start_env: Vec::new(),
+            });
+            inst
+        };
 
+        let inst = sandboxed_pi("piownconfig01");
         assert!(
             inst.pi_extension_launch().is_some(),
             "a session on the staged config dir publishes as before"
+        );
+        // What that session leaves behind, and what the container can write.
+        let sidecar = inst.pi_sandbox_sidecar().expect("a staged sidecar dir");
+        std::fs::create_dir_all(&sidecar).unwrap();
+        std::fs::write(sidecar.join("session_id"), format!("{STALE_ID}\n")).unwrap();
+        std::fs::write(
+            sidecar.join("session_path"),
+            "/root/.pi/sessions/--p--/2026-01-01T00-00-00-000Z_x.jsonl\n",
+        )
+        .unwrap();
+        assert!(
+            inst.uses_pi_session_sidecar(),
+            "the staged sidecar is this session's until it declares otherwise"
         );
 
         std::fs::write(
@@ -1186,10 +1224,25 @@ mod tests {
             "[session.agent_config_dir]\npi = \"~/.pi-personal\"\n",
         )
         .unwrap();
+
+        // A fresh object, the way a reload builds one: the declared dir is
+        // resolved once per instance rather than on every refresh.
+        let mut declared = sandboxed_pi("piownconfig01");
         assert_eq!(
-            inst.pi_extension_launch(),
+            declared.pi_extension_launch(),
             None,
             "a declared config dir leaves the session on store polling"
+        );
+        assert_eq!(declared.pi_sidecar_source(), None);
+        assert!(!declared.uses_pi_session_sidecar());
+        assert_eq!(declared.pi_published_session_id(true), None);
+        assert_eq!(declared.pi_published_session_path(), None);
+
+        let mut cmd = String::from("pi");
+        declared.apply_session_flags(&mut cmd, "test");
+        assert!(
+            !cmd.contains(STALE_ID) && !cmd.contains("--session"),
+            "the stale sidecar must not reach the launch line, got {cmd:?}"
         );
     }
 

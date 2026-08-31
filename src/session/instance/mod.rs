@@ -611,6 +611,13 @@ pub struct Instance {
     #[serde(skip)]
     pi_extension_launched: bool,
 
+    /// Memo for `declares_agent_config_dir`. Resolving the profile config
+    /// reads several files, and the answer gates the Pi sidecar, which sits on
+    /// the per-refresh path. Runtime only, so an edit to `agent_config_dir`
+    /// lands on the next reload rather than mid-life of a session object.
+    #[serde(skip)]
+    agent_config_dir_declared: std::sync::OnceLock<bool>,
+
     /// Absolute transcript path this Pi pane last published. Pi indexes
     /// sessions by their starting cwd, so this is what resumes a conversation
     /// whose managed worktree has since moved; the id alone would resolve to

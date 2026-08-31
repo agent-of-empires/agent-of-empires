@@ -181,36 +181,125 @@ fn atomic_write_resolved(path: &Path, content: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Replace `path` with `content` via a uniquely named temp file in the same
-/// directory, following no symlink on the way.
+/// Replace `root`/`rel` with `content`, creating `rel`'s directories, without
+/// ever traversing a symlink below `root`.
 ///
-/// For a file AoE writes into a sandbox bind mount, where a process in the
-/// container can pre-create the path it is about to use: the temp file is
-/// created exclusively, so a planted symlink fails the create instead of
-/// redirecting the write onto a host file, and `rename(2)` replaces a link at
-/// `path` rather than writing through it. [`atomic_write`] resolves symlinks
-/// by design and must not be used there. The unique name also keeps two
-/// concurrent installs from renaming each other's half-written file.
+/// For the files AoE writes inside a bind mount the container can write to. A
+/// process in the sandbox can plant a link at the destination, or swap a
+/// parent directory for one, between the create and the write; a plain
+/// `std::fs::write` follows either and lands on a host file of the container's
+/// choosing. Every component below `root` is opened `O_NOFOLLOW` from the
+/// previous directory's descriptor, so a swapped ancestor fails the walk
+/// instead of redirecting it, and the temp file is created and renamed through
+/// that descriptor rather than by path. `root` itself is the caller's trusted
+/// anchor (an AoE-owned directory, or the host side of the mount, which the
+/// container cannot replace) and is opened normally.
 ///
-/// Written 0o644: the reader is a process in the container, which need not be
-/// the uid that owns the bind, and tempfile defaults to 0o600.
-pub(crate) fn replace_file_no_follow(path: &Path, content: &[u8]) -> Result<()> {
-    let dir = path.parent().ok_or_else(|| {
-        anyhow!(
-            "replace_file_no_follow needs a path with a parent: {}",
-            path.display()
-        )
-    })?;
+/// [`atomic_write`] is the opposite contract, resolving symlinks so a user's
+/// dotfile link survives, and must not be used for these paths.
+///
+/// The temp name is unique per attempt, so two concurrent installs cannot
+/// rename each other's half-written file, and the result is 0o644: the reader
+/// is a process in the container, which need not be the uid owning the bind.
+#[cfg(unix)]
+pub(crate) fn replace_file_no_follow(root: &Path, rel: &Path, content: &[u8]) -> Result<()> {
+    use nix::errno::Errno;
+    use nix::fcntl::{open, openat, renameat, OFlag};
+    use nix::sys::stat::{fchmod, mkdirat, Mode};
+    use nix::unistd::{unlinkat, UnlinkatFlags};
+    use std::os::fd::OwnedFd;
+
+    let mut dirs = Vec::new();
+    let mut file_name = None;
+    let mut components = rel.components().peekable();
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(anyhow!(
+                "replace_file_no_follow needs a plain relative path, got {}",
+                rel.display()
+            ));
+        };
+        if components.peek().is_some() {
+            dirs.push(name);
+        } else {
+            file_name = Some(name);
+        }
+    }
+    let file_name = file_name.ok_or_else(|| anyhow!("replace_file_no_follow needs a file name"))?;
+
+    let dir_flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
+    // The anchor is created the ordinary way; anything that could plant a
+    // symlink above it already owns the tree AoE writes into.
+    fs::create_dir_all(root).with_context(|| format!("creating {}", root.display()))?;
+    let mut dir: OwnedFd = open(root, dir_flags, Mode::empty())
+        .with_context(|| format!("opening {}", root.display()))?;
+    for name in dirs {
+        match mkdirat(&dir, name, Mode::from_bits_truncate(0o700)) {
+            Ok(()) | Err(Errno::EEXIST) => {}
+            Err(e) => {
+                return Err(anyhow!(e)).with_context(|| {
+                    format!("creating {} under {}", rel.display(), root.display())
+                })
+            }
+        }
+        dir = openat(&dir, name, dir_flags | OFlag::O_NOFOLLOW, Mode::empty()).with_context(
+            || {
+                format!(
+                    "opening {:?} under {}: a symlink there would redirect the write",
+                    name,
+                    root.display()
+                )
+            },
+        )?;
+    }
+
+    let tmp_name = format!(
+        ".{}.{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        NO_FOLLOW_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let tmp = openat(
+        &dir,
+        tmp_name.as_str(),
+        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC,
+        Mode::from_bits_truncate(0o644),
+    )
+    .with_context(|| format!("creating a temp file under {}", root.display()))?;
+
+    let written = (|| -> Result<()> {
+        let mut file = fs::File::from(tmp);
+        file.write_all(content)?;
+        fchmod(&file, Mode::from_bits_truncate(0o644))?;
+        file.sync_all()?;
+        drop(file);
+        renameat(&dir, tmp_name.as_str(), &dir, file_name)?;
+        Ok(())
+    })();
+    if written.is_err() {
+        let _ = unlinkat(&dir, tmp_name.as_str(), UnlinkatFlags::NoRemoveDir);
+    }
+    written.with_context(|| format!("writing {} under {}", rel.display(), root.display()))
+}
+
+/// Serial for the per-attempt temp name in [`replace_file_no_follow`], so two
+/// writers in one process cannot pick the same one inside a clock tick.
+#[cfg(unix)]
+static NO_FOLLOW_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Windows has no `O_NOFOLLOW` walk here; the sandbox this guards against is
+/// Linux and macOS only. Kept so the module compiles.
+#[cfg(not(unix))]
+pub(crate) fn replace_file_no_follow(root: &Path, rel: &Path, content: &[u8]) -> Result<()> {
+    let path = root.join(rel);
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow!("replace_file_no_follow needs a path with a parent"))?;
+    fs::create_dir_all(dir)?;
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     tmp.write_all(content)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        tmp.as_file()
-            .set_permissions(fs::Permissions::from_mode(0o644))?;
-    }
     tmp.as_file().sync_all()?;
-    tmp.persist(path)?;
+    tmp.persist(&path)?;
     Ok(())
 }
 
@@ -2687,36 +2776,53 @@ mod tests {
 
     /// The mirror of `atomic_write_follows_symlinks`, for the paths AoE writes
     /// inside a sandbox bind: a link planted there by a container process must
-    /// be replaced, never written through, or the container picks the host file
-    /// the write lands on.
+    /// be replaced, never written through, and a swapped parent directory must
+    /// fail the write rather than redirect it out of the bind.
     #[cfg(unix)]
     #[test]
-    fn replace_file_no_follow_replaces_planted_symlinks() {
+    fn replace_file_no_follow_refuses_planted_links() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempdir().unwrap();
-        let outside = tmp.path().join("host-secret");
-        std::fs::write(&outside, "untouched").unwrap();
-        let path = tmp.path().join("extension.js");
-        std::os::unix::fs::symlink(&outside, &path).unwrap();
+        let root = tmp.path().join("bind");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(root.join("agent/extensions")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let secret = outside.join("host-secret");
+        fs::write(&secret, "untouched").unwrap();
+        let rel = Path::new("agent/extensions/extension.js");
 
-        replace_file_no_follow(&path, b"payload").unwrap();
-
-        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "untouched");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "payload");
-        assert!(!std::fs::symlink_metadata(&path)
+        // A link at the destination is replaced, not followed.
+        std::os::unix::fs::symlink(&secret, root.join(rel)).unwrap();
+        replace_file_no_follow(&root, rel, b"payload").unwrap();
+        assert_eq!(fs::read_to_string(&secret).unwrap(), "untouched");
+        assert_eq!(fs::read_to_string(root.join(rel)).unwrap(), "payload");
+        assert!(!fs::symlink_metadata(root.join(rel))
             .unwrap()
             .file_type()
             .is_symlink());
         assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            fs::metadata(root.join(rel)).unwrap().permissions().mode() & 0o777,
             0o644,
             "the container reader may not be the uid that owns the bind"
         );
-        // Nothing is left behind for a concurrent writer to collide with.
-        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
-            .unwrap()
+
+        // A parent swapped for a link fails the walk, leaving the target dir
+        // untouched: nothing is written outside the bind root.
+        fs::remove_dir_all(root.join("agent")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("agent")).unwrap();
+        let err = replace_file_no_follow(&root, rel, b"payload").unwrap_err();
+        assert!(
+            !outside.join("extensions").exists(),
+            "a swapped ancestor must not be traversed: {err:#}"
+        );
+
+        // And nothing is left behind for a concurrent writer to collide with.
+        fs::remove_file(root.join("agent")).unwrap();
+        let leftovers: Vec<_> = fs::read_dir(root.join("agent/extensions"))
+            .into_iter()
+            .flatten()
             .filter_map(|e| e.ok().map(|e| e.file_name()))
-            .filter(|name| name != "host-secret" && name != "extension.js")
+            .filter(|name| name != "extension.js")
             .collect();
         assert!(leftovers.is_empty(), "stray temp files: {leftovers:?}");
     }

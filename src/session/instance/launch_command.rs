@@ -42,11 +42,11 @@ fn apply_yolo_mode(cmd: &mut String, yolo: &crate::agents::YoloMode, is_sandboxe
 /// Rewritten when the content differs so an upgrade ships its own version.
 pub(super) fn pi_extension_path() -> Result<PathBuf> {
     const SOURCE: &str = crate::session::instance::PI_SESSION_EXTENSION;
-    let dir = crate::session::get_app_dir()?.join("agent-extensions");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join("pi-aoe-session-id.js");
+    let root = crate::session::get_app_dir()?;
+    let rel = Path::new("agent-extensions").join("pi-aoe-session-id.js");
+    let path = root.join(&rel);
     if std::fs::read_to_string(&path).ok().as_deref() != Some(SOURCE) {
-        crate::session::replace_file_no_follow(&path, SOURCE.as_bytes())?;
+        crate::session::replace_file_no_follow(&root, &rel, SOURCE.as_bytes())?;
     }
     Ok(path)
 }

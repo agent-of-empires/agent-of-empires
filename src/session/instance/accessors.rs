@@ -83,6 +83,7 @@ impl Instance {
             pending_detection: None,
             pending_host_env: Vec::new(),
             pi_extension_launched: false,
+            agent_config_dir_declared: std::sync::OnceLock::new(),
             pi_session_path: None,
             last_error: None,
             session_id_poller: None,

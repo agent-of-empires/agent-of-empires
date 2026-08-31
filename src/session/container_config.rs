@@ -984,21 +984,20 @@ pub(crate) fn pi_sandbox_dir() -> Option<std::path::PathBuf> {
 /// pi refuses to start when an `-e` path is missing, and the file has to
 /// survive an upgrade of AoE under a container that already exists.
 pub(crate) fn install_pi_sandbox_extension() -> Result<()> {
-    let dir = pi_sandbox_dir()
-        .ok_or_else(|| anyhow::anyhow!("no Pi sandbox dir"))?
-        .join("agent")
-        .join("extensions");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join("aoe-session-id.js");
+    let root = pi_sandbox_dir().ok_or_else(|| anyhow::anyhow!("no Pi sandbox dir"))?;
+    let rel = Path::new("agent")
+        .join("extensions")
+        .join("aoe-session-id.js");
     let source = crate::session::instance::PI_SESSION_EXTENSION;
-    // Sandbox-writable, so the current content is read only through a regular
-    // file and replaced without following a link a container process planted.
+    // The bind is writable from the container, so the current content counts
+    // only when it is a regular file, and the write below follows no link.
+    let path = root.join(&rel);
     let current = std::fs::symlink_metadata(&path)
         .is_ok_and(|m| m.is_file())
         .then(|| std::fs::read_to_string(&path).ok())
         .flatten();
     if current.as_deref() != Some(source) {
-        crate::session::replace_file_no_follow(&path, source.as_bytes())?;
+        crate::session::replace_file_no_follow(&root, &rel, source.as_bytes())?;
     }
     Ok(())
 }
