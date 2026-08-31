@@ -140,7 +140,7 @@ describe("SessionRow Fork affordance gating", () => {
   });
 
   it("hides Fork on a resume-only structured row (captured id but not fork-capable)", () => {
-    // e.g. the bundled aoe-agent: advertises loadSession and mints an
+    // e.g. aoe-agent: advertises loadSession and mints an
     // acp_session_id, but does not advertise session/fork. Gating on the id
     // alone would offer a dead-end button that fails at the handshake.
     const ws = workspace("w-resume-only", [

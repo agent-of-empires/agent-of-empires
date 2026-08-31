@@ -485,7 +485,7 @@ pub struct Instance {
     /// session's tool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_name: Option<String>,
-    /// Optional model id forwarded to the selected ACP agent (e.g.,
+    /// Optional model id, injected at spawn as `AOE_AGENT_MODEL` (e.g.,
     /// "claude-opus-4-7", "gpt-5", "llama3.3:ollama").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_model: Option<String>,
