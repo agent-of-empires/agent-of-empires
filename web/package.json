@@ -59,7 +59,7 @@
     "jsdom": "^29.1.1",
     "monocart-coverage-reports": "^2.12.12",
     "msw": "^2.15.0",
-    "oxfmt": "^0.62.0",
+    "oxfmt": "^0.63.0",
     "tslib": "^2.8.1",
     "typescript": "~6.0.2",
     "typescript-eslint": "8.67.0",
