@@ -513,6 +513,10 @@ pub struct HomeView {
     /// bare flag, so a sweep that never lands cannot strand recovery for the
     /// whole boot. See `release_startup_recovery_gate`.
     pub(super) startup_recovery_gate: Option<std::time::Instant>,
+    /// A landed sweep whose repair has not reached `instances` yet, because
+    /// live-send is holding the reload. Keeps the recovery gate armed until the
+    /// repair is applied. See `apply_reconcile_results`.
+    pub(super) pending_reconcile_reload: bool,
 
     // Performance: background restart (the start cascade shells out to docker
     // and runs the before_start host hook, which can block for seconds)

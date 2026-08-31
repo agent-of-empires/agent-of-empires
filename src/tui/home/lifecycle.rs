@@ -331,6 +331,7 @@ impl HomeView {
             trash_poller: crate::tui::trash_poller::TrashPoller::new(),
             reconcile_poller: crate::tui::reconcile_poller::ReconcilePoller::new(),
             startup_recovery_gate: None,
+            pending_reconcile_reload: false,
             restart_poller: RestartPoller::new(),
             restart_in_flight: std::collections::HashSet::new(),
             attach_project_poller: crate::tui::attach_project_poller::AttachProjectPoller::new(),

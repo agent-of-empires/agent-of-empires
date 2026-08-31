@@ -242,6 +242,14 @@ impl HomeView {
     /// [`Self::STARTUP_RECOVERY_GATE_TIMEOUT`] has elapsed if it never does.
     /// Idempotent: the gate is cleared as it fires.
     pub(super) fn release_startup_recovery_gate(&mut self, sweep_landed: bool) {
+        // The gate exists so recovery reads repaired rows, and that holds only
+        // if every repair has already been applied to `instances` when it
+        // opens. The ordering is otherwise invisible from outside the call, so
+        // it is asserted here rather than left to a test to notice.
+        debug_assert!(
+            !self.pending_reconcile_reload,
+            "startup recovery gate released with a repair still unapplied",
+        );
         let Some(armed_at) = self.startup_recovery_gate else {
             return;
         };
@@ -261,38 +269,50 @@ impl HomeView {
     pub fn apply_reconcile_results(&mut self) -> bool {
         use std::sync::mpsc::TryRecvError;
 
-        // Deadline release runs before the live-send guard below. Starting
-        // recovery spawns workers and never touches the terminal, so a long
-        // paste must not strand it any more than a blocked sweep can.
-        self.release_startup_recovery_gate(false);
-        // Every storage reload gates on live-send being idle so none of them
-        // interrupts a paste in progress. Checked before the drain, so the
-        // worker's result stays queued for the next eligible tick rather than
-        // being consumed and dropped.
+        // Probe before anything else, the deadline included. A repair sitting
+        // in the channel has to reach `instances` before the gate opens, or
+        // startup recovery clones a `project_path` the sweep has already fixed
+        // on disk and spends that row's one boot-scoped attempt on it, which is
+        // the failure the gate exists to prevent.
+        let mut sweep_landed = self.pending_reconcile_reload;
+        if !sweep_landed {
+            match self.reconcile_poller.try_recv_result() {
+                Ok(result) => {
+                    sweep_landed = true;
+                    self.pending_reconcile_reload = result.changed;
+                }
+                // The worker is gone, so neither a sweep nor a repair is
+                // coming; nothing is left to apply before opening the gate.
+                Err(TryRecvError::Disconnected) => sweep_landed = true,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+
+        // Only the reload waits on live-send, since it repaints. An unapplied
+        // repair holds the gate shut regardless of the deadline: opening early
+        // is worse than opening late. With nothing to apply the deadline still
+        // runs, so a long paste cannot strand recovery on its own.
         if self.live_send.is_some() {
+            if !self.pending_reconcile_reload {
+                self.release_startup_recovery_gate(sweep_landed);
+            }
             return false;
         }
-        let changed = match self.reconcile_poller.try_recv_result() {
-            Ok(result) => result.changed,
-            Err(TryRecvError::Empty) => return false,
-            // The worker is gone, so no sweep is coming. Release the recovery
-            // gate below rather than waiting out its deadline.
-            Err(TryRecvError::Disconnected) => false,
-        };
-        // Startup recovery waits for the sweep either way: an unchanged sweep
-        // still means the paths it would launch from are now known good.
-        self.release_startup_recovery_gate(true);
-        if !changed {
-            return false;
+
+        let mut reloaded = false;
+        if self.pending_reconcile_reload {
+            self.pending_reconcile_reload = false;
+            match self.reload_storage_only() {
+                Ok(()) => reloaded = true,
+                Err(error) => tracing::warn!(
+                    target: "tui.home",
+                    "reload after load-time reconciliation failed: {error}",
+                ),
+            }
         }
-        if let Err(error) = self.reload_storage_only() {
-            tracing::warn!(
-                target: "tui.home",
-                "reload after load-time reconciliation failed: {error}",
-            );
-            return false;
-        }
-        true
+        // Released only now, so recovery reads the repaired rows.
+        self.release_startup_recovery_gate(sweep_landed);
+        reloaded
     }
 
     /// Apply any pending session ID updates from background pollers.

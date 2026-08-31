@@ -21485,3 +21485,122 @@ fn startup_recovery_gate_expires_during_live_send() {
         "a long paste must not strand recovery either"
     );
 }
+
+/// #3615 review: a repair queued in the channel must be applied to `instances`
+/// before the gate opens, deadline or not. Releasing first let startup recovery
+/// clone a `project_path` the sweep had already fixed on disk and spend that
+/// row's one boot-scoped attempt on it, which is what the gate exists to stop.
+#[test]
+#[serial]
+fn a_queued_repair_is_applied_before_the_gate_opens_at_the_deadline() {
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+    let mut seed = Instance::new("row", "/tmp/stale-path");
+    seed.source_profile = "test".to_string();
+    let id = seed.id.clone();
+    storage
+        .update(|instances, _groups| {
+            instances.push(seed);
+            Ok(())
+        })
+        .unwrap();
+
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    assert_eq!(
+        view.get_instance(&id).unwrap().project_path,
+        "/tmp/stale-path"
+    );
+
+    // The sweep repaired durable storage and reported the change.
+    storage
+        .update(|instances, _groups| {
+            instances[0].project_path = "/tmp/repaired-path".to_string();
+            Ok(())
+        })
+        .unwrap();
+    view.reconcile_poller =
+        crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(true);
+    view.startup_recovery_gate =
+        Some(std::time::Instant::now() - HomeView::STARTUP_RECOVERY_GATE_TIMEOUT);
+
+    assert!(
+        view.apply_reconcile_results(),
+        "the queued repair must reload"
+    );
+    assert_eq!(
+        view.get_instance(&id).unwrap().project_path,
+        "/tmp/repaired-path",
+        "recovery must not be released against the stale in-memory path"
+    );
+    assert!(view.startup_recovery_gate.is_none());
+}
+
+/// The live-send case of the same rule: the reload is postponed, so the result
+/// must be preserved and the gate must stay armed even past the deadline.
+#[test]
+#[serial]
+fn a_queued_repair_keeps_the_gate_armed_while_live_send_holds_the_reload() {
+    use super::live_send::{LiveSendState, LiveSendTarget};
+
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+    let mut seed = Instance::new("row", "/tmp/stale-path");
+    seed.source_profile = "test".to_string();
+    let id = seed.id.clone();
+    storage
+        .update(|instances, _groups| {
+            instances.push(seed);
+            Ok(())
+        })
+        .unwrap();
+
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    storage
+        .update(|instances, _groups| {
+            instances[0].project_path = "/tmp/repaired-path".to_string();
+            Ok(())
+        })
+        .unwrap();
+    view.reconcile_poller =
+        crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(true);
+    view.startup_recovery_gate =
+        Some(std::time::Instant::now() - HomeView::STARTUP_RECOVERY_GATE_TIMEOUT);
+    view.live_send = Some(LiveSendState {
+        session_id: "s".to_string(),
+        title: "s".to_string(),
+        tmux_name: "aoe_test_live".to_string(),
+        target: LiveSendTarget::Agent,
+        exit_chords: Vec::new(),
+        leader: None,
+    });
+
+    assert!(
+        !view.apply_reconcile_results(),
+        "the reload waits for live-send"
+    );
+    assert!(
+        view.startup_recovery_gate.is_some(),
+        "an unapplied repair must hold the gate shut past the deadline"
+    );
+
+    // The result is preserved, not dropped, and lands once the paste ends.
+    view.live_send = None;
+    assert!(view.apply_reconcile_results());
+    assert_eq!(
+        view.get_instance(&id).unwrap().project_path,
+        "/tmp/repaired-path"
+    );
+    assert!(view.startup_recovery_gate.is_none());
+}
