@@ -1724,6 +1724,36 @@ enter to select · esc to cancel";
     }
 
     #[test]
+    fn test_claude_background_work_outlives_the_turn() {
+        // A finished turn whose background work is still going: the REPL is
+        // parked and the box is free, but shells, MCP tasks or agents the
+        // agent started are still running. Captured from a live footer.
+        let parked = "✻ Cooked for 1m 58s\n❯ \n";
+        let footer =
+            |tail: &str| format!("{parked}  ⏵⏵ auto mode on (shift+tab to cycle) · PR #3600{tail}");
+
+        // The footer's shells segment is live: present while they run, gone
+        // when the last one exits, so its absence is the parked case.
+        let with_shells = footer(" · 5 shells · ← for agents");
+        assert!(claude_rule_matches("background_shell", &with_shells));
+        assert_eq!(detect_claude(&with_shells, "", None), Status::Running);
+
+        let without = footer(" · ← for agents");
+        assert!(!claude_rule_matches("background_shell", &without));
+        assert_eq!(detect_claude(&without, "", None), Status::Idle);
+
+        // MCP tasks outliving the turn that started them.
+        let mcp = format!("{parked}✻ Ran 3 tools · 2 MCP tasks still running\n");
+        assert!(claude_rule_matches("background_mcp_task", &mcp));
+        assert_eq!(detect_claude(&mcp, "", None), Status::Running);
+
+        // The same sentence quoted inside a permission prompt is not evidence
+        // that anything is running.
+        let quoted = format!("{mcp}Do you want to proceed?\n❯ 1. Yes\n  2. No\n");
+        assert!(!claude_rule_matches("background_mcp_task", &quoted));
+    }
+
+    #[test]
     fn test_claude_stuck_running_pane_recovers() {
         // Captured from a session that had reported Running for two hours: a
         // finished turn, Claude's own update banner between the completion
