@@ -67,9 +67,9 @@ duplicating cases across test functions.
 
 ### E2E tests
 
-Run `cargo test --features e2e-tests --test e2e`; add `serve` for dashboard or
-structured-view coverage. New e2e tests use `#[parallel]`. Reserve `#[serial]`
-for tests that mutate process-global state. The harness already isolates HOME,
+Run `cargo test --features e2e-tests --test e2e`; add `web` for dashboard
+coverage. New e2e tests use `#[parallel]`. Reserve `#[serial]` for tests
+that mutate process-global state. The harness already isolates HOME,
 tmux sockets, and session names. Tests auto-skip unavailable external tools.
 
 Use `RECORD_E2E=1` to record local review artifacts. See `tests/e2e/harness.rs`

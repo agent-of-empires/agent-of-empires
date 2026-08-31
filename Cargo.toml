@@ -219,6 +219,11 @@ e2e-tests = []
 # Without it the daemon still runs and answers `/api/*`; only the dashboard
 # routes are absent.
 web = ["rust-embed", "qrcode"]
+# Deprecated alias for `web`, kept for one release so existing
+# `--features serve` invocations keep building. build.rs warns when it is
+# set, and a CI guard rejects any `cfg(feature = "serve")` so the alias
+# cannot diverge from `web`.
+serve = ["web"]
 
 [dev-dependencies]
 serial_test = "4.0"

@@ -79,6 +79,15 @@ jobs:
       - name: Cargo test (web, e2e only)
         if: matrix.leg == 'web-e2e'
         run: cargo test --features web,e2e-tests --test e2e -- --test-threads=3
+      # `cargo test --features web` is otherwise never run: core-rest builds at
+      # default features and this leg names only the e2e target, so the two
+      # `cfg(feature = "web")` test blocks (the dashboard-route half of
+      # daemon_core_web_optional and the aoe.web builtin assertion in
+      # plugin_install) would compile nowhere in CI. This leg already has the
+      # lib built with `web`, so naming those two binaries is nearly free.
+      - name: Cargo test (web-gated test blocks)
+        if: matrix.leg == 'web-e2e'
+        run: cargo test --features web --test daemon_core_web_optional --test plugin_install
       # core-rest: the full default-feature suite minus e2e (lib + bins +
       # integration + the standalone test bins). The daemon is core, so this
       # leg covers it end to end with no dashboard bundle and no npm in the

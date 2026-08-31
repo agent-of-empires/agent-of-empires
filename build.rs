@@ -6,9 +6,22 @@ include!("build_git_watch.rs");
 fn main() {
     check_stale_build_cache();
     emit_build_version();
+    warn_on_deprecated_serve_feature();
 
     #[cfg(feature = "web")]
     build_frontend();
+}
+
+/// `serve` is an alias for `web` and is removed after one release. Cargo sets
+/// `CARGO_FEATURE_SERVE` only when the alias itself was selected, so this
+/// stays quiet for a plain `--features web` build.
+fn warn_on_deprecated_serve_feature() {
+    if std::env::var_os("CARGO_FEATURE_SERVE").is_some() {
+        println!(
+            "cargo:warning=the `serve` feature is deprecated and will be removed after the next \
+             release; use `--features web` instead"
+        );
+    }
 }
 
 /// Emit `AOE_BUILD_VERSION`, the build identity stamped on each structured view
