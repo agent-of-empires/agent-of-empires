@@ -761,17 +761,16 @@ const AUTHORITATIVE_CAPTURE_INTERVAL: std::time::Duration = std::time::Duration:
 const AUTHORITATIVE_REFRESH_QUIESCENCE_MS: u64 = LIVE_CAPTURE_INTERVAL_FAST_MS * 2;
 
 fn authoritative_capture_due(
-    last_attempt: Option<std::time::Instant>,
+    next_attempt: Option<std::time::Instant>,
     now: std::time::Instant,
 ) -> bool {
-    last_attempt
-        .is_none_or(|at| now.saturating_duration_since(at) >= AUTHORITATIVE_CAPTURE_INTERVAL)
+    next_attempt.is_none_or(|at| now >= at)
 }
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuthoritativeRefreshAction {
     None,
-    Stamp,
-    DropToCapture,
+    Schedule(std::time::Duration),
 }
 
 fn authoritative_refresh_action(
@@ -788,9 +787,11 @@ fn authoritative_refresh_action(
                 crate::tmux::vt::VtRefreshResult::Busy
                 | crate::tmux::vt::VtRefreshResult::Refreshed,
             ),
-        ) => AuthoritativeRefreshAction::Stamp,
+        ) => AuthoritativeRefreshAction::Schedule(AUTHORITATIVE_CAPTURE_INTERVAL),
+        // A failed snapshot does not prove the pipe channel died. Keep sampling
+        // its live grid and retry self-heal at the shorter re-arm cadence.
         (true, Some(crate::tmux::vt::VtRefreshResult::Failed) | None) => {
-            AuthoritativeRefreshAction::DropToCapture
+            AuthoritativeRefreshAction::Schedule(VT_REARM_INTERVAL)
         }
     }
 }
@@ -1238,7 +1239,7 @@ impl LiveCaptureWorker {
             let mut observed_wake = 0;
 
             #[cfg(unix)]
-            let mut last_authoritative_capture: Option<std::time::Instant> = None;
+            let mut next_authoritative_capture: Option<std::time::Instant> = None;
             let mut last_captured: Option<String> = None;
             // Budget the currently-held capture was published at. A budget
             // change alone (scroll depth, viewport resize over a quiet pane)
@@ -1343,7 +1344,7 @@ impl LiveCaptureWorker {
                     {
                         shutdown_vt_source(&mut vt_source, &command_deadline);
                         last_vt_arm = None;
-                        last_authoritative_capture = None;
+                        next_authoritative_capture = None;
                         shutdown_osc52_source(&mut osc52_source, &command_deadline);
                         osc52_seen = 0;
                         last_osc52_arm = None;
@@ -1367,7 +1368,7 @@ impl LiveCaptureWorker {
                 if !vt_enabled {
                     shutdown_vt_source(&mut vt_source, &command_deadline);
                     last_vt_arm = None;
-                    last_authoritative_capture = None;
+                    next_authoritative_capture = None;
                 }
                 #[cfg(unix)]
                 if !clipboard_capture_enabled {
@@ -1466,7 +1467,9 @@ impl LiveCaptureWorker {
                             // the remainder of a poll interval.
                             if let Some(v) = vt_source.as_ref() {
                                 v.set_change_wakeup(nudge_thread.clone());
-                                last_authoritative_capture = Some(std::time::Instant::now());
+                                next_authoritative_capture = Some(
+                                    std::time::Instant::now() + AUTHORITATIVE_CAPTURE_INTERVAL,
+                                );
                             }
                         }
                         // A channel whose forwarder has disconnected stops
@@ -1477,11 +1480,11 @@ impl LiveCaptureWorker {
                         // without thrashing on a permanently broken pane.
                         if vt_source.as_ref().is_some_and(|v| !v.is_alive()) {
                             shutdown_vt_source(&mut vt_source, &command_deadline);
-                            last_authoritative_capture = None;
+                            next_authoritative_capture = None;
                         }
                         let authoritative_due = vt_source.is_some()
                             && authoritative_capture_due(
-                                last_authoritative_capture,
+                                next_authoritative_capture,
                                 std::time::Instant::now(),
                             );
                         let refresh_result = authoritative_due.then(|| match vt_source.as_ref() {
@@ -1495,14 +1498,9 @@ impl LiveCaptureWorker {
                         });
                         match authoritative_refresh_action(authoritative_due, refresh_result) {
                             AuthoritativeRefreshAction::None => {}
-                            AuthoritativeRefreshAction::Stamp => {
-                                last_authoritative_capture = Some(std::time::Instant::now());
-                            }
-                            AuthoritativeRefreshAction::DropToCapture => {
-                                let failed_at = std::time::Instant::now();
-                                shutdown_vt_source(&mut vt_source, &command_deadline);
-                                last_authoritative_capture = None;
-                                last_vt_arm = Some(failed_at);
+                            AuthoritativeRefreshAction::Schedule(after) => {
+                                next_authoritative_capture =
+                                    Some(std::time::Instant::now() + after);
                             }
                         }
                         match vt_source.as_ref() {
@@ -3524,15 +3522,13 @@ mod tests {
     #[test]
     fn authoritative_capture_reopens_at_trust_ceiling() {
         let t0 = std::time::Instant::now();
+        let regular_due = t0 + AUTHORITATIVE_CAPTURE_INTERVAL;
         assert!(authoritative_capture_due(None, t0));
         assert!(!authoritative_capture_due(
-            Some(t0),
-            t0 + AUTHORITATIVE_CAPTURE_INTERVAL - std::time::Duration::from_millis(1)
+            Some(regular_due),
+            regular_due - std::time::Duration::from_millis(1)
         ));
-        assert!(authoritative_capture_due(
-            Some(t0),
-            t0 + AUTHORITATIVE_CAPTURE_INTERVAL
-        ));
+        assert!(authoritative_capture_due(Some(regular_due), regular_due));
         assert!(authoritative_refresh_is_quiet(None));
         assert!(!authoritative_refresh_is_quiet(Some((
             AUTHORITATIVE_REFRESH_QUIESCENCE_MS - 1,
@@ -3548,19 +3544,23 @@ mod tests {
             (
                 true,
                 Some(VtRefreshResult::Busy),
-                AuthoritativeRefreshAction::Stamp,
+                AuthoritativeRefreshAction::Schedule(AUTHORITATIVE_CAPTURE_INTERVAL),
             ),
             (
                 true,
                 Some(VtRefreshResult::Refreshed),
-                AuthoritativeRefreshAction::Stamp,
+                AuthoritativeRefreshAction::Schedule(AUTHORITATIVE_CAPTURE_INTERVAL),
             ),
             (
                 true,
                 Some(VtRefreshResult::Failed),
-                AuthoritativeRefreshAction::DropToCapture,
+                AuthoritativeRefreshAction::Schedule(VT_REARM_INTERVAL),
             ),
-            (true, None, AuthoritativeRefreshAction::DropToCapture),
+            (
+                true,
+                None,
+                AuthoritativeRefreshAction::Schedule(VT_REARM_INTERVAL),
+            ),
         ];
         for (due, result, expected) in cases {
             assert_eq!(authoritative_refresh_action(due, result), expected);

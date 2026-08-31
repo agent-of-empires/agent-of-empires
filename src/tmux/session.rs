@@ -2028,10 +2028,6 @@ impl Session {
         command.args(["if-shell", "-t", &self.name, "-F", &condition, &release]);
         let _ = deadline.run(&mut command);
     }
-    pub(crate) fn release_vt_pipe_owner(&self, owner_id: &str) {
-        let deadline = crate::tmux::TmuxCommandDeadline::new();
-        self.release_vt_pipe_owner_with_deadline(owner_id, &deadline);
-    }
 
     /// Force ownership to owner_id, even over a live holder. Used by the
     /// explicit "take over" action: a user tap is an intentional steal, not
@@ -3363,6 +3359,14 @@ mod tests {
         assert!(session.refresh_vt_owner("pid-4"));
         assert!(pane_is_piped());
 
+        // A replacement that owns only the lease must release that lease
+        // without tearing down the older generation's still-live pane pipe.
+        session.set_user_option(VT_OWNER_OPT, "pid-5");
+        session.set_user_option(VT_OWNER_HB_OPT, &now_ms().to_string());
+        session.release_vt_owner_with_deadline("pid-5", &deadline);
+        assert!(!session.refresh_vt_owner("pid-5"));
+        assert!(pane_is_piped());
+
         session.release_vt_pipe_owner_with_deadline("pid-4", &deadline);
         assert!(!session.refresh_vt_owner("pid-4"));
         assert!(!pane_is_piped());
@@ -3697,17 +3701,14 @@ mod tests {
         );
     }
     #[test]
-    fn expired_deadline_stops_vt_owner_claim_immediately() {
+    fn expired_deadline_stops_vt_owner_commands_immediately() {
         let deadline = crate::tmux::TmuxCommandDeadline::with_timeout(Duration::from_millis(1));
         std::thread::sleep(Duration::from_millis(5));
         let started = Instant::now();
-        assert!(
-            !Session::from_name("aoe_test_expired_owner").claim_vt_owner_with_deadline(
-                "owner",
-                Duration::from_secs(10),
-                &deadline,
-            )
-        );
+        let session = Session::from_name("aoe_test_expired_owner");
+        assert!(!session.claim_vt_owner_with_deadline("owner", Duration::from_secs(10), &deadline,));
+        session.release_vt_owner_with_deadline("owner", &deadline);
+        session.release_vt_pipe_owner_with_deadline("owner", &deadline);
         assert!(started.elapsed() < Duration::from_millis(50));
     }
 

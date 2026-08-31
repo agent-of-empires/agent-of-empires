@@ -1229,7 +1229,6 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
                 }
                 if let Ok(mut p) = ctx.parser.lock() {
                     p.process(&buf[..n]);
-                    ctx.settled_chunk_seq.store(seq + 1, Ordering::Release);
                     ctx.app_cursor
                         .store(p.screen().application_cursor(), Ordering::Relaxed);
                     // Invalidate cached sample assemblies BEFORE the wakeup, so a
@@ -1250,6 +1249,10 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
                         },
                         Ordering::Relaxed,
                     );
+                    // Publish settlement after every parser, cursor, generation,
+                    // and timing update. Acquire readers can then treat this as
+                    // the completion fence for the whole chunk.
+                    ctx.settled_chunk_seq.store(seq + 1, Ordering::Release);
                     // Wake the in-process poller (the TUI capture worker) so the
                     // just-landed output samples now, not after the remainder of
                     // its poll interval. This is the echo-latency path.
@@ -1483,14 +1486,12 @@ impl VtChannel {
         };
         let Some((sock_path, listener)) = setup() else {
             let _ = std::fs::remove_dir_all(&sock_dir);
-            let cleanup_deadline = crate::tmux::TmuxCommandDeadline::new();
-            session.release_vt_pipe_owner_with_deadline(&owner, &cleanup_deadline);
+            session.release_vt_owner_with_deadline(&owner, deadline);
             return None;
         };
         let Some(exe) = std::env::current_exe().ok() else {
             let _ = std::fs::remove_dir_all(&sock_dir);
-            let cleanup_deadline = crate::tmux::TmuxCommandDeadline::new();
-            session.release_vt_pipe_owner_with_deadline(&owner, &cleanup_deadline);
+            session.release_vt_owner_with_deadline(&owner, deadline);
             return None;
         };
         let wakeup: Arc<Mutex<Option<ChangeWakeup>>> = Arc::new(Mutex::new(None));
@@ -1529,7 +1530,7 @@ impl VtChannel {
             stop_and_wake_reader(&stop, &sock_path);
             // Free the owner lock we claimed above so another process can arm
             // right away instead of waiting out the TTL on our failed attempt.
-            session.release_vt_pipe_owner(&owner);
+            session.release_vt_pipe_owner_with_deadline(&owner, deadline);
             let _ = reader.join();
             let _ = std::fs::remove_dir_all(&sock_dir);
             return None;
@@ -1546,7 +1547,7 @@ impl VtChannel {
             if Instant::now() >= connect_deadline {
                 tracing::warn!(%target, "vt: forwarder did not connect; falling back to capture");
                 stop_and_wake_reader(&stop, &sock_path);
-                session.release_vt_pipe_owner(&owner);
+                session.release_vt_pipe_owner_with_deadline(&owner, deadline);
                 let _ = reader.join();
                 let _ = std::fs::remove_dir_all(&sock_dir);
                 return None;
@@ -1573,7 +1574,7 @@ impl VtChannel {
         {
             tracing::warn!(%target, "vt: initial seed failed; falling back to capture");
             stop_and_wake_reader(&stop, &sock_path);
-            session.release_vt_pipe_owner(&owner);
+            session.release_vt_pipe_owner_with_deadline(&owner, deadline);
             let _ = reader.join();
             let _ = std::fs::remove_dir_all(&sock_dir);
             return None;
@@ -2037,12 +2038,12 @@ impl Osc52Channel {
         };
         let Some((sock_path, listener)) = setup() else {
             let _ = std::fs::remove_dir_all(&sock_dir);
-            session.release_vt_pipe_owner(&owner);
+            session.release_vt_owner_with_deadline(&owner, deadline);
             return None;
         };
         let Some(exe) = std::env::current_exe().ok() else {
             let _ = std::fs::remove_dir_all(&sock_dir);
-            session.release_vt_pipe_owner(&owner);
+            session.release_vt_owner_with_deadline(&owner, deadline);
             return None;
         };
 
@@ -2067,7 +2068,7 @@ impl Osc52Channel {
         let armed = session.arm_vt_pipe_if_owner_with_deadline(&owner, "-O", &pipe_cmd, deadline);
         if !armed {
             stop.store(true, Ordering::Relaxed);
-            session.release_vt_pipe_owner(&owner);
+            session.release_vt_pipe_owner_with_deadline(&owner, deadline);
             let _ = UnixStream::connect(&sock_path);
             let _ = reader.join();
             let _ = std::fs::remove_dir_all(&sock_dir);
@@ -2077,7 +2078,7 @@ impl Osc52Channel {
         while !alive.load(Ordering::Relaxed) {
             if Instant::now() >= connect_deadline {
                 stop.store(true, Ordering::Relaxed);
-                session.release_vt_pipe_owner(&owner);
+                session.release_vt_pipe_owner_with_deadline(&owner, deadline);
                 let _ = UnixStream::connect(&sock_path);
                 let _ = reader.join();
                 let _ = std::fs::remove_dir_all(&sock_dir);
@@ -3295,6 +3296,7 @@ mod tests {
         let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
         let stop = Arc::new(AtomicBool::new(false));
         let chunk_seq = Arc::new(AtomicU64::new(0));
+        let settled_chunk_seq = Arc::new(AtomicU64::new(0));
         let last_chunk_ms = Arc::new(AtomicU64::new(0));
         let prev_gap_ms = Arc::new(AtomicU64::new(u64::MAX));
         let ctx = ReaderCtx {
@@ -3307,8 +3309,8 @@ mod tests {
             alive: Arc::new(AtomicBool::new(false)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
-            chunk_seq: chunk_seq.clone(),
-            settled_chunk_seq: Arc::new(AtomicU64::new(0)),
+            chunk_seq,
+            settled_chunk_seq: settled_chunk_seq.clone(),
             last_chunk_ms: last_chunk_ms.clone(),
             prev_gap_ms: prev_gap_ms.clone(),
             grid_gen: Arc::new(AtomicU64::new(0)),
@@ -3316,16 +3318,16 @@ mod tests {
         let reader = std::thread::spawn(move || run_reader(listener, ctx));
         let mut conn = UnixStream::connect(&sock).expect("connect");
 
-        // Wait for the reader to finish processing the `n`th chunk. Writing the
-        // next chunk only after the previous is consumed keeps them separate
-        // reads (a unix stream is a byte stream, so two pending writes could
-        // otherwise coalesce into one chunk).
+        // Wait for the reader to publish the nth chunk's complete parser
+        // and timing state. Writing the next chunk only after the previous is
+        // settled also keeps them as separate reads (a unix stream is a byte
+        // stream, so two pending writes could otherwise coalesce).
         let wait_seq = |n: u64| {
             let deadline = Instant::now() + Duration::from_secs(5);
-            while chunk_seq.load(Ordering::Relaxed) < n {
+            while settled_chunk_seq.load(Ordering::Acquire) < n {
                 assert!(
                     Instant::now() < deadline,
-                    "reader did not process {n} chunks"
+                    "reader did not settle {n} chunks"
                 );
                 std::thread::sleep(Duration::from_millis(1));
             }

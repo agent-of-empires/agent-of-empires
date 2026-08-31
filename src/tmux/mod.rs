@@ -432,7 +432,13 @@ fn publish_session_cache(
     if refresh_id <= cache.refresh_id {
         return cache.outcome;
     }
-    cache.data = data;
+    // An unexpected refresh failure says nothing about the last successful
+    // session list. Keep that list for display-only lookups while exposing the
+    // failed outcome to authoritative lifecycle callers. A populated response
+    // replaces it, and a recognized no-server response clears it.
+    if outcome != SessionCacheRefresh::Unknown {
+        cache.data = data;
+    }
     cache.time = Some(Instant::now());
     cache.refresh_id = refresh_id;
     cache.outcome = outcome;
@@ -910,14 +916,16 @@ pub(crate) fn live_session_name(derived: &str, shape: &NameShape) -> String {
     session_name_from_cache(derived, shape).unwrap_or_else(|| derived.to_string())
 }
 
-/// [`live_session_name`] for **render paths**: answered from the current
-/// snapshot only, never refreshing. A stale or missing snapshot resolves to
-/// the derived name; the background [`spawn_snapshot_poller`] refreshes the
-/// snapshot and the next frame self-corrects onto a renamed session. Paint
-/// must never wait on tmux, so unlike [`live_session_name`] there is no
-/// synchronous fallback.
+/// Display variant of live_session_name, answered from the last successful
+/// snapshot only and never refreshing. Display keeps using that map while it
+/// is stale or an unexpected refresh fails; only a populated miss or recognized
+/// no-server response changes visible liveness. Paint must never wait on tmux,
+/// so this path has no synchronous fallback.
 pub(crate) fn session_name_for_display(derived: &str, shape: &NameShape) -> String {
-    session_name_from_cache(derived, shape).unwrap_or_else(|| derived.to_string())
+    let Ok(cache) = SESSION_CACHE.read() else {
+        return derived.to_string();
+    };
+    resolve_session_name_from_snapshot(cache.data.as_ref(), derived, shape)
 }
 
 /// `session_name_for_display` for the agent pane.
@@ -932,9 +940,22 @@ pub fn live_agent_session_name(session_id: &str, derived: &str) -> String {
     live_session_name(derived, &NameShape::agent(&suffix))
 }
 
-/// Resolve from the current cache snapshot without spawning. `None` only when
-/// the snapshot is stale or the lock is poisoned, so the caller knows a refresh
-/// could still change the answer.
+fn resolve_session_name_from_snapshot(
+    names: Option<&HashMap<String, i64>>,
+    derived: &str,
+    shape: &NameShape,
+) -> String {
+    let Some(names) = names else {
+        return derived.to_string();
+    };
+    if names.contains_key(derived) {
+        return derived.to_string();
+    }
+    resolve_session_name(names.keys().map(String::as_str), derived, shape)
+}
+
+/// Resolve from the current authoritative cache snapshot without spawning.
+/// Returns None only when the snapshot is stale or the lock is poisoned, so
 fn session_name_from_cache(derived: &str, shape: &NameShape) -> Option<String> {
     let cache = SESSION_CACHE.read().ok()?;
     let fresh = cache
@@ -944,21 +965,11 @@ fn session_name_from_cache(derived: &str, shape: &NameShape) -> Option<String> {
     if !fresh {
         return None;
     }
-    // A fresh snapshot with no data means the last `list-sessions` produced
-    // either no-server or an unexpected failure. Neither selects a live name,
-    // and this is an answer rather than a stale snapshot: returning `None`
-    // would make every caller re-refresh into the same result, one subprocess
-    // per call from render loops.
-    let Some(names) = cache.data.as_ref() else {
-        return Some(derived.to_string());
-    };
-    // Fast path: the derived name is live, which is the overwhelmingly common
-    // case, so skip the scan.
-    if names.contains_key(derived) {
+    if cache.outcome == SessionCacheRefresh::Unknown {
         return Some(derived.to_string());
     }
-    Some(resolve_session_name(
-        names.keys().map(String::as_str),
+    Some(resolve_session_name_from_snapshot(
+        cache.data.as_ref(),
         derived,
         shape,
     ))
@@ -1457,7 +1468,9 @@ const CACHE_TTL: Duration = Duration::from_secs(2);
 pub fn session_exists_from_cache(name: &str) -> Option<bool> {
     let cache = SESSION_CACHE.read().ok()?;
 
-    if cache.time.map(|t| t.elapsed() > CACHE_TTL).unwrap_or(true) {
+    if cache.time.map(|t| t.elapsed() > CACHE_TTL).unwrap_or(true)
+        || cache.outcome == SessionCacheRefresh::Unknown
+    {
         return None;
     }
 
@@ -1504,22 +1517,15 @@ fn session_existence_from_cache(name: &str) -> Option<SessionExistence> {
     if !fresh {
         return None;
     }
+    if cache.outcome == SessionCacheRefresh::Unknown {
+        return Some(SessionExistence::Unknown);
+    }
 
     Some(match &cache.data {
         Some(map) if map.contains_key(name) => SessionExistence::Present,
         Some(_) => SessionExistence::Absent,
-        // The last refresh could not produce a session list (recognized
-        // no-server response or unexpected query failure): a definitive
-        // "can't tell" for status polling, not "absent". Do not fall back to a
-        // fresh `has-session` probe here; during an outage that call fails the
-        // same way and just burns a subprocess per session per poll for no new
-        // information.
-        //
-        // Resolving this arm to `Unknown` freezes every polled instance at its
-        // prior status until the bounded-window escalation in
-        // `update_status_with_metadata_inner` kicks in; do not collapse it to
-        // `Absent`. Rekeying separately consumes `SessionCacheRefresh` so it
-        // can treat a recognized no-server result as an absent rename target.
+        // A recognized no-server response is conservative for lifecycle
+        // callers: it still means the session cannot be proven absent.
         None => SessionExistence::Unknown,
     })
 }
@@ -1577,8 +1583,14 @@ pub fn session_exists(name: &str) -> bool {
 /// kill a pane already force a [`refresh_session_cache`], so the glyph flips
 /// immediately there; the poller covers panes created behind this process's
 /// back. Paint must never wait on tmux, so there is no synchronous fallback.
+/// An expired or unexpectedly failed refresh retains the last successful map;
+/// a populated miss or recognized no-server response removes the session.
 pub fn session_exists_for_display(name: &str) -> bool {
-    session_existence_from_cache(name) == Some(SessionExistence::Present)
+    SESSION_CACHE
+        .read()
+        .ok()
+        .and_then(|cache| cache.data.as_ref().map(|map| map.contains_key(name)))
+        .unwrap_or(false)
 }
 
 /// Pane-dead state for a **render path**, from a shared `list-panes -a`
@@ -3144,6 +3156,57 @@ mod tests {
             !pane_dead_for_display("aoe_tool_absent_00000000"),
             "and the display helper must not claim a pane it cannot see is dead"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn display_lookups_keep_last_good_snapshot_until_authoritative_absence() {
+        let guard = SessionCacheGuard::capture();
+        let derived = format!("{P}Current_{ID8}");
+        let last_good = format!("{P}Previous_{ID8}");
+        let suffix = id_suffix(ID);
+        let shape = NameShape::agent(&suffix);
+
+        guard.force_present(&[last_good.as_str()]);
+        guard.force_stale();
+        assert!(session_exists_for_display(&last_good));
+        assert_eq!(session_name_for_display(&derived, &shape), last_good);
+        let unknown_refresh_id = SESSION_CACHE.read().expect("session cache").refresh_id + 1;
+        assert_eq!(
+            publish_session_cache(
+                unknown_refresh_id,
+                None,
+                SessionCacheRefresh::Unknown,
+                false,
+            ),
+            SessionCacheRefresh::Unknown,
+        );
+        assert_eq!(
+            session_existence_from_cache(&last_good),
+            Some(SessionExistence::Unknown),
+        );
+        assert_eq!(session_exists_from_cache(&last_good), None);
+        assert_eq!(
+            session_name_from_cache(&derived, &shape),
+            Some(derived.clone())
+        );
+        assert!(session_exists_for_display(&last_good));
+        assert_eq!(session_name_for_display(&derived, &shape), last_good);
+
+        guard.force_present(&[]);
+        assert!(!session_exists_for_display(&last_good));
+        assert_eq!(session_name_for_display(&derived, &shape), derived);
+
+        guard.force_present(&[last_good.as_str()]);
+        let no_server_refresh_id = SESSION_CACHE.read().expect("session cache").refresh_id + 1;
+        publish_session_cache(
+            no_server_refresh_id,
+            None,
+            SessionCacheRefresh::NoServer,
+            false,
+        );
+        assert!(!session_exists_for_display(&last_good));
+        assert_eq!(session_name_for_display(&derived, &shape), derived);
     }
 
     #[test]
