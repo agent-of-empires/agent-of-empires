@@ -330,7 +330,7 @@ impl HomeView {
             stop_poller: StopPoller::new(),
             trash_poller: crate::tui::trash_poller::TrashPoller::new(),
             reconcile_poller: crate::tui::reconcile_poller::ReconcilePoller::new(),
-            startup_recovery_pending: false,
+            startup_recovery_gate: None,
             restart_poller: RestartPoller::new(),
             restart_in_flight: std::collections::HashSet::new(),
             attach_project_poller: crate::tui::attach_project_poller::AttachProjectPoller::new(),
@@ -534,8 +534,9 @@ impl HomeView {
         // moved outside aoe (#2002) still carries the stale path until the
         // sweep repoints it, and recovering from the stale path would burn
         // that row's only attempt for the whole boot.
-        // `apply_reconcile_results` starts it once the sweep lands.
-        view.startup_recovery_pending = true;
+        // `release_startup_recovery_gate` starts it once the sweep lands, or on
+        // a deadline if it never does.
+        view.startup_recovery_gate = Some(std::time::Instant::now());
         // Config subscriptions are intentionally asymmetric: even in
         // single-profile mode, peer edits to ANY profile's config.toml
         // (or the global config) must be observable so the picker UI

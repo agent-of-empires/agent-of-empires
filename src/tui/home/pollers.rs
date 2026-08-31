@@ -226,9 +226,45 @@ impl HomeView {
     /// worker repointed is shown at its real path. Nothing to merge field by
     /// field: the sweeps only rewrite durable state, so a storage reload is
     /// both sufficient and cheaper than mirroring each repair. See #3611.
+    /// How long startup recovery waits for the first reconcile sweep before
+    /// starting without it.
+    ///
+    /// The sweep takes milliseconds on a healthy store, but it writes through
+    /// `Storage::update`, and `acquire_open_storage_flock` retries a contended
+    /// profile lock forever with no timeout. A peer holding that lock would
+    /// otherwise leave the worker neither delivering nor disconnecting, and
+    /// recovery gated behind it for the whole boot. Recovering from a stale
+    /// path is a wasted attempt; not recovering at all is a dead session.
+    pub(super) const STARTUP_RECOVERY_GATE_TIMEOUT: std::time::Duration =
+        std::time::Duration::from_secs(30);
+
+    /// Start startup auto-recovery once the first sweep has landed, or once
+    /// [`Self::STARTUP_RECOVERY_GATE_TIMEOUT`] has elapsed if it never does.
+    /// Idempotent: the gate is cleared as it fires.
+    pub(super) fn release_startup_recovery_gate(&mut self, sweep_landed: bool) {
+        let Some(armed_at) = self.startup_recovery_gate else {
+            return;
+        };
+        if !sweep_landed {
+            if armed_at.elapsed() < Self::STARTUP_RECOVERY_GATE_TIMEOUT {
+                return;
+            }
+            tracing::warn!(
+                target: "tui.home",
+                "load-time reconciliation has not landed; starting startup recovery without it",
+            );
+        }
+        self.startup_recovery_gate = None;
+        self.maybe_start_startup_recovery();
+    }
+
     pub fn apply_reconcile_results(&mut self) -> bool {
         use std::sync::mpsc::TryRecvError;
 
+        // Deadline release runs before the live-send guard below. Starting
+        // recovery spawns workers and never touches the terminal, so a long
+        // paste must not strand it any more than a blocked sweep can.
+        self.release_startup_recovery_gate(false);
         // Every storage reload gates on live-send being idle so none of them
         // interrupts a paste in progress. Checked before the drain, so the
         // worker's result stays queued for the next eligible tick rather than
@@ -240,15 +276,12 @@ impl HomeView {
             Ok(result) => result.changed,
             Err(TryRecvError::Empty) => return false,
             // The worker is gone, so no sweep is coming. Release the recovery
-            // gate below rather than stranding it for the whole boot.
+            // gate below rather than waiting out its deadline.
             Err(TryRecvError::Disconnected) => false,
         };
         // Startup recovery waits for the sweep either way: an unchanged sweep
         // still means the paths it would launch from are now known good.
-        if self.startup_recovery_pending {
-            self.startup_recovery_pending = false;
-            self.maybe_start_startup_recovery();
-        }
+        self.release_startup_recovery_gate(true);
         if !changed {
             return false;
         }

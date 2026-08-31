@@ -21394,7 +21394,7 @@ fn startup_recovery_waits_for_the_first_reconcile_sweep() {
     .unwrap();
 
     assert!(
-        view.startup_recovery_pending,
+        view.startup_recovery_gate.is_some(),
         "construction must arm the gate rather than recover from unrepaired paths"
     );
 
@@ -21406,7 +21406,7 @@ fn startup_recovery_waits_for_the_first_reconcile_sweep() {
         "nothing changed, so no reload"
     );
     assert!(
-        !view.startup_recovery_pending,
+        view.startup_recovery_gate.is_none(),
         "the sweep landing must release the recovery gate"
     );
 
@@ -21414,5 +21414,74 @@ fn startup_recovery_waits_for_the_first_reconcile_sweep() {
     view.reconcile_poller =
         crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(false);
     assert!(!view.apply_reconcile_results());
-    assert!(!view.startup_recovery_pending);
+    assert!(view.startup_recovery_gate.is_none());
+}
+
+/// #3615 review follow-up: the gate cannot outlive its deadline.
+/// `Storage::update` blocks on a contended profile flock with no timeout, so a
+/// peer holding that lock leaves the sweep worker neither delivering a result
+/// nor disconnecting. Gating recovery on that forever would trade "recovery
+/// used a stale path" for "recovery never ran", which is the worse failure.
+#[test]
+#[serial]
+fn startup_recovery_gate_expires_when_the_sweep_never_lands() {
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let _storage = Storage::new_unwatched("test").unwrap();
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    // A poller that never reports, standing in for a sweep blocked on a flock.
+    view.reconcile_poller = crate::tui::reconcile_poller::ReconcilePoller::new();
+
+    assert!(!view.apply_reconcile_results());
+    assert!(
+        view.startup_recovery_gate.is_some(),
+        "an un-landed sweep inside the deadline must still hold the gate"
+    );
+
+    view.startup_recovery_gate =
+        Some(std::time::Instant::now() - HomeView::STARTUP_RECOVERY_GATE_TIMEOUT);
+    assert!(!view.apply_reconcile_results());
+    assert!(
+        view.startup_recovery_gate.is_none(),
+        "past the deadline recovery must start without the sweep"
+    );
+}
+
+/// The deadline is also checked while live-send holds the reload, since starting
+/// recovery spawns workers rather than touching the terminal.
+#[test]
+#[serial]
+fn startup_recovery_gate_expires_during_live_send() {
+    use super::live_send::{LiveSendState, LiveSendTarget};
+
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let _storage = Storage::new_unwatched("test").unwrap();
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.live_send = Some(LiveSendState {
+        session_id: "s".to_string(),
+        title: "s".to_string(),
+        tmux_name: "aoe_test_live".to_string(),
+        target: LiveSendTarget::Agent,
+        exit_chords: Vec::new(),
+        leader: None,
+    });
+    view.startup_recovery_gate =
+        Some(std::time::Instant::now() - HomeView::STARTUP_RECOVERY_GATE_TIMEOUT);
+
+    assert!(!view.apply_reconcile_results());
+    assert!(
+        view.startup_recovery_gate.is_none(),
+        "a long paste must not strand recovery either"
+    );
 }
