@@ -740,18 +740,7 @@ fn sandbox_dir_for(
     home: &Path,
     instance_id: Option<&str>,
 ) -> Result<PathBuf> {
-    sandbox_dir_in(&home.join(mount.host_rel), mount, instance_id)
-}
-
-/// [`sandbox_dir_for`] against an explicit agent config directory, for a
-/// session whose agent reads somewhere other than the built-in `~/.claude`-style
-/// default (`session.agent_config_dir`).
-fn sandbox_dir_in(
-    config_dir: &Path,
-    mount: &AgentConfigMount,
-    instance_id: Option<&str>,
-) -> Result<PathBuf> {
-    let sandbox_dir = config_dir.join(SANDBOX_SUBDIR);
+    let sandbox_dir = home.join(mount.host_rel).join(SANDBOX_SUBDIR);
     if mount.tool_name != "codex" {
         return Ok(sandbox_dir);
     }
@@ -1375,6 +1364,8 @@ fn apply_folder_trust_config(
         ("codex", ".codex") if is_yolo_mode => crate::hooks::trust_codex_project(
             &sandbox_dir.join("config.toml"),
             container_workspace_path,
+            // Bind-mounted into the container, which can plant a link here.
+            crate::hooks::SymlinkPolicy::Never,
         ),
         ("gemini", ".gemini") if is_yolo_mode && staged => {
             crate::hooks::disable_gemini_folder_trust(&sandbox_dir.join("settings.json"))
@@ -1382,6 +1373,8 @@ fn apply_folder_trust_config(
         ("gemini", ".gemini") if is_yolo_mode => crate::hooks::trust_gemini_project(
             &sandbox_dir.join("trustedFolders.json"),
             container_workspace_path,
+            // Bind-mounted into the container, which can plant a link here.
+            crate::hooks::SymlinkPolicy::Never,
         ),
         // The same host file is bind-mounted at both `$CLAUDE_CONFIG_DIR/.claude.json`
         // (via the config dir) and `~/.claude.json` (via `home_seed_files`), so one
@@ -1389,6 +1382,8 @@ fn apply_folder_trust_config(
         ("claude", ".claude") => crate::hooks::trust_claude_project(
             &sandbox_dir.join(".claude.json"),
             container_workspace_path,
+            // Bind-mounted into the container, which can plant a link here.
+            crate::hooks::SymlinkPolicy::Never,
         ),
         _ => Ok(()),
     }
@@ -1420,8 +1415,15 @@ pub(crate) fn ensure_folder_trust_config_for_active_agent(
         .iter()
         .filter(|m| m.tool_name == config_tool)
     {
+        // A declared directory stops at `sandbox`, with no per-instance segment
+        // even for Codex. That segment gives each session its own staged Codex
+        // home (its SQLite state is the single-instance lock), and AoE mounts
+        // the instance directory itself at the container's config path. Here
+        // the user writes the mount, and it can only name a fixed path, so a
+        // per-instance segment would put the record one level below whatever
+        // `CODEX_HOME` exposes, where Codex never looks.
         let sandbox_dir = match agent_config_dir.as_ref() {
-            Some(dir) => sandbox_dir_in(dir, mount, Some(instance_id)),
+            Some(dir) => Ok(dir.join(SANDBOX_SUBDIR)),
             None => sandbox_dir_for(mount, &home, Some(instance_id)),
         };
         let sandbox_dir = match sandbox_dir {
@@ -4473,6 +4475,84 @@ extra_volumes = ["{}/sandbox:/root/.claude-personal:rw"]
         assert!(
             default_trust.is_null(),
             "the built-in config dir must be left alone, got {default_trust}"
+        );
+
+        crate::hooks::cleanup_hook_status_dir(instance_id);
+    }
+
+    // Codex stages one config dir per instance because its SQLite state is the
+    // single-instance lock, and AoE mounts that instance dir at the container's
+    // config path. A dir the user declares is mounted by their own
+    // `extra_volumes` entry, which can only name a fixed path, so the record
+    // has to sit directly in `sandbox` or it lands a level below whatever
+    // CODEX_HOME exposes and Codex reads an untrusted config.
+    #[test]
+    #[serial_test::serial]
+    fn test_declared_codex_config_dir_trusts_at_the_mounted_level() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let declared = temp_home.path().join(".codex-work");
+        let app_dir = crate::session::get_app_dir().unwrap();
+        fs::write(
+            app_dir.join("config.toml"),
+            format!(
+                r#"
+[session.custom_agents]
+codex-work = "codex-work"
+
+[session.agent_detect_as]
+codex-work = "codex"
+
+[session.agent_config_dir]
+codex-work = "{}"
+
+[sandbox]
+extra_volumes = ["{}/sandbox:/root/.codex-work:rw"]
+"#,
+                declared.display(),
+                declared.display()
+            ),
+        )
+        .unwrap();
+
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+
+        let sandbox_info = super::super::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
+        let instance_id = "declared-codex-dir-test";
+        let config = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("codex-work", Some("codex")),
+            true,
+            instance_id,
+            None,
+            "",
+        )
+        .unwrap();
+
+        let staged = declared.join(SANDBOX_SUBDIR);
+        let trusted = fs::read_to_string(staged.join("config.toml")).unwrap();
+        assert!(
+            trusted.contains(&config.working_dir) && trusted.contains("trusted"),
+            "the mounted directory itself must carry the trust record, got {trusted}"
+        );
+        assert!(
+            !staged.join(instance_id).exists(),
+            "no per-instance level: the user's mount cannot name one"
         );
 
         crate::hooks::cleanup_hook_status_dir(instance_id);
