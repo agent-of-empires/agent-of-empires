@@ -3383,12 +3383,12 @@ mod tests {
         });
 
         // Let the handler reach its parked wait. It cannot return until the
-        // reservation drops, so anything past the lock scope is enough.
+        // reservation drops, so anything past the wake is enough.
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // The 2s budget is far under the 10s `WORKER_READY_TIMEOUT` the
         // pre-fix handler holds the lock for, and far over the microseconds
-        // the fixed one needs to clear and release.
+        // `touch_on_prompt_and_wake_if_sunk` holds it now.
         let inst_lock = state.instance_lock(&id).await;
         let acquired = tokio::time::timeout(Duration::from_secs(2), inst_lock.lock()).await;
         assert!(

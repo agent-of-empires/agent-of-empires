@@ -640,7 +640,7 @@ impl SessionService {
             service: Arc::clone(self),
             id: id.to_string(),
         };
-        let _serialized = self.prompt_submission(id).await;
+        let _submission = self.prompt_submission(id).await;
         let Some((text, attachment_refs, profile, caller)) = ({
             let instances = self.instances.read().await;
             instances.iter().find(|i| i.id == id).and_then(|i| {
@@ -1009,7 +1009,7 @@ impl SessionService {
         prompt_id: String,
         text: String,
     ) -> EditQueuedOutcome {
-        let _serialized = self.prompt_submission(id).await;
+        let _submission = self.prompt_submission(id).await;
         self.mutate_instance_persisted(id, move |inst| {
             match inst.queued_prompts.iter_mut().find(|q| q.id == prompt_id) {
                 Some(q) if text.trim().is_empty() && q.attachments.is_empty() => {
@@ -1043,7 +1043,7 @@ impl SessionService {
         id: &str,
         prompt_id: String,
     ) -> bool {
-        let _serialized = self.prompt_submission(id).await;
+        let _submission = self.prompt_submission(id).await;
         let prompt_id_cleanup = prompt_id.clone();
         let removed = self
             .mutate_instance_persisted(id, move |inst| {
@@ -1069,7 +1069,7 @@ impl SessionService {
     /// the user watches the queue empty and then sees it sent anyway.
     #[cfg(feature = "serve")]
     pub(crate) async fn clear_queued_prompts(self: &Arc<Self>, id: &str) {
-        let _serialized = self.prompt_submission(id).await;
+        let _submission = self.prompt_submission(id).await;
         let cleared_ids = self
             .mutate_instance_persisted(id, move |inst| {
                 let ids: Vec<String> = inst.queued_prompts.iter().map(|q| q.id.clone()).collect();
@@ -1196,7 +1196,7 @@ impl SessionService {
             service: Arc::clone(self),
             id: id.to_string(),
         };
-        let _serialized = self.prompt_submission(id).await;
+        let _submission = self.prompt_submission(id).await;
 
         let (caller, agent_key, queue) = {
             let instances = self.instances.read().await;
@@ -1374,10 +1374,13 @@ impl SessionService {
     }
 
     /// The session's single prompt-submission authority: hold this guard
-    /// across the whole decide-then-dispatch step, so queue/steer/fresh-turn
-    /// ownership is settled atomically for every surface that can start a turn
-    /// (the `/acp/prompt` handler, the plugin host's `sessions.turn.send`, the
-    /// queue drain, and the pending-initial-turn drain). See #3621.
+    /// across the whole decide-then-dispatch step, so the `Sent` / `Steered` /
+    /// `Queued` disposition ([`crate::acp::dispatch::PromptDispatch`]) is
+    /// settled atomically for every surface that can start a turn (both prompt
+    /// endpoints, the plugin host's `sessions.turn.send`, the queue drain, and
+    /// the pending-initial-turn drain). The quiesce barriers that stop a worker
+    /// under it (`attach_project`, the tied-worktree renames) hold it too, so a
+    /// drain cannot deliver into a worker they are about to stop. See #3621.
     ///
     /// Two rules make this work, and neither is optional:
     ///
@@ -1417,6 +1420,23 @@ impl SessionService {
                 .clone(),
         };
         lock.lock_owned().await
+    }
+
+    /// Drop a deleted session's submission lock, mirroring the `instance_locks`
+    /// removal the same delete paths already do. The registry is keyed by
+    /// session id and nothing prunes it otherwise, so without this a long-lived
+    /// daemon retains one entry per session it has ever seen.
+    #[cfg(feature = "serve")]
+    pub(crate) async fn forget_prompt_lock(&self, id: &str) {
+        self.prompt_locks.write().await.remove(id);
+    }
+
+    /// Registry size for a test asserting `prompt_locks` stays bounded (e.g.
+    /// does not grow for ids that were never admitted past an existence
+    /// check).
+    #[cfg(all(test, feature = "serve"))]
+    pub(crate) async fn prompt_locks_len(&self) -> usize {
+        self.prompt_locks.read().await.len()
     }
 }
 
