@@ -1503,8 +1503,9 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
 
 /// Spawn a detached drain for every session that still carries a persisted
 /// `pending_initial_turn` and has a live worker to receive it (#2897). The
-/// drain itself claims a per-session slot and runs under the instance lock,
-/// so overlapping ticks and the create fast path cannot double-deliver.
+/// drain itself claims a per-session slot and runs under the session's
+/// prompt-submission guard, so overlapping ticks and the create fast path
+/// cannot double-deliver.
 /// Triaged sessions are skipped like everywhere else in the reconciler; the
 /// turn stays persisted and delivers if the session is ever un-triaged.
 /// Queue the rate-limit-interrupted prompt as the session's next turn so a

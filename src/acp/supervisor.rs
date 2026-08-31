@@ -3331,15 +3331,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     #[cfg(test)]
     pub(crate) async fn test_insert_worker(&self, session_id: &str) {
         let (client, _tx) = AcpClient::fake_for_test(AcpSessionId(format!("acp-{session_id}")));
-        self.workers.lock().await.insert(
-            session_id.to_string(),
-            WorkerHandle {
-                client: Arc::new(client),
-                drain_task: tokio::spawn(async {}),
-                restart_history: vec![],
-                kind: WorkerKind::Stdio,
-            },
-        );
+        self.test_install_worker(session_id, client).await;
     }
 
     /// Like `test_insert_worker`, but the fake worker's command loop records
@@ -3353,6 +3345,15 @@ impl<S: BroadcastSink> Supervisor<S> {
     ) -> Arc<std::sync::Mutex<Vec<&'static str>>> {
         let (client, _tx, cmds) =
             AcpClient::fake_for_test_cmd_recording(AcpSessionId(format!("acp-{session_id}")));
+        self.test_install_worker(session_id, client).await;
+        cmds
+    }
+
+    /// Register `client` as this session's in-memory worker. Shared by the
+    /// `test_insert_worker*` fixtures so they differ only in which fake
+    /// client they build.
+    #[cfg(test)]
+    async fn test_install_worker(&self, session_id: &str, client: AcpClient) {
         self.workers.lock().await.insert(
             session_id.to_string(),
             WorkerHandle {
@@ -3362,7 +3363,6 @@ impl<S: BroadcastSink> Supervisor<S> {
                 kind: WorkerKind::Stdio,
             },
         );
-        cmds
     }
 
     /// Drop a fake in-memory worker inserted by `test_insert_worker`, freeing

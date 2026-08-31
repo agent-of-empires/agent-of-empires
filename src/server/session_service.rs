@@ -499,8 +499,10 @@ impl SessionService {
         // Ownership gate, before ANY side effect (no wake, resume, publish,
         // or forward for a denied caller): a plugin may deliver turns only
         // to sessions it created. Ownership is immutable after creation, so
-        // a read snapshot suffices; deliberately no instance_lock here (the
-        // pending-turn drain calls this while holding it).
+        // a read snapshot suffices. Deliberately no instance_lock anywhere in
+        // this function: it waits on worker readiness below, and the resume it
+        // waits for needs that lock to finish (#3172, #3621). Callers own the
+        // per-session ordering through [`Self::prompt_submission`] instead.
         let (acp_mode_id, yolo_mode) = {
             let instances = self.instances.read().await;
             let Some(inst) = instances.iter().find(|i| i.id == id) else {
@@ -988,6 +990,12 @@ impl SessionService {
     /// the batch, so it retries on every reconciler tick, nothing behind it
     /// ever drains, and the idle reaper (which skips a session with a queue)
     /// keeps its worker alive forever.
+    ///
+    /// Takes [`Self::prompt_submission`] for the same reason
+    /// `remove_queued_prompt` does: the drain snapshots its batch and only
+    /// then sends, so an unserialized edit landing inside that window is
+    /// written to a row the drain has already copied. It delivers the old
+    /// text and retires the row, and the edit is lost with nothing to retry.
     #[cfg(feature = "serve")]
     pub(crate) async fn edit_queued_prompt(
         self: &Arc<Self>,
@@ -995,6 +1003,7 @@ impl SessionService {
         prompt_id: String,
         text: String,
     ) -> EditQueuedOutcome {
+        let _serialized = self.prompt_submission(id).await;
         self.mutate_instance_persisted(id, move |inst| {
             match inst.queued_prompts.iter_mut().find(|q| q.id == prompt_id) {
                 Some(q) if text.trim().is_empty() && q.attachments.is_empty() => {
@@ -1047,8 +1056,14 @@ impl SessionService {
 
     /// Drop every queued prompt for a session, plus every attachment blob
     /// buffered for those prompts.
+    ///
+    /// Serialized against delivery like the other queue mutations: clearing
+    /// inside the drain's snapshot-to-send window empties the durable rows
+    /// while the batch the drain already copied still goes to the agent, so
+    /// the user watches the queue empty and then sees it sent anyway.
     #[cfg(feature = "serve")]
     pub(crate) async fn clear_queued_prompts(self: &Arc<Self>, id: &str) {
+        let _serialized = self.prompt_submission(id).await;
         let cleared_ids = self
             .mutate_instance_persisted(id, move |inst| {
                 let ids: Vec<String> = inst.queued_prompts.iter().map(|q| q.id.clone()).collect();
@@ -1372,6 +1387,13 @@ impl SessionService {
     ///    lock would stall the very resume it is waiting for and give up after
     ///    `WORKER_READY_TIMEOUT`. This lock is deliberately distinct so the two
     ///    never overlap; where both are genuinely needed, take this one first.
+    ///
+    /// One input escapes the hold: `acp_prompt` samples `woke_idle_dormant`
+    /// from `touch_on_prompt_and_wake_if_sunk` before claiming the guard,
+    /// because that helper takes `instance_lock`. A stale `true` only forces
+    /// `send_turn`'s resume trigger, which answers `AlreadyResuming` or
+    /// `AlreadyRunning` for a worker that is already there, so it costs a
+    /// lookup rather than a wrong disposition.
     #[cfg(feature = "serve")]
     pub(crate) async fn prompt_submission(&self, id: &str) -> tokio::sync::OwnedMutexGuard<()> {
         let lock = {
@@ -2098,6 +2120,80 @@ mod tests {
             1,
             "no worker ever arrived, so the batch stays queued for the next tick"
         );
+    }
+
+    /// Every queue mutation that can race a delivery waits for it.
+    ///
+    /// The drain snapshots its batch and only then sends, so a mutation
+    /// landing inside that window changes rows the agent is already about to
+    /// receive: an edit is delivered as its old text and then retired, losing
+    /// the new text with nothing to retry, and a clear empties the durable
+    /// queue for a batch that goes out anyway. `remove_queued_prompt` was
+    /// already serialized for this reason; `edit` and `clear` were not.
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn queue_mutations_wait_for_an_in_flight_delivery() {
+        use std::time::Duration;
+
+        let mut inst = Instance::new("queue-mut", "/tmp/aoe-queue-mutations");
+        inst.id = "sess-mut".to_string();
+        inst.view = crate::session::View::Structured;
+        inst.status = crate::session::Status::Idle;
+        let service = crate::server::test_support::build_test_app_state(vec![inst])
+            .session_service
+            .clone();
+        service
+            .enqueue_prompt(
+                "sess-mut",
+                "q1".into(),
+                "original".into(),
+                vec![],
+                None,
+                "t0".into(),
+            )
+            .await
+            .expect("session exists");
+
+        // Stand in for a drain holding the session across snapshot -> send.
+        let delivering = service.prompt_submission("sess-mut").await;
+        let edit = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move {
+                service
+                    .edit_queued_prompt("sess-mut", "q1".into(), "edited".into())
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !edit.is_finished(),
+            "an edit must not rewrite a row a delivery has already snapshotted"
+        );
+        drop(delivering);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(10), edit)
+                .await
+                .expect("the edit lands once the delivery releases the session")
+                .expect("edit task must not panic"),
+            EditQueuedOutcome::Updated
+        ));
+
+        let delivering = service.prompt_submission("sess-mut").await;
+        let clear = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.clear_queued_prompts("sess-mut").await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !clear.is_finished(),
+            "a clear must not empty the queue out from under a delivery"
+        );
+        drop(delivering);
+        tokio::time::timeout(Duration::from_secs(10), clear)
+            .await
+            .expect("the clear lands once the delivery releases the session")
+            .expect("clear task must not panic");
+        assert!(service.queued_prompts_snapshot("sess-mut").await.is_empty());
     }
 
     /// Queueing a follow-up is a user gesture, so it must advance
