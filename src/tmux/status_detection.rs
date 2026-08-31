@@ -4192,6 +4192,14 @@ Final prose line.\n";
                 "timer-only narrow band",
                 "  ⎋ Waiting\n╭── ⠋ 16s ─╮\n╰─",
             ),
+            (
+                "status preset without pi segment",
+                "  ⎋ Working…",
+            ),
+            (
+                "timer-only nerd band",
+                "  󱊷 Working…\n ⠋ 0s ",
+            ),
         ];
         for (name, pane) in cases {
             assert_eq!(detect_omp_status(pane), Status::Running, "case: {name}");
@@ -4394,6 +4402,8 @@ Final prose line.\n";
             format!("I would approve and execute refine plan steps\n{box_}"),
             // A footer phrase inside the live composer is draft text.
             "╭── π > GPT-5.6 Sol ─╮\n│ Enter select · n note while documenting the UI │\n│ second draft line │\n╰──────────────────╯"
+                .to_string(),
+            "│ Enter submit · ↑/↓ scroll · current prompt to answer │\n╭── \u{f0d57} > ─╮"
                 .to_string(),
             // Ask-arm verbs without the dialog's exact footer phrasing.
             format!("press enter to select an option\n{box_}"),

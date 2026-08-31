@@ -47,7 +47,7 @@ positional = true
 max_position = 2
 region = "bottom_non_empty_lines(3)"
 visible = true
-line_regex = ['^\s*(?:(?:╭[─-]*|\+[=-]*)\s*)?(?:\x{e0b6}\s+)?\S\s+(?:0|[1-9]\d*)[smh](?:\s+\S+\s+\S|\s*[─-]*(?:╮|\+)?\s*$)']
+line_regex = ['^\s*(?:(?:╭[─-]*|\+[=-]*)\s*)?(?:\x{e0b6}\s+)?\S\s+(?:0|[1-9]\d*)[smh](?:\s+\S+\s+\S|\s*[─-]*(?:╮|\+|\x{e0b0})?\s*$)']
 all = [
   { region = "bottom_non_empty_lines(4)", any = [
     { line_regex = ['(?i)^\s*(?:⎋|\x{f12b7}|esc)\s+\S'] },
@@ -57,6 +57,20 @@ all = [
 ]
 not = [
   { line_regex = ['^\s*(?:⏱|\x{f017}|◷|◴|⌛)\s+'] },
+]
+
+# Presets without the pi segment expose only the built-in interrupt row.
+[[rules]]
+id = "active_interrupt"
+state = "running"
+priority = 960
+positional = true
+max_position = 2
+region = "bottom_non_empty_lines(3)"
+visible = true
+line_regex = ['(?i)^\s*(?:⎋|\x{f12b7}|esc)\s+working(?:…|\.\.\.)\s*$']
+not = [
+  { region = "bottom_non_empty_lines(3)", line_regex = ['^\s*(?:(?:╭[─-]*|\+[=-]*)\s*)?(?:π|\x{f0d57}|pi)\s+'] },
 ]
 
 # The parked band exposes its brand token in the composer border. Its visible
@@ -138,7 +152,7 @@ contains_any = [
   "current prompt to answer",
 ]
 not = [
-  { region = "bottom_non_empty_lines(8)", line_regex = ['^\s*(?:╭|\+).*(?:π|pi)\s*>'] },
+  { region = "bottom_non_empty_lines(8)", line_regex = ['^\s*(?:╭|\+).*(?:π|\x{f0d57}|pi)\s*>'] },
 ]
 
 # The approve/deny selector: its footer decides the position, gated on both
