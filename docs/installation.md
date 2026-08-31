@@ -6,6 +6,11 @@
 - [Docker](https://www.docker.com/) (optional, for sandboxing agents in containers)
 - [Node.js](https://nodejs.org/) (optional, only needed when building the web dashboard from source with `--features web`)
 
+Building from source also needs a C toolchain for the bundled native
+dependencies (SQLite, libgit2, OpenSSL, liblzma, and AWS-LC). Most platforms
+are covered by a stock `cc`; targets without pre-generated AWS-LC bindings
+also need CMake.
+
 ## Install Agent of Empires
 
 ### Quick Install (Recommended)

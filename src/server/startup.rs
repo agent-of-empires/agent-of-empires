@@ -534,10 +534,15 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             );
         }
 
-        // Nothing to show a browser without the dashboard bundle.
-        if cfg!(feature = "web") && open_browser && !is_daemon {
-            if let Some((_, primary)) = labeled_urls.first() {
-                maybe_open_browser(primary);
+        if open_browser && !is_daemon {
+            if cfg!(feature = "web") {
+                if let Some((_, primary)) = labeled_urls.first() {
+                    maybe_open_browser(primary);
+                }
+            } else {
+                // Opening a browser on an API-only daemon lands on a 404. Say
+                // so rather than dropping the flag on the floor.
+                eprintln!("--open ignored: this build has no dashboard bundle");
             }
         }
 
