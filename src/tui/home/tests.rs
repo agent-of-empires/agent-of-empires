@@ -21604,3 +21604,74 @@ fn a_queued_repair_keeps_the_gate_armed_while_live_send_holds_the_reload() {
     );
     assert!(view.startup_recovery_gate.is_none());
 }
+
+/// #3615 review: a failed reload must keep the repair pending and the gate shut.
+/// Clearing the flag before the fallible call dropped the repair and released
+/// recovery against stale rows, which is the failure the gate exists to prevent.
+#[test]
+#[serial]
+fn a_failed_reload_keeps_the_repair_pending_and_the_gate_shut() {
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+    let mut seed = Instance::new("row", "/tmp/stale-path");
+    seed.source_profile = "test".to_string();
+    let id = seed.id.clone();
+    storage
+        .update(|instances, _groups| {
+            instances.push(seed);
+            Ok(())
+        })
+        .unwrap();
+
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    storage
+        .update(|instances, _groups| {
+            instances[0].project_path = "/tmp/repaired-path".to_string();
+            Ok(())
+        })
+        .unwrap();
+    view.reconcile_poller =
+        crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(true);
+
+    // A groups.json that is a directory makes `load_with_groups` fail.
+    let groups = crate::session::get_app_dir()
+        .unwrap()
+        .join("profiles")
+        .join("test")
+        .join("groups.json");
+    std::fs::remove_file(&groups).ok();
+    std::fs::create_dir(&groups).unwrap();
+
+    assert!(
+        !view.apply_reconcile_results(),
+        "the reload failed, so no refresh"
+    );
+    assert!(
+        view.startup_recovery_gate.is_some(),
+        "a dropped repair must not open the gate onto stale rows"
+    );
+    assert_eq!(
+        view.get_instance(&id).unwrap().project_path,
+        "/tmp/stale-path",
+        "the in-memory row is still the stale one"
+    );
+
+    // The repair is retried, not lost, once storage is readable again.
+    std::fs::remove_dir(&groups).unwrap();
+    std::fs::write(&groups, "[]").unwrap();
+    assert!(
+        view.apply_reconcile_results(),
+        "the retry must land the repair"
+    );
+    assert_eq!(
+        view.get_instance(&id).unwrap().project_path,
+        "/tmp/repaired-path"
+    );
+    assert!(view.startup_recovery_gate.is_none());
+}

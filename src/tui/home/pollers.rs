@@ -301,13 +301,21 @@ impl HomeView {
 
         let mut reloaded = false;
         if self.pending_reconcile_reload {
-            self.pending_reconcile_reload = false;
             match self.reload_storage_only() {
-                Ok(()) => reloaded = true,
-                Err(error) => tracing::warn!(
-                    target: "tui.home",
-                    "reload after load-time reconciliation failed: {error}",
-                ),
+                Ok(()) => {
+                    self.pending_reconcile_reload = false;
+                    reloaded = true;
+                }
+                Err(error) => {
+                    // The repair stays pending and the gate stays shut, so the
+                    // next tick retries rather than letting recovery run
+                    // against rows the sweep has already superseded on disk.
+                    tracing::warn!(
+                        target: "tui.home",
+                        "reload after load-time reconciliation failed: {error}",
+                    );
+                    return false;
+                }
             }
         }
         // Released only now, so recovery reads the repaired rows.

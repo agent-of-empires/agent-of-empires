@@ -137,9 +137,11 @@ fn is_protected_default_branch_cached(inst: &Instance, cache: &mut ProtectedBran
 /// it against the process directory instead of the worktree would read a live
 /// checkout as stranded and refuse to relocate it for good.
 ///
-/// Only an absent `.git` entry counts as gone. Anything else unreadable is
-/// treated as present, since this decides whether to stop retrying and guessing
-/// "stranded" from a transient stat error is the expensive mistake.
+/// Only a definite absence counts as gone, for the `.git` entry and for the
+/// admin dir it names. Anything else unreadable is treated as present, since
+/// this decides whether to stop retrying and the sweep runs once per launch, so
+/// guessing "stranded" from a transient stat error suppresses the relocation
+/// until the app is started again.
 fn is_orphaned_checkout(worktree: &Path) -> bool {
     let link = worktree.join(".git");
     let metadata = match std::fs::symlink_metadata(&link) {
@@ -150,8 +152,11 @@ fn is_orphaned_checkout(worktree: &Path) -> bool {
         // A repo of its own, not a linked worktree; nothing to strand.
         return false;
     }
+    // `Path::exists` reports false for every error, so a permission or I/O
+    // blip on the admin dir would read a live checkout as stranded. Only a
+    // definite absence is terminal; anything else stays retriable.
     match crate::git::cleanup::read_linked_worktree_gitdir(worktree) {
-        Some(admin) => !admin.exists(),
+        Some(admin) => matches!(admin.try_exists(), Ok(false)),
         None => false,
     }
 }
@@ -1368,6 +1373,45 @@ mod tests {
         );
         // And the real thing still does, relative link or not.
         std::fs::remove_dir_all(worktree.join(&target)).unwrap();
+        assert!(is_orphaned_checkout(&worktree));
+    }
+
+    /// #3615 review: `Path::exists` cannot tell absence from a stat failure, so
+    /// an EACCES or ELOOP on the admin dir would read a live checkout as
+    /// stranded. The sweep runs once per launch, so that suppresses the
+    /// relocation until the app is restarted. A symlink loop stands in for the
+    /// error class because it needs no permission games (tests run as root).
+    #[test]
+    fn a_stat_failure_on_the_admin_dir_is_not_a_stranded_checkout() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let worktree = tmp.path().join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        // `loop_a -> loop_b -> loop_a`, so resolving either yields ELOOP.
+        let loop_a = tmp.path().join("loop_a");
+        let loop_b = tmp.path().join("loop_b");
+        std::os::unix::fs::symlink(&loop_b, &loop_a).unwrap();
+        std::os::unix::fs::symlink(&loop_a, &loop_b).unwrap();
+        assert!(
+            loop_a.try_exists().is_err(),
+            "the fixture must actually produce a stat error"
+        );
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", loop_a.display()),
+        )
+        .unwrap();
+
+        assert!(
+            !is_orphaned_checkout(&worktree),
+            "a stat failure must stay retriable, not become terminal"
+        );
+
+        // A definite absence is still terminal.
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", tmp.path().join("definitely-gone").display()),
+        )
+        .unwrap();
         assert!(is_orphaned_checkout(&worktree));
     }
 
