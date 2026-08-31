@@ -3541,14 +3541,10 @@ impl App {
                     self.draw(terminal)?;
                 }
                 let outcome = self.home.prepare_live_send(&id);
-                // Settle the toast to its final state BEFORE the sync resize
-                // and redraw, so HomeView's cached `preview_pane_area`
-                // matches the geometry the user will see for the next
-                // several frames. Otherwise the toast row that was on screen
-                // during `prepare_live_send` would make the preview pane one
-                // row shorter than post-toast, the sync resize would target
-                // the smaller pane, and the first capture would render
-                // shifted up.
+                // Settle the toast before redraw so HomeView computes the
+                // geometry the user will actually see. That draw queues the
+                // resize through LiveSendWorker; the action thread never
+                // performs or waits for a tmux resize.
                 if !warm {
                     self.update_status = match &outcome {
                         // On clean ready, drop the toast entirely. On Err the
@@ -3559,7 +3555,6 @@ impl App {
                 }
                 if outcome.is_ok() {
                     self.draw(terminal)?;
-                    self.home.finalize_live_send_resize();
                 }
             }
             Action::AttachToolSession(id, tool_name) => {

@@ -26,22 +26,20 @@ use crate::tmux::status_detection::{OMP_BANNER_DISMISSAL_ANCHOR, OMP_TERMINAL_RE
 use crate::session::capture::{
     capture_claude_session_id, capture_claude_session_id_in_container, capture_codex_session_id,
     capture_copilot_session_id, capture_gemini_session_id, capture_hermes_session_id,
-    capture_kimi_session_id, capture_omp_session_id, capture_pi_session_id,
-    capture_prime_agent_session_id, capture_vibe_session_id, claude_poll_fn,
-    claude_poll_fn_sandboxed, codex_poll_fn, codex_poll_fn_sandboxed, copilot_poll_fn,
-    gemini_poll_fn, gemini_poll_fn_sandboxed, generate_claude_session_id, hermes_poll_fn,
-    hermes_poll_fn_sandboxed, is_valid_session_id, kimi_poll_fn, omp_host_routing_environment,
-    omp_poll_fn, omp_poll_fn_sandboxed, omp_sandbox_launch_marker, opencode_poll_fn,
-    opencode_poll_fn_sandboxed, pi_poll_fn, pi_poll_fn_sandboxed, prime_agent_poll_fn,
+    capture_kimi_session_id, capture_omp_session_id, capture_prime_agent_session_id,
+    capture_vibe_session_id, claude_poll_fn, claude_poll_fn_sandboxed, codex_poll_fn,
+    codex_poll_fn_sandboxed, copilot_poll_fn, gemini_poll_fn, gemini_poll_fn_sandboxed,
+    generate_session_uuid, hermes_poll_fn, hermes_poll_fn_sandboxed, is_valid_session_id,
+    kimi_poll_fn, omp_host_routing_environment, omp_poll_fn, omp_poll_fn_sandboxed,
+    omp_sandbox_launch_marker, opencode_poll_fn, opencode_poll_fn_sandboxed, prime_agent_poll_fn,
     reject_omp_secret_args, resolve_omp_store_layout,
     resolve_omp_store_layout_in_container_with_environment,
     resolve_omp_store_layout_with_environment, try_capture_codex_session_id_in_container,
     try_capture_gemini_session_id_in_container, try_capture_hermes_session_id_in_container,
     try_capture_omp_session_id_in_container, try_capture_opencode_session_id,
-    try_capture_opencode_session_id_in_container, try_capture_pi_session_id_in_container,
-    try_capture_vibe_session_id_in_container, validate_omp_capture_metadata, validated_session_id,
-    vibe_poll_fn, vibe_poll_fn_sandboxed, OmpCaptureMetadata, OmpCapturePlan, OmpCliCaptureOptions,
-    OmpStoreKind,
+    try_capture_opencode_session_id_in_container, try_capture_vibe_session_id_in_container,
+    validate_omp_capture_metadata, validated_session_id, vibe_poll_fn, vibe_poll_fn_sandboxed,
+    OmpCaptureMetadata, OmpCapturePlan, OmpCliCaptureOptions, OmpStoreKind,
 };
 
 mod accessors;
@@ -50,6 +48,11 @@ mod flags;
 mod hooks;
 mod kill;
 mod launch_command;
+
+/// The extension AoE loads into Pi so a pane publishes its own conversation.
+/// Written to the app dir for a host launch and into the Pi sandbox dir for a
+/// container one.
+pub(crate) const PI_SESSION_EXTENSION: &str = include_str!("../../../assets/pi/aoe-session-id.js");
 mod lifecycle;
 mod merge;
 mod omp;
@@ -83,11 +86,11 @@ pub use status::{Status, TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR}
 pub(crate) use tmux_session::{
     duplicate_session_error, find_duplicate_session, is_duplicate_session,
 };
+pub(crate) use types::{PiSidecarSource, PriorToolSession, ResumeIntent};
 pub use types::{
     PluginCreateIdempotency, SandboxInfo, TerminalInfo, View, WorkspaceInfo, WorkspaceRepo,
     WorktreeInfo,
 };
-pub(crate) use types::{PriorToolSession, ResumeIntent};
 
 // Re-exported so each submodule can reach its siblings through `use super::*`.
 use hooks::status_hook_env_prefix;
@@ -579,6 +582,20 @@ pub struct Instance {
     /// from scratch.
     #[serde(skip)]
     pending_host_env: Vec<(String, String)>,
+
+    /// Set when this pane's launch line carried the Pi session-id extension.
+    /// Runtime only: after an AoE restart the pane is still running with it,
+    /// and the sidecar it wrote is what says so (see
+    /// `uses_pi_session_sidecar`).
+    #[serde(skip)]
+    pi_extension_launched: bool,
+
+    /// Absolute transcript path this Pi pane last published. Pi indexes
+    /// sessions by their starting cwd, so this is what resumes a conversation
+    /// whose managed worktree has since moved; the id alone would resolve to
+    /// nothing there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pi_session_path: Option<String>,
 
     #[serde(skip)]
     pub last_error: Option<String>,

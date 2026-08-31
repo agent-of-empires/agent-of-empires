@@ -20280,7 +20280,7 @@ mod live_send_boot_size_tests {
     #[serial_test::serial]
     fn boots_agent_at_visible_preview_size() {
         let mut env = create_test_env_empty();
-        // The rect `finalize_live_send_resize` would resize the pane to.
+        // The visible rect the post-toast draw queues to LiveSendWorker.
         env.view.preview_pane_area = Rect::new(35, 1, 123, 38);
 
         assert_eq!(

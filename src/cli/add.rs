@@ -141,13 +141,13 @@ pub struct AddArgs {
     #[arg(long = "structured-view")]
     structured_view: bool,
 
-    /// Pick a specific ACP agent for the structured view (e.g., aoe-agent,
-    /// claude-code).
+    /// Pick a specific ACP agent for the structured view (e.g., claude-code,
+    /// codex).
     #[cfg(feature = "serve")]
     #[arg(long = "agent")]
     agent: Option<String>,
 
-    /// Override the model used by aoe-agent (e.g., claude-opus-4-7,
+    /// Override the model used by the ACP agent (e.g., claude-opus-4-7,
     /// gpt-5, gemini-2.5-pro). Forwarded to the agent at session start.
     #[cfg(feature = "serve")]
     #[arg(long = "model")]
@@ -410,7 +410,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         let seed = crate::session::fork::terminal_fork_seed(
             &resolved_tool,
             parent_agent_session_id.as_deref(),
-            crate::session::capture::generate_claude_session_id(),
+            crate::session::capture::generate_session_uuid(),
         )
         .map_err(|denied| match denied {
             crate::session::ForkDenied::AgentCannotFork => anyhow::anyhow!(
@@ -747,14 +747,15 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         let agent_name = pick_acp_agent_name(
             &registry,
             &config.session,
+            &config.acp,
             &instance.tool,
             instance.agent_name.as_deref(),
         );
         // Capability is judged against the explicit `--agent` (or, with none,
-        // the tool itself), NOT `pick_acp_agent_name`'s aoe-agent fallback:
-        // otherwise every tool would look ACP-capable via the bundled default
-        // and `--structured-view` could never be rejected for a non-ACP tool
-        // (it would silently substitute aoe-agent). Mirrors the server create
+        // the tool itself), NOT `pick_acp_agent_name`'s default-agent fallback:
+        // otherwise every tool would look ACP-capable via that default and
+        // `--structured-view` could never be rejected for a non-ACP tool (it
+        // would silently substitute the default). Mirrors the server create
         // path in `src/server/api/sessions.rs`.
         let capability_key = instance
             .agent_name
@@ -864,7 +865,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                         "ACP adapter `{}` is not installed or not on $PATH.\n\
                          Install: {}\n\
                          Or run: aoe acp doctor --fix\n\
-                         Or use the bundled fallback: rerun with `--agent aoe-agent`\n\
                          Or use the terminal view: drop --agent / --structured-view.",
                         spec.command,
                         hint
@@ -1449,11 +1449,12 @@ fn cleanup_partial_session(
 /// async supervisor. Precedence: explicit override → tool-keyed
 /// registry entry → custom agent with `agent_acp_cmd` → custom agent
 /// inheriting a registry-backed base via `agent_detect_as` (resolves to
-/// the base key) → legacy (`claude` → `claude`, else `aoe-agent`).
+/// the base key) → `claude` for the claude tool, else `acp.default_agent`.
 #[cfg(feature = "serve")]
 fn pick_acp_agent_name(
     registry: &crate::acp::agent_registry::AgentRegistry,
     session: &crate::session::config::SessionConfig,
+    acp: &crate::session::config::AcpConfig,
     tool: &str,
     explicit_override: Option<&str>,
 ) -> String {
@@ -1476,7 +1477,7 @@ fn pick_acp_agent_name(
     if tool == "claude" {
         "claude".into()
     } else {
-        "aoe-agent".into()
+        acp.resolved_default_agent().to_string()
     }
 }
 

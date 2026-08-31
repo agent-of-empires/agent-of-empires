@@ -403,11 +403,11 @@ enum GridReconcile {
 /// Geometry wins: a resize reseeds anyway, so there is no point ruling on a
 /// cursor that the reflow is about to move.
 ///
-/// The cursor check exists because nothing else resyncs the grid. `pipe-pane`
-/// is a one-way byte stream with no acknowledgement, so any byte the grid
-/// misses (or applies twice) is a permanent divergence, and before this the
-/// only reseed was on a size change: a pane that never resized stayed wrong
-/// indefinitely.
+/// The cursor check is the grid's resync for a pane that is being watched but
+/// never resizes. `pipe-pane` is a one-way byte stream with no
+/// acknowledgement, so any byte the grid misses (or applies twice) is a
+/// permanent divergence, and before this the only reseed was on a size change:
+/// a pane that never resized stayed wrong indefinitely.
 ///
 /// Confirming across two passes is what keeps it from firing on a race. The
 /// probe is a fork, so a pane that emits output between the grid's last applied
@@ -590,7 +590,7 @@ fn seed_parser(
     cols: u16,
     rows: u16,
     deadline: &crate::tmux::TmuxCommandDeadline,
-    chunk_guard: Option<(&AtomicU64, u64)>,
+    chunk_guard: Option<(&AtomicU64, &AtomicU64, u64)>,
 ) -> VtRefreshResult {
     let Some((body, state)) = capture_seed_snapshot(target, deadline) else {
         return VtRefreshResult::Failed;
@@ -605,12 +605,14 @@ fn install_seed_stream(
     cols: u16,
     rows: u16,
     stream: &[u8],
-    chunk_guard: Option<(&AtomicU64, u64)>,
+    chunk_guard: Option<(&AtomicU64, &AtomicU64, u64)>,
 ) -> VtRefreshResult {
     let Ok(mut parser) = parser.lock() else {
         return VtRefreshResult::Failed;
     };
-    if chunk_guard.is_some_and(|(seq, expected)| seq.load(Ordering::Acquire) != expected) {
+    if chunk_guard.is_some_and(|(received, settled, expected)| {
+        received.load(Ordering::Acquire) != expected || settled.load(Ordering::Acquire) != expected
+    }) {
         return VtRefreshResult::Busy;
     }
     *parser = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
@@ -1155,6 +1157,9 @@ struct ReaderCtx {
     /// (millis since `CHUNK_CLOCK`), and the gap between the two most recent
     /// chunks.
     chunk_seq: Arc<AtomicU64>,
+    /// Read sequences no longer waiting to mutate the parser. A seed may
+    /// commit only when this equals its arrival baseline.
+    settled_chunk_seq: Arc<AtomicU64>,
     last_chunk_ms: Arc<AtomicU64>,
     prev_gap_ms: Arc<AtomicU64>,
     /// Grid generation, bumped after every parsed chunk so `sample`'s
@@ -1205,57 +1210,25 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
                         *guard = Some(text.clone());
                     }
                 }
-                // Bytes that arrive before the seed are ALREADY IN IT, so they
-                // must be dropped rather than applied. `arm` orders the pipe
-                // first and the seed second (pipe-pane, wait for the forwarder
-                // to connect, then `capture-pane`), so tmux has folded every
-                // byte written during that window into the grid the seed is
-                // taken from. The old code held these bytes and replayed them
-                // once `seeded` flipped, which applied them TWICE: the pane's
-                // output appeared duplicated a screenful lower, with zsh's
-                // PROMPT_EOL_MARK duplicated onto a row tmux has none on, and
-                // every later row shifted down by the length of the double.
-                // An alternate-screen agent repaints in full and washed that
-                // out within a frame, but a shell pane only ever appends, so
-                // it stayed on screen until the next reseed.
-                //
-                // Dropping is the right side to err on: the seed carries an
-                // absolute CUP, so later output still lands on the correct cell
-                // and merely overwrites, whereas a duplicate displaces every
-                // row after it and compounds on each re-arm.
-                //
-                // Be clear about what this costs. Bytes tmux emitted after the
-                // capture body was taken but before `seeded` flips are in
-                // neither the seed nor the grid, so they are LOST, not merely
-                // reordered, and they used to be applied correctly. The window
-                // is the seed's own application time, measured at 4-5ms to take
-                // the capture plus 4-5ms to parse it into a fresh 2000-line
-                // grid, so it is milliseconds and not sub-millisecond.
-                // `reconcile_grid` heals it, but only once the pane goes quiet
-                // for two passes, since the drift check deliberately stands
-                // down while output is still arriving. A pane that streams
-                // without pause therefore carries the gap until it settles.
-                // Taking the seed BEFORE arming the pipe would make every
-                // observed byte post-capture and remove this path entirely; it
-                // is the better shape and is left as follow-up rather than
-                // folded into a bug fix.
-                if !ctx.seeded.load(Ordering::Relaxed) {
-                    // A pre-seed copy still needs a wakeup to be drained; the
-                    // grid-change wakeup below is not reached on this path. Only
-                    // wake when there was actually something to publish, so a
-                    // dropped chunk carrying no copy stays silent.
+                // Claim every read before waiting on the parser. An
+                // authoritative seed that captured this output must then see
+                // the changed sequence and return Busy instead of installing a
+                // snapshot ahead of a queued chunk and applying it twice.
+                let seq = ctx.chunk_seq.fetch_add(1, Ordering::AcqRel);
+                // The initial snapshot is taken only after `seeded` flips.
+                // Bytes received during the shorter pipe-connect window are
+                // already present in that later snapshot, so do not replay them.
+                if !ctx.seeded.load(Ordering::Acquire) {
+                    ctx.settled_chunk_seq.store(seq + 1, Ordering::Release);
+                    // OSC 52 remains independent of grid publication.
                     if copied.is_some() {
                         notify_change_wakeup(&ctx.wakeup);
                     }
                     continue;
                 }
                 if let Ok(mut p) = ctx.parser.lock() {
-                    // Claim the sequence while holding the parser lock. A
-                    // concurrent authoritative reseed can then compare this
-                    // counter under the same lock and never erase a chunk that
-                    // was accepted after its snapshot began.
-                    let seq = ctx.chunk_seq.fetch_add(1, Ordering::AcqRel);
                     p.process(&buf[..n]);
+                    ctx.settled_chunk_seq.store(seq + 1, Ordering::Release);
                     ctx.app_cursor
                         .store(p.screen().application_cursor(), Ordering::Relaxed);
                     // Invalidate cached sample assemblies BEFORE the wakeup, so a
@@ -1330,6 +1303,9 @@ pub(crate) struct VtChannel {
     /// Number of chunks the reader has parsed. `0` means none yet, so
     /// `chunk_timing` reports `None` and the caller leaves pacing untouched.
     chunk_seq: Arc<AtomicU64>,
+    /// Highest contiguous read sequence that has either been applied to the
+    /// parser or deliberately discarded before the initial snapshot.
+    settled_chunk_seq: Arc<AtomicU64>,
     /// Arrival of the most recent chunk (millis since `CHUNK_CLOCK`), stamped
     /// by the reader thread on every chunk.
     last_chunk_ms: Arc<AtomicU64>,
@@ -1518,6 +1494,7 @@ impl VtChannel {
         };
         let wakeup: Arc<Mutex<Option<ChangeWakeup>>> = Arc::new(Mutex::new(None));
         let chunk_seq = Arc::new(AtomicU64::new(0));
+        let settled_chunk_seq = Arc::new(AtomicU64::new(0));
         let last_chunk_ms = Arc::new(AtomicU64::new(0));
         let prev_gap_ms = Arc::new(AtomicU64::new(u64::MAX));
         let grid_gen = Arc::new(AtomicU64::new(0));
@@ -1532,6 +1509,7 @@ impl VtChannel {
                 wakeup: wakeup.clone(),
                 clipboard: clipboard.clone(),
                 chunk_seq: chunk_seq.clone(),
+                settled_chunk_seq: settled_chunk_seq.clone(),
                 last_chunk_ms: last_chunk_ms.clone(),
                 prev_gap_ms: prev_gap_ms.clone(),
                 grid_gen: grid_gen.clone(),
@@ -1575,10 +1553,22 @@ impl VtChannel {
             std::thread::sleep(Duration::from_millis(2));
         }
 
-        // Seed the current screen so an already-running agent shows up
-        // immediately instead of starting blank (pipe-pane has no backlog).
-        if seed_parser(&target, &parser, &app_cursor, cols, rows, deadline, None)
-            != VtRefreshResult::Refreshed
+        // Mark the reader live before capture. Chunks observed before this point
+        // are represented by the later snapshot; chunks observed after it are
+        // applied to the parser and advance the guard before waiting on its lock.
+        // The seed therefore either includes each chunk or returns Busy, never
+        // dropping the capture-to-install window.
+        seeded.store(true, Ordering::Release);
+        let expected_chunk_seq = chunk_seq.load(Ordering::Acquire);
+        if seed_parser(
+            &target,
+            &parser,
+            &app_cursor,
+            cols,
+            rows,
+            deadline,
+            Some((&chunk_seq, &settled_chunk_seq, expected_chunk_seq)),
+        ) != VtRefreshResult::Refreshed
         {
             tracing::warn!(%target, "vt: initial seed failed; falling back to capture");
             stop_and_wake_reader(&stop, &sock_path);
@@ -1588,7 +1578,6 @@ impl VtChannel {
             return None;
         }
         grid_gen.fetch_add(1, Ordering::Relaxed);
-        seeded.store(true, Ordering::Relaxed);
         tracing::info!(
             %target,
             cols,
@@ -1608,6 +1597,7 @@ impl VtChannel {
             wakeup,
             clipboard,
             chunk_seq,
+            settled_chunk_seq,
             last_chunk_ms,
             prev_gap_ms,
             grid_gen,
@@ -1653,11 +1643,13 @@ impl VtChannel {
     ///
     /// - **geometry changed**, the original trigger.
     /// - **the cursor drifted** and stayed drifted across a pass with no output
-    ///   in between, which means the grid genuinely diverged from tmux. This is
-    ///   the only resync the grid has: `pipe-pane` is an unacknowledged one-way
-    ///   stream, so a missed or doubled byte is permanent, and a pane that never
-    ///   resizes used to carry that divergence forever. `reconcile_step` owns the
-    ///   race-vs-drift call.
+    ///   in between, which means the grid genuinely diverged from tmux:
+    ///   `pipe-pane` is an unacknowledged one-way stream, so a missed or doubled
+    ///   byte is permanent, and a pane that never resizes used to carry that
+    ///   divergence forever. `reconcile_step` owns the race-vs-drift call, and
+    ///   deliberately does not reseed while output is flowing. Cursor-clean
+    ///   cell drift is repaired by the capture worker's guarded authoritative
+    ///   refresh without adding a second resync protocol.
     fn reconcile_grid(&self, deadline: &crate::tmux::TmuxCommandDeadline) {
         let mut guard = self.last_size_check.lock().unwrap();
         if guard.elapsed() < Duration::from_secs(1) {
@@ -1735,7 +1727,7 @@ impl VtChannel {
             cols,
             rows,
             deadline,
-            Some((&self.chunk_seq, expected_chunk_seq)),
+            Some((&self.chunk_seq, &self.settled_chunk_seq, expected_chunk_seq)),
         );
         if result == VtRefreshResult::Refreshed {
             self.grid_gen.fetch_add(1, Ordering::Relaxed);
@@ -2383,6 +2375,7 @@ mod tests {
         parser.lock().unwrap().process(b"LIVE-CHUNK");
         let app_cursor = AtomicBool::new(false);
         let chunk_seq = AtomicU64::new(1);
+        let settled_chunk_seq = AtomicU64::new(0);
 
         assert_eq!(
             install_seed_stream(
@@ -2391,9 +2384,21 @@ mod tests {
                 80,
                 24,
                 b"STALE-SNAPSHOT",
-                Some((&chunk_seq, 0)),
+                Some((&chunk_seq, &settled_chunk_seq, 0)),
             ),
             VtRefreshResult::Busy,
+        );
+        assert_eq!(
+            install_seed_stream(
+                &parser,
+                &app_cursor,
+                80,
+                24,
+                b"STALE-SNAPSHOT",
+                Some((&chunk_seq, &settled_chunk_seq, 1)),
+            ),
+            VtRefreshResult::Busy,
+            "a seed must not overtake a read waiting on the parser"
         );
         let contents = parser.lock().unwrap().screen().contents();
         assert!(contents.contains("LIVE-CHUNK"));
@@ -2671,6 +2676,7 @@ mod tests {
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
             chunk_seq: Arc::new(AtomicU64::new(0)),
+            settled_chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
             prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
             grid_gen: Arc::new(AtomicU64::new(0)),
@@ -2927,6 +2933,7 @@ mod tests {
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
             chunk_seq: Arc::new(AtomicU64::new(0)),
+            settled_chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
             prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
             grid_gen: grid_gen.clone(),
@@ -3008,6 +3015,7 @@ mod tests {
             wakeup: wakeup_slot.clone(),
             clipboard: Arc::new(Mutex::new(None)),
             chunk_seq: Arc::new(AtomicU64::new(0)),
+            settled_chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
             prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
             grid_gen: Arc::new(AtomicU64::new(0)),
@@ -3165,6 +3173,7 @@ mod tests {
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: clipboard.clone(),
             chunk_seq: Arc::new(AtomicU64::new(0)),
+            settled_chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
             prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
             grid_gen: Arc::new(AtomicU64::new(0)),
@@ -3298,6 +3307,7 @@ mod tests {
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
             chunk_seq: chunk_seq.clone(),
+            settled_chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: last_chunk_ms.clone(),
             prev_gap_ms: prev_gap_ms.clone(),
             grid_gen: Arc::new(AtomicU64::new(0)),
@@ -3389,21 +3399,14 @@ mod tests {
     }
 
     #[test]
-    fn reader_drops_pre_seed_bytes_but_still_taps_clipboard() {
+    fn reader_fences_seed_windows_and_still_taps_clipboard() {
         use std::io::Write;
 
-        // `arm` orders the pipe first and the seed second, so every byte the
-        // pane emits while the channel is arming is already folded into the
-        // `capture-pane` the seed is built from. Replaying those bytes once
-        // `seeded` flipped applied them TWICE: the output appeared duplicated
-        // lower down, carrying a second copy of zsh's PROMPT_EOL_MARK onto a
-        // row tmux has none on, and shifting every later row. A shell pane only
-        // appends, so it never washed out. They must be dropped instead.
-        //
-        // The OSC 52 tap is deliberately NOT gated on the seed: a copy that
-        // lands while arming has no other route to the host clipboard, and it
-        // doubles here as the barrier proving the pre-seed chunk was consumed
-        // (a dropped chunk bumps neither `grid_gen` nor the chunk counters).
+        // Output received before the initial capture is not replayed because
+        // that later snapshot already contains it. The read still advances the
+        // seed fence, and OSC 52 remains observable while the grid is unseeded.
+        // Once seeded, every read advances the same fence before waiting on the
+        // parser so an authoritative refresh cannot duplicate a queued chunk.
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("s.sock");
         let listener = UnixListener::bind(&sock).expect("bind");
@@ -3412,6 +3415,8 @@ mod tests {
         let seeded = Arc::new(AtomicBool::new(false));
         let parser = Arc::new(Mutex::new(vt100::Parser::new(6, 40, 0)));
         let clipboard: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let chunk_seq = Arc::new(AtomicU64::new(0));
+        let settled_chunk_seq = Arc::new(AtomicU64::new(0));
         let ctx = ReaderCtx {
             parser: parser.clone(),
             stop: stop.clone(),
@@ -3421,7 +3426,8 @@ mod tests {
             alive: Arc::new(AtomicBool::new(false)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: clipboard.clone(),
-            chunk_seq: Arc::new(AtomicU64::new(0)),
+            chunk_seq: chunk_seq.clone(),
+            settled_chunk_seq: settled_chunk_seq.clone(),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
             prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
             grid_gen: grid_gen.clone(),
@@ -3451,15 +3457,40 @@ mod tests {
             "a dropped pre-seed chunk must not bump the grid generation"
         );
 
-        // The seed lands, then post-seed output arrives.
-        seeded.store(true, Ordering::Relaxed);
+        assert_eq!(chunk_seq.load(Ordering::Acquire), 1);
+        assert_eq!(
+            settled_chunk_seq.load(Ordering::Acquire),
+            1,
+            "a discarded pre-seed read must be settled before capture"
+        );
+
+        // Hold the parser while a live chunk arrives. The sequence must move
+        // before the reader can acquire this lock, otherwise a concurrent seed
+        // could install a snapshot containing the chunk and then apply it again.
+        let parser_guard = parser.lock().unwrap();
+        seeded.store(true, Ordering::Release);
         conn.write_all(b"POST-SEED-OUTPUT")
             .expect("write post-seed");
         let deadline = Instant::now() + Duration::from_secs(5);
-        while grid_gen.load(Ordering::Relaxed) < 1 {
-            assert!(Instant::now() < deadline, "post-seed chunk never applied");
+        while chunk_seq.load(Ordering::Acquire) < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "reader did not fence queued chunk"
+            );
             std::thread::sleep(Duration::from_millis(2));
         }
+        assert_eq!(grid_gen.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            settled_chunk_seq.load(Ordering::Acquire),
+            1,
+            "a queued chunk must remain unsettled until it mutates the parser"
+        );
+        drop(parser_guard);
+        while settled_chunk_seq.load(Ordering::Acquire) < 2 {
+            assert!(Instant::now() < deadline, "post-seed chunk never settled");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(grid_gen.load(Ordering::Relaxed), 1);
 
         let screen = {
             let p = parser.lock().unwrap();

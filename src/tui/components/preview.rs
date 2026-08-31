@@ -35,9 +35,9 @@ impl<'a> CachedPreview<'a> {
 /// optional sandbox line, optional worktree block) for `instance`.
 ///
 /// Exposed at the module level so callers outside `Preview::render_with_cache`
-/// can compute the same split. In particular, the live-send sync resize
-/// in `HomeView::finalize_live_send_resize` needs to size the tmux pane
-/// to the OUTPUT portion, not the full inner. The output portion is
+/// can compute the same split. In particular, render queues the live-send
+/// worker to size the tmux pane to the OUTPUT portion, not the full inner. The
+/// output portion is
 /// `inner.height - agent_info_height(inst) - 1`: subtract the info
 /// header, then subtract one more row for the inner ` Output ` banner
 /// that `render_output_cached` draws on top of the output sub-rect (a
@@ -653,7 +653,7 @@ mod tests {
             if let Some(home_str) = home.to_str() {
                 let path = format!("{}extra/not/home", home_str);
                 let shortened = shorten_path(&path);
-                assert_eq!(shortened, format!("~extra/not/home"));
+                assert_eq!(shortened, "~extra/not/home");
             }
         }
     }
@@ -790,9 +790,8 @@ mod tests {
         );
     }
 
-    // `agent_info_height` drives both the preview layout split in
-    // `render_with_cache` and the live-send sync resize in
-    // `HomeView::finalize_live_send_resize`. A one-row drift here brings
+    // `agent_info_height` drives both the preview layout split and the
+    // live-send worker geometry queued from render. A one-row drift here brings
     // the shifted-preview bug right back, so each branch of the formula
     // gets a dedicated case.
     mod agent_info_height {

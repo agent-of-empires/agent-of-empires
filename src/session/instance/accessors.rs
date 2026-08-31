@@ -79,6 +79,8 @@ impl Instance {
             ever_confirmed_present: false,
             unknown_since: None,
             pending_host_env: Vec::new(),
+            pi_extension_launched: false,
+            pi_session_path: None,
             last_error: None,
             session_id_poller: None,
             retroactive_capture_excludes: HashSet::new(),

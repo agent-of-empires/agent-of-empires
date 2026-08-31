@@ -952,6 +952,42 @@ fn sync_managed_skills_into_sandbox(
 /// default case where no worktree is detected).
 ///
 /// Returns (host_mount_path, container_mount_path, working_dir)
+/// Where a sandboxed Pi publishes its conversation, inside the container.
+///
+/// Under the pi config mount rather than the hook base: that bind already
+/// exists for every Pi container, so no new mount is needed and an image
+/// created by an older AoE keeps working. Docker cannot add a mount to a
+/// container that already exists, and reusing one is the normal path.
+pub(crate) const PI_SIDECAR_DIR_IN_CONTAINER: &str = "/root/.pi/aoe-session";
+
+/// Host directory backing [`PI_SIDECAR_DIR_IN_CONTAINER`], and the root the
+/// extension is written under.
+pub(crate) fn pi_sandbox_dir() -> Option<std::path::PathBuf> {
+    let mount = AGENT_CONFIG_MOUNTS.iter().find(|m| m.tool_name == "pi")?;
+    let home = dirs::home_dir()?;
+    sandbox_dir_for(mount, &home, None).ok()
+}
+
+/// Write the session-id extension where a sandboxed Pi discovers it
+/// (`~/.pi/agent/extensions/` in the container). Discovery rather than `-e`:
+/// pi refuses to start when an `-e` path is missing, and the file has to
+/// survive an upgrade of AoE under a container that already exists.
+pub(crate) fn install_pi_sandbox_extension() -> Result<()> {
+    let dir = pi_sandbox_dir()
+        .ok_or_else(|| anyhow::anyhow!("no Pi sandbox dir"))?
+        .join("agent")
+        .join("extensions");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("aoe-session-id.js");
+    let source = crate::session::instance::PI_SESSION_EXTENSION;
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(source) {
+        let tmp = dir.join("aoe-session-id.js.tmp");
+        std::fs::write(&tmp, source)?;
+        std::fs::rename(&tmp, &path)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn compute_volume_paths(
     project_path: &Path,
     project_path_str: &str,
@@ -2130,6 +2166,81 @@ fn common_ancestor(a: &Path, b: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    // The sandbox design rests on a bind that already exists: the Pi config
+    // dir at `/root/.pi`. Everything else follows from it, so assert the mount
+    // the builder actually produces rather than the one this branch intended.
+    // No container runs in CI, which is exactly why this has to be pinned here.
+    #[test]
+    #[serial_test::serial]
+    fn sandboxed_pi_config_mount_backs_the_sidecar_and_extension() {
+        let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+        let sandbox_info = super::super::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
+        let instance_id = "pisandboxbind001";
+        let config = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("pi", None),
+            false,
+            instance_id,
+            None,
+            "",
+        )
+        .unwrap();
+
+        let sandbox_dir = pi_sandbox_dir().expect("a Pi sandbox dir");
+        let bind = config
+            .volumes
+            .iter()
+            .find(|v| v.container_path == "/root/.pi")
+            .expect("the Pi config dir must be bound at /root/.pi");
+        assert_eq!(bind.host_path, sandbox_dir.to_string_lossy());
+        assert!(!bind.read_only, "the pane publishes into this bind");
+
+        // Both container paths therefore resolve under that host directory.
+        assert!(PI_SIDECAR_DIR_IN_CONTAINER.starts_with("/root/.pi/"));
+        let host_sidecar = sandbox_dir.join(
+            PI_SIDECAR_DIR_IN_CONTAINER
+                .strip_prefix("/root/.pi/")
+                .unwrap(),
+        );
+        assert!(host_sidecar.starts_with(&sandbox_dir));
+
+        install_pi_sandbox_extension().expect("install the extension");
+        assert!(
+            sandbox_dir
+                .join("agent/extensions/aoe-session-id.js")
+                .is_file(),
+            "the extension must land where the container discovers it"
+        );
+
+        // Nothing this branch adds may introduce a mount: a container that
+        // already exists cannot gain one.
+        assert!(
+            !config
+                .volumes
+                .iter()
+                .any(|v| v.container_path.contains("aoe-pi-session-id")),
+            "no per-extension mount may be required"
+        );
+    }
+
     use super::*;
     use crate::hooks::test_support::BaseGuard;
     use std::fs;

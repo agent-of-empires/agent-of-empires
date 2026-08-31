@@ -87,6 +87,48 @@ pub(crate) struct MetricsSampler {
     last_at: Option<Instant>,
     last_host_cpu: Option<(u64, u64)>,
     last_process_cpu: HashMap<(u32, u64), f64>,
+    last_pane_roots: PaneRoots,
+}
+
+/// Pane metadata from the last successful `list-panes -a`, with the start
+/// identity of every root pid as seen in the process snapshot taken alongside
+/// it. A tick whose `list-panes` fails reuses the map, and the identity check
+/// keeps a pid that exited and was recycled during the outage from seeding a
+/// process-tree walk.
+#[derive(Default)]
+struct PaneRoots {
+    panes: HashMap<String, crate::tmux::PaneMetadata>,
+    start_ids: HashMap<u32, u64>,
+}
+
+impl PaneRoots {
+    fn capture(
+        panes: HashMap<String, crate::tmux::PaneMetadata>,
+        processes: &[ProcessRecord],
+    ) -> Self {
+        let pids: HashSet<u32> = panes.values().filter_map(|meta| meta.pane_pid).collect();
+        let start_ids = processes
+            .iter()
+            .filter(|p| pids.contains(&p.pid))
+            .map(|p| (p.pid, p.start_id))
+            .collect();
+        Self { panes, start_ids }
+    }
+
+    /// The live root pid of `inst`'s agent pane: resolved against this same
+    /// snapshot (a renamed session still matches), not dead, and still the
+    /// process it was when the snapshot was taken.
+    fn root_for(&self, inst: &Instance, by_pid: &HashMap<u32, &ProcessRecord>) -> Option<u32> {
+        let derived = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+        let name = crate::tmux::resolve_agent_session_name_in(&self.panes, &inst.id, &derived);
+        let meta = self.panes.get(&name)?;
+        if meta.pane_dead {
+            return None;
+        }
+        let pid = meta.pane_pid?;
+        let record = by_pid.get(&pid)?;
+        (self.start_ids.get(&pid) == Some(&record.start_id)).then_some(pid)
+    }
 }
 
 impl MetricsSampler {
@@ -108,7 +150,19 @@ impl MetricsSampler {
         });
 
         let processes = process_snapshot();
-        let agents = aggregate_agents(instances, &processes, elapsed, &self.last_process_cpu);
+        // One `list-panes -a` for every pane root, instead of one
+        // `display-message` per session. `Err` means tmux could not answer, not
+        // that there are no panes, so the previous snapshot stands for that tick.
+        if let Ok(panes) = crate::tmux::batch_pane_metadata() {
+            self.last_pane_roots = PaneRoots::capture(panes, &processes);
+        }
+        let agents = aggregate_agents(
+            instances,
+            &processes,
+            &self.last_pane_roots,
+            elapsed,
+            &self.last_process_cpu,
+        );
         let counts = AgentCounts {
             agents: agents.len(),
             procs: agents.iter().filter_map(|a| a.procs).sum(),
@@ -205,6 +259,7 @@ fn host_figures(
 fn aggregate_agents(
     instances: &[Instance],
     processes: &[ProcessRecord],
+    roots: &PaneRoots,
     elapsed: Option<f64>,
     previous: &HashMap<(u32, u64), f64>,
 ) -> Vec<AgentMetric> {
@@ -253,18 +308,10 @@ fn aggregate_agents(
         || sandboxed_worker)
         .then(crate::containers::stats::cached_stats)
         .unwrap_or_default();
-    let alive = crate::session::recovery::orphaned_agents_alive(&eligible);
-    for (inst, is_alive) in eligible.iter().zip(alive) {
-        if !is_alive {
-            continue;
-        }
-        let session_name = crate::tmux::Session::resolve_name(&inst.id, &inst.title);
-        let Some(root) = crate::process::get_pane_pid(&session_name) else {
+    for inst in &eligible {
+        let Some(root) = roots.root_for(inst, &by_pid) else {
             continue;
         };
-        if !by_pid.contains_key(&root) {
-            continue;
-        }
         let mut stack = vec![root];
         let mut pids = Vec::new();
         while let Some(pid) = stack.pop() {
@@ -394,5 +441,51 @@ fn process_snapshot() -> Vec<ProcessRecord> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(pid: u32, start_id: u64) -> ProcessRecord {
+        ProcessRecord {
+            pid,
+            ppid: 1,
+            start_id,
+            rss_bytes: 0,
+            cpu_seconds: 0.0,
+        }
+    }
+
+    fn pane(pid: Option<u32>, dead: bool) -> crate::tmux::PaneMetadata {
+        crate::tmux::PaneMetadata {
+            pane_dead: dead,
+            pane_current_command: None,
+            pane_start_command_is_protected: false,
+            pane_pid: pid,
+        }
+    }
+
+    #[test]
+    fn root_for_requires_a_live_pane_whose_pid_kept_its_identity() {
+        let inst = Instance::new("metrics-root", "/tmp/metrics-root");
+        let name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+        let snapshot = [record(100, 7)];
+        // (pane, current processes, expected)
+        let cases = [
+            (pane(Some(100), false), vec![record(100, 7)], Some(100)),
+            // The pane died and its pid was handed to something else.
+            (pane(Some(100), false), vec![record(100, 8)], None),
+            (pane(Some(100), false), vec![], None),
+            (pane(Some(100), true), vec![record(100, 7)], None),
+            (pane(None, false), vec![record(100, 7)], None),
+        ];
+        for (meta, processes, expected) in cases {
+            let roots = PaneRoots::capture(HashMap::from([(name.clone(), meta)]), &snapshot);
+            let by_pid: HashMap<u32, &ProcessRecord> =
+                processes.iter().map(|p| (p.pid, p)).collect();
+            assert_eq!(roots.root_for(&inst, &by_pid), expected);
+        }
     }
 }
