@@ -215,7 +215,7 @@ pub const GEMINI: AgentProfile = AgentProfile {
     supports_wakeup_tools: false,
     emits_heartbeat_keepalives: false,
     // gemini-cli surfaces its YOLO approval mode over `gemini --acp` with
-    // the `yolo` id (see the CurrentModeUpdate mapping in acp_client.rs).
+    // the `yolo` id (see the CurrentModeUpdate mapping in acp_client/update_events.rs).
     yolo_mode_id: Some("yolo"),
 };
 

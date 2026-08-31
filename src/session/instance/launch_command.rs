@@ -37,6 +37,33 @@ fn apply_yolo_mode(cmd: &mut String, yolo: &crate::agents::YoloMode, is_sandboxe
     }
 }
 
+/// Write the Pi session-id extension into the app dir and return its path.
+///
+/// Rewritten when the content differs so an upgrade ships its own version.
+pub(super) fn pi_extension_path() -> Result<PathBuf> {
+    const SOURCE: &str = crate::session::instance::PI_SESSION_EXTENSION;
+    let dir = crate::session::get_app_dir()?.join("agent-extensions");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("pi-aoe-session-id.js");
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(SOURCE) {
+        let tmp = dir.join("pi-aoe-session-id.js.tmp");
+        std::fs::write(&tmp, SOURCE)?;
+        std::fs::rename(&tmp, &path)?;
+    }
+    Ok(path)
+}
+
+/// Whether a host `environment` list assigns `PATH`. Entries are either `KEY`
+/// (pass AoE's own value through, which cannot redirect a binary lookup) or
+/// `KEY=VALUE`, so only the assigning form counts.
+pub(super) fn environment_defines_path(environment: &[String]) -> bool {
+    environment.iter().any(|entry| {
+        entry
+            .split_once('=')
+            .is_some_and(|(key, _)| key.trim() == "PATH")
+    })
+}
+
 pub(super) fn build_resume_flags(
     tool: &str,
     session_id: &str,
@@ -363,6 +390,16 @@ impl Instance {
                 }
             }
 
+            // Pi publishes its conversation from inside the container through
+            // the same extension, reaching the instance dir and the extension
+            // file by bind-mount (see `container_config`).
+            let pi_extension = self.pi_extension_launch();
+            if let Some((ref flag, _)) = pi_extension {
+                // Empty for a container: the extension is discovered there
+                // rather than named on the command line.
+                tool_cmd.push_str(flag);
+                self.pi_extension_launched = true;
+            }
             let is_existing = self.apply_session_flags(&mut tool_cmd, "sandboxed");
             apply_agent_launch_env(&mut tool_cmd, agent);
 
@@ -391,6 +428,12 @@ impl Instance {
                 shell_escape(&profile),
                 shell_escape(&self.id)
             ));
+            if let Some((_, ref env)) = pi_extension {
+                // `KEY=VALUE ` from the host form, passed as a docker `-e`.
+                env_info
+                    .docker_args
+                    .push_str(&format!(" -e {}", shell_escape(env.trim())));
+            }
             let env_part = format!("{} ", env_info.docker_args);
             let raw_command = container.exec_command(Some(&env_part), &tool_cmd);
             let launch_command = if let Some(plan) = omp_capture_plan.as_ref() {
@@ -463,12 +506,23 @@ impl Instance {
             .and_then(|options| self.resolve_omp_capture_plan(&options));
 
         let profile = self.effective_profile();
-        let env_prefix = status_hook_env_prefix(&profile, &self.id, agent);
+        let mut env_prefix = status_hook_env_prefix(&profile, &self.id, agent);
+        // Pi publishes its own conversation through an AoE extension; the flag
+        // rides the built-in command only, an override being unvouched.
+        let pi_extension = self.pi_extension_launch();
+        if let Some((_, ref env)) = pi_extension {
+            env_prefix.push_str(env);
+            self.pi_extension_launched = true;
+        }
+        let env_prefix = env_prefix;
 
         if self.command.is_empty() {
             match crate::agents::get_agent(&self.tool) {
                 Some(a) => {
                     let mut cmd = a.launch_base_command();
+                    if let Some((ref flag, _)) = pi_extension {
+                        cmd.push_str(flag);
+                    }
                     if !self.extra_args.is_empty() {
                         // A model id carrying shell metacharacters (a
                         // context-window suffix such as `[1m]`) would abort the
@@ -531,6 +585,86 @@ impl Instance {
 
 #[cfg(test)]
 mod tests {
+
+    // The sidecar env var has to survive into the docker argv, not just be
+    // computed: nothing in CI runs a container to catch it going missing.
+    #[test]
+    #[serial_test::serial]
+    fn sandboxed_pi_launch_line_carries_the_sidecar_env() {
+        let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let temp_home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::EnvGuard::set(&[("HOME", temp_home.path())]);
+
+        let project = temp_home.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut inst = Instance::new("pi-argv", project.to_str().unwrap());
+        inst.tool = "pi".to_string();
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "aoe-pi-argv".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: Some("/workspace".to_string()),
+            before_start_env: Vec::new(),
+        });
+
+        let (cmd, _, _, _) = inst
+            .build_launch_command()
+            .expect("a sandboxed launch line");
+        let cmd = cmd.expect("a command");
+        assert!(
+            cmd.contains(&format!(
+                "AOE_PI_SESSION_ID_FILE={}/{}/session_id",
+                crate::session::container_config::PI_SIDECAR_DIR_IN_CONTAINER,
+                inst.id
+            )),
+            "the pane cannot publish without this: {cmd}"
+        );
+        assert!(
+            !cmd.contains(" -e /") || !cmd.contains("aoe-session-id.js"),
+            "no `-e` path may reach a container launch: {cmd}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn sandboxed_pi_publishes_without_a_command_line_extension() {
+        // `pi -e <missing path>` refuses to start, and a container created
+        // before this change has no mount for one, so a sandboxed launch names
+        // no extension: pi discovers it inside the config bind instead. The
+        // sidecar path it publishes to is a container path.
+        //
+        // The extension is written under `HOME`, so this owns one: the
+        // global lock keeps it from racing another test's `HOME` swap.
+        let temp_home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::EnvGuard::set(&[("HOME", temp_home.path())]);
+
+        let mut inst = Instance::new("pi-sandbox", "/tmp/pi-sandbox");
+        inst.tool = "pi".to_string();
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test-image".to_string(),
+            container_name: "aoe-pi-sandbox".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: None,
+            before_start_env: Vec::new(),
+        });
+
+        let (flag, env) = inst.pi_extension_launch().expect("sandboxed pi publishes");
+        assert!(flag.is_empty(), "no `-e` may reach a container launch");
+        assert_eq!(
+            env.trim(),
+            format!(
+                "AOE_PI_SESSION_ID_FILE={}/{}/session_id",
+                crate::session::container_config::PI_SIDECAR_DIR_IN_CONTAINER,
+                inst.id
+            )
+        );
+    }
     use super::*;
 
     use crate::session::test_support::EnvGuard;
@@ -833,12 +967,32 @@ mod tests {
     }
 
     #[test]
+    fn environment_defines_path_only_for_the_assigning_form() {
+        // A pass-through entry hands the pane AoE's own PATH, so the probed
+        // binary is the one that runs; an assignment can front a different pi.
+        assert!(environment_defines_path(&["PATH=/opt/bin".to_string()]));
+        assert!(environment_defines_path(&[
+            "API_KEY=x".to_string(),
+            " PATH =/opt/bin".to_string()
+        ]));
+        assert!(!environment_defines_path(&["PATH".to_string()]));
+        assert!(!environment_defines_path(&["PATHOLOGICAL=1".to_string()]));
+        assert!(!environment_defines_path(&[]));
+    }
+
+    #[test]
     fn test_build_pi_resume_flags() {
+        // An id already on file resumes with `--session`, which every pi
+        // version takes. A fresh launch pins the id AoE minted with
+        // `--session-id`, which creates the session when it is missing.
         let flags = build_resume_flags("pi", "019342ab-1234-7def-8901-abcdef012345", true);
         assert_eq!(flags, "--session 019342ab-1234-7def-8901-abcdef012345");
 
         let flags_new = build_resume_flags("pi", "019342ab-1234-7def-8901-abcdef012345", false);
-        assert_eq!(flags_new, "--session 019342ab-1234-7def-8901-abcdef012345");
+        assert_eq!(
+            flags_new,
+            "--session-id 019342ab-1234-7def-8901-abcdef012345"
+        );
     }
 
     #[test]

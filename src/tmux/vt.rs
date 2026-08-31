@@ -396,11 +396,11 @@ enum GridReconcile {
 /// Geometry wins: a resize reseeds anyway, so there is no point ruling on a
 /// cursor that the reflow is about to move.
 ///
-/// The cursor check exists because nothing else resyncs the grid. `pipe-pane`
-/// is a one-way byte stream with no acknowledgement, so any byte the grid
-/// misses (or applies twice) is a permanent divergence, and before this the
-/// only reseed was on a size change: a pane that never resized stayed wrong
-/// indefinitely.
+/// The cursor check is the grid's resync for a pane that is being watched but
+/// never resizes. `pipe-pane` is a one-way byte stream with no
+/// acknowledgement, so any byte the grid misses (or applies twice) is a
+/// permanent divergence, and before this the only reseed was on a size change:
+/// a pane that never resized stayed wrong indefinitely.
 ///
 /// Confirming across two passes is what keeps it from firing on a race. The
 /// probe is a fork, so a pane that emits output between the grid's last applied
@@ -570,16 +570,19 @@ fn seed_parser(
     app_cursor: &AtomicBool,
     cols: u16,
     rows: u16,
-) {
+) -> bool {
     let Some((body, state)) = capture_seed_snapshot(target) else {
-        return;
+        return false;
     };
     let stream = assemble_seed_stream(&body, &state, rows);
-    if let Ok(mut p) = parser.lock() {
-        *p = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
-        p.process(&stream);
-        app_cursor.store(p.screen().application_cursor(), Ordering::Relaxed);
-    }
+    parser
+        .lock()
+        .map(|mut p| {
+            *p = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
+            p.process(&stream);
+            app_cursor.store(p.screen().application_cursor(), Ordering::Relaxed);
+        })
+        .is_ok()
 }
 
 /// How many times [`capture_seed_snapshot`] re-runs the probe/capture/probe
@@ -1553,11 +1556,13 @@ impl VtChannel {
     ///
     /// - **geometry changed**, the original trigger.
     /// - **the cursor drifted** and stayed drifted across a pass with no output
-    ///   in between, which means the grid genuinely diverged from tmux. This is
-    ///   the only resync the grid has: `pipe-pane` is an unacknowledged one-way
-    ///   stream, so a missed or doubled byte is permanent, and a pane that never
-    ///   resizes used to carry that divergence forever. `reconcile_step` owns the
-    ///   race-vs-drift call.
+    ///   in between, which means the grid genuinely diverged from tmux:
+    ///   `pipe-pane` is an unacknowledged one-way stream, so a missed or doubled
+    ///   byte is permanent, and a pane that never resizes used to carry that
+    ///   divergence forever. `reconcile_step` owns the race-vs-drift call, and
+    ///   deliberately does not reseed while output is flowing. A cursor-clean
+    ///   divergence is caught instead by the capture worker's periodic
+    ///   [`VtChannel::resync_from_pane`].
     fn reconcile_grid(&self) {
         let mut guard = self.last_size_check.lock().unwrap();
         if guard.elapsed() < Duration::from_secs(1) {
@@ -1625,10 +1630,22 @@ impl VtChannel {
     /// Rebuild the grid from `capture-pane` and clear any armed drift, so the
     /// freshly seeded cursor is not immediately re-judged against a stale
     /// generation.
-    fn reseed(&self, cols: u16, rows: u16) {
-        seed_parser(&self.target, &self.parser, &self.app_cursor, cols, rows);
+    fn reseed(&self, cols: u16, rows: u16) -> bool {
+        let seeded = seed_parser(&self.target, &self.parser, &self.app_cursor, cols, rows);
         self.grid_gen.fetch_add(1, Ordering::Relaxed);
         self.clear_drift();
+        seeded
+    }
+
+    /// Rebuild the grid from a fresh `capture-pane` at its current size, the
+    /// seed `acquire` starts from, so a grid that has stably diverged from
+    /// tmux cannot stand indefinitely. False when the pane could not be
+    /// captured, so the caller can retry sooner than its normal interval.
+    pub(crate) fn resync_from_pane(&self) -> bool {
+        self.reseed(
+            self.cols.load(Ordering::Relaxed),
+            self.rows.load(Ordering::Relaxed),
+        )
     }
 
     /// Serialise up to `max_lines` of (scrollback + screen) to per-row ANSI,

@@ -2,7 +2,7 @@
 
 The **structured view** is the default rendering for AI coding agents in the web dashboard and the native TUI. Instead of a terminal pane (PTY bytes through xterm.js), it renders the agent's structured state directly: plan, tool-call cards, diffs, and approvals. It is mobile-first and scales the same components into a richer multi-pane desktop layout.
 
-It speaks the [Agent Client Protocol](https://agentclientprotocol.com/) (ACP), a JSON-RPC standard for editor-agent communication. aoe is the *client*; the agent (Claude Code, Gemini, the bundled `aoe-agent`, etc.) is the *server*. Any ACP-capable agent uses the structured view by default; a session can opt into the **terminal view** instead, per session, and you can switch at any time. Agents with no ACP adapter always run in the terminal view.
+It speaks the [Agent Client Protocol](https://agentclientprotocol.com/) (ACP), a JSON-RPC standard for editor-agent communication. aoe is the *client*; the agent (Claude Code, Gemini, Codex, etc.) is the *server*. Any ACP-capable agent uses the structured view by default; a session can opt into the **terminal view** instead, per session, and you can switch at any time. Agents with no ACP adapter always run in the terminal view.
 
 ![The structured view rendering an agent's plan, tool-call cards, and a pending approval](assets/structured-view/overview.png)
 
@@ -29,7 +29,7 @@ aoe ships an ACP registry entry for each tool whose ACP server we've verified. F
 | `omp` | `omp acp` (native) | `curl -fsSL https://omp.sh/install \| sh` | provider environment or OMP login |
 | `kimi` | `kimi acp` (native) | `curl -fsSL https://code.kimi.com/kimi-code/install.sh \| bash` | `kimi login`, or provider env |
 | `prime-agent` | `prime-agent --mode acp` (native) | `curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh \| sh` | `/login` once, or provider env |
-| `aoe-agent` | bundled (Vercel AI SDK 6) | ships with `aoe` | provider env vars |
+| `aoe-agent` | in-tree (Vercel AI SDK 6) | not yet packaged; needs a local build of `acp-worker/aoe-agent` (#3553) | provider env vars |
 
 Gemini CLI is deprecated upstream for individual accounts since 2026-06-18. Enterprise and API-key authentication remain valid; Antigravity CLI is the replacement for consumer accounts.
 
@@ -79,7 +79,7 @@ The CLI is the optional path for scripting or headless launches. Unlike the wiza
 ```bash
 aoe acp doctor                              # confirm prerequisites
 aoe add . --cmd claude --structured-view    # structured view for an ACP tool
-aoe add . --agent aoe-agent --model gpt-5   # pick an ACP agent + model (implies structured view)
+aoe add . --agent codex --model gpt-5       # pick an ACP agent + model (implies structured view)
 ```
 
 `--agent` for an uninstalled adapter errors with an install hint; `--structured-view` (no `--agent`) falls back to the terminal view with a warning so the command still succeeds.

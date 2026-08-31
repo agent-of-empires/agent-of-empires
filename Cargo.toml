@@ -75,6 +75,7 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # UUID generation
 uuid = { version = "1.23", features = ["v4"] }
+zstd = "0.13"
 
 # Random
 rand = "0.10"

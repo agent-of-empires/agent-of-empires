@@ -457,17 +457,17 @@ pub struct PermissionResponse {
 /// "done working, waiting for the user" signal and fires whenever Claude parks
 /// at the prompt regardless of why the turn ended, so it backstops `Stop`;
 /// `StopFailure` covers the API-error path deterministically. The remaining
-/// gap (silent tool stop) has no hook, so it is recovered pane-side by
-/// `reconcile_claude_hook_status`.
+/// gap (silent tool stop) has no hook, so it is recovered pane-side by the
+/// parked-evidence rules in `detect/manifests/claude.toml`.
 ///
 /// The `idle_prompt` backstop also introduces a write race: `Stop` and
 /// `UserPromptSubmit` hooks are awaited, but `Notification` hooks are
 /// fire-and-forget, so when a queued prompt submits the moment a turn ends,
 /// the notification's `idle` write can land after `UserPromptSubmit`'s
 /// `running`, leaving the file on `idle` while the new turn generates (no
-/// running-mapped hook fires again until its first `PreToolUse`). An `idle`
-/// read on a session last observed Running/Waiting is therefore reconciled
-/// against the pane (`reconcile_claude_idle_hook_status`).
+/// running-mapped hook fires again until its first `PreToolUse`). The pane's
+/// own running evidence outranks an `idle` write in the detection manifest,
+/// which is what recovers that race.
 ///
 /// The `Notification` matchers also carry the agent-view identifiers added in
 /// Claude Code 2.1.198: `agent_needs_input` (background session blocked on the
@@ -483,8 +483,8 @@ pub struct PermissionResponse {
 /// makes the status command write `waiting` when the payload's `tool_name` is
 /// `AskUserQuestion`, and the `PostToolUse` matcher restores `running` the
 /// moment the answer lands (the rest of the turn is ordinary generation). The
-/// pane-side `reconcile_claude_hook_status` stays as the backstop for hooks
-/// installed before this pair existed.
+/// pane-side detection rules stay as the backstop for hooks installed before
+/// this pair existed.
 const CLAUDE_HOOK_EVENTS: &[HookEvent] = &[
     HookEvent {
         name: "SessionStart",
@@ -1047,7 +1047,14 @@ pub const AGENTS: &[AgentDef] = &[
         container_env: &[("PI_CODING_AGENT_DIR", "/root/.pi/agent")],
         hook_config: None,
         sidecar_hooks: None,
-        resume_strategy: ResumeStrategy::Flag("--session"),
+        // `--session-id` both creates and attaches, so it carries a pinned
+        // id; `--session` (every pi version) only resumes one already on
+        // file, and is what an unpinnable binary falls back to. See
+        // `pi_supports_session_id_flag`.
+        resume_strategy: ResumeStrategy::FlagPair {
+            existing: "--session",
+            new_session: "--session-id",
+        },
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -1089,7 +1096,7 @@ pub const AGENTS: &[AgentDef] = &[
         yolo: Some(YoloMode::AlwaysYolo),
         instruction_flag: None,
         set_default_command: false,
-        detect_status: status_detection::detect_settl_status,
+        detect_status: status_detection::detect_hook_only_status,
         container_env: &[],
         // settl uses TOML config (`[[hooks]]` entries), not the JSON
         // settings.json schema, so it installs via a sidecar hook. host_only,
@@ -1169,7 +1176,7 @@ pub const AGENTS: &[AgentDef] = &[
         yolo: Some(YoloMode::CliFlag("--trust-all-tools")),
         instruction_flag: None,
         set_default_command: false,
-        detect_status: status_detection::detect_kiro_status,
+        detect_status: status_detection::detect_hook_only_status,
         container_env: &[("KIRO_CONFIG_DIR", "/root/.kiro")],
         // Kiro uses a per-agent JSON config (lowercase event names, flat
         // {command} objects) rather than the JSON settings.json schema shared
@@ -1265,7 +1272,7 @@ pub const AGENTS: &[AgentDef] = &[
         yolo: Some(YoloMode::CliFlag("--yolo")),
         instruction_flag: None,
         set_default_command: false,
-        detect_status: status_detection::detect_kimi_status,
+        detect_status: status_detection::detect_hook_only_status,
         container_env: &[("KIMI_CODE_HOME", "/root/.kimi-code")],
         // Kimi Code stores hooks as `[[hooks]]` entries in its runtime
         // `config.toml` (which also holds provider/oauth settings), so it
@@ -1338,7 +1345,7 @@ pub const AGENTS: &[AgentDef] = &[
         yolo: Some(YoloMode::AlwaysYolo),
         instruction_flag: Some("--append-system-prompt {}"),
         set_default_command: false,
-        detect_status: status_detection::detect_prime_agent_status,
+        detect_status: status_detection::detect_hook_only_status,
         container_env: &[("PRIME_AGENT_CODING_AGENT_DIR", "/root/.prime/agent")],
         // Level 3 (hooks) is skipped by design: upstream has no hook system
         // at all (no Claude/Codex/Kiro-style config file to write), so status
@@ -1483,6 +1490,62 @@ impl AgentDef {
         }
     }
 }
+
+/// Whether `help` advertises `flag`, matched on the whole flag: what follows
+/// must end it (whitespace, `=`, or the `,` of an alias list such as
+/// `--extension, -e`), so `--session-id` is never read out of
+/// `--session-id-file`.
+fn help_advertises_flag(help: &str, flag: &str) -> bool {
+    help.match_indices(flag).any(|(index, _)| {
+        help[index + flag.len()..]
+            .chars()
+            .next()
+            .is_none_or(|next| next.is_whitespace() || next == '=' || next == ',')
+    })
+}
+
+/// One cached `pi --help` per process: two launch decisions read it, and a
+/// launch cannot afford to re-run it.
+fn pi_help_text() -> &'static str {
+    static HELP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HELP.get_or_init(|| {
+        let Some(agent) = get_agent("pi") else {
+            return String::new();
+        };
+        let mut cmd = std::process::Command::new(agent.binary);
+        cmd.arg("--help");
+        crate::process::run_with_timeout(&mut cmd, PI_HELP_PROBE_TIMEOUT)
+            .ok()
+            .flatten()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .unwrap_or_default()
+    })
+}
+
+/// Whether the `pi` on PATH loads an extension from the command line
+/// (`--extension`, `-e`). That is what lets AoE publish the pane's current
+/// conversation, `/new` included, instead of inferring it from a store keyed
+/// by cwd.
+pub(crate) fn pi_supports_extension_flag() -> bool {
+    help_advertises_flag(pi_help_text(), "--extension")
+}
+
+/// Whether the `pi` on PATH understands `--session-id` (pi 0.76.0+), which is
+/// what lets AoE pin a conversation at launch instead of guessing which file
+/// in the shared store belongs to this pane (#3576).
+///
+/// Probed once per process from `pi --help` and cached: the answer is a
+/// property of the installed binary, and a launch cannot afford to re-run it.
+/// Any failure (binary absent, non-zero exit, timeout) reports `false`, so an
+/// unknown binary launches exactly as it did before pinning existed rather
+/// than emitting a flag it may not accept. The cache keeps a failure too, so
+/// a transient one disables pinning until the process restarts.
+pub(crate) fn pi_supports_session_id_flag() -> bool {
+    help_advertises_flag(pi_help_text(), "--session-id")
+}
+
+const PI_HELP_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub fn get_agent(name: &str) -> Option<&'static AgentDef> {
     AGENTS.iter().find(|a| a.name == name)
@@ -1968,6 +2031,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn pi_help_probe_matches_only_the_whole_flag() {
+        // The probe decides whether AoE may pin a Pi conversation at launch,
+        // so a longer flag that merely starts the same way must not pass for
+        // it, and an old help text without the flag must not either.
+        assert!(help_advertises_flag(
+            "  --session-id <id>    Use exact project session ID\n",
+            "--session-id"
+        ));
+        assert!(help_advertises_flag("--session-id=<id>", "--session-id"));
+        assert!(help_advertises_flag("--session-id", "--session-id"));
+        assert!(!help_advertises_flag(
+            "  --session-id-file <path>\n",
+            "--session-id"
+        ));
+        assert!(!help_advertises_flag(
+            "  --extensions-dir <dir>\n",
+            "--extension"
+        ));
+        assert!(!help_advertises_flag(
+            "  --session <path|id>    Use specific session file\n",
+            "--session-id"
+        ));
+        assert!(help_advertises_flag(
+            "  --extension, -e <path>   Load an extension file\n",
+            "--extension"
+        ));
     }
 
     #[test]

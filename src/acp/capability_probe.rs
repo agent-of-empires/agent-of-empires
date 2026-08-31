@@ -3,7 +3,7 @@
 //! The structured-session model / mode / thought-level pickers are fed by the
 //! `config_options` an agent advertises. Those are cached per-agent in
 //! [`crate::acp::option_catalog`], but only ever written as a side effect of a
-//! *live* session (`src/server/mod.rs` on `ConfigOptionsUpdated`). So an agent
+//! *live* session (`src/server/acp_events.rs` on `ConfigOptionsUpdated`). So an agent
 //! that has never run shows an empty picker, which reads as a bug.
 //!
 //! ACP puts the option set in the `session/new` response itself

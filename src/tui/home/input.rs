@@ -3283,7 +3283,7 @@ impl HomeView {
                 return;
             }
         } else {
-            let child_id = crate::session::capture::generate_claude_session_id();
+            let child_id = crate::session::capture::generate_session_uuid();
             match crate::session::fork::terminal_fork_seed(
                 &tool,
                 parent_agent_session_id.as_deref(),

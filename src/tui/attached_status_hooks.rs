@@ -164,7 +164,7 @@ fn snapshot(sessions: &[AttachedStatusHookSession]) -> Vec<StatusUpdate> {
             // `Set(ts)` / `Clear` reflect the real observation.
             //
             // Arm order matches consumer sites (`apply_updates` above,
-            // `apply_status_update` in `src/tui/home/mod.rs`) and the
+            // `apply_status_update` in `src/tui/home/status.rs`) and the
             // enum declaration in `src/tui/status_poller.rs`:
             // `Set` first, `Clear` second, `Keep` last.
             idle_entered_at: match (
@@ -233,7 +233,7 @@ mod tests {
         // `apply_updates` (the `match update.idle_entered_at` arms
         // above) is the attached-hooks copy of the same match that
         // `HomeView::apply_status_update` performs in
-        // `src/tui/home/mod.rs`. The `home` copy is covered by
+        // `src/tui/home/status.rs`. The `home` copy is covered by
         // `apply_status_update_clears_idle_entered_at_on_idle_to_running`
         // in `src/tui/home/tests.rs`. This test locks the equivalent
         // shape here so a Set<->Clear swap in either consumer is

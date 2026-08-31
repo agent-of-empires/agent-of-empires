@@ -1,0 +1,60 @@
+id = "copilot"
+
+# Copilot renders a bordered full-screen TUI; its bottom status line is the
+# signal. The parked and blocked shapes outrank the working ones, because it
+# keeps its spinner rendered under a prompt it is blocked on.
+[[rules]]
+extends = "approval_prompt"
+id = "approval_prompt"
+priority = 950
+contains_any = [
+  "continue?",
+  "run command?",
+  "allow this tool",
+  "approve for the rest",
+  "enter to select",
+  "esc to cancel",
+]
+
+# The parked footer (`/ commands · ? help · tab next tab`), or the input
+# prompt itself.
+[[rules]]
+id = "ready_footer"
+state = "waiting"
+priority = 940
+region = "whole_recent"
+visible = true
+contains = ["/ commands", "? help", "tab next tab"]
+
+[[rules]]
+extends = "input_prompt"
+id = "input_prompt"
+priority = 940
+any = [
+  { line_regex = ['(?i)^\s*copilot>\s*$'] },
+  { line = { regex = ['(?i)^\s*>\s\S.{0,96}$'], not_regex = ['(?i)esc'] } },
+]
+
+# Only the last three lines: a finished turn leaves its own activity text in
+# the transcript, and the status line is always at the bottom.
+[[rules]]
+id = "footer_spinner"
+state = "running"
+priority = 930
+region = "bottom_non_empty_lines(3)"
+visible = true
+line_regex = ['[\x{2800}-\x{28FF}]']
+
+[[rules]]
+id = "footer_activity"
+state = "running"
+priority = 920
+region = "bottom_non_empty_lines(3)"
+visible = true
+contains_any = [
+  "thinking",
+  "working",
+  "esc to interrupt",
+  "ctrl+c to interrupt",
+  "esc cancel",
+]

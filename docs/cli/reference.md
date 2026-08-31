@@ -205,8 +205,8 @@ Add a new session
 * `--extra-args <EXTRA_ARGS>` — Extra arguments to append after the agent binary
 * `--cmd-override <CMD_OVERRIDE>` — Override the agent binary command
 * `--structured-view` — Render this session in the structured view (ACP-based native rendering) instead of the default terminal view. `aoe add` defaults to the terminal (raw tmux/PTY) so the CLI matches the TUI; pass this (or `--agent`) to opt into the structured rendering. Ignored for tools with no ACP adapter
-* `--agent <AGENT>` — Pick a specific ACP agent for the structured view (e.g., aoe-agent, claude-code)
-* `--model <MODEL>` — Override the model used by aoe-agent (e.g., claude-opus-4-7, gpt-5, gemini-2.5-pro). Forwarded to the agent at session start
+* `--agent <AGENT>` — Pick a specific ACP agent for the structured view (e.g., claude-code, codex)
+* `--model <MODEL>` — Override the model used by the ACP agent (e.g., claude-opus-4-7, gpt-5, gemini-2.5-pro). Forwarded to the agent at session start
 * `--scratch` — Create the session in a fresh scratch directory under `<app_dir>/scratch/<id>/` instead of a project path. The directory is removed when the session is deleted (unless `aoe rm` is given `--keep-scratch`). Mutually exclusive with worktree-related flags
 
 

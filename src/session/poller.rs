@@ -114,6 +114,11 @@ pub(crate) enum SessionIdGuard {
     /// upgrade.
     OmpLegacy,
     OmpGeneration(String),
+    /// Read from a per-instance sidecar the agent itself wrote (Pi's
+    /// extension), so the observation names this pane rather than being
+    /// inferred from a store. Sources that cannot do that are refused for Pi;
+    /// see `session::sync`.
+    InstanceSidecar,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -130,6 +135,13 @@ impl SessionIdObservation {
         Self {
             sid,
             guard: SessionIdGuard::Unguarded,
+        }
+    }
+
+    pub(crate) fn instance_sidecar(sid: String) -> Self {
+        Self {
+            sid,
+            guard: SessionIdGuard::InstanceSidecar,
         }
     }
 
@@ -427,6 +439,16 @@ impl SessionPoller {
                 SessionIdObservation::unguarded(session_id.to_string()),
             ))
             .expect("inject_test_update: result channel disconnected");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_test_sidecar_update(&self, instance_id: &str, session_id: &str) {
+        self.result_tx
+            .send((
+                instance_id.to_string(),
+                SessionIdObservation::instance_sidecar(session_id.to_string()),
+            ))
+            .expect("inject_test_sidecar_update: result channel disconnected");
     }
 
     #[cfg(test)]
