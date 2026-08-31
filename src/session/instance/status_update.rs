@@ -530,10 +530,16 @@ mod tests {
         let resolved = format!("{}live_elsewhere_00000000", crate::tmux::SESSION_PREFIX);
 
         let guard = crate::tmux::SessionCacheGuard::capture();
-        guard.force_present(&[resolved.as_str()]);
 
+        // Force the snapshot immediately before each probe. `#[serial]` only
+        // excludes other serial tests, and the resolved-name pass below spawns
+        // tmux for pane metadata and capture; a parallel test refreshing the
+        // process-global cache during that window (routine on a suite whose
+        // tmux server comes and goes) leaves a `data: None` snapshot, and the
+        // second probe then reads Unknown instead of Absent.
         let mut inst = Instance::new("resolve-r2", "/tmp/resolve-r2");
         inst.status = Status::Running;
+        guard.force_present(&[resolved.as_str()]);
         inst.update_status_with_metadata_inner(None, Some(&resolved));
         assert!(
             inst.ever_confirmed_present,
@@ -543,6 +549,7 @@ mod tests {
 
         let mut untold = Instance::new("resolve-r2", "/tmp/resolve-r2");
         untold.status = Status::Running;
+        guard.force_present(&[resolved.as_str()]);
         untold.update_status_with_metadata_inner(None, None);
         assert_eq!(
             untold.status,
