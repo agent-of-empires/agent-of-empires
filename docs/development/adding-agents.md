@@ -24,7 +24,7 @@ Each level is additive; do only what the agent supports.
 | Level | What it gives | Requires |
 |-------|---------------|----------|
 | 1. Basic | Appears in `aoe agents`, sessions launch, status always "Idle" | `AgentDef` + stub `detect_status` |
-| 2. Pane-parse status | Status inferred from terminal output; no agent config | A manifest (Claude, Cursor) or a `detect_<agent>_status(&str) -> Status` (OpenCode, Vibe, Copilot, Pi, Droid) |
+| 2. Pane-parse status | Status inferred from terminal output; no agent config | A manifest in `src/tmux/detect/manifests/`, plus a `detect_<agent>_status(&str) -> Status` calling into it |
 | 3. Hook status | Agent writes status to a file via hooks; lands the instant state changes, and carries the agent's session id for resume | `hook_config` + generic `install_hooks()` or a custom `install_<agent>_hooks()` (Claude, Cursor, Gemini generic; Codex TOML, Hermes YAML, Kiro JSON) |
 | 4. Session resume | Restart resumes the prior conversation | `resume_strategy` in `AgentDef` |
 | 5. Docker sandbox | Runs isolated; host config synced in | `AgentConfigMount` + Dockerfile install |
@@ -95,7 +95,7 @@ type = "command"
 command = "sh -c '...'"
 ```
 
-Set `hook_config: Some(AgentHookConfig { settings_rel_path: ".codex/config.toml", ... })`. Host installs must go through `install_codex_hooks()` / `uninstall_codex_hooks()` so `CODEX_HOME`, existing `[hooks.state]` trust data, `[features].hooks = false`, the `config.toml.lock`, and atomic replacement are respected. Codex status is hook-first with targeted pane reconciliation for known hook gaps.
+Set `hook_config: Some(AgentHookConfig { settings_rel_path: ".codex/config.toml", ... })`. Host installs must go through `install_codex_hooks()` / `uninstall_codex_hooks()` so `CODEX_HOME`, existing `[hooks.state]` trust data, `[features].hooks = false`, the `config.toml.lock`, and atomic replacement are respected. Codex status weighs the hook write against its manifest rules by declared priority, so a prompt on screen outranks a `running` write.
 
 ### Hermes (custom YAML)
 

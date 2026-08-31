@@ -569,16 +569,14 @@ pub struct Instance {
     #[serde(skip)]
     pub unknown_since: Option<std::time::Instant>,
 
-    /// tmux's last-output timestamp for the pane at the last capture, and the
-    /// status that capture resolved to. A pane that has drawn nothing since
-    /// cannot have changed, so the capture is skipped and that status stands:
-    /// a parked session costs one batched format read per poll rather than a
-    /// subprocess. `#[serde(skip)]` like the rest of the live-status
-    /// bookkeeping, so a fresh load re-derives both.
+    /// tmux's last-output timestamp for the pane at the last capture. A pane
+    /// that has drawn nothing since cannot have changed, so the capture is
+    /// skipped and the previous verdict stands: a parked session costs one
+    /// batched format read per poll rather than a subprocess.
+    /// `#[serde(skip)]` like the rest of the live-status bookkeeping, so a
+    /// fresh load re-derives it.
     #[serde(skip)]
     pub detection_activity: Option<i64>,
-    #[serde(skip)]
-    pub detection_status: Option<Status>,
     /// The manifest rule that decided the last detection, for the
     /// status-change log. Names why a session is in the state it is in, which
     /// is what a wrong-state report needs and what a fingerprint of pane

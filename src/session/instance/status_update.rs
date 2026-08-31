@@ -3,6 +3,30 @@
 
 use super::*;
 
+/// Whether this poll can reuse the last verdict instead of capturing the pane.
+///
+/// Four conditions, and each one has cost a bug:
+///
+/// - tmux has to have given us an activity stamp at all; without one there is
+///   nothing to compare and every poll captures.
+/// - The pane must have drawn nothing since the last capture. Anything drawn
+///   could have changed the verdict.
+/// - The session must have no hook file, since a hook write changes the
+///   verdict without the pane drawing anything.
+/// - No proposal may be waiting on its confirming poll. The pane that produced
+///   a hold is exactly the one that then goes quiet, so skipping here would
+///   leave the proposal unresolved and the session pinned on its previous
+///   status until new output arrived, which is the failure this whole path
+///   exists to end.
+fn skip_capture(
+    activity: Option<i64>,
+    last_activity: Option<i64>,
+    has_hook: bool,
+    pending: bool,
+) -> bool {
+    activity.is_some() && activity == last_activity && !has_hook && !pending
+}
+
 /// How long a `running` hook write keeps its authority for an agent that is
 /// still on a hand-written detector. Matches the bound the manifests declare,
 /// which is what keeps a lost terminating hook from pinning a parked session
@@ -282,9 +306,9 @@ impl Instance {
             return;
         }
 
-        // Agents still on hand-written detectors: the hook file decides, with
-        // the pane consulted to release a `waiting` write whose clearing hook
-        // never fired (an Esc-cancelled prompt).
+        // Agents still on hand-written detectors: the hook file decides. The
+        // three that reach this path (settl, kiro, kimi) render no pane shape
+        // worth parsing, so there is nothing to weigh the write against.
         //
         // A `running` write past the freshness bound is not consulted at all.
         // The terminating hook can be lost, and an unbounded write then
@@ -296,13 +320,7 @@ impl Instance {
                     .age
                     .is_some_and(|age| age >= LEGACY_RUNNING_HOOK_MAX_AGE);
             if !stale_running {
-                self.status = match hook.status {
-                    Status::Waiting => match session.capture_pane(50) {
-                        Ok(pane) => tmux::reconcile_waiting_hook(hook_tool, &pane),
-                        Err(_) => hook.status,
-                    },
-                    other => other,
-                };
+                self.status = hook.status;
                 self.last_error = None;
                 return;
             }
@@ -396,8 +414,12 @@ impl Instance {
         let osc_title = metadata
             .and_then(|m| m.pane_title.as_deref())
             .unwrap_or_default();
-        let screen_unchanged =
-            activity.is_some() && self.detection_activity == activity && hook.is_none();
+        let screen_unchanged = skip_capture(
+            activity,
+            self.detection_activity,
+            hook.is_some(),
+            self.pending_detection.is_some(),
+        );
 
         if screen_unchanged {
             // Nothing to re-decide, and nothing to re-derive from: the checks
@@ -423,7 +445,6 @@ impl Instance {
             // The screen is an agent-owned viewer; the last known status
             // stands rather than being overwritten by what a pager shows.
             self.detection_activity = activity;
-            self.detection_status = Some(self.status);
             self.detection_rule = Some(detection.rule);
             return;
         };
@@ -454,7 +475,6 @@ impl Instance {
             }
         }
         self.detection_activity = activity;
-        self.detection_status = Some(self.status);
         self.detection_rule = Some(detection.rule);
         tracing::trace!(target: "session.store",
             "status '{}': manifest rule={} candidate={:?} visible={} -> {:?}",
@@ -507,6 +527,26 @@ impl Instance {
 mod tests {
     use super::*;
     use crate::session::instance::test_helpers::*;
+
+    #[test]
+    fn test_skip_capture_requires_a_resolved_proposal() {
+        // The regression this guard reintroduced once: a turn ends, the poll
+        // that sees the final frame proposes Idle and holds it for a
+        // confirming poll, and the pane then draws nothing. Skipping that
+        // confirming poll leaves the hold unresolved forever.
+        assert!(
+            !skip_capture(Some(100), Some(100), false, true),
+            "a pending proposal must be resolved, not skipped past"
+        );
+        assert!(skip_capture(Some(100), Some(100), false, false));
+
+        // A hook write changes the verdict without the pane drawing anything.
+        assert!(!skip_capture(Some(100), Some(100), true, false));
+        // Fresh output, or no stamp to compare against at all.
+        assert!(!skip_capture(Some(101), Some(100), false, false));
+        assert!(!skip_capture(None, None, false, false));
+        assert!(!skip_capture(Some(100), None, false, false));
+    }
 
     #[test]
     fn test_confirm_detection_holds_only_unwitnessed_idle() {

@@ -38,9 +38,8 @@ pub fn detect_via_manifest(
 
 /// Rules-free pane detection: strip ANSI, then the built-in detector only, no
 /// status-rule registry consult. Used by callers that are keyed to the
-/// built-in / alias identity rather than to a session's profile (see
-/// `reconcile_waiting_hook`), so their behavior is independent of any
-/// configured `[[agents.<name>.status_rules]]`.
+/// built-in / alias identity rather than to a session's profile, so their
+/// behavior is independent of any configured `[[agents.<name>.status_rules]]`.
 pub fn detect_status_from_content(content: &str, tool: &str) -> Status {
     let clean = strip_ansi(content);
     crate::agents::get_agent(tool)
@@ -84,45 +83,6 @@ pub fn detect_claude(
     super::detect::detect("claude", &strip_ansi(content), osc_title, hook)
         .and_then(|d| d.status)
         .unwrap_or(Status::Idle)
-}
-
-/// Reconcile a hook that reports `Waiting` against the live pane, for any agent.
-///
-/// Several agents write `waiting` to the status file directly from a hook the
-/// moment a blocking prompt appears: Claude (`AskUserQuestion` `PreToolUse` and
-/// the `permission_prompt` `Notification`), Codex (`PermissionRequest`), Cursor
-/// and Qwen (`permission_prompt` `Notification`), and Gemini (`ToolPermission`
-/// `Notification`). The write that clears it (`PostToolUse` /
-/// `ElicitationResult` -> `running`) only fires when the tool runs to
-/// completion. If the user Esc-cancels the prompt the tool never runs, no
-/// clearing hook fires, and the status file sticks on `waiting` until the next
-/// prompt is submitted, pinning the session yellow. This is the `Waiting`
-/// analogue of the Esc-interrupt gap `reconcile_claude_hook_status` handles for
-/// `Running`.
-///
-/// Re-run the agent's own pane detector, which is built to recognize exactly
-/// that agent's blocking prompt: while the prompt is still on screen the
-/// detector re-reports `Waiting` and we keep it; once it is gone the detector's
-/// `Running` (a turn resumed) or `Idle` (parked at the prompt) verdict replaces
-/// the stale wait. An empty capture carries no evidence, so keep `Waiting`
-/// there rather than let a blank or mid-redraw frame flip a live prompt to Idle.
-/// The detector is the same one the hook-disabled path already trusts, so this
-/// adds no new false-positive surface, only the un-stick.
-pub(crate) fn reconcile_waiting_hook(agent: &str, raw_content: &str) -> Status {
-    if raw_content.trim().is_empty() {
-        return Status::Waiting;
-    }
-    match detect_status_from_content(raw_content, agent) {
-        // Prompt still on screen: the wait is real, keep it.
-        Status::Waiting => Status::Waiting,
-        // Prompt gone (Esc-cancelled, or answered with a missed clearing hook):
-        // the detector's fresh read of the pane wins over the stale hook.
-        other => {
-            tracing::debug!(target: "tmux.status",
-                "{agent} reconciler: stale hook Waiting reconciled to {other:?} (prompt gone)");
-            other
-        }
-    }
 }
 
 pub fn detect_opencode_status(raw_content: &str) -> Status {
@@ -312,6 +272,15 @@ mod tests {
     /// the shape it claims to exercise is really present.
     fn claude_rule_matches(rule: &str, content: &str) -> bool {
         super::super::detect::rule_matches("claude", rule, &strip_ansi(content), "", None)
+    }
+
+    /// A `waiting` write left behind by a prompt the user cancelled: the write
+    /// nothing clears, which is why the screen has to be able to outrank it.
+    fn stale_wait() -> Option<super::super::detect::HookObservation> {
+        Some(hook_at(
+            Status::Waiting,
+            Some(std::time::Duration::from_secs(600)),
+        ))
     }
 
     /// The rule that decided a capture, which is what the status-change log
@@ -890,11 +859,11 @@ enter to select · esc to cancel";
     }
 
     #[test]
-    fn test_reconcile_waiting_hook_blank_pane_keeps_waiting() {
+    fn test_stale_waiting_hook_blank_pane_keeps_waiting() {
         // No evidence either way: a blank or whitespace-only capture must not
         // flip a live prompt to Idle. Keep the hook's Waiting.
-        assert_eq!(reconcile_waiting_hook("claude", ""), Status::Waiting);
-        assert_eq!(reconcile_waiting_hook("claude", "   \n\n"), Status::Waiting);
+        assert_eq!(detect_claude("", "", stale_wait()), Status::Waiting);
+        assert_eq!(detect_claude("   \n\n", "", stale_wait()), Status::Waiting);
     }
 
     #[test]
@@ -1293,7 +1262,7 @@ enter to select · esc to cancel";
     }
 
     #[test]
-    fn test_reconcile_waiting_hook_claude_cleared_on_esc_cancel() {
+    fn test_stale_waiting_hook_claude_cleared_on_esc_cancel() {
         // Regression from #2937: Claude's PreToolUse writes `waiting` for
         // AskUserQuestion, but Esc-cancelling the question fires no PostToolUse
         // (the tool never completes), so the hook file sticks on `waiting`. Once
@@ -1304,89 +1273,98 @@ enter to select · esc to cancel";
         let pane = "\x1b[1m> Tell me about the weather\x1b[0m\n\
 ● I'll pull that up.\n\n\
 What should Claude do instead?\n❯\n  ? for shortcuts";
-        assert_eq!(reconcile_waiting_hook("claude", pane), Status::Idle);
+        assert_eq!(detect_claude(pane, "", stale_wait()), Status::Idle);
     }
 
     #[test]
-    fn test_reconcile_waiting_hook_claude_cleared_at_ready_prompt() {
+    fn test_stale_waiting_hook_claude_cleared_at_ready_prompt() {
         // Same stale-`waiting` gap, cancel dropped straight back to the idle
         // ready prompt. The parked `❯` plus the idle footer, no running signal,
         // reads as Idle.
         let pane = "● Done for now.\n\n❯\n  ? for shortcuts";
-        assert_eq!(reconcile_waiting_hook("claude", pane), Status::Idle);
+        assert_eq!(detect_claude(pane, "", stale_wait()), Status::Idle);
     }
 
     #[test]
-    fn test_reconcile_waiting_hook_claude_resumed_turn_reads_running() {
+    fn test_stale_waiting_hook_claude_resumed_turn_reads_running() {
         // The user cancelled the question and Claude started generating again
         // before the poll: the live spinner means Running, not a stale wait.
         let pane = "✶ Working… (4s · ↓ 88 tokens)\n  esc to interrupt";
-        assert_eq!(reconcile_waiting_hook("claude", pane), Status::Running);
+        assert_eq!(detect_claude(pane, "", stale_wait()), Status::Running);
     }
 
     #[test]
-    fn test_reconcile_waiting_hook_claude_keeps_waiting_while_question_on_screen() {
+    fn test_stale_waiting_hook_claude_keeps_waiting_while_question_on_screen() {
         // The AskUserQuestion selection UI is still parked on the pane: the
         // detector re-reports Waiting, so the wait survives (answering a real
         // question is unaffected).
         let pane = "\x1b[1m  Which approach do you prefer?\x1b[0m\n\
 ❯ 1. First\n    2. Second\n\n\
   Enter to select · ↑/↓ to navigate · Esc to cancel";
-        assert_eq!(reconcile_waiting_hook("claude", pane), Status::Waiting);
+        assert_eq!(detect_claude(pane, "", stale_wait()), Status::Waiting);
     }
 
     #[test]
-    fn test_reconcile_waiting_hook_claude_keeps_waiting_while_approval_on_screen() {
+    fn test_stale_waiting_hook_claude_keeps_waiting_while_approval_on_screen() {
         let pane = "\x1b[1m  Do you want to proceed?\x1b[0m\n\
   ❯ 1. Yes\n    2. No\n\n  Esc to cancel · Tab to amend";
-        assert_eq!(reconcile_waiting_hook("claude", pane), Status::Waiting);
+        assert_eq!(detect_claude(pane, "", stale_wait()), Status::Waiting);
     }
 
     #[test]
-    fn test_reconcile_waiting_hook_codex_cleared_and_kept() {
+    fn test_stale_waiting_hook_codex_cleared_and_kept() {
         // Codex writes `waiting` from PermissionRequest; Esc-denying it fires no
         // PostToolUse. Prompt gone -> detector reads Idle and clears; prompt
         // still up -> Waiting kept.
-        assert_eq!(reconcile_waiting_hook("codex", "file saved"), Status::Idle);
         assert_eq!(
-            reconcile_waiting_hook("codex", "approve changes?"),
+            detect_via_manifest("codex", "file saved", "", stale_wait()),
+            Status::Idle
+        );
+        assert_eq!(
+            detect_via_manifest("codex", "approve changes?", "", stale_wait()),
             Status::Waiting
         );
     }
 
     #[test]
-    fn test_reconcile_waiting_hook_cursor_cleared_and_kept() {
+    fn test_stale_waiting_hook_cursor_cleared_and_kept() {
         // Cursor writes `waiting` from a permission_prompt Notification. After
         // cancel it parks at the follow-up prompt (Idle); while the approval is
         // up it stays Waiting.
         assert_eq!(
-            reconcile_waiting_hook("cursor", "→ add a follow-up"),
+            detect_via_manifest("cursor", "→ add a follow-up", "", stale_wait()),
             Status::Idle
         );
         let prompt = "Run this command?\n\n> Allow this command\n  Deny\n\n\
 enter to select · esc to cancel";
-        assert_eq!(reconcile_waiting_hook("cursor", prompt), Status::Waiting);
-    }
-
-    #[test]
-    fn test_reconcile_waiting_hook_qwen_cleared_and_kept() {
-        // Qwen writes `waiting` from a permission_prompt Notification.
         assert_eq!(
-            reconcile_waiting_hook("qwen", "random output text"),
-            Status::Idle
-        );
-        assert_eq!(
-            reconcile_waiting_hook("qwen", "Allow this tool to run?"),
+            detect_via_manifest("cursor", prompt, "", stale_wait()),
             Status::Waiting
         );
     }
 
     #[test]
-    fn test_reconcile_waiting_hook_gemini_cleared_and_kept() {
-        // Gemini writes `waiting` from a ToolPermission Notification.
-        assert_eq!(reconcile_waiting_hook("gemini", "file saved"), Status::Idle);
+    fn test_stale_waiting_hook_qwen_cleared_and_kept() {
+        // Qwen writes `waiting` from a permission_prompt Notification.
         assert_eq!(
-            reconcile_waiting_hook("gemini", "approve changes?"),
+            detect_via_manifest("qwen", "random output text", "", stale_wait()),
+            Status::Idle
+        );
+        assert_eq!(
+            detect_via_manifest("qwen", "Allow this tool to run?", "", stale_wait()),
+            Status::Waiting
+        );
+    }
+
+    #[test]
+    fn test_stale_waiting_hook_gemini_cleared_and_kept() {
+        // Gemini writes `waiting` from a ToolPermission Notification.
+        assert_eq!(
+            detect_via_manifest("gemini", "file saved", "", stale_wait()),
+            Status::Idle
+        );
+        assert_eq!(
+            detect_via_manifest("gemini", "approve changes?", "", stale_wait()),
             Status::Waiting
         );
     }

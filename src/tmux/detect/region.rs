@@ -178,7 +178,15 @@ impl Region {
             .strip_prefix("bottom_non_empty_lines(")
             .and_then(|r| r.strip_suffix(')'))
         {
-            return n.trim().parse().ok().map(Region::BottomLines);
+            // Zero is rejected rather than clamped: an empty region matches
+            // nothing, so a rule asking for it is a manifest bug, and
+            // `manifests_compile` names the rule at build time.
+            return n
+                .trim()
+                .parse()
+                .ok()
+                .filter(|n| *n > 0)
+                .map(Region::BottomLines);
         }
         Some(match raw {
             "whole_recent" => Region::WholeRecent,

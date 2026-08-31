@@ -360,6 +360,11 @@ impl Rule {
         prompt_marker: &[regex::Regex],
         markers: &std::collections::HashMap<String, Marker>,
     ) -> bool {
+        let ctx = MatchContext {
+            screen,
+            prompt_marker,
+            markers,
+        };
         if self.is_hook {
             let Some(hook) = hook else {
                 return false;
@@ -371,24 +376,24 @@ impl Rule {
             // evidence of anything: the agent's terminating hook can be lost
             // (a turn that ends on a tool result fires none), and without a
             // bound that lost write outranks the screen indefinitely.
-            return match (self.max_age, hook.age) {
+            let fresh = match (self.max_age, hook.age) {
                 (Some(max), Some(age)) => age < max,
                 // An unreadable mtime is missing evidence, not evidence of
                 // staleness, so the bound does not fire on it.
                 (Some(_), None) => true,
                 (None, _) => true,
             };
+            // A hook rule's clauses still apply, and they carry their own
+            // regions: `hook` is a source of evidence rather than a slice of
+            // screen, so there is no text to match here beyond what a clause
+            // asks for itself.
+            return fresh && self.matcher.matches("", "", &ctx);
         }
         let text = screen.region_text(self.region, prompt_marker, markers);
         if text.is_empty() {
             return false;
         }
         let lower = text.to_lowercase();
-        let ctx = MatchContext {
-            screen,
-            prompt_marker,
-            markers,
-        };
         self.matcher.matches(&text, &lower, &ctx)
     }
 }
@@ -443,12 +448,26 @@ impl RawMatcher {
 }
 
 const SHARED_HOOK_RULES: &str = r#"
+# A `waiting` write speaks only for a capture with nothing in it.
+#
+# Several agents write `waiting` the moment a prompt appears, and
+# Esc-cancelling that prompt fires no clearing hook, so the file sticks on
+# `waiting` until the next turn (#2937). The screen is what releases it: a
+# prompt still up matches a blocking-prompt rule, a parked pane matches an idle
+# one, and a pane showing something this table has no rule for is still better
+# evidence than a write nothing will ever clear, so it falls to the default
+# rather than to the write. That leaves the write speaking for the one case the
+# screen cannot: a capture that came back empty.
+#
+# Only one hook rule can fire for a given write, so the ranking among the hook
+# rules is inert; every number here is a ranking against the screen.
 [[rules]]
 id = "hook_waiting"
 state = "waiting"
-priority = 900
+priority = 240
 region = "hook"
 hook_status = "waiting"
+not = [{ region = "whole_recent", regex = ['\S'] }]
 
 # Younger than the poll's own settling time: a turn that has just started
 # still shows the previous turn's parked chrome.

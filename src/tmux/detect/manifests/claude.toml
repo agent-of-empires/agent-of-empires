@@ -110,10 +110,9 @@ contains = [
   "yes, i trust this folder",
 ]
 
-# A `waiting` hook write, which several agents emit the moment a prompt
-# appears. Esc-cancelling the prompt fires no clearing hook, so the file
-# sticks; the running signals above and the parked evidence below both outrank
-# it, which is what releases it once the prompt is gone.
+# The completion line a finished turn leaves in the status slot above the
+# input box (`✻ Cooked for 1m 58s`). Positive evidence that the turn is over,
+# so it outranks a `running` write nobody has refreshed for 30 seconds.
 [[rules]]
 id = "completed_turn"
 state = "idle"
@@ -143,9 +142,9 @@ region = "prompt_box_body"
 visible = true
 regex = ['^\s*\x{276F}\s*$']
 
-# A `running` write with no screen evidence either way. Bounded: a turn that
-# ends on a tool result fires neither terminating hook, and an unbounded write
-# then outranks every later capture for as long as the session lives.
+# The static title glyph. Weak evidence of idle and never proof: measured
+# against 2.1.251 it also shows during a long tool call, so it ranks below
+# every screen rule and only speaks for a capture nothing else does.
 [[rules]]
 id = "osc_title_idle"
 state = "idle"
