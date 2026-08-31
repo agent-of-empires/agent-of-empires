@@ -86,18 +86,19 @@ Each entry in `events: &[HookEvent]` carries:
 | `session_id_capture` | `true` installs a command that extracts `session_id` from the agent's stdin JSON and writes it to `/tmp/aoe-hooks-<euid>/<AOE_INSTANCE_ID>/session_id` (host) or `/tmp/aoe-hooks/<AOE_INSTANCE_ID>/session_id` (sandbox; see issue #1844 for the host/container path split), read by [session-resume](../guides/session-resume.md). Currently only Claude (`SessionStart`, `UserPromptSubmit`). With `status` also set, both commands share the matcher block and the session-id command runs first so it consumes stdin before the status writer. |
 | `waiting_tools` | Tool names whose invocation blocks on the user for the tool's entire execution (Claude's `AskUserQuestion`). When non-empty on a status event, the status writer inspects the payload's `tool_name` on stdin and writes `waiting` for these tools instead of the event's status. Pair it with a tool-scoped event that restores the normal status once the tool completes (Claude adds `PostToolUse` with matcher `AskUserQuestion`), or the status sticks on `waiting` through the rest of the turn. |
 
-### Codex (custom TOML)
+### Codex (`hooks.json` plus separate TOML state)
 
-`[hooks]` table in `.codex/config.toml`:
+Codex reads AoE hook handlers from `.codex/hooks.json`, resolved relative to `CODEX_HOME` (default `~/.codex`). Declare `settings_rel_path: ".codex/hooks.json"` with `format: HookFormat::CodexJson`. The file uses the same JSON payload shape as the generic hook settings:
 
-```toml
-[[hooks.PreToolUse]]
-[[hooks.PreToolUse.hooks]]
-type = "command"
-command = "sh -c '...'"
+```json
+{
+  "hooks": {
+    "PreToolUse": [{"hooks": [{"type": "command", "command": "sh -c '...'"}]}]
+  }
+}
 ```
 
-Set `hook_config: Some(AgentHookConfig { settings_rel_path: ".codex/config.toml", ... })`. Host installs must go through `install_codex_hooks()` / `uninstall_codex_hooks()` so `CODEX_HOME`, existing `[hooks.state]` trust data, `[features].hooks = false`, the `config.toml.lock`, and atomic replacement are respected. Codex status weighs the hook write against its manifest rules by declared priority, so a prompt on screen outranks a `running` write.
+Host installation resolves `hooks.json` through `codex_hooks_json_path_for_host_environment()` and writes it with `install_hooks()`; `HookTargetKind::CodexJson` uninstall targets use `uninstall_hooks()`. Keep `.codex/config.toml` separate: it owns `[hooks.state]` trust data and `[features].hooks = false`. The `install_codex_hooks()` / `uninstall_codex_hooks()` TOML workflow keeps those updates behind `config.toml.lock` and atomic replacement. Do not point `settings_rel_path` at `config.toml`. Codex status weighs the hook write against its manifest rules by declared priority, so a prompt on screen outranks a `running` write.
 
 ### Hermes (custom YAML)
 
