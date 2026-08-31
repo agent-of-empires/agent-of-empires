@@ -877,22 +877,21 @@ pub fn stop_all_sessions() -> anyhow::Result<usize> {
         .output()
         .map_err(|e| anyhow::anyhow!("tmux list-sessions spawn failed: {e}"))?;
 
+    let mut matched = false;
     let killed = if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         stop_aoe_sessions(stdout.lines(), |name| {
+            matched = true;
             if let Some(pid) = crate::process::get_pane_pid(name) {
                 crate::process::kill_process_tree(pid);
             }
-            tmux_command()
-                .args(["kill-session", "-t", name])
-                .output()
-                .is_ok_and(|result| result.status.success())
+            utils::kill_session_if_present(name).is_ok()
         })
     } else {
         0
     };
 
-    if killed > 0 {
+    if matched {
         refresh_session_cache();
     }
     Ok(killed)

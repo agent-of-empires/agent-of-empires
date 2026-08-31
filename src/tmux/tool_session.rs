@@ -221,7 +221,7 @@ impl ToolSession {
 pub fn kill_all_tool_sessions_for_id(session_id: &str) {
     let id_suffix = format!("_{}", truncate_id(session_id, 8));
 
-    let output = crate::tmux::tmux_command()
+    let output = crate::tmux::tmux_query_command()
         .args(["list-sessions", "-F", "#{session_name}"])
         .output();
 
