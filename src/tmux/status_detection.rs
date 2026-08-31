@@ -28,9 +28,9 @@ pub fn detect_status_from_content_in(profile: &str, content: &str, tool: &str) -
 /// The status poller and `aoe session capture` both route through this so they
 /// cannot disagree about a configured rule or a terminal title (#3625). The
 /// two identities are separate on purpose: `rules_tool` is what configured
-/// rules are keyed to ([`super::status_rules::detection_tool`], which keeps a
-/// session's own rules ahead of its `agent_detect_as` alias), while `agent` is
-/// the manifest identity, which follows the alias. `clean` must already be
+/// rules are keyed to (`status_rules::detection_tool`, which keeps a session's
+/// own rules ahead of its `agent_detect_as` alias), while `agent` is the
+/// manifest identity, which follows the alias. `clean` must already be
 /// ANSI-stripped; `osc_title` is tmux's `#{pane_title}`, empty when unknown.
 ///
 /// `None` means the agent has no manifest and no configured rules, leaving the
