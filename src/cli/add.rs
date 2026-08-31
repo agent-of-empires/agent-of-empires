@@ -865,7 +865,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                         "ACP adapter `{}` is not installed or not on $PATH.\n\
                          Install: {}\n\
                          Or run: aoe acp doctor --fix\n\
-                         Or use the bundled fallback: rerun with `--agent aoe-agent`\n\
                          Or use the terminal view: drop --agent / --structured-view.",
                         spec.command,
                         hint
