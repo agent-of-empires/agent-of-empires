@@ -27,66 +27,44 @@ impl HomeView {
             for inst in &mut instances {
                 inst.source_profile = profile_name.clone();
             }
-            // Backfill / heal trashed worktrees: relocate any still sitting in
-            // the active dir (rows trashed before relocation existed) and fix a
-            // pointer a crash left stale. Best-effort and only touches trashed
-            // rows, which are typically few. See #2522.
-            for instance in &mut instances {
-                if !instance.is_trashed() {
-                    continue;
-                }
-                if let Err(error) = crate::session::trash::reconcile_trashed_transition(instance) {
-                    tracing::warn!(
-                        target: "tui.home",
-                        session = %instance.id,
-                        "trash reconciliation skipped: {error}",
-                    );
-                }
-            }
-            // Heal a managed worktree whose directory was moved outside aoe
-            // (a `git worktree move` from another shell): rewrite project_path
-            // from git so attach, status, diff, and rename all act on the live
-            // location instead of failing. Only rows whose recorded path is
-            // already gone cost anything. See #2002.
-            let mut reconcile_cache = crate::session::worktree_reconcile::ReconcileCache::default();
-            for instance in &mut instances {
-                if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist(
-                    &storage,
-                    instance,
-                    &mut reconcile_cache,
-                ) {
-                    tracing::warn!(
-                        target: "tui.home",
-                        session = %instance.id,
-                        "worktree path reconciliation skipped: {error}",
-                    );
-                }
-            }
-            // Clear expired lifecycle reservations only while holding the same
-            // per-instance flock used by live transitions.
+            // Clear expired lifecycle reservations in one write, under the same
+            // per-instance flocks live transitions take. Locks are acquired in
+            // sorted id order; peers take one at a time, so an ordered
+            // multi-lock holder cannot close a cycle with them.
             let ttl = crate::session::Instance::LIFECYCLE_RESERVATION_TTL;
             let now = chrono::Utc::now();
-            for instance in &mut instances {
-                if !instance.has_fresh_lifecycle_reservation(now)
-                    && instance.lifecycle_reservation.is_some()
-                {
-                    let Ok(_lifecycle_lock) = storage.acquire_instance_lifecycle_lock(&instance.id)
-                    else {
-                        continue;
-                    };
-                    let target_id = instance.id.clone();
-                    if storage
-                        .update(|disk, _groups| {
-                            if let Some(stored) =
-                                disk.iter_mut().find(|candidate| candidate.id == target_id)
-                            {
-                                stored.clear_expired_lifecycle_reservation(ttl, now);
-                            }
-                            Ok(())
-                        })
-                        .is_ok()
-                    {
-                        instance.clear_expired_lifecycle_reservation(ttl, now);
+            let mut expired: Vec<String> = instances
+                .iter()
+                .filter(|instance| {
+                    instance.lifecycle_reservation.is_some()
+                        && !instance.has_fresh_lifecycle_reservation(now)
+                })
+                .map(|instance| instance.id.clone())
+                .collect();
+            if !expired.is_empty() {
+                expired.sort();
+                let mut locks = Vec::with_capacity(expired.len());
+                expired.retain(|id| match storage.acquire_instance_lifecycle_lock(id) {
+                    Ok(lock) => {
+                        locks.push(lock);
+                        true
+                    }
+                    Err(_) => false,
+                });
+                let cleared = storage.update(|disk, _groups| {
+                    for id in &expired {
+                        if let Some(stored) = disk.iter_mut().find(|candidate| &candidate.id == id)
+                        {
+                            stored.clear_expired_lifecycle_reservation(ttl, now);
+                        }
+                    }
+                    Ok(())
+                });
+                if cleared.is_ok() {
+                    for instance in &mut instances {
+                        if expired.contains(&instance.id) {
+                            instance.clear_expired_lifecycle_reservation(ttl, now);
+                        }
                     }
                 }
             }
@@ -345,6 +323,7 @@ impl HomeView {
             deletion_poller: DeletionPoller::new(),
             stop_poller: StopPoller::new(),
             trash_poller: crate::tui::trash_poller::TrashPoller::new(),
+            reconcile_poller: crate::tui::reconcile_poller::ReconcilePoller::new(),
             restart_poller: RestartPoller::new(),
             restart_in_flight: std::collections::HashSet::new(),
             attach_project_poller: crate::tui::attach_project_poller::AttachProjectPoller::new(),
@@ -544,6 +523,12 @@ impl HomeView {
         let mut initial_disk_profiles: Vec<String> = view.storages.keys().cloned().collect();
         initial_disk_profiles.sort();
         view.rewire_disk_subscriptions(&initial_disk_profiles);
+        // Trashed-worktree relocation (#2522) and the repair of a worktree
+        // moved outside aoe (#2002) are healing work, not render input, and
+        // cost a git spawn and a storage write per broken row. They sweep the
+        // loaded profiles on a worker so they never delay the first frame
+        // (#3611).
+        view.reconcile_poller.request(initial_disk_profiles.clone());
         // Config subscriptions are intentionally asymmetric: even in
         // single-profile mode, peer edits to ANY profile's config.toml
         // (or the global config) must be observable so the picker UI

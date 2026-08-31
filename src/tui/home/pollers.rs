@@ -222,6 +222,27 @@ impl HomeView {
         }
     }
 
+    /// Reload once the background load-time healing sweeps land, so a row the
+    /// worker repointed is shown at its real path. Nothing to merge field by
+    /// field: the sweeps only rewrite durable state, so a storage reload is
+    /// both sufficient and cheaper than mirroring each repair. See #3611.
+    pub fn apply_reconcile_results(&mut self) -> bool {
+        let Ok(result) = self.reconcile_poller.try_recv_result() else {
+            return false;
+        };
+        if !result.changed {
+            return false;
+        }
+        if let Err(error) = self.reload_storage_only() {
+            tracing::warn!(
+                target: "tui.home",
+                "reload after load-time reconciliation failed: {error}",
+            );
+            return false;
+        }
+        true
+    }
+
     /// Apply any pending session ID updates from background pollers.
     /// Returns true if any instance's in-memory `agent_session_id` changed.
     /// Tmux env may also be republished when this returns `false`

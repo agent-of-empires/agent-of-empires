@@ -151,6 +151,7 @@ pub(crate) fn commit_trash_relocation(
     }
     row.project_path = relocation.new_project_path.clone();
     row.pre_trash_project_path = relocation.pre_trash_project_path.clone();
+    row.trash_relocation_failed = relocation.relocation_failed.clone();
     row.release_lifecycle_reservation_if_owned(LifecycleOperation::Trash, generation);
     RelocationCommit::Persisted
 }
@@ -171,6 +172,7 @@ mod tests {
         crate::session::trash::TrashRelocation {
             new_project_path: "/tmp/.aoe-trash/session".to_string(),
             pre_trash_project_path: Some("/tmp/worktree".to_string()),
+            relocation_failed: None,
         }
     }
 

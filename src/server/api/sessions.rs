@@ -3146,6 +3146,7 @@ pub async fn trash_session(
                 Some(crate::session::trash::TrashRelocation {
                     new_project_path: instance.project_path.clone(),
                     pre_trash_project_path: instance.pre_trash_project_path.clone(),
+                    relocation_failed: instance.trash_relocation_failed.clone(),
                 })
             }
             crate::session::trash::RelocateOutcome::Skipped
@@ -3188,7 +3189,7 @@ pub async fn trash_session(
             return persist_failed_response();
         }
     };
-    if let crate::session::trash::RelocateOutcome::Failed { reason } = outcome {
+    if let crate::session::trash::RelocateOutcome::Failed { reason, .. } = outcome {
         tracing::warn!(
             target: "http.api.sessions",
             session = %id,
@@ -4565,6 +4566,7 @@ pub(crate) async fn reconcile_trashed_worktrees(state: &Arc<AppState>) {
         if let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) {
             instance.project_path = moved.project_path;
             instance.pre_trash_project_path = moved.pre_trash_project_path;
+            instance.trash_relocation_failed = moved.trash_relocation_failed;
             instance.lifecycle_generation = moved.lifecycle_generation;
             instance.lifecycle_reservation = moved.lifecycle_reservation;
         }

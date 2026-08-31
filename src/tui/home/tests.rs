@@ -21286,3 +21286,58 @@ fn observe_worker_pulse_needs_a_moving_counter_and_resets_on_retarget() {
         "the retargeted pane must fork once before the pulse is trusted again"
     );
 }
+
+/// #3611: trashed-row healing must not run before the first frame. `HomeView::new`
+/// hands it to `ReconcilePoller`, so the repair lands through
+/// `apply_reconcile_results` instead. This row needs only a pointer repair, so
+/// the sweep reaches durable state without git.
+#[test]
+#[serial]
+fn trashed_row_healing_lands_through_the_reconcile_poller() {
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let project = TempDir::new().unwrap();
+    let storage = Storage::new_unwatched("test").unwrap();
+
+    let recorded = project.path().join("feat");
+    let mut instance = Instance::new("trashed", recorded.to_str().unwrap());
+    instance.worktree_info = Some(crate::session::WorktreeInfo {
+        branch: "feat".to_string(),
+        main_repo_path: project.path().to_string_lossy().into_owned(),
+        managed_by_aoe: true,
+        created_at: chrono::Utc::now(),
+        base_branch: None,
+    });
+    instance.trash();
+    let id = instance.id.clone();
+    let holding = crate::session::trash::trash_holding_path(&recorded, &id).unwrap();
+    std::fs::create_dir_all(&holding).unwrap();
+    storage
+        .update(|instances, _groups| {
+            instances.push(instance);
+            Ok(())
+        })
+        .unwrap();
+
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+
+    let mut applied = false;
+    for _ in 0..100 {
+        if view.apply_reconcile_results() {
+            applied = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(applied, "the reconcile poller never reported its sweep");
+    assert_eq!(
+        view.get_instance(&id).unwrap().project_path,
+        holding.to_string_lossy(),
+        "the reload must publish the healed path"
+    );
+}

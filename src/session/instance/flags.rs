@@ -124,6 +124,9 @@ impl Instance {
     /// archived, depending on the preserved sibling flags). Idempotent.
     pub fn untrash(&mut self) {
         self.trashed_at = None;
+        // The terminal marker describes one trashing's relocation, so leaving
+        // the trash bucket retires it: a re-trash gets a fresh attempt.
+        self.trash_relocation_failed = None;
     }
 
     pub fn is_trashed(&self) -> bool {

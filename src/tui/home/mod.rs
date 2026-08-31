@@ -503,6 +503,10 @@ pub struct HomeView {
     // Performance: background trash prep (stops the sandbox container, so the
     // same ~10s docker stop block as `stop_poller`, plus the worktree move)
     pub(super) trash_poller: crate::tui::trash_poller::TrashPoller,
+    /// Load-time healing (trashed-worktree relocation, worktree paths moved
+    /// outside aoe) kicked once from `HomeView::new` so it never delays the
+    /// first frame; `apply_reconcile_results` reloads when it lands. See #3611.
+    pub(super) reconcile_poller: crate::tui::reconcile_poller::ReconcilePoller,
 
     // Performance: background restart (the start cascade shells out to docker
     // and runs the before_start host hook, which can block for seconds)

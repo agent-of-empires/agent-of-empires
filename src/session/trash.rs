@@ -60,7 +60,11 @@ pub enum RelocateOutcome {
     /// The move could not run safely (sandbox container still mounting the
     /// dir, locked, cross-device, git error). `project_path` is untouched;
     /// the caller trashes in place and surfaces `reason`. Never blocks trash.
-    Failed { reason: String },
+    ///
+    /// `retriable` is false when git itself refused the move, which no later
+    /// attempt fixes: the load-time reconcile records that verdict on the row
+    /// instead of re-running the move on every launch (#3611).
+    Failed { reason: String, retriable: bool },
 }
 
 /// Result of attempting to move a worktree back out of the holding area.
@@ -137,17 +141,20 @@ pub fn relocate_worktree_to_trash(inst: &mut Instance) -> RelocateOutcome {
     let Some(target) = trash_holding_path(&current, &inst.id) else {
         return RelocateOutcome::Failed {
             reason: format!("worktree path {} has no parent dir", current.display()),
+            retriable: false,
         };
     };
     if target.exists() {
         return RelocateOutcome::Failed {
             reason: format!("trash holding path {} already exists", target.display()),
+            retriable: true,
         };
     }
     if ensure_sandbox_container_released(&inst.id, is_sandboxed(inst)) {
         return RelocateOutcome::Failed {
             reason: "sandbox container still holds the worktree; stop the session first"
                 .to_string(),
+            retriable: true,
         };
     }
 
@@ -161,6 +168,7 @@ pub fn relocate_worktree_to_trash(inst: &mut Instance) -> RelocateOutcome {
         Err(e) => {
             return RelocateOutcome::Failed {
                 reason: format!("open main repo {main_repo}: {e}"),
+                retriable: true,
             }
         }
     };
@@ -168,12 +176,14 @@ pub fn relocate_worktree_to_trash(inst: &mut Instance) -> RelocateOutcome {
         if let Err(e) = std::fs::create_dir_all(parent) {
             return RelocateOutcome::Failed {
                 reason: format!("create {}: {e}", parent.display()),
+                retriable: true,
             };
         }
     }
     if let Err(e) = git.move_worktree(&current, &target) {
         return RelocateOutcome::Failed {
             reason: format!("git worktree move: {e}"),
+            retriable: false,
         };
     }
 
@@ -264,6 +274,10 @@ pub struct TrashRequest {
 pub struct TrashRelocation {
     pub new_project_path: String,
     pub pre_trash_project_path: Option<String>,
+    /// Terminal marker for a relocation git will never accept, carried
+    /// alongside the paths so it commits under the same reservation. See
+    /// [`Instance::trash_relocation_failed`].
+    pub relocation_failed: Option<String>,
 }
 
 #[derive(Debug)]
@@ -314,6 +328,7 @@ pub fn perform_trash(request: &TrashRequest) -> TrashResult {
         RelocateOutcome::Relocated { .. } => Some(TrashRelocation {
             new_project_path: inst.project_path.clone(),
             pre_trash_project_path: inst.pre_trash_project_path.clone(),
+            relocation_failed: inst.trash_relocation_failed.clone(),
         }),
         RelocateOutcome::Skipped | RelocateOutcome::Failed { .. } => None,
     };
@@ -342,7 +357,7 @@ pub fn perform_trash(request: &TrashRequest) -> TrashResult {
         session_id: request.session_id.clone(),
         relocation,
         relocate_warning: match outcome {
-            RelocateOutcome::Failed { reason } => Some(reason),
+            RelocateOutcome::Failed { reason, .. } => Some(reason),
             RelocateOutcome::Relocated { .. } | RelocateOutcome::Skipped => None,
         },
     }
@@ -431,6 +446,92 @@ pub fn restore_worktree_location(inst: &mut Instance) -> RestoreOutcome {
     }
 }
 
+/// What a load-time reconcile would do to one trashed row.
+///
+/// Decided from the recorded paths and the filesystem alone, so a sweep can
+/// drop a row that needs nothing before opening storage, taking its lifecycle
+/// flock, or spawning git. That pre-filter is the whole point of the split:
+/// the cost used to be paid per trashed row whether or not anything changed
+/// (#3611).
+#[derive(Debug, PartialEq, Eq)]
+enum ReconcilePlan {
+    /// The row is consistent, or is not one this pass owns.
+    Nothing,
+    /// Move a protected default branch's checkout back out of the holding
+    /// area (#3215).
+    RestoreDefaultBranch,
+    /// Legacy backfill: relocate a worktree still sitting in the active dir.
+    Relocate,
+    /// The worktree is in the holding area but the pointer persist was lost.
+    PointAtHolding { holding: PathBuf, original: PathBuf },
+    /// The holding move never took (or was undone); point back at the original.
+    PointAtOriginal(PathBuf),
+}
+
+fn plan_trashed_reconcile(inst: &Instance) -> ReconcilePlan {
+    if !inst.is_trashed() || !is_managed_single_worktree(inst) {
+        return ReconcilePlan::Nothing;
+    }
+
+    // Upgrade path for #3215: a default branch's checkout that an earlier
+    // version relocated is still sitting in the holding area, and the purge now
+    // refuses to remove it, so clearing the row would leave that checkout there
+    // with nothing pointing at it. Move it back instead. Strict like every
+    // restore: an occupied original leaves the row untouched.
+    if inst.pre_trash_project_path.is_some() && is_protected_default_branch(inst) {
+        return ReconcilePlan::RestoreDefaultBranch;
+    }
+
+    let current = PathBuf::from(&inst.project_path);
+    // The pre-trash location: the recorded marker if we have one, else the
+    // current path (an un-relocated legacy row points at its own original).
+    let original = inst
+        .pre_trash_project_path
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| current.clone());
+    let Some(holding) = trash_holding_path(&original, &inst.id) else {
+        return ReconcilePlan::Nothing;
+    };
+
+    if current.exists() {
+        // Legacy backfill: a trashed managed worktree still sitting in the
+        // active dir with no marker gets relocated now. An already-relocated
+        // row (marker set, current == holding) is left alone, as is a
+        // markerless row that already sits in the holding area (relocating it
+        // again would nest it under .aoe-trash/.aoe-trash/<id>).
+        if inst.pre_trash_project_path.is_some()
+            || current == holding
+            || is_holding_path(&current, &inst.id)
+        {
+            return ReconcilePlan::Nothing;
+        }
+        // Crash case: the worktree was already moved to `holding` but the
+        // marker/pointer persist was lost and something was recreated at the
+        // original path. Retrying the move would fail (the target exists) and
+        // leave project_path on the wrong dir, so heal to the existing holding
+        // path and record the marker. Restore can then fail cleanly if the
+        // original stays occupied.
+        if holding.exists() {
+            return ReconcilePlan::PointAtHolding { holding, original };
+        }
+        if inst.trash_relocation_failed.is_some() {
+            return ReconcilePlan::Nothing;
+        }
+        return ReconcilePlan::Relocate;
+    }
+
+    // The recorded path is gone. Heal the pointer toward wherever the worktree
+    // actually landed.
+    if holding.exists() {
+        return ReconcilePlan::PointAtHolding { holding, original };
+    }
+    if original.exists() && original != current {
+        return ReconcilePlan::PointAtOriginal(original);
+    }
+    ReconcilePlan::Nothing
+}
+
 /// Load-time reconciliation for a single trashed session. Returns `true` when
 /// it mutated the instance (the caller must then persist).
 ///
@@ -444,19 +545,13 @@ pub fn restore_worktree_location(inst: &mut Instance) -> RestoreOutcome {
 ///   - Heal-back: if `project_path` is gone and only the original survives, the
 ///     move never took (or was undone); point back at the original.
 ///
-/// Best-effort and non-fatal: a git failure logs and leaves the row as-is.
+/// Best-effort and non-fatal: a git failure logs and leaves the row as-is,
+/// except that a backfill move git rejects outright is recorded in
+/// `trash_relocation_failed` so it is not retried forever (#3611).
 pub fn reconcile_trashed_location(inst: &mut Instance) -> bool {
-    if !inst.is_trashed() || !is_managed_single_worktree(inst) {
-        return false;
-    }
-
-    // Upgrade path for #3215: a default branch's checkout that an earlier
-    // version relocated is still sitting in the holding area, and the purge now
-    // refuses to remove it, so clearing the row would leave that checkout there
-    // with nothing pointing at it. Move it back instead. Strict like every
-    // restore: an occupied original leaves the row untouched.
-    if inst.pre_trash_project_path.is_some() && is_protected_default_branch(inst) {
-        return match restore_worktree_location(inst) {
+    match plan_trashed_reconcile(inst) {
+        ReconcilePlan::Nothing => false,
+        ReconcilePlan::RestoreDefaultBranch => match restore_worktree_location(inst) {
             RestoreOutcome::Restored { .. } => true,
             // The marker was set but nothing had actually moved, so restore
             // dropped it. That is still a mutation worth persisting.
@@ -469,91 +564,190 @@ pub fn reconcile_trashed_location(inst: &mut Instance) -> bool {
                 );
                 false
             }
-        };
-    }
-
-    let current = PathBuf::from(&inst.project_path);
-    // The pre-trash location: the recorded marker if we have one, else the
-    // current path (an un-relocated legacy row points at its own original).
-    let original = inst
-        .pre_trash_project_path
-        .clone()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| current.clone());
-    let Some(target) = trash_holding_path(&original, &inst.id) else {
-        return false;
-    };
-
-    if current.exists() {
-        // Legacy backfill: a trashed managed worktree still sitting in the
-        // active dir with no marker gets relocated now. An already-relocated
-        // row (marker set, current == holding) is left alone, as is a
-        // markerless row that already sits in the holding area (relocating it
-        // again would nest it under .aoe-trash/.aoe-trash/<id>).
-        if inst.pre_trash_project_path.is_none()
-            && current != target
-            && !is_holding_path(&current, &inst.id)
-        {
-            // Crash case: the worktree was already moved to `target` but the
-            // marker/pointer persist was lost and something was recreated at
-            // the original path. Retrying the move would fail (target exists)
-            // and leave project_path on the wrong dir, so heal to the existing
-            // holding path and record the marker. Restore can then fail
-            // cleanly if the original stays occupied.
-            if target.exists() {
-                inst.project_path = target.to_string_lossy().into_owned();
-                inst.pre_trash_project_path = Some(original.to_string_lossy().into_owned());
-                tracing::info!(
+        },
+        ReconcilePlan::Relocate => match relocate_worktree_to_trash(inst) {
+            RelocateOutcome::Relocated { .. } => true,
+            RelocateOutcome::Failed {
+                reason,
+                retriable: true,
+            } => {
+                tracing::warn!(
                     target: "session.trash",
                     session = %inst.id,
-                    to = %target.display(),
-                    "reconciled trashed worktree pointer to existing holding area"
+                    "trash worktree reconcile relocation failed: {reason}"
                 );
-                return true;
+                false
             }
-            return match relocate_worktree_to_trash(inst) {
-                RelocateOutcome::Relocated { .. } => true,
-                RelocateOutcome::Failed { reason } => {
-                    tracing::warn!(
-                        target: "session.trash",
-                        session = %inst.id,
-                        "trash worktree reconcile relocation failed: {reason}"
-                    );
-                    false
-                }
-                RelocateOutcome::Skipped => false,
-            };
+            RelocateOutcome::Failed {
+                reason,
+                retriable: false,
+            } => {
+                tracing::warn!(
+                    target: "session.trash",
+                    session = %inst.id,
+                    "git refused the trash relocation; recording it so it is not retried: {reason}"
+                );
+                inst.trash_relocation_failed = Some(reason);
+                true
+            }
+            RelocateOutcome::Skipped => false,
+        },
+        ReconcilePlan::PointAtHolding { holding, original } => {
+            inst.project_path = holding.to_string_lossy().into_owned();
+            inst.pre_trash_project_path = Some(original.to_string_lossy().into_owned());
+            tracing::info!(
+                target: "session.trash",
+                session = %inst.id,
+                to = %holding.display(),
+                "reconciled trashed worktree pointer to holding area"
+            );
+            true
         }
-        return false;
+        ReconcilePlan::PointAtOriginal(original) => {
+            inst.project_path = original.to_string_lossy().into_owned();
+            inst.pre_trash_project_path = None;
+            tracing::info!(
+                target: "session.trash",
+                session = %inst.id,
+                to = %original.display(),
+                "reconciled trashed worktree pointer back to original (holding move never landed)"
+            );
+            true
+        }
+    }
+}
+
+/// Reconcile every trashed row in one profile, batched.
+///
+/// Returns the rows whose durable record changed. Rows that need nothing are
+/// decided from the filesystem alone, so a profile whose trash is already
+/// consistent costs one `sessions.json` read and no lock, git spawn, or write
+/// at all. The rest are reserved in one [`Storage::update`] per batch, do
+/// their blocking filesystem work outside the storage lock, and commit in a
+/// second, instead of two full read-parse-serialize-write cycles per row
+/// (#3611).
+///
+/// Every lifecycle flock a batch needs is taken up front in sorted id order.
+/// Peers take one at a time, so an ordered multi-lock holder cannot close a
+/// cycle with them.
+///
+/// BLOCKING: takes cross-process locks and shells out to git. Never call it on
+/// an event loop or the async runtime.
+pub fn reconcile_trashed_profile(profile: &str) -> anyhow::Result<Vec<Instance>> {
+    let storage = crate::session::Storage::open_unwatched(profile)?;
+    let mut candidates: Vec<String> = storage
+        .load()?
+        .into_iter()
+        .filter(|inst| plan_trashed_reconcile(inst) != ReconcilePlan::Nothing)
+        .map(|inst| inst.id)
+        .collect();
+    candidates.sort();
+
+    let mut healed = Vec::new();
+    for batch in candidates.chunks(RECONCILE_BATCH) {
+        healed.extend(reconcile_trashed_batch(&storage, batch)?);
+    }
+    Ok(healed)
+}
+
+/// How many rows one batch reserves at once. Every row in a batch holds its
+/// lifecycle flock open for the batch's whole filesystem pass, so this bounds
+/// both the open file descriptors and how long a peer taking a single lock can
+/// be made to wait, while still collapsing a store's worth of repairs into a
+/// handful of writes.
+const RECONCILE_BATCH: usize = 32;
+
+fn reconcile_trashed_batch(
+    storage: &crate::session::Storage,
+    batch: &[String],
+) -> anyhow::Result<Vec<Instance>> {
+    let mut candidates = batch.to_vec();
+    let mut locks = Vec::with_capacity(candidates.len());
+    candidates.retain(|id| match storage.acquire_instance_lifecycle_lock(id) {
+        Ok(lock) => {
+            locks.push(lock);
+            true
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "session.trash",
+                session = %id,
+                "trash reconciliation skipped: could not acquire lifecycle lock: {error}"
+            );
+            false
+        }
+    });
+
+    let now = Utc::now();
+    let reserved = storage.update(|instances, _groups| {
+        let mut reserved: Vec<(u64, Instance)> = Vec::new();
+        for id in &candidates {
+            let Some(stored) = instances.iter_mut().find(|candidate| &candidate.id == id) else {
+                continue;
+            };
+            match stored.try_acquire_lifecycle_reservation(
+                crate::session::LifecycleOperation::Trash,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                now,
+            ) {
+                Ok(generation) => reserved.push((generation, stored.clone())),
+                Err(error) => tracing::debug!(
+                    target: "session.trash",
+                    session = %id,
+                    "trash reconciliation deferred: {error}"
+                ),
+            }
+        }
+        Ok(reserved)
+    })?;
+
+    let reconciled: Vec<(u64, bool, Instance)> = reserved
+        .into_iter()
+        .map(|(generation, mut durable)| {
+            let changed = reconcile_trashed_location(&mut durable);
+            (generation, changed, durable)
+        })
+        .collect();
+    if reconciled.is_empty() {
+        return Ok(Vec::new());
     }
 
-    // The recorded path is gone. Heal the pointer toward wherever the worktree
-    // actually landed.
-    if target.exists() {
-        inst.project_path = target.to_string_lossy().into_owned();
-        if inst.pre_trash_project_path.is_none() {
-            inst.pre_trash_project_path = Some(original.to_string_lossy().into_owned());
+    storage.update(|instances, _groups| {
+        let mut healed = Vec::new();
+        for (generation, changed, durable) in &reconciled {
+            if !changed {
+                if let Some(stored) = instances
+                    .iter_mut()
+                    .find(|candidate| candidate.id == durable.id)
+                {
+                    stored.release_lifecycle_reservation_if_owned(
+                        crate::session::LifecycleOperation::Trash,
+                        *generation,
+                    );
+                }
+                continue;
+            }
+            let relocation = TrashRelocation {
+                new_project_path: durable.project_path.clone(),
+                pre_trash_project_path: durable.pre_trash_project_path.clone(),
+                relocation_failed: durable.trash_relocation_failed.clone(),
+            };
+            match crate::session::claim::commit_trash_relocation(
+                instances,
+                &durable.id,
+                *generation,
+                &relocation,
+            ) {
+                crate::session::claim::RelocationCommit::Persisted => healed.push(durable.clone()),
+                outcome => tracing::warn!(
+                    target: "session.trash",
+                    session = %durable.id,
+                    "trash reconciliation not committed: {outcome:?}"
+                ),
+            }
         }
-        tracing::info!(
-            target: "session.trash",
-            session = %inst.id,
-            to = %target.display(),
-            "reconciled trashed worktree pointer to holding area"
-        );
-        return true;
-    }
-    if original.exists() && original != current {
-        inst.project_path = original.to_string_lossy().into_owned();
-        inst.pre_trash_project_path = None;
-        tracing::info!(
-            target: "session.trash",
-            session = %inst.id,
-            to = %original.display(),
-            "reconciled trashed worktree pointer back to original (holding move never landed)"
-        );
-        return true;
-    }
-    false
+        Ok(healed)
+    })
 }
 
 /// Reconcile one trashed worktree as a serialized lifecycle transition.
@@ -561,6 +755,13 @@ pub fn reconcile_trashed_location(inst: &mut Instance) -> bool {
 /// The caller's snapshot is replaced with the durable row after commit. A
 /// fresh peer reservation refuses the pass; an expired reservation is superseded.
 pub fn reconcile_trashed_transition(inst: &mut Instance) -> anyhow::Result<bool> {
+    // Decide from the caller's snapshot before paying for storage, the
+    // lifecycle flock, and two write cycles. The pass is best-effort and
+    // idempotent, so a snapshot that has gone stale just defers to the next
+    // one (#3611).
+    if plan_trashed_reconcile(inst) == ReconcilePlan::Nothing {
+        return Ok(false);
+    }
     let profile = inst.source_profile.clone();
     anyhow::ensure!(
         !profile.is_empty(),
@@ -585,6 +786,7 @@ pub fn reconcile_trashed_transition(inst: &mut Instance) -> anyhow::Result<bool>
     let relocation = TrashRelocation {
         new_project_path: durable.project_path.clone(),
         pre_trash_project_path: durable.pre_trash_project_path.clone(),
+        relocation_failed: durable.trash_relocation_failed.clone(),
     };
     storage.update(|instances, _groups| {
         if changed {
@@ -970,6 +1172,134 @@ mod tests {
         assert!(!reconcile_trashed_location(&mut inst));
     }
 
+    /// #3611: an orphaned managed worktree (directory present, git's
+    /// registration gone) makes `git worktree move` fail permanently. Without
+    /// a terminal state the reconcile re-ran it on every launch and every
+    /// daemon tick forever.
+    #[test]
+    fn reconcile_records_a_relocation_git_refuses_and_stops_retrying() {
+        if !git_available() {
+            return;
+        }
+        let (_tmp, mut inst) = real_worktree_instance();
+        let original = inst.project_path.clone();
+        inst.trash();
+        // Orphan the checkout: the directory survives, its link to the repo
+        // does not, so `git worktree move` reports "not a working tree".
+        std::fs::remove_file(PathBuf::from(&original).join(".git")).unwrap();
+
+        assert!(
+            reconcile_trashed_location(&mut inst),
+            "a permanent relocation failure must be persisted"
+        );
+        assert!(inst.trash_relocation_failed.is_some());
+        // The row is untouched otherwise, so restore and purge still see the
+        // worktree where it actually is.
+        assert_eq!(inst.project_path, original);
+        assert!(inst.pre_trash_project_path.is_none());
+
+        assert!(
+            !reconcile_trashed_location(&mut inst),
+            "a recorded failure must not be retried"
+        );
+
+        // Restoring the row retires the verdict, so a later re-trash gets a
+        // fresh attempt.
+        inst.untrash();
+        assert!(inst.trash_relocation_failed.is_none());
+    }
+
+    /// #3611: the sweep decides from the filesystem alone, so a profile whose
+    /// trash is already consistent takes no reservation. A bumped
+    /// `lifecycle_generation` is the durable trace of the reserve/release pair
+    /// the old per-row pass ran on every launch.
+    #[test]
+    #[serial_test::serial]
+    fn profile_sweep_leaves_a_consistent_profile_untouched() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let storage = crate::session::Storage::new_unwatched("default").unwrap();
+        let mut plain = Instance::new("plain", "/tmp/plain");
+        plain.trash();
+        let (_tmp, mut relocated) = if git_available() {
+            let (tmp, mut inst) = real_worktree_instance();
+            inst.trash();
+            assert!(matches!(
+                relocate_worktree_to_trash(&mut inst),
+                RelocateOutcome::Relocated { .. }
+            ));
+            (Some(tmp), Some(inst))
+        } else {
+            (None, None)
+        };
+        let ids: Vec<String> = std::iter::once(plain.id.clone())
+            .chain(relocated.as_ref().map(|inst| inst.id.clone()))
+            .collect();
+        storage
+            .update(|instances, _groups| {
+                instances.push(plain.clone());
+                if let Some(inst) = relocated.take() {
+                    instances.push(inst);
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(reconcile_trashed_profile("default").unwrap().is_empty());
+        for stored in storage.load().unwrap() {
+            assert!(ids.contains(&stored.id));
+            assert_eq!(
+                stored.lifecycle_generation, 0,
+                "a row needing nothing must not be reserved"
+            );
+            assert!(stored.lifecycle_reservation.is_none());
+        }
+    }
+
+    /// #3611: every row that does need work is reserved, moved, and committed
+    /// in one pass rather than two `Storage::update` cycles each.
+    #[test]
+    #[serial_test::serial]
+    fn profile_sweep_heals_every_row_that_needs_it() {
+        if !git_available() {
+            return;
+        }
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let storage = crate::session::Storage::new_unwatched("default").unwrap();
+        let mut keeps = Vec::new();
+        let mut originals = Vec::new();
+        for _ in 0..2 {
+            let (tmp, mut inst) = real_worktree_instance();
+            inst.trash();
+            originals.push((inst.id.clone(), inst.project_path.clone()));
+            keeps.push(tmp);
+            storage
+                .update(|instances, _groups| {
+                    instances.push(inst.clone());
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        let healed = reconcile_trashed_profile("default").unwrap();
+        assert_eq!(healed.len(), 2);
+        let stored = storage.load().unwrap();
+        for (id, original) in &originals {
+            let row = stored.iter().find(|row| &row.id == id).unwrap();
+            let holding = trash_holding_path(Path::new(original), id).unwrap();
+            assert_eq!(PathBuf::from(&row.project_path), holding);
+            assert_eq!(
+                row.pre_trash_project_path.as_deref(),
+                Some(original.as_str())
+            );
+            assert!(row.lifecycle_reservation.is_none());
+        }
+
+        assert!(
+            reconcile_trashed_profile("default").unwrap().is_empty(),
+            "the sweep is idempotent"
+        );
+    }
+
     #[test]
     fn reconcile_skips_markerless_row_already_in_holding() {
         // A trashed worktree that already lives in the holding area but lost
@@ -1298,6 +1628,7 @@ mod tests {
         let reloc = TrashRelocation {
             new_project_path: inst.project_path.clone(),
             pre_trash_project_path: inst.pre_trash_project_path.clone(),
+            relocation_failed: None,
         };
 
         // The live row a raced restore produced: untrashed, pointing at the

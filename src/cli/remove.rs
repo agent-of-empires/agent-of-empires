@@ -140,6 +140,7 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
                 let reloc = crate::session::trash::TrashRelocation {
                     new_project_path: inst.project_path.clone(),
                     pre_trash_project_path: inst.pre_trash_project_path.clone(),
+                    relocation_failed: inst.trash_relocation_failed.clone(),
                 };
                 // The decision travels through this captured slot rather than
                 // the closure's return value, so it survives an update that
@@ -188,7 +189,7 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
                     return Ok(());
                 }
             }
-            crate::session::trash::RelocateOutcome::Failed { reason } => {
+            crate::session::trash::RelocateOutcome::Failed { reason, .. } => {
                 eprintln!("  Note: left worktree in place ({reason}).");
                 release_trash_reservation_best_effort(&storage, &removed_id, trash_generation);
             }
