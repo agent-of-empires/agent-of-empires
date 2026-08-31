@@ -163,9 +163,6 @@ pub fn detect_antigravity_status(raw_content: &str) -> Status {
 mod tests {
     use super::*;
 
-    /// A hook observation for the detection tests. `None` age means the write
-    /// exists but its mtime could not be read, the case the freshness bounds
-    /// deliberately do not fire on.
     /// Whether one manifest rule matches a fixture, used where a test asserts
     /// the shape it claims to exercise is really present.
     fn claude_rule_matches(rule: &str, content: &str) -> bool {
@@ -196,6 +193,9 @@ mod tests {
             .expect("hook_running_fresh declares a bound")
     }
 
+    /// A hook observation for the detection tests. `None` age means the write
+    /// exists but its mtime could not be read, the case the freshness bounds
+    /// deliberately do not fire on.
     fn hook_at(
         status: Status,
         age: Option<std::time::Duration>,
@@ -739,9 +739,9 @@ enter to select · esc to cancel";
 
     #[test]
     fn test_reconcile_claude_hook_status_passes_non_running_through() {
-        // The Running-path reconciler only touches Running; a stale Waiting hook
-        // is handled by reconcile_waiting_hook instead, so here Waiting/Idle are
-        // passed straight through even with contradicting pane text.
+        // A `waiting` write speaks for an empty capture, and stock question
+        // phrasing without a cursored menu row is prose rather than a prompt,
+        // so an `idle` write stands against it.
         assert_eq!(
             detect_claude("", "", Some(hook_at(Status::Waiting, None))),
             Status::Waiting

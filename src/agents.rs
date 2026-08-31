@@ -457,17 +457,17 @@ pub struct PermissionResponse {
 /// "done working, waiting for the user" signal and fires whenever Claude parks
 /// at the prompt regardless of why the turn ended, so it backstops `Stop`;
 /// `StopFailure` covers the API-error path deterministically. The remaining
-/// gap (silent tool stop) has no hook, so it is recovered pane-side by
-/// `reconcile_claude_hook_status`.
+/// gap (silent tool stop) has no hook, so it is recovered pane-side by the
+/// parked-evidence rules in `detect/manifests/claude.toml`.
 ///
 /// The `idle_prompt` backstop also introduces a write race: `Stop` and
 /// `UserPromptSubmit` hooks are awaited, but `Notification` hooks are
 /// fire-and-forget, so when a queued prompt submits the moment a turn ends,
 /// the notification's `idle` write can land after `UserPromptSubmit`'s
 /// `running`, leaving the file on `idle` while the new turn generates (no
-/// running-mapped hook fires again until its first `PreToolUse`). An `idle`
-/// read on a session last observed Running/Waiting is therefore reconciled
-/// against the pane (`reconcile_claude_idle_hook_status`).
+/// running-mapped hook fires again until its first `PreToolUse`). The pane's
+/// own running evidence outranks an `idle` write in the detection manifest,
+/// which is what recovers that race.
 ///
 /// The `Notification` matchers also carry the agent-view identifiers added in
 /// Claude Code 2.1.198: `agent_needs_input` (background session blocked on the
@@ -483,8 +483,8 @@ pub struct PermissionResponse {
 /// makes the status command write `waiting` when the payload's `tool_name` is
 /// `AskUserQuestion`, and the `PostToolUse` matcher restores `running` the
 /// moment the answer lands (the rest of the turn is ordinary generation). The
-/// pane-side `reconcile_claude_hook_status` stays as the backstop for hooks
-/// installed before this pair existed.
+/// pane-side detection rules stay as the backstop for hooks installed before
+/// this pair existed.
 const CLAUDE_HOOK_EVENTS: &[HookEvent] = &[
     HookEvent {
         name: "SessionStart",

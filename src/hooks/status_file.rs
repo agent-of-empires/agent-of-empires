@@ -54,9 +54,10 @@ pub fn read_hook_status(instance_id: &str) -> Option<Status> {
 ///
 /// The running-mapped hooks (`PreToolUse`, `UserPromptSubmit`, `ElicitationResult`)
 /// rewrite the file on every fire, so a fresh mtime means the last write is
-/// recent. `reconcile_claude_hook_status` uses this to tell a genuinely fresh
-/// `running` (a turn that just started, spinner not yet rendered) from a stale
-/// one that a missed idle hook left standing after the turn ended.
+/// recent. The detection manifests' hook freshness bounds use this to tell a
+/// genuinely fresh `running` (a turn that just started, spinner not yet
+/// rendered) from a stale one that a missed idle hook left standing after the
+/// turn ended.
 ///
 /// Returns `None` when the file is absent or its mtime can't be read.
 pub fn read_hook_status_age(instance_id: &str) -> Option<std::time::Duration> {

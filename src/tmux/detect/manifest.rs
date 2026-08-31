@@ -398,11 +398,6 @@ impl Rule {
     }
 }
 
-/// The hook rules every agent shares, so ten manifests do not carry ten
-/// copies of the same five rows. They rank below the screen rules that read
-/// state off live chrome and above the ones that only guess, which is the
-/// arrangement the whole design turns on. A manifest that needs different
-/// bounds declares its own rule with the same id and wins.
 /// Rule templates shared across manifests, keyed by name.
 const SHARED_TEMPLATES: &str = include_str!("manifests/shared.toml");
 
@@ -447,6 +442,11 @@ impl RawMatcher {
     }
 }
 
+/// The hook rules every agent shares, so ten manifests do not carry ten
+/// copies of the same five rows. They rank below the screen rules that read
+/// state off live chrome and above the ones that only guess, which is the
+/// arrangement the whole design turns on. A manifest that needs different
+/// bounds declares its own rule with the same id and wins.
 const SHARED_HOOK_RULES: &str = r#"
 # A `waiting` write speaks only for a capture with nothing in it.
 #
