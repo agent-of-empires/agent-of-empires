@@ -1503,8 +1503,9 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
 
 /// Spawn a detached drain for every session that still carries a persisted
 /// `pending_initial_turn` and has a live worker to receive it (#2897). The
-/// drain itself claims a per-session slot and runs under the instance lock,
-/// so overlapping ticks and the create fast path cannot double-deliver.
+/// drain itself claims a per-session slot and runs under the session's
+/// prompt-submission guard, so overlapping ticks and the create fast path
+/// cannot double-deliver.
 /// Triaged sessions are skipped like everywhere else in the reconciler; the
 /// turn stays persisted and delivers if the session is ever un-triaged.
 /// Queue the rate-limit-interrupted prompt as the session's next turn so a
@@ -1572,9 +1573,11 @@ async fn drain_pending_initial_turns(state: &Arc<AppState>) {
 /// so a follow-up queued behind a busy turn drains with no client tab open.
 /// Candidates are idle
 /// (turn ended), structured, live sessions with a non-empty queue; the drain
-/// itself re-checks state under the per-instance lock and applies the
-/// `/clear`-boundary split. Gating on `is_running` here means the worker is
-/// live, so the drain can hold the instance lock across delivery safely.
+/// itself re-checks state under the session's prompt-submission guard and
+/// applies the `/clear`-boundary split. `is_running` is also true for a resume
+/// that holds a reservation but has no worker yet, so the drain may park on
+/// the readiness wait; it must never hold `instance_lock` while it does, since
+/// that is the lock the resume needs to finish (#3621).
 async fn drain_queued_prompts(state: &Arc<AppState>) {
     // Snapshot `(id, is_idle_dormant)`: dormant sessions have no live worker
     // but are excluded from the resume pass, so wake-on-drain must clear their
@@ -1600,9 +1603,9 @@ async fn drain_queued_prompts(state: &Arc<AppState>) {
         let service = Arc::clone(&state.session_service);
         if state.acp_supervisor.is_running(&id).await {
             // Live (or mid-respawn) worker: drain now. `drain_queued_prompts_once`
-            // holds the instance lock across delivery, which is safe only because
-            // a live worker makes `send_turn`'s resume a no-op (no spawn under the
-            // lock, so the #3172 re-entrant-spawn deadlock cannot occur).
+            // delivers under the session's prompt-submission guard, so a
+            // mid-respawn worker is simply waited for rather than deadlocked
+            // against (#3621).
             crate::task_util::spawn_supervised(
                 "acp.queue_drain",
                 crate::task_util::PanicPolicy::Log,
@@ -1809,10 +1812,13 @@ pub(crate) enum ResumeTrigger {
 /// session, so there is no double-spawn. Returns `Err(CapacityFull)` when
 /// the worker cap is reached so the handler can surface 503. See #1748.
 ///
-/// Callers MUST NOT hold the session's `instance_lock` while awaiting the
-/// worker this kicks: the detached task takes that same lock inside
-/// `build_spawn_request`, so a caller that holds it stalls the spawn for
-/// its whole `WORKER_READY_TIMEOUT` wait and then gives up. See #3172.
+/// NOTHING may hold the session's `instance_lock` while awaiting worker
+/// readiness, whether or not it kicked the resume itself: the detached task
+/// takes that same lock inside `build_spawn_request`, so a holder stalls the
+/// spawn for its whole `WORKER_READY_TIMEOUT` wait and then gives up. A
+/// reservation already in flight makes `is_running` true, so a waiter can park
+/// on a resume it never triggered; that is how the queue drain hit this
+/// without ever calling here. See #3172 and #3621.
 pub(crate) async fn trigger_resume_background(
     service: &Arc<SessionService>,
     id: &str,

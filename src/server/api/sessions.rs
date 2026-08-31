@@ -1295,6 +1295,10 @@ pub async fn rename_session(
 
     // Serialize against other mutations on this session (start, delete,
     // worktree edit) so the tied git move and the metadata write don't race.
+    // Prompt submission has its own authority and never takes `instance_lock`
+    // (#3621), so hold that one too or a queue drain lands a follow-up on the
+    // worker this quiesces for the move. Submission first, as it documents.
+    let _submission = state.session_service.prompt_submission(&id).await;
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
 
@@ -1749,6 +1753,10 @@ pub async fn set_worktree_name(
 
     // Serialize against other mutations on this session (start, delete,
     // another rename) so the git ops and the metadata write don't race.
+    // Prompt submission has its own authority and never takes `instance_lock`
+    // (#3621), so hold that one too or a queue drain lands a follow-up on the
+    // worker this quiesces for the move. Submission first, as it documents.
+    let _submission = state.session_service.prompt_submission(&id).await;
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
 
@@ -4300,6 +4308,7 @@ async fn purge_session_artifacts(
                         &state.mutation_epoch,
                     );
                     state.instance_locks.write().await.remove(id);
+                    state.session_service.forget_prompt_lock(id).await;
                     Ok((true, result.messages))
                 }
                 crate::session::deletion::DeletionDisposition::KeptRestored => {
@@ -4431,6 +4440,7 @@ async fn purge_session_artifacts(
         remove_instance(&mut instances, id, &state.mutation_epoch);
     }
     state.instance_locks.write().await.remove(id);
+    state.session_service.forget_prompt_lock(id).await;
     if let Some(entry) = recent_entry {
         if let Err(e) = crate::session::record_recent_project(entry) {
             tracing::warn!(target: "http.api.sessions",

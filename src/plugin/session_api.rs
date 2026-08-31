@@ -557,6 +557,32 @@ async fn sessions_turn_send(
 
     let result = async {
         deps.policy.admit_turn(&plugin_id)?;
+        // Reject an unknown session before claiming the submission guard:
+        // `prompt_submission` auto-vivifies a lock-registry entry for any id
+        // it is asked for, and nothing ever prunes it, so a plugin probing
+        // distinct nonexistent ids could otherwise grow the registry without
+        // bound within its turn quota.
+        if !deps
+            .session_service
+            .instances
+            .read()
+            .await
+            .iter()
+            .any(|i| i.id == req.session_id)
+        {
+            return Err(DispatchError::with_kind(
+                codes::INVALID_PARAMS,
+                "session_not_found",
+                "session not found",
+            ));
+        }
+        // Same per-session submission authority the HTTP surfaces and the
+        // queue drain take, so a plugin turn cannot land between the drain's
+        // idle check and its send (#3621).
+        let _submission = deps
+            .session_service
+            .prompt_submission(&req.session_id)
+            .await;
         deps.session_service
             .send_turn(
                 &SessionCaller::Plugin {
@@ -842,5 +868,33 @@ mod tests {
             assert_eq!(err.code, expected_code, "{session}");
             assert_eq!(kind(&err), expected_kind, "{session}");
         }
+    }
+
+    /// `prompt_submission` auto-vivifies a per-session lock-registry entry
+    /// and nothing ever prunes one, so a plugin probing distinct nonexistent
+    /// session ids must be refused before the guard is claimed, or the
+    /// registry grows without bound within the caller's turn quota.
+    #[tokio::test]
+    async fn turn_send_does_not_grow_the_lock_registry_for_nonexistent_sessions() {
+        let (deps, _dir) = test_deps(Vec::new());
+        let ctx = ctx_with(&["session.prompt"]);
+
+        for i in 0..5 {
+            let err = dispatch(
+                &deps,
+                &ctx,
+                "sessions.turn.send",
+                &serde_json::json!({ "session_id": format!("sess-gone-{i}"), "text": "hi" }),
+            )
+            .await
+            .expect_err("must be refused");
+            assert_eq!(kind(&err), "session_not_found");
+        }
+
+        assert_eq!(
+            deps.session_service.prompt_locks_len().await,
+            0,
+            "an id that was never admitted must not leave a lock-registry entry behind"
+        );
     }
 }
