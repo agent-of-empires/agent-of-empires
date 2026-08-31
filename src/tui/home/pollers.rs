@@ -231,6 +231,11 @@ impl HomeView {
     /// otherwise leave the worker neither delivering nor disconnecting, and
     /// recovery gated behind it for the whole boot. Recovering from a stale
     /// path is a wasted attempt; not recovering at all is a dead session.
+    /// Gap between retries of a reconcile reload that failed, matching the
+    /// heartbeat reload's own cadence in the same loop.
+    pub(super) const RECONCILE_RELOAD_RETRY_INTERVAL: std::time::Duration =
+        std::time::Duration::from_secs(5);
+
     pub(super) const STARTUP_RECOVERY_GATE_TIMEOUT: std::time::Duration =
         std::time::Duration::from_secs(30);
 
@@ -301,19 +306,37 @@ impl HomeView {
 
         let mut reloaded = false;
         if self.pending_reconcile_reload {
+            // Back off between attempts. This runs once per tick (~30Hz), and
+            // the heartbeat reload beside it retries on a 5s interval, so an
+            // unreadable store would otherwise spin on storage and emit tens of
+            // warn lines a second where every other reload in the loop is
+            // throttled.
+            if self
+                .reconcile_reload_retry_at
+                .is_some_and(|at| std::time::Instant::now() < at)
+            {
+                return false;
+            }
             match self.reload_storage_only() {
                 Ok(()) => {
                     self.pending_reconcile_reload = false;
+                    self.reconcile_reload_retry_at = None;
                     reloaded = true;
                 }
                 Err(error) => {
-                    // The repair stays pending and the gate stays shut, so the
-                    // next tick retries rather than letting recovery run
+                    // The repair stays pending and the gate stays shut, so a
+                    // later tick retries rather than letting recovery run
                     // against rows the sweep has already superseded on disk.
+                    // The gate deliberately stays shut for the whole boot if
+                    // this never succeeds: recovery reads the same store, so
+                    // opening it would only spend each row's one attempt
+                    // against the same failure.
                     tracing::warn!(
                         target: "tui.home",
                         "reload after load-time reconciliation failed: {error}",
                     );
+                    self.reconcile_reload_retry_at =
+                        Some(std::time::Instant::now() + Self::RECONCILE_RELOAD_RETRY_INTERVAL);
                     return false;
                 }
             }

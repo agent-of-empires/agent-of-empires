@@ -142,7 +142,7 @@ fn is_protected_default_branch_cached(inst: &Instance, cache: &mut ProtectedBran
 /// this decides whether to stop retrying and the sweep runs once per launch, so
 /// guessing "stranded" from a transient stat error suppresses the relocation
 /// until the app is started again.
-fn is_orphaned_checkout(worktree: &Path) -> bool {
+fn is_stranded_checkout(worktree: &Path) -> bool {
     let link = worktree.join(".git");
     let metadata = match std::fs::symlink_metadata(&link) {
         Ok(metadata) => metadata,
@@ -576,7 +576,7 @@ fn plan_trashed_reconcile_cached(
         // filesystem rather than recorded on the row, so a repaired repo
         // becomes relocatable again on its own and no transient git failure
         // can ever freeze into `sessions.json`.
-        if is_orphaned_checkout(&current) {
+        if is_stranded_checkout(&current) {
             tracing::warn!(
                 target: "session.trash",
                 session = %inst.id,
@@ -703,7 +703,17 @@ pub fn reconcile_trashed_profile(profile: &str) -> anyhow::Result<Vec<Instance>>
 
     let mut healed = Vec::new();
     for batch in candidates.chunks(RECONCILE_BATCH) {
-        healed.extend(reconcile_trashed_batch(&storage, batch)?);
+        // One batch's write failure must not abandon the rest of the profile:
+        // the pass this replaced logged per row and carried on, and a batch
+        // that bails leaves its reservations to expire on the TTL.
+        match reconcile_trashed_batch(&storage, batch) {
+            Ok(batch_healed) => healed.extend(batch_healed),
+            Err(error) => tracing::warn!(
+                target: "session.trash",
+                rows = batch.len(),
+                "trash reconciliation batch skipped: {error}"
+            ),
+        }
     }
     Ok(healed)
 }
@@ -1368,15 +1378,15 @@ mod tests {
             return;
         }
         assert!(
-            !is_orphaned_checkout(&worktree),
+            !is_stranded_checkout(&worktree),
             "a live checkout with a relative gitdir link must not read as stranded"
         );
         // And the real thing still does, relative link or not.
         std::fs::remove_dir_all(worktree.join(&target)).unwrap();
-        assert!(is_orphaned_checkout(&worktree));
+        assert!(is_stranded_checkout(&worktree));
     }
 
-    /// #3615 review: `Path::exists` cannot tell absence from a stat failure, so
+    /// `Path::exists` cannot tell absence from a stat failure, so
     /// an EACCES or ELOOP on the admin dir would read a live checkout as
     /// stranded. The sweep runs once per launch, so that suppresses the
     /// relocation until the app is restarted. A symlink loop stands in for the
@@ -1402,7 +1412,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            !is_orphaned_checkout(&worktree),
+            !is_stranded_checkout(&worktree),
             "a stat failure must stay retriable, not become terminal"
         );
 
@@ -1412,7 +1422,7 @@ mod tests {
             format!("gitdir: {}\n", tmp.path().join("definitely-gone").display()),
         )
         .unwrap();
-        assert!(is_orphaned_checkout(&worktree));
+        assert!(is_stranded_checkout(&worktree));
     }
 
     /// #3611: only a stranded checkout is terminal. A move that fails while the

@@ -21342,7 +21342,7 @@ fn trashed_row_healing_lands_through_the_reconcile_poller() {
     );
 }
 
-/// #3615 review: the reconcile sweep's reload must respect the same live-send
+/// the reconcile sweep's reload must respect the same live-send
 /// gate every other storage reload uses, and the worker's verdict must survive
 /// being skipped rather than being drained and dropped.
 #[test]
@@ -21374,7 +21374,7 @@ fn reconcile_reload_waits_for_live_send_to_finish() {
     );
 }
 
-/// #3615 review: startup auto-recovery launches from `project_path` and records
+/// startup auto-recovery launches from `project_path` and records
 /// each attempt in a boot-scoped ledger that is not retried, so it must not run
 /// until the reconcile sweep has had its chance to repoint a row whose worktree
 /// moved outside aoe (#2002). `HomeView::new` therefore arms the gate instead of
@@ -21417,7 +21417,7 @@ fn startup_recovery_waits_for_the_first_reconcile_sweep() {
     assert!(view.startup_recovery_gate.is_none());
 }
 
-/// #3615 review follow-up: the gate cannot outlive its deadline.
+/// the gate cannot outlive its deadline.
 /// `Storage::update` blocks on a contended profile flock with no timeout, so a
 /// peer holding that lock leaves the sweep worker neither delivering a result
 /// nor disconnecting. Gating recovery on that forever would trade "recovery
@@ -21450,6 +21450,64 @@ fn startup_recovery_gate_expires_when_the_sweep_never_lands() {
         view.startup_recovery_gate.is_none(),
         "past the deadline recovery must start without the sweep"
     );
+}
+
+/// A failed reload must not be retried on every tick. `apply_reconcile_results`
+/// runs ~30 times a second, so an unreadable store would spin on storage and
+/// flood the log where every other reload in that loop is throttled.
+#[test]
+#[serial]
+fn a_failed_reload_backs_off_instead_of_retrying_every_tick() {
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+    let mut seed = Instance::new("row", "/tmp/stale-path");
+    seed.source_profile = "test".to_string();
+    storage
+        .update(|instances, _groups| {
+            instances.push(seed);
+            Ok(())
+        })
+        .unwrap();
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.reconcile_poller =
+        crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(true);
+
+    let groups = crate::session::get_app_dir()
+        .unwrap()
+        .join("profiles")
+        .join("test")
+        .join("groups.json");
+    std::fs::remove_file(&groups).ok();
+    std::fs::create_dir(&groups).unwrap();
+
+    assert!(!view.apply_reconcile_results(), "the first attempt fails");
+    let armed = view
+        .reconcile_reload_retry_at
+        .expect("a failed reload must arm the backoff");
+
+    // Storage is readable again, but the backoff has not elapsed, so the next
+    // tick must not touch it.
+    std::fs::remove_dir(&groups).unwrap();
+    std::fs::write(&groups, "[]").unwrap();
+    assert!(!view.apply_reconcile_results(), "still inside the backoff");
+    assert_eq!(
+        view.reconcile_reload_retry_at,
+        Some(armed),
+        "a skipped attempt must not re-arm the backoff"
+    );
+    assert!(view.pending_reconcile_reload, "the repair is still pending");
+
+    // Once it elapses the retry lands.
+    view.reconcile_reload_retry_at = Some(std::time::Instant::now());
+    assert!(view.apply_reconcile_results(), "the retry must land");
+    assert!(view.reconcile_reload_retry_at.is_none());
+    assert!(!view.pending_reconcile_reload);
 }
 
 /// The deadline is also checked while live-send holds the reload, since starting
@@ -21486,7 +21544,7 @@ fn startup_recovery_gate_expires_during_live_send() {
     );
 }
 
-/// #3615 review: a repair queued in the channel must be applied to `instances`
+/// a repair queued in the channel must be applied to `instances`
 /// before the gate opens, deadline or not. Releasing first let startup recovery
 /// clone a `project_path` the sweep had already fixed on disk and spend that
 /// row's one boot-scoped attempt on it, which is what the gate exists to stop.
@@ -21605,7 +21663,7 @@ fn a_queued_repair_keeps_the_gate_armed_while_live_send_holds_the_reload() {
     assert!(view.startup_recovery_gate.is_none());
 }
 
-/// #3615 review: a failed reload must keep the repair pending and the gate shut.
+/// a failed reload must keep the repair pending and the gate shut.
 /// Clearing the flag before the fallible call dropped the repair and released
 /// recovery against stale rows, which is the failure the gate exists to prevent.
 #[test]
@@ -21662,9 +21720,13 @@ fn a_failed_reload_keeps_the_repair_pending_and_the_gate_shut() {
         "the in-memory row is still the stale one"
     );
 
-    // The repair is retried, not lost, once storage is readable again.
+    // The repair is retried, not lost, once storage is readable again. The
+    // retry is throttled, so let the backoff elapse as a later tick would;
+    // `a_failed_reload_backs_off_instead_of_retrying_every_tick` covers the
+    // throttle itself.
     std::fs::remove_dir(&groups).unwrap();
     std::fs::write(&groups, "[]").unwrap();
+    view.reconcile_reload_retry_at = Some(std::time::Instant::now());
     assert!(
         view.apply_reconcile_results(),
         "the retry must land the repair"

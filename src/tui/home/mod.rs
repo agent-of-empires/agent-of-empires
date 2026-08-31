@@ -517,6 +517,11 @@ pub struct HomeView {
     /// live-send is holding the reload. Keeps the recovery gate armed until the
     /// repair is applied. See `apply_reconcile_results`.
     pub(super) pending_reconcile_reload: bool,
+    /// Earliest retry for a reconcile reload that failed. The tick calls
+    /// `apply_reconcile_results` ~30 times a second, so an unreadable store
+    /// would otherwise spin on storage and flood the log. See
+    /// `RECONCILE_RELOAD_RETRY_INTERVAL`.
+    pub(super) reconcile_reload_retry_at: Option<std::time::Instant>,
 
     // Performance: background restart (the start cascade shells out to docker
     // and runs the before_start host hook, which can block for seconds)
