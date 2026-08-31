@@ -15,6 +15,11 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 const GIT_ENV = {
+  // Fixtures run under the developer's `~/.gitconfig` otherwise, so a global
+  // `commit.gpgsign` or `core.hooksPath` decides whether a live spec passes.
+  // Identity and the initial branch are pinned below and by `init -b`.
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_SYSTEM: "/dev/null",
   GIT_AUTHOR_NAME: "t",
   GIT_AUTHOR_EMAIL: "t@t",
   GIT_COMMITTER_NAME: "t",

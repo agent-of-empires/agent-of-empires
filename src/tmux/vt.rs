@@ -588,40 +588,80 @@ fn seed_parser(
     target: &str,
     parser: &Mutex<vt100::Parser>,
     app_cursor: &AtomicBool,
-    cols: u16,
-    rows: u16,
+    grid_gen: &AtomicU64,
+    size: (u16, u16),
     deadline: &crate::tmux::TmuxCommandDeadline,
     chunk_guard: Option<(&AtomicU64, &AtomicU64, u64)>,
 ) -> VtRefreshResult {
-    let Some((body, state)) = capture_seed_snapshot(target, deadline) else {
+    let (_, rows) = size;
+    let Some(stream) = capture_seed_stream(target, rows, deadline) else {
         return VtRefreshResult::Failed;
     };
-    let stream = assemble_seed_stream(&body, &state, rows);
-    install_seed_stream(parser, app_cursor, cols, rows, &stream, chunk_guard)
+    swap_seeded_parser(
+        parser,
+        app_cursor,
+        grid_gen,
+        None,
+        &stream,
+        size,
+        chunk_guard,
+    )
+}
+/// Capture the pane and weave its modes and cursor into one replayable byte
+/// stream, or `None` when the pane could not be captured. Split from the swap
+/// so a caller can bracket the (forking, multi-millisecond) capture with the
+/// generation check `swap_seeded_parser` needs.
+fn capture_seed_stream(
+    target: &str,
+    rows: u16,
+    deadline: &crate::tmux::TmuxCommandDeadline,
+) -> Option<Vec<u8>> {
+    let (body, state) = capture_seed_snapshot(target, deadline)?;
+    Some(assemble_seed_stream(&body, &state, rows))
 }
 
-fn install_seed_stream(
+/// Replace `parser` with a fresh grid built from `stream`, unless the reader
+/// applied a chunk since generation `since` or has not settled the expected
+/// chunk sequence.
+///
+/// The guards are the ordering boundary between the snapshot and `pipe-pane`
+/// consumption (#3617). `capture_seed_stream` forks tmux, so `run_reader` can
+/// take the parser lock first and apply a chunk that the snapshot does not
+/// contain; replacing the parser would then drop that chunk from both grids.
+/// Generation changes fence applied chunks, while the received/settled pair
+/// also fences a chunk queued on this parser lock.
+///
+/// A raced swap is abandoned rather than retried inline: the old parser holds
+/// the newer output, so leaving it alone is the safe side, and the caller
+/// reseeds again on its own cadence. `since` of `None` disables only the
+/// generation guard for callers whose current grid is stale by definition.
+fn swap_seeded_parser(
     parser: &Mutex<vt100::Parser>,
     app_cursor: &AtomicBool,
-    cols: u16,
-    rows: u16,
+    grid_gen: &AtomicU64,
+    since: Option<u64>,
     stream: &[u8],
+    size: (u16, u16),
     chunk_guard: Option<(&AtomicU64, &AtomicU64, u64)>,
 ) -> VtRefreshResult {
-    let Ok(mut parser) = parser.lock() else {
+    let Ok(mut p) = parser.lock() else {
         return VtRefreshResult::Failed;
     };
-    if chunk_guard.is_some_and(|(received, settled, expected)| {
-        received.load(Ordering::Acquire) != expected || settled.load(Ordering::Acquire) != expected
-    }) {
+    if since.is_some_and(|generation| generation != grid_gen.load(Ordering::Relaxed))
+        || chunk_guard.is_some_and(|(received, settled, expected)| {
+            received.load(Ordering::Acquire) != expected
+                || settled.load(Ordering::Acquire) != expected
+        })
+    {
         return VtRefreshResult::Busy;
     }
-    *parser = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
-    parser.process(stream);
-    app_cursor.store(parser.screen().application_cursor(), Ordering::Relaxed);
+    let (cols, rows) = size;
+    *p = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
+    p.process(stream);
+    app_cursor.store(p.screen().application_cursor(), Ordering::Relaxed);
+    grid_gen.fetch_add(1, Ordering::Relaxed);
     VtRefreshResult::Refreshed
 }
-
 /// How many times [`capture_seed_snapshot`] re-runs the probe/capture/probe
 /// round before settling for its last (possibly raced) snapshot. Each retry
 /// costs two forks plus a short settle sleep, and only fires while the pane is
@@ -1231,14 +1271,12 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
                     p.process(&buf[..n]);
                     ctx.app_cursor
                         .store(p.screen().application_cursor(), Ordering::Relaxed);
-                    // Invalidate cached sample assemblies BEFORE the wakeup, so a
-                    // woken sampler always sees the new generation.
+                    // Bump while still holding the parser lock. A woken sampler
+                    // sees the new generation, and a guarded seed swap cannot
+                    // discard a chunk behind a generation bump that has not landed.
                     ctx.grid_gen.fetch_add(1, Ordering::Relaxed);
                     // Stamp this chunk's arrival so the capture worker can tell a
-                    // lone chunk (keystroke echo) from a back-to-back stream (a
-                    // multi-chunk repaint) and hold the sample until the stream
-                    // settles. Recorded before the wakeup so the woken worker reads
-                    // fresh timing.
+                    // lone chunk from a back-to-back stream and wait for settling.
                     let now = chunk_now_ms();
                     let prev = ctx.last_chunk_ms.swap(now, Ordering::Relaxed);
                     ctx.prev_gap_ms.store(
@@ -1249,13 +1287,9 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
                         },
                         Ordering::Relaxed,
                     );
-                    // Publish settlement after every parser, cursor, generation,
-                    // and timing update. Acquire readers can then treat this as
-                    // the completion fence for the whole chunk.
+                    // Publish settlement after parser, cursor, generation, and
+                    // timing updates. Acquire readers use this completion fence.
                     ctx.settled_chunk_seq.store(seq + 1, Ordering::Release);
-                    // Wake the in-process poller (the TUI capture worker) so the
-                    // just-landed output samples now, not after the remainder of
-                    // its poll interval. This is the echo-latency path.
                     notify_change_wakeup(&ctx.wakeup);
                 }
             }
@@ -1566,8 +1600,8 @@ impl VtChannel {
             &target,
             &parser,
             &app_cursor,
-            cols,
-            rows,
+            &grid_gen,
+            (cols, rows),
             deadline,
             Some((&chunk_seq, &settled_chunk_seq, expected_chunk_seq)),
         ) != VtRefreshResult::Refreshed
@@ -1579,7 +1613,6 @@ impl VtChannel {
             let _ = std::fs::remove_dir_all(&sock_dir);
             return None;
         }
-        grid_gen.fetch_add(1, Ordering::Relaxed);
         tracing::info!(
             %target,
             cols,
@@ -1666,26 +1699,29 @@ impl VtChannel {
             self.cols.load(Ordering::Relaxed),
             self.rows.load(Ordering::Relaxed),
         );
-        let (gcy, gcx) = match self.parser.lock() {
-            Ok(p) => p.screen().cursor_position(),
-            Err(_) => return,
+        // Read the cursor and the generation under ONE parser lock, which is
+        // also where `run_reader` bumps the generation: a cursor that already
+        // reflects a chunk therefore cannot pair with a generation that does
+        // not, which would read as drift-without-output and reseed for nothing.
+        let Ok(p) = self.parser.lock() else {
+            return;
         };
-        // Read generation after cursor. The reader increments chunk_seq and
-        // grid_gen while holding the parser lock, so a processed cursor can
-        // never be observed without its generation bump. A chunk that lands
-        // after this cursor read either bumps before this load or invalidates
-        // the armed generation on the next reconcile pass.
+        let (gcy, gcx) = p.screen().cursor_position();
+        // Read generation after cursor while holding the same parser lock used
+        // by the reader's generation bump. A processed cursor cannot pair with
+        // a generation from before that chunk.
         let grid_gen = self.grid_gen.load(Ordering::Relaxed);
-        let pending = self.pending_drift.lock().ok().and_then(|g| *g);
+        drop(p);
+        let pending = self.pending_drift.lock().ok().and_then(|guard| *guard);
         match reconcile_step((c, r, cx, cy), (gc, gr, gcx, gcy), pending, grid_gen) {
             GridReconcile::InSync => self.clear_drift(),
             GridReconcile::ArmDrift => {
-                if let Ok(mut g) = self.pending_drift.lock() {
-                    *g = Some(grid_gen);
+                if let Ok(mut guard) = self.pending_drift.lock() {
+                    *guard = Some(grid_gen);
                 }
             }
             GridReconcile::Resize => {
-                if refresh_commits_geometry(self.reseed(c, r, deadline)) {
+                if refresh_commits_geometry(self.reseed(c, r, false, deadline)) {
                     self.cols.store(c, Ordering::Relaxed);
                     self.rows.store(r, Ordering::Relaxed);
                 }
@@ -1698,7 +1734,7 @@ impl VtChannel {
                     grid_cursor = ?(gcx, gcy),
                     "vt: grid diverged from pane; reseeding",
                 );
-                self.reseed(c, r, deadline);
+                self.reseed(c, r, true, deadline);
             }
         }
     }
@@ -1707,32 +1743,41 @@ impl VtChannel {
     /// place, which at worst costs one extra reconcile pass; the alternative is
     /// panicking the render thread over a display-only heuristic.
     fn clear_drift(&self) {
-        if let Ok(mut g) = self.pending_drift.lock() {
-            *g = None;
+        if let Ok(mut guard) = self.pending_drift.lock() {
+            *guard = None;
         }
     }
 
-    /// Rebuild the grid from `capture-pane` and clear any armed drift, so the
-    /// freshly seeded cursor is not immediately re-judged against a stale
-    /// generation.
+    /// Rebuild the grid from `capture-pane` and clear any armed drift after a
+    /// successful swap.
+    ///
+    /// `guarded` makes the swap conditional on the generation sampled before
+    /// the capture. Healing reseeds are guarded because the current grid owns
+    /// any concurrent output; resize reseeds are not, because tmux has reflowed
+    /// and made the pre-resize grid stale. Both paths retain the received and
+    /// settled chunk fence so a queued chunk cannot be duplicated or dropped.
     fn reseed(
         &self,
         cols: u16,
         rows: u16,
+        guarded: bool,
         deadline: &crate::tmux::TmuxCommandDeadline,
     ) -> VtRefreshResult {
+        let since = guarded.then(|| self.grid_gen.load(Ordering::Relaxed));
         let expected_chunk_seq = self.chunk_seq.load(Ordering::Acquire);
-        let result = seed_parser(
-            &self.target,
+        let Some(stream) = capture_seed_stream(&self.target, rows, deadline) else {
+            return VtRefreshResult::Failed;
+        };
+        let result = swap_seeded_parser(
             &self.parser,
             &self.app_cursor,
-            cols,
-            rows,
-            deadline,
+            &self.grid_gen,
+            since,
+            &stream,
+            (cols, rows),
             Some((&self.chunk_seq, &self.settled_chunk_seq, expected_chunk_seq)),
         );
         if result == VtRefreshResult::Refreshed {
-            self.grid_gen.fetch_add(1, Ordering::Relaxed);
             self.clear_drift();
         }
         result
@@ -1747,6 +1792,7 @@ impl VtChannel {
         self.reseed(
             self.cols.load(Ordering::Relaxed),
             self.rows.load(Ordering::Relaxed),
+            true,
             deadline,
         )
     }
@@ -2376,27 +2422,30 @@ mod tests {
         let parser = Mutex::new(vt100::Parser::new(24, 80, SCROLLBACK_LINES));
         parser.lock().unwrap().process(b"LIVE-CHUNK");
         let app_cursor = AtomicBool::new(false);
+        let grid_gen = AtomicU64::new(0);
         let chunk_seq = AtomicU64::new(1);
         let settled_chunk_seq = AtomicU64::new(0);
 
         assert_eq!(
-            install_seed_stream(
+            swap_seeded_parser(
                 &parser,
                 &app_cursor,
-                80,
-                24,
+                &grid_gen,
+                None,
                 b"STALE-SNAPSHOT",
+                (80, 24),
                 Some((&chunk_seq, &settled_chunk_seq, 0)),
             ),
             VtRefreshResult::Busy,
         );
         assert_eq!(
-            install_seed_stream(
+            swap_seeded_parser(
                 &parser,
                 &app_cursor,
-                80,
-                24,
+                &grid_gen,
+                None,
                 b"STALE-SNAPSHOT",
+                (80, 24),
                 Some((&chunk_seq, &settled_chunk_seq, 1)),
             ),
             VtRefreshResult::Busy,
@@ -2413,8 +2462,8 @@ mod tests {
                 "aoe_test_missing_seed",
                 &parser,
                 &app_cursor,
-                80,
-                24,
+                &grid_gen,
+                (80, 24),
                 &deadline,
                 None,
             ),
@@ -2949,6 +2998,100 @@ mod tests {
             assert!(Instant::now() < deadline, "reader never bumped grid_gen");
             std::thread::sleep(Duration::from_millis(2));
         }
+
+        stop.store(true, Ordering::Relaxed);
+        drop(conn);
+        let _ = reader.join();
+    }
+
+    #[test]
+    fn seed_swap_abandons_a_chunk_that_landed_during_capture() {
+        use std::io::Write;
+
+        // #3617: `capture_seed_stream` forks tmux, so a chunk can reach the
+        // live parser between the snapshot and the swap. Replacing the parser
+        // would drop it from both grids and pipe-pane cannot redeliver it, so
+        // the swap must stand down instead. Deterministic without tmux: drive
+        // `run_reader` over a raw socket, then call the swap directly with the
+        // generation a reseed would have sampled before its capture.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("s.sock");
+        let listener = UnixListener::bind(&sock).expect("bind");
+        let stop = Arc::new(AtomicBool::new(false));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        let app_cursor = Arc::new(AtomicBool::new(false));
+        let grid_gen = Arc::new(AtomicU64::new(0));
+        let chunk_seq = Arc::new(AtomicU64::new(0));
+        let settled_chunk_seq = Arc::new(AtomicU64::new(0));
+        let ctx = ReaderCtx {
+            parser: parser.clone(),
+            stop: stop.clone(),
+            seeded: Arc::new(AtomicBool::new(true)),
+            stream: Arc::new(Mutex::new(None)),
+            app_cursor: app_cursor.clone(),
+            alive: Arc::new(AtomicBool::new(false)),
+            wakeup: Arc::new(Mutex::new(None)),
+            clipboard: Arc::new(Mutex::new(None)),
+            chunk_seq: chunk_seq.clone(),
+            settled_chunk_seq: settled_chunk_seq.clone(),
+            last_chunk_ms: Arc::new(AtomicU64::new(0)),
+            prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
+            grid_gen: grid_gen.clone(),
+        };
+        let reader = std::thread::spawn(move || run_reader(listener, ctx));
+        let mut conn = UnixStream::connect(&sock).expect("connect");
+
+        // The generation a reseed reads before forking its capture.
+        let since = grid_gen.load(Ordering::Relaxed);
+        // The pane resumes output while that capture is in flight.
+        conn.write_all(b"post-snapshot-chunk").expect("write");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while grid_gen.load(Ordering::Relaxed) == since {
+            assert!(Instant::now() < deadline, "reader never applied the chunk");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        let seed = assemble_seed_stream(b"snapshot-body\n", &PaneSeedState::default(), 24);
+        assert_eq!(
+            swap_seeded_parser(
+                &parser,
+                &app_cursor,
+                &grid_gen,
+                Some(since),
+                &seed,
+                (80, 24),
+                Some((&chunk_seq, &settled_chunk_seq, 0)),
+            ),
+            VtRefreshResult::Busy,
+            "swap must stand down once a chunk has landed"
+        );
+        let grid = parser.lock().expect("parser").screen().contents();
+        assert!(
+            grid.contains("post-snapshot-chunk"),
+            "the raced chunk must survive in the live grid:\n{grid:?}"
+        );
+
+        // Same swap once the grid is quiet at the sampled generation: applies.
+        let quiet = grid_gen.load(Ordering::Relaxed);
+        let expected_chunk_seq = chunk_seq.load(Ordering::Acquire);
+        assert_eq!(
+            swap_seeded_parser(
+                &parser,
+                &app_cursor,
+                &grid_gen,
+                Some(quiet),
+                &seed,
+                (80, 24),
+                Some((&chunk_seq, &settled_chunk_seq, expected_chunk_seq,)),
+            ),
+            VtRefreshResult::Refreshed,
+            "an unraced swap must apply the snapshot"
+        );
+        let grid = parser.lock().expect("parser").screen().contents();
+        assert!(
+            grid.contains("snapshot-body") && !grid.contains("post-snapshot-chunk"),
+            "snapshot must replace the grid:\n{grid:?}"
+        );
 
         stop.store(true, Ordering::Relaxed);
         drop(conn);

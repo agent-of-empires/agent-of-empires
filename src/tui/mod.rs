@@ -18,6 +18,7 @@ mod metrics_poller;
 pub(crate) mod open_url;
 #[cfg(feature = "serve")]
 pub(crate) mod plugin_ui;
+mod reconcile_poller;
 #[cfg(feature = "serve")]
 pub(crate) mod remote_home;
 pub(crate) mod responsive;

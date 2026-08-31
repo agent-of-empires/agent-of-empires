@@ -1867,7 +1867,7 @@ impl Session {
     fn tmux_format_literal(value: &str) -> String {
         let mut escaped = String::with_capacity(value.len());
         for ch in value.chars() {
-            if matches!(ch, ',' | '#' | '{' | '}' | ':') {
+            if matches!(ch, ',' | '#' | '}') {
                 escaped.push('#');
             }
             escaped.push(ch);
@@ -3246,6 +3246,15 @@ mod tests {
             session.size_owner().map(|(id, _)| id),
             Some("recovered".to_string())
         );
+        session.release_size_owner("recovered");
+
+        // Format operands escape only tmux's actual separators. Prefixing a
+        // literal brace or colon with '#' changes the operand on tmux 3.6+.
+        let literal_owner = "owner{with:literal";
+        assert!(session.claim_size_owner(literal_owner, Duration::from_secs(10)));
+        assert!(session.refresh_size_owner(literal_owner));
+        session.release_size_owner(literal_owner);
+        assert!(session.size_owner().is_none());
     }
     #[test]
     #[serial_test::serial]

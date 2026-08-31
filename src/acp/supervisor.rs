@@ -505,11 +505,12 @@ pub struct SpawnRequest {
     /// session. Distinct from [`Self::agent`]: `agent` is what
     /// `pick_agent_for_tool` resolved the tool to for ACP spawning, and can
     /// differ from the tool on an explicit override, a custom agent with no
-    /// configured ACP command (falls back to `"aoe-agent"`), or the
-    /// `switch-agent` path (the tool stays fixed while `agent` becomes the new
-    /// backend). Tool-scoped `host_hooks.before_session` env (`AOE_TOOL`) uses
-    /// this field so it agrees with the terminal view rather than with
-    /// whatever ACP backend happened to serve the request.
+    /// configured ACP command (falls back to the configured
+    /// `acp.default_agent`), or the `switch-agent` path (the tool stays fixed
+    /// while `agent` becomes the new backend). Tool-scoped
+    /// `host_hooks.before_session` env (`AOE_TOOL`) uses this field so it
+    /// agrees with the terminal view rather than with whatever ACP backend
+    /// happened to serve the request.
     pub tool: String,
     pub cwd: PathBuf,
     pub additional_dirs: Vec<PathBuf>,

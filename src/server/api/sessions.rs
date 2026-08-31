@@ -225,8 +225,8 @@ pub struct SessionResponse {
     pub acp_agent: Option<String>,
     /// True when this session's agent can run a structured ACP `session/fork`:
     /// it is ACP-capable AND declares a real fork strategy. Resume-only ACP
-    /// agents (e.g. the bundled `aoe-agent`, which advertises `loadSession` but
-    /// not `session/fork`) are ACP-capable yet not forkable, so gating the web
+    /// agents (e.g. `aoe-agent`, which advertises `loadSession` but not
+    /// `session/fork`) are ACP-capable yet not forkable, so gating the web
     /// "Fork" action on `acp_session_id` alone would offer a dead-end button
     /// that fails at the `session/fork` handshake. The true capability is only
     /// advertised transiently during the handshake, so this projects the static
