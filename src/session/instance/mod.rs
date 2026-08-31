@@ -588,7 +588,7 @@ pub struct Instance {
     /// frames are otherwise indistinguishable from real transitions, and they
     /// flipped parked sessions between Idle and Running every few seconds.
     #[serde(skip)]
-    pub pending_detection: Option<(Status, u8)>,
+    pub pending_detection: Option<Status>,
 
     /// Runtime-only `KEY=VALUE` pairs minted by
     /// `host_hooks.before_session` for the host launch currently being

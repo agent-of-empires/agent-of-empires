@@ -1034,15 +1034,12 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
 
     for line in output.lines() {
         // The two trailing fields ride their own separator (see [`TAIL_SEP`]),
-        // so the pipe-separated head parses exactly as it did before them.
+        // so the pipe-separated head parses exactly as it did before them; a
+        // line with no tail is all head.
         let mut tail = line.splitn(3, TAIL_SEP);
-        let (Some(line), window_activity, pane_title) = (
-            tail.next(),
-            tail.next().and_then(|a| a.trim().parse::<i64>().ok()),
-            tail.next().unwrap_or(""),
-        ) else {
-            continue;
-        };
+        let line = tail.next().unwrap_or(line);
+        let window_activity = tail.next().and_then(|a| a.trim().parse::<i64>().ok());
+        let pane_title = tail.next().unwrap_or("");
         let mut parts = line.splitn(5, FIELD_SEP);
         let (
             Some(session_name),
@@ -2132,6 +2129,29 @@ mod tests {
         assert_eq!(meta.pane_current_command.as_deref(), Some("claude"));
         assert!(!meta.pane_start_command_is_protected);
         assert_eq!(meta.pane_pid, Some(4242));
+    }
+
+    #[test]
+    fn test_parse_pane_metadata_reads_the_tail_fields() {
+        // Built from TAIL_SEP itself, so a drift between the constant and the
+        // `list-panes` format literal fails here instead of degrading silently
+        // (no activity gate, every title rule dark).
+        let output =
+            format!("{P}proj_abc12345|0|0|claude|claude{TAIL_SEP}1770000000{TAIL_SEP}✶ Working\n");
+        let meta = parse_pane_metadata(&output)
+            .remove(&format!("{P}proj_abc12345"))
+            .unwrap();
+        assert_eq!(meta.window_activity, Some(1770000000));
+        assert_eq!(meta.pane_title.as_deref(), Some("✶ Working"));
+
+        // An unparsable activity reads as absent, an empty title as `None`,
+        // and a head with no tail at all parses as it did before the fields.
+        let odd = format!("{P}proj_def67890|0|0|claude|claude{TAIL_SEP}{TAIL_SEP}\n");
+        let meta = parse_pane_metadata(&odd)
+            .remove(&format!("{P}proj_def67890"))
+            .unwrap();
+        assert_eq!(meta.window_activity, None);
+        assert_eq!(meta.pane_title, None);
     }
 
     #[test]

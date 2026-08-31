@@ -300,9 +300,18 @@ impl Instance {
         }
 
         if tmux::detect::has_manifest(hook_tool) {
-            // Owned: the alias borrows `self`, which the manifest path mutates.
+            // Owned: both identities borrow `self`, which the manifest path
+            // mutates.
             let agent = hook_tool.to_string();
-            self.update_status_from_manifest(&session, metadata, &agent, hook, is_dead);
+            let rules_tool = pane_tool.to_string();
+            self.update_status_from_manifest(
+                &session,
+                metadata,
+                &agent,
+                &rules_tool,
+                hook,
+                is_dead,
+            );
             return;
         }
 
@@ -407,6 +416,7 @@ impl Instance {
         session: &tmux::Session,
         metadata: Option<&tmux::PaneMetadata>,
         agent: &str,
+        rules_tool: &str,
         hook: Option<tmux::detect::HookObservation>,
         is_dead: bool,
     ) {
@@ -432,7 +442,9 @@ impl Instance {
         let clean = tmux::utils::strip_ansi(&pane_content);
         // A profile's own `[[agents.<name>.status_rules]]` outrank the
         // manifest, matching the hookless path they were written for.
-        let detection = tmux::status_rules::detect(&self.source_profile, agent, &clean)
+        // `rules_tool` keeps a session's own rules ahead of its `detect_as`
+        // alias, the precedence `detection_tool` declares.
+        let detection = tmux::status_rules::detect(&self.source_profile, rules_tool, &clean)
             .map(|status| tmux::detect::Detection {
                 status: Some(status),
                 visible: true,
@@ -500,12 +512,12 @@ impl Instance {
             return Some(candidate);
         }
         match self.pending_detection {
-            Some((pending, _)) if pending == candidate => {
+            Some(pending) if pending == candidate => {
                 self.pending_detection = None;
                 Some(candidate)
             }
             _ => {
-                self.pending_detection = Some((candidate, 1));
+                self.pending_detection = Some(candidate);
                 None
             }
         }
