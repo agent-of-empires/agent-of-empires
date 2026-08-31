@@ -56,7 +56,7 @@
     "eslint-plugin-react-refresh": "^0.5.4",
     "eslint-plugin-react-you-might-not-need-an-effect": "^1.0.2",
     "globals": "^17.11.0",
-    "jsdom": "^29.1.1",
+    "jsdom": "^30.0.1",
     "monocart-coverage-reports": "^2.12.12",
     "msw": "^2.15.0",
     "oxfmt": "^0.63.0",
