@@ -10,10 +10,6 @@
 
 use std::sync::mpsc::TryRecvError;
 
-use crate::session::worktree_reconcile::{
-    reconcile_and_persist, ReconcileCache, WorktreePathResolution,
-};
-use crate::session::Storage;
 use crate::tui::worker::Worker;
 
 pub struct ReconcileRequest {
@@ -48,6 +44,16 @@ impl ReconcilePoller {
     pub fn try_recv_result(&mut self) -> Result<ReconcileResult, TryRecvError> {
         self.worker.try_recv()
     }
+
+    #[cfg(test)]
+    pub(crate) fn with_result_for_test(changed: bool) -> Self {
+        Self {
+            worker: Worker::seeded_for_test(
+                "aoe-reconcile-poller-test",
+                ReconcileResult { changed },
+            ),
+        }
+    }
 }
 
 impl Default for ReconcilePoller {
@@ -72,39 +78,7 @@ fn sweep(profiles: &[String]) -> bool {
                 "trash reconciliation skipped: {error}",
             ),
         }
-        changed |= reconcile_worktree_paths(profile);
-    }
-    changed
-}
-
-/// Repoint sessions whose managed worktree was moved outside aoe (#2002).
-fn reconcile_worktree_paths(profile: &str) -> bool {
-    let storage = match Storage::open_unwatched(profile) {
-        Ok(storage) => storage,
-        Err(error) => {
-            tracing::warn!(
-                target: "tui.home",
-                profile = %profile,
-                "worktree path reconciliation skipped: {error}",
-            );
-            return false;
-        }
-    };
-    let Ok(mut instances) = storage.load() else {
-        return false;
-    };
-    let mut cache = ReconcileCache::default();
-    let mut changed = false;
-    for instance in &mut instances {
-        match reconcile_and_persist(&storage, instance, &mut cache) {
-            Ok(WorktreePathResolution::Moved(_)) => changed = true,
-            Ok(_) => {}
-            Err(error) => tracing::warn!(
-                target: "tui.home",
-                session = %instance.id,
-                "worktree path reconciliation skipped: {error}",
-            ),
-        }
+        changed |= crate::session::worktree_reconcile::reconcile_profile(profile);
     }
     changed
 }
@@ -112,7 +86,14 @@ fn reconcile_worktree_paths(profile: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::Storage;
     use crate::session::{Instance, WorktreeInfo};
+
+    #[test]
+    fn try_recv_reports_empty_while_no_sweep_has_landed() {
+        let mut poller = ReconcilePoller::new();
+        assert!(matches!(poller.try_recv_result(), Err(TryRecvError::Empty)));
+    }
 
     /// A trashed managed worktree whose recorded dir is gone but whose holding
     /// dir exists needs only a pointer repair, so the sweep heals it without

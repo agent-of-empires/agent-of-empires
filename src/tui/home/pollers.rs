@@ -227,6 +227,13 @@ impl HomeView {
     /// field: the sweeps only rewrite durable state, so a storage reload is
     /// both sufficient and cheaper than mirroring each repair. See #3611.
     pub fn apply_reconcile_results(&mut self) -> bool {
+        // Every storage reload gates on live-send being idle so none of them
+        // interrupts a paste in progress. Checked before the drain, so the
+        // worker's result stays queued for the next eligible tick rather than
+        // being consumed and dropped.
+        if self.live_send.is_some() {
+            return false;
+        }
         let Ok(result) = self.reconcile_poller.try_recv_result() else {
             return false;
         };

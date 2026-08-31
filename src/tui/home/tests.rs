@@ -21341,3 +21341,35 @@ fn trashed_row_healing_lands_through_the_reconcile_poller() {
         "the reload must publish the healed path"
     );
 }
+
+/// #3615 review: the reconcile sweep's reload must respect the same live-send
+/// gate every other storage reload uses, and the worker's verdict must survive
+/// being skipped rather than being drained and dropped.
+#[test]
+#[serial]
+fn reconcile_reload_waits_for_live_send_to_finish() {
+    use super::live_send::{LiveSendState, LiveSendTarget};
+
+    let mut env = create_test_env_empty();
+    env.view.reconcile_poller =
+        crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(true);
+    env.view.live_send = Some(LiveSendState {
+        session_id: "s".to_string(),
+        title: "s".to_string(),
+        tmux_name: "aoe_test_live".to_string(),
+        target: LiveSendTarget::Agent,
+        exit_chords: Vec::new(),
+        leader: None,
+    });
+
+    assert!(
+        !env.view.apply_reconcile_results(),
+        "a reload must not interrupt a paste in progress"
+    );
+
+    env.view.live_send = None;
+    assert!(
+        env.view.apply_reconcile_results(),
+        "the skipped verdict must still be waiting once live-send ends"
+    );
+}

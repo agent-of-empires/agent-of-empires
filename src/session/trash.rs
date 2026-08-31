@@ -92,12 +92,36 @@ fn is_managed_single_worktree(inst: &Instance) -> bool {
 /// checkout must be left where it is (#3215). Only meaningful for a managed
 /// single-repo worktree, which every caller has already established.
 fn is_protected_default_branch(inst: &Instance) -> bool {
+    is_protected_default_branch_cached(inst, &mut ProtectedBranchCache::default())
+}
+
+/// One sweep's worth of `protected_default_branch_names` results, keyed by main
+/// repo path.
+///
+/// The lookup opens the repo through libgit2 and walks its remotes and refs, and
+/// every already-relocated trashed row asks for it, so a store's worth of rows
+/// in one repo would otherwise pay that per row. A failure is not cached: it
+/// usually means the repo is unreachable right now, and the next row should get
+/// a fresh attempt rather than inherit a stale verdict. Mirrors
+/// [`crate::session::worktree_reconcile::ReconcileCache`].
+#[derive(Default)]
+struct ProtectedBranchCache(std::collections::HashMap<String, std::collections::HashSet<String>>);
+
+fn is_protected_default_branch_cached(inst: &Instance, cache: &mut ProtectedBranchCache) -> bool {
     let Some(wt) = inst.worktree_info.as_ref() else {
         return false;
     };
-    GitWorktree::new(PathBuf::from(&wt.main_repo_path))
+    if let Some(names) = cache.0.get(&wt.main_repo_path) {
+        return names.contains(&wt.branch);
+    }
+    let Ok(names) = GitWorktree::new(PathBuf::from(&wt.main_repo_path))
         .and_then(|git| git.protected_default_branch_names())
-        .is_ok_and(|names| names.contains(&wt.branch))
+    else {
+        return false;
+    };
+    let hit = names.contains(&wt.branch);
+    cache.0.insert(wt.main_repo_path.clone(), names);
+    hit
 }
 
 /// Whether a managed worktree's directory has outlived its registration, so
@@ -480,6 +504,13 @@ enum ReconcilePlan {
 }
 
 fn plan_trashed_reconcile(inst: &Instance) -> ReconcilePlan {
+    plan_trashed_reconcile_cached(inst, &mut ProtectedBranchCache::default())
+}
+
+fn plan_trashed_reconcile_cached(
+    inst: &Instance,
+    cache: &mut ProtectedBranchCache,
+) -> ReconcilePlan {
     if !inst.is_trashed() || !is_managed_single_worktree(inst) {
         return ReconcilePlan::Nothing;
     }
@@ -489,7 +520,7 @@ fn plan_trashed_reconcile(inst: &Instance) -> ReconcilePlan {
     // refuses to remove it, so clearing the row would leave that checkout there
     // with nothing pointing at it. Move it back instead. Strict like every
     // restore: an occupied original leaves the row untouched.
-    if inst.pre_trash_project_path.is_some() && is_protected_default_branch(inst) {
+    if inst.pre_trash_project_path.is_some() && is_protected_default_branch_cached(inst, cache) {
         return ReconcilePlan::RestoreDefaultBranch;
     }
 
@@ -631,25 +662,24 @@ pub fn reconcile_trashed_location(inst: &mut Instance) -> bool {
 /// Returns the rows whose durable record changed. Rows that need nothing are
 /// decided from the recorded paths and the filesystem, so a profile whose
 /// trash is already consistent takes no lock, spawns no git, and writes
-/// nothing. It is not free: an already-relocated row still costs one libgit2
-/// repo open for the default-branch check in the plan step, which is now the
-/// dominant cost of an idle sweep. The rows that do need work are
+/// nothing; the one libgit2 open the default-branch check needs is shared
+/// across every row in a repo. The rows that do need work are
 /// reserved in one [`crate::session::Storage::update`] per batch, do their
 /// blocking filesystem work outside the storage lock, and commit in a second,
 /// instead of two full read-parse-serialize-write cycles per row (#3611).
 ///
-/// Every lifecycle flock a batch needs is taken up front in sorted id order.
-/// Peers take one at a time, so an ordered multi-lock holder cannot close a
-/// cycle with them.
+/// Only one lifecycle flock is ever held at a time, so this cannot deadlock
+/// against a peer and cannot make one wait behind an unrelated row's git call.
 ///
 /// BLOCKING: takes cross-process locks and shells out to git. Never call it on
 /// an event loop or the async runtime.
 pub fn reconcile_trashed_profile(profile: &str) -> anyhow::Result<Vec<Instance>> {
     let storage = crate::session::Storage::open_unwatched(profile)?;
+    let mut cache = ProtectedBranchCache::default();
     let mut candidates: Vec<String> = storage
         .load()?
         .into_iter()
-        .filter(|inst| plan_trashed_reconcile(inst) != ReconcilePlan::Nothing)
+        .filter(|inst| plan_trashed_reconcile_cached(inst, &mut cache) != ReconcilePlan::Nothing)
         .map(|inst| inst.id)
         .collect();
     candidates.sort();
@@ -663,40 +693,21 @@ pub fn reconcile_trashed_profile(profile: &str) -> anyhow::Result<Vec<Instance>>
 
 /// How many rows one batch reserves at once.
 ///
-/// Every row in a batch holds its lifecycle flock for the batch's whole
-/// filesystem pass, and `git worktree move` is bounded at 30s, so the batch
-/// size is also the worst-case multiplier on how long a peer wanting one of
-/// those sessions waits (`acquire_open_storage_flock` retries without a
-/// timeout). Kept small enough that the pathological case stays in the tens of
-/// seconds rather than the tens of minutes, while still collapsing the common
-/// case, a handful of rows, into a single pair of writes.
+/// A batch holds its reservations from the first write to the second, and
+/// `git worktree move` is bounded at 30s per row, so the batch size sets how
+/// long that window can get. It has to stay well inside
+/// [`Instance::LIFECYCLE_RESERVATION_TTL`] (10 minutes) or a slow batch would
+/// outlive its own reservations and commit nothing.
 const RECONCILE_BATCH: usize = 8;
 
 fn reconcile_trashed_batch(
     storage: &crate::session::Storage,
     batch: &[String],
 ) -> anyhow::Result<Vec<Instance>> {
-    let mut candidates = batch.to_vec();
-    let mut locks = Vec::with_capacity(candidates.len());
-    candidates.retain(|id| match storage.acquire_instance_lifecycle_lock(id) {
-        Ok(lock) => {
-            locks.push(lock);
-            true
-        }
-        Err(error) => {
-            tracing::warn!(
-                target: "session.trash",
-                session = %id,
-                "trash reconciliation skipped: could not acquire lifecycle lock: {error}"
-            );
-            false
-        }
-    });
-
     let now = Utc::now();
     let reserved = storage.update(|instances, _groups| {
         let mut reserved: Vec<(u64, Instance)> = Vec::new();
-        for id in &candidates {
+        for id in batch {
             let Some(stored) = instances.iter_mut().find(|candidate| &candidate.id == id) else {
                 continue;
             };
@@ -716,10 +727,25 @@ fn reconcile_trashed_batch(
         Ok(reserved)
     })?;
 
+    // Each row takes its own lifecycle flock only across its own filesystem
+    // work. Holding the batch's flocks throughout would make a peer wanting any
+    // one of these sessions wait behind every other row's `git worktree move`.
+    // The reservation taken above, not the flock, is what keeps peers off these
+    // rows for the whole batch.
     let reconciled: Vec<(u64, bool, Instance)> = reserved
         .into_iter()
         .map(|(generation, mut durable)| {
-            let changed = reconcile_trashed_location(&mut durable);
+            let changed = match storage.acquire_instance_lifecycle_lock(&durable.id) {
+                Ok(_lifecycle_lock) => reconcile_trashed_location(&mut durable),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "session.trash",
+                        session = %durable.id,
+                        "trash reconciliation skipped: could not acquire lifecycle lock: {error}"
+                    );
+                    false
+                }
+            };
             (generation, changed, durable)
         })
         .collect();
