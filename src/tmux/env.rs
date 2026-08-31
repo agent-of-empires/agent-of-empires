@@ -338,7 +338,7 @@ pub fn get_hidden_env_batch(session_names: &[&str], key: &str) -> Vec<(String, O
                 Some(value) => value,
                 None => {
                     repaired += 1;
-                    get_hidden_env(name, key)
+                    get_hidden_env_uncached(name, key)
                 }
             };
             (name.to_string(), value)
