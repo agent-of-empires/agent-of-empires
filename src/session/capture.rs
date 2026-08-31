@@ -1006,17 +1006,20 @@ fn compose_exclusion_in(
 /// starts. Parked conversations are no longer published in the peer's tmux
 /// environment, so [`build_exclusion_set`] cannot see them. Without this set,
 /// another session can capture the parked conversation before its owner swaps
-/// back. Claude, host Codex, and host Kimi additionally need inactive
-/// same-tool protection because their shared-store MRU scans can select a
-/// conversation after the owning pane disappears. Sandboxed Codex and Kimi
-/// omit that protection because their stores are instance-private or are not
-/// captured from the host (#3317).
+/// back. Claude, host OpenCode, host Codex, and host Kimi additionally need
+/// inactive same-tool protection because their shared-store MRU scans can
+/// select a conversation after the owning pane disappears. Sandboxed Codex
+/// and Kimi omit that protection because their stores are instance-private
+/// or are not captured from the host (#3317); sandboxed OpenCode likewise
+/// owns a container-private store.
 ///
 /// Scope: host stores are keyed by each agent's effective home, not by AoE
 /// profile, but this helper inspects only `sessions.json` for the caller's
 /// effective profile. A stopped peer in another profile against the same
 /// agent home will not be excluded; callers needing global ownership must
-/// compose their own cross-profile check.
+/// compose their own cross-profile check. For OpenCode that remainder is
+/// covered by [`opencode_shared_store_peers`], which the launch-time guard
+/// consults and whose owner sids the poller's exclusion snapshot carries.
 pub(crate) fn compose_exclusion_with_persisted_peers(
     current_instance_id: &str,
     current_project_path: &str,
@@ -1607,6 +1610,10 @@ pub(crate) fn opencode_store_identity(lookup: &dyn Fn(&str) -> Option<String>) -
     Ok(data_dir.join("opencode.db"))
 }
 
+/// Resolve opencode's data directory.
+///
+/// Uses `XDG_DATA_HOME` if set (same `xdg-basedir` npm package opencode uses),
+/// otherwise `$HOME/.local/share`. Both Linux and macOS use this path.
 fn opencode_data_dir_with(lookup: &dyn Fn(&str) -> Option<String>) -> Result<PathBuf> {
     if let Some(xdg) = lookup("XDG_DATA_HOME") {
         if !xdg.is_empty() {
@@ -1620,10 +1627,6 @@ fn opencode_data_dir_with(lookup: &dyn Fn(&str) -> Option<String>) -> Result<Pat
         .join("opencode"))
 }
 
-/// Resolve opencode's data directory.
-///
-/// Uses `XDG_DATA_HOME` if set (same `xdg-basedir` npm package opencode uses),
-/// otherwise `$HOME/.local/share`. Both Linux and macOS use this path.
 /// Load opencode's session rows from its SQLite store at `db_path`.
 ///
 /// Selects `id`, `directory`, and `time_updated` from the `session` table
@@ -1985,6 +1988,102 @@ pub(crate) fn opencode_poll_fn_sandboxed(
         .ok()
         .and_then(validated_session_id)
     }
+}
+
+/// Whether another persisted host-opencode instance shares this one's
+/// OpenCode store *and* canonicalized project path, and which conversation
+/// ids those peers own.
+///
+/// This is the OpenCode counterpart of [`kimi_store_is_shared`]: the store is
+/// one global SQLite database keyed by directory, not by AoE profile, so a
+/// peer in any profile resolving to the same store can poison the directory
+/// MRU scan behind [`try_capture_opencode_session_id`] (#3555, family
+/// #2344/#2708/#2858). Owner means the peer's current tool is opencode or it
+/// parked an opencode conversation in `prior_tool_session_ids` during a tool
+/// swap; bucket and liveness are irrelevant, because recovery races and
+/// restorable trash rows adopt exactly like live rows.
+///
+/// The own side resolves from the process environment on purpose: that is the
+/// store [`opencode_db_path`] actually opens for the scan, and resolving it
+/// from the profile's static list instead would compare against a store the
+/// scan never touches. Peer sides resolve their profile `environment` first
+/// through [`crate::session::environment::resolve_host_environment_value`]
+/// (the same `$VAR` / bare-key / last-wins grammar launch applies), falling
+/// back to the process env, so unrelated entries never hide a same-store
+/// peer while genuine `OPENCODE_DB` redirects still do.
+///
+/// Sandboxed instances own container-private stores (#3317) and other tools
+/// scan their own transcript dirs, so neither can be confused with this
+/// store's freshest row.
+///
+/// Fail-closed: if the profile registry, any same-store profile config or
+/// store, or a peer's store identity cannot be read, report shared. A skipped
+/// rescan costs one resume; a wrong adoption loses a conversation.
+pub(crate) fn opencode_shared_store_peers(
+    current_instance_id: &str,
+    current_project_path: &str,
+) -> (bool, HashSet<String>) {
+    let canonical_current = canonicalize_or_raw(current_project_path);
+    let own_store = match opencode_store_identity(&|key| std::env::var(key).ok()) {
+        Ok(path) => path,
+        Err(_) => return (true, HashSet::new()),
+    };
+    let Ok(profiles) = crate::session::list_profiles() else {
+        return (true, HashSet::new());
+    };
+    let mut owner_sids: HashSet<String> = HashSet::new();
+    let mut shared = false;
+    for peer_profile in profiles {
+        let Ok(peer_config) = super::profile_config::resolve_config(&peer_profile) else {
+            return (true, owner_sids);
+        };
+        let peer_store = match opencode_store_identity(&|key: &str| {
+            crate::session::environment::resolve_host_environment_value(
+                &peer_config.environment,
+                key,
+            )
+            .or_else(|| std::env::var(key).ok())
+        }) {
+            Ok(path) => path,
+            Err(_) => return (true, owner_sids),
+        };
+        if peer_store != own_store {
+            continue;
+        }
+        let Ok(storage) = crate::session::storage::Storage::new_unwatched(&peer_profile) else {
+            return (true, owner_sids);
+        };
+        let Ok(instances) = storage.load() else {
+            return (true, owner_sids);
+        };
+        for inst in instances {
+            if inst.id == current_instance_id || inst.is_sandboxed() {
+                continue;
+            }
+            let mut owned: Vec<String> = Vec::new();
+            if inst.tool == "opencode" {
+                if let Some(sid) = inst.agent_session_id.as_deref().filter(|s| !s.is_empty()) {
+                    owned.push(sid.to_string());
+                }
+            }
+            if let Some(parked) = inst
+                .prior_tool_session_ids
+                .get("opencode")
+                .and_then(|p| p.agent_session_id.as_deref())
+                .filter(|s| !s.is_empty())
+            {
+                owned.push(parked.to_string());
+            }
+            if owned.is_empty() {
+                continue;
+            }
+            if canonicalize_or_raw(&inst.project_path) == canonical_current {
+                shared = true;
+                owner_sids.extend(owned);
+            }
+        }
+    }
+    (shared, owner_sids)
 }
 
 // ─── Codex CLI session capture ────────────────────────────────────────────────

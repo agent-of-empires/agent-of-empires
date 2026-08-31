@@ -3217,92 +3217,20 @@ impl Instance {
             &self.project_path,
             &self.tool,
             self.tool == "claude"
-                || self.tool == "opencode"
-                || (matches!(self.tool.as_str(), "codex" | "kimi") && !self.is_sandboxed()),
+                || (matches!(self.tool.as_str(), "opencode" | "codex" | "kimi")
+                    && !self.is_sandboxed()),
             &self.effective_profile(),
             &self.retroactive_capture_excludes,
         )
     }
 
-    /// Effective env lookup for one profile: explicit `KEY=value` entries
-    /// win, bare `KEY` entries inherit the process value, anything unset
-    /// falls through to the process environment.
-    fn opencode_profile_env_lookup(profile: &str, key: &str) -> Option<String> {
-        let config = super::profile_config::resolve_config_or_warn(profile);
-        for entry in &config.environment {
-            if let Some(value) = entry.strip_prefix(&format!("{key}=")) {
-                return Some(value.to_string());
-            }
-        }
-        std::env::var(key).ok()
+    /// Same-store same-cwd OpenCode peers across every profile: whether any
+    /// exists and which conversation ids they own. See
+    /// [`super::capture::opencode_shared_store_peers`] for the ownership,
+    /// sandbox, and fail-closed rules.
+    fn opencode_shared_store_peers(&self) -> (bool, HashSet<String>) {
+        super::capture::opencode_shared_store_peers(&self.id, &self.project_path)
     }
-
-    /// Whether at least one OTHER host-opencode instance shares this
-    /// session's OpenCode store *and* its canonicalized project_path.
-    ///
-    /// Store identity is resolved per profile with opencode's own rules
-    /// ([`super::capture::opencode_store_identity`]: `OPENCODE_DB` override,
-    /// else `XDG_DATA_HOME`/`HOME` data dir), layered over the process env by
-    /// that profile's `environment` entries. Profiles resolving to a
-    /// different store are skipped; an unrelated environment entry therefore
-    /// never hides a same-store peer.
-    ///
-    /// Sandboxed instances own instance-private stores (#3317) and other
-    /// tools scan their own distinct transcript dirs, so neither can be
-    /// confused with this store's freshest conversation.
-    ///
-    /// Fail-closed: if the profile registry, this session's own store
-    /// identity, or any same-store listing cannot be read, treat the store
-    /// as shared and skip the MRU capture — a skipped rescan costs one
-    /// resume; a wrong adoption loses a conversation.
-    fn opencode_shares_store_with_peer(&self) -> bool {
-        if self.is_sandboxed() {
-            return false;
-        }
-        let own_profile = self.effective_profile();
-        let own_store = match super::capture::opencode_store_identity(&|key: &str| {
-            Self::opencode_profile_env_lookup(&own_profile, key)
-        }) {
-            Ok(path) => path,
-            Err(_) => return true,
-        };
-        let Ok(mut profiles) = crate::session::list_profiles() else {
-            return true;
-        };
-        if !profiles.iter().any(|p| p == &own_profile) {
-            profiles.push(own_profile.clone());
-        }
-        let canon = super::capture::canonicalize_or_raw(&self.project_path);
-        for profile in profiles {
-            let store = match super::capture::opencode_store_identity(&|key: &str| {
-                Self::opencode_profile_env_lookup(&profile, key)
-            }) {
-                Ok(path) => path,
-                // Unresolvable peer store identity: it cannot be proven to
-                // be the same store, so it cannot hide a same-store peer.
-                Err(_) => continue,
-            };
-            if store != own_store {
-                continue;
-            }
-            let Ok(storage) = super::storage::Storage::new_unwatched(&profile) else {
-                return true;
-            };
-            let Ok(instances) = storage.load() else {
-                return true;
-            };
-            if instances.iter().any(|i| {
-                i.id != self.id
-                    && i.tool == "opencode"
-                    && !i.is_sandboxed()
-                    && super::capture::canonicalize_or_raw(&i.project_path) == canon
-            }) {
-                return true;
-            }
-        }
-        false
-    }
-
     /// Whether another AoE session shares this one's Kimi store, which makes
     /// the session index useless for attributing a conversation to a pane.
     /// Both own homes are supplied so a hook-minted `KIMI_CODE_HOME` still
@@ -3344,15 +3272,13 @@ impl Instance {
                 }
             }
             "opencode" => {
-                // Multi-session-same-cwd guard: with another HOST-OPENCODE
-                // instance on this project_path/store, the launch-time
-                // freshest-MRU scan cannot attribute the directory's newest
-                // conversation to THIS session (#2344/#2708 family). Resume
-                // trusts the stored sid.
-                if self.opencode_shares_store_with_peer() {
+                // On a shared store the directory's freshest row is not
+                // attributable to this pane, so the rescan would adopt
+                // whoever wrote last (#3555). Resume trusts the stored sid.
+                if self.opencode_shared_store_peers().0 {
                     tracing::debug!(target: "session.capture",
                         instance = %self.id,
-                        "skipping opencode retroactive capture: project_path shared");
+                        "skipping opencode retroactive capture: shared store and cwd");
                     return None;
                 }
                 let exclusion = self.retroactive_capture_exclusion_set();
@@ -5932,11 +5858,22 @@ impl Instance {
                         extra_excludes.clone(),
                     ))
                 } else {
+                    let (shared, owner_sids) = self.opencode_shared_store_peers();
+                    let mut extra_excludes = extra_excludes.clone();
+                    if shared {
+                        // Same-store same-cwd peers own rows this poller's MRU
+                        // scan would otherwise adopt before their own profile
+                        // drains them; excluding their sids keeps a staggered
+                        // poller from claiming another session's conversation
+                        // (#3555). The scan itself must keep running so a
+                        // fresh session still binds its own post-prompt id.
+                        extra_excludes.extend(owner_sids);
+                    }
                     Box::new(opencode_poll_fn(
                         self.project_path.clone(),
                         self.id.clone(),
                         launch_time_ms,
-                        extra_excludes.clone(),
+                        extra_excludes,
                     ))
                 }
             }
@@ -17520,16 +17457,52 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
 mod opencode_same_cwd_clobbering_tests {
     use super::*;
     use crate::session::test_support::EnvGuard;
-    use crate::session::Status;
     use std::path::PathBuf;
     use tempfile::tempdir;
 
     const OC_SID_SELF: &str = "019342ab-1234-7def-8901-oc0000000001";
     const OC_SID_PEER: &str = "019342ab-1234-7def-8901-oc0000000002";
+    const OC_SID_FRESH: &str = "019342ab-1234-7def-8901-oc0000000003";
 
-    fn seed_two(profile: &str, me: &Instance, peer: &Instance) {
+    /// Keep the tests serial: they rewrite the process-global
+    /// HOME / XDG_CONFIG_HOME / OPENCODE_DB variables through EnvGuard.
+    fn env_guard(
+        temp: &std::path::Path,
+        db: &std::path::Path,
+        extra: &[(&'static str, PathBuf)],
+    ) -> EnvGuard {
+        let mut pairs: Vec<(&'static str, PathBuf)> = vec![
+            ("HOME", temp.to_path_buf()),
+            ("XDG_CONFIG_HOME", temp.join(".config")),
+            ("OPENCODE_DB", db.to_path_buf()),
+        ];
+        pairs.extend(extra.iter().cloned());
+        EnvGuard::set(&pairs)
+    }
+
+    /// Seed a real OpenCode SQLite store: `read_opencode_sessions_from_sqlite_at`
+    /// selects exactly these columns.
+    fn seed_store(db: &std::path::Path, rows: &[(&str, &str, i64)]) {
+        if let Some(parent) = db.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT NOT NULL, time_updated INTEGER NOT NULL);",
+        )
+        .unwrap();
+        for (id, directory, updated) in rows {
+            conn.execute(
+                "INSERT INTO session (id, directory, time_updated) VALUES (?1, ?2, ?3)",
+                rusqlite::params![id, directory, updated],
+            )
+            .unwrap();
+        }
+    }
+
+    fn seed_instance(profile: &str, inst: &Instance) {
         let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
-        let owned = vec![me.clone(), peer.clone()];
+        let owned = vec![inst.clone()];
         storage
             .update(|instances, groups| {
                 *instances = owned.clone();
@@ -17539,28 +17512,38 @@ mod opencode_same_cwd_clobbering_tests {
             .unwrap();
     }
 
+    fn write_profile_config(profile: &str, body: &str) {
+        let dir = crate::session::get_profile_dir_path(profile).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), body).unwrap();
+    }
+
+    fn make_me(profile: &str, cwd: &std::path::Path) -> Instance {
+        let mut me = Instance::new("me-row", cwd.to_str().unwrap());
+        me.source_profile = profile.to_string();
+        me.tool = "opencode".to_string();
+        me.agent_session_id = Some(OC_SID_SELF.to_string());
+        me
+    }
+
     #[serial_test::serial]
     #[test]
     fn exclusion_set_includes_inactive_same_cwd_peer_for_opencode() {
         let temp = tempdir().unwrap();
-        #[allow(unused_mut)]
-        let mut pairs: Vec<(&'static str, PathBuf)> = vec![("HOME", temp.path().to_path_buf())];
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        pairs.push(("XDG_CONFIG_HOME", temp.path().join(".config")));
-        let _guard = EnvGuard::set(&pairs);
+        let _guard = EnvGuard::set(&[
+            ("HOME", temp.path().to_path_buf()),
+            ("XDG_CONFIG_HOME", temp.path().join(".config")),
+        ]);
 
-        let profile = "oc-cwd-excl";
-        let mut me = Instance::new("me-row", "/tmp/aoe-shared-cwd-a");
-        me.source_profile = profile.to_string();
-        me.tool = "opencode".to_string();
-        me.agent_session_id = Some(OC_SID_SELF.to_string());
+        let profile = "oc-inactive-peer-exclusion";
+        let me = make_me(profile, std::path::Path::new("/tmp/aoe-shared-cwd-a"));
 
         let mut peer = Instance::new("peer-row", "/tmp/aoe-shared-cwd-a");
         peer.source_profile = profile.to_string();
         peer.tool = "opencode".to_string();
         peer.status = Status::Stopped;
         peer.agent_session_id = Some(OC_SID_PEER.to_string());
-        seed_two(profile, &me, &peer);
+        seed_instance(profile, &peer);
 
         let exclusion = me.retroactive_capture_exclusion_set();
         assert!(
@@ -17569,94 +17552,206 @@ mod opencode_same_cwd_clobbering_tests {
         );
     }
 
+    /// Every row below must keep the scan from adopting `OC_SID_FRESH`, the
+    /// untracked newest conversation in the shared directory. Removing the
+    /// launch-time guard turns this test red: the scan then returns
+    /// `Some(OC_SID_FRESH)` because the fresh row is in no exclusion set.
     #[serial_test::serial]
     #[test]
-    fn retroactive_capture_is_skipped_when_project_path_is_shared() {
+    fn retroactive_capture_is_skipped_for_every_same_store_peer_shape() {
+        struct PeerShape {
+            profile: &'static str,
+            config: Option<&'static str>,
+            parked: bool,
+        }
+        let own_redirect_toml = Some("environment = [\"OPENCODE_DB=/nonexistent/elsewhere.db\"]\n");
+        let unrelated_env_toml = Some("environment = [\"RUST_LOG=debug\"]\n");
+        let var_store_toml = Some("environment = [\"OPENCODE_DB=$OC_TEST_DB\"]\n");
+        let cases: Vec<(&'static str, Option<&'static str>, Option<PeerShape>)> = vec![
+            // Peer in the same profile: the exclusion arm already covers it,
+            // the guard must agree.
+            (
+                "same profile peer",
+                None,
+                Some(PeerShape {
+                    profile: "oc-self",
+                    config: None,
+                    parked: false,
+                }),
+            ),
+            // An environment entry unrelated to the store must not make a
+            // same-store peer look foreign.
+            (
+                "cross-profile peer, unrelated env entry",
+                None,
+                Some(PeerShape {
+                    profile: "oc-peer-unrelated",
+                    config: unrelated_env_toml,
+                    parked: false,
+                }),
+            ),
+            // The own side resolves from the process env (what the scan
+            // opens), so a redirect entry in the own profile must not
+            // reclassify default-store peers as foreign.
+            (
+                "own profile redirects OPENCODE_DB",
+                own_redirect_toml,
+                Some(PeerShape {
+                    profile: "oc-peer-default",
+                    config: None,
+                    parked: false,
+                }),
+            ),
+            // A peer reaching this store through $VAR grammar is same-store.
+            (
+                "peer reaches this store through $VAR",
+                None,
+                Some(PeerShape {
+                    profile: "oc-peer-var",
+                    config: var_store_toml,
+                    parked: false,
+                }),
+            ),
+            // A peer that swapped away still owns its parked opencode
+            // conversation; the row it left behind is the freshest one here.
+            (
+                "cross-profile parked opencode owner",
+                None,
+                Some(PeerShape {
+                    profile: "oc-peer-parked",
+                    config: None,
+                    parked: true,
+                }),
+            ),
+        ];
+        for (name, own_config, peer) in cases {
+            let temp = tempdir().unwrap();
+            let cwd = temp.path().join("cwd");
+            std::fs::create_dir_all(&cwd).unwrap();
+            let db = temp.path().join("opencode.db");
+            let mut extra: Vec<(&'static str, PathBuf)> = Vec::new();
+            if peer.as_ref().is_some_and(|p| p.profile == "oc-peer-var") {
+                extra.push(("OC_TEST_DB", db.clone()));
+            }
+            let _guard = env_guard(temp.path(), &db, &extra);
+            seed_store(
+                &db,
+                &[
+                    (OC_SID_PEER, cwd.to_str().unwrap(), 1_000),
+                    (OC_SID_FRESH, cwd.to_str().unwrap(), 2_000),
+                ],
+            );
+
+            let own_profile = "oc-self";
+            if let Some(body) = own_config {
+                write_profile_config(own_profile, body);
+            }
+            let me = make_me(own_profile, &cwd);
+            seed_instance(own_profile, &me);
+
+            if let Some(peer) = peer {
+                if let Some(body) = peer.config {
+                    write_profile_config(peer.profile, body);
+                }
+                let mut peer_inst = Instance::new("peer-row", cwd.to_str().unwrap());
+                peer_inst.source_profile = peer.profile.to_string();
+                if peer.parked {
+                    peer_inst.tool = "claude".to_string();
+                    peer_inst.prior_tool_session_ids.insert(
+                        "opencode".to_string(),
+                        PriorToolSession {
+                            agent_session_id: Some(OC_SID_FRESH.to_string()),
+                            acp_session_id: None,
+                        },
+                    );
+                } else {
+                    peer_inst.tool = "opencode".to_string();
+                    peer_inst.status = Status::Stopped;
+                    peer_inst.agent_session_id = Some(OC_SID_PEER.to_string());
+                }
+                seed_instance(peer.profile, &peer_inst);
+            }
+
+            assert_eq!(
+                me.try_retroactive_capture(),
+                None,
+                "case {name:?}: a shared store and cwd must suppress the MRU rescan"
+            );
+        }
+    }
+
+    /// The guard must suppress only the contested rescan. With no same-cwd
+    /// peer anywhere, the scan still runs and returns the directory's row.
+    #[serial_test::serial]
+    #[test]
+    fn retroactive_capture_still_runs_without_a_same_cwd_peer() {
         let temp = tempdir().unwrap();
-        #[allow(unused_mut)]
-        let mut pairs: Vec<(&'static str, PathBuf)> = vec![("HOME", temp.path().to_path_buf())];
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        pairs.push(("XDG_CONFIG_HOME", temp.path().join(".config")));
-        let _guard = EnvGuard::set(&pairs);
+        let cwd = temp.path().join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let db = temp.path().join("opencode.db");
+        let _guard = env_guard(temp.path(), &db, &[]);
+        seed_store(&db, &[(OC_SID_SELF, cwd.to_str().unwrap(), 1_000)]);
 
-        let profile = "oc-cwd-skip";
-        let mut me = Instance::new("me-row", "/tmp/aoe-shared-cwd-b");
-        me.source_profile = profile.to_string();
-        me.tool = "opencode".to_string();
-        me.agent_session_id = Some(OC_SID_SELF.to_string());
-
-        let mut peer = Instance::new("peer-row", "/tmp/aoe-shared-cwd-b");
-        peer.source_profile = profile.to_string();
-        peer.tool = "opencode".to_string();
-        seed_two(profile, &me, &peer);
+        let me = make_me("oc-solo", &cwd);
+        seed_instance("oc-solo", &me);
 
         assert_eq!(
             me.try_retroactive_capture(),
-            None,
-            "shared project_path: resume must trust the stored sid instead of the dir MRU scan"
+            Some(OC_SID_SELF.to_string()),
+            "a sole session keeps its retroactive capture"
         );
     }
 
+    /// The poller's exclusion snapshot must carry the cross-profile owner
+    /// sids, or a staggered poller claims the owner's row before the owning
+    /// profile drains it.
     #[serial_test::serial]
     #[test]
-    fn cross_profile_peer_with_unrelated_env_is_still_same_store() {
+    fn poller_excludes_cross_profile_owner_sids_on_shared_store() {
         let temp = tempdir().unwrap();
-        #[allow(unused_mut)]
-        let mut pairs: Vec<(&'static str, PathBuf)> = vec![("HOME", temp.path().to_path_buf())];
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        pairs.push(("XDG_CONFIG_HOME", temp.path().join(".config")));
-        let _guard = EnvGuard::set(&pairs);
+        let cwd = temp.path().join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let db = temp.path().join("opencode.db");
+        let _guard = env_guard(temp.path(), &db, &[]);
+        seed_store(&db, &[(OC_SID_PEER, cwd.to_str().unwrap(), 1_000)]);
 
-        let app = std::path::PathBuf::from(std::env::var("XDG_CONFIG_HOME").unwrap())
-            .join("agent-of-empires");
-        let other_profile = "oc-unrelated-env";
-        let cfg_dir = app.join("profiles").join(other_profile);
-        std::fs::create_dir_all(&cfg_dir).unwrap();
-        // Unrelated entry only: must NOT make the store look different.
-        std::fs::write(
-            cfg_dir.join("config.toml"),
-            "environment = [\"RUST_LOG=debug\"]\n",
-        )
-        .unwrap();
-
-        let me_profile = "oc-main-cwd";
-        let mut me = Instance::new("me-row", "/tmp/aoe-shared-cwd-c");
-        me.source_profile = me_profile.to_string();
-        me.tool = "opencode".to_string();
-        me.agent_session_id = Some(OC_SID_SELF.to_string());
-        {
-            let storage = crate::session::storage::Storage::new_unwatched(me_profile).unwrap();
-            let owned = vec![me.clone()];
-            storage
-                .update(|i, g| {
-                    *i = owned.clone();
-                    *g = crate::session::GroupTree::new_with_groups(&owned, &[]).get_all_groups();
-                    Ok(())
-                })
-                .unwrap();
-        }
-
-        let mut peer = Instance::new("peer-row", "/tmp/aoe-shared-cwd-c");
-        peer.source_profile = other_profile.to_string();
+        let me = make_me("oc-self", &cwd);
+        seed_instance("oc-self", &me);
+        let mut peer = Instance::new("peer-row", cwd.to_str().unwrap());
+        peer.source_profile = "oc-peer-x".to_string();
         peer.tool = "opencode".to_string();
-        peer.status = crate::session::Status::Stopped;
+        peer.status = Status::Stopped;
         peer.agent_session_id = Some(OC_SID_PEER.to_string());
-        {
-            let storage = crate::session::storage::Storage::new_unwatched(other_profile).unwrap();
-            let owned = vec![peer.clone()];
-            storage
-                .update(|i, g| {
-                    *i = owned.clone();
-                    *g = crate::session::GroupTree::new_with_groups(&owned, &[]).get_all_groups();
-                    Ok(())
-                })
-                .unwrap();
-        }
+        seed_instance("oc-peer-x", &peer);
 
+        let (shared, owner_sids) = me.opencode_shared_store_peers();
+        assert!(
+            shared,
+            "cross-profile same-store same-cwd peer must be detected"
+        );
+        assert!(owner_sids.contains(OC_SID_PEER));
+
+        let quiet = crate::session::capture::opencode_poll_fn(
+            cwd.to_str().unwrap().to_string(),
+            me.id.clone(),
+            0.0,
+            owner_sids,
+        );
         assert_eq!(
-            me.try_retroactive_capture(),
+            quiet(),
             None,
-            "a peer profile differing only by an unrelated env entry shares the default store; the guard must still skip the MRU scan"
+            "with the owner sids propagated the poller must not claim the peer's row"
+        );
+        let unguarded = crate::session::capture::opencode_poll_fn(
+            cwd.to_str().unwrap().to_string(),
+            me.id.clone(),
+            0.0,
+            Default::default(),
+        );
+        assert_eq!(
+            unguarded(),
+            Some(OC_SID_PEER.to_string()),
+            "without the propagation the poller adopts the peer's row; this assert is the mutation tripwire"
         );
     }
 }
