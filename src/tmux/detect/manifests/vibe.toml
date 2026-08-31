@@ -42,14 +42,14 @@ id = "spinner"
 priority = 960
 
 # Loose on purpose: these words are matched anywhere in the window, which is
-# the behaviour this detector has always had. Textual renders a status word one
-# character per line in a narrow pane, so the window is concatenated to read it
-# back as a word.
+# the behaviour this detector has always had. A pane too narrow for the status
+# word makes Textual stack it one character per row, so the window is unstacked
+# first to read it back as a word.
 [[rules]]
 id = "activity_word"
 state = "running"
 priority = 955
-region = "concatenated_recent"
+region = "unstacked_recent"
 contains_any = [
   "running",
   "reading",

@@ -2266,11 +2266,12 @@ Do you want to proceed?\n\
         assert!(!vibe_rule_matches("spinner", vertical));
         assert!(!vibe_rule_matches("trailing_ellipsis", vertical));
 
-        // A pane narrow enough to stack the word is narrow enough to stack the
-        // chrome under it, so the word sits well above the line-oriented
-        // window and only the deeper concatenated one still reaches it.
-        let buried = format!("{vertical}\n{}", "x\n".repeat(40));
-        assert_eq!(detect_vibe_status(&buried), Status::Running);
+        // Only stacked runs are glued: two ordinary lines that happen to meet
+        // mid-word stay separate, so they cannot spell an activity word
+        // neither of them contains.
+        let glued = "finished a long run\nning total of 3 files";
+        assert_eq!(detect_vibe_status(glued), Status::Idle);
+        assert!(!vibe_rule_matches("activity_word", glued));
 
         // Ellipsis indicates ongoing activity
         assert_eq!(detect_vibe_status("Working…"), Status::Running);
