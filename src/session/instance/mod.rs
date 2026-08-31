@@ -486,7 +486,8 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_name: Option<String>,
     /// Optional model id, injected at spawn as `AOE_AGENT_MODEL` (e.g.,
-    /// "claude-opus-4-7", "gpt-5", "llama3.3:ollama").
+    /// "claude-opus-4-7", "gpt-5", "llama3.3:ollama"). Only `aoe-agent`
+    /// reads that variable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_model: Option<String>,
     /// Reasoning effort ("thought level") this session was explicitly pinned
