@@ -2566,6 +2566,68 @@ const PASSPHRASE_WORDS: &[&str] = &[
 ];
 
 #[cfg(test)]
+mod qr_seam {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// Unicode half-blocks the QR renderer draws with. Their presence is the
+    /// only way to tell a rendered code from an empty panel.
+    const QR_GLYPHS: [char; 3] = ['\u{2588}', '\u{2580}', '\u{2584}'];
+
+    fn active_screen() -> String {
+        let urls = vec![ServeUrl {
+            label: Some("lan".to_string()),
+            url: "http://192.168.1.42:8080/?t=abc123def456".to_string(),
+        }];
+        let mut term = Terminal::new(TestBackend::new(72, 26)).expect("terminal");
+        term.draw(|f| {
+            render_active(
+                f,
+                f.area(),
+                &Theme::default(),
+                ServeMode::Local,
+                &urls,
+                0,
+                None,
+                std::time::Duration::from_secs(42),
+                None,
+            )
+        })
+        .expect("draw");
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The URL is what a user needs off this screen, so it must survive the
+    /// QR being compiled out. Without the dashboard bundle the code is not
+    /// drawn (nothing would answer a scan of it), and the layout must absorb
+    /// the missing rows rather than leaving a gap or panicking on a
+    /// zero-height chunk.
+    #[test]
+    fn active_screen_keeps_the_url_and_drops_the_code_without_web() {
+        let screen = active_screen();
+        assert!(
+            screen.contains("http://192.168.1.42:8080/?t=abc123def456"),
+            "URL must render in both feature corners:\n{screen}"
+        );
+        let drawn = screen.chars().any(|c| QR_GLYPHS.contains(&c));
+        assert_eq!(
+            drawn,
+            cfg!(feature = "web"),
+            "QR code should be drawn only with the dashboard bundle:\n{screen}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
