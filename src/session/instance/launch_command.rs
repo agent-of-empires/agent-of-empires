@@ -46,9 +46,7 @@ pub(super) fn pi_extension_path() -> Result<PathBuf> {
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("pi-aoe-session-id.js");
     if std::fs::read_to_string(&path).ok().as_deref() != Some(SOURCE) {
-        let tmp = dir.join("pi-aoe-session-id.js.tmp");
-        std::fs::write(&tmp, SOURCE)?;
-        std::fs::rename(&tmp, &path)?;
+        crate::session::replace_file_no_follow(&path, SOURCE.as_bytes())?;
     }
     Ok(path)
 }

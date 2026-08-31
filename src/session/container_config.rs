@@ -991,10 +991,14 @@ pub(crate) fn install_pi_sandbox_extension() -> Result<()> {
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("aoe-session-id.js");
     let source = crate::session::instance::PI_SESSION_EXTENSION;
-    if std::fs::read_to_string(&path).ok().as_deref() != Some(source) {
-        let tmp = dir.join("aoe-session-id.js.tmp");
-        std::fs::write(&tmp, source)?;
-        std::fs::rename(&tmp, &path)?;
+    // Sandbox-writable, so the current content is read only through a regular
+    // file and replaced without following a link a container process planted.
+    let current = std::fs::symlink_metadata(&path)
+        .is_ok_and(|m| m.is_file())
+        .then(|| std::fs::read_to_string(&path).ok())
+        .flatten();
+    if current.as_deref() != Some(source) {
+        crate::session::replace_file_no_follow(&path, source.as_bytes())?;
     }
     Ok(())
 }

@@ -181,6 +181,39 @@ fn atomic_write_resolved(path: &Path, content: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Replace `path` with `content` via a uniquely named temp file in the same
+/// directory, following no symlink on the way.
+///
+/// For a file AoE writes into a sandbox bind mount, where a process in the
+/// container can pre-create the path it is about to use: the temp file is
+/// created exclusively, so a planted symlink fails the create instead of
+/// redirecting the write onto a host file, and `rename(2)` replaces a link at
+/// `path` rather than writing through it. [`atomic_write`] resolves symlinks
+/// by design and must not be used there. The unique name also keeps two
+/// concurrent installs from renaming each other's half-written file.
+///
+/// Written 0o644: the reader is a process in the container, which need not be
+/// the uid that owns the bind, and tempfile defaults to 0o600.
+pub(crate) fn replace_file_no_follow(path: &Path, content: &[u8]) -> Result<()> {
+    let dir = path.parent().ok_or_else(|| {
+        anyhow!(
+            "replace_file_no_follow needs a path with a parent: {}",
+            path.display()
+        )
+    })?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(content)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        tmp.as_file()
+            .set_permissions(fs::Permissions::from_mode(0o644))?;
+    }
+    tmp.as_file().sync_all()?;
+    tmp.persist(path)?;
+    Ok(())
+}
+
 /// Resolve `path` through a symlink chain to the underlying target file. Used
 /// for user-facing config files where users symlink to a dotfiles repo:
 /// `rename(2)` would otherwise replace the symlink instead of updating the
@@ -2650,6 +2683,42 @@ mod tests {
             0o644,
             "a pre-existing non-default mode must survive the rename"
         );
+    }
+
+    /// The mirror of `atomic_write_follows_symlinks`, for the paths AoE writes
+    /// inside a sandbox bind: a link planted there by a container process must
+    /// be replaced, never written through, or the container picks the host file
+    /// the write lands on.
+    #[cfg(unix)]
+    #[test]
+    fn replace_file_no_follow_replaces_planted_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempdir().unwrap();
+        let outside = tmp.path().join("host-secret");
+        std::fs::write(&outside, "untouched").unwrap();
+        let path = tmp.path().join("extension.js");
+        std::os::unix::fs::symlink(&outside, &path).unwrap();
+
+        replace_file_no_follow(&path, b"payload").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "untouched");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "payload");
+        assert!(!std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "the container reader may not be the uid that owns the bind"
+        );
+        // Nothing is left behind for a concurrent writer to collide with.
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .filter(|name| name != "host-secret" && name != "extension.js")
+            .collect();
+        assert!(leftovers.is_empty(), "stray temp files: {leftovers:?}");
     }
 
     #[cfg(unix)]

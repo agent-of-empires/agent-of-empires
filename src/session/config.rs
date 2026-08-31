@@ -7,7 +7,7 @@ use aoe_settings_derive::SettingsSection;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1720,6 +1720,15 @@ pub fn validate_auto_stop_idle_secs(secs: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// The forms [`SessionConfig::agent_config_dir_for`] resolves: `~`, a `~/`
+/// path, or a path already absolute for this platform (so a Windows
+/// `C:\Users\me\.claude` counts and `~bob/.claude` does not). Warnings and
+/// the settings editor both gate on this so no value they accept is silently
+/// dropped at resolution.
+pub fn is_resolvable_agent_config_dir(dir: &str) -> bool {
+    dir == "~" || dir.starts_with("~/") || Path::new(dir).is_absolute()
+}
+
 impl SessionConfig {
     /// Resolve the command override for a tool, checking agent_command_override first,
     /// then falling back to custom_agents. Returns empty string if no override found.
@@ -1740,14 +1749,13 @@ impl SessionConfig {
     /// resolved against AoE's working directory would be a surprise.
     pub fn agent_config_dir_for(&self, tool: &str, home: &std::path::Path) -> Option<PathBuf> {
         let dir = self.agent_config_dir.get(tool).filter(|d| !d.is_empty())?;
-        let expanded = match dir.as_str() {
-            "~" => home.to_path_buf(),
+        match dir.as_str() {
+            "~" => Some(home.to_path_buf()),
             _ => match dir.strip_prefix("~/") {
-                Some(rest) => home.join(rest),
-                None => PathBuf::from(dir),
+                Some(rest) => Some(home.join(rest)),
+                None => Path::new(dir).is_absolute().then(|| PathBuf::from(dir)),
             },
-        };
-        expanded.is_absolute().then_some(expanded)
+        }
     }
 
     /// Log warnings for misconfigured custom agent entries.
@@ -1828,9 +1836,9 @@ impl SessionConfig {
             } else if dir.is_empty() {
                 tracing::warn!(target: "session.store",
                     "agent_config_dir: '{}' has an empty directory and will be ignored", name);
-            } else if !dir.starts_with('/') && !dir.starts_with('~') {
+            } else if !is_resolvable_agent_config_dir(dir) {
                 tracing::warn!(target: "session.store",
-                    "agent_config_dir: '{}' maps to relative path '{}'; use an absolute path or ~/, the entry will be ignored",
+                    "agent_config_dir: '{}' maps to unresolvable path '{}'; use an absolute path, ~ or ~/, the entry will be ignored",
                     name, dir
                 );
             }
@@ -4786,8 +4794,10 @@ mod tests {
             ("~", Some("/home/me")),
             ("/opt/claude", Some("/opt/claude")),
             // A relative path would resolve against AoE's working directory,
-            // and an empty one against nothing at all.
+            // and an empty one against nothing at all. `~bob` is another
+            // user's home, which nothing here expands.
             (".claude-personal", None),
+            ("~bob/.claude", None),
             ("", None),
         ] {
             config
@@ -4796,6 +4806,13 @@ mod tests {
             assert_eq!(
                 config.agent_config_dir_for("my-agent", home),
                 expected.map(PathBuf::from),
+                "value: {value:?}"
+            );
+            // What the warning and the settings editor accept must be what
+            // resolution keeps, or a value is dropped without a word.
+            assert_eq!(
+                is_resolvable_agent_config_dir(value),
+                expected.is_some(),
                 "value: {value:?}"
             );
         }

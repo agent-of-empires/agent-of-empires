@@ -388,6 +388,13 @@ impl Instance {
             return None;
         }
         if self.is_sandboxed() {
+            if self.declares_agent_config_dir() {
+                tracing::warn!(target: "session.instance",
+                    "session {} declares session.agent_config_dir for pi; publishing its conversation needs a config dir AoE mounts itself, so this session falls back to store polling",
+                    self.id
+                );
+                return None;
+            }
             // No `-e`: pi refuses to start when an `-e` path is missing, and a
             // container created before this change has no mount for one. The
             // extension is written where pi discovers it, inside the config
@@ -473,6 +480,24 @@ impl Instance {
             return self.pi_sandbox_sidecar().map(PiSidecarSource::SandboxDir);
         }
         Some(PiSidecarSource::HostHooks)
+    }
+
+    /// Whether this session's agent reads a config dir the profile named
+    /// (`session.agent_config_dir`) rather than the one AoE stages.
+    ///
+    /// Both sidecar paths derive from AoE's own config bind: the host side from
+    /// `pi_sandbox_dir`, the container side from `PI_SIDECAR_DIR_IN_CONTAINER`.
+    /// A directory the user named is mounted by their own `extra_volumes`
+    /// entry, whose container path AoE never sees, so neither side can be
+    /// derived and the launch declines the sidecar instead of publishing into
+    /// a bind that pane does not read.
+    fn declares_agent_config_dir(&self) -> bool {
+        dirs::home_dir().is_some_and(|home| {
+            crate::session::profile_config::resolve_config_or_warn(&self.effective_profile())
+                .session
+                .agent_config_dir_for(&self.tool, &home)
+                .is_some()
+        })
     }
 
     /// Host directory backing this sandboxed pane's sidecar.
@@ -1123,6 +1148,48 @@ mod tests {
             reloaded.pi_published_session_id(true).as_deref(),
             Some("01a053b6-c470-78de-9d8f-bc00ef05332a"),
             "and the final flush must read it"
+        );
+    }
+
+    /// A Pi session pointed at a config dir the user named gets no sidecar.
+    /// Both halves of the path (the discovered extension, the published file)
+    /// live in the bind AoE mounts itself; the user's own dir reaches the
+    /// container through their `extra_volumes` entry, at a path AoE cannot
+    /// see, so publishing there would report into a directory the pane in the
+    /// container never opens.
+    #[test]
+    #[serial_test::serial]
+    fn sandboxed_pi_with_its_own_config_dir_declines_the_sidecar() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let app_dir = crate::session::get_app_dir().unwrap();
+
+        let mut inst = Instance::new("pi-own-config", "/tmp/pi-own-config");
+        inst.tool = "pi".to_string();
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "aoe-pi-own-config".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: None,
+            before_start_env: Vec::new(),
+        });
+
+        assert!(
+            inst.pi_extension_launch().is_some(),
+            "a session on the staged config dir publishes as before"
+        );
+
+        std::fs::write(
+            app_dir.join("config.toml"),
+            "[session.agent_config_dir]\npi = \"~/.pi-personal\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            inst.pi_extension_launch(),
+            None,
+            "a declared config dir leaves the session on store polling"
         );
     }
 

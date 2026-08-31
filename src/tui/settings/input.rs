@@ -948,11 +948,8 @@ fn validate_agent_config_dir_entry(text: &str) -> Result<(), String> {
     if dir.is_empty() {
         return Err("Config directory cannot be empty".to_string());
     }
-    if !dir.starts_with('/') && !dir.starts_with('~') {
-        return Err(format!(
-            "'{}' must be an absolute path or start with ~/",
-            dir
-        ));
+    if !crate::session::config::is_resolvable_agent_config_dir(dir) {
+        return Err(format!("'{}' must be an absolute path, ~ or ~/...", dir));
     }
     Ok(())
 }
@@ -1079,11 +1076,15 @@ mod tests {
         // checked against the registry the way agent_key_value does.
         assert!(validate_agent_config_dir_entry("claude-personal=~/.claude-personal").is_ok());
         assert!(validate_agent_config_dir_entry("claude=/opt/claude").is_ok());
+        assert!(validate_agent_config_dir_entry("claude=~").is_ok());
         for (entry, expected) in [
             ("just-a-name", "agent_name=dir"),
             ("=~/.claude-personal", "name cannot be empty"),
             ("my-agent=", "directory cannot be empty"),
             ("my-agent=.claude-personal", "absolute path"),
+            // Another user's home: accepting it here would take a value
+            // resolution drops without a word.
+            ("my-agent=~bob/.claude", "absolute path"),
         ] {
             let err = validate_agent_config_dir_entry(entry).unwrap_err();
             assert!(err.contains(expected), "{entry:?} -> {err:?}");
