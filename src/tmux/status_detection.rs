@@ -4188,6 +4188,10 @@ Final prose line.\n";
                 "wrapped working message",
                 "  ⎋ Locating files in the parent tree\n continuation\n ⠋ 0s > model status\n╰─",
             ),
+            (
+                "timer-only narrow band",
+                "  ⎋ Waiting\n╭── ⠋ 16s ─╮\n╰─",
+            ),
         ];
         for (name, pane) in cases {
             assert_eq!(detect_omp_status(pane), Status::Running, "case: {name}");
