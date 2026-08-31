@@ -33,19 +33,45 @@ vi.mock("shiki/engine/oniguruma", () => ({
 // into the stubbed engine, so we don't need to resolve it to a real module.
 vi.mock("shiki/wasm", () => ({ default: {} }));
 
-// Every theme module the source can import. Each resolves to a `default`
-// carrying a `name`, except the two below that exercise fallback branches.
+// `getHighlighter` imports github-dark directly for its construction theme.
 vi.mock("shiki/themes/github-dark.mjs", () => ({ default: { name: "github-dark" } }));
-vi.mock("shiki/themes/github-light.mjs", () => ({ default: { name: "github-light" } }));
-vi.mock("shiki/themes/github-dark-dimmed.mjs", () => ({ default: { name: "github-dark-dimmed" } }));
-vi.mock("shiki/themes/catppuccin-latte.mjs", () => ({ default: { name: "catppuccin-latte" } }));
-vi.mock("shiki/themes/dracula.mjs", () => ({ default: { name: "dracula" } }));
-vi.mock("shiki/themes/material-theme-ocean.mjs", () => ({ default: { name: "material-theme-ocean" } }));
-// Resolves with no usable default -> exercises the `if (theme)` falsy branch.
-vi.mock("shiki/themes/tokyo-night.mjs", () => ({ default: undefined }));
-// Import rejects -> exercises the catch branch.
-vi.mock("shiki/themes/rose-pine.mjs", () => {
-  throw new Error("boom");
+
+// `ensureThemeLoaded` reads shiki's own `bundledThemes` registry, so the mock
+// stands in for that registry rather than for individual theme modules. Real
+// shiki ships 65; these are the ids the tests exercise, plus two that drive the
+// fallback branches.
+vi.mock("shiki/themes", () => {
+  const resolves = (name: string) => async () => ({ default: { name } });
+  const ids = [
+    "github-dark",
+    "github-light",
+    "github-dark-dimmed",
+    "catppuccin-latte",
+    "dracula",
+    "material-theme-ocean",
+    // Named by the ported VS Code themes.
+    "dark-plus",
+    "light-plus",
+    "monokai",
+    "solarized-dark",
+    "solarized-light",
+    "red",
+    "min-light",
+    "gruvbox-dark-medium",
+    "github-dark-high-contrast",
+    "github-light-high-contrast",
+  ];
+  return {
+    bundledThemes: {
+      ...Object.fromEntries(ids.map((id) => [id, resolves(id)])),
+      // Resolves with no usable default -> exercises the `if (theme)` falsy branch.
+      "tokyo-night": async () => ({ default: undefined }),
+      // Import rejects -> exercises the catch branch.
+      "rose-pine": async () => {
+        throw new Error("boom");
+      },
+    },
+  };
 });
 
 // Every language module the source can import. The exact `name` value is
@@ -309,6 +335,17 @@ describe("ensureThemeLoaded", () => {
       "github-dark-dimmed",
       "catppuccin-latte",
       "material-theme-ocean",
+      // Shipped by shiki but outside the old hand-picked allowlist.
+      "dark-plus",
+      "light-plus",
+      "monokai",
+      "solarized-dark",
+      "solarized-light",
+      "red",
+      "min-light",
+      "gruvbox-dark-medium",
+      "github-dark-high-contrast",
+      "github-light-high-contrast",
     ]) {
       expect(await ensureThemeLoaded(theme, "dark")).toBe(theme);
       expect(loadedThemes).toContain(theme);
