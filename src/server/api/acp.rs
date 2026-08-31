@@ -1339,13 +1339,9 @@ pub async fn acp_prompt(
     // atomic step. Releasing between them let a queue drain read a fold this
     // prompt had not published into yet, so both delivered and whichever lost
     // the agent's race came back `agent_busy` after its queue row was already
-    // retired (#3621).
-    //
-    // This is emphatically NOT `instance_lock`. `send_turn` ->
-    // `trigger_resume_background` detaches a task that calls
-    // `build_spawn_request`, which takes that lock, so a handler holding it
-    // could not let its own spawn start and burned `WORKER_READY_TIMEOUT`
-    // waiting for it (#3172).
+    // retired (#3621). Not `instance_lock`, for the reason `prompt_submission`
+    // documents: holding that one here stalls this handler's own resume
+    // (#3172).
     let _submission = state.session_service.prompt_submission(&id).await;
     // A fresh user prompt supersedes any queued rate-limit resume
     // continuation, so drop it before sending: otherwise the reconciler could

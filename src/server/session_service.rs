@@ -949,6 +949,12 @@ impl SessionService {
     /// edges kept recency fresh by accident; dropping that stamp is what made
     /// the missing gesture-side write observable in the attention sort and the
     /// TUI activity column.
+    ///
+    /// Deliberately does NOT take [`Self::prompt_submission`]: `acp_prompt`
+    /// calls this through `buffer_and_enqueue` while already holding it, and
+    /// the guard is not reentrant. The `queue_enqueue` handler claims it
+    /// instead, so the row rewrite this does for an existing id still cannot
+    /// land inside a drain's snapshot-to-send window.
     #[cfg(feature = "serve")]
     pub(crate) async fn enqueue_prompt(
         self: &Arc<Self>,
