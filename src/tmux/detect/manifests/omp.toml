@@ -38,6 +38,40 @@ contains_any = ["⟦esc⟧", "⟨esc⟩", "[esc]", "(esc to cancel)"]
 # is never a loader however punctuation-shaped the glyph is.
 not = [{ line_regex = ['^\s*[\x{2022}\x{f111}\x{203B}\x{276F}\x{f054}\x{2502}\x{2503}\x{258F}\x{258E}]'] }]
 
+# OMP 18 renders its activity frame and whole-unit timer in the status line.
+# Pair that band with the nearby interrupt row so elapsed prose is not activity.
+[[rules]]
+id = "active_brand"
+state = "running"
+priority = 960
+positional = true
+max_position = 2
+region = "bottom_non_empty_lines(3)"
+visible = true
+line_regex = ['^\s*(?:(?:╭[─-]*|\+[=-]*)\s*)?(?:\x{e0b6}\s+)?\S\s+(?:0|[1-9]\d*)[smh]\s+\S+\s+\S']
+all = [
+  { region = "bottom_non_empty_lines(4)", any = [
+    { line_regex = ['(?i)^\s*(?:⎋|\x{f12b7}|esc)\s+\S'] },
+    { line_regex = ['(?i)^\s*\S+\s+working(?:…|\.\.\.)'] },
+    { line_regex = ['(?i)^ {2}cancel\s+\S'] },
+  ] },
+]
+not = [
+  { line_regex = ['^\s*(?:⏱|\x{f017}|◷|◴|⌛)\s+'] },
+]
+
+# The parked band exposes its brand token in the composer border. This is a
+# visible Idle verdict, so a finished turn does not need redraw confirmation.
+[[rules]]
+id = "composer_idle"
+state = "idle"
+priority = 950
+positional = true
+max_position = 2
+region = "bottom_non_empty_lines(3)"
+visible = true
+line_regex = ['^\s*(?:(?:╭[─-]*|\+[=-]*)\s*)?(?:π|\x{f0d57}|pi)\s+']
+
 # The wrapped variant: the frame line runs on and the hint lands on an
 # indented continuation. The frame line itself must carry neither the hint (or
 # the plain rule above would have caught it) nor sentence-final punctuation,
@@ -103,6 +137,9 @@ contains_any = [
   "space toggle · enter ",
   "enter submit · ↑/↓ scroll",
   "current prompt to answer",
+]
+not = [
+  { region = "bottom_non_empty_lines(8)", line_regex = ['^\s*(?:╭|\+).*(?:π|pi)\s*>'] },
 ]
 
 # The approve/deny selector: its footer decides the position, gated on both
