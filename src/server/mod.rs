@@ -1,6 +1,7 @@
 //! The daemon: an axum server exposing the REST/WS API that the dashboard,
 //! the TUI structured view, and ACP clients all speak. The embedded dashboard
-//! bundle it can also serve is optional (`web` feature, see [`assets`]).
+//! bundle it can also serve is optional; the `web` feature gates it, and
+//! `assets` holds the serving code.
 
 pub(crate) mod access;
 pub(crate) mod acp_events;
