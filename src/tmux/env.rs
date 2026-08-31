@@ -5,7 +5,7 @@
 //! child processes, making them ideal for storing session metadata.
 
 use anyhow::bail;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub const AOE_INSTANCE_ID_KEY: &str = "AOE_INSTANCE_ID";
 pub const AOE_CAPTURED_SESSION_ID_KEY: &str = "AOE_CAPTURED_SESSION_ID";
@@ -201,40 +201,27 @@ fn sequential_set_fallback(entries: &[(&str, &str, &str)]) {
 /// First character of the marker line each batched segment prints ahead of
 /// its `show-environment` output, so a block that is empty (the session has
 /// no hidden vars) cannot shift every later line onto the wrong session.
-const BATCH_MARKER: char = '\u{1f}';
+///
+/// Printable ASCII on purpose: tmux rewrites every byte outside `0x20..=0x7e`
+/// to `_` for a client whose locale is not UTF-8, so a control character here
+/// would erase every marker and leave the whole batch to the fallback.
+const BATCH_MARKER: char = '@';
 
 /// Get a hidden environment variable from multiple sessions in one tmux
 /// command, returning `(session_name, value)` in input order.
 ///
 /// tmux ABORTS a `;`-separated command list at the first command that fails,
 /// so no segment may fail: each one queries the session's whole hidden
-/// environment (`show-environment -h` with no variable exits 0 even when the
-/// variable, or every variable, is unset) rather than the single key, and the
-/// key is picked out of the marked block. A session that disappears mid-batch
-/// still truncates the run, so any session whose marker never came back is
-/// re-read sequentially instead of being reported as unset.
+/// environment (`show-environment -h -s` with no variable exits 0 even when
+/// the variable, or every variable, is unset) rather than the single key, and
+/// the key is picked out of the marked block. A session that disappears
+/// mid-batch still truncates the run, so any session whose marker never came
+/// back is re-read sequentially instead of being reported as unset.
 pub fn get_hidden_env_batch(session_names: &[&str], key: &str) -> Vec<(String, Option<String>)> {
     if session_names.is_empty() {
         return Vec::new();
     }
-    let mut args: Vec<String> = Vec::new();
-    for (i, session_name) in session_names.iter().enumerate() {
-        if i > 0 {
-            args.push(";".to_string());
-        }
-        args.extend([
-            "display-message".to_string(),
-            "-p".to_string(),
-            "-t".to_string(),
-            session_name.to_string(),
-            format!("{BATCH_MARKER}{}", session_name.replace('#', "##")),
-            ";".to_string(),
-            "show-environment".to_string(),
-            "-h".to_string(),
-            "-t".to_string(),
-            session_name.to_string(),
-        ]);
-    }
+    let args = batch_args(session_names);
     let str_args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let output = crate::tmux::tmux_command().args(&str_args).output();
     let mut covered = match output {
@@ -275,40 +262,129 @@ pub fn get_hidden_env_batch(session_names: &[&str], key: &str) -> Vec<(String, O
     results
 }
 
+/// tmux argument list for one batched read: a marker line then the whole
+/// hidden environment, per session.
+fn batch_args(session_names: &[&str]) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    for (i, session_name) in session_names.iter().enumerate() {
+        if i > 0 {
+            args.push(";".to_string());
+        }
+        args.extend([
+            "display-message".to_string(),
+            "-p".to_string(),
+            "-t".to_string(),
+            session_name.to_string(),
+            format!("{BATCH_MARKER}{}", session_name.replace('#', "##")),
+            ";".to_string(),
+            "show-environment".to_string(),
+            "-h".to_string(),
+            "-s".to_string(),
+            "-t".to_string(),
+            session_name.to_string(),
+        ]);
+    }
+    args
+}
+
 /// Parse marker-delimited batch output into `key`'s value per session.
 ///
 /// Only sessions whose marker line came back are present in the map: an entry
 /// is the authoritative reading for that session (`None` = the key is unset),
-/// while an ABSENT session is one the run never reached and the caller must
-/// read separately. `-KEY` (explicitly removed) reads as unset.
+/// while an ABSENT session is one the run never reached, or one whose block
+/// did not parse, and the caller must read separately. `unset KEY;`
+/// (explicitly removed) reads as unset.
 fn parse_batch_output<'a>(
     output: &str,
     session_names: &[&'a str],
     key: &str,
 ) -> HashMap<&'a str, Option<String>> {
-    let prefix = format!("{key}=");
     let mut values: HashMap<&str, Option<String>> = HashMap::new();
+    let mut unparsed: HashSet<&str> = HashSet::new();
     let mut current: Option<&str> = None;
-    for line in output.lines() {
-        let line = line.trim();
-        if let Some(name) = line.strip_prefix(BATCH_MARKER) {
-            current = session_names.iter().copied().find(|n| *n == name);
-            if let Some(name) = current {
-                values.entry(name).or_insert(None);
-            }
+    let mut rest = output;
+    while !rest.is_empty() {
+        let (line, after_line) = split_line(rest);
+        let marked = line.trim().strip_prefix(BATCH_MARKER);
+        if let Some(name) = marked.and_then(|n| session_names.iter().copied().find(|s| *s == n)) {
+            current = Some(name);
+            values.entry(name).or_insert(None);
+            rest = after_line;
             continue;
         }
-        let Some(name) = current else { continue };
-        if let Some(value) = line.strip_prefix(&prefix) {
-            values.insert(name, Some(value.to_string()));
+        if let Some((name, value, after_entry)) = parse_env_entry(rest) {
+            if name == key {
+                if let Some(session) = current {
+                    values.insert(session, value);
+                }
+            }
+            rest = after_entry;
+            continue;
         }
+        // A marker for a session nobody asked about ends the current block;
+        // anything else means the block did not parse as tmux wrote it, so
+        // drop it rather than guess which entry a stray line belonged to.
+        if marked.is_some() {
+            current = None;
+        } else if let Some(session) = current {
+            unparsed.insert(session);
+        }
+        rest = after_line;
+    }
+    for name in unparsed {
+        values.remove(name);
     }
     values
+}
+
+/// Consume one `show-environment -s` record from the head of `input`,
+/// returning `(name, value, remainder)`; `None` when the head is not a record.
+///
+/// `-s` wraps every value in double quotes and backslash-escapes any quote or
+/// backslash inside it, so a value holding a newline cannot end a record: the
+/// scan runs to the first unescaped quote, not to the next line break. That is
+/// what stops a continuation line reading `KEY=...` from impersonating an
+/// entry for `KEY` (#3616).
+fn parse_env_entry(input: &str) -> Option<(&str, Option<String>, &str)> {
+    if let Some(rest) = input.strip_prefix("unset ") {
+        let (line, after) = split_line(rest);
+        let name = line.strip_suffix(';')?;
+        return (!name.is_empty()).then_some((name, None, after));
+    }
+    let (head, _) = split_line(input);
+    let name = &input[..head.find("=\"")?];
+    if name.is_empty() {
+        return None;
+    }
+    let mut value = String::new();
+    let body = &input[name.len() + 2..];
+    let mut chars = body.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\\' => value.push(chars.next()?.1),
+            '"' => return Some((name, Some(value), split_line(&body[i + 1..]).1)),
+            _ => value.push(c),
+        }
+    }
+    None
+}
+
+/// Split off the first line, dropping its terminator.
+fn split_line(input: &str) -> (&str, &str) {
+    match input.split_once('\n') {
+        Some((line, rest)) => (line.strip_suffix('\r').unwrap_or(line), rest),
+        None => (input, ""),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One `show-environment -s` record. `value` is already tmux-escaped.
+    fn entry(name: &str, value: &str) -> String {
+        format!("{name}=\"{value}\"; export {name};\n")
+    }
 
     fn marked(name: &str, body: &str) -> String {
         format!("{BATCH_MARKER}{name}\n{body}")
@@ -318,57 +394,68 @@ mod tests {
     fn test_parse_batch_output_attributes_by_marker() {
         let m = BATCH_MARKER;
         let key = "AOE_INSTANCE_ID";
+        let id = entry(key, "abc123");
         // (output, sessions, expected per session: None = not covered by the
         // run at all, Some(None) = covered and unset)
         let cases = vec![
-            (
-                marked("s1", "AOE_INSTANCE_ID=abc123\n"),
-                &["s1"][..],
-                vec![Some(Some("abc123"))],
-            ),
+            (marked("s1", &id), &["s1"][..], vec![Some(Some("abc123"))]),
             // Covered but unset: the block is empty, or holds other keys only.
             (marked("s1", ""), &["s1"][..], vec![Some(None)]),
             (
-                marked("s1", "AOE_CAPTURED_SESSION_ID=other\n"),
+                marked("s1", &entry(AOE_CAPTURED_SESSION_ID_KEY, "other")),
                 &["s1"][..],
                 vec![Some(None)],
             ),
             (
-                marked("s1", "-AOE_INSTANCE_ID\n"),
+                marked("s1", "unset AOE_INSTANCE_ID;\n"),
                 &["s1"][..],
                 vec![Some(None)],
             ),
             (
-                marked("s1", "AOE_INSTANCE_ID=value=with=equals\n"),
+                marked("s1", &entry(key, "value=with=equals")),
                 &["s1"][..],
                 vec![Some(Some("value=with=equals"))],
             ),
+            // tmux escapes quotes and backslashes inside the value; the
+            // reading must undo that rather than stop at the first quote.
+            (
+                marked("s1", &entry(key, r#"a\"b\\c"#)),
+                &["s1"][..],
+                vec![Some(Some(r#"a"b\c"#))],
+            ),
             // A session lacking the variable must not shift the rest.
             (
-                format!("{m}s1\nAOE_INSTANCE_ID=abc123\n{m}s2\n{m}s3\nAOE_INSTANCE_ID=xyz789\n"),
+                format!("{m}s1\n{id}{m}s2\n{m}s3\n{}", entry(key, "xyz789")),
                 &["s1", "s2", "s3"][..],
                 vec![Some(Some("abc123")), Some(None), Some(Some("xyz789"))],
             ),
-            // The regression: tmux aborts the list at a failing segment, so
-            // sessions past it produce no marker and must read as uncovered
-            // (the caller re-reads them) rather than as unset.
+            // tmux aborts the list at a failing segment, so sessions past it
+            // produce no marker and must read as uncovered (the caller
+            // re-reads them) rather than as unset.
             (
-                format!("{m}s1\nAOE_INSTANCE_ID=abc123\n"),
+                format!("{m}s1\n{id}"),
                 &["s1", "s2"][..],
                 vec![Some(Some("abc123")), None],
             ),
             (String::new(), &["s1", "s2"][..], vec![None, None]),
-            ("AOE_INSTANCE_ID=abc\n".to_string(), &["s1"][..], vec![None]),
+            (id.clone(), &["s1"][..], vec![None]),
             // A block for a session that was not asked about is ignored.
             (
-                format!("{m}other\nAOE_INSTANCE_ID=nope\n{m}s1\nAOE_INSTANCE_ID=abc\n"),
+                format!("{m}other\n{}{m}s1\n{id}", entry(key, "nope")),
                 &["s1"][..],
-                vec![Some(Some("abc"))],
+                vec![Some(Some("abc123"))],
             ),
             (
-                format!("  {m}s1  \n  AOE_INSTANCE_ID=value123  \n"),
+                format!("  {m}s1  \n{id}"),
                 &["s1"][..],
-                vec![Some(Some("value123"))],
+                vec![Some(Some("abc123"))],
+            ),
+            // A line tmux could not have written leaves the block ambiguous,
+            // so it drops out and the caller re-reads the session.
+            (
+                format!("{m}s1\nnot an entry\n{id}"),
+                &["s1"][..],
+                vec![None],
             ),
         ];
         for (output, sessions, expected) in cases {
@@ -379,6 +466,109 @@ mod tests {
                 .collect();
             assert_eq!(got, expected, "values for {output:?}");
         }
+    }
+
+    /// #3616: an unrelated multiline value emits continuation lines that can
+    /// read as `KEY=...` or as a marker. They belong to the variable that
+    /// opened the quote and must not be read as entries of their own.
+    #[test]
+    fn test_parse_batch_output_ignores_multiline_continuations() {
+        let m = BATCH_MARKER;
+        let key = "AOE_INSTANCE_ID";
+        let cases = vec![
+            // The key is set and a later variable's continuation claims it.
+            (
+                format!(
+                    "{m}s1\n{}{}",
+                    entry(key, "real-id"),
+                    entry("ZZZ", "unrelated\nAOE_INSTANCE_ID=spoofed-id"),
+                ),
+                &["s1"][..],
+                vec![Some(Some("real-id"))],
+            ),
+            // The key is unset and an earlier variable's continuation invents
+            // it. Sorted output puts that continuation where the real entry
+            // would have been.
+            (
+                format!("{m}s1\n{}", entry("AAA", "x\nAOE_INSTANCE_ID=spoofed-id")),
+                &["s1"][..],
+                vec![Some(None)],
+            ),
+            // A continuation that imitates the next session's marker must not
+            // reattribute the rest of the run.
+            (
+                format!(
+                    "{m}s1\n{}{m}s2\n{}",
+                    entry("ZZZ", "x\n@s2\nAOE_INSTANCE_ID=spoofed-id"),
+                    entry(key, "s2-id"),
+                ),
+                &["s1", "s2"][..],
+                vec![Some(None), Some(Some("s2-id"))],
+            ),
+            // Escaped quotes cannot close the value early to fake an entry.
+            (
+                format!(
+                    "{m}s1\n{}",
+                    entry(
+                        "NASTY",
+                        "a\\\"; export ZZZ;\nAOE_INSTANCE_ID=\\\"spoofed-id\\\""
+                    ),
+                ),
+                &["s1"][..],
+                vec![Some(None)],
+            ),
+        ];
+        for (output, sessions, expected) in cases {
+            let parsed = parse_batch_output(&output, sessions, key);
+            let got: Vec<Option<Option<&str>>> = sessions
+                .iter()
+                .map(|name| parsed.get(name).map(|v| v.as_deref()))
+                .collect();
+            assert_eq!(got, expected, "values for {output:?}");
+        }
+    }
+
+    /// The batch is worthless if its own markers do not survive tmux. tmux
+    /// rewrites bytes outside printable ASCII to `_` for a client whose
+    /// locale is not UTF-8, so pin that client and require full coverage:
+    /// without it every session silently falls through to a sequential read.
+    #[test]
+    fn test_batch_output_covers_sessions_for_a_non_utf8_client() {
+        struct KillSession(&'static str);
+        impl Drop for KillSession {
+            fn drop(&mut self) {
+                let _ = crate::tmux::tmux_command()
+                    .args(["kill-session", "-t", self.0])
+                    .output();
+            }
+        }
+
+        let name = "aoe_env_batch_marker_probe";
+        let created = crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", name, "sh"])
+            .output();
+        if !created.is_ok_and(|out| out.status.success()) {
+            eprintln!("skipping: tmux unavailable");
+            return;
+        }
+        let _cleanup = KillSession(name);
+
+        set_hidden_env(name, AOE_INSTANCE_ID_KEY, "real-id").unwrap();
+        set_hidden_env(name, "ZZZ", "unrelated\nAOE_INSTANCE_ID=spoofed-id").unwrap();
+
+        let output = crate::tmux::tmux_command()
+            .env("LC_ALL", "C")
+            .args(batch_args(&[name]))
+            .output()
+            .unwrap();
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let parsed = parse_batch_output(&stdout, &[name], AOE_INSTANCE_ID_KEY);
+        assert_eq!(
+            parsed.get(name).map(|v| v.as_deref()),
+            Some(Some("real-id")),
+            "batch output: {stdout:?}"
+        );
     }
 
     #[test]

@@ -73,3 +73,40 @@ fn batch_reads_sessions_after_one_without_the_key() {
         ]
     );
 }
+
+/// #3616: `show-environment` emits a multiline value as continuation lines, so
+/// an unrelated variable can print a line reading `AOE_INSTANCE_ID=...`. The
+/// batch must still report the variable's real value.
+#[test]
+#[serial]
+fn batch_ignores_a_multiline_value_that_imitates_the_key() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let socket = crate::common::tmux_socket();
+    let name = "aoe_hb_multiline";
+    let out = Command::new("tmux")
+        .arg("-S")
+        .arg(&socket)
+        .args(["new-session", "-d", "-s", name, "sh"])
+        .output()
+        .expect("tmux new-session");
+    assert!(
+        out.status.success(),
+        "new-session {name}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _cleanup = Cleanup(vec![name.to_string()]);
+
+    env::set_hidden_env(name, env::AOE_INSTANCE_ID_KEY, "real-id").unwrap();
+    env::set_hidden_env(
+        name,
+        "ZZZ",
+        &format!("unrelated\n{}=spoofed-id", env::AOE_INSTANCE_ID_KEY),
+    )
+    .unwrap();
+
+    let got = env::get_hidden_env_batch(&[name], env::AOE_INSTANCE_ID_KEY);
+    assert_eq!(got, vec![(name.to_string(), Some("real-id".to_string()))]);
+}
