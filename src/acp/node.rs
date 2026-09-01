@@ -19,9 +19,8 @@ use thiserror::Error;
 use tracing::{debug, info, warn};
 
 /// The minimum Node major version aoe-agent supports. Pinned to the
-/// `engines.node` field in `acp-worker/aoe-agent/package.json`: aoe-agent
-/// runs its TypeScript sources under `node --experimental-strip-types`,
-/// which needs Node 22.
+/// `engines.node` field in `acp-worker/aoe-agent/package.json` by
+/// `package_engines_matches_min_node_major`.
 pub const MIN_NODE_MAJOR: u32 = 22;
 
 /// The pinned Node version aoe downloads when no host Node is found.
