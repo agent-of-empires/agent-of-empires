@@ -315,23 +315,55 @@ pub(crate) const TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 /// one stalled preview sample into two consecutive full timeouts.
 pub(crate) struct TmuxCommandDeadline {
     deadline: Instant,
+    #[cfg(test)]
+    budget: Option<CommandBudget>,
 }
+
+/// Test-only stand-in for the wall clock: the first `commands` runs get the
+/// standard timeout and every later one reports the budget as spent. Lets a
+/// test expire a deadline at a chosen command instead of racing the tmux
+/// forks that precede it.
+#[cfg(test)]
+struct CommandBudget(std::sync::atomic::AtomicI64);
 
 impl TmuxCommandDeadline {
     pub(crate) fn new() -> Self {
         Self {
             deadline: Instant::now() + TMUX_COMMAND_TIMEOUT,
+            #[cfg(test)]
+            budget: None,
         }
     }
     #[cfg(test)]
     fn with_timeout(timeout: Duration) -> Self {
         Self {
             deadline: Instant::now() + timeout,
+            budget: None,
         }
     }
 
+    #[cfg(test)]
+    fn expiring_after_commands(commands: i64) -> Self {
+        Self {
+            deadline: Instant::now() + TMUX_COMMAND_TIMEOUT,
+            budget: Some(CommandBudget(std::sync::atomic::AtomicI64::new(commands))),
+        }
+    }
+
+    fn remaining(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(budget) = &self.budget {
+            return if budget.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) > 0 {
+                TMUX_COMMAND_TIMEOUT
+            } else {
+                Duration::ZERO
+            };
+        }
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+
     pub(crate) fn run(&self, cmd: &mut Command) -> std::io::Result<Output> {
-        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        let remaining = self.remaining();
         if remaining.is_zero() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,

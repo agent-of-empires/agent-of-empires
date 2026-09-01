@@ -3004,14 +3004,12 @@ mod tests {
         }
     }
 
-    #[test]
-    #[serial_test::serial]
-    fn size_owner_lock_claims_rejects_steals_and_releases() {
-        if !tmux_available() {
-            eprintln!("Skipping test: tmux not available");
-            return;
-        }
-        let guard = TmuxTestSession::new("aoe_test_owner");
+    /// Detached 80x24 session with a known pane index, plus the cache refresh
+    /// the lock paths need: the session is created behind the existence
+    /// cache's back, and a cache warmed without it turns every exists()-guarded
+    /// lock call into a false no-op.
+    fn owner_lock_session(prefix: &str) -> (TmuxTestSession, Session) {
+        let guard = TmuxTestSession::new(prefix);
         let out = crate::tmux::tmux_command()
             .args([
                 "new-session",
@@ -3033,11 +3031,19 @@ mod tests {
             .output()
             .expect("tmux new-session");
         assert!(out.status.success());
-        // The session was created behind the existence cache's back; an
-        // earlier test may have warmed the cache without it, which would
-        // make every exists()-guarded lock call a false no-op.
         refresh_session_cache();
         let session = Session::from_name(guard.name());
+        (guard, session)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn size_owner_lock_claims_rejects_steals_and_releases() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let (guard, session) = owner_lock_session("aoe_test_owner");
 
         // Vacant -> first claimer wins and is recorded.
         assert!(session.claim_size_owner("a", Duration::from_secs(10)));
@@ -3185,6 +3191,9 @@ mod tests {
         session.release_size_owner(literal_owner);
         assert!(session.size_owner().is_none());
     }
+    /// A guarded resize that never got to run leaves the shared budget spent.
+    /// Verification and cleanup must run on that same budget: on a fresh
+    /// deadline they read back the unchanged heartbeat and release the lock.
     #[test]
     #[serial_test::serial]
     fn resize_window_if_owner_keeps_timeout_recovery_in_one_deadline() {
@@ -3192,69 +3201,14 @@ mod tests {
             eprintln!("Skipping test: tmux not available");
             return;
         }
-        let guard = TmuxTestSession::new("aoe_test_owner_resize_deadline");
-        let out = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                guard.name(),
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sleep 30",
-                ";",
-                "set-window-option",
-                "-t",
-                guard.name(),
-                "pane-base-index",
-                "0",
-            ])
-            .output()
-            .expect("tmux new-session");
-        assert!(out.status.success());
-        refresh_session_cache();
-        let session = Session::from_name(guard.name());
+        let (_guard, session) = owner_lock_session("aoe_test_owner_resize_deadline");
         assert!(session.steal_size_owner("owner"));
 
-        let out = crate::tmux::tmux_command()
-            .args([
-                "set-hook",
-                "-t",
-                guard.name(),
-                "after-resize-window",
-                "run-shell 'sleep 1'",
-            ])
-            .output()
-            .expect("tmux set-hook");
-        assert!(out.status.success());
-
-        let deadline = crate::tmux::TmuxCommandDeadline::with_timeout(Duration::from_millis(200));
-        let started = Instant::now();
-        assert!(!session.resize_window_if_owner_with_deadline("owner", 91, 31, &deadline,));
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed >= Duration::from_millis(150),
-            "deadline expired before the guarded resize ran: {elapsed:?}"
-        );
-        assert!(
-            elapsed < Duration::from_millis(600),
-            "verification or cleanup received a fresh deadline: {elapsed:?}"
-        );
-
-        let out = crate::tmux::tmux_command()
-            .args([
-                "display-message",
-                "-p",
-                "-t",
-                &format!("{}:^.0", guard.name()),
-                "#{pane_width} #{pane_height}",
-            ])
-            .output()
-            .expect("tmux pane size");
-        assert!(out.status.success());
-        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "91 31");
+        // The owner snapshot and the chrome probe behind the guarded resize.
+        const COMMANDS_BEFORE_RESIZE: i64 = 2;
+        let deadline =
+            crate::tmux::TmuxCommandDeadline::expiring_after_commands(COMMANDS_BEFORE_RESIZE);
+        assert!(!session.resize_window_if_owner_with_deadline("owner", 91, 31, &deadline));
         assert_eq!(
             session.size_owner().map(|(id, _)| id),
             Some("owner".to_string())
@@ -3268,34 +3222,13 @@ mod tests {
             eprintln!("Skipping test: tmux not available");
             return;
         }
-        let guard = TmuxTestSession::new("aoe_test_owner_resize_heartbeat");
-        let out = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                guard.name(),
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sleep 30",
-                ";",
-                "set-window-option",
-                "-t",
-                guard.name(),
-                "pane-base-index",
-                "0",
-            ])
-            .output()
-            .expect("tmux new-session");
-        assert!(out.status.success());
-        refresh_session_cache();
-        let session = Session::from_name(guard.name());
+        let (guard, session) = owner_lock_session("aoe_test_owner_resize_heartbeat");
         assert!(session.steal_size_owner("owner"));
 
+        // Every message the owner reads moves the heartbeat, so the queue-local
+        // guard never matches and each attempt loses the race to the same owner.
         let hook = format!(
-            "set-option -F -t {} @aoe_test_show_count '#{{e|+:#{{@aoe_test_show_count}},1}}' ; if-shell -F '#{{==:#{{e|%:#{{@aoe_test_show_count}},2}},1}}' \"set-option -F -t {} {SIZE_OWNER_HB_OPT} '#{{e|+:#{{{SIZE_OWNER_HB_OPT}}},1}}'\"",
+            "set-option -F -t {} @aoe_test_show_count '#{{e|+:#{{@aoe_test_show_count}},1}}' ; set-option -F -t {} {SIZE_OWNER_HB_OPT} '#{{e|+:#{{{SIZE_OWNER_HB_OPT}}},1}}'",
             guard.name(),
             guard.name(),
         );
@@ -3317,15 +3250,16 @@ mod tests {
             .expect("tmux heartbeat hook");
         assert!(out.status.success());
 
-        let deadline = crate::tmux::TmuxCommandDeadline::with_timeout(Duration::from_millis(300));
-        let started = Instant::now();
-        assert!(!session.resize_window_if_owner_with_deadline("owner", 91, 31, &deadline));
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed >= Duration::from_millis(200),
-            "same-owner heartbeat retries stopped before the shared deadline: {elapsed:?}"
+        // An attempt spends four tmux commands and displays three messages: the
+        // guarded resize prints nothing while its condition fails. Budgeting two
+        // attempts leaves the third attempt's owner read past the deadline.
+        const COMMANDS_PER_ATTEMPT: i64 = 4;
+        const MESSAGES_PER_ATTEMPT: u64 = 3;
+        const ATTEMPTS: i64 = 2;
+        let deadline = crate::tmux::TmuxCommandDeadline::expiring_after_commands(
+            COMMANDS_PER_ATTEMPT * ATTEMPTS,
         );
-        assert!(elapsed < Duration::from_millis(700));
+        assert!(!session.resize_window_if_owner_with_deadline("owner", 91, 31, &deadline));
 
         let out = crate::tmux::tmux_command()
             .args([
@@ -3348,9 +3282,10 @@ mod tests {
             .trim()
             .parse()
             .expect("numeric hook count");
-        assert!(
-            show_count >= 4,
-            "expected two heartbeat races, got {show_count}"
+        assert_eq!(
+            show_count,
+            MESSAGES_PER_ATTEMPT * ATTEMPTS as u64,
+            "retries did not run once per heartbeat race"
         );
         assert_eq!(
             session.size_owner().map(|(id, _)| id),
@@ -3365,30 +3300,7 @@ mod tests {
             eprintln!("Skipping test: tmux not available");
             return;
         }
-        let guard = TmuxTestSession::new("aoe_test_vt_owner");
-        let out = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                guard.name(),
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sleep 30",
-                ";",
-                "set-window-option",
-                "-t",
-                guard.name(),
-                "pane-base-index",
-                "0",
-            ])
-            .output()
-            .expect("tmux new-session");
-        assert!(out.status.success());
-        refresh_session_cache();
-        let session = Session::from_name(guard.name());
+        let (guard, session) = owner_lock_session("aoe_test_vt_owner");
 
         // Same claim protocol as the size owner: vacant -> first claimer
         // wins, idempotent re-claim, fresh lock rejects others, stale lock
