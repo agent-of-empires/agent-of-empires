@@ -48,6 +48,7 @@ impl Instance {
         if generation_can_merge {
             self.omp_capture_generation = src.omp_capture_generation.clone();
             self.session_id_poller = src.session_id_poller.clone();
+            self.session_id_poller_retry_after = src.session_id_poller_retry_after;
             if sid_unchanged {
                 self.agent_session_id = src.agent_session_id.clone();
             }
@@ -105,6 +106,7 @@ impl Instance {
         self.last_error_check = previous.last_error_check;
         self.last_start_time = previous.last_start_time;
         self.session_id_poller = previous.session_id_poller.clone();
+        self.session_id_poller_retry_after = previous.session_id_poller_retry_after;
         self.retroactive_capture_excludes = previous.retroactive_capture_excludes.clone();
     }
 

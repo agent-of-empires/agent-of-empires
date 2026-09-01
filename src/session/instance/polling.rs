@@ -4,6 +4,8 @@ use super::*;
 use fs2::FileExt as _;
 use sha2::{Digest as _, Sha256};
 
+const MANAGED_CAPTURE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+
 fn try_acquire_managed_capture_lease(
     backend: crate::agents::SessionCaptureBackend,
     store: &Path,
@@ -137,22 +139,29 @@ impl Instance {
             let Some(store) = self.sandbox_capture_store_dir() else {
                 return;
             };
-            if !self.managed_capture_store_is_exclusive(backend) {
-                tracing::warn!(target: "session.capture", session = %self.id, ?backend,
-                    "Session capture disabled because store ownership is ambiguous");
-                return;
-            }
+            // Lease contention is the common multi-process loser path. Check it
+            // before loading every profile to prove store exclusivity.
             let Some(lease) =
                 try_acquire_managed_capture_lease(backend, &store, &self.container_workdir())
             else {
+                self.session_id_poller_retry_after =
+                    Some(std::time::Instant::now() + MANAGED_CAPTURE_RETRY_BACKOFF);
                 tracing::warn!(target: "session.capture", session = %self.id, ?backend,
-                    "Session capture disabled because another process owns this store and workspace");
+                    "Session capture deferred because another process owns this store and workspace");
                 return;
             };
+            if !self.managed_capture_store_is_exclusive(backend) {
+                self.session_id_poller_retry_after =
+                    Some(std::time::Instant::now() + MANAGED_CAPTURE_RETRY_BACKOFF);
+                tracing::warn!(target: "session.capture", session = %self.id, ?backend,
+                    "Session capture deferred because store ownership is ambiguous");
+                return;
+            }
             Some(lease)
         } else {
             None
         };
+        self.session_id_poller_retry_after = None;
 
         let tmux_session_name = self
             .tmux_env_session_name()
@@ -346,6 +355,9 @@ impl Instance {
         if self.is_structured()
             || !self.supports_session_poller()
             || self.session_id_poller_is_running()
+            || self
+                .session_id_poller_retry_after
+                .is_some_and(|deadline| std::time::Instant::now() < deadline)
             || !self.has_live_tmux_pane_in(snapshot)
         {
             return false;
@@ -415,7 +427,7 @@ impl Instance {
 
 #[cfg(test)]
 mod tests {
-    use crate::session::Instance;
+    use crate::session::{Instance, SandboxInfo};
 
     // Restart, stop, and the sid_persist path all tear down through this
     // helper, so flushing here covers each of them. Restart is the one that
@@ -535,6 +547,36 @@ mod tests {
         claude.tool = "claude".to_string();
         assert!(claude.supports_session_poller());
     }
+    #[test]
+    #[serial_test::serial]
+    fn managed_capture_repair_honors_contention_backoff() {
+        let app = tempfile::tempdir().unwrap();
+        let _app_guard = crate::session::test_support::isolate_app_dir_at(app.path());
+        let mut inst = Instance::new("gemini", "/tmp/gemini-backoff");
+        inst.tool = "gemini".to_string();
+        inst.sandbox_info = Some(SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test-image".to_string(),
+            container_name: "test".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: Some("/workspace/gemini-backoff".to_string()),
+        });
+        let name = inst.tmux_session().unwrap().name().to_string();
+        let live = crate::tmux::LiveSessionSnapshot::from_parts(Some(vec![name]), None);
+        inst.session_id_poller_retry_after =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+
+        assert!(!inst.repair_session_id_poller_if_needed(&live));
+        assert!(inst.session_id_poller.is_none());
+
+        inst.session_id_poller_retry_after = None;
+        assert!(inst.repair_session_id_poller_if_needed(&live));
+        assert!(inst.session_id_poller_is_running());
+    }
+
     #[test]
     #[serial_test::serial]
     fn managed_capture_lease_serializes_store_and_workspace() {

@@ -85,6 +85,7 @@ impl Instance {
             pi_session_path: None,
             last_error: None,
             session_id_poller: None,
+            session_id_poller_retry_after: None,
             retroactive_capture_excludes: HashSet::new(),
             pane_dead_observed: false,
             file_watch: None,
@@ -198,7 +199,7 @@ impl Instance {
             (!value.is_empty() && value.lines().count() != 1)
                 || value
                     .chars()
-                    .any(|ch| matches!(ch, '|' | '&' | ';' | '<' | '>' | '(' | ')'))
+                    .any(|ch| matches!(ch, '|' | '&' | ';' | '<' | '>' | '(' | ')' | '#' | '`'))
         };
         if command.is_empty() || contains_control(command) || contains_control(&self.extra_args) {
             return false;
@@ -652,6 +653,14 @@ mod tests {
 
         inst.command = "claude".to_string();
         inst.extra_args = "--model opus | tee /tmp/transcript".to_string();
+        assert!(!inst.supports_native_resume());
+
+        inst.extra_args.clear();
+        inst.command = "claude # local note".to_string();
+        assert!(!inst.supports_native_resume());
+
+        inst.command = "claude".to_string();
+        inst.extra_args = "--model opus # local note".to_string();
         assert!(!inst.supports_native_resume());
     }
 

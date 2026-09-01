@@ -29,7 +29,7 @@ impl Instance {
     /// [`flush_pi_sidecar_conversation`] against this session's own storage,
     /// for teardown paths that hold no handle.
     pub(super) fn flush_pi_sidecar_if_published(&mut self) {
-        if self.tool != "pi" {
+        if self.resolved_capture_backend() != Some(crate::agents::SessionCaptureBackend::Pi) {
             return;
         }
         let profile = self.effective_profile();
@@ -454,6 +454,37 @@ mod tests {
             storage.load().unwrap()[0].agent_session_id.as_deref(),
             Some(published),
             "the conversation the pane published must outlive its instance dir"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pi_alias_flushes_the_published_conversation() {
+        let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::session::test_support::isolate_app_dir_at(home.path());
+        let profile = "pi-alias-sidecar-flush";
+        let mut inst = Instance::new("pi alias", "/tmp/pi-alias");
+        inst.source_profile = profile.to_string();
+        inst.tool = "company-pi".to_string();
+        inst.detect_as = "pi".to_string();
+        inst.command = "pi".to_string();
+        inst.agent_session_id = Some("old-id".to_string());
+        inst.mark_pi_extension_launched_for_test();
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|instances, _| {
+                *instances = vec![inst.clone()];
+                Ok(())
+            })
+            .unwrap();
+        crate::hooks::write_session_id_via_guard(&inst.id, "published-id").unwrap();
+
+        inst.flush_pi_sidecar_if_published();
+
+        assert_eq!(
+            storage.load().unwrap()[0].agent_session_id.as_deref(),
+            Some("published-id")
         );
     }
 

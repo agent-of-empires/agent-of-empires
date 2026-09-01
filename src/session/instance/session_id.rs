@@ -297,7 +297,7 @@ impl Instance {
             crate::agents::SessionCaptureBackend::Claude
                 | crate::agents::SessionCaptureBackend::HookSidecar
         ) {
-            let authoritative = crate::hooks::read_hook_session_id(&self.id)?;
+            let authoritative = crate::hooks::read_hook_session_id_any_age(&self.id)?;
             if self.retroactive_capture_excludes.contains(&authoritative) {
                 return None;
             }
@@ -581,14 +581,16 @@ impl Instance {
             session_id.as_deref(),
             explicitly_pinned,
         );
-        // Sandboxed Copilot, Kimi, and Prime Agent start fresh: their session
-        // stores live inside the container (Copilot's SQLite db, Kimi's
-        // `~/.kimi-code/session_index.jsonl`, Prime Agent's
-        // `~/.prime/agent/sessions/*.jsonl`), so a host-captured or manually
-        // pinned sid would launch `--resume <id>` against an id that does
-        // not resolve there. Capture is already host-only above; drop the sid
-        // to gate emission too.
-        if self.tool == "copilot" && self.is_sandboxed() {
+        // Copilot has no verified automatic capture source in a sandbox. A
+        // stale automatically stored host ID must not cross that namespace,
+        // but an explicit pin is authoritative and must be attempted against
+        // this instance's own persistent sandbox store.
+        if self
+            .resolved_agent()
+            .is_some_and(|agent| agent.name == "copilot")
+            && self.is_sandboxed()
+            && !explicitly_pinned
+        {
             session_id = None;
         }
         // A transcript the pane published outranks its id: `--session <path>`
@@ -913,7 +915,7 @@ mod tests {
     fn sandbox_resume_flags_follow_capture_context_support() {
         let sid = "11111111-2222-3333-4444-555555555555";
         for (tool, expected, resumed) in [
-            ("copilot", "copilot".to_string(), false),
+            ("copilot", format!("copilot --session-id {sid}"), true),
             ("kimi", format!("kimi --session {sid}"), true),
             ("prime-agent", format!("prime-agent --resume {sid}"), true),
         ] {
@@ -940,6 +942,23 @@ mod tests {
             assert_eq!(cmd, expected, "{tool}");
             assert_eq!(inst.agent_session_id.as_deref(), Some(sid));
         }
+
+        let mut automatic_copilot = Instance::new("test", "/tmp/test");
+        automatic_copilot.tool = "copilot".to_string();
+        automatic_copilot.agent_session_id = Some(sid.to_string());
+        automatic_copilot.sandbox_info = Some(SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test-image".to_string(),
+            container_name: "test".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        });
+        let mut automatic_cmd = "copilot".to_string();
+        assert!(!automatic_copilot.apply_session_flags(&mut automatic_cmd, "test"));
+        assert_eq!(automatic_cmd, "copilot");
 
         let mut host_prime = Instance::new("test", "/tmp/test");
         host_prime.tool = "prime-agent".to_string();
@@ -1883,6 +1902,32 @@ pi = "~/.pi-personal"
             assert_eq!(sid.as_deref(), Some(mine));
             assert!(is_existing);
             assert_eq!(inst.agent_session_id.as_deref(), Some(mine));
+        }
+
+        #[test]
+        #[serial]
+        fn idle_sidecar_still_overrides_stored_identity() {
+            let temp = tempdir().unwrap();
+            let _guard = claude_home_guard(&temp);
+            let mut inst = Instance::new("idle-sidecar", "/tmp/idle-sidecar");
+            inst.tool = "claude".to_string();
+            inst.agent_session_id = Some("stored-old".to_string());
+            inst.resume_intent = ResumeIntent::Default;
+
+            let dir = super::write_sidecar(&inst.id, "published-new");
+            let stale = SystemTime::now() - Duration::from_secs(10 * 60);
+            std::fs::File::options()
+                .write(true)
+                .open(dir.join("session_id"))
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(stale))
+                .unwrap();
+
+            assert_eq!(
+                inst.capture_freshest_session_id().as_deref(),
+                Some("published-new")
+            );
+            std::fs::remove_dir_all(dir).ok();
         }
 
         // Sandboxed Claude uses the same instance-keyed host sidecar through

@@ -322,11 +322,11 @@ impl Instance {
             .resolved_agent()
             .is_some_and(|agent| agent.name == "cursor")
         {
-            if let Some(root) = self
-                .resolved_host_environment()
-                .iter()
-                .find_map(|entry| entry.strip_prefix("CURSOR_CONFIG_DIR="))
-                .filter(|root| !root.is_empty())
+            if let Some(root) = crate::session::environment::resolve_host_environment_value(
+                &self.resolved_host_environment(),
+                "CURSOR_CONFIG_DIR",
+            )
+            .filter(|root| !root.is_empty())
             {
                 return std::path::PathBuf::from(root).join(relative);
             }
@@ -381,6 +381,33 @@ mod tests {
     use super::*;
 
     use crate::session::test_support::EnvGuard;
+
+    #[test]
+    #[serial_test::serial]
+    fn cursor_sidecar_resolves_bare_config_dir_environment_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let custom = temp.path().join("cursor-custom");
+        let _cursor = EnvGuard::set(&[("CURSOR_CONFIG_DIR", custom.as_os_str())]);
+        crate::session::config::update_config(|config| {
+            config.environment = vec!["CURSOR_CONFIG_DIR".to_string()];
+        })
+        .unwrap();
+
+        let mut inst = Instance::new("cursor", "/tmp/test");
+        inst.tool = "cursor".to_string();
+        let config = crate::session::profile_config::resolve_config_or_warn("");
+        let sidecar = crate::agents::get_agent("cursor")
+            .unwrap()
+            .sidecar_hooks
+            .as_ref()
+            .unwrap();
+
+        assert_eq!(
+            inst.sidecar_host_config_path(sidecar, temp.path(), &config.session),
+            custom.join("hooks.json")
+        );
+    }
 
     #[test]
     fn test_codex_gets_status_hook_env_prefix() {

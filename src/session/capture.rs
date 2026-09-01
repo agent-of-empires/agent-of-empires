@@ -267,9 +267,11 @@ pub(crate) fn pi_sidecar_poll_fn(
     }
 }
 
+pub(crate) const MAX_SESSION_ID_LEN: usize = 256;
+
 pub(crate) fn is_valid_session_id(id: &str) -> bool {
     !id.is_empty()
-        && id.len() <= 256
+        && id.len() <= MAX_SESSION_ID_LEN
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')

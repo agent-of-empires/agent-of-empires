@@ -637,6 +637,9 @@ pub struct Instance {
     pub last_error: Option<String>,
     #[serde(skip)]
     pub session_id_poller: Option<Arc<Mutex<SessionPoller>>>,
+    /// Runtime backoff after managed-store ownership or lease contention.
+    #[serde(skip)]
+    pub(crate) session_id_poller_retry_after: Option<std::time::Instant>,
     /// Session IDs invalidated at a fresh-generation boundary. Persisting this
     /// set prevents a process restart from resurrecting an abandoned ID from a
     /// still-present upstream artifact.

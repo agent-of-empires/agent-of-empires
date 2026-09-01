@@ -767,6 +767,35 @@ pub(crate) fn sandbox_store_dir(
         .unwrap_or_else(|| sandbox_dir_for(mount, home, Some(instance_id)))
         .map(Some)
 }
+
+/// Legacy shared store and new instance-private store pairs for one agent.
+/// Multiple entries matter for agents such as OpenCode that mount config and
+/// data directories separately. Identical declared roots are deduplicated.
+pub(crate) fn sandbox_store_migration_paths(
+    tool: &str,
+    home: &Path,
+    declared_config_dir: Option<&Path>,
+    instance_id: &str,
+) -> Result<Vec<(PathBuf, PathBuf)>> {
+    crate::session::validate_instance_id(instance_id)?;
+    let mut paths = Vec::new();
+    for mount in AGENT_CONFIG_MOUNTS
+        .iter()
+        .filter(|mount| mount.tool_name == tool)
+    {
+        let shared = declared_config_dir
+            .map(|dir| dir.join(SANDBOX_SUBDIR))
+            .unwrap_or_else(|| home.join(mount.host_rel).join(SANDBOX_SUBDIR));
+        let private = shared.join(instance_id);
+        if !paths
+            .iter()
+            .any(|pair| pair == &(shared.clone(), private.clone()))
+        {
+            paths.push((shared, private));
+        }
+    }
+    Ok(paths)
+}
 /// Seed a newly isolated Codex home from the legacy shared sandbox only for the
 /// credential that prior AoE versions migrated there. SQLite state is deliberately
 /// not copied: it is process-local and is the source of the single-instance lock.
@@ -6274,5 +6303,33 @@ volume_ignores = ["target"]
         assert_ne!(declared_a, declared_b);
         assert_eq!(default_a, home.join(".gemini/sandbox/instance-a"));
         assert_eq!(declared_a, declared.join("sandbox/instance-a"));
+
+        assert_eq!(
+            sandbox_store_migration_paths("gemini", home, None, "instance-a").unwrap(),
+            vec![(
+                home.join(".gemini/sandbox"),
+                home.join(".gemini/sandbox/instance-a")
+            )]
+        );
+        assert_eq!(
+            sandbox_store_migration_paths("gemini", home, Some(declared), "instance-a").unwrap(),
+            vec![(
+                declared.join("sandbox"),
+                declared.join("sandbox/instance-a")
+            )]
+        );
+        assert_eq!(
+            sandbox_store_migration_paths("opencode", home, None, "instance-a")
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            sandbox_store_migration_paths("opencode", home, Some(declared), "instance-a")
+                .unwrap()
+                .len(),
+            1,
+            "a declared root shared by both OpenCode mounts must be copied once"
+        );
     }
 }
