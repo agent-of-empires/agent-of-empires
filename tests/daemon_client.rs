@@ -194,7 +194,12 @@ async fn daemon_client_http_contract() {
         DaemonClient::new("http://example.test", Some("bad\nvalue")),
         Err(DaemonClientError::InvalidBearerToken)
     ));
-
+    assert!(matches!(
+        DaemonClient::new("http://example.test", Some("secret-token")),
+        Err(DaemonClientError::InsecureBearerTransport)
+    ));
+    assert!(DaemonClient::new("http://example.test", None).is_ok());
+    assert!(DaemonClient::new("https://example.test", Some("secret-token")).is_ok());
     for invalid_token in ["bad value", "tøken"] {
         assert!(matches!(
             DaemonClient::new("http://example.test", Some(invalid_token)),

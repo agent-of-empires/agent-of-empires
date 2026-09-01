@@ -47,6 +47,9 @@ pub enum DaemonClientError {
     /// The bearer token cannot be represented as an HTTP authorization header.
     #[error("invalid daemon bearer token")]
     InvalidBearerToken,
+    /// Bearer authentication was configured for a non-loopback plaintext URL.
+    #[error("daemon bearer token requires HTTPS or a loopback HTTP URL")]
+    InsecureBearerTransport,
     /// The default reqwest client could not be built.
     #[error("failed to build daemon HTTP client: {0}")]
     ClientBuild(#[source] reqwest::Error),
@@ -74,9 +77,17 @@ pub enum DaemonClientError {
 
 impl DaemonClient {
     /// Build a client with a 15-second timeout and redirects disabled.
+    ///
+    /// Bearer authentication requires HTTPS except for loopback HTTP endpoints.
     pub fn new(base_url: &str, bearer_token: Option<&str>) -> Result<Self, DaemonClientError> {
         let sessions_url = sessions_url(base_url)?;
         let authorization = authorization_header(bearer_token)?;
+        if authorization.is_some()
+            && sessions_url.scheme() == "http"
+            && !is_loopback_url(&sessions_url)
+        {
+            return Err(DaemonClientError::InsecureBearerTransport);
+        }
         let http = reqwest::Client::builder()
             .timeout(DEFAULT_TIMEOUT)
             .user_agent(concat!("aoe-daemon-client/", env!("CARGO_PKG_VERSION")))
@@ -192,6 +203,20 @@ async fn read_bounded_body(
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
+}
+
+pub(crate) fn is_loopback_url(url: &Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let ip_host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    host.eq_ignore_ascii_case("localhost")
+        || ip_host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 fn sessions_url(base_url: &str) -> Result<Url, DaemonClientError> {

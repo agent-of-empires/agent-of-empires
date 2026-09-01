@@ -182,17 +182,7 @@ fn is_loopback(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
     };
-    let Some(host) = parsed.host_str() else {
-        return false;
-    };
-    let ip_host = host
-        .strip_prefix('[')
-        .and_then(|host| host.strip_suffix(']'))
-        .unwrap_or(host);
-    host.eq_ignore_ascii_case("localhost")
-        || ip_host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
+    crate::daemon::is_loopback_url(&parsed)
 }
 
 fn trim_query(url: &str) -> &str {
