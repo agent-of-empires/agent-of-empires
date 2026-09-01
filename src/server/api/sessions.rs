@@ -480,7 +480,7 @@ impl SessionResponse {
             },
             // Shares `agent_is_structured_fork_capable` with the create-time
             // guard so the web "Fork" affordance and server-side acceptance
-            // cannot drift: forkable = ACP-capable AND a real fork strategy.
+            // cannot drift: forkable = built-in ACP adapter verified to fork.
             #[cfg(feature = "serve")]
             acp_can_fork: agent_is_structured_fork_capable(&inst.tool, inst.agent_name.as_deref()),
             // Same agent resolution as `acp_agent` above; computed once here so
