@@ -21,7 +21,7 @@ use agent_of_empires::server::test_support::build_test_app_state;
 use agent_of_empires::server::test_support::{
     reload_disk_only_for_test, reload_tmux_applied_for_test,
 };
-use agent_of_empires::session::{Instance, Status};
+use agent_of_empires::session::{DetectionState, Instance, Status};
 use chrono::TimeZone;
 
 #[tokio::test]
@@ -115,27 +115,30 @@ async fn reload_state_instances_from_disk_tmux_applied_takes_fresh_status() {
     );
 }
 
-/// #2865: `status_poll_loop` calls `update_status_with_metadata` on the
-/// `fresh` vector (after seeding it from the prior in-memory
-/// `unknown_since`/`ever_confirmed_present`) BEFORE this helper runs, so by
-/// the time `TmuxApplied` reaches here `fresh` already holds this tick's
-/// authoritative escalation decision. If the merge instead restored the
-/// prior in-memory snapshot (taken before that decision ran), it would wipe
-/// out the just-computed `unknown_since` advancement every single tick,
-/// permanently resetting the Unknown->Error escalation window and
-/// reintroducing the bug this test guards against.
+/// #2865 / #3642: `status_poll_loop` calls `update_status_with_metadata` on
+/// the `fresh` vector (after seeding it from the prior in-memory tracking)
+/// BEFORE this helper runs, so by the time `TmuxApplied` reaches here `fresh`
+/// already holds this tick's authoritative decisions. If the merge instead
+/// restored the prior in-memory snapshot (taken before that decision ran), it
+/// would wipe out the just-computed `unknown_since` advancement and the
+/// detection this tick just resolved, every single tick.
 #[tokio::test]
-async fn reload_state_instances_from_disk_tmux_applied_trusts_fresh_unknown_tracking() {
+async fn reload_state_instances_from_disk_tmux_applied_trusts_fresh_tick_tracking() {
     let mut prior = Instance::new("seed", "/tmp/seed");
     prior.ever_confirmed_present = false;
     prior.unknown_since = None;
+    prior.detection = DetectionState {
+        pending: Some(Status::Idle),
+        ..Default::default()
+    };
     let prior_id = prior.id.clone();
     let state = build_test_app_state(vec![prior]);
 
     // Simulates status_poll_loop having already run
     // `update_status_with_metadata` on a disk-fresh instance seeded from the
     // prior tick's tracking fields: this tick's tmux probe found the server
-    // still unreachable, so `unknown_since` advanced from `None` to `Some`.
+    // still unreachable, so `unknown_since` advanced from `None` to `Some`,
+    // and the pending proposal was confirmed and cleared.
     let advanced_since = std::time::Instant::now();
     let mut fresh = Instance::new("seed", "/tmp/seed");
     fresh.id = prior_id.clone();
@@ -152,22 +155,31 @@ async fn reload_state_instances_from_disk_tmux_applied_trusts_fresh_unknown_trac
         "TmuxApplied must trust fresh's just-computed unknown_since, not the \
          prior in-memory snapshot taken before this tick's status decision"
     );
+    assert_eq!(
+        result[0].detection.pending, None,
+        "TmuxApplied must trust fresh's resolved detection, or a proposal the \
+         tick just published comes straight back"
+    );
     assert!(
         !result[0].ever_confirmed_present,
         "unrelated field unaffected by the advancement"
     );
 }
 
-/// #2865 counterpart: `disk_watcher_consumer`'s `DiskOnly` path never calls
-/// `update_status_with_metadata` (no tmux scrape), so `fresh` here is a raw
-/// disk load with both fields at their `#[serde(skip)]` defaults. The prior
-/// in-memory tracking must still survive this reload.
+/// #2865 / #3642 counterpart: `disk_watcher_consumer`'s `DiskOnly` path never
+/// calls `update_status_with_metadata` (no tmux scrape), so `fresh` here is a
+/// raw disk load with these fields at their `#[serde(skip)]` defaults. The
+/// prior in-memory tracking must still survive this reload.
 #[tokio::test]
-async fn reload_state_instances_from_disk_disk_only_preserves_prior_unknown_tracking() {
+async fn reload_state_instances_from_disk_disk_only_preserves_prior_tick_tracking() {
     let confirmed_since = std::time::Instant::now();
     let mut prior = Instance::new("seed", "/tmp/seed");
     prior.ever_confirmed_present = true;
     prior.unknown_since = Some(confirmed_since);
+    prior.detection = DetectionState {
+        pending: Some(Status::Idle),
+        ..Default::default()
+    };
     let prior_id = prior.id.clone();
     let state = build_test_app_state(vec![prior]);
 
@@ -175,6 +187,7 @@ async fn reload_state_instances_from_disk_disk_only_preserves_prior_unknown_trac
     fresh.id = prior_id.clone();
     assert!(!fresh.ever_confirmed_present);
     assert_eq!(fresh.unknown_since, None);
+    assert_eq!(fresh.detection, DetectionState::default());
 
     reload_disk_only_for_test(&state, vec![fresh], Vec::new()).await;
 
@@ -188,6 +201,12 @@ async fn reload_state_instances_from_disk_disk_only_preserves_prior_unknown_trac
         result[0].unknown_since,
         Some(confirmed_since),
         "DiskOnly must restore the prior in-memory unknown_since"
+    );
+    assert_eq!(
+        result[0].detection.pending,
+        Some(Status::Idle),
+        "DiskOnly must restore the prior in-memory detection, or a watcher \
+         reload between ticks drops a proposal awaiting its confirming poll"
     );
 }
 

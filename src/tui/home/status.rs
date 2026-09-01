@@ -341,6 +341,8 @@ impl HomeView {
                 // dead-pane tier never applies to them.
                 pane_dead: false,
                 live_status_baseline: Some(update.status),
+                // A structured row has no pane to detect against.
+                detection: None,
             },
             true,
             true,
@@ -390,6 +392,7 @@ impl HomeView {
             let new_error = update.last_error;
             let new_idle_entered_at = update.idle_entered_at;
             let new_live_status_baseline = update.live_status_baseline;
+            let new_detection = update.detection;
             let status_changed = old_status != Some(new_status);
             self.mutate_instance(&update.id, |inst| {
                 inst.status = new_status;
@@ -431,6 +434,13 @@ impl HomeView {
                 // in `src/tui/home/tests.rs`. See #2690.
                 if let Some(baseline) = new_live_status_baseline {
                     inst.live_status_baseline = Some(baseline);
+                }
+                // The poller decided on a clone, so its detection bookkeeping
+                // only reaches the next poll through here. `None` is a
+                // producer that never detected; it must not reset the row.
+                // See #3642.
+                if let Some(detection) = new_detection {
+                    inst.detection = detection;
                 }
                 inst.pane_dead_observed = new_pane_dead;
             });

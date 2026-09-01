@@ -131,6 +131,9 @@ fn apply_updates(
         if let Some(baseline) = update.live_status_baseline {
             session.instance.live_status_baseline = Some(baseline);
         }
+        if let Some(detection) = update.detection {
+            session.instance.detection = detection;
+        }
 
         if run_hooks && old != update.status {
             crate::status_hooks::run_for_transition(
@@ -178,6 +181,10 @@ fn snapshot(sessions: &[AttachedStatusHookSession]) -> Vec<StatusUpdate> {
             last_accessed_at: session.instance.last_accessed_at,
             pane_dead: session.instance.pane_dead_observed,
             live_status_baseline: session.instance.live_status_baseline,
+            // The watcher owns detection while the main loop is parked on
+            // the attach, so a proposal raised during it is confirmed after
+            // it only if the copy hands this back (#3642).
+            detection: Some(session.instance.detection),
         })
         .collect()
 }
@@ -214,6 +221,7 @@ mod tests {
                 last_accessed_at: None,
                 pane_dead: false,
                 live_status_baseline: None,
+                detection: None,
             }],
             true,
         );
@@ -261,6 +269,7 @@ mod tests {
                 last_accessed_at: None,
                 pane_dead: false,
                 live_status_baseline: Some(Status::Idle),
+                detection: None,
             }],
             false,
         );
@@ -280,6 +289,7 @@ mod tests {
                 last_accessed_at: None,
                 pane_dead: false,
                 live_status_baseline: Some(Status::Running),
+                detection: None,
             }],
             false,
         );

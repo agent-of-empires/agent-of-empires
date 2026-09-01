@@ -104,6 +104,41 @@ use status::{UNKNOWN_ERROR_WINDOW_CONFIRMED_PRESENT, UNKNOWN_ERROR_WINDOW_NEVER_
 use tmux_session::tmux_env_session_name_for_instance_id;
 use types::{deserialize_session_id, is_zero_u64};
 
+/// Runtime bookkeeping that one pane detection leaves for the next.
+///
+/// Not persisted, and no poller owns the row it decides on: the TUI polls a
+/// clone and the daemon rebuilds every row from disk each tick. Each of those
+/// boundaries has to carry this back onto the live row, or every poll starts
+/// from `default()`, a `pending` proposal never meets the poll that agrees
+/// with it, and a hookless manifest agent stays Running for the life of the
+/// session (#3642).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DetectionState {
+    /// tmux's last-output timestamp for the pane at the last capture. A pane
+    /// that has drawn nothing since cannot have changed, so the capture is
+    /// skipped and the previous verdict stands: a parked session costs one
+    /// batched format read per poll rather than a subprocess.
+    pub activity: Option<i64>,
+    /// The wall-clock second in which the last capture was taken, stamped
+    /// before it rather than after. `activity` has one-second granularity, so
+    /// a capture taken inside the second it names can have read the screen
+    /// before a later frame in that same second (#3624): the stamp is only
+    /// proof of "nothing drawn since" once a capture has been taken past the
+    /// end of that second. A clock that never satisfies that degrades to
+    /// capturing every poll, which is the pre-gate behavior.
+    pub captured_at: Option<i64>,
+    /// The manifest rule that decided the last detection, for the
+    /// status-change log. Names why a session is in the state it is in, which
+    /// is what a wrong-state report needs and what a fingerprint of pane
+    /// markers could only hint at.
+    pub rule: Option<&'static str>,
+    /// A status proposed by a rule that did not read it off the agent's own
+    /// live chrome. It is published once a second poll agrees. Mid-redraw
+    /// frames are otherwise indistinguishable from real transitions, and they
+    /// flipped parked sessions between Idle and Running every few seconds.
+    pub pending: Option<Status>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Instance {
     pub id: String,
@@ -570,35 +605,12 @@ pub struct Instance {
     #[serde(skip)]
     pub unknown_since: Option<std::time::Instant>,
 
-    /// tmux's last-output timestamp for the pane at the last capture. A pane
-    /// that has drawn nothing since cannot have changed, so the capture is
-    /// skipped and the previous verdict stands: a parked session costs one
-    /// batched format read per poll rather than a subprocess.
-    /// `#[serde(skip)]` like the rest of the live-status bookkeeping, so a
-    /// fresh load re-derives it.
+    /// What the last detection left behind, for the next one to read. See
+    /// [`DetectionState`]: every poller decides on a copy of this row, so
+    /// each one has to carry this field back or the confirming poll never
+    /// arrives (#3642).
     #[serde(skip)]
-    pub detection_activity: Option<i64>,
-    /// The wall-clock second in which the last capture was taken, stamped
-    /// before it rather than after. `detection_activity` has one-second
-    /// granularity, so a capture taken inside the second it names can have
-    /// read the screen before a later frame in that same second (#3624): the
-    /// stamp is only proof of "nothing drawn since" once a capture has been
-    /// taken past the end of that second. A clock that never satisfies that
-    /// degrades to capturing every poll, which is the pre-gate behavior.
-    #[serde(skip)]
-    pub detection_captured_at: Option<i64>,
-    /// The manifest rule that decided the last detection, for the
-    /// status-change log. Names why a session is in the state it is in, which
-    /// is what a wrong-state report needs and what a fingerprint of pane
-    /// markers could only hint at.
-    #[serde(skip)]
-    pub detection_rule: Option<&'static str>,
-    /// A status proposed by a rule that did not read it off the agent's own
-    /// live chrome. It is published once a second poll agrees. Mid-redraw
-    /// frames are otherwise indistinguishable from real transitions, and they
-    /// flipped parked sessions between Idle and Running every few seconds.
-    #[serde(skip)]
-    pub pending_detection: Option<Status>,
+    pub detection: DetectionState,
 
     /// Runtime-only `KEY=VALUE` pairs minted by
     /// `host_hooks.before_session` for the host launch currently being

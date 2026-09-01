@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 
-use crate::session::{Instance, Status};
+use crate::session::{DetectionState, Instance, Status};
 use crate::tui::worker::Worker;
 
 /// Adaptive polling intervals (in cycles). 0 = never poll.
@@ -101,6 +101,12 @@ pub(crate) struct StatusUpdate {
     /// baseline, so the consumer applies this conditionally. `Some(_)` is
     /// unambiguous: apply it. See #2690.
     pub live_status_baseline: Option<Status>,
+    /// The polled clone's [`DetectionState`] after
+    /// `update_status_with_metadata` ran. `None` means the producer never
+    /// reached a detection, so the consumer keeps what the real `Instance`
+    /// holds. Dropping this is what left a proposed `Running -> Idle`
+    /// waiting on a confirming poll that could never see it (#3642).
+    pub detection: Option<DetectionState>,
 }
 
 pub(super) struct StatusPollState {
@@ -245,6 +251,8 @@ pub(super) fn poll_statuses_once(
                                 // usual sense; the Error tier itself sinks the row.
                                 pane_dead: false,
                                 live_status_baseline: Some(Status::Error),
+                                // No detection ran on this branch.
+                                detection: None,
                             });
                         }
                     }
@@ -292,6 +300,7 @@ pub(super) fn poll_statuses_once(
                 last_accessed_at: inst.last_accessed_at,
                 pane_dead,
                 live_status_baseline: inst.live_status_baseline,
+                detection: Some(inst.detection),
             })
         })
         .collect()
@@ -355,6 +364,7 @@ mod tests {
             last_accessed_at: None,
             pane_dead: false,
             live_status_baseline: None,
+            detection: None,
         };
         assert_eq!(update.idle_entered_at, IdleIntent::Set(ts));
     }
@@ -390,6 +400,10 @@ mod tests {
         assert_eq!(
             default.live_status_baseline, None,
             "live_status_baseline defaults to None (no baseline observed yet)"
+        );
+        assert_eq!(
+            default.detection, None,
+            "detection defaults to None (producer never detected)"
         );
     }
 

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use super::idle_reap::reap_idle_sessions;
 use super::reload::{
     apply_tick_status_decisions, load_all_instances, observed_transitions,
-    reload_state_instances_from_disk, seed_unknown_tracking,
+    reload_state_instances_from_disk, seed_tick_tracking, PriorTickTracking,
 };
 use super::session_identity::drain_session_id_updates_in_state;
 use super::sleep_inhibit::update_sleep_inhibit;
@@ -269,22 +269,18 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
                 &mut acp_capacity_deferred,
             );
         }
-        // Snapshot of the prior tick's Unknown-escalation tracking fields,
-        // taken from the same in-memory `state.instances` this tick's
-        // `load_all_instances()` call is about to reset to defaults. Fed to
-        // `seed_unknown_tracking` below, before `update_status_with_metadata`
-        // runs, so the escalation window in
-        // `update_status_with_metadata_inner` can actually accumulate
-        // elapsed time across ticks instead of restarting at zero every
-        // 2s (#2865).
-        let prev_unknown_tracking: std::collections::HashMap<
-            String,
-            (bool, Option<std::time::Instant>),
-        > = {
+        // Snapshot of the prior tick's status bookkeeping, taken from the same
+        // in-memory `state.instances` this tick's `load_all_instances()` call
+        // is about to reset to defaults. Fed to `seed_tick_tracking` below,
+        // before `update_status_with_metadata` runs, so the Unknown->Error
+        // escalation window can accumulate elapsed time across ticks (#2865)
+        // and a detection awaiting confirmation survives to meet the poll that
+        // confirms it (#3642), instead of both restarting every 2s.
+        let prev_tracking: std::collections::HashMap<String, PriorTickTracking> = {
             let instances = state.instances.read().await;
             instances
                 .iter()
-                .map(|i| (i.id.clone(), (i.ever_confirmed_present, i.unknown_since)))
+                .map(|i| (i.id.clone(), PriorTickTracking::of(i)))
                 .collect()
         };
 
@@ -314,7 +310,7 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
             .load(std::sync::atomic::Ordering::SeqCst);
         let updated = tokio::task::spawn_blocking(move || {
             let mut instances = load_all_instances(&file_watch_for_poll).unwrap_or_default();
-            seed_unknown_tracking(&mut instances, &prev_unknown_tracking);
+            seed_tick_tracking(&mut instances, &prev_tracking);
             crate::tmux::refresh_session_cache();
             let pane_metadata = crate::tmux::batch_pane_metadata();
             if let Err(error) = &pane_metadata {
