@@ -10463,11 +10463,24 @@ mod tests {
     /// these tests only need to observe that it waits for one.
     #[cfg(feature = "serve")]
     fn delete_race_state(id: &str) -> std::sync::Arc<crate::server::AppState> {
-        let mut inst = Instance::new("delete-3650", "/tmp/aoe-3650-delete");
-        inst.id = id.to_string();
-        inst.view = crate::session::View::Structured;
-        inst.status = Status::Idle;
-        crate::server::test_support::build_test_app_state(vec![inst])
+        delete_race_state_for(&[id])
+    }
+
+    /// [`delete_race_state`] for a workspace: every id shares the shape, so a
+    /// sibling teardown can be observed the same way the owner's is.
+    #[cfg(feature = "serve")]
+    fn delete_race_state_for(ids: &[&str]) -> std::sync::Arc<crate::server::AppState> {
+        let instances = ids
+            .iter()
+            .map(|id| {
+                let mut inst = Instance::new("delete-3650", "/tmp/aoe-3650-delete");
+                inst.id = (*id).to_string();
+                inst.view = crate::session::View::Structured;
+                inst.status = Status::Idle;
+                inst
+            })
+            .collect();
+        crate::server::test_support::build_test_app_state(instances)
     }
 
     /// #3650: prompt submission moved off `instance_lock`, so a permanent
@@ -10545,6 +10558,53 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), workspace)
             .await
             .expect("the workspace teardown lands once the submission releases")
+            .expect("workspace task must not panic");
+
+        // Workspace teardown, on a sibling's guard. The owner's is free, so
+        // the plan loop reaches the sibling and must park there: the owner is
+        // ordered last, and a sibling torn down under a live delivery is the
+        // case #3650 names alongside the direct delete.
+        let state = delete_race_state_for(&["sess-3650-sib", "sess-3650-ws-owner"]);
+        let delivering = state
+            .session_service
+            .prompt_submission("sess-3650-sib")
+            .await;
+        let workspace = tokio::spawn({
+            let state = std::sync::Arc::clone(&state);
+            async move {
+                purge_workspace_artifacts(
+                    &state,
+                    "sess-3650-ws-owner".to_string(),
+                    vec![
+                        ("sess-3650-sib".to_string(), DeleteSessionBody::default()),
+                        (
+                            "sess-3650-ws-owner".to_string(),
+                            DeleteSessionBody::default(),
+                        ),
+                    ],
+                    false,
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !workspace.is_finished(),
+            "a workspace teardown must wait for a sibling's in-flight submission"
+        );
+        assert!(
+            state
+                .instances
+                .read()
+                .await
+                .iter()
+                .all(|i| i.status == Status::Idle),
+            "no row may be marked Deleting while the sibling's submission is in flight"
+        );
+        drop(delivering);
+        tokio::time::timeout(Duration::from_secs(10), workspace)
+            .await
+            .expect("the workspace teardown lands once the sibling submission releases")
             .expect("workspace task must not panic");
     }
 

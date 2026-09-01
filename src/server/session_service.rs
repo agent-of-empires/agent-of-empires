@@ -1390,7 +1390,10 @@ impl SessionService {
     /// permanent delete. The drain reads status and the
     /// trashed/archived/snoozed flags once and then reaches `send_turn`, which
     /// respawns a worker it finds gone, so a quiesce landing inside that window
-    /// is undone and a delete races teardown against a live delivery. See
+    /// is undone and a delete races teardown against a live delivery. The
+    /// supervisor's reapers stay outside this: they drop a handle rather than
+    /// start a turn, so the worst they do to a delivery in flight is fail it,
+    /// and a failed delivery leaves its rows queued for the next tick. See
     /// #3621 and #3650. Callers that have not yet proved the session exists take
     /// [`Self::prompt_submission_for_session`] instead.
     ///
