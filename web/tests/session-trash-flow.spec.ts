@@ -1,4 +1,5 @@
 import { test, expect } from "./helpers/mockedTest";
+import { mockSessionsEnvelope } from "./helpers/sessionMocks";
 import { Page } from "@playwright/test";
 
 // User story (#2489): trash-first delete. Right-clicking a session and
@@ -59,7 +60,7 @@ async function mockApis(page: Page, options: { title?: string } = {}): Promise<H
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
     const sessions = handle.deletes > 0 ? [] : [sessionPayload(handle.trashed, options.title)];
-    return r.fulfill({ json: { sessions, workspace_ordering: [] } });
+    return r.fulfill({ json: mockSessionsEnvelope({ sessions, workspace_ordering: [] }) });
   });
   await page.route("**/api/sessions/sess-trash/trash", (r) => {
     if (r.request().method() !== "POST") return r.fulfill({ status: 400 });
@@ -283,7 +284,7 @@ async function mockMultiApis(
     const live = sessions
       .filter((s) => !handle.deletedIds.includes(s.id))
       .map((s) => multiPayload(s.id, s.groupPath, trashedState.get(s.id) ?? false, s.deleteToTrash));
-    return r.fulfill({ json: { sessions: live, workspace_ordering: [] } });
+    return r.fulfill({ json: mockSessionsEnvelope({ sessions: live, workspace_ordering: [] }) });
   });
   for (const s of sessions) {
     await page.route(`**/api/sessions/${s.id}/trash`, (r) => {

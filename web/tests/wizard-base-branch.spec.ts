@@ -1,4 +1,5 @@
 import { test, expect } from "./helpers/mockedTest";
+import { mockSessionsEnvelope } from "./helpers/sessionMocks";
 import { Page } from "@playwright/test";
 import { openWizard, selectProject, expandMoreOptions, wizard } from "./helpers/wizard";
 
@@ -37,7 +38,7 @@ async function mockApis(page: Page) {
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() === "GET") {
       return r.fulfill({
-        json: {
+        json: mockSessionsEnvelope({
           sessions: [
             {
               id: "seed-session",
@@ -59,7 +60,7 @@ async function mockApis(page: Page) {
             },
           ],
           workspace_ordering: [],
-        },
+        }),
       });
     }
     return r.fulfill({ json: { session: { id: "new-session" } } });

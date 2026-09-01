@@ -12,6 +12,7 @@
 // tests (src/lib/__tests__/pluginUi.test.ts, sidebarSort.test.ts).
 
 import { test, expect } from "./helpers/mockedTest";
+import { mockSessionsEnvelope } from "./helpers/sessionMocks";
 import { Page } from "@playwright/test";
 
 interface MockSession {
@@ -92,7 +93,9 @@ async function mockApis(page: Page, sessions: MockSession[], ordering: string[],
   await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
-    return r.fulfill({ json: { sessions: sessions.map(sessionResponse), workspace_ordering: ordering } });
+    return r.fulfill({
+      json: mockSessionsEnvelope({ sessions: sessions.map(sessionResponse), workspace_ordering: ordering }),
+    });
   });
   await page.route("**/api/plugins/ui-state", (r) => r.fulfill({ json: { entries: uiEntries, notifications: [] } }));
   for (const path of ["settings", "themes", "agents", "profiles", "groups", "devices", "docker/status", "about"]) {

@@ -1,4 +1,5 @@
 import { test, expect } from "./helpers/mockedTest";
+import { mockSessionsEnvelope } from "./helpers/sessionMocks";
 import { Page } from "@playwright/test";
 
 interface UpdateStatusFixture {
@@ -15,7 +16,9 @@ interface UpdateStatusFixture {
 
 async function mockBase(page: Page) {
   await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
-  await page.route("**/api/sessions", (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }));
+  await page.route("**/api/sessions", (r) =>
+    r.fulfill({ json: mockSessionsEnvelope({ sessions: [], workspace_ordering: [] }) }),
+  );
   for (const path of ["settings", "themes", "agents", "profiles", "groups", "devices", "docker/status", "about"]) {
     await page.route(`**/api/${path}`, (r) => r.fulfill({ json: path === "docker/status" ? {} : [] }));
   }

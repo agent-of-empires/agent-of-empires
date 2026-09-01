@@ -1,4 +1,5 @@
 import { test, expect } from "./helpers/mockedTest";
+import { mockSessionsEnvelope } from "./helpers/sessionMocks";
 import { Page } from "@playwright/test";
 
 // User story (#3167): the web Trash section gains a section-level "Empty Trash"
@@ -82,7 +83,7 @@ async function mockApis(
     const live = sessions
       .filter((s) => !handle.deletedIds.includes(s.id))
       .map((s) => payload(s.id, s.branch, s.trashed, s.cleanup));
-    return r.fulfill({ json: { sessions: live, workspace_ordering: [] } });
+    return r.fulfill({ json: mockSessionsEnvelope({ sessions: live, workspace_ordering: [] }) });
   });
   await page.route("**/api/workspaces", (r) => {
     if (r.request().method() !== "DELETE") return r.fulfill({ status: 400 });

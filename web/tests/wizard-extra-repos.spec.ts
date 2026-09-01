@@ -1,4 +1,5 @@
 import { test, expect } from "./helpers/mockedTest";
+import { mockSessionsEnvelope } from "./helpers/sessionMocks";
 import { Page } from "@playwright/test";
 
 // Wizard Extra repos picker (#1219). Lives under the Project step once
@@ -45,7 +46,7 @@ async function mockApis(page: Page, opts: MockOptions = {}) {
   );
   await page.route("**/api/sessions", (r) =>
     r.fulfill({
-      json: {
+      json: mockSessionsEnvelope({
         sessions: [
           {
             id: "seed-session",
@@ -67,7 +68,7 @@ async function mockApis(page: Page, opts: MockOptions = {}) {
           },
         ],
         workspace_ordering: [],
-      },
+      }),
     }),
   );
 }

@@ -1,4 +1,5 @@
 import { test, expect } from "./helpers/mockedTest";
+import { mockSessionsEnvelope } from "./helpers/sessionMocks";
 
 const NEW_SESSION_PANE_NAME = /New session Pick a project, then launch a new session/i;
 
@@ -52,7 +53,7 @@ test.describe("URL routing", () => {
       if (r.request().method() === "POST") return r.fulfill({ status: 400 });
       await new Promise((resolve) => setTimeout(resolve, 1000));
       await r.fulfill({
-        json: { sessions: [], workspace_ordering: [] },
+        json: mockSessionsEnvelope({ sessions: [], workspace_ordering: [] }),
       });
     });
 
@@ -76,7 +77,7 @@ test.describe("URL routing", () => {
     await page.route("**/api/sessions", (r) => {
       if (r.request().method() === "POST") return r.fulfill({ status: 400 });
       return r.fulfill({
-        json: {
+        json: mockSessionsEnvelope({
           sessions: [
             {
               id: "known-session",
@@ -106,7 +107,7 @@ test.describe("URL routing", () => {
             },
           ],
           workspace_ordering: [],
-        },
+        }),
       });
     });
     await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
@@ -172,7 +173,7 @@ function makeSession(id: string) {
 async function stubSessions(page: import("@playwright/test").Page, ids: string[]) {
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() === "POST") return r.fulfill({ status: 400 });
-    return r.fulfill({ json: { sessions: ids.map(makeSession), workspace_ordering: [] } });
+    return r.fulfill({ json: mockSessionsEnvelope({ sessions: ids.map(makeSession), workspace_ordering: [] }) });
   });
   await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
   await page.route("**/api/sessions/*/terminal", (r) => r.fulfill({ status: 200, body: "" }));

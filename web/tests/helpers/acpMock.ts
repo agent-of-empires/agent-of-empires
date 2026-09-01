@@ -12,6 +12,7 @@
 // drops the duplicates.
 
 import { expect, type Page, type WebSocketRoute } from "@playwright/test";
+import { mockSessionsEnvelope } from "./sessionMocks";
 
 /** Parsed `POST .../acp/prompt` request body. `prompt_id` is the
  *  client-minted id the daemon echoes back on `UserPromptSent`, so a spec can
@@ -208,7 +209,7 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() === "POST") return r.fulfill({ status: 400 });
     return r.fulfill({
-      json: {
+      json: mockSessionsEnvelope({
         sessions: [
           {
             id: sessionId,
@@ -234,7 +235,7 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
           },
         ],
         workspace_ordering: [],
-      },
+      }),
     });
   });
   await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));

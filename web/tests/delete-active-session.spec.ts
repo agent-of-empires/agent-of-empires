@@ -1,4 +1,5 @@
 import { test, expect } from "./helpers/mockedTest";
+import { mockSessionsEnvelope } from "./helpers/sessionMocks";
 import { Page } from "@playwright/test";
 
 // User story (ported from the live Playwright acp-stories suite):
@@ -44,10 +45,7 @@ async function mockApis(page: Page): Promise<Handle> {
     // Once the DELETE has landed, the server no longer lists the
     // session; the sidebar poll picks that up and drops the row.
     return r.fulfill({
-      json: {
-        sessions: handle.deletes.length === 0 ? [session] : [],
-        workspace_ordering: [],
-      },
+      json: mockSessionsEnvelope({ sessions: handle.deletes.length === 0 ? [session] : [], workspace_ordering: [] }),
     });
   });
   await page.route("**/api/workspaces", (r) => {

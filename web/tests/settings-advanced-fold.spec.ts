@@ -11,6 +11,7 @@
 // format of an advanced edit.
 
 import { test, expect } from "./helpers/mockedTest";
+import { mockSessionsEnvelope } from "./helpers/sessionMocks";
 import type { Page } from "@playwright/test";
 
 const ALLOW = { policy: "allow" };
@@ -117,7 +118,7 @@ async function installFoldMocks(page: Page): Promise<FoldMockHandle> {
 
   await page.route(
     (url) => url.pathname === "/api/sessions",
-    (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }),
+    (r) => r.fulfill({ json: mockSessionsEnvelope({ sessions: [], workspace_ordering: [] }) }),
   );
   await page.route(
     (url) => url.pathname === "/api/about",

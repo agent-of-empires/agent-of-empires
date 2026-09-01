@@ -1,4 +1,5 @@
 import { test, expect, Page } from "@playwright/test";
+import { mockSessionsEnvelope } from "./helpers/sessionMocks";
 import { openWizard, selectProject, selectAgent, expandMoreOptions, launch, wizard } from "./helpers/wizard";
 
 // Custom agent picker on the single-screen wizard (#2210). A configured
@@ -13,7 +14,7 @@ const hiddenCommand = "ssh prod.example.com remote-helper";
 const hiddenDetectAs = "agent_detect_as";
 
 function seedSessionsPayload() {
-  return {
+  return mockSessionsEnvelope({
     sessions: [
       {
         id: "seed-session",
@@ -35,7 +36,7 @@ function seedSessionsPayload() {
       },
     ],
     workspace_ordering: [],
-  };
+  });
 }
 
 async function mockWizardApis(page: Page, agents: unknown[]) {

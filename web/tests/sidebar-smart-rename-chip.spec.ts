@@ -1,4 +1,5 @@
 import { test, expect } from "./helpers/mockedTest";
+import { mockSessionsEnvelope } from "./helpers/sessionMocks";
 import { Page } from "@playwright/test";
 
 // Renders the smart-rename sidebar chips through the real bundle so their JSX
@@ -19,7 +20,7 @@ async function mockApis(page: Page, sessions: MockSession[]) {
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
     return r.fulfill({
-      json: {
+      json: mockSessionsEnvelope({
         sessions: sessions.map((s) => ({
           id: s.id,
           title: s.title,
@@ -40,7 +41,7 @@ async function mockApis(page: Page, sessions: MockSession[]) {
           smart_rename: s.smart_rename,
         })),
         workspace_ordering: [],
-      },
+      }),
     });
   });
   for (const path of ["settings", "themes", "agents", "profiles", "groups", "devices", "docker/status", "about"]) {

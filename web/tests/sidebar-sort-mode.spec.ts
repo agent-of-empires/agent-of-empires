@@ -17,6 +17,7 @@
 // bump) live in the matching tests/live/sidebar-sort-mode.spec.ts.
 
 import { test, expect } from "./helpers/mockedTest";
+import { mockSessionsEnvelope } from "./helpers/sessionMocks";
 import { Page } from "@playwright/test";
 
 interface MockSession {
@@ -67,10 +68,7 @@ async function mockApis(
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
     return r.fulfill({
-      json: {
-        sessions: getSessions().map(sessionResponse),
-        workspace_ordering: getOrdering(),
-      },
+      json: mockSessionsEnvelope({ sessions: getSessions().map(sessionResponse), workspace_ordering: getOrdering() }),
     });
   });
   await page.route("**/api/workspace-ordering", (r) => {

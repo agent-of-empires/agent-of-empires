@@ -1,4 +1,5 @@
 import { test, expect } from "./helpers/mockedTest";
+import { mockSessionsEnvelope } from "./helpers/sessionMocks";
 import { Page } from "@playwright/test";
 import { openWizard, selectProject, expandMoreOptions, launch, wizard } from "./helpers/wizard";
 
@@ -25,7 +26,7 @@ interface MockOptions {
 }
 
 function seedSessionsPayload() {
-  return {
+  return mockSessionsEnvelope({
     sessions: [
       {
         id: "seed-session",
@@ -47,7 +48,7 @@ function seedSessionsPayload() {
       },
     ],
     workspace_ordering: [],
-  };
+  });
 }
 
 async function mockApis(page: Page, opts: MockOptions = {}) {

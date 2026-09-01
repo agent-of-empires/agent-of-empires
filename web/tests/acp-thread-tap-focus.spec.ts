@@ -1,4 +1,5 @@
 import { test, expect } from "./helpers/mockedTest";
+import { mockSessionsEnvelope } from "./helpers/sessionMocks";
 import { devices, type Page } from "@playwright/test";
 import { clickSidebarSession, openMobileSidebar } from "./helpers/sidebar";
 
@@ -38,7 +39,7 @@ async function setup(page: Page) {
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() === "POST") return r.fulfill({ status: 400 });
     return r.fulfill({
-      json: {
+      json: mockSessionsEnvelope({
         sessions: [
           {
             id: SESSION_ID,
@@ -63,7 +64,7 @@ async function setup(page: Page) {
           },
         ],
         workspace_ordering: [],
-      },
+      }),
     });
   });
   await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));

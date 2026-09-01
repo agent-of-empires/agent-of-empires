@@ -1,4 +1,5 @@
 import { test, expect } from "./helpers/mockedTest";
+import { mockSessionsEnvelope } from "./helpers/sessionMocks";
 import { Page } from "@playwright/test";
 import { openWizard, selectProject, expandMoreOptions, launch, wizard } from "./helpers/wizard";
 
@@ -51,7 +52,7 @@ async function mockApis(page: Page, captured?: { body: Record<string, unknown> |
       if (captured) captured.body = JSON.parse(r.request().postData() || "{}");
       return r.fulfill({ json: { session: { id: "new-session" } } });
     }
-    return r.fulfill({ json: { sessions: [SEED_SESSION], workspace_ordering: [] } });
+    return r.fulfill({ json: mockSessionsEnvelope({ sessions: [SEED_SESSION], workspace_ordering: [] }) });
   });
 }
 
@@ -138,7 +139,7 @@ test.describe("Single-screen wizard (#2210)", () => {
         await createPromise;
         return r.fulfill({ json: { session: { id: "new-session" } } });
       }
-      return r.fulfill({ json: { sessions: [SEED_SESSION], workspace_ordering: [] } });
+      return r.fulfill({ json: mockSessionsEnvelope({ sessions: [SEED_SESSION], workspace_ordering: [] }) });
     });
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");

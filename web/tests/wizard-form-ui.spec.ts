@@ -1,4 +1,5 @@
 import { test, expect } from "./helpers/mockedTest";
+import { mockSessionsEnvelope } from "./helpers/sessionMocks";
 import { Page } from "@playwright/test";
 import { openWizard, selectProject, selectAgent, expandMoreOptions, setTitle, launch, wizard } from "./helpers/wizard";
 
@@ -30,7 +31,7 @@ const CLAUDE_AGENT: AgentStub = {
 const CODEX_AGENT: AgentStub = { name: "codex", binary: "codex", host_only: false, installed: true, install_hint: "" };
 
 function seedSessionsPayload() {
-  return {
+  return mockSessionsEnvelope({
     sessions: [
       {
         id: "seed-session",
@@ -52,7 +53,7 @@ function seedSessionsPayload() {
       },
     ],
     workspace_ordering: [],
-  };
+  });
 }
 
 async function mockApis(

@@ -14,6 +14,7 @@
 // the issue test plan.
 
 import { test, expect } from "./helpers/mockedTest";
+import { mockSessionsEnvelope } from "./helpers/sessionMocks";
 import { devices, type Page } from "@playwright/test";
 import { openMobileSidebar } from "./helpers/sidebar";
 
@@ -47,10 +48,7 @@ async function mockApis(page: Page) {
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
     return r.fulfill({
-      json: {
-        sessions: [sessionResponse()],
-        workspace_ordering: ["/tmp/repo::feature/demo"],
-      },
+      json: mockSessionsEnvelope({ sessions: [sessionResponse()], workspace_ordering: ["/tmp/repo::feature/demo"] }),
     });
   });
   for (const path of ["settings", "themes", "agents", "profiles", "groups", "devices", "docker/status", "about"]) {

@@ -7,6 +7,7 @@
 // assertions exercise the same fetch-and-reapply path the real backend feeds.
 
 import { test, expect } from "./helpers/mockedTest";
+import { mockSessionsEnvelope } from "./helpers/sessionMocks";
 import type { Page } from "@playwright/test";
 
 interface ResolvedThemePayload {
@@ -52,7 +53,7 @@ async function installOnboardingMocks(page: Page): Promise<OnboardingMockHandle>
 
   await page.route(
     (url) => url.pathname === "/api/sessions",
-    (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }),
+    (r) => r.fulfill({ json: mockSessionsEnvelope({ sessions: [], workspace_ordering: [] }) }),
   );
   await page.route(
     (url) => url.pathname === "/api/about",
