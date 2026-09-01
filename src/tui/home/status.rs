@@ -220,10 +220,10 @@ impl HomeView {
     ///
     /// Archived and trashed rows are also excluded. `/api/sessions` returns
     /// them unfiltered, and the `is_archived()` short-circuit that keeps the
-    /// tmux producer off a sunk row lives in `update_status_with_metadata_inner`
-    /// (`instance.rs`), which this daemon path never reaches; without this a
-    /// sunk row would be restamped and re-marked unread. See #3201 / #1868 /
-    /// #2206.
+    /// tmux producer off a sunk row lives in
+    /// `session::instance::status_update::update_status_with_metadata_inner`,
+    /// which this daemon path never reaches; without this a sunk row would be
+    /// restamped and re-marked unread. See #3201 / #1868 / #2206.
     ///
     /// The cost of that exclusion: a sunk structured row that is already in
     /// `Status::Error` now has no producer able to clear it. The daemon is
