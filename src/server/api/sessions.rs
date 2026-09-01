@@ -10349,14 +10349,12 @@ mod tests {
     /// `purge_session_artifacts` refuses on its first line. The teardown that
     /// follows is what a delete must not start under an in-flight submission;
     /// these tests only need to observe that it waits for one.
-    #[cfg(feature = "serve")]
     fn delete_race_state(id: &str) -> std::sync::Arc<crate::server::AppState> {
         delete_race_state_for(&[id])
     }
 
     /// [`delete_race_state`] for a workspace: every id shares the shape, so a
     /// sibling teardown can be observed the same way the owner's is.
-    #[cfg(feature = "serve")]
     fn delete_race_state_for(ids: &[&str]) -> std::sync::Arc<crate::server::AppState> {
         let instances = ids
             .iter()
@@ -10380,7 +10378,6 @@ mod tests {
     /// Each permanent-delete path is checked the same way: hold the session's
     /// submission guard (standing in for that drain) and assert the delete
     /// parks before any teardown, then completes once the guard drops.
-    #[cfg(feature = "serve")]
     #[tokio::test]
     async fn permanent_deletion_waits_for_an_in_flight_submission() {
         use std::time::Duration;
@@ -10500,7 +10497,6 @@ mod tests {
     /// config, which reads the user's global config, before it reaches the
     /// guard, so the race above cannot cover it without reading user state.
     /// The lock order is asserted in the source instead.
-    #[cfg(feature = "serve")]
     #[test]
     fn the_retention_purge_takes_submission_before_the_instance_lock() {
         let source = std::fs::read_to_string(
@@ -10531,7 +10527,6 @@ mod tests {
     /// Before #3639 the drain held `instance_lock` across delivery and these
     /// four handlers were excluded by it. They take the submission guard now
     /// for the same reason `attach_project` and the tied renames do.
-    #[cfg(feature = "serve")]
     #[tokio::test]
     async fn worker_stopping_handlers_wait_for_an_in_flight_submission() {
         use std::time::Duration;
@@ -10600,7 +10595,6 @@ mod tests {
     /// id it is handed and nothing prunes it, so every externally reachable
     /// mutation that claims it must prove the session exists first. Otherwise
     /// an authenticated client grows daemon memory with random ids.
-    #[cfg(feature = "serve")]
     #[tokio::test]
     async fn session_mutations_allocate_no_prompt_lock_for_an_unknown_id() {
         let state = crate::server::test_support::build_test_app_state(Vec::new());

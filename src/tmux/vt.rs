@@ -2015,7 +2015,6 @@ impl Osc52Channel {
     /// Arm a read-only observer. `pipe-pane` is exclusive, so this uses the
     /// same cross-process owner lease as a VT grid and only runs when the grid
     /// transport is disabled for the displayed terminal pane.
-    #[cfg(feature = "serve")]
     pub(crate) fn acquire(name: &str) -> Option<Arc<Self>> {
         let deadline = crate::tmux::TmuxCommandDeadline::new();
         Self::acquire_with_deadline(name, &deadline)
@@ -2166,7 +2165,6 @@ impl Osc52Channel {
 
     /// Keep the exclusive pipe owner lease alive while the terminal snapshot
     /// worker still observes this pane.
-    #[cfg(feature = "serve")]
     pub(crate) fn refresh_owner_heartbeat(&self) {
         let deadline = crate::tmux::TmuxCommandDeadline::new();
         self.refresh_owner_heartbeat_with_deadline(&deadline);

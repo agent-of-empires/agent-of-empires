@@ -193,7 +193,6 @@ pub struct SessionService {
     persist_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Per-session prompt-submission locks. See
     /// [`SessionService::prompt_submission`].
-    #[cfg(feature = "serve")]
     prompt_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
@@ -1372,7 +1371,6 @@ impl SessionService {
     /// `send_turn`'s resume trigger, which answers `AlreadyResuming` or
     /// `AlreadyRunning` for a worker that is already there, so it costs a
     /// lookup rather than a wrong disposition.
-    #[cfg(feature = "serve")]
     pub(crate) async fn prompt_submission(&self, id: &str) -> tokio::sync::OwnedMutexGuard<()> {
         let lock = {
             let guard = self.prompt_locks.read().await;
@@ -1403,7 +1401,6 @@ impl SessionService {
     /// teardown and removes the session row before dropping its lock, so both
     /// a waiter parked on that lock and one that vivified a fresh entry after
     /// `forget_prompt_lock` observe the removal and decline.
-    #[cfg(feature = "serve")]
     pub(crate) async fn prompt_submission_for_session(
         &self,
         id: &str,
@@ -1424,7 +1421,6 @@ impl SessionService {
     /// disposition under it, so every turn-starting surface decides and
     /// dispatches as one step instead of dispatching unconditionally after
     /// the wait (#3649). `None` for a session that no longer exists.
-    #[cfg(feature = "serve")]
     pub(crate) async fn begin_prompt_submission(
         &self,
         id: &str,
@@ -1442,7 +1438,6 @@ impl SessionService {
         Some((guard, dispatch))
     }
 
-    #[cfg(feature = "serve")]
     async fn session_exists(&self, id: &str) -> bool {
         self.instances.read().await.iter().any(|i| i.id == id)
     }
@@ -1451,7 +1446,6 @@ impl SessionService {
     /// removal the same delete paths already do. The registry is keyed by
     /// session id and nothing prunes it otherwise, so without this a long-lived
     /// daemon retains one entry per session it has ever seen.
-    #[cfg(feature = "serve")]
     pub(crate) async fn forget_prompt_lock(&self, id: &str) {
         self.prompt_locks.write().await.remove(id);
     }
@@ -1459,7 +1453,7 @@ impl SessionService {
     /// Registry size for a test asserting `prompt_locks` stays bounded (e.g.
     /// does not grow for ids that were never admitted past an existence
     /// check).
-    #[cfg(all(test, feature = "serve"))]
+    #[cfg(test)]
     pub(crate) async fn prompt_locks_len(&self) -> usize {
         self.prompt_locks.read().await.len()
     }
@@ -2084,7 +2078,6 @@ mod tests {
     /// fixture `acp::wake_prompt_frees_instance_lock_and_publishes_nothing_without_a_worker`
     /// uses: it makes `wait_for_worker` park exactly as it does mid-respawn,
     /// with no process, sandbox, or agent involved.
-    #[cfg(feature = "serve")]
     #[tokio::test]
     async fn the_queue_drain_frees_instance_lock_while_it_waits_for_a_resuming_worker() {
         use crate::acp::supervisor::{ResumeKind, ResumeReservationOutcome};
@@ -2164,7 +2157,6 @@ mod tests {
     /// the new text with nothing to retry, and a clear empties the durable
     /// queue for a batch that goes out anyway. `remove_queued_prompt` was
     /// already serialized for this reason; `edit` and `clear` were not.
-    #[cfg(feature = "serve")]
     #[tokio::test]
     async fn queue_mutations_wait_for_an_in_flight_delivery() {
         use std::time::Duration;
