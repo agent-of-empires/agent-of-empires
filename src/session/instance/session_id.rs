@@ -650,6 +650,13 @@ impl Instance {
         None
     }
 
+    fn terminal_resume_explicit_target_invalid(&self) -> bool {
+        matches!(
+            &self.resume_intent,
+            ResumeIntent::Use(target) if !is_valid_session_id(target)
+        )
+    }
+
     #[cfg(feature = "serve")]
     pub(crate) fn terminal_context_resume(&self) -> TerminalContextResume {
         self.terminal_context_resume_with_runtime_source(|| {
@@ -677,11 +684,11 @@ impl Instance {
         match &self.resume_intent {
             ResumeIntent::Cleared => TerminalContextResume::ForcedFresh,
             ResumeIntent::Fork { .. } => TerminalContextResume::ForkPending,
-            ResumeIntent::Use(target) => {
-                if is_valid_session_id(target) {
-                    TerminalContextResume::Available
-                } else {
+            ResumeIntent::Use(_) => {
+                if self.terminal_resume_explicit_target_invalid() {
                     TerminalContextResume::InvalidTarget
+                } else {
+                    TerminalContextResume::Available
                 }
             }
             ResumeIntent::Default => {
@@ -718,9 +725,10 @@ impl Instance {
             // A fork is a fresh session, not an in-place resume.
             return false;
         }
-        // Read before acquisition: the `Use` intent is what marks an id the
-        // user pinned rather than one AoE minted or captured.
+        // Read before acquisition: a Use intent marks an id the user pinned
+        // rather than one AoE minted or captured.
         let explicitly_pinned = matches!(self.resume_intent, ResumeIntent::Use(_));
+        let invalid_explicit_target = self.terminal_resume_explicit_target_invalid();
         self.absorb_published_pi_session();
         let (mut session_id, is_existing) = self.acquire_session_id();
         // Which ResumeStrategy arm to emit. Pi diverges from `is_existing`
@@ -732,9 +740,9 @@ impl Instance {
             session_id.as_deref(),
             explicitly_pinned,
         );
-        // Apply the same deterministic transport constraints used by the
-        // client-context projection before emitting any resume target.
-        if self.terminal_resume_static_unavailable().is_some() {
+        // Apply the same deterministic constraints used by the client-context
+        // projection before emitting any resume target.
+        if self.terminal_resume_static_unavailable().is_some() || invalid_explicit_target {
             session_id = None;
         }
         // A transcript the pane published outranks its id: `--session <path>`
@@ -3328,6 +3336,9 @@ mod tests {
             inst.terminal_context_resume(),
             TerminalContextResume::InvalidTarget
         );
+        let mut command = "claude".to_string();
+        assert!(!inst.apply_session_flags(&mut command, "test"));
+        assert_eq!(command, "claude");
         inst.resume_intent = ResumeIntent::Cleared;
         assert_eq!(
             inst.terminal_context_resume(),
