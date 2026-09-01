@@ -2061,7 +2061,7 @@ impl Session {
         rows: u16,
         deadline: &crate::tmux::TmuxCommandDeadline,
     ) -> bool {
-        for attempt in 0..2 {
+        loop {
             let Ok(Some((observed_owner, heartbeat))) =
                 self.owner_at_result_with_deadline(SIZE_OWNER_OPT, SIZE_OWNER_HB_OPT, deadline)
             else {
@@ -2082,7 +2082,7 @@ impl Session {
 
             match self.owner_at_result_with_deadline(SIZE_OWNER_OPT, SIZE_OWNER_HB_OPT, deadline) {
                 Ok(Some((id, refreshed_heartbeat))) if id == owner_id => {
-                    if attempt == 0 && refreshed_heartbeat != heartbeat {
+                    if refreshed_heartbeat != heartbeat {
                         continue;
                     }
                     self.release_owner_pair_at_with_deadline(
@@ -2108,7 +2108,6 @@ impl Session {
             }
             return false;
         }
-        false
     }
     /// Resize a detached pane only if the inactive owner state observed here
     /// is unchanged when tmux executes resize-window. This fences a live owner
@@ -3329,6 +3328,103 @@ mod tests {
             .expect("tmux pane size");
         assert!(out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "91 31");
+        assert_eq!(
+            session.size_owner().map(|(id, _)| id),
+            Some("owner".to_string())
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resize_window_if_owner_retries_same_owner_heartbeat_until_deadline() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let guard = TmuxTestSession::new("aoe_test_owner_resize_heartbeat");
+        let out = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                guard.name(),
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "sleep 30",
+                ";",
+                "set-window-option",
+                "-t",
+                guard.name(),
+                "pane-base-index",
+                "0",
+            ])
+            .output()
+            .expect("tmux new-session");
+        assert!(out.status.success());
+        refresh_session_cache();
+        let session = Session::from_name(guard.name());
+        assert!(session.steal_size_owner("owner"));
+
+        let hook = format!(
+            "set-option -F -t {} @aoe_test_show_count '#{{e|+:#{{@aoe_test_show_count}},1}}' ; if-shell -F '#{{==:#{{e|%:#{{@aoe_test_show_count}},2}},1}}' \"set-option -F -t {} {SIZE_OWNER_HB_OPT} '#{{e|+:#{{{SIZE_OWNER_HB_OPT}}},1}}'\"",
+            guard.name(),
+            guard.name(),
+        );
+        let out = crate::tmux::tmux_command()
+            .args([
+                "set-option",
+                "-t",
+                guard.name(),
+                "@aoe_test_show_count",
+                "0",
+                ";",
+                "set-hook",
+                "-t",
+                guard.name(),
+                "after-display-message",
+                &hook,
+            ])
+            .output()
+            .expect("tmux heartbeat hook");
+        assert!(out.status.success());
+
+        let deadline = crate::tmux::TmuxCommandDeadline::with_timeout(Duration::from_millis(300));
+        let started = Instant::now();
+        assert!(!session.resize_window_if_owner_with_deadline("owner", 91, 31, &deadline));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "same-owner heartbeat retries stopped before the shared deadline: {elapsed:?}"
+        );
+        assert!(elapsed < Duration::from_millis(700));
+
+        let out = crate::tmux::tmux_command()
+            .args([
+                "set-hook",
+                "-u",
+                "-t",
+                guard.name(),
+                "after-display-message",
+                ";",
+                "show-options",
+                "-v",
+                "-t",
+                guard.name(),
+                "@aoe_test_show_count",
+            ])
+            .output()
+            .expect("tmux heartbeat hook count");
+        assert!(out.status.success());
+        let show_count: u64 = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("numeric hook count");
+        assert!(
+            show_count >= 4,
+            "expected two heartbeat races, got {show_count}"
+        );
         assert_eq!(
             session.size_owner().map(|(id, _)| id),
             Some("owner".to_string())

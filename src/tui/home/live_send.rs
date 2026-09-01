@@ -596,7 +596,6 @@ impl LiveSendWorker {
                         if !batch.is_empty() {
                             match dispatch_batch(&tmux_name, &owner_id, batch) {
                                 ResizeDispatchResult::Failed => {
-                                    session.release_size_owner(&owner_id);
                                     owned = false;
                                     thread_resize_failed.store(true, Ordering::Relaxed);
                                 }
