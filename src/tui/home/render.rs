@@ -2883,7 +2883,10 @@ impl HomeView {
                                 frame,
                                 inner,
                                 inst,
-                                CachedPreview::from_text(self.preview_cache.parsed_text.as_ref()),
+                                CachedPreview::new(
+                                    self.preview_cache.parsed_text.as_ref(),
+                                    self.preview_cache.is_pending_for(id),
+                                ),
                                 self.preview_scroll_offset,
                                 theme,
                                 self.idle_decay_window,
@@ -2977,14 +2980,14 @@ impl HomeView {
                         // every frame, and the preview capture above is already
                         // worker-driven, so a per-name `has-session` here would
                         // be the only fork left in a steady-state frame.
-                        let (terminal_running, preview_text) =
+                        let (terminal_running, cache) =
                             match terminal_mode {
                                 TerminalMode::Container => {
                                     let name = crate::tmux::ContainerTerminalSession::
                                     resolve_name_for_display(&inst.id, &inst.title);
                                     (
                                         crate::tmux::session_exists_for_display(&name),
-                                        self.container_terminal_preview_cache.parsed_text.as_ref(),
+                                        &self.container_terminal_preview_cache,
                                     )
                                 }
                                 TerminalMode::Host => {
@@ -2995,7 +2998,7 @@ impl HomeView {
                                         );
                                     (
                                         crate::tmux::session_exists_for_display(&name),
-                                        self.terminal_preview_cache.parsed_text.as_ref(),
+                                        &self.terminal_preview_cache,
                                     )
                                 }
                             };
@@ -3005,7 +3008,10 @@ impl HomeView {
                             inner,
                             inst,
                             terminal_running,
-                            CachedPreview::from_text(preview_text),
+                            CachedPreview::new(
+                                cache.parsed_text.as_ref(),
+                                cache.is_pending_for(&id),
+                            ),
                             self.preview_scroll_offset,
                             theme,
                             compact,
@@ -3073,7 +3079,10 @@ impl HomeView {
                             inner,
                             inst,
                             tool_running,
-                            CachedPreview::from_text(self.tool_preview_cache.parsed_text.as_ref()),
+                            CachedPreview::new(
+                                self.tool_preview_cache.parsed_text.as_ref(),
+                                self.tool_preview_cache.is_pending_for(&id),
+                            ),
                             self.preview_scroll_offset,
                             theme,
                             compact,
