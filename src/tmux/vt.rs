@@ -601,8 +601,10 @@ fn capture_seed_stream(target: &str, rows: u16) -> Option<Vec<u8>> {
 /// the newer output, so leaving it alone is the safe side, and the caller
 /// reseeds again on its own cadence.
 ///
-/// `since` of `None` swaps unconditionally, for callers whose current grid is
-/// stale by definition (the initial seed, and the post-resize reflow).
+/// `since` of `None` swaps unconditionally, for the initial seed alone: there
+/// is no prior grid a raced chunk could survive in. Every later swap, resize
+/// included (#3652), passes a generation, because a reflow invalidates the old
+/// grid's layout but not the output it took after the snapshot.
 fn swap_seeded_parser(
     parser: &Mutex<vt100::Parser>,
     app_cursor: &AtomicBool,
@@ -1606,6 +1608,10 @@ impl VtChannel {
     ///   deliberately does not reseed while output is flowing. A cursor-clean
     ///   divergence is caught instead by the capture worker's periodic
     ///   [`VtChannel::resync_from_pane`].
+    ///
+    /// Both reseeds are generation-guarded, so either can stand down when
+    /// output raced the capture. A resize that stands down keeps the old
+    /// geometry, which is what makes the next pass retry it.
     fn reconcile_grid(&self) {
         let mut guard = self.last_size_check.lock().unwrap();
         if guard.elapsed() < Duration::from_secs(1) {
@@ -1638,10 +1644,14 @@ impl VtChannel {
                     *g = Some(grid_gen);
                 }
             }
+            // Guarded like the healing reseed below: reflow makes the old
+            // grid's LAYOUT stale, not a chunk that reached the parser after
+            // the snapshot, and pipe-pane cannot redeliver one (#3652).
+            // `reseed` commits the size only on a swap that landed, so a raced
+            // resize is still a mismatch next pass and retries without waiting
+            // for the quiet the drift path needs.
             GridReconcile::Resize => {
-                self.cols.store(c, Ordering::Relaxed);
-                self.rows.store(r, Ordering::Relaxed);
-                self.reseed(c, r, false);
+                self.reseed(c, r, true);
             }
             GridReconcile::Reseed => {
                 tracing::debug!(
@@ -1651,7 +1661,7 @@ impl VtChannel {
                     grid_cursor = ?(gcx, gcy),
                     "vt: grid diverged from pane; reseeding",
                 );
-                self.reseed(c, r, true);
+                self.reseed(c, r, false);
             }
         }
     }
@@ -1669,26 +1679,47 @@ impl VtChannel {
     /// freshly seeded cursor is not immediately re-judged against a stale
     /// generation.
     ///
-    /// `guarded` sets the generation the swap is conditional on (see
-    /// [`swap_seeded_parser`]), sampled here so it precedes the capture's
-    /// forks. Healing reseeds pass true: their premise is that the current
-    /// grid is right except for the drift, so a chunk arriving mid-capture is
-    /// output that only the current grid holds. A resize passes false, because
-    /// tmux reflowed and the pre-resize grid is wrong whatever it received.
-    fn reseed(&self, cols: u16, rows: u16, guarded: bool) -> bool {
-        let since = guarded.then(|| self.grid_gen.load(Ordering::Relaxed));
+    /// Every reseed is generation-guarded (see [`swap_seeded_parser`]), the
+    /// generation sampled here so it precedes the capture's forks: a chunk that
+    /// reaches the live parser after the snapshot is output only the current
+    /// grid holds, resize passes included (#3652).
+    ///
+    /// `adopt_size` marks the pass adopting a NEW pane geometry: `cols`/`rows`
+    /// are committed only on a swap that landed, leaving a raced resize pending
+    /// for the next `reconcile_grid` pass.
+    fn reseed(&self, cols: u16, rows: u16, adopt_size: bool) -> bool {
+        let since = self.grid_gen.load(Ordering::Relaxed);
         let Some(stream) = capture_seed_stream(&self.target, rows) else {
             return false;
         };
+        self.swap_reseed(cols, rows, adopt_size, since, &stream)
+    }
+
+    /// The post-capture half of [`Self::reseed`]: guard, swap, commit the
+    /// geometry when this pass owns it, drop any armed drift. Split from the
+    /// capture so a test can inject reader output into the snapshot/swap window
+    /// without tmux.
+    fn swap_reseed(
+        &self,
+        cols: u16,
+        rows: u16,
+        adopt_size: bool,
+        since: u64,
+        stream: &[u8],
+    ) -> bool {
         let seeded = swap_seeded_parser(
             &self.parser,
             &self.app_cursor,
             &self.grid_gen,
-            since,
-            &stream,
+            Some(since),
+            stream,
             cols,
             rows,
         );
+        if seeded && adopt_size {
+            self.cols.store(cols, Ordering::Relaxed);
+            self.rows.store(rows, Ordering::Relaxed);
+        }
         self.clear_drift();
         seeded
     }
@@ -1702,7 +1733,7 @@ impl VtChannel {
         self.reseed(
             self.cols.load(Ordering::Relaxed),
             self.rows.load(Ordering::Relaxed),
-            true,
+            false,
         )
     }
 
@@ -2816,6 +2847,125 @@ mod tests {
         assert!(
             grid.contains("snapshot-body") && !grid.contains("post-snapshot-chunk"),
             "snapshot must replace the grid:\n{grid:?}"
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        drop(conn);
+        let _ = reader.join();
+    }
+
+    #[test]
+    fn resize_reseed_stands_down_and_stays_pending_when_output_races_it() {
+        use std::io::Write;
+
+        // #3652: the resize reseed used to swap unconditionally, dropping a
+        // chunk that reached the live parser between `capture-pane` and the
+        // swap; pipe-pane cannot redeliver it and tmux's reflow does not carry
+        // it. `swap_reseed` is the post-capture half of `reseed`, so this
+        // occupies the exact window a live pane races, with no tmux involved.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (ch, _alive) = dummy_channel("vt-resize-race", dir.path());
+        assert_eq!(
+            (
+                ch.cols.load(Ordering::Relaxed),
+                ch.rows.load(Ordering::Relaxed)
+            ),
+            (20, 4)
+        );
+
+        // Drive the real reader loop over the channel's own parser and
+        // generation, so the injected chunk lands exactly as pane output does.
+        let sock = dir.path().join("reader.sock");
+        let listener = UnixListener::bind(&sock).expect("bind");
+        let stop = Arc::new(AtomicBool::new(false));
+        let ctx = ReaderCtx {
+            parser: ch.parser.clone(),
+            stop: stop.clone(),
+            seeded: Arc::new(AtomicBool::new(true)),
+            stream: Arc::new(Mutex::new(None)),
+            app_cursor: ch.app_cursor.clone(),
+            alive: Arc::new(AtomicBool::new(false)),
+            wakeup: Arc::new(Mutex::new(None)),
+            clipboard: Arc::new(Mutex::new(None)),
+            chunk_seq: Arc::new(AtomicU64::new(0)),
+            last_chunk_ms: Arc::new(AtomicU64::new(0)),
+            prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
+            grid_gen: ch.grid_gen.clone(),
+        };
+        let reader = std::thread::spawn(move || run_reader(listener, ctx));
+        let mut conn = UnixStream::connect(&sock).expect("connect");
+
+        // tmux reports a resize to 40x10. `reseed` samples the generation
+        // before forking `capture-pane`; this is that generation and that
+        // snapshot.
+        let (new_cols, new_rows) = (40u16, 10u16);
+        let since = ch.grid_gen.load(Ordering::Relaxed);
+        let seed = assemble_seed_stream(b"snapshot-body\n", &PaneSeedState::default(), new_rows);
+
+        // The pane keeps emitting while the capture is in flight.
+        conn.write_all(b"post-snapshot-chunk").expect("write");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while ch.grid_gen.load(Ordering::Relaxed) == since {
+            assert!(Instant::now() < deadline, "reader never applied the chunk");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        assert!(
+            !ch.swap_reseed(new_cols, new_rows, true, since, &seed),
+            "a resize swap must stand down once a chunk has landed"
+        );
+        let grid = ch.parser.lock().expect("parser").screen().contents();
+        assert!(
+            grid.contains("post-snapshot-chunk"),
+            "the raced chunk must survive in the live grid:\n{grid:?}"
+        );
+        // Geometry uncommitted: the resize is still pending, and the next
+        // reconcile pass reads the same mismatch and retries it.
+        assert_eq!(
+            (
+                ch.cols.load(Ordering::Relaxed),
+                ch.rows.load(Ordering::Relaxed)
+            ),
+            (20, 4),
+            "a raced resize must not commit the new geometry"
+        );
+        assert_eq!(
+            reconcile_step(
+                (new_cols, new_rows, 0, 0),
+                (
+                    ch.cols.load(Ordering::Relaxed),
+                    ch.rows.load(Ordering::Relaxed),
+                    0,
+                    0
+                ),
+                None,
+                ch.grid_gen.load(Ordering::Relaxed),
+            ),
+            GridReconcile::Resize,
+            "the pending resize must re-trigger on the next pass"
+        );
+
+        // The retry: same snapshot, generation resampled after the chunk.
+        let quiet = ch.grid_gen.load(Ordering::Relaxed);
+        assert!(
+            ch.swap_reseed(new_cols, new_rows, true, quiet, &seed),
+            "an unraced resize swap must apply the snapshot"
+        );
+        let p = ch.parser.lock().expect("parser");
+        let grid = p.screen().contents();
+        assert_eq!(p.screen().size(), (new_rows, new_cols));
+        drop(p);
+        assert!(
+            grid.contains("snapshot-body"),
+            "the reflowed snapshot must be in the grid:\n{grid:?}"
+        );
+        assert_eq!(
+            (
+                ch.cols.load(Ordering::Relaxed),
+                ch.rows.load(Ordering::Relaxed)
+            ),
+            (new_cols, new_rows),
+            "a landed resize must commit the new geometry"
         );
 
         stop.store(true, Ordering::Relaxed);
