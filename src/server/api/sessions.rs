@@ -206,10 +206,9 @@ pub struct SessionResponse {
     pub queued_prompts: Vec<crate::acp::state::QueuedPromptEntry>,
     /// The session's captured ACP session id, present only once the
     /// structured-view worker has minted one. The web dashboard passes this
-    /// as `fork_from` on a structured fork create, so the sidebar only offers
-    /// "Fork" on a structured row that has a captured id to diverge from.
-    /// Omitted when absent (terminal sessions, or structured ones whose worker
-    /// has not minted an id yet).
+    /// as `fork_from` on a structured fork create and gates the "Fork" action
+    /// on it together with `acp_can_fork`. Omitted when absent (terminal
+    /// sessions, or structured ones whose worker has not minted an id yet).
     #[cfg(feature = "serve")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acp_session_id: Option<String>,
@@ -223,16 +222,12 @@ pub struct SessionResponse {
     #[cfg(feature = "serve")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acp_agent: Option<String>,
-    /// True when this session's agent can run a structured ACP `session/fork`:
-    /// it is ACP-capable AND declares a real fork strategy. Resume-only ACP
-    /// agents (e.g. `aoe-agent`, which advertises `loadSession` but not
-    /// `session/fork`) are ACP-capable yet not forkable, so gating the web
-    /// "Fork" action on `acp_session_id` alone would offer a dead-end button
-    /// that fails at the `session/fork` handshake. The true capability is only
-    /// advertised transiently during the handshake, so this projects the static
-    /// agent fork strategy instead, which is the set AoE treats as forkable.
-    /// Omitted (read as not-forkable) for terminal sessions and non-forkable
-    /// agents.
+    /// True when this session's agent can run a structured ACP `session/fork`,
+    /// per [`crate::session::fork::structured_fork_capable`]. Resume-only ACP
+    /// agents (e.g. `aoe-agent`) are ACP-capable yet not forkable, so the web
+    /// gates "Fork" on this AND `acp_session_id` rather than on a captured id
+    /// alone. Omitted (read as not-forkable) for terminal sessions and
+    /// non-forkable agents.
     #[cfg(feature = "serve")]
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub acp_can_fork: bool,
@@ -5240,8 +5235,9 @@ fn create_body_combines_scratch_and_worktree(body: &CreateSessionBody) -> bool {
 /// structured request (`structured == true`) forks through ACP `session/fork`
 /// against the parent's `acp_session_id`; a terminal request resumes the
 /// parent agent id with the agent's fork flag, generating a fresh child id.
-/// `Err` reports an unforkable terminal agent or missing parent id; structured
-/// forks defer that check to the live `session/fork` handshake.
+/// `Err` reports an unforkable terminal agent or missing parent id; a
+/// structured request is already rejected by the caller's
+/// `agent_is_structured_fork_capable` guard before it reaches here.
 #[cfg(feature = "serve")]
 fn resolve_create_fork_seed(
     tool: &str,

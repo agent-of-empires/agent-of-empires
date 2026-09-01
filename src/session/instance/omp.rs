@@ -292,8 +292,8 @@ impl Instance {
         })
     }
 
-    /// Load typed launch metadata without the generic env cache. A pane carrying
-    /// the regular bootstrap generation is modern; if its hidden metadata is
+    /// Load typed launch metadata directly from tmux. A pane carrying the
+    /// regular bootstrap generation is modern; if its hidden metadata is
     /// absent, capture stays disabled instead of being legacy-migrated.
     pub(super) fn omp_capture_metadata(
         &self,
