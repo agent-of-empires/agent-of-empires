@@ -16,9 +16,14 @@ pub(super) struct Screen<'a> {
     /// blank tail carries nothing and filtering it keeps window sizes
     /// meaningful.
     recent: Vec<&'a str>,
+    /// Whether a blank row sat above each [`Self::recent`] line. Blank rows are
+    /// dropped from the window, so this is the only thing left that says two
+    /// stacked characters came from different blocks rather than one word.
+    blank_before: Vec<bool>,
     osc_title: &'a str,
     joined: OnceLock<String>,
     collapsed: OnceLock<String>,
+    unstacked: OnceLock<String>,
     above_input_box: OnceLock<Option<String>>,
     prompt_box_body: OnceLock<Option<String>>,
     after_last_rule: OnceLock<String>,
@@ -124,6 +129,11 @@ pub(super) enum Region {
     /// Recent lines with runs of ASCII whitespace collapsed to one space, so a
     /// footer hint that word-wrapped mid-phrase still reads as one string.
     CollapsedRecent,
+    /// Recent lines with runs of single-character lines glued back into one
+    /// line, so a word a Textual pane stacks one character per row reads as a
+    /// word. Wider lines keep their newline, so this cannot spell a word out
+    /// of two ordinary lines that only meet at their ends.
+    UnstackedRecent,
     /// The last `n` non-empty lines.
     BottomLines(usize),
     /// The transcript line the input box's status slot sits on: the live
@@ -191,6 +201,7 @@ impl Region {
         Some(match raw {
             "whole_recent" => Region::WholeRecent,
             "collapsed_recent" => Region::CollapsedRecent,
+            "unstacked_recent" => Region::UnstackedRecent,
             "last_non_empty_above_prompt_box" => Region::AboveInputBox,
             "prompt_box_body" => Region::PromptBoxBody,
             "after_last_horizontal_rule" => Region::AfterLastRule,
@@ -204,16 +215,25 @@ impl Region {
 
 impl<'a> Screen<'a> {
     pub(super) fn new(clean_screen: &'a str, osc_title: &'a str) -> Self {
-        let non_empty: Vec<&str> = clean_screen
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .collect();
+        let mut non_empty: Vec<&str> = Vec::new();
+        let mut blank_before: Vec<bool> = Vec::new();
+        let mut after_blank = false;
+        for line in clean_screen.lines() {
+            if line.trim().is_empty() {
+                after_blank = true;
+                continue;
+            }
+            non_empty.push(line);
+            blank_before.push(std::mem::take(&mut after_blank));
+        }
         let start = non_empty.len().saturating_sub(RECENT_LINES);
         Self {
             recent: non_empty[start..].to_vec(),
+            blank_before: blank_before[start..].to_vec(),
             osc_title,
             joined: OnceLock::new(),
             collapsed: OnceLock::new(),
+            unstacked: OnceLock::new(),
             above_input_box: OnceLock::new(),
             prompt_box_body: OnceLock::new(),
             after_last_rule: OnceLock::new(),
@@ -236,6 +256,9 @@ impl<'a> Screen<'a> {
             Region::CollapsedRecent => self
                 .collapsed
                 .get_or_init(|| collapse_ascii_whitespace(self.joined())),
+            Region::UnstackedRecent => self
+                .unstacked
+                .get_or_init(|| unstack(&self.recent, &self.blank_before)),
             Region::BottomLines(n) => {
                 // Bottom-n is a suffix of the joined recent window, so it is
                 // sliced from it rather than joined again per rule.
@@ -391,6 +414,35 @@ fn line_is_update_banner(trimmed: &str) -> bool {
     (trimmed.starts_with('✔') || trimmed.starts_with('✓'))
         && lower.contains("update")
         && (lower.contains("restart") || lower.contains("installed"))
+}
+
+/// Glue each run of single-character lines into one line, leaving wider lines
+/// alone. A Textual pane too narrow for its status word stacks the word one
+/// character per row, and a run of such rows is the word; anything wider is
+/// ordinary content, so it keeps its own line and cannot be glued to the text
+/// under it.
+///
+/// A blank row ends a run for the same reason: characters either side of one
+/// came from different blocks, so they are not one word.
+fn unstack(lines: &[&str], blank_before: &[bool]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut run = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        let stacked = trimmed.chars().count() == 1;
+        if (!stacked || blank_before[i]) && !run.is_empty() {
+            out.push(std::mem::take(&mut run));
+        }
+        if stacked {
+            run.push_str(trimmed);
+        } else {
+            out.push((*line).to_string());
+        }
+    }
+    if !run.is_empty() {
+        out.push(run);
+    }
+    out.join("\n")
 }
 
 pub(super) fn collapse_ascii_whitespace(text: &str) -> String {

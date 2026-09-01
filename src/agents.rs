@@ -1580,9 +1580,9 @@ pub(crate) fn registry_lifecycle(name: &str) -> AgentLifecycle {
 /// Today only claude qualifies: `claude-agent-acp`'s `session/new` UUID is
 /// the claude SDK session id in `~/.claude/projects/*.jsonl`, exactly what
 /// `claude --resume` reads. `claude-code` is the legacy alias for the same
-/// adapter. codex-acp and the bundled `aoe-agent` do not share a
-/// CLI-resumable store, so a claude session whose adapter was swapped to one
-/// of them does not qualify.
+/// adapter. codex-acp and `aoe-agent` do not share a CLI-resumable store, so
+/// a claude session whose adapter was swapped to one of them does not
+/// qualify.
 pub fn acp_transcript_cli_resumable(tool: &str, acp_agent: &str) -> bool {
     tool == "claude" && matches!(acp_agent, "claude" | "claude-code")
 }

@@ -1203,6 +1203,106 @@ fn test_cli_session_capture_plain() {
     );
 }
 
+/// #3625: `aoe session capture` ran the agent's manifest directly, so a
+/// profile's own `[[agents.<name>.status_rules]]` never got a say and the CLI
+/// could report a different status than the dashboard for the same pane. The
+/// tool has to be manifest-backed for the regression to bite, since that is
+/// the branch that skipped the rules.
+#[test]
+#[parallel]
+fn test_cli_session_capture_honors_configured_status_rules() {
+    require_tmux!();
+
+    let mut h = TuiTestHarness::new("cli_capture_rules");
+    h.install_path_command("opencode");
+
+    let dir = h.home_path().join("fake-bin");
+    std::fs::create_dir_all(&dir).expect("create fake-bin dir");
+    let agent = dir.join("fake-rules-agent");
+    // The pane text the configured rule matches. No opencode manifest rule
+    // reads it as Waiting, so a Waiting verdict can only come from the rule.
+    std::fs::write(&agent, "#!/bin/sh\necho 'deploy to prod?'\nsleep 60\n")
+        .expect("write fake agent script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake agent script");
+    }
+
+    let config_path = crate::harness::app_dir_in(h.home_path()).join("config.toml");
+    let seeded = std::fs::read_to_string(&config_path).expect("read seeded config");
+    std::fs::write(
+        &config_path,
+        format!(
+            "{seeded}\n\n[[agents.opencode.status_rules]]\n\
+             status = \"waiting\"\ncontains = \"deploy to prod?\"\n"
+        ),
+    )
+    .expect("write status rules config");
+
+    let project = h.project_path();
+    let add_output = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "-t",
+        "CaptureRules",
+        "--tool",
+        "opencode",
+        "--cmd-override",
+        agent.to_str().unwrap(),
+    ]);
+    assert!(
+        add_output.status.success(),
+        "aoe add failed: {}",
+        String::from_utf8_lossy(&add_output.stderr)
+    );
+
+    let sessions = read_sessions_json(&h);
+    let session_id = sessions[0]["id"]
+        .as_str()
+        .expect("session should have id")
+        .to_string();
+
+    let start_output = h.run_cli(&["session", "start", &session_id]);
+    assert!(
+        start_output.status.success(),
+        "aoe session start failed: {}",
+        String::from_utf8_lossy(&start_output.stderr)
+    );
+
+    // The rule can only match once the pane has painted, so poll the CLI
+    // itself rather than sleeping on a guess.
+    let mut json = serde_json::Value::Null;
+    for _ in 0..50 {
+        let out = h.run_cli(&["session", "capture", &session_id, "--json"]);
+        if out.status.success() {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&stdout) {
+                json = parsed;
+                if json["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("deploy to prod?"))
+                {
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    assert!(
+        json["content"]
+            .as_str()
+            .is_some_and(|c| c.contains("deploy to prod?")),
+        "fake agent never painted into the pane; capture was: {json}"
+    );
+    assert_eq!(
+        json["status"], "waiting",
+        "a configured status rule must decide what `aoe session capture` reports (#3625)"
+    );
+}
+
 /// Renaming a session via CLI should rename the tmux session, not kill it.
 /// Regression test for https://github.com/agent-of-empires/agent-of-empires/issues/431
 #[test]

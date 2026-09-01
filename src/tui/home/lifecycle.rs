@@ -27,66 +27,51 @@ impl HomeView {
             for inst in &mut instances {
                 inst.source_profile = profile_name.clone();
             }
-            // Backfill / heal trashed worktrees: relocate any still sitting in
-            // the active dir (rows trashed before relocation existed) and fix a
-            // pointer a crash left stale. Best-effort and only touches trashed
-            // rows, which are typically few. See #2522.
-            for instance in &mut instances {
-                if !instance.is_trashed() {
-                    continue;
-                }
-                if let Err(error) = crate::session::trash::reconcile_trashed_transition(instance) {
-                    tracing::warn!(
-                        target: "tui.home",
-                        session = %instance.id,
-                        "trash reconciliation skipped: {error}",
-                    );
-                }
-            }
-            // Heal a managed worktree whose directory was moved outside aoe
-            // (a `git worktree move` from another shell): rewrite project_path
-            // from git so attach, status, diff, and rename all act on the live
-            // location instead of failing. Only rows whose recorded path is
-            // already gone cost anything. See #2002.
-            let mut reconcile_cache = crate::session::worktree_reconcile::ReconcileCache::default();
-            for instance in &mut instances {
-                if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist(
-                    &storage,
-                    instance,
-                    &mut reconcile_cache,
-                ) {
-                    tracing::warn!(
-                        target: "tui.home",
-                        session = %instance.id,
-                        "worktree path reconciliation skipped: {error}",
-                    );
-                }
-            }
-            // Clear expired lifecycle reservations only while holding the same
-            // per-instance flock used by live transitions.
+            // Clear expired lifecycle reservations in one write, under the same
+            // per-instance flocks live transitions take. Acquired in sorted id
+            // order, matching the only other multi-lock holder
+            // (`Storage::move_instance_between_profiles`), which sorts too, so
+            // the two cannot close a cycle.
             let ttl = crate::session::Instance::LIFECYCLE_RESERVATION_TTL;
             let now = chrono::Utc::now();
-            for instance in &mut instances {
-                if !instance.has_fresh_lifecycle_reservation(now)
-                    && instance.lifecycle_reservation.is_some()
-                {
-                    let Ok(_lifecycle_lock) = storage.acquire_instance_lifecycle_lock(&instance.id)
-                    else {
-                        continue;
-                    };
-                    let target_id = instance.id.clone();
-                    if storage
-                        .update(|disk, _groups| {
+            let mut expired: Vec<String> = instances
+                .iter()
+                .filter(|instance| {
+                    instance.lifecycle_reservation.is_some()
+                        && !instance.has_fresh_lifecycle_reservation(now)
+                })
+                .map(|instance| instance.id.clone())
+                .collect();
+            if !expired.is_empty() {
+                expired.sort();
+                let mut locks = Vec::with_capacity(expired.len());
+                expired.retain(|id| match storage.acquire_instance_lifecycle_lock(id) {
+                    Ok(lock) => {
+                        locks.push(lock);
+                        true
+                    }
+                    Err(_) => false,
+                });
+                // `retain` can empty this when every lock failed; writing then
+                // would rewrite sessions.json and notify subscribers for no
+                // change at all.
+                if !expired.is_empty() {
+                    let cleared = storage.update(|disk, _groups| {
+                        for id in &expired {
                             if let Some(stored) =
-                                disk.iter_mut().find(|candidate| candidate.id == target_id)
+                                disk.iter_mut().find(|candidate| &candidate.id == id)
                             {
                                 stored.clear_expired_lifecycle_reservation(ttl, now);
                             }
-                            Ok(())
-                        })
-                        .is_ok()
-                    {
-                        instance.clear_expired_lifecycle_reservation(ttl, now);
+                        }
+                        Ok(())
+                    });
+                    if cleared.is_ok() {
+                        for instance in &mut instances {
+                            if expired.contains(&instance.id) {
+                                instance.clear_expired_lifecycle_reservation(ttl, now);
+                            }
+                        }
                     }
                 }
             }
@@ -345,6 +330,10 @@ impl HomeView {
             deletion_poller: DeletionPoller::new(),
             stop_poller: StopPoller::new(),
             trash_poller: crate::tui::trash_poller::TrashPoller::new(),
+            reconcile_poller: crate::tui::reconcile_poller::ReconcilePoller::new(),
+            startup_recovery_gate: None,
+            pending_reconcile_reload: false,
+            reconcile_reload_retry_at: None,
             restart_poller: RestartPoller::new(),
             restart_in_flight: std::collections::HashSet::new(),
             attach_project_poller: crate::tui::attach_project_poller::AttachProjectPoller::new(),
@@ -523,15 +512,6 @@ impl HomeView {
             inst.repair_session_id_poller_if_needed(&live);
         }
 
-        // Startup auto-recovery: kick off a worker pool to restart any
-        // resume-capable sessions whose tmux pane is missing. The TUI defers
-        // to the daemon when one is running (the daemon owns recovery in
-        // that case); when the TUI is standalone, it acquires the
-        // cross-process recovery lock to keep a late-starting daemon from
-        // duplicating cascades. See `crate::session::recovery` for the full
-        // exclusion rationale.
-        view.maybe_start_startup_recovery();
-
         view.refresh_registered_projects();
         view.flat_items = view.build_flat_items();
         view.update_selected();
@@ -544,6 +524,22 @@ impl HomeView {
         let mut initial_disk_profiles: Vec<String> = view.storages.keys().cloned().collect();
         initial_disk_profiles.sort();
         view.rewire_disk_subscriptions(&initial_disk_profiles);
+        // Trashed-worktree relocation (#2522) and the repair of a worktree
+        // moved outside aoe (#2002) are healing work, not render input, and
+        // cost a git spawn and a storage write per broken row. They sweep the
+        // loaded profiles on a worker so they never delay the first frame
+        // (#3611).
+        view.reconcile_poller.request(initial_disk_profiles.clone());
+        // Startup auto-recovery restarts resume-capable sessions whose tmux
+        // pane is missing, launching each from its recorded `project_path` and
+        // recording the attempt in a boot-scoped ledger that is not retried.
+        // It therefore has to wait for the sweep above: a row whose worktree
+        // moved outside aoe (#2002) still carries the stale path until the
+        // sweep repoints it, and recovering from the stale path would burn
+        // that row's only attempt for the whole boot.
+        // `release_startup_recovery_gate` starts it once the sweep lands, or on
+        // a deadline if it never does.
+        view.startup_recovery_gate = Some(std::time::Instant::now());
         // Config subscriptions are intentionally asymmetric: even in
         // single-profile mode, peer edits to ANY profile's config.toml
         // (or the global config) must be observable so the picker UI

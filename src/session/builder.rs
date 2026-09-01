@@ -1045,8 +1045,8 @@ pub mod structured {
     /// inherits a registry-backed base through `[session.agent_detect_as]`
     /// (e.g. a Claude wrapper that only overrides profile/oauth locations).
     /// Mirrors the server create path's capability re-validation; deliberately
-    /// NOT the aoe-agent fallback (`pick_acp_agent_name`), which would make
-    /// every tool look capable.
+    /// NOT the configured-default fallback (`pick_acp_agent_name`), which
+    /// would make every tool look capable.
     pub fn tool_acp_capable(tool: &str, config: &crate::session::Config) -> bool {
         crate::acp::agent_registry::AgentRegistry::with_defaults()
             .get(tool)

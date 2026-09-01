@@ -1857,6 +1857,11 @@ impl App {
                 needs_full_refresh = true;
             }
 
+            if self.home.apply_reconcile_results() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
             if last_session_idle_reap.elapsed() >= SESSION_IDLE_REAP_INTERVAL {
                 last_session_idle_reap = std::time::Instant::now();
                 if self.reap_idle_sessions() {

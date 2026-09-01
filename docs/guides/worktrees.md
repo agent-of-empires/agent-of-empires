@@ -106,7 +106,7 @@ The new directory and branch persist across reload and restart. See #1723 and #1
 
 ### When the Directory Moves Outside aoe
 
-aoe records a worktree session's directory at creation, so relocating it from another shell leaves that record stale. aoe repairs it from `git worktree list`, matching on the session's branch: at TUI startup, at `aoe serve` startup, and on each CLI workdir edit. If exactly one live worktree checks out the branch, the recorded path is rewritten to it and the session keeps working. If two do, aoe leaves the path alone rather than guessing which checkout is yours.
+aoe records a worktree session's directory at creation, so relocating it from another shell leaves that record stale. aoe repairs it from `git worktree list`, matching on the session's branch: shortly after TUI startup, on a background sweep, at `aoe serve` startup, and on each CLI workdir edit. The TUI paints before that sweep lands, so a session whose directory moved can briefly show its old path. If exactly one live worktree checks out the branch, the recorded path is rewritten to it and the session keeps working. If two do, aoe leaves the path alone rather than guessing which checkout is yours.
 
 Two caveats:
 

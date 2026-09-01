@@ -164,6 +164,11 @@ Trust does activate the repo's own `.claude/settings.json`, whose
 what holds a session before startup, a pre-trusted workspace runs that file's
 hooks unprompted.
 
+AoE seeds the config it stages for the container. A custom agent whose wrapper
+points the CLI at another directory (one CLI, two accounts) reads a config AoE
+does not stage, so name that directory in `session.agent_config_dir` and mount
+its `sandbox` subdirectory into the container; AoE warns when nothing does.
+
 To pre-trust worktrees for host sessions too, see `session.pre_trust_agent_folders`
 in the [configuration guide](configuration.md).
 

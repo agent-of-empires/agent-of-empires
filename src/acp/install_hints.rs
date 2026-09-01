@@ -4,7 +4,7 @@
 //! the ACP handshake failure path so the user sees the correct command
 //! for whichever agent they tried to spawn.
 
-/// Friendly binary token for aoe's bundled multi-provider agent. Shared by the
+/// Friendly binary token for aoe's own multi-provider agent. Shared by the
 /// registry's spawn registration and [`env_allowlist_for`] so the two cannot
 /// drift onto different spellings (which would silently drop the agent's
 /// provider keys). Distinct from `AgentSpec.command`, whose value for this
@@ -66,7 +66,7 @@ pub fn npm_package_for(binary: &str) -> Option<&'static str> {
 /// [`AOE_AGENT_BINARY`]), NOT `AgentSpec.command`. `command` for `aoe-agent`
 /// carries a `${aoe_data_dir}/...` placeholder that is substituted at
 /// spawn time (`supervisor.rs`), so keying on it here would silently
-/// miss the bundled agent.
+/// miss that agent.
 pub fn env_allowlist_for(binary: &str) -> &'static [&'static str] {
     match binary {
         // Existing Claude adapter contract, previously supplied through
