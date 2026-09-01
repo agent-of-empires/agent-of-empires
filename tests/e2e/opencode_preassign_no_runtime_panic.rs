@@ -18,6 +18,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use serial_test::parallel;
 
@@ -46,6 +47,7 @@ fn install_fake_opencode(h: &mut TuiTestHarness) -> PathBuf {
     }
     log
 }
+
 fn enable_preassign(h: &TuiTestHarness) {
     let config_path = crate::harness::app_dir_in(h.home_path()).join("config.toml");
     let mut file = fs::OpenOptions::new()
@@ -55,6 +57,7 @@ fn enable_preassign(h: &TuiTestHarness) {
     file.write_all(b"\n[session]\nopencode_preassign_session_id = true\n")
         .expect("enable OpenCode preassignment");
 }
+
 struct StopSessionOnDrop<'a> {
     h: &'a TuiTestHarness,
 }
@@ -107,12 +110,38 @@ fn opencode_opt_in_preassign_does_not_panic_nested_runtime() {
         "aoe session start failed:\n{stderr}"
     );
 
-    // Prove the preassign path actually ran; otherwise "no panic" would be
-    // vacuously true. The fake opencode logs every invocation, and preassign
-    // spawns `opencode serve` right before the `block_on` that used to panic.
-    let invocations = fs::read_to_string(&log_path).unwrap_or_default();
+    // Prove both sides of the timeout contract: preassignment ran, then the
+    // real launch started fresh without a guessed native ID.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let invocations = loop {
+        let invocations = fs::read_to_string(&log_path).unwrap_or_default();
+        let saw_serve = invocations
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some("serve"));
+        let saw_launch = invocations
+            .lines()
+            .any(|line| line.split_whitespace().next() != Some("serve"));
+        if saw_serve && saw_launch {
+            break invocations;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected preassign and normal OpenCode invocations; fake log:\n{invocations}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
     assert!(
-        invocations.lines().any(|line| line.contains("serve")),
+        invocations
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some("serve")),
         "preassign never spawned `opencode serve`; fake log:\n{invocations}"
+    );
+    let launch = invocations
+        .lines()
+        .find(|line| line.split_whitespace().next() != Some("serve"))
+        .expect("normal OpenCode launch was not recorded");
+    assert!(
+        !launch.split_whitespace().any(|arg| arg == "--session"),
+        "preassignment timeout must start fresh; fake launch argv: {launch:?}"
     );
 }
