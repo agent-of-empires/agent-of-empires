@@ -173,7 +173,7 @@ mod tests {
             ("sandbox", "extra_volumes", RepoPolicy::Deny),
             ("sandbox", "container_runtime", RepoPolicy::Unspecified),
             ("sandbox", "selinux_relabel", RepoPolicy::Deny),
-            ("session", "default_tool", RepoPolicy::Allow),
+            ("session", "default_tool", RepoPolicy::Deny),
             ("sandbox", "memory_limit", RepoPolicy::Unspecified),
         ] {
             let d = descriptor(section, field).unwrap_or_else(|| panic!("{section}.{field}"));

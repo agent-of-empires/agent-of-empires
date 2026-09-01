@@ -905,14 +905,17 @@ pub struct AppStateConfig {
 #[setting_section(name = "session", category = "Session")]
 pub struct SessionConfig {
     /// Default coding tool for new sessions. If not set or the tool is
-    /// unavailable, falls back to the first available tool. Only names a tool
-    /// the user configured (built-in or from their own `custom_agents`).
+    /// unavailable, falls back to the first available tool. Repo-denied: the
+    /// launch path exact-matches the user's `custom_agents` before built-ins,
+    /// so a repo could name a user-defined host command, and validating
+    /// against built-in names would not help because custom agents may
+    /// shadow them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[setting(
         label = "Default Tool",
         widget = "custom:default-tool",
         category = "Agents",
-        repo = "allow"
+        repo = "deny"
     )]
     pub default_tool: Option<String>,
 

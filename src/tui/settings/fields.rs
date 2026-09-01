@@ -1244,6 +1244,7 @@ mod tests {
             "session.agent_command_override",
             "session.agent_extra_args",
             "session.agent_acp_cmd",
+            "session.default_tool",
             "session.agent_config_dir",
         ] {
             assert!(
@@ -1255,12 +1256,11 @@ mod tests {
                 "{denied} must still be editable in Global scope"
             );
         }
-        for allowed in ["session.default_tool", "session.agent_detect_as"] {
-            assert!(
-                ident_present(&repo_rows, allowed),
-                "{allowed} stays repo-overridable"
-            );
-        }
+        let allowed = "session.agent_detect_as";
+        assert!(
+            ident_present(&repo_rows, allowed),
+            "{allowed} stays repo-overridable"
+        );
     }
 
     /// #3229: no field under Repo scope for a category whose section is not

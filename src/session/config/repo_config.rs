@@ -79,6 +79,10 @@ const REPO_OVERRIDABLE_SECTIONS: &[&str] = &["hooks", "session", "sandbox", "wor
 /// default means a field added to `SessionConfig` later stays repo-denied
 /// until someone marks it `repo = "allow"`.
 ///
+/// Even `default_tool` is denied despite only naming a tool: the launch path
+/// exact-matches the user's `custom_agents` before built-ins, so a repo could
+/// select a user-defined host command (see the field's doc comment).
+///
 /// Every other overridable section is a genuine team-shared surface, so its
 /// fields default to allowed and dangerous ones opt out with `repo = "deny"`
 /// on the field (e.g. the sandbox image and mount fields).
@@ -1688,7 +1692,7 @@ pub const INIT_TEMPLATE: &str = r#"# Agent of Empires - Repository Configuration
 # on_destroy = ["docker-compose down"]
 
 # [session]
-# default_tool = "claude"
+# agent_detect_as = { my-agent = "claude" }
 
 # [sandbox]
 # enabled_by_default = true
@@ -2035,9 +2039,36 @@ mod tests {
             merged.session.custom_agents.is_empty(),
             "repo-declared custom_agents must be dropped on merge"
         );
-        // `default_tool` stays repo-overridable (the documented use case); it
-        // can only name a tool the user configured, never a command.
-        assert_eq!(merged.session.default_tool.as_deref(), Some("repo-agent"));
+        assert_eq!(
+            merged.session.default_tool, None,
+            "repo-declared default_tool must be dropped on merge"
+        );
+    }
+
+    #[test]
+    fn test_repo_config_cannot_select_a_user_custom_agent() {
+        // The launch path exact-matches the user's `custom_agents` before
+        // built-ins when resolving `default_tool` (cli/add.rs), so a repo
+        // pointing it at a user-defined custom agent would launch that host
+        // command. Validating the value against built-in names would not
+        // close the hole because a custom agent may shadow a built-in name,
+        // so the field is repo-denied outright.
+        let mut global = Config::default();
+        global
+            .session
+            .custom_agents
+            .insert("deploy-helper".to_string(), "do-deploy --prod".to_string());
+        let repo: RepoConfig =
+            toml::from_str("[session]\ndefault_tool = \"deploy-helper\"\n").unwrap();
+        let merged = merge_repo_config(global, &repo);
+        assert_eq!(
+            merged.session.default_tool, None,
+            "repo must not select the user's custom agent"
+        );
+        assert!(
+            merged.session.custom_agents.contains_key("deploy-helper"),
+            "the user's own custom_agents are untouched"
+        );
     }
 
     #[test]
@@ -2071,8 +2102,8 @@ mod tests {
         assert!(merged.session.smart_rename_agent.is_empty());
         assert!(merged.session.smart_rename_model.is_empty());
         assert!(!merged.session.yolo_mode_default);
-        // The two allowed fields still come through.
-        assert_eq!(merged.session.default_tool.as_deref(), Some("codex"));
+        assert_eq!(merged.session.default_tool, None);
+        // The one allowed field still comes through.
         assert_eq!(
             merged.session.agent_detect_as.get("x").map(String::as_str),
             Some("claude")
@@ -2087,6 +2118,7 @@ mod tests {
                 "session.agent_config_dir",
                 "session.agent_extra_args",
                 "session.custom_agents",
+                "session.default_tool",
                 "session.smart_rename_agent",
                 "session.smart_rename_model",
                 "session.yolo_mode_default",
@@ -2104,7 +2136,7 @@ mod tests {
         fs::create_dir_all(&config_dir).unwrap();
         fs::write(
             config_dir.join("config.toml"),
-            "[session]\ncustom_agents = 7\ndefault_tool = \"codex\"\n",
+            "[session]\ncustom_agents = 7\nagent_detect_as = { my-agent = \"claude\" }\n",
         )
         .unwrap();
 
@@ -2112,7 +2144,14 @@ mod tests {
             .expect("a wrongly-typed denied field must not fail the load")
             .expect("config exists");
         let merged = merge_repo_config(Config::default(), &loaded);
-        assert_eq!(merged.session.default_tool.as_deref(), Some("codex"));
+        assert_eq!(
+            merged
+                .session
+                .agent_detect_as
+                .get("my-agent")
+                .map(String::as_str),
+            Some("claude")
+        );
         assert!(merged.session.custom_agents.is_empty());
     }
 
@@ -2124,7 +2163,11 @@ mod tests {
         let profile = ProfileConfig {
             description: None,
             overrides: serde_json::from_value(serde_json::json!({
-                "session": { "custom_agents": { "x": "sh -c pwned" }, "default_tool": "codex" },
+                "session": {
+                    "custom_agents": { "x": "sh -c pwned" },
+                    "default_tool": "codex",
+                    "agent_detect_as": { "my-agent": "claude" },
+                },
                 "acp": { "auto_approve": true },
             }))
             .unwrap(),
@@ -2135,14 +2178,15 @@ mod tests {
         save_repo_config(dir.path(), &repo).unwrap();
         let written = fs::read_to_string(dir.path().join(REPO_CONFIG_PATH)).unwrap();
         assert!(!written.contains("custom_agents"), "written: {written}");
-        assert!(written.contains("default_tool"), "written: {written}");
+        assert!(!written.contains("default_tool"), "written: {written}");
+        assert!(written.contains("agent_detect_as"), "written: {written}");
     }
 
     #[test]
     fn test_repo_may_override_field() {
         // (section, field, expected): field-declared repo policy and section defaults.
         let cases = [
-            ("session", "default_tool", true),
+            ("session", "default_tool", false),
             ("session", "agent_detect_as", true),
             ("sandbox", "memory_limit", true),
             ("worktree", "path_template", true),
@@ -2473,11 +2517,19 @@ mod tests {
     #[test]
     fn test_merge_repo_config_session() {
         let config = Config::default();
-        let repo: RepoConfig =
-            serde_json::from_value(serde_json::json!({"session": {"default_tool": "opencode"}}))
-                .unwrap();
+        let repo: RepoConfig = serde_json::from_value(
+            serde_json::json!({"session": {"agent_detect_as": {"my-agent": "claude"}}}),
+        )
+        .unwrap();
         let merged = merge_repo_config(config, &repo);
-        assert_eq!(merged.session.default_tool, Some("opencode".to_string()));
+        assert_eq!(
+            merged
+                .session
+                .agent_detect_as
+                .get("my-agent")
+                .map(String::as_str),
+            Some("claude")
+        );
     }
 
     #[test]
