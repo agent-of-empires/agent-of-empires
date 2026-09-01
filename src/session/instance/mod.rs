@@ -96,6 +96,7 @@ enum ResumeStaticUnavailable {
 pub(crate) enum TerminalContextResume {
     Available,
     RuntimeCheckRequired,
+    NoTarget,
     AgentUnsupported,
     SandboxUnsupported,
     ForcedFresh,

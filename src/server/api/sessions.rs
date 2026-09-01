@@ -801,6 +801,9 @@ fn context_resume_for(inst: &Instance) -> ContextResumeAvailability {
         TerminalContextResume::RuntimeCheckRequired => ContextResumeAvailability::Indeterminate {
             reason: ContextResumeIndeterminateReason::RuntimeCheckRequired,
         },
+        TerminalContextResume::NoTarget => ContextResumeAvailability::Unavailable {
+            reason: ContextResumeUnavailableReason::NoTarget,
+        },
         TerminalContextResume::AgentUnsupported => ContextResumeAvailability::Unavailable {
             reason: ContextResumeUnavailableReason::AgentUnsupported,
         },

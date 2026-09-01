@@ -652,6 +652,18 @@ impl Instance {
 
     #[cfg(feature = "serve")]
     pub(crate) fn terminal_context_resume(&self) -> TerminalContextResume {
+        self.terminal_context_resume_with_runtime_source(|| {
+            self.tmux_session()
+                .map(|session| crate::tmux::probe_session_existence(session.name()))
+                .unwrap_or(crate::tmux::SessionExistence::Unknown)
+        })
+    }
+
+    #[cfg(feature = "serve")]
+    fn terminal_context_resume_with_runtime_source(
+        &self,
+        runtime_source: impl FnOnce() -> crate::tmux::SessionExistence,
+    ) -> TerminalContextResume {
         if let Some(unavailable) = self.terminal_resume_static_unavailable() {
             return match unavailable {
                 ResumeStaticUnavailable::AgentUnsupported => {
@@ -677,8 +689,12 @@ impl Instance {
                     && self.agent_session_id == self.resume_probe_failed_sid
                 {
                     TerminalContextResume::PreviousFailure
-                } else {
+                } else if self.agent_session_id.is_some()
+                    || !matches!(runtime_source(), crate::tmux::SessionExistence::Absent)
+                {
                     TerminalContextResume::RuntimeCheckRequired
+                } else {
+                    TerminalContextResume::NoTarget
                 }
             }
         }
@@ -3270,7 +3286,21 @@ mod tests {
         let mut inst = Instance::new("context", "/tmp/context");
         inst.tool = "claude".to_string();
         assert_eq!(
-            inst.terminal_context_resume(),
+            inst.terminal_context_resume_with_runtime_source(|| {
+                crate::tmux::SessionExistence::Absent
+            }),
+            TerminalContextResume::NoTarget
+        );
+        assert_eq!(
+            inst.terminal_context_resume_with_runtime_source(|| {
+                crate::tmux::SessionExistence::Present
+            }),
+            TerminalContextResume::RuntimeCheckRequired
+        );
+        assert_eq!(
+            inst.terminal_context_resume_with_runtime_source(|| {
+                crate::tmux::SessionExistence::Unknown
+            }),
             TerminalContextResume::RuntimeCheckRequired
         );
         inst.agent_session_id = Some(sid.clone());
