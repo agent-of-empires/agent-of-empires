@@ -4368,6 +4368,14 @@ Final prose line.\n";
                 "ascii clock-only first segment",
                 "  esc Working...\n\n>\n t: 5m > RCA Slow Turn",
             ),
+            (
+                "decorated nerd clock-only first segment",
+                "  󱊷 Working…\n\n❯\n  5m  RCA Slow Turn",
+            ),
+            (
+                "decorated unicode clock-only first segment",
+                "  ⎋ Working…\n❯\n╭── ⏱ 5m ─╮\n╰─",
+            ),
         ];
         for (name, pane) in cases {
             assert_eq!(detect_omp_status(pane), Status::Idle, "case: {name}");

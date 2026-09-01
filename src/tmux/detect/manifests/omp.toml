@@ -56,7 +56,7 @@ all = [
   ] },
 ]
 not = [
-  { line_regex = ['^\s*(?:⏱|\x{f017}|◷|◴|⌛)\s+'] },
+  { line_regex = ['^\s*(?:(?:╭[─-]*|\+[=-]*)\s*)?(?:\x{e0b6}\s+)?(?:⏱|\x{f017}|◷|◴|⌛)\s+'] },
 ]
 
 # Presets without the pi segment expose only the built-in interrupt row.
