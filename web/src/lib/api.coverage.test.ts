@@ -124,9 +124,62 @@ describe("fetchSessions", () => {
     expect(url).toBe("/api/sessions");
     expect(init?.headers).toEqual({ "X-Aoe-Client-Capabilities": "acp_ws_v1,terminal_ws_v1" });
   });
+  it.each([
+    {
+      name: "runtime-gated resume with terminal attach",
+      interaction: {
+        context_resume: { state: "indeterminate", reason: "runtime_check_required" },
+        attach: { state: "available", transport: "terminal_websocket_v1" },
+      },
+    },
+    {
+      name: "handshake-gated resume without an attach transport",
+      interaction: {
+        context_resume: { state: "indeterminate", reason: "agent_handshake_required" },
+        attach: { state: "unavailable", reason: "client_missing_transport" },
+      },
+    },
+    {
+      name: "unavailable resume with ACP attach",
+      interaction: {
+        context_resume: { state: "unavailable", reason: "no_target" },
+        attach: available.attach,
+      },
+    },
+  ])("accepts $name", async ({ interaction }) => {
+    const env = {
+      sessions: [{ id: "s1" }],
+      workspace_ordering: ["s1"],
+      session_interactions: { s1: interaction },
+    };
+    fetchSpy.mockResolvedValueOnce(jsonResponse(env));
+    expect(await fetchSessions()).toEqual(env);
+  });
 
   it.each([
     { sessions: [{ id: "s1" }], workspace_ordering: [], session_interactions: {} },
+    {
+      sessions: [{ id: "s1" }],
+      workspace_ordering: [],
+      session_interactions: { s1: { context_resume: null, attach: available.attach } },
+    },
+    {
+      sessions: [{ id: "s1" }],
+      workspace_ordering: [],
+      session_interactions: {
+        s1: { context_resume: { state: "new_state" }, attach: available.attach },
+      },
+    },
+    {
+      sessions: [{ id: "s1" }],
+      workspace_ordering: [],
+      session_interactions: { s1: { context_resume: available.context_resume, attach: null } },
+    },
+    {
+      sessions: [{ id: "s1" }, { id: "s1" }],
+      workspace_ordering: [],
+      session_interactions: { s1: available },
+    },
     {
       sessions: [{ id: "s1" }],
       workspace_ordering: [],

@@ -85,6 +85,13 @@
       "specs": ["tests/live/session-create-duplicate-worktree.spec.ts"]
     },
     {
+      "id": "session.client-interaction-contract",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/lib/api.coverage.test.ts"],
+      "components": ["web/src/lib/api.ts"]
+    },
+    {
       "id": "terminal.mobile-backspace-autorepeat",
       "kind": "mocked-playwright",
       "risk": "medium",
