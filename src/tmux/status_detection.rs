@@ -3637,9 +3637,8 @@ Final prose line.\n";
                 "stale loader ignored",
                 format!("⠋ Working… ⟦esc⟧\nCompleted response.\nAdditional output.\nOK\n{MINIMAL_COMPOSER_BOX}"),
             ),
-            // Live loader pushed one line past the 3-line footer window:
-            // the miss reads Idle, the same bounded flapping other agents
-            // accept between polls.
+            // A live loader pushed one line past the footer window becomes an
+            // unwitnessed Idle candidate, so the poller waits for confirmation.
             (
                 "loader pushed past footer",
                 format!("⠋ Working… ⟦esc⟧\nOK\n{MINIMAL_COMPOSER_BOX}"),
@@ -3650,6 +3649,11 @@ Final prose line.\n";
         for (name, pane) in &cases {
             assert_eq!(detect_omp_status(pane), Status::Idle, "case: {name}");
         }
+
+        let detection = crate::tmux::detect::detect("omp", MINIMAL_COMPOSER_BOX, "", None)
+            .expect("omp manifest");
+        assert_eq!(detection.status, Some(Status::Idle));
+        assert!(!detection.visible);
     }
 
     #[test]
@@ -4349,6 +4353,14 @@ Final prose line.\n";
                 "⎋ Working…\nThe probe took 1s > historical timing\n╰─",
             ),
             (
+                "stale interrupt rows around completed output",
+                "⎋ Working…\nDone. Wrote 3 files.\nesc Working...",
+            ),
+            (
+                "duration prose with a single-cell prefix",
+                "esc Working...\nx 30m saved per run",
+            ),
+            (
                 "active band pushed above current composer",
                 "⎋ Working…\n⠸ 1s > model status\nCompleted response.\n╭── π > idle ─╮\n╰─           ─╯",
             ),
@@ -4437,6 +4449,19 @@ Final prose line.\n";
             // Input-guard footer: shown while a composer draft exists.
             "\
 │ Finish or clear the current prompt to answer · Esc cancel │
+╰──────────────────────────────────────────────╯",
+            // The composer remains visible below a blocked ask dialog.
+            "\
+╭─ Ask ────────────────────────────────────────╮
+│ Enter select · n note · ↑/↓ move · Esc       │
+╰──────────────────────────────────────────────╯
+╭── π > draft ─────────────────────────────────╮
+╰──────────────────────────────────────────────╯",
+            "\
+╭─ Ask ────────────────────────────────────────╮
+│ Finish or clear the current prompt to answer · Esc cancel │
+╰──────────────────────────────────────────────╯
+╭── π > draft ─────────────────────────────────╮
 ╰──────────────────────────────────────────────╯",
         ];
         for (i, pane) in cases.iter().enumerate() {

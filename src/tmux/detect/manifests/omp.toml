@@ -1,8 +1,7 @@
 id = "omp"
 
-# omp stacks live markers, so priority-960 rules compete by screen position:
-# the lowest match is current. The lower-priority parked composer only clears
-# held state when no live rule matches.
+# omp stacks live markers, so priority-960 rules compete by screen position.
+# The lowest match is current.
 
 # The loader: a frame glyph opening the line, plus either the word `working` or
 # an interrupt hint. Braille frames carry the word; ascii and symbolic frames
@@ -57,33 +56,24 @@ all = [
 ]
 not = [
   { line_regex = ['^\s*(?:(?:╭[─-]*|\+[=-]*)\s*)?(?:\x{e0b6}\s+)?(?:⏱|\x{f017}|◷|◴|⌛)\s+'] },
+  # A lowercase word before and after the timer is ordinary duration prose.
+  { line_regex = ['^\s*(?:(?:╭[─-]*|\+[=-]*)\s*)?(?:\x{e0b6}\s+)?\p{Ll}\s+(?:0|[1-9]\d*)[smh]\s+\p{Ll}'] },
 ]
 
-# Presets without the pi segment expose only the built-in interrupt row.
+# Presets without the pi segment expose one bottommost interrupt row.
 [[rules]]
 id = "active_interrupt"
 state = "running"
 priority = 960
 positional = true
-max_position = 2
+max_position = 1
 region = "bottom_non_empty_lines(3)"
 visible = true
 line_regex = ['(?i)^\s*(?:⎋|\x{f12b7}|esc)\s+working(?:…|\.\.\.)\s*$']
 not = [
   { region = "bottom_non_empty_lines(3)", line_regex = ['^\s*(?:(?:╭[─-]*|\+[=-]*)\s*)?(?:π|\x{f0d57}|pi)\s+'] },
+  { region = "bottom_non_empty_lines(3)", line_regex = ['(?i)^\s*(?:⎋|\x{f12b7}|esc)\s+working(?:…|\.\.\.)\s*$'], min_lines = 2 },
 ]
-
-# The parked band exposes its brand token in the composer border. Its visible
-# Idle verdict ranks below live evidence and clears a finished turn.
-[[rules]]
-id = "composer_idle"
-state = "idle"
-priority = 950
-positional = true
-max_position = 2
-region = "bottom_non_empty_lines(3)"
-visible = true
-line_regex = ['^\s*(?:(?:╭[─-]*|\+[=-]*)\s*)?(?:π|\x{f0d57}|pi)\s+']
 
 # The wrapped variant: the frame line runs on and the hint lands on an
 # indented continuation. The frame line itself must carry neither the hint (or
@@ -135,8 +125,8 @@ region = "bottom_non_empty_lines(6)"
 visible = true
 contains_any = ["error: retry budget exhausted", "error: retry failed after"]
 
-# A prompt panel's footer row. The panel is drawn as `│ ... │` rows, and the
-# footer is the row that names its keys.
+# A prompt panel's footer row. A composer may remain below a genuine Ask
+# panel; without its Ask border, the same hint is draft content.
 [[rules]]
 id = "panel_prompt"
 state = "waiting"
@@ -152,7 +142,9 @@ contains_any = [
   "current prompt to answer",
 ]
 not = [
-  { region = "bottom_non_empty_lines(8)", line_regex = ['^\s*(?:╭|\+).*(?:π|\x{f0d57}|pi)\s*>'] },
+  { region = "bottom_non_empty_lines(8)", line_regex = ['^\s*(?:╭|\+).*(?:π|\x{f0d57}|pi)\s*>'], not = [
+    { line_regex = ['(?i)^\s*(?:╭[─-]*|\+[=-]*)\s*ask\b'] },
+  ] },
 ]
 
 # The approve/deny selector: its footer decides the position, gated on both
