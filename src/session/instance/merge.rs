@@ -93,11 +93,14 @@ impl Instance {
             self.status = previous.status;
             self.idle_entered_at = previous.idle_entered_at;
         }
-        // Reachability sentinels are runtime-only just like poller errors. A
-        // lifecycle generation bump does not make serde-skipped defaults from
-        // disk authoritative.
+        // Reachability sentinels and detection bookkeeping are runtime-only
+        // just like poller errors. A lifecycle generation bump does not make
+        // serde-skipped defaults from disk authoritative, and the TUI's
+        // heartbeat reload lands between two poll cycles: dropping `detection`
+        // here loses the proposal awaiting its confirming poll (#3642).
         self.ever_confirmed_present = previous.ever_confirmed_present;
         self.unknown_since = previous.unknown_since;
+        self.detection = previous.detection;
         self.last_error = previous.last_error.clone();
         self.last_error_check = previous.last_error_check;
         self.last_start_time = previous.last_start_time;
@@ -508,11 +511,18 @@ mod tests {
         previous.idle_entered_at = Some(Utc::now());
         previous.last_error = Some("old observation".to_string());
 
+        previous.detection = DetectionState {
+            pending: Some(Status::Idle),
+            ..Default::default()
+        };
+
         let mut reloaded = previous.clone();
         reloaded.lifecycle_generation = 4;
         reloaded.status = Status::Stopped;
         reloaded.idle_entered_at = None;
         reloaded.last_error = None;
+        // A disk load leaves every `#[serde(skip)]` field at its default.
+        reloaded.detection = DetectionState::default();
         reloaded.merge_runtime_from_reload(&previous);
 
         // Generation-governed fields: the strictly-newer disk snapshot wins.
@@ -522,6 +532,9 @@ mod tests {
         // last_error is runtime-only: the in-memory poller value survives even a
         // newer generation, since no lifecycle writer persists last_error.
         assert_eq!(reloaded.last_error.as_deref(), Some("old observation"));
+        // So is the detection bookkeeping: a reload between two poll cycles
+        // must not drop a proposal awaiting its confirming poll (#3642).
+        assert_eq!(reloaded.detection.pending, Some(Status::Idle));
 
         let mut deleting = Instance::new("deleting", "/tmp/test");
         deleting.lifecycle_generation = 3;

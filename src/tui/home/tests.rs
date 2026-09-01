@@ -8298,7 +8298,10 @@ fn poll_cycles_confirm_an_unwitnessed_idle_through_the_status_update() {
 
     let session_name = {
         let inst = env.view.get_instance(&id).unwrap();
-        assert_eq!(inst.tool, "claude");
+        assert_eq!(
+            inst.tool, "claude",
+            "fixture invariant: this test needs an agent with a manifest"
+        );
         crate::tmux::Session::generate_name(&inst.id, &inst.title)
     };
     let _kill = crate::tmux::test_helpers::TmuxTestSession::from_name(session_name.clone());

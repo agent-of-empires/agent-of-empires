@@ -759,7 +759,10 @@ mod tests {
         // `load_all_instances` leaves it.
         let mut on_disk = Instance::new("aoe_test_3642_tick", "/tmp");
         on_disk.status = Status::Running;
-        assert_eq!(on_disk.tool, "claude");
+        assert_eq!(
+            on_disk.tool, "claude",
+            "fixture invariant: this test needs an agent with a manifest"
+        );
 
         let session_name = crate::tmux::Session::generate_name(&on_disk.id, &on_disk.title);
         let _kill = crate::tmux::test_helpers::TmuxTestSession::from_name(session_name.clone());
