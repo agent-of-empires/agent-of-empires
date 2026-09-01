@@ -12,15 +12,15 @@ use serial_test::parallel;
 
 use crate::harness::{app_dir_in, require_tmux, TuiTestHarness};
 
-// Seeded Hermes conversation ids, one per project. Each session must end up
-// persisting its own; the global most-recent conversation under a reverted
-// fix is B (higher started_at).
+// Seeded Hermes conversation ids, one per project. The global most-recent
+// conversation under a reverted fix is B (higher started_at).
 const CONV_A: &str = "20260101_000000_aaaa";
 const CONV_B: &str = "20260101_000000_bbbb";
 
 // Deadline and cadence for a shim to publish its marker.
 const SHIM_DEADLINE: Duration = Duration::from_secs(10);
 const SHIM_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const FAIL_CLOSED_OBSERVATION: Duration = Duration::from_secs(5);
 
 /// Parse the `  ID:      <id>` line that `aoe add` prints on success.
 fn parse_session_id(add_stdout: &str) -> String {
@@ -177,7 +177,22 @@ fn hermes_host_capture_fails_closed() {
     h.spawn_tui();
     h.wait_for_ready();
 
-    let sessions = read_sessions(&h);
-    assert_eq!(agent_session_id_of(&sessions, &id_a), None);
-    assert_eq!(agent_session_id_of(&sessions, &id_b), None);
+    let deadline = Instant::now() + FAIL_CLOSED_OBSERVATION;
+    loop {
+        let sessions = read_sessions(&h);
+        assert_eq!(
+            agent_session_id_of(&sessions, &id_a),
+            None,
+            "Hermes host capture assigned an unverified identity to {id_a}"
+        );
+        assert_eq!(
+            agent_session_id_of(&sessions, &id_b),
+            None,
+            "Hermes host capture assigned an unverified identity to {id_b}"
+        );
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(SHIM_POLL_INTERVAL);
+    }
 }
