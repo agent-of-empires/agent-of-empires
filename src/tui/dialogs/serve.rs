@@ -1996,6 +1996,13 @@ fn render_qr(_url: &str) -> String {
     String::new()
 }
 
+/// Shown in place of the QR when the dashboard bundle is not embedded.
+const API_ONLY_NOTICE: &str =
+    "No dashboard bundle in this build: the URL serves the REST API only, and a browser gets a 404.";
+
+/// Rows [`API_ONLY_NOTICE`] needs once wrapped at a usable terminal width.
+const API_ONLY_ROWS: u16 = 2;
+
 #[allow(clippy::too_many_arguments)]
 fn render_active(
     frame: &mut Frame,
@@ -2054,11 +2061,15 @@ fn render_active(
         ServeMode::Local => "local",
         ServeMode::Tunnel => "tunnel",
     };
+    // Without the bundle this screen hands out an API endpoint, not a
+    // dashboard, so the title says which one the user is looking at.
+    let title = if cfg!(feature = "web") {
+        format!(" Remote Access ({mode_label})")
+    } else {
+        format!(" Remote API Access ({mode_label})")
+    };
     let mut header_spans = vec![
-        Span::styled(
-            format!(" Remote Access ({mode_label})"),
-            Style::default().fg(title_color).bold(),
-        ),
+        Span::styled(title, Style::default().fg(title_color).bold()),
         Span::styled(
             format!("  open {}", format_elapsed(elapsed)),
             Style::default().fg(theme.dimmed),
@@ -2080,9 +2091,16 @@ fn render_active(
     let show_passphrase = matches!(mode, ServeMode::Tunnel);
     let show_kind_label = kind_label.is_some();
     let show_split_token = !url_fits_one_line && split_token.is_some();
+    // No bundle means no QR (nothing would answer a scan) and a 404 for any
+    // browser that follows the URL, so the screen says what it is good for
+    // instead of presenting a bare address.
+    let show_api_only = !cfg!(feature = "web");
 
     // Calculate total content height for vertical centering.
     let mut inner_height: u16 = qr_height + 1 /* spacer */ + 1 /* url */;
+    if show_api_only {
+        inner_height += API_ONLY_ROWS;
+    }
     if show_kind_label {
         inner_height += 1;
     }
@@ -2097,6 +2115,9 @@ fn render_active(
 
     let mut constraints = vec![Constraint::Length(v_pad)]; // top padding
     constraints.push(Constraint::Length(qr_height));
+    if show_api_only {
+        constraints.push(Constraint::Length(API_ONLY_ROWS));
+    }
     constraints.push(Constraint::Length(1)); // spacer after QR
     if show_kind_label {
         constraints.push(Constraint::Length(1));
@@ -2129,6 +2150,17 @@ fn render_active(
         chunks[idx],
     );
     idx += 1;
+
+    if show_api_only {
+        frame.render_widget(
+            Paragraph::new(API_ONLY_NOTICE)
+                .style(Style::default().fg(theme.dimmed))
+                .wrap(Wrap { trim: true })
+                .alignment(Alignment::Center),
+            chunks[idx],
+        );
+        idx += 1;
+    }
 
     // Spacer after QR
     idx += 1;
@@ -2624,6 +2656,22 @@ mod qr_seam {
             cfg!(feature = "web"),
             "QR code should be drawn only with the dashboard bundle:\n{screen}"
         );
+    }
+
+    /// A QR-less screen offering a bare URL reads as a dashboard link, and a
+    /// browser following it gets a bodiless 404. Both the title and the panel
+    /// have to say the endpoint is API-only, and neither may say it in a build
+    /// that does embed the bundle.
+    #[test]
+    fn active_screen_says_api_only_without_web() {
+        let screen = active_screen();
+        for needle in ["Remote API Access", "No dashboard bundle in this build:"] {
+            assert_eq!(
+                screen.contains(needle),
+                !cfg!(feature = "web"),
+                "{needle:?} belongs on the screen only without the dashboard bundle:\n{screen}"
+            );
+        }
     }
 }
 

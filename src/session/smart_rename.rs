@@ -626,10 +626,9 @@ pub(crate) fn title_is_auto_overwritable(inst: &crate::session::instance::Instan
 // (native attach, web live-view, `aoe send`) and fires only once the pane
 // agent is idle, so the one-shot never races it for the provider API. The work
 // runs in a detached `aoe __smart-rename` child so it never blocks the poller.
-// Cross-process guards (a
-// per-session advisory lock, MAX_CONCURRENT global slot locks, and the
-// persisted `Instance.smart_rename_attempted` marker) coordinate the TUI, the
-// daemon, and sibling children, which are all separate processes.
+// Cross-process guards (a per-session advisory lock, MAX_CONCURRENT global slot
+// locks, and the persisted `Instance.smart_rename_attempted` marker) coordinate
+// the TUI, the daemon, and sibling children, which are all separate processes.
 // ---------------------------------------------------------------------------
 
 /// Head/tail byte budgets for the captured first-turn transcript handed to the

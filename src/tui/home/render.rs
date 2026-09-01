@@ -3728,9 +3728,16 @@ impl HomeView {
         // serve.mode file from disk on every frame.
         let mode_label = crate::cli::serve::cached_serve_mode_label();
         if crate::cli::serve::daemon_pid().is_some() {
+            // A build without the dashboard bundle answers the API only, so
+            // the badge must not read as "the dashboard is up".
+            let what = if cfg!(feature = "web") {
+                "Serving"
+            } else {
+                "Serving API"
+            };
             let label = match mode_label {
-                Some(m) => format!(" \u{25CF} Serving ({}) ", m),
-                None => " \u{25CF} Serving ".to_string(),
+                Some(m) => format!(" \u{25CF} {} ({}) ", what, m),
+                None => format!(" \u{25CF} {} ", what),
             };
             groups.push((
                 0,
