@@ -79,15 +79,23 @@ jobs:
       - name: Cargo test (web, e2e only)
         if: matrix.leg == 'web-e2e'
         run: cargo test --features web,e2e-tests --test e2e -- --test-threads=3
-      # `cargo test --features web` is otherwise never run: core-rest builds at
-      # default features and this leg names only the e2e target, so the two
-      # `cfg(feature = "web")` test blocks (the dashboard-route half of
-      # daemon_core_web_optional and the aoe.web builtin assertion in
-      # plugin_install) would compile nowhere in CI. This leg already has the
-      # lib built with `web`, so naming those two binaries is nearly free.
+      # The `web`-gated test code runs nowhere else: core-rest builds at
+      # default features and the step above names only the e2e target. Both
+      # halves need naming. The integration blocks are the dashboard-route half
+      # of daemon_core_web_optional and the aoe.web builtin assertion in
+      # plugin_install; the lib-level ones are src/server/assets.rs (the whole
+      # module is `web`-gated) and the QR seam in src/tui/dialogs/serve.rs,
+      # which would otherwise be neither compiled nor run on a PR. Keep
+      # `e2e-tests` on so the feature set matches the step above and cargo
+      # reuses its artifacts instead of rebuilding the crate; filter the lib run
+      # so it does not re-run the whole suite core-rest already covers.
       - name: Cargo test (web-gated test blocks)
         if: matrix.leg == 'web-e2e'
-        run: cargo test --features web --test daemon_core_web_optional --test plugin_install
+        run: |
+          cargo test --features web,e2e-tests \
+            --test daemon_core_web_optional --test plugin_install
+          cargo test --features web,e2e-tests --lib -- \
+            server::assets:: tui::dialogs::serve::qr_seam
       # core-rest: the full default-feature suite minus e2e (lib + bins +
       # integration + the standalone test bins). The daemon is core, so this
       # leg covers it end to end with no dashboard bundle and no npm in the
