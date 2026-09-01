@@ -124,6 +124,7 @@ describe("fetchSessions", () => {
     expect(url).toBe("/api/sessions");
     expect(init?.headers).toEqual({ "X-Aoe-Client-Capabilities": "acp_ws_v1,terminal_ws_v1" });
   });
+
   it.each([
     {
       name: "runtime-gated resume with terminal attach",
