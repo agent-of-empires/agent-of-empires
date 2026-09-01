@@ -68,6 +68,9 @@ Pick a `widget` for the field's type:
   web) or `local_only:<reason>` (host-execution surface the server rejects and
   the dashboard never renders, e.g. a binary path or command argv). Omit for a
   plain allow.
+- `repo`: `allow` or `deny`; whether a repo's `.agent-of-empires/config.toml`
+  may override the field. If absent, defaults to `allow` (or `deny` in the
+  `session` section). Global-only fields cannot be overridden by repos.
 - `category`: override the section's default TUI tab.
 - `advanced`: group the field under an "Advanced" fold on both surfaces.
 - `global_only`: shown but not profile-overridable (the dashboard adds an

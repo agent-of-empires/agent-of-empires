@@ -21,6 +21,7 @@
 //! Keys: `label`, `desc`, `category` (override the section default), `widget`,
 //! `min`, `max`, `step`, `multiline`, `mono`, `options` ("v:Label,v2:Label2"),
 //! `web` ("allow" | "elevation:reason" | "local_only:reason"),
+//! `repo` ("allow" | "deny": explicit repo-config override policy),
 //! `validate` ("none" | "range:min[:max]" | "nonempty" | "memory_limit" |
 //!   "volume_list" | "env_list" | "port_mapping_list" | "network"),
 //! `global_only` (flag: field is shown but not profile-overridable),
@@ -79,6 +80,7 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         }
         let widget = build_widget(field, &attrs)?;
         let web = build_web(field, &attrs)?;
+        let repo = build_repo_policy(field, &attrs)?;
         let validation = build_validation(field, &attrs)?;
         let overridable = !attrs.global_only;
         let advanced = attrs.advanced;
@@ -98,6 +100,7 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 description: #description.to_string(),
                 widget: #widget,
                 web_write: #web,
+                repo_policy: #repo,
                 profile_overridable: #overridable,
                 validation: #validation,
                 advanced: #advanced,
@@ -116,7 +119,7 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             /// how every surface renders and guards these fields.
             pub fn settings_descriptors() -> ::std::vec::Vec<crate::session::config::settings_schema::FieldDescriptor> {
                 use crate::session::config::settings_schema::{
-                    FieldDescriptor, WidgetKind, WebWritePolicy, ValidationKind, SelectOption,
+                    FieldDescriptor, WidgetKind, WebWritePolicy, RepoPolicy, ValidationKind, SelectOption,
                 };
                 ::std::vec![ #(#descriptors),* ]
             }
@@ -161,6 +164,7 @@ struct FieldAttrs {
     category: Option<String>,
     widget: Option<String>,
     web: Option<String>,
+    repo: Option<String>,
     validate: Option<String>,
     options: Option<String>,
     min: Option<i64>,
@@ -195,6 +199,7 @@ fn parse_field_attrs(field: &syn::Field, field_name: &str) -> syn::Result<FieldA
                 "category" => out.category = Some(meta.value()?.parse::<LitStr>()?.value()),
                 "widget" => out.widget = Some(meta.value()?.parse::<LitStr>()?.value()),
                 "web" => out.web = Some(meta.value()?.parse::<LitStr>()?.value()),
+                "repo" => out.repo = Some(meta.value()?.parse::<LitStr>()?.value()),
                 "validate" => out.validate = Some(meta.value()?.parse::<LitStr>()?.value()),
                 "options" => out.options = Some(meta.value()?.parse::<LitStr>()?.value()),
                 "min" => out.min = Some(meta.value()?.parse::<LitInt>()?.base10_parse()?),
@@ -292,6 +297,26 @@ fn build_web(field: &syn::Field, attrs: &FieldAttrs) -> syn::Result<proc_macro2:
             field,
             format!("unknown web policy `{spec}`"),
         ));
+    };
+    Ok(ts)
+}
+
+fn build_repo_policy(
+    field: &syn::Field,
+    attrs: &FieldAttrs,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let Some(spec) = attrs.repo.as_deref() else {
+        return Ok(quote!(RepoPolicy::Unspecified));
+    };
+    let ts = match spec {
+        "allow" => quote!(RepoPolicy::Allow),
+        "deny" => quote!(RepoPolicy::Deny),
+        other => {
+            return Err(syn::Error::new_spanned(
+                field,
+                format!("unknown repo policy `{other}` (expected \"allow\" or \"deny\")"),
+            ))
+        }
     };
     Ok(ts)
 }

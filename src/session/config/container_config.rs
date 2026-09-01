@@ -2188,11 +2188,12 @@ pub(crate) fn build_container_config(
 
 /// Normalize the configured `sandbox.network` into the value passed to
 /// `--network`. Unset and `bridge` both map to `None` (runtime default, no
-/// flag). `host` is rejected here as defense in depth even though the settings
-/// validator already refuses it, because repo/profile TOML is only
-/// type-checked, not value-validated (a repo config could set it directly, the
-/// concern raised in #2706). Everything else (`none` or a named network) passes
-/// through verbatim.
+/// flag); `none` is canonicalized to lowercase. Anything the settings
+/// validator rejects (`host`, namespace-sharing forms like `container:` and
+/// `ns:`, malformed names) is dropped with a warning here too, because
+/// repo/profile TOML is only type-checked, not value-validated (a repo config
+/// could set it directly, the concern raised in #2706). Valid named networks
+/// pass through verbatim.
 fn sanitize_network(network: Option<&str>) -> Option<String> {
     let value = network.map(str::trim).filter(|v| !v.is_empty())?;
     if value.eq_ignore_ascii_case("bridge") {
@@ -2211,6 +2212,13 @@ fn sanitize_network(network: Option<&str>) -> Option<String> {
     // user-defined and case-sensitive).
     if value.eq_ignore_ascii_case("none") {
         return Some("none".to_string());
+    }
+    if let Err(reason) = crate::session::validate_network_format(value) {
+        tracing::warn!(
+            target: "session.profile",
+            "Ignoring sandbox.network = {value:?}: {reason}"
+        );
+        return None;
     }
     Some(value.to_string())
 }
@@ -2365,6 +2373,16 @@ mod tests {
     fn sanitize_network_rejects_host() {
         assert_eq!(sanitize_network(Some("host")), None);
         assert_eq!(sanitize_network(Some("Host")), None);
+    }
+
+    #[test]
+    fn sanitize_network_rejects_namespace_sharing_forms() {
+        // Repo/profile TOML is only type-checked, so `container:` (Docker) and
+        // `ns:` (Podman) must be rejected here, not just by the settings
+        // validator: either shares another namespace's network stack.
+        assert_eq!(sanitize_network(Some("container:abc")), None);
+        assert_eq!(sanitize_network(Some("ns:/var/run/netns/x")), None);
+        assert_eq!(sanitize_network(Some("has space")), None);
     }
 
     #[test]
@@ -3924,6 +3942,65 @@ mount_ssh = true
             crate::session::artifacts::CONTAINER_ARTIFACT_DIR,
             volume_pairs
         );
+    }
+
+    /// `sandbox.network` stays repo-overridable, but namespace-sharing forms
+    /// (`container:` on Docker, `ns:` on Podman) must be dropped at container
+    /// build, because repo/profile TOML is only type-checked, never
+    /// value-validated. `selinux_relabel` is repo-denied outright: `:z`
+    /// relabels host paths.
+    #[test]
+    #[serial_test::serial]
+    fn test_build_container_config_drops_repo_network_escape_and_relabel() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        for network in ["container:victim", "ns:/var/run/netns/x"] {
+            let project_dir = TempDir::new().unwrap();
+            let config_dir = project_dir.path().join(".agent-of-empires");
+            fs::create_dir_all(&config_dir).unwrap();
+            fs::write(
+                config_dir.join("config.toml"),
+                format!("[sandbox]\nnetwork = \"{network}\"\nselinux_relabel = true\n"),
+            )
+            .unwrap();
+
+            git2::Repository::init(project_dir.path()).unwrap();
+
+            let sandbox_info = crate::session::instance::SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: "test:latest".to_string(),
+                container_name: "test-container".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                container_workdir: None,
+            };
+
+            let config = build_container_config(
+                project_dir.path().to_str().unwrap(),
+                &sandbox_info,
+                ContainerAgentSelection::new("claude", None),
+                false,
+                "test-instance-id",
+                None,
+                "",
+            )
+            .unwrap();
+
+            assert_eq!(
+                config.network, None,
+                "repo-declared network {network:?} must be dropped"
+            );
+            assert!(
+                !config.selinux_relabel,
+                "repo-declared selinux_relabel must be dropped"
+            );
+        }
     }
 
     #[test]

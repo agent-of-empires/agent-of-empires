@@ -211,6 +211,15 @@ pub enum WebWritePolicy {
     LocalOnly { reason: String },
 }
 
+/// Whether a repo config may override a field (`#[setting(repo = "...")]`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum RepoPolicy {
+    #[default]
+    Unspecified,
+    Allow,
+    Deny,
+}
+
 /// Server-authoritative validation applied to an incoming value before it is
 /// merged. Min/max in [`WidgetKind`] is advisory UI metadata; this is the gate.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -297,7 +306,10 @@ pub struct FieldDescriptor {
     pub description: String,
     pub widget: WidgetKind,
     pub web_write: WebWritePolicy,
-    /// Whether a profile/repo may override this field. `false` means the
+    /// Repo-override policy declared on the field.
+    #[serde(skip)]
+    pub repo_policy: RepoPolicy,
+    /// Whether a profile may override this field. `false` means the
     /// value is global-only (the field is still shown, but not overridable).
     pub profile_overridable: bool,
     pub validation: ValidationKind,

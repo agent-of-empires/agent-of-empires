@@ -12,6 +12,16 @@ use crate::status_hooks::StatusHookConfig;
 
 /// All settings descriptors, in section then field order.
 pub fn schema() -> Vec<FieldDescriptor> {
+    schema_ref().to_vec()
+}
+
+/// [`schema`] without the clone, for callers that only read.
+pub fn schema_ref() -> &'static [FieldDescriptor] {
+    static SCHEMA: std::sync::OnceLock<Vec<FieldDescriptor>> = std::sync::OnceLock::new();
+    SCHEMA.get_or_init(build_schema)
+}
+
+fn build_schema() -> Vec<FieldDescriptor> {
     let mut out = Vec::new();
     out.extend(ThemeConfig::settings_descriptors());
     out.extend(UpdatesConfig::settings_descriptors());
@@ -48,9 +58,9 @@ pub fn runtime_schema() -> Vec<FieldDescriptor> {
 }
 
 /// Look up a single field's descriptor by `section` and `field`.
-pub fn descriptor(section: &str, field: &str) -> Option<FieldDescriptor> {
-    schema()
-        .into_iter()
+pub fn descriptor(section: &str, field: &str) -> Option<&'static FieldDescriptor> {
+    schema_ref()
+        .iter()
         .find(|d| d.section == section && d.field == field)
 }
 
@@ -103,7 +113,7 @@ mod tests {
     #[test]
     fn session_row_tag_is_select_with_options() {
         let d = descriptor("session", "row_tag").expect("row_tag");
-        match d.widget {
+        match &d.widget {
             WidgetKind::Select { options } => {
                 let values: Vec<_> = options.iter().map(|o| o.value.as_str()).collect();
                 assert_eq!(values, ["none", "auto", "profile", "sandbox", "branch"]);
@@ -154,5 +164,26 @@ mod tests {
         assert!(d.advanced);
         let d = descriptor("acp", "default_agent").unwrap();
         assert!(!d.advanced);
+    }
+
+    #[test]
+    fn field_declared_repo_and_write_policies() {
+        use super::super::RepoPolicy;
+        for (section, field, expected) in [
+            ("sandbox", "extra_volumes", RepoPolicy::Deny),
+            ("sandbox", "container_runtime", RepoPolicy::Unspecified),
+            ("sandbox", "selinux_relabel", RepoPolicy::Deny),
+            ("session", "default_tool", RepoPolicy::Allow),
+            ("sandbox", "memory_limit", RepoPolicy::Unspecified),
+        ] {
+            let d = descriptor(section, field).unwrap_or_else(|| panic!("{section}.{field}"));
+            assert_eq!(d.repo_policy, expected, "{section}.{field}");
+        }
+
+        assert!(
+            !descriptor("sandbox", "container_runtime")
+                .unwrap()
+                .profile_overridable
+        );
     }
 }

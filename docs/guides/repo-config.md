@@ -97,7 +97,7 @@ auto_cleanup = true
 default_terminal_mode = "host"   # "host" or "container"
 ```
 
-`enabled_by_default`, `default_image`, `extra_volumes` and `mount_ssh` are ignored from repo config (with a warning naming the keys): together they let a repo put you in a container you did not ask for, running an image it chose, with your filesystem and SSH keys mounted in. Set them in your global or profile config, or pass `--sandbox` / `--sandbox-image` per session.
+Security-sensitive sandbox settings are ignored from repo config (with a warning naming the keys): `enabled_by_default`, `default_image`, `container_runtime`, `extra_volumes`, `mount_ssh`, and `selinux_relabel`. Set them in global or profile config instead, or pass `--sandbox` / `--sandbox-image` per session. Global-only settings such as `container_runtime` are always read from the global config.
 
 List fields (`environment`, `volume_ignores`, `port_mappings`) accept either an array or a single string:
 
