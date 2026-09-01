@@ -835,6 +835,15 @@ pub async fn shutdown_acp(
     if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
+    // Worker-stopping barrier: submission guard before any teardown, per
+    // `prompt_submission` (#3650).
+    let Some(_submission) = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await
+    else {
+        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    };
     match state.acp_supervisor.shutdown(&id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => supervisor_error_response("shutdown failed", &e),
@@ -957,6 +966,15 @@ pub async fn switch_acp_agent(
     if target.is_empty() {
         return (StatusCode::BAD_REQUEST, "target is required").into_response();
     }
+    // Worker-stopping barrier: submission guard before any teardown, per
+    // `prompt_submission` (#3650).
+    let Some(_submission) = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await
+    else {
+        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    };
 
     // Look up the instance first: custom agents are profile-specific, so
     // validation needs the session's source_profile and project_path. This
@@ -2217,12 +2235,15 @@ pub async fn acp_disable(
     if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
-    {
-        let instances = state.instances.read().await;
-        if !instances.iter().any(|i| i.id == id) {
-            return (StatusCode::NOT_FOUND, "session not found").into_response();
-        }
-    }
+    // Worker-stopping barrier: submission guard before any teardown, per
+    // `prompt_submission` (#3650).
+    let Some(_submission) = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await
+    else {
+        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    };
     let inst_lock = state.instance_lock(&id).await;
     let _guard = inst_lock.lock().await;
     let (mut instance, profile) = {
@@ -3621,6 +3642,64 @@ mod tests {
             !published,
             "a refused review must not leave a card in the transcript"
         );
+    }
+
+    /// The ACP-side half of the #3650 worker-stopping barrier. `shutdown_acp`,
+    /// `switch_acp_agent` and `acp_disable` all tear the worker down, so a
+    /// queue drain mid-delivery must finish first: `send_turn` respawns a
+    /// worker it finds gone, which would undo the shutdown and, for the
+    /// switch, deliver the prompt to the agent the user just switched away
+    /// from.
+    #[tokio::test]
+    async fn worker_stopping_acp_endpoints_wait_for_an_in_flight_submission() {
+        use std::time::Duration;
+
+        async fn call(which: &str, state: Arc<AppState>, id: String) -> axum::response::Response {
+            match which {
+                "shutdown" => shutdown_acp(State(state), Path(id)).await.into_response(),
+                "switch" => switch_acp_agent(
+                    State(state),
+                    Path(id),
+                    Json(SwitchAgentRequest {
+                        target: "codex".to_string(),
+                        model: None,
+                        reason: None,
+                    }),
+                )
+                .await
+                .into_response(),
+                "disable" => acp_disable(State(state), Path(id)).await.into_response(),
+                other => unreachable!("unknown handler {other}"),
+            }
+        }
+
+        for which in ["shutdown", "switch", "disable"] {
+            let mut inst = crate::session::Instance::new("acp-3650", "/tmp/aoe-3650-acp");
+            inst.id = format!("sess-3650-acp-{which}");
+            inst.view = crate::session::View::Structured;
+            inst.status = crate::session::Status::Idle;
+            let id = inst.id.clone();
+            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+            let delivering = state.session_service.prompt_submission(&id).await;
+            let handler = tokio::spawn({
+                let state = Arc::clone(&state);
+                let id = id.clone();
+                async move { call(which, state, id).await }
+            });
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                !handler.is_finished(),
+                "{which} must not tear the worker down under an in-flight submission"
+            );
+
+            drop(delivering);
+            tokio::time::timeout(Duration::from_secs(10), handler)
+                .await
+                .unwrap_or_else(|_| panic!("{which} must finish once the submission releases"))
+                .unwrap_or_else(|e| panic!("{which} task must not panic: {e}"));
+        }
     }
 
     #[tokio::test]

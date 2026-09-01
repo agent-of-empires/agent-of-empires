@@ -1385,12 +1385,13 @@ impl SessionService {
     /// settled atomically for every surface that can start a turn (both prompt
     /// endpoints, the plugin host's `sessions.turn.send`, the queue drain, and
     /// the pending-initial-turn drain). Every barrier that quiesces a worker
-    /// holds it too (`attach_project`, the tied-worktree renames, stop, trash,
-    /// archive, snooze, and every permanent delete), so a drain cannot deliver
-    /// into a worker they are about to stop or a session they are about to
-    /// erase. The drain reads status and the trashed/archived/snoozed flags
-    /// once and then resurrects a worker it finds gone, so a quiesce that
-    /// lands inside that window is simply undone. See #3621 and #3650. Callers that have not yet proved the session exists take
+    /// holds it too: stop, trash, archive, snooze, ACP shutdown, agent switch,
+    /// ACP disable, `attach_project`, the tied-worktree renames, and every
+    /// permanent delete. The drain reads status and the
+    /// trashed/archived/snoozed flags once and then reaches `send_turn`, which
+    /// respawns a worker it finds gone, so a quiesce landing inside that window
+    /// is undone and a delete races teardown against a live delivery. See
+    /// #3621 and #3650. Callers that have not yet proved the session exists take
     /// [`Self::prompt_submission_for_session`] instead.
     ///
     /// Two rules make this work, and neither is optional:
