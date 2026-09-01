@@ -58,6 +58,12 @@ fn enable_preassign(h: &TuiTestHarness) {
         .expect("enable OpenCode preassignment");
 }
 
+fn normal_launch_after_serve(invocations: &str) -> Option<&str> {
+    let mut lines = invocations.lines();
+    lines.find(|line| line.split_whitespace().next() == Some("serve"))?;
+    lines.find(|line| line.split_whitespace().next() != Some("serve"))
+}
+
 struct StopSessionOnDrop<'a> {
     h: &'a TuiTestHarness,
 }
@@ -115,13 +121,7 @@ fn opencode_opt_in_preassign_does_not_panic_nested_runtime() {
     let deadline = Instant::now() + Duration::from_secs(5);
     let invocations = loop {
         let invocations = fs::read_to_string(&log_path).unwrap_or_default();
-        let saw_serve = invocations
-            .lines()
-            .any(|line| line.split_whitespace().next() == Some("serve"));
-        let saw_launch = invocations
-            .lines()
-            .any(|line| line.split_whitespace().next() != Some("serve"));
-        if saw_serve && saw_launch {
+        if normal_launch_after_serve(&invocations).is_some() {
             break invocations;
         }
         assert!(
@@ -136,10 +136,8 @@ fn opencode_opt_in_preassign_does_not_panic_nested_runtime() {
             .any(|line| line.split_whitespace().next() == Some("serve")),
         "preassign never spawned `opencode serve`; fake log:\n{invocations}"
     );
-    let launch = invocations
-        .lines()
-        .find(|line| line.split_whitespace().next() != Some("serve"))
-        .expect("normal OpenCode launch was not recorded");
+    let launch = normal_launch_after_serve(&invocations)
+        .expect("normal OpenCode launch after preassignment was not recorded");
     assert!(
         !launch.split_whitespace().any(|arg| arg == "--session"),
         "preassignment timeout must start fresh; fake launch argv: {launch:?}"

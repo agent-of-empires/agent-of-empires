@@ -536,7 +536,10 @@ mod tests {
         assert!(claude.supports_session_poller());
     }
     #[test]
+    #[serial_test::serial]
     fn managed_capture_lease_serializes_store_and_workspace() {
+        let app = tempfile::tempdir().unwrap();
+        let _app_guard = crate::session::test_support::isolate_app_dir_at(app.path());
         let store = tempfile::tempdir().unwrap();
         let backend = crate::agents::SessionCaptureBackend::Gemini;
         let first =
