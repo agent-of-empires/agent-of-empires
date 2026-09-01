@@ -467,6 +467,7 @@ pub(super) fn apply_acp_overlay_inplace(prior_by_id: &PriorById, merged: &mut [I
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
 
     /// A structured row as the poll loop finds it mid-phantom: disk says `Idle`,
     /// the live acp status is `Error` because the worker died with
@@ -744,8 +745,11 @@ mod tests {
     /// re-proposes the same Idle every tick, never meets its own proposal,
     /// and the dashboard shows Running for the life of the session.
     ///
-    /// Two ticks over a live pane parked on a screen no Claude rule matches,
-    /// each one starting from a fresh disk load as production does.
+    /// Four ticks over a live pane parked on a screen no Claude rule matches,
+    /// each one starting from a fresh disk load as production does. The last
+    /// two also cover the capture-skip gate (#3600), which only reaches
+    /// production once this carry exists: on a skipped tick the status the
+    /// row came off disk with has to be the one that stands.
     #[test]
     #[serial_test::serial]
     fn a_proposal_survives_the_tick_that_reloads_its_row_from_disk() {
@@ -788,25 +792,25 @@ mod tests {
         let cache = crate::tmux::SessionCacheGuard::capture();
         cache.force_present(&[session_name.as_str()]);
 
-        // A live agent pane, and no activity stamp, so the capture-skip gate
-        // never fires and each tick decides on a real capture.
-        let metadata = std::collections::HashMap::from([(
-            session_name.clone(),
-            crate::tmux::PaneMetadata {
-                pane_dead: false,
-                pane_current_command: Some("claude".to_string()),
-                pane_start_command_is_protected: false,
-                pane_pid: None,
-                pane_title: None,
-                window_activity: None,
-            },
-        )]);
-        let prev = std::collections::HashMap::from([(on_disk.id.clone(), Status::Running)]);
-
+        let mut prev = std::collections::HashMap::from([(on_disk.id.clone(), Status::Running)]);
         let mut tracking: std::collections::HashMap<String, PriorTickTracking> =
             std::collections::HashMap::new();
-        let mut published = Vec::new();
-        for _ in 0..2 {
+
+        // One daemon tick, reporting the status it settled on and the rule
+        // that decided. `window_activity` is supplied rather than scraped so
+        // the capture-skip gate is driven, not raced.
+        let mut tick = |window_activity: Option<i64>| {
+            let metadata = std::collections::HashMap::from([(
+                session_name.clone(),
+                crate::tmux::PaneMetadata {
+                    pane_dead: false,
+                    pane_current_command: Some("claude".to_string()),
+                    pane_start_command_is_protected: false,
+                    pane_pid: None,
+                    pane_title: None,
+                    window_activity,
+                },
+            )]);
             let mut instances = vec![on_disk.clone()];
             seed_tick_tracking(&mut instances, &tracking);
             apply_tick_status_decisions(
@@ -819,14 +823,36 @@ mod tests {
                 .iter()
                 .map(|i| (i.id.clone(), PriorTickTracking::of(i)))
                 .collect();
-            published.push(instances[0].status);
-        }
+            // A passive transition reaches disk in the tick that publishes it
+            // (`flush_passive_transition_writes`), so the next tick's disk
+            // load agrees with what this one decided.
+            on_disk.status = instances[0].status;
+            prev.insert(instances[0].id.clone(), instances[0].status);
+            (instances[0].status, instances[0].detection.rule)
+        };
 
+        // No activity stamp: nothing to skip against, so both ticks decide on
+        // a real capture.
         assert_eq!(
-            published,
-            vec![Status::Running, Status::Idle],
-            "an unwitnessed Idle waits one tick, then publishes on the tick \
-             that agrees with it (#3642)"
+            tick(None).0,
+            Status::Running,
+            "an unwitnessed Idle waits for a tick that agrees with it"
+        );
+        assert_eq!(
+            tick(None).0,
+            Status::Idle,
+            "the tick that agrees publishes it (#3642)"
+        );
+
+        // A stamp whose second is already past: the tick that records it still
+        // captures, and the one after it has the proof the gate asks for.
+        let settled = Utc::now().timestamp() - 60;
+        assert_eq!(tick(Some(settled)).0, Status::Idle);
+        assert_eq!(
+            tick(Some(settled)),
+            (Status::Idle, Some("screen_unchanged")),
+            "a skipped tick must leave the published status standing, not \
+             re-derive one from a row it did not capture for"
         );
     }
 
