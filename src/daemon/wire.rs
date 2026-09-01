@@ -300,7 +300,7 @@ pub struct SessionResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acp_agent: Option<String>,
     /// True when this session's agent can run a structured ACP `session/fork`,
-    /// per [`crate::session::fork::structured_fork_capable`]. Resume-only ACP
+    /// per `crate::session::fork::structured_fork_capable`. Resume-only ACP
     /// agents (e.g. `aoe-agent`) are ACP-capable yet not forkable, so the web
     /// gates "Fork" on this AND `acp_session_id` rather than on a captured id
     /// alone. Omitted (read as not-forkable) for terminal sessions and

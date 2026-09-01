@@ -31,10 +31,14 @@ pub struct DaemonClient {
 
 impl fmt::Debug for DaemonClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DaemonClient")
-            .field("sessions_url", &self.sessions_url)
-            .field("authenticated", &self.authorization.is_some())
-            .finish()
+        let authenticated = self.authorization.is_some();
+        let mut debug = f.debug_struct("DaemonClient");
+        if authenticated {
+            debug.field("sessions_url", &"<redacted>");
+        } else {
+            debug.field("sessions_url", &self.sessions_url);
+        }
+        debug.field("authenticated", &authenticated).finish()
     }
 }
 

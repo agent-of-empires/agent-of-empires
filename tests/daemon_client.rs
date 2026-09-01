@@ -134,6 +134,14 @@ async fn daemon_client_http_contract() {
     fn assert_traits<T: Clone + Send + Sync>() {}
     assert_traits::<DaemonClient>();
 
+    let overlapping_token = "secret-token";
+    let authenticated = DaemonClient::new(
+        "https://daemon.example/secret-token/",
+        Some(overlapping_token),
+    )
+    .unwrap();
+    assert!(!format!("{authenticated:?}").contains(overlapping_token));
+
     let success = r#"{"sessions":[],"workspace_ordering":["workspace-a"]}"#;
     let cases = [
         ("", None, None, "/api/sessions"),
