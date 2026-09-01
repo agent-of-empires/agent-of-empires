@@ -273,6 +273,7 @@ impl HomeView {
             preview_worker_pulse: None,
             preview_wake: std::sync::Arc::new(tokio::sync::Notify::new()),
             live_send_last_resize: None,
+            live_send_resize_retry_at: None,
             live_send_pending_leader: false,
             live_send_ctrl_c_flash_until: None,
             sidebar_collapsed: user_config

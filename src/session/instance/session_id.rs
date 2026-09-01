@@ -21,13 +21,14 @@ impl Instance {
         let preassign = backend == Some(crate::agents::SessionCaptureBackend::OpenCode)
             && self.opencode_preassign_enabled();
         let pin_pi = self.pi_session_id_pinnable();
+        let preassign_environment = preassign.then(|| self.resolved_host_environment());
         self.acquire_session_id_with(&|path| {
             if pin_pi {
                 return Some(crate::session::capture::generate_session_uuid());
             }
-            preassign
-                .then(|| crate::session::capture::preassign_opencode_session_id(path))
-                .flatten()
+            preassign_environment.as_deref().and_then(|environment| {
+                crate::session::capture::preassign_opencode_session_id(path, environment)
+            })
         })
     }
 
@@ -162,27 +163,26 @@ impl Instance {
         }
     }
 
-    /// Whether automatic OpenCode session-id preassignment applies. Only a
-    /// direct host launch can share the ephemeral server's binary and store.
+    /// Whether automatic OpenCode session-id preassignment applies. It is an
+    /// opt-in host-only operation and requires a direct OpenCode launch.
     fn opencode_preassign_enabled(&self) -> bool {
-        if self.is_sandboxed() {
+        if self.is_sandboxed()
+            || !crate::session::profile_config::resolve_config_or_warn(&self.effective_profile())
+                .session
+                .opencode_preassign_session_id
+        {
             return false;
         }
         self.opencode_launch_mirrorable_by_ambient_serve()
     }
 
-    /// Whether the ephemeral `opencode serve` used for preassignment provably
-    /// hits the same binary and data store as the real launch.
-    ///
-    /// Command overrides and profile-scoped environment can select another
-    /// binary or data store. In that case preassignment is skipped and the
-    /// launch remains without a native id; adopting an ambient SQLite row would
-    /// not establish ownership.
+    /// Whether the ephemeral `opencode serve` used for preassignment runs the
+    /// same binary as the real launch. The caller passes the resolved launch
+    /// environment to both processes so their data-store routing also matches.
     fn opencode_launch_mirrorable_by_ambient_serve(&self) -> bool {
-        self.profile_host_environment().is_empty()
-            && self.resolved_agent().is_some_and(|agent| {
-                agent.name == "opencode" && self.launch_invokes_resolved_agent_directly(agent)
-            })
+        self.resolved_agent().is_some_and(|agent| {
+            agent.name == "opencode" && self.launch_invokes_resolved_agent_directly(agent)
+        })
     }
 
     /// Best-effort backfill of a missing `agent_session_id` during a read-only
@@ -193,17 +193,20 @@ impl Instance {
     /// declared capture context remains authoritative: pane-scoped sources may
     /// publish their own id, while managed stores still require the in-memory
     /// launch floor and exclusive lease. A miss or CAS race is a silent no-op.
+    fn self_heal_row_is_eligible(&self, contended: &HashSet<(String, String)>) -> bool {
+        self.agent_session_id.is_none()
+            && self.resume_intent.is_default()
+            && !matches!(self.status, Status::Deleting | Status::Creating)
+            && self.effective_bucket() == SessionBucket::Active
+            && !contended.contains(&self.contended_capture_key())
+    }
+
     pub(crate) fn self_heal_session_id(
         &mut self,
         profile: &str,
         contended: &HashSet<(String, String)>,
     ) {
-        if self.agent_session_id.is_some()
-            || !self.resume_intent.is_default()
-            || matches!(self.status, Status::Deleting | Status::Creating)
-            || self.effective_bucket() != SessionBucket::Active
-            || contended.contains(&self.contended_capture_key())
-        {
+        if !self.self_heal_row_is_eligible(contended) {
             return;
         }
         if !self.tmux_alive_cached() {
@@ -689,6 +692,42 @@ mod tests {
     use crate::session::instance::test_helpers::*;
     use crate::session::test_support::EnvGuard;
     use serial_test::serial;
+
+    #[test]
+    fn self_heal_eligibility_rejects_owned_and_inactive_rows() {
+        let base = Instance::new("self-heal", "/tmp/self-heal");
+        let empty = HashSet::new();
+        assert!(base.self_heal_row_is_eligible(&empty));
+
+        let mut with_id = base.clone();
+        with_id.agent_session_id = Some("native-id".to_string());
+        let mut cleared = base.clone();
+        cleared.resume_intent = ResumeIntent::Cleared;
+        let mut deleting = base.clone();
+        deleting.status = Status::Deleting;
+        let mut creating = base.clone();
+        creating.status = Status::Creating;
+        let mut archived = base.clone();
+        archived.archived_at = Some(Utc::now());
+
+        for (reason, instance) in [
+            ("stored identity", with_id),
+            ("cleared intent", cleared),
+            ("deleting", deleting),
+            ("creating", creating),
+            ("archived", archived),
+        ] {
+            assert!(
+                !instance.self_heal_row_is_eligible(&empty),
+                "self-heal accepted {reason}"
+            );
+        }
+
+        let contended = HashSet::from([base.contended_capture_key()]);
+        assert!(!base.self_heal_row_is_eligible(&contended));
+    }
+
+    // Tests for agent_session_id field
     use tempfile::tempdir;
 
     // Tests for agent_session_id field
@@ -915,7 +954,7 @@ mod tests {
     fn fresh_launch_clears_every_host_identity_sidecar() {
         let tmp = tempfile::TempDir::new().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
-        for tool in ["cursor", "qwen", "kiro", "pi"] {
+        for tool in ["cursor", "pi"] {
             let mut inst = Instance::new(tool, "/tmp/test");
             inst.tool = tool.to_string();
             inst.detect_as = tool.to_string();
@@ -1354,20 +1393,43 @@ pi = "~/.pi-personal"
     }
 
     #[test]
-    fn opencode_preassign_skips_when_launch_not_mirrorable() {
-        // Plain ambient opencode (no command override, no profile host env):
-        // the ephemeral serve provably matches the launch, so preassign is
-        // allowed to run.
+    fn opencode_preassign_requires_a_mirrorable_launch() {
         let mut inst = Instance::new("Test", "/tmp/test");
         inst.tool = "opencode".to_string();
         assert!(inst.opencode_launch_mirrorable_by_ambient_serve());
 
-        // A command override points the launch at a different binary/store,
-        // which the ambient `opencode serve` cannot mirror, so preassign is
-        // skipped (falls back to the poller) rather than risking a launch that
-        // fails "Session not found".
         inst.command = "opencode-wrapper".to_string();
         assert!(!inst.opencode_launch_mirrorable_by_ambient_serve());
+    }
+
+    #[test]
+    #[serial]
+    fn opencode_preassign_requires_profile_opt_in() {
+        let temp = tempdir().unwrap();
+        let _home = EnvGuard::set(&[("HOME", temp.path())]);
+        let cases = [
+            ("opencode-preassign-off", false),
+            ("opencode-preassign-on", true),
+        ];
+
+        for (profile, enabled) in cases {
+            let config_path = crate::session::get_profile_dir_path(profile)
+                .unwrap()
+                .join("config.toml");
+            std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+            std::fs::write(
+                config_path,
+                format!(
+                    "environment = [\"OPENCODE_CONFIG_DIR=/tmp/opencode-test\"]\n[session]\nopencode_preassign_session_id = {enabled}\n"
+                ),
+            )
+            .unwrap();
+
+            let mut inst = Instance::new("Test", "/tmp/test");
+            inst.source_profile = profile.to_string();
+            inst.tool = "opencode".to_string();
+            assert_eq!(inst.opencode_preassign_enabled(), enabled);
+        }
     }
 
     #[test]

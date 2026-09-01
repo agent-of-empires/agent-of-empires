@@ -80,6 +80,11 @@ pub(super) fn build_resume_flags(
         return String::new();
     };
     let Some(support) = agent.session_support.as_ref() else {
+        tracing::info!(target: "session.store",
+            tool = %tool,
+            sid = %session_id,
+            "session resume is disabled for this agent; stored ID left unused"
+        );
         return String::new();
     };
     match &support.resume {
@@ -897,6 +902,19 @@ mod tests {
 
         let flags = build_resume_flags("opencode", session_id, true);
         assert_eq!(flags, "--session session-789");
+    }
+
+    #[test]
+    fn test_build_resume_flags_for_resume_only_agents() {
+        let session_id = "session-789";
+        assert_eq!(
+            build_resume_flags("vibe", session_id, true),
+            "--resume session-789"
+        );
+        assert_eq!(
+            build_resume_flags("copilot", session_id, true),
+            "--session-id session-789"
+        );
     }
 
     #[test]

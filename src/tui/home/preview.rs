@@ -1,7 +1,5 @@
 //! The preview pane's text view, its selection, and the cache behind it.
 
-use super::*;
-
 /// The output pane's text layout, captured at render time so the input
 /// handlers (which run between frames) can map a screen cell to the
 /// absolute content line beneath it and back. `pane` is the on-screen
@@ -163,12 +161,17 @@ impl PreviewSelection {
     }
 }
 
-/// Cached preview content to avoid subprocess calls on every frame
+/// Cached preview content received from the off-thread capture worker.
+#[derive(Default)]
 pub(in crate::tui) struct PreviewCache {
     pub(in crate::tui) session_id: Option<String>,
+    pub(in crate::tui) capture_target: Option<String>,
+    pub(in crate::tui) capture_generation: u64,
     pub(in crate::tui) content: String,
-    pub(in crate::tui) last_refresh: Instant,
     pub(in crate::tui) dimensions: (u16, u16),
+    /// Cursor and terminal mode flags from the same accepted capture frame as
+    /// content. Paint and input routing must never read a newer worker sample.
+    pub(in crate::tui) cursor: Option<crate::tmux::PaneCursor>,
     /// Number of lines that were captured into `content`. Used together with
     /// the BUFFER reserve so consecutive wheel ticks don't trigger a fresh
     /// `tmux capture-pane` subprocess while the cached window still covers
@@ -177,8 +180,8 @@ pub(in crate::tui) struct PreviewCache {
     /// Lazily parsed ratatui `Text` view of `content`. Populated on the
     /// first render after a refresh that wasn't a no-op; reused as-is
     /// on every subsequent render until `content` is replaced. The
-    /// invalidation point is `refresh_*_preview_cache_if_needed` which
-    /// sets this to `None` whenever it writes a fresh `content`. See
+    /// invalidation point is `apply_worker_capture`, which sets this to
+    /// `None` whenever it writes fresh content. See
     /// `PreviewCache::ensure_parsed` for the lazy-parse contract.
     ///
     /// Without this cache, `ansi-to-tui` re-parses the full pane
@@ -187,19 +190,6 @@ pub(in crate::tui) struct PreviewCache {
     /// wake-ups or unrelated key events. With it, the parse happens
     /// at most once per actual content change.
     pub(in crate::tui) parsed_text: Option<ratatui::text::Text<'static>>,
-}
-
-impl Default for PreviewCache {
-    fn default() -> Self {
-        Self {
-            session_id: None,
-            content: String::new(),
-            last_refresh: Instant::now(),
-            dimensions: (0, 0),
-            captured_lines: 0,
-            parsed_text: None,
-        }
-    }
 }
 
 impl PreviewCache {
@@ -224,15 +214,17 @@ impl PreviewCache {
     }
 
     /// Store a fresh capture, invalidating the parsed cache and stamping
-    /// the session/dimensions/time the content belongs to. Returns the
-    /// captured line count so the caller can clamp scroll. Shared by the
-    /// synchronous fork path (`refresh_preview_cache_core`) and the
-    /// off-thread worker path so the two can't drift.
+    /// the session, target, generation, and dimensions the content belongs to.
+    /// Returns the captured line count so the caller can clamp scroll. Written
+    /// only by `apply_worker_capture`; there is no synchronous capture source.
     pub(in crate::tui) fn store_capture(
         &mut self,
         content: String,
         session_id: String,
+        capture_target: String,
+        capture_generation: u64,
         dimensions: (u16, u16),
+        cursor: Option<crate::tmux::PaneCursor>,
     ) -> usize {
         self.captured_lines = content.lines().count();
         self.content = content;
@@ -240,18 +232,20 @@ impl PreviewCache {
         // `ansi-to-tui`.
         self.parsed_text = None;
         self.session_id = Some(session_id);
+        self.capture_target = Some(capture_target);
+        self.capture_generation = capture_generation;
         self.dimensions = dimensions;
-        self.last_refresh = Instant::now();
+        self.cursor = cursor;
         self.captured_lines
     }
 }
 
-/// Per-frame durations for the preview pipeline's two fork/CPU phases.
-/// Lives on `HomeView`, reset each frame by `App::render`, and read back
-/// by the render sampler so a slow or live-send frame logs the breakdown
-/// instead of a single opaque `frame_ms`.
+/// Per-frame durations for the preview pipeline's paint-side apply/parse phases.
+/// Lives on `HomeView`, resets each frame in `App::render`, and feeds the render
+/// sampler so slow frames distinguish mailbox/cache application from ANSI
+/// parsing and widget construction. Actual tmux capture runs on the worker.
 #[derive(Default, Clone, Copy)]
 pub(in crate::tui) struct PreviewTimings {
-    pub(in crate::tui) capture: std::time::Duration,
+    pub(in crate::tui) apply: std::time::Duration,
     pub(in crate::tui) parse: std::time::Duration,
 }

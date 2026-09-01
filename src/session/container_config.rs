@@ -4508,9 +4508,8 @@ claude-personal = "~/.claude-personal"
         crate::hooks::cleanup_hook_status_dir(instance_id);
     }
 
-    // Declared Codex stores are mounted directly at CODEX_HOME. They remain
-    // fixed paths, so concurrent sessions sharing one store fail closed in the
-    // capture ownership gate instead of inventing a per-instance subdirectory.
+    // Declared Codex roots stage one writable store per instance, then mount
+    // that staged directory directly at CODEX_HOME.
     #[test]
     #[serial_test::serial]
     fn test_declared_codex_config_dir_trusts_at_the_mounted_level() {

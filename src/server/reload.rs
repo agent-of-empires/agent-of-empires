@@ -73,26 +73,52 @@ pub(super) fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Inst
     fresh
 }
 
-/// Carry the previous tick's Unknown-escalation tracking fields
-/// (`ever_confirmed_present`, `unknown_since`) onto a freshly disk-loaded
-/// instance, keyed by id. `load_all_instances` unconditionally resets both
+/// The prior tick's `#[serde(skip)]` status bookkeeping for one row, the
+/// input to [`seed_tick_tracking`].
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct PriorTickTracking {
+    ever_confirmed_present: bool,
+    unknown_since: Option<std::time::Instant>,
+    detection: crate::session::DetectionState,
+}
+
+impl PriorTickTracking {
+    pub(super) fn of(inst: &Instance) -> Self {
+        Self {
+            ever_confirmed_present: inst.ever_confirmed_present,
+            unknown_since: inst.unknown_since,
+            detection: inst.detection,
+        }
+    }
+}
+
+/// Carry the previous tick's status bookkeeping onto a freshly disk-loaded
+/// instance, keyed by id. `load_all_instances` unconditionally resets these
 /// `#[serde(skip)]` fields to their defaults on every call, so
 /// `status_poll_loop` must call this BEFORE running
-/// `update_status_with_metadata` on the fresh instance: otherwise
-/// `unknown_since` restarts at `Instant::now()` every 2s tick and the
-/// bounded Unknown->Error escalation window in
-/// `update_status_with_metadata_inner` can never elapse (#2865). The
-/// counterpart carry for the opposite direction, after the status decision
-/// has run, lives in `reload_state_instances_from_disk`'s per-`StatusSource`
-/// handling.
-pub(super) fn seed_unknown_tracking(
+/// `update_status_with_metadata` on the fresh instance. Each field breaks
+/// differently without it:
+///
+/// - `unknown_since` restarts at `Instant::now()` every 2s tick, so the
+///   bounded Unknown->Error escalation window in
+///   `update_status_with_metadata_inner` can never elapse (#2865).
+/// - `detection` restarts empty, so a `Running -> Idle` the rules did not
+///   read off live chrome proposes itself every tick and never meets the
+///   confirming poll that would publish it: a hookless manifest agent stays
+///   Running for the life of the session (#3642).
+///
+/// The counterpart carry for the opposite direction, after the status
+/// decision has run, lives in `reload_state_instances_from_disk`'s
+/// per-`StatusSource` handling.
+pub(super) fn seed_tick_tracking(
     instances: &mut [Instance],
-    prev: &std::collections::HashMap<String, (bool, Option<std::time::Instant>)>,
+    prev: &std::collections::HashMap<String, PriorTickTracking>,
 ) {
     for inst in instances {
-        if let Some(&(ever_confirmed_present, unknown_since)) = prev.get(&inst.id) {
-            inst.ever_confirmed_present = ever_confirmed_present;
-            inst.unknown_since = unknown_since;
+        if let Some(prior) = prev.get(&inst.id) {
+            inst.ever_confirmed_present = prior.ever_confirmed_present;
+            inst.unknown_since = prior.unknown_since;
+            inst.detection = prior.detection;
         }
     }
 }
@@ -226,18 +252,20 @@ pub(super) fn skip_tmux_decision_for_structured(inst: &mut Instance) -> bool {
 //    `last_start_time`, `last_error`, `session_id_poller`,
 //    `retroactive_capture_excludes`) that disk reload zeroes by design.
 // 3. `merge_runtime_fields` does NOT carry `status`, `last_accessed_at`,
-//    `idle_entered_at`, `ever_confirmed_present`, or `unknown_since`.
+//    `idle_entered_at`, or the `PriorTickTracking` fields
+//    (`ever_confirmed_present`, `unknown_since`, `detection`).
 //    Those are handled per StatusSource: DiskOnly takes prior.status,
 //    `prior.idle_entered_at.or(fresh.idle_entered_at)`, and prior's
-//    Unknown-tracking pair verbatim (its `fresh` never went through
-//    `update_status_with_metadata`, so both fields are still at their
-//    zeroed defaults). TmuxApplied takes fresh's status and Unknown-tracking
-//    pair: the caller (`status_poll_loop`) already seeded `fresh` from the
-//    prior tick's tracking pair before running the tmux scrape and status
+//    tracking verbatim (its `fresh` never went through
+//    `update_status_with_metadata`, so those fields are still at their
+//    zeroed defaults). TmuxApplied takes fresh's status and tracking:
+//    the caller (`status_poll_loop`) already seeded `fresh` from the
+//    prior tick's tracking before running the tmux scrape and status
 //    decision, so `fresh` already holds this tick's authoritative values;
 //    restoring the pre-decision prior snapshot here would erase that
-//    decision every tick and re-freeze the Unknown->Error escalation window
-//    at zero elapsed time (#2865). `last_accessed_at` is monotonic-max
+//    decision every tick, re-freezing the Unknown->Error escalation window
+//    at zero elapsed time (#2865) and dropping a detection awaiting its
+//    confirming poll (#3642). `last_accessed_at` is monotonic-max
 //    regardless.
 // 4. The acp overlay filter is `inst.is_structured()`, never the lazy
 //    ACP session id. The latter is set lazily by the ACP handshake
@@ -357,28 +385,27 @@ pub(crate) async fn reload_state_instances_from_disk(
             let prior_status = prior.status;
             let prior_last_accessed = prior.last_accessed_at;
             let prior_idle_entered = prior.idle_entered_at;
-            let prior_ever_confirmed_present = prior.ever_confirmed_present;
-            let prior_unknown_since = prior.unknown_since;
+            let prior_tracking = PriorTickTracking::of(&prior);
             row = merge_runtime_fields(prior, row);
             match status_source {
                 StatusSource::DiskOnly => {
                     row.status = prior_status;
                     row.idle_entered_at = prior_idle_entered.or(row.idle_entered_at);
                     // `row` here is a raw disk load (no tmux scrape ran), so
-                    // both `#[serde(skip)]` tracking fields are still at
-                    // their zeroed defaults; restore the prior tick's.
-                    row.ever_confirmed_present = prior_ever_confirmed_present;
-                    row.unknown_since = prior_unknown_since;
+                    // the `#[serde(skip)]` tracking fields are still at their
+                    // zeroed defaults; restore the prior tick's.
+                    row.ever_confirmed_present = prior_tracking.ever_confirmed_present;
+                    row.unknown_since = prior_tracking.unknown_since;
+                    row.detection = prior_tracking.detection;
                 }
                 StatusSource::TmuxApplied => {
                     // Caller already applied tmux scrape to fresh.status;
                     // that is the authoritative value. idle_entered_at is
                     // recomputed by upstream status-transition logic;
-                    // trust fresh. Likewise `ever_confirmed_present` /
-                    // `unknown_since`: the caller seeded them from the
-                    // prior tick before running the status decision, so
-                    // `row` already carries this tick's advanced values.
-                    // See #2865.
+                    // trust fresh. Likewise the tracking fields: the caller
+                    // seeded them from the prior tick before running the
+                    // status decision, so `row` already carries this tick's
+                    // advanced values. See #2865 and #3642.
                 }
             }
             row.last_accessed_at = prior_last_accessed.max(row.last_accessed_at);
@@ -440,6 +467,7 @@ pub(super) fn apply_acp_overlay_inplace(prior_by_id: &PriorById, merged: &mut [I
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
 
     /// A structured row as the poll loop finds it mid-phantom: disk says `Idle`,
     /// the live acp status is `Error` because the worker died with
@@ -641,18 +669,32 @@ mod tests {
     }
 
     #[test]
-    fn seed_unknown_tracking_carries_prior_tick_fields_onto_fresh_instance() {
-        // `load_all_instances` always resets both `#[serde(skip)]` fields to
+    fn seed_tick_tracking_carries_prior_tick_fields_onto_fresh_instance() {
+        // `load_all_instances` always resets these `#[serde(skip)]` fields to
         // their defaults, mimicking status_poll_loop's fresh disk load.
         let mut fresh = vec![Instance::new("sess-1", "/tmp/seed")];
         assert!(!fresh[0].ever_confirmed_present);
         assert_eq!(fresh[0].unknown_since, None);
+        assert_eq!(
+            fresh[0].detection,
+            crate::session::DetectionState::default()
+        );
 
         let confirmed_at = std::time::Instant::now() - std::time::Duration::from_secs(3);
         let mut prev = std::collections::HashMap::new();
-        prev.insert(fresh[0].id.clone(), (true, Some(confirmed_at)));
+        prev.insert(
+            fresh[0].id.clone(),
+            PriorTickTracking {
+                ever_confirmed_present: true,
+                unknown_since: Some(confirmed_at),
+                detection: crate::session::DetectionState {
+                    pending: Some(Status::Idle),
+                    ..Default::default()
+                },
+            },
+        );
 
-        seed_unknown_tracking(&mut fresh, &prev);
+        seed_tick_tracking(&mut fresh, &prev);
 
         assert!(
             fresh[0].ever_confirmed_present,
@@ -666,17 +708,152 @@ mod tests {
              Unknown->Error escalation window can actually accumulate elapsed \
              time across ticks (#2865)"
         );
+        assert_eq!(
+            fresh[0].detection.pending,
+            Some(Status::Idle),
+            "prior tick's proposal must seed the fresh instance so the poll \
+             that agrees with it can publish it (#3642)"
+        );
     }
 
     #[test]
-    fn seed_unknown_tracking_leaves_unknown_ids_untouched() {
+    fn seed_tick_tracking_leaves_unknown_ids_untouched() {
         let mut fresh = vec![Instance::new("sess-unseen", "/tmp/seed")];
         let prev = std::collections::HashMap::new();
 
-        seed_unknown_tracking(&mut fresh, &prev);
+        seed_tick_tracking(&mut fresh, &prev);
 
         assert!(!fresh[0].ever_confirmed_present);
         assert_eq!(fresh[0].unknown_since, None);
+        assert_eq!(
+            fresh[0].detection,
+            crate::session::DetectionState::default()
+        );
+    }
+
+    fn tmux_available() -> bool {
+        crate::tmux::tmux_command()
+            .arg("-V")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// #3642: the daemon rebuilds every row from disk each tick, so a
+    /// detection awaiting its confirming poll only survives through
+    /// `seed_tick_tracking`. Without that carry a hookless manifest agent
+    /// re-proposes the same Idle every tick, never meets its own proposal,
+    /// and the dashboard shows Running for the life of the session.
+    ///
+    /// Four ticks over a live pane parked on a screen no Claude rule matches,
+    /// each one starting from a fresh disk load as production does. The last
+    /// two also cover the capture-skip gate (#3600), which only reaches
+    /// production once this carry exists: on a skipped tick the status the
+    /// row came off disk with has to be the one that stands.
+    #[test]
+    #[serial_test::serial]
+    fn a_proposal_survives_the_tick_that_reloads_its_row_from_disk() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not available");
+            return;
+        }
+
+        // Never mutated: cloning it is this test's disk load, so every
+        // `#[serde(skip)]` field starts at its default exactly as
+        // `load_all_instances` leaves it.
+        let mut on_disk = Instance::new("aoe_test_3642_tick", "/tmp");
+        on_disk.status = Status::Running;
+        assert_eq!(
+            on_disk.tool, "claude",
+            "fixture invariant: this test needs an agent with a manifest"
+        );
+
+        let session_name = crate::tmux::Session::generate_name(&on_disk.id, &on_disk.title);
+        let _kill = crate::tmux::test_helpers::TmuxTestSession::from_name(session_name.clone());
+        let created = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &session_name,
+                "-x",
+                "120",
+                "-y",
+                "40",
+                "printf 'turn over\n'; sleep 300",
+            ])
+            .output()
+            .expect("spawn tmux");
+        assert!(
+            created.status.success(),
+            "tmux new-session failed: {}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let cache = crate::tmux::SessionCacheGuard::capture();
+        cache.force_present(&[session_name.as_str()]);
+
+        let mut prev = std::collections::HashMap::from([(on_disk.id.clone(), Status::Running)]);
+        let mut tracking: std::collections::HashMap<String, PriorTickTracking> =
+            std::collections::HashMap::new();
+
+        // One daemon tick, reporting the status it settled on and the rule
+        // that decided. `window_activity` is supplied rather than scraped so
+        // the capture-skip gate is driven, not raced.
+        let mut tick = |window_activity: Option<i64>| {
+            let metadata = std::collections::HashMap::from([(
+                session_name.clone(),
+                crate::tmux::PaneMetadata {
+                    pane_dead: false,
+                    pane_current_command: Some("claude".to_string()),
+                    pane_start_command_is_protected: false,
+                    pane_pid: None,
+                    pane_title: None,
+                    window_activity,
+                },
+            )]);
+            let mut instances = vec![on_disk.clone()];
+            seed_tick_tracking(&mut instances, &tracking);
+            apply_tick_status_decisions(
+                &mut instances,
+                &prev,
+                &std::collections::HashSet::new(),
+                Some(&metadata),
+            );
+            tracking = instances
+                .iter()
+                .map(|i| (i.id.clone(), PriorTickTracking::of(i)))
+                .collect();
+            // A passive transition reaches disk in the tick that publishes it
+            // (`flush_passive_transition_writes`), so the next tick's disk
+            // load agrees with what this one decided.
+            on_disk.status = instances[0].status;
+            prev.insert(instances[0].id.clone(), instances[0].status);
+            (instances[0].status, instances[0].detection.rule)
+        };
+
+        // No activity stamp: nothing to skip against, so both ticks decide on
+        // a real capture.
+        assert_eq!(
+            tick(None).0,
+            Status::Running,
+            "an unwitnessed Idle waits for a tick that agrees with it"
+        );
+        assert_eq!(
+            tick(None).0,
+            Status::Idle,
+            "the tick that agrees publishes it (#3642)"
+        );
+
+        // A stamp whose second is already past: the tick that records it still
+        // captures, and the one after it has the proof the gate asks for.
+        let settled = Utc::now().timestamp() - 60;
+        assert_eq!(tick(Some(settled)).0, Status::Idle);
+        assert_eq!(
+            tick(Some(settled)),
+            (Status::Idle, Some("screen_unchanged")),
+            "a skipped tick must leave the published status standing, not \
+             re-derive one from a row it did not capture for"
+        );
     }
 
     #[test]

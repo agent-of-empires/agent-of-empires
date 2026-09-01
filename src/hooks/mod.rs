@@ -487,13 +487,8 @@ fn hook_command_session_id_sandbox(base: &str, field: crate::agents::HookIdentit
             r#"if (.conversation_id|type)=="string" then .conversation_id elif (.session_id|type)=="string" then .session_id else empty end"#
         }
     };
-    // `jq -r` does the structural top-level extraction symmetric with the
-    // host's `serde_json` path. POSIX `case` enforces the UUID shape after
-    // jq returns, because `case` has no `{N}` quantifier we expand the
-    // 8-4-4-4-12 layout literally over the `$H` hex-class abbreviation.
-    // The `'\''` close-escape-reopen is the standard shell idiom for a
-    // literal single-quote inside a single-quoted `sh -c '...'`; in Rust
-    // source that is `'\\''`.
+    // jq performs structural top-level extraction like the host path. The
+    // POSIX guards then enforce the shared shell-safe session-id contract.
     format!(
         "sh -c 'unset IFS; set -f; umask 077; \
          [ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
@@ -504,8 +499,8 @@ fn hook_command_session_id_sandbox(base: &str, field: crate::agents::HookIdentit
          case \"$M\" in drwx------|drwx------.|drwx------+|drwx------@) ;; *) exit 0 ;; esac; \
          command -v jq >/dev/null 2>&1 || exit 0; \
          SID=$(jq -r '\\''{selector}'\\'' 2>/dev/null); \
-         H=[0-9a-fA-F]; \
-         case \"$SID\" in $H$H$H$H$H$H$H$H-$H$H$H$H-$H$H$H$H-$H$H$H$H-$H$H$H$H$H$H$H$H$H$H$H$H) ;; *) exit 0 ;; esac; \
+         case \"$SID\" in \"\"|*[!0-9a-zA-Z._-]*) exit 0 ;; esac; \
+         [ \"${{#SID}}\" -le 256 ] || exit 0; \
          printf \"%s\" \"$SID\" > \"$D/.session_id.$$.tmp\" 2>/dev/null && mv \"$D/.session_id.$$.tmp\" \"$D/session_id\" 2>/dev/null; \
          exit 0 # {AOE_HOOK_MARKER}'"
     )
@@ -4999,7 +4994,7 @@ hooks_auto_accept: false
         }
         let tmp = TempDir::new().unwrap();
         let nested = "11111111-2222-3333-4444-555555555555";
-        let top_level = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let top_level = "conversation_opaque.123";
         let payload =
             format!(r#"{{"context":{{"session_id":"{nested}"}},"session_id":"{top_level}"}}"#);
         let output = run_session_id_hook(&payload, "sandbox_top_wins", tmp.path());
@@ -5336,8 +5331,12 @@ hooks_auto_accept: false
             "missing jq string-type gate: {cmd}"
         );
         assert!(
-            cmd.contains("H=[0-9a-fA-F]"),
-            "missing hex-class abbreviation for UUID case: {cmd}"
+            cmd.contains("case \"$SID\" in \"\"|*[!0-9a-zA-Z._-]*) exit 0 ;; esac"),
+            "missing session-id allowlist: {cmd}"
+        );
+        assert!(
+            cmd.contains("[ \"${#SID}\" -le 256 ] || exit 0"),
+            "missing session-id length guard: {cmd}"
         );
         assert!(
             cmd.contains(".session_id.$$.tmp"),

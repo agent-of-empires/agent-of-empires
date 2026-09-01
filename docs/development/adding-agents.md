@@ -26,22 +26,16 @@ Each level is additive; do only what the agent supports.
 | 1. Basic | Appears in `aoe agents`, sessions launch, status always "Idle" | `AgentDef` + stub `detect_status` |
 | 2. Pane-parse status | Status inferred from terminal output; no agent config | A manifest in `src/tmux/detect/manifests/`, plus a `detect_<agent>_status(&str) -> Status` calling into it |
 | 3. Hook status | Agent writes status to a file via hooks; lands the instant state changes | `hook_config` + generic `install_hooks()`, or `sidecar_hooks` + a custom `install_<agent>_hooks()` |
-| 4. Session resume | Restart resumes the same native conversation | A complete `session_support` contract: resume argv, capture backend, and declared host/sandbox authority |
+| 4. Session resume | Restart resumes the same native conversation | A `session_support` contract with verified resume argv and, when available, an authoritative capture backend |
 | 5. Docker sandbox | Runs isolated; host config synced in | `AgentConfigMount` + Dockerfile install |
 
-Levels 3 and 4 are independent. `session_support` pairs resume argv with the
-only capture backend allowed to supply its id. Each environment is explicitly
-`PaneScoped`, `Preassigned`, `ManagedExclusiveStore`, or `Unsupported`.
-Unsupported environments never discover an id automatically. An explicit
-`Use` or `Fork` id is still authoritative for an agent with a verified native
-resume contract. Managed-store capture requires a physically per-instance
-store, cwd match, launch-time floor, and cross-process ownership lease.
+Levels 3 and 4 are independent. `session_support` declares verified native resume argv. Its optional capture spec is the only backend allowed to supply an ID, with each environment explicitly `PaneScoped`, `Preassigned`, `ManagedExclusiveStore`, or `Unsupported`. Agents with verified resume argv but no authoritative identity source use `capture: None`: explicit `Use` and `Fork` IDs work, while automatic capture remains off. Agents without a verified native resume contract have no `session_support`. Managed-store capture requires a physically per-instance store, cwd match, launch-time floor, and cross-process ownership lease. `agent_status_hooks = false` disables status writers but not declared authoritative identity hooks.
 
 ## Steps
 
 **1. Research:** binary name, detection (`which`), YOLO flag, exact native resume/fork argv, authoritative session-id source, host and sandbox storage paths, hook identity field, config dir, and install command. Treat an unverified environment as unsupported.
 
-**2. `AgentDef` (`src/agents.rs`):** add to `AGENTS`. Declare detection, YOLO mode, hooks, lifecycle, and a complete `SessionSupport` when native resume is supported. The capture spec names one backend plus separate host and sandbox contexts. Hook-based capture must declare `HookIdentityField::SessionId` or `ConversationIdOrSessionId` from the upstream payload contract. Store-backed capture is permitted only for an exact managed store with cwd filtering, a pre-launch time floor, and exclusive ownership. Leave `session_support` absent when any resume/capture pairing is unproven; do not add an argv-only capability or a fallback scan.
+**2. `AgentDef` (`src/agents.rs`):** add to `AGENTS`. Declare detection, YOLO mode, hooks, lifecycle, and `SessionSupport` when native resume argv is verified. Add a capture spec only for an authoritative source; it names one backend plus separate host and sandbox contexts. Hook-based capture must declare `HookIdentityField::SessionId` or `ConversationIdOrSessionId` from the upstream payload contract. Store-backed capture is permitted only for an exact managed store with cwd filtering, a pre-launch time floor, and exclusive ownership. Use `capture: None` for argv-only support and omit `session_support` when resume argv itself is unverified.
 
 **3. Status detection:** an agent whose pane carries state gets a manifest in `src/tmux/detect/manifests/<agent>.toml`, and a `detect_<agent>_status` that calls into it (see `detect_claude`). Rules are `{id, state, priority, region, matcher}` and the highest-priority match wins, so a new case is a row rather than another branch. The hook file is a rule too (`region = "hook"`), which is what lets a blocking prompt on screen outrank a `running` write, and what bounds how long an unrefreshed write keeps its authority. Give a rule `visible = true` only when it reads the state off the agent's own live chrome: that is what lets the poller publish it without waiting for a confirming capture. Agents with no pane signal keep a stub returning `Status::Idle`. See `src/tmux/detect/mod.rs` for the region vocabulary.
 
@@ -100,7 +94,7 @@ Cursor uses version 1 `.cursor/hooks.json`, with direct command entries under `h
 
 The generic JSON payload above, written to `hooks.json` in Codex's config dir rather than to a settings file: set `hook_config: Some(AgentHookConfig { settings_rel_path: ".codex/hooks.json", format: HookFormat::CodexJson, ... })`. `codex_hooks_json_path_in()` resolves `CODEX_HOME` (else `~/.codex`) and the generic `install_hooks()` writes it. Codex status weighs the hook write against its manifest rules by declared priority, so a prompt on screen outranks a `running` write.
 
-`install_codex_hooks_with_preserved_state()` / `uninstall_codex_hooks()` write Codex's `config.toml` instead; they exist only for the v015/v017/v018 migrations that repair or strip hooks AoE once wrote there.
+Codex's separate `config.toml` stores `[hooks.state]` trust data and `[features].hooks = false`; its mutations are serialized with `config.toml.lock` and committed by atomic replacement. `install_codex_hooks_with_preserved_state()` / `uninstall_codex_hooks()` exist only for the v015/v017/v018 migrations that repair or strip hooks AoE once wrote there. Do not point `settings_rel_path` at `config.toml`.
 
 ### Hermes (custom YAML)
 

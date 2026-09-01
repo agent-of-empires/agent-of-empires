@@ -53,10 +53,10 @@ impl Instance {
     /// conversation, and a store keyed by cwd cannot say which pane owns what.
     /// Reads memory only: this runs per session on every TUI refresh.
     pub fn supports_session_poller(&self) -> bool {
-        let Some((support, context)) = self.resolved_session_support() else {
+        let Some((capture, context)) = self.resolved_session_support() else {
             return false;
         };
-        match support.capture.backend {
+        match capture.backend {
             crate::agents::SessionCaptureBackend::OpenCode => false,
             crate::agents::SessionCaptureBackend::Pi => self.uses_pi_session_sidecar(),
             _ => context != crate::agents::SessionCaptureContext::Preassigned,
@@ -124,10 +124,10 @@ impl Instance {
     }
 
     pub(super) fn maybe_start_poller_since(&mut self, omp_metadata: Option<OmpCaptureMetadata>) {
-        let Some((support, context)) = self.resolved_session_support() else {
+        let Some((capture, context)) = self.resolved_session_support() else {
             return;
         };
-        let backend = support.capture.backend;
+        let backend = capture.backend;
         if !self.supports_session_poller() {
             return;
         }

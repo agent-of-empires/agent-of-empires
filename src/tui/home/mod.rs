@@ -35,7 +35,6 @@ mod watchers;
 // go through the `super::live_send::LiveSendState` path.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
 
 use ratatui::prelude::Rect;
 use tui_input::Input;
@@ -346,16 +345,10 @@ pub struct HomeView {
     /// at, so the reconcile can tell when the displayed pane changed and
     /// retarget. `None` before the first preview or when nothing is selected.
     pub(super) preview_capture_target: Option<String>,
-    /// Last observed `LiveCaptureWorker::cycles` value and when it was seen,
-    /// so the render thread can tell a running worker with nothing new (an
-    /// idle pane) from a wedged one. `None` before the first observation and
-    /// after every retarget.
-    ///
-    /// This gates the synchronous fallback fork. Without it the 250ms idle
-    /// poll re-forked `capture-pane` on the render thread to re-read content
-    /// the worker had already reported unchanged: measured at 10-50ms per
-    /// fork against a 429x113 terminal, one to three whole frame budgets
-    /// burned every 250ms of simply looking at an idle session.
+    /// Last observed `LiveCaptureWorker::cycles` value and when it advanced.
+    /// `None` before the first observation and after every retarget. If it
+    /// remains unchanged beyond the shared tmux operation deadline plus grace,
+    /// render replaces the worker without executing tmux synchronously.
     pub(super) preview_worker_pulse: Option<(u64, std::time::Instant)>,
     /// Notified by the capture worker thread when it has fresh, changed
     /// content. The event loop selects on this to repaint without
@@ -365,6 +358,10 @@ pub struct HomeView {
     /// the current live-send session. Used to dedup the resize messages
     /// fired from the preview refresh path; cleared on live-send exit.
     pub(super) live_send_last_resize: Option<(u16, u16)>,
+    /// Earliest time the same live-send geometry may retry after a worker
+    /// failure. Keeps a dead or unreachable pane from turning the render
+    /// ticker into a tmux subprocess loop.
+    pub(super) live_send_resize_retry_at: Option<std::time::Instant>,
     /// True between a live-send leader press and the next key. While armed,
     /// the next key is interpreted as a live-send command (palette, sidebar
     /// toggle, exit) rather than forwarded to the agent, and the status bar
@@ -561,17 +558,9 @@ pub struct HomeView {
     pub(super) container_terminal_preview_cache: PreviewCache,
     pub(super) tool_preview_cache: PreviewCache,
 
-    /// Per-frame timing of the preview pipeline's two latency-sensitive
-    /// phases, reset by `App::render` before each `render` and populated
-    /// at the agent-preview call site. `capture` is the `tmux
-    /// capture-pane` fork (sub-100us when the gate short-circuits, ~1-10ms
-    /// when it actually forks); `parse` is the `ansi-to-tui` pass (~0 on a
-    /// parsed-cache hit). The app loop's render sampler reads these to
-    /// break a live-send frame down into fork vs. parse vs. widget build.
+    /// Paint-side preview timings used to split mailbox/cache application,
+    /// ANSI parsing, and widget construction in slow-frame traces.
     pub(super) preview_timings: PreviewTimings,
-
-    /// Mouse wheel offset for the preview pane, in lines back from the bottom.
-    /// Reset to 0 whenever the selected session changes.
     pub(super) preview_scroll_offset: u16,
     pub(super) preview_area: Rect,
     /// Sub-rect of `preview_area` where the agent's captured pane content

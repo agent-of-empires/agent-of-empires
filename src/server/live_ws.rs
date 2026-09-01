@@ -622,8 +622,7 @@ async fn handle_live_ws(
                             let claimed = tokio::task::spawn_blocking(move || {
                                 let session = crate::tmux::Session::from_name(&name);
                                 if session.claim_size_owner(&who, SIZE_OWNER_TTL) {
-                                    session.resize_window(cols, rows);
-                                    true
+                                    session.resize_window_if_owner(&who, cols, rows)
                                 } else {
                                     false
                                 }
@@ -902,8 +901,7 @@ async fn handle_live_ws(
                                 let owned = tokio::task::spawn_blocking(move || {
                                     let session = crate::tmux::Session::from_name(&name);
                                     if session.claim_size_owner(&who, SIZE_OWNER_TTL) {
-                                        session.resize_window(cols, rows);
-                                        true
+                                        session.resize_window_if_owner(&who, cols, rows)
                                     } else {
                                         false
                                     }
@@ -963,9 +961,10 @@ async fn handle_live_ws(
                                     let session = crate::tmux::Session::from_name(&name);
                                     if session.steal_size_owner(&who) {
                                         if cols > 0 && rows > 0 {
-                                            session.resize_window(cols, rows);
+                                            session.resize_window_if_owner(&who, cols, rows)
+                                        } else {
+                                            true
                                         }
-                                        true
                                     } else {
                                         false
                                     }

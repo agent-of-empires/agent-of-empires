@@ -480,7 +480,7 @@ impl SessionResponse {
             },
             // Shares `agent_is_structured_fork_capable` with the create-time
             // guard so the web "Fork" affordance and server-side acceptance
-            // cannot drift: forkable = ACP-capable AND a real fork strategy.
+            // cannot drift: forkable = built-in ACP adapter verified to fork.
             #[cfg(feature = "serve")]
             acp_can_fork: agent_is_structured_fork_capable(&inst.tool, inst.agent_name.as_deref()),
             // Same agent resolution as `acp_agent` above; computed once here so
@@ -1292,8 +1292,15 @@ pub async fn rename_session(
     // worktree edit) so the tied git move and the metadata write don't race.
     // Prompt submission has its own authority and never takes `instance_lock`
     // (#3621), so hold that one too or a queue drain lands a follow-up on the
-    // worker this quiesces for the move. Submission first, as it documents.
-    let _submission = state.session_service.prompt_submission(&id).await;
+    // worker this quiesces for the move. Submission first, as it documents,
+    // and via the admission form so an unknown id allocates neither lock.
+    let Some(_submission) = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await
+    else {
+        return super::session_not_found();
+    };
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
 
@@ -1750,8 +1757,15 @@ pub async fn set_worktree_name(
     // another rename) so the git ops and the metadata write don't race.
     // Prompt submission has its own authority and never takes `instance_lock`
     // (#3621), so hold that one too or a queue drain lands a follow-up on the
-    // worker this quiesces for the move. Submission first, as it documents.
-    let _submission = state.session_service.prompt_submission(&id).await;
+    // worker this quiesces for the move. Submission first, as it documents,
+    // and via the admission form so an unknown id allocates neither lock.
+    let Some(_submission) = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await
+    else {
+        return super::session_not_found();
+    };
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
 
@@ -2905,6 +2919,15 @@ pub async fn update_session_archive(
         Err(rej) => return rej.into_response(),
     };
 
+    // Worker-stopping barrier: submission guard before `instance_lock`, per
+    // `prompt_submission` (#3650).
+    let Some(_submission) = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await
+    else {
+        return super::session_not_found();
+    };
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
 
@@ -3052,6 +3075,15 @@ pub async fn trash_session(
     }
     let body = body.map(|Json(body)| body).unwrap_or_default();
 
+    // Worker-stopping barrier: submission guard before `instance_lock`, per
+    // `prompt_submission` (#3650).
+    let Some(_submission) = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await
+    else {
+        return super::session_not_found();
+    };
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
     let (profile, snapshot) = {
@@ -3648,6 +3680,15 @@ pub async fn stop_session(
         return super::read_only_response();
     }
 
+    // Worker-stopping barrier: submission guard before `instance_lock`, per
+    // `prompt_submission` (#3650).
+    let Some(_submission) = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await
+    else {
+        return super::session_not_found();
+    };
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
 
@@ -4029,6 +4070,15 @@ pub async fn update_session_snooze(
         }
     }
 
+    // Worker-stopping barrier: submission guard before `instance_lock`, per
+    // `prompt_submission` (#3650).
+    let Some(_submission) = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await
+    else {
+        return super::session_not_found();
+    };
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
 
@@ -4613,6 +4663,17 @@ pub(crate) async fn purge_expired_trash(state: &Arc<AppState>) {
             continue;
         }
 
+        // Submission authority before `instance_lock`, as the permanent
+        // `DELETE` path takes them: teardown must not start under an in-flight
+        // queue drain (#3650). A row that vanished since the snapshot is
+        // skipped here rather than below.
+        let Some(_submission) = state
+            .session_service
+            .prompt_submission_for_session(&id)
+            .await
+        else {
+            continue;
+        };
         let lock = state.instance_lock(&id).await;
         let _guard = lock.lock().await;
 
@@ -4671,10 +4732,20 @@ pub async fn delete_session(
 
     let body = body.map(|Json(b)| b).unwrap_or_default();
 
-    // Acquire per-instance lock to serialize concurrent mutations.
-    // Owned guard so it can move into the detached deletion task below and
-    // stay held until the bookkeeping finishes, rather than only until this
-    // request future is dropped.
+    // Serialize concurrent mutations. Prompt submission first, per
+    // `prompt_submission`: a queue drain snapshots an idle turn under that
+    // guard and never takes `instance_lock`, so without it the delivery runs
+    // against a worker, worktree and transcript this is tearing down (#3650).
+    // Both guards are owned so they move into the detached deletion task below
+    // and stay held until the bookkeeping finishes, rather than only until
+    // this request future is dropped.
+    let Some(submission) = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await
+    else {
+        return super::session_not_found();
+    };
     let lock = state.instance_lock(&id).await;
     let guard = lock.lock_owned().await;
 
@@ -4705,6 +4776,7 @@ pub async fn delete_session(
     // until the bookkeeping finishes.
     let join = tokio::spawn(async move {
         let _guard = guard;
+        let _submission = submission;
 
         // Mark as Deleting so polling clients see the status change
         {
@@ -4871,15 +4943,16 @@ fn workspace_dirty_message(instance: &Instance) -> Option<String> {
 /// shared-worktree owner last (see [`order_workspace_deletion`]). Each session
 /// goes through the shared [`purge_session_artifacts`].
 ///
-/// The owner's instance lock is acquired up front and held for the whole
-/// teardown, and the dirty-worktree gate is re-checked under that lock right
-/// before any sibling is torn down. This serializes the dirty check with the
-/// teardown so dirty + non-force stays all-or-nothing even if the worktree is
-/// dirtied between the handler preflight and now, and it cannot deadlock: a
-/// session belongs to exactly one workspace, so two workspace deletes never
-/// contend for each other's locks, and single-session deletes only ever hold
-/// one lock at a time. Sibling locks are then taken one at a time. A session
-/// already gone (a retention purge won the race) is skipped, not failed; a
+/// The owner's submission guard and instance lock are acquired up front and
+/// held for the whole teardown, and the dirty-worktree gate is re-checked
+/// under them right before any sibling is torn down. This serializes the dirty
+/// check with the teardown so dirty + non-force stays all-or-nothing even if
+/// the worktree is dirtied between the handler preflight and now, and it
+/// cannot deadlock: a session belongs to exactly one workspace, so two
+/// workspace deletes never contend for each other's locks, and single-session
+/// deletes only ever hold one session's locks at a time. Sibling locks are
+/// then taken one session at a time. A session already gone (a retention purge
+/// won the race) is skipped, not failed; a
 /// pre-owner failure aborts before the worktree is removed, so the shared
 /// worktree keeps its live owning session rather than being orphaned. A
 /// session whose row a concurrent restore kept (`removed == false`) is reported
@@ -4894,7 +4967,12 @@ async fn purge_workspace_artifacts(
     let mut failed = Vec::new();
     let mut messages = Vec::new();
 
-    // Hold the owner lock across the entire teardown (see doc comment).
+    // Hold the owner's locks across the entire teardown (see doc comment).
+    // `None` only when the owner row already vanished; the plan loop skips it.
+    let _owner_submission = state
+        .session_service
+        .prompt_submission_for_session(&owner_id)
+        .await;
     let owner_lock = state.instance_lock(&owner_id).await;
     let _owner_guard = owner_lock.lock_owned().await;
 
@@ -4918,12 +4996,18 @@ async fn purge_workspace_artifacts(
     }
 
     for (id, body) in plan {
-        // The owner lock is already held; only siblings need their own lock,
+        // The owner's locks are already held; only siblings need their own,
         // one at a time. Re-locking the owner here would self-deadlock.
-        let _sibling_guard = if id == owner_id {
+        let _sibling_locks = if id == owner_id {
             None
         } else {
-            Some(state.instance_lock(&id).await.lock_owned().await)
+            Some((
+                state
+                    .session_service
+                    .prompt_submission_for_session(&id)
+                    .await,
+                state.instance_lock(&id).await.lock_owned().await,
+            ))
         };
 
         let instance = {
@@ -10367,6 +10451,324 @@ mod tests {
             "default",
             project.path()
         ));
+    }
+
+    /// Build one structured, idle session with an empty `source_profile`, so
+    /// `purge_session_artifacts` refuses on its first line. The teardown that
+    /// follows is what a delete must not start under an in-flight submission;
+    /// these tests only need to observe that it waits for one.
+    #[cfg(feature = "serve")]
+    fn delete_race_state(id: &str) -> std::sync::Arc<crate::server::AppState> {
+        delete_race_state_for(&[id])
+    }
+
+    /// [`delete_race_state`] for a workspace: every id shares the shape, so a
+    /// sibling teardown can be observed the same way the owner's is.
+    #[cfg(feature = "serve")]
+    fn delete_race_state_for(ids: &[&str]) -> std::sync::Arc<crate::server::AppState> {
+        let instances = ids
+            .iter()
+            .map(|id| {
+                let mut inst = Instance::new("delete-3650", "/tmp/aoe-3650-delete");
+                inst.id = (*id).to_string();
+                inst.view = crate::session::View::Structured;
+                inst.status = Status::Idle;
+                inst
+            })
+            .collect();
+        crate::server::test_support::build_test_app_state(instances)
+    }
+
+    /// #3650: prompt submission moved off `instance_lock`, so a permanent
+    /// delete that takes only `instance_lock` no longer excludes a queue drain
+    /// that snapshotted an idle turn and is on its way to `send_turn`. The
+    /// delete would then stop the worker, purge the transcript and remove the
+    /// worktree under a delivery already in flight.
+    ///
+    /// Each permanent-delete path is checked the same way: hold the session's
+    /// submission guard (standing in for that drain) and assert the delete
+    /// parks before any teardown, then completes once the guard drops.
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn permanent_deletion_waits_for_an_in_flight_submission() {
+        use std::time::Duration;
+
+        // Direct delete.
+        let state = delete_race_state("sess-3650-direct");
+        let delivering = state
+            .session_service
+            .prompt_submission("sess-3650-direct")
+            .await;
+        let delete = tokio::spawn({
+            let state = std::sync::Arc::clone(&state);
+            async move {
+                delete_session(
+                    State(state),
+                    Path("sess-3650-direct".to_string()),
+                    Some(Json(DeleteSessionBody::default())),
+                )
+                .await
+                .into_response()
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !delete.is_finished(),
+            "a delete must not tear a session down under an in-flight submission"
+        );
+        assert_eq!(
+            state.instances.read().await[0].status,
+            Status::Idle,
+            "the session must not even be marked Deleting yet"
+        );
+        drop(delivering);
+        tokio::time::timeout(Duration::from_secs(10), delete)
+            .await
+            .expect("the delete lands once the submission releases the session")
+            .expect("delete task must not panic");
+
+        // Workspace teardown, on the owner's own guard.
+        let state = delete_race_state("sess-3650-owner");
+        let delivering = state
+            .session_service
+            .prompt_submission("sess-3650-owner")
+            .await;
+        let workspace = tokio::spawn({
+            let state = std::sync::Arc::clone(&state);
+            async move {
+                purge_workspace_artifacts(
+                    &state,
+                    "sess-3650-owner".to_string(),
+                    vec![("sess-3650-owner".to_string(), DeleteSessionBody::default())],
+                    false,
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !workspace.is_finished(),
+            "a workspace teardown must wait for the owner's in-flight submission"
+        );
+        drop(delivering);
+        tokio::time::timeout(Duration::from_secs(10), workspace)
+            .await
+            .expect("the workspace teardown lands once the submission releases")
+            .expect("workspace task must not panic");
+
+        // Workspace teardown, on a sibling's guard. The owner's is free, so
+        // the plan loop reaches the sibling and must park there: the owner is
+        // ordered last, and a sibling torn down under a live delivery is the
+        // case #3650 names alongside the direct delete.
+        let state = delete_race_state_for(&["sess-3650-sib", "sess-3650-ws-owner"]);
+        let delivering = state
+            .session_service
+            .prompt_submission("sess-3650-sib")
+            .await;
+        let workspace = tokio::spawn({
+            let state = std::sync::Arc::clone(&state);
+            async move {
+                purge_workspace_artifacts(
+                    &state,
+                    "sess-3650-ws-owner".to_string(),
+                    vec![
+                        ("sess-3650-sib".to_string(), DeleteSessionBody::default()),
+                        (
+                            "sess-3650-ws-owner".to_string(),
+                            DeleteSessionBody::default(),
+                        ),
+                    ],
+                    false,
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !workspace.is_finished(),
+            "a workspace teardown must wait for a sibling's in-flight submission"
+        );
+        assert!(
+            state
+                .instances
+                .read()
+                .await
+                .iter()
+                .all(|i| i.status == Status::Idle),
+            "no row may be marked Deleting while the sibling's submission is in flight"
+        );
+        drop(delivering);
+        tokio::time::timeout(Duration::from_secs(10), workspace)
+            .await
+            .expect("the workspace teardown lands once the sibling submission releases")
+            .expect("workspace task must not panic");
+    }
+
+    /// The retention purge's copy of the same barrier. It resolves profile
+    /// config, which reads the user's global config, before it reaches the
+    /// guard, so the race above cannot cover it without reading user state.
+    /// The lock order is asserted in the source instead.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn the_retention_purge_takes_submission_before_the_instance_lock() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server/api/sessions.rs"),
+        )
+        .unwrap();
+        let start = source
+            .find("pub(crate) async fn purge_expired_trash")
+            .unwrap();
+        let body = &source[start..];
+        let submission = body.find("prompt_submission_for_session(&id)").unwrap();
+        let inst_lock = body.find("state.instance_lock(&id).await").unwrap();
+        let purge = body.find("purge_session_artifacts(").unwrap();
+        assert!(
+            submission < inst_lock,
+            "submission authority is taken first"
+        );
+        assert!(inst_lock < purge, "both are held across the teardown");
+    }
+
+    /// #3650's barrier applies to every handler that stops a worker, not just
+    /// the ones that delete a session. `drain_queued_prompts_once` reads the
+    /// status and the trashed/archived/snoozed flags once under the submission
+    /// guard and only then reaches `send_turn`, which respawns a worker it
+    /// finds gone. So a stop that lands inside that window is undone: the user
+    /// presses Stop and the session comes back running the queued prompt.
+    ///
+    /// Before #3639 the drain held `instance_lock` across delivery and these
+    /// four handlers were excluded by it. They take the submission guard now
+    /// for the same reason `attach_project` and the tied renames do.
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn worker_stopping_handlers_wait_for_an_in_flight_submission() {
+        use std::time::Duration;
+
+        async fn call(
+            which: &str,
+            state: std::sync::Arc<crate::server::AppState>,
+            id: String,
+        ) -> axum::response::Response {
+            match which {
+                "stop" => stop_session(State(state), Path(id)).await.into_response(),
+                "trash" => trash_session(State(state), Path(id), None)
+                    .await
+                    .into_response(),
+                "archive" => update_session_archive(
+                    State(state),
+                    Path(id),
+                    Ok(Json(UpdateArchiveBody {
+                        archived: true,
+                        kill_pane: true,
+                    })),
+                )
+                .await
+                .into_response(),
+                "snooze" => update_session_snooze(
+                    State(state),
+                    Path(id),
+                    Ok(Json(UpdateSnoozeBody { minutes: Some(30) })),
+                )
+                .await
+                .into_response(),
+                other => unreachable!("unknown handler {other}"),
+            }
+        }
+
+        for which in ["stop", "trash", "archive", "snooze"] {
+            let id = format!("sess-3650-{which}");
+            let state = delete_race_state(&id);
+            let delivering = state.session_service.prompt_submission(&id).await;
+            let handler = tokio::spawn({
+                let state = std::sync::Arc::clone(&state);
+                let id = id.clone();
+                async move { call(which, state, id).await }
+            });
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                !handler.is_finished(),
+                "{which} must not quiesce a worker a submission is mid-delivery on"
+            );
+            assert_eq!(
+                state.instances.read().await[0].status,
+                Status::Idle,
+                "{which} must not have touched the session yet"
+            );
+
+            drop(delivering);
+            tokio::time::timeout(Duration::from_secs(10), handler)
+                .await
+                .unwrap_or_else(|_| panic!("{which} must finish once the submission releases"))
+                .unwrap_or_else(|e| panic!("{which} task must not panic: {e}"));
+        }
+    }
+
+    /// #3651: `prompt_submission` auto-vivifies a registry entry for whatever
+    /// id it is handed and nothing prunes it, so every externally reachable
+    /// mutation that claims it must prove the session exists first. Otherwise
+    /// an authenticated client grows daemon memory with random ids.
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn session_mutations_allocate_no_prompt_lock_for_an_unknown_id() {
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let service = std::sync::Arc::clone(&state.session_service);
+
+        for i in 0..3 {
+            let id = format!("sess-gone-{i}");
+            assert_eq!(
+                rename_session(
+                    State(std::sync::Arc::clone(&state)),
+                    Path(id.clone()),
+                    Ok(Json(RenameSessionBody {
+                        title: "new title".to_string(),
+                        rename_branch: false,
+                    })),
+                )
+                .await
+                .into_response()
+                .status(),
+                StatusCode::NOT_FOUND
+            );
+            assert_eq!(
+                set_worktree_name(
+                    State(std::sync::Arc::clone(&state)),
+                    Path(id.clone()),
+                    Ok(Json(SetWorktreeNameBody {
+                        name: "new-dir".to_string(),
+                        rename_branch: false,
+                    })),
+                )
+                .await
+                .into_response()
+                .status(),
+                StatusCode::NOT_FOUND
+            );
+            assert!(matches!(
+                crate::server::attach_project::attach_project(
+                    &state,
+                    &id,
+                    std::path::Path::new("/tmp"),
+                    crate::session::attach_project::ExistingBranch::Refuse,
+                )
+                .await,
+                Err(crate::server::attach_project::AttachError::NotFound)
+            ));
+            assert!(matches!(
+                service
+                    .edit_queued_prompt(&id, "q1".to_string(), "text".to_string())
+                    .await,
+                crate::server::session_service::EditQueuedOutcome::NotFound
+            ));
+            assert!(!service.remove_queued_prompt(&id, "q1".to_string()).await);
+            service.clear_queued_prompts(&id).await;
+        }
+
+        assert_eq!(
+            service.prompt_locks_len().await,
+            0,
+            "an id that was never admitted must not leave a lock-registry entry behind"
+        );
     }
 
     #[test]

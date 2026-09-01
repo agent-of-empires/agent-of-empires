@@ -1009,7 +1009,9 @@ impl SessionService {
         prompt_id: String,
         text: String,
     ) -> EditQueuedOutcome {
-        let _submission = self.prompt_submission(id).await;
+        let Some(_submission) = self.prompt_submission_for_session(id).await else {
+            return EditQueuedOutcome::NotFound;
+        };
         self.mutate_instance_persisted(id, move |inst| {
             match inst.queued_prompts.iter_mut().find(|q| q.id == prompt_id) {
                 Some(q) if text.trim().is_empty() && q.attachments.is_empty() => {
@@ -1043,7 +1045,9 @@ impl SessionService {
         id: &str,
         prompt_id: String,
     ) -> bool {
-        let _submission = self.prompt_submission(id).await;
+        let Some(_submission) = self.prompt_submission_for_session(id).await else {
+            return false;
+        };
         let prompt_id_cleanup = prompt_id.clone();
         let removed = self
             .mutate_instance_persisted(id, move |inst| {
@@ -1069,7 +1073,9 @@ impl SessionService {
     /// the user watches the queue empty and then sees it sent anyway.
     #[cfg(feature = "serve")]
     pub(crate) async fn clear_queued_prompts(self: &Arc<Self>, id: &str) {
-        let _submission = self.prompt_submission(id).await;
+        let Some(_submission) = self.prompt_submission_for_session(id).await else {
+            return;
+        };
         let cleared_ids = self
             .mutate_instance_persisted(id, move |inst| {
                 let ids: Vec<String> = inst.queued_prompts.iter().map(|q| q.id.clone()).collect();
@@ -1378,9 +1384,18 @@ impl SessionService {
     /// `Queued` disposition ([`crate::acp::dispatch::PromptDispatch`]) is
     /// settled atomically for every surface that can start a turn (both prompt
     /// endpoints, the plugin host's `sessions.turn.send`, the queue drain, and
-    /// the pending-initial-turn drain). The quiesce barriers that stop a worker
-    /// under it (`attach_project`, the tied-worktree renames) hold it too, so a
-    /// drain cannot deliver into a worker they are about to stop. See #3621.
+    /// the pending-initial-turn drain). Every barrier that quiesces a worker
+    /// holds it too: stop, trash, archive, snooze, ACP shutdown, agent switch,
+    /// ACP disable, `attach_project`, the tied-worktree renames, and every
+    /// permanent delete. The drain reads status and the
+    /// trashed/archived/snoozed flags once and then reaches `send_turn`, which
+    /// respawns a worker it finds gone, so a quiesce landing inside that window
+    /// is undone and a delete races teardown against a live delivery. The
+    /// supervisor's reapers stay outside this: they drop a handle rather than
+    /// start a turn, so the worst they do to a delivery in flight is fail it,
+    /// and a failed delivery leaves its rows queued for the next tick. See
+    /// #3621 and #3650. Callers that have not yet proved the session exists take
+    /// [`Self::prompt_submission_for_session`] instead.
     ///
     /// Two rules make this work, and neither is optional:
     ///
@@ -1420,6 +1435,62 @@ impl SessionService {
                 .clone(),
         };
         lock.lock_owned().await
+    }
+
+    /// [`Self::prompt_submission`] for a caller that has not yet proved the
+    /// session exists. `None` means "do not act", and no registry entry is
+    /// left behind for an id that was never admitted: the registry
+    /// auto-vivifies per id it is asked for and nothing else prunes it, so an
+    /// authenticated client probing random ids would otherwise grow it for the
+    /// daemon's lifetime (#3651).
+    ///
+    /// The re-check under the guard is what makes a permanent delete a
+    /// barrier (#3650). A delete holds this guard across its irreversible
+    /// teardown and removes the session row before dropping its lock, so both
+    /// a waiter parked on that lock and one that vivified a fresh entry after
+    /// `forget_prompt_lock` observe the removal and decline.
+    #[cfg(feature = "serve")]
+    pub(crate) async fn prompt_submission_for_session(
+        &self,
+        id: &str,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        if !self.session_exists(id).await {
+            return None;
+        }
+        let guard = self.prompt_submission(id).await;
+        if !self.session_exists(id).await {
+            drop(guard);
+            self.forget_prompt_lock(id).await;
+            return None;
+        }
+        Some(guard)
+    }
+
+    /// Claim the session's submission authority and settle the prompt's
+    /// disposition under it, so every turn-starting surface decides and
+    /// dispatches as one step instead of dispatching unconditionally after
+    /// the wait (#3649). `None` for a session that no longer exists.
+    #[cfg(feature = "serve")]
+    pub(crate) async fn begin_prompt_submission(
+        &self,
+        id: &str,
+        idle_dormant: bool,
+    ) -> Option<(
+        tokio::sync::OwnedMutexGuard<()>,
+        crate::acp::dispatch::PromptDispatch,
+    )> {
+        let guard = self.prompt_submission_for_session(id).await?;
+        let liveness = crate::acp::dispatch::WorkerLiveness {
+            running: self.acp_supervisor.is_running(id).await,
+            idle_dormant,
+        };
+        let dispatch = crate::acp::dispatch::decide(&self.fold_control_state(id).await, liveness);
+        Some((guard, dispatch))
+    }
+
+    #[cfg(feature = "serve")]
+    async fn session_exists(&self, id: &str) -> bool {
+        self.instances.read().await.iter().any(|i| i.id == id)
     }
 
     /// Drop a deleted session's submission lock, mirroring the `instance_locks`

@@ -388,11 +388,10 @@ fn restore_or_remove(key: &str, prev: Option<OsString>) {
     //      matching `serial_test::serial(...)` group, because the mutex
     //      excludes guards across every group (and across un-annotated
     //      tests). `EnvGuard` shims a caller-chosen key (today also
-    //      `CODEX_HOME`, `VIBE_HOME`, `GEMINI_CLI_HOME`,
-    //      `CLAUDE_CONFIG_DIR`, the sibling `*_CONFIG_DIR` overrides, and
-    //      `AOE_MOUSE_CAPTURE`), so no fixed grep list can bound which
-    //      readers might race; routing every env mutation through the
-    //      guard is what keeps that open set safe.
+    //      `CODEX_HOME`, `GEMINI_CLI_HOME`, `CLAUDE_CONFIG_DIR`, the sibling
+    //      `*_CONFIG_DIR` overrides, and `AOE_MOUSE_CAPTURE`), so no fixed grep
+    //      list can bound which readers might race. Routing every env mutation
+    //      through the guard is what keeps that open set safe.
     //   2. The `#[tokio::test]` sites that use this helper all run on
     //      the default single-threaded runtime; no worker task reads env
     //      concurrently with the mutation.

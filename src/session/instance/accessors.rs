@@ -78,10 +78,7 @@ impl Instance {
             live_status_baseline: None,
             ever_confirmed_present: false,
             unknown_since: None,
-            detection_activity: None,
-            detection_captured_at: None,
-            detection_rule: None,
-            pending_detection: None,
+            detection: DetectionState::default(),
             pending_host_env: Vec::new(),
             capture_started_at: None,
             pi_extension_launched: false,
@@ -206,12 +203,6 @@ impl Instance {
         if command.is_empty() || contains_control(command) || contains_control(&self.extra_args) {
             return false;
         }
-        if crate::agents::get_agent(&self.tool).is_some()
-            && !self.command.is_empty()
-            && self.command.trim() != agent.binary
-        {
-            return false;
-        }
         shell_words::split(command)
             .ok()
             .and_then(|words| words.into_iter().next())
@@ -221,7 +212,7 @@ impl Instance {
     pub(super) fn resolved_session_support(
         &self,
     ) -> Option<(
-        &'static crate::agents::SessionSupport,
+        &'static crate::agents::SessionCaptureSpec,
         crate::agents::SessionCaptureContext,
     )> {
         let agent = self.resolved_agent()?;
@@ -229,17 +220,18 @@ impl Instance {
             return None;
         }
         let support = agent.session_support.as_ref()?;
+        let capture = support.capture.as_ref()?;
         let context = if self.is_sandboxed() {
-            support.capture.sandbox
+            capture.sandbox
         } else {
-            support.capture.host
+            capture.host
         };
-        (context != crate::agents::SessionCaptureContext::Unsupported).then_some((support, context))
+        (context != crate::agents::SessionCaptureContext::Unsupported).then_some((capture, context))
     }
 
     pub(super) fn resolved_capture_backend(&self) -> Option<crate::agents::SessionCaptureBackend> {
         self.resolved_session_support()
-            .map(|(support, _)| support.capture.backend)
+            .map(|(capture, _)| capture.backend)
     }
 
     pub fn supports_native_resume(&self) -> bool {
@@ -252,12 +244,15 @@ impl Instance {
         let Some(support) = agent.session_support.as_ref() else {
             return false;
         };
-        let context = if self.is_sandboxed() {
-            support.capture.sandbox
-        } else {
-            support.capture.host
-        };
-        context != crate::agents::SessionCaptureContext::Unsupported
+        let automatic = support.capture.is_some_and(|capture| {
+            let context = if self.is_sandboxed() {
+                capture.sandbox
+            } else {
+                capture.host
+            };
+            context != crate::agents::SessionCaptureContext::Unsupported
+        });
+        automatic
             || matches!(
                 self.resume_intent,
                 ResumeIntent::Use(_) | ResumeIntent::Fork { .. }
@@ -642,6 +637,8 @@ mod tests {
         inst.command = "claude --model opus".to_string();
         assert!(inst.supports_native_resume());
 
+        inst.tool = "claude".to_string();
+        assert!(inst.supports_native_resume());
         inst.command = "ssh -t host claude".to_string();
         assert!(!inst.supports_native_resume());
         inst.command = "claude > /tmp/transcript".to_string();

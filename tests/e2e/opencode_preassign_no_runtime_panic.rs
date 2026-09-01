@@ -11,11 +11,12 @@
 //! ```
 //!
 //! Running the preassign on a dedicated OS thread makes it safe regardless of
-//! the caller's context. This test launches a real host opencode session through
-//! the aoe binary with a fake opencode on PATH and proves automatic
-//! preassignment ran without triggering the nested-runtime panic.
+//! the caller's context. This test enables the opt-in setting, launches a real
+//! host OpenCode session through the AoE binary with a fake executable on PATH,
+//! and proves preassignment ran without triggering the nested-runtime panic.
 
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 
 use serial_test::parallel;
@@ -25,9 +26,9 @@ use crate::harness::{require_tmux, TuiTestHarness};
 const TITLE: &str = "OpencodePreassignE2E";
 const RUNTIME_PANIC: &str = "Cannot start a runtime from within a runtime";
 
-/// Install a fake opencode on PATH that records its argv and then idles.
-/// The fake serve never binds its port, so automatic preassignment times out
-/// and the launch proceeds without a guessed id.
+/// Install a fake OpenCode on PATH that records its argv and then idles.
+/// The fake server never binds its port, so opt-in preassignment times out and
+/// the launch proceeds without a guessed id.
 fn install_fake_opencode(h: &mut TuiTestHarness) -> PathBuf {
     let bin = h.install_path_command("opencode");
     let log = h.home_path().join("fake-opencode.log");
@@ -45,7 +46,15 @@ fn install_fake_opencode(h: &mut TuiTestHarness) -> PathBuf {
     }
     log
 }
-
+fn enable_preassign(h: &TuiTestHarness) {
+    let config_path = crate::harness::app_dir_in(h.home_path()).join("config.toml");
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(&config_path)
+        .unwrap_or_else(|error| panic!("failed to open {}: {error}", config_path.display()));
+    file.write_all(b"\n[session]\nopencode_preassign_session_id = true\n")
+        .expect("enable OpenCode preassignment");
+}
 struct StopSessionOnDrop<'a> {
     h: &'a TuiTestHarness,
 }
@@ -56,15 +65,16 @@ impl Drop for StopSessionOnDrop<'_> {
     }
 }
 
-/// Automatic host preassignment must not panic with "Cannot start a runtime
-/// from within a runtime".
+/// Opt-in host preassignment must not panic with "Cannot start a runtime from
+/// within a runtime".
 #[test]
 #[parallel]
-fn opencode_automatic_preassign_does_not_panic_nested_runtime() {
+fn opencode_opt_in_preassign_does_not_panic_nested_runtime() {
     require_tmux!();
 
     let mut h = TuiTestHarness::new("opencode_preassign_no_runtime_panic");
     let log_path = install_fake_opencode(&mut h);
+    enable_preassign(&h);
     let project = h.project_path();
 
     let add = h.run_cli(&[
@@ -82,9 +92,9 @@ fn opencode_automatic_preassign_does_not_panic_nested_runtime() {
     );
     let _cleanup = StopSessionOnDrop { h: &h };
 
-    // aoe session start reaches the automatic host preassign inside the
-    // Tokio CLI runtime. The fake server never becomes ready, so AoE launches
-    // without a native id instead of guessing one from the store.
+    // aoe session start reaches the opt-in host preassign inside the Tokio CLI
+    // runtime. The fake server never becomes ready, so AoE launches without a
+    // native id instead of guessing one from the store.
     let start = h.run_cli(&["session", "start", TITLE]);
     let stderr = String::from_utf8_lossy(&start.stderr);
 

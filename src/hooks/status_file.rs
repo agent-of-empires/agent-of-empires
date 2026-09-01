@@ -11,7 +11,6 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
-use uuid::Uuid;
 
 use crate::session::Status;
 
@@ -147,11 +146,7 @@ fn read_hook_session_id_within(
     let bytes =
         dir_guard::read_file_at(dir.as_fd(), "session_id", SESSION_ID_FILE_READ_CAP).ok()??;
     let id = std::str::from_utf8(&bytes).ok()?.trim().to_string();
-    if Uuid::parse_str(&id).is_ok() {
-        Some(id)
-    } else {
-        None
-    }
+    crate::session::capture::is_valid_session_id(&id).then_some(id)
 }
 
 /// Read the urgent flag from the hook-written `attention.json`.
@@ -434,9 +429,21 @@ mod tests {
 
     #[test]
     #[serial_test::serial(hook_base)]
-    fn test_read_hook_session_id_rejects_non_uuid() {
+    fn test_read_hook_session_id_accepts_safe_opaque_id() {
         let (_g, _, _tmp) = BaseGuard::ready();
-        write_session_id_sidecar("session_id_garbage", "not-a-uuid");
+        let id = "conversation_opaque.123";
+        write_session_id_sidecar("session_id_opaque", id);
+        assert_eq!(
+            read_hook_session_id("session_id_opaque").as_deref(),
+            Some(id)
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn test_read_hook_session_id_rejects_unsafe_id() {
+        let (_g, _, _tmp) = BaseGuard::ready();
+        write_session_id_sidecar("session_id_garbage", "unsafe id;");
         assert_eq!(read_hook_session_id("session_id_garbage"), None);
     }
 

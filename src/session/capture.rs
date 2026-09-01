@@ -307,35 +307,15 @@ fn compose_exclusion_in(
     set
 }
 
-/// Extend [`compose_exclusion`] with conversations same-project peers parked
-/// for `current_tool` during an engine swap. When
-/// `include_inactive_same_tool` is true, also include the sids of stopped,
-/// archived, or pane-less peers using `current_tool`. Persisted peers are read
-/// from `sessions.json` via `Storage` for the caller's effective profile.
+/// Build the capture exclusion set from live pane ownership, caller-provided
+/// exclusions, and conversation ids parked by peer engine swaps.
 ///
-/// Used by `Instance::try_retroactive_capture` and snapshotted when its poller
-/// starts. Parked conversations are no longer published in the peer's tmux
-/// environment, so [`build_exclusion_set`] cannot see them. Without this set,
-/// another session can capture the parked conversation before its owner swaps
-/// back. Claude, host Codex, and host Kimi additionally need inactive
-/// same-tool protection because their shared-store MRU scans can select a
-/// conversation after the owning pane disappears. Host Pi is included for its
-/// poller alone: acquisition no longer scans its store at all (#3576), but a
-/// peer that goes inactive after this pane launched can still leave the
-/// freshest file inside the poller's floor. Sandboxed Codex, Kimi, and Pi omit
-/// the protection because their stores are instance-private or are not
-/// captured from the host (#3317).
-///
-/// Scope: host stores are keyed by each agent's effective home, not by AoE
-/// profile, but this helper inspects only `sessions.json` for the caller's
-/// effective profile. A stopped peer in another profile against the same
-/// agent home will not be excluded; callers needing global ownership must
-/// compose their own cross-profile check.
+/// Parked ids are persisted outside a peer's current tool, so the live pane
+/// scan cannot discover them. They remain owned until that peer resumes them.
 pub(crate) fn compose_exclusion_with_persisted_peers(
     current_instance_id: &str,
     current_project_path: &str,
     current_tool: &str,
-    include_inactive_same_tool: bool,
     profile: &str,
     retroactive_capture_excludes: &HashSet<String>,
 ) -> HashSet<String> {
@@ -379,18 +359,6 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
             .filter(|s| !s.is_empty())
         {
             set.insert(parked.to_string());
-        }
-        if !include_inactive_same_tool || inst.tool != current_tool {
-            continue;
-        }
-        let should_exclude = matches!(inst.status, crate::session::Status::Stopped)
-            || inst.is_archived()
-            || !inst.has_live_tmux_pane_in(&live);
-        if !should_exclude {
-            continue;
-        }
-        if let Some(sid) = inst.agent_session_id.as_deref().filter(|s| !s.is_empty()) {
-            set.insert(sid.to_string());
         }
     }
     set
@@ -593,30 +561,31 @@ fn kill_serve_group(pid: u32) {
     let _ = pid;
 }
 
-/// Pre-assign an OpenCode session id before launch, eliminating the post-launch
-/// SQLite capture race by creating the session up front.
+/// Pre-assign an OpenCode session id before launch by creating the session up
+/// front through a short-lived `opencode serve` process.
 ///
-/// Spawns a throwaway `opencode serve` on a loopback port, `POST`s a chosen
-/// `ses_` id bound to `project_path` via `POST /api/session`, then tears the
-/// server down. The subsequent `opencode --session <id>` launch resumes the
-/// pre-created (empty) session. Opt-in and fail-closed: any failure returns
-/// `None`, and the caller falls back to the existing background poller.
-///
-/// Host sessions only: the loopback server is unreachable from inside a sandbox
-/// container, so sandboxed opencode keeps polling.
-pub(crate) fn preassign_opencode_session_id(project_path: &str) -> Option<String> {
-    preassign_opencode_session_id_impl(project_path)
+/// The caller provides the resolved host environment used by the real agent
+/// launch so both processes select the same store. Any failure leaves the
+/// session unowned; AoE never guesses from the shared SQLite store.
+pub(crate) fn preassign_opencode_session_id(
+    project_path: &str,
+    environment: &[String],
+) -> Option<String> {
+    preassign_opencode_session_id_impl(project_path, environment)
         .map_err(|e| {
             tracing::warn!(
                 target: "session.capture",
-                "opencode session preassign failed ({e}); falling back to the SQLite poller"
+                "opencode session preassign failed ({e}); automatic capture remains disabled"
             )
         })
         .ok()
         .and_then(validated_session_id)
 }
 
-fn preassign_opencode_session_id_impl(project_path: &str) -> Result<String> {
+fn preassign_opencode_session_id_impl(
+    project_path: &str,
+    environment: &[String],
+) -> Result<String> {
     // Reserve a free loopback port from the OS, then release it so the spawned
     // server can bind it. The tiny bind/drop/bind race is covered by the
     // readiness timeout and the caller's safe fallback.
@@ -629,6 +598,9 @@ fn preassign_opencode_session_id_impl(project_path: &str) -> Result<String> {
     let id = format!("ses_{}", Uuid::new_v4().simple());
 
     let mut cmd = std::process::Command::new("opencode");
+    cmd.envs(crate::session::environment::resolve_host_environment_pairs(
+        environment,
+    ));
     cmd.args([
         "serve",
         "--hostname",

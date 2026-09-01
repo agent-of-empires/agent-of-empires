@@ -90,6 +90,7 @@ pub enum SessionCaptureBackend {
 /// Authority available in one launch environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionCaptureContext {
+    /// AoE must not discover a native identity in this environment.
     Unsupported,
     PaneScoped,
     Preassigned,
@@ -108,7 +109,7 @@ pub struct SessionCaptureSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionSupport {
     pub resume: ResumeStrategy,
-    pub capture: SessionCaptureSpec,
+    pub capture: Option<SessionCaptureSpec>,
 }
 
 /// How an agent forks an existing session from the CLI: resume the parent's
@@ -216,8 +217,6 @@ pub struct HookEvent {
     pub status: Option<HookStatus>,
     /// Native identity field to extract into the per-instance sidecar.
     pub identity_field: Option<HookIdentityField>,
-    /// Tool names whose invocation blocks on the user for the tool's entire
-    /// execution (e.g. Claude's `AskUserQuestion` selection UI). When
     /// Tool names whose invocation blocks on the user for the tool's entire
     /// execution (e.g. Claude's `AskUserQuestion` selection UI). When
     /// non-empty on a status event, the generated hook command inspects the
@@ -378,7 +377,7 @@ pub struct AgentDef {
     pub binary: &'static str,
     /// Subcommand token inserted immediately after `binary` when AoE builds the
     /// default launch command (e.g. `Some("chat")` for kiro → `kiro-cli chat`).
-    /// Required for CLIs whose interactive flags (yolo, `--agent`, resume) live
+    /// Required for CLIs whose interactive flags (yolo, `--agent`) live
     /// on a subcommand rather than the top-level binary: bare
     /// `kiro-cli --trust-all-tools` is rejected with "unexpected argument",
     /// while `kiro-cli chat --trust-all-tools` parses. `None` for agents whose
@@ -596,11 +595,18 @@ const CLAUDE_HOOK_EVENTS: &[HookEvent] = &[
 ];
 /// Cursor's native beforeSubmitPrompt hook publishes the stable conversation_id.
 /// generation_id is turn-scoped and must never be used as resume identity.
-const CURSOR_HOOK_EVENTS: &[SidecarHookEvent] = &[SidecarHookEvent {
-    name: "beforeSubmitPrompt",
-    status: HookStatus::Running,
-    identity_field: Some(HookIdentityField::ConversationIdOrSessionId),
-}];
+const CURSOR_HOOK_EVENTS: &[SidecarHookEvent] = &[
+    SidecarHookEvent {
+        name: "beforeSubmitPrompt",
+        status: HookStatus::Running,
+        identity_field: Some(HookIdentityField::ConversationIdOrSessionId),
+    },
+    SidecarHookEvent {
+        name: "stop",
+        status: HookStatus::Idle,
+        identity_field: None,
+    },
+];
 /// Qwen Code uses the Claude-style event schema. PostToolUse clears waiting
 /// after a permission prompt is approved and the tool completes.
 const QWEN_HOOK_EVENTS: &[HookEvent] = &[
@@ -615,7 +621,7 @@ const QWEN_HOOK_EVENTS: &[HookEvent] = &[
         name: "UserPromptSubmit",
         matcher: None,
         status: Some(HookStatus::Running),
-        identity_field: Some(HookIdentityField::SessionId),
+        identity_field: None,
         waiting_tools: &[],
     },
     HookEvent {
@@ -747,7 +753,7 @@ pub(crate) const KIRO_SIDECAR_EVENTS: &[SidecarHookEvent] = &[
     SidecarHookEvent {
         name: "userPromptSubmit",
         status: HookStatus::Running,
-        identity_field: Some(HookIdentityField::SessionId),
+        identity_field: None,
     },
     SidecarHookEvent {
         name: "stop",
@@ -802,11 +808,18 @@ const fn session_support(
 ) -> Option<SessionSupport> {
     Some(SessionSupport {
         resume,
-        capture: SessionCaptureSpec {
+        capture: Some(SessionCaptureSpec {
             backend,
             host,
             sandbox,
-        },
+        }),
+    })
+}
+
+const fn resume_only(resume: ResumeStrategy) -> Option<SessionSupport> {
+    Some(SessionSupport {
+        resume,
+        capture: None,
     })
 }
 
@@ -916,7 +929,7 @@ pub const AGENTS: &[AgentDef] = &[
         container_env: &[],
         hook_config: None,
         sidecar_hooks: None,
-        session_support: None,
+        session_support: resume_only(ResumeStrategy::Flag("--resume")),
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -1086,9 +1099,9 @@ pub const AGENTS: &[AgentDef] = &[
         container_env: &[("COPILOT_CONFIG_DIR", "/root/.copilot")],
         hook_config: None,
         sidecar_hooks: None,
-        // Copilot exposes resume argv and a shared session store, but no
-        // verified pane-to-row ownership source. Native resume stays disabled.
-        session_support: None,
+        // Copilot exposes native resume argv but no verified pane-to-row
+        // ownership source for automatic capture.
+        session_support: resume_only(ResumeStrategy::Flag("--session-id")),
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -1242,7 +1255,7 @@ pub const AGENTS: &[AgentDef] = &[
         name: "kiro",
         oneshot_flag: None,
         binary: "kiro-cli",
-        // Kiro's interactive flags (--trust-all-tools, --agent, --resume-id)
+        // Kiro's interactive flags (--trust-all-tools, --agent)
         // are defined on the `chat` subcommand. Bare `kiro-cli --trust-all-tools`
         // fails with "unexpected argument"; `kiro-cli chat ...` parses.
         launch_subcommand: Some("chat"),
@@ -1277,12 +1290,8 @@ pub const AGENTS: &[AgentDef] = &[
             format: SidecarFormat::KiroJson,
             events: KIRO_SIDECAR_EVENTS,
         }),
-        session_support: session_support(
-            ResumeStrategy::Flag("--resume-id"),
-            SessionCaptureBackend::HookSidecar,
-            SessionCaptureContext::PaneScoped,
-            SessionCaptureContext::PaneScoped,
-        ),
+        // Kiro's native identity payload shape is not verified.
+        session_support: None,
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -1310,15 +1319,8 @@ pub const AGENTS: &[AgentDef] = &[
             format: HookFormat::JsonSettings,
         }),
         sidecar_hooks: None,
-        session_support: session_support(
-            ResumeStrategy::FlagPair {
-            existing: "--resume",
-            new_session: "--session-id",
-            },
-            SessionCaptureBackend::HookSidecar,
-            SessionCaptureContext::PaneScoped,
-            SessionCaptureContext::PaneScoped,
-        ),
+        // Qwen's native identity payload shape is not verified.
+        session_support: None,
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -1582,7 +1584,7 @@ impl AgentDef {
 
     /// The base launch token(s) for the default (non-overridden) command:
     /// the binary, plus any `launch_subcommand` (e.g. `"kiro-cli chat"`). All
-    /// subsequent flags (extra args, yolo, resume) are appended after this, so
+    /// subsequent flags (extra args, yolo, agent selection) are appended after this, so
     /// subcommand-scoped flags land on the subcommand where the CLI expects
     /// them. Agents without a `launch_subcommand` just return the binary.
     pub fn launch_base_command(&self) -> String {
@@ -2433,9 +2435,12 @@ mod tests {
             DetectionMethod::Which("copilot")
         ));
         assert!(matches!(&copilot.yolo, Some(YoloMode::CliFlag("--yolo"))));
-        // Copilot resumes a prior conversation with `copilot --session-id <id>`,
-        // where the id is captured from `~/.copilot/session-store.db`.
-        assert!(copilot.session_support.is_none());
+        let support = copilot.session_support.as_ref().unwrap();
+        assert!(matches!(
+            support.resume,
+            ResumeStrategy::Flag("--session-id")
+        ));
+        assert!(support.capture.is_none());
         // One-shot title generation runs `copilot -p <prompt> -s
         // --allow-all-tools --no-ask-user`.
         assert_eq!(copilot.oneshot_flag, Some("-p"));
@@ -2558,7 +2563,7 @@ mod tests {
 
     #[test]
     fn test_kiro_launches_via_chat_subcommand() {
-        // Kiro's interactive flags (--trust-all-tools, --agent, --resume-id)
+        // Kiro's interactive flags (--trust-all-tools, --agent)
         // are scoped to the `chat` subcommand, so the base command must include
         // it; bare `kiro-cli --trust-all-tools` is rejected by the CLI.
         let kiro = get_agent("kiro").unwrap();
@@ -2596,9 +2601,9 @@ mod tests {
     fn test_launch_subcommand_not_combined_with_subcommand_resume() {
         // `append_resume_flags` inserts a Subcommand resume token after the
         // first whitespace token, which for a launch_subcommand agent is the
-        // binary. That lands the resume token before the subcommand and produces
-        // a malformed command (e.g. `kiro-cli resume <id> chat ...`). Forbid the
-        // pairing until that insertion is made subcommand-aware.
+        // binary. That lands the resume token before the launch subcommand and
+        // produces a malformed command. Forbid the pairing until insertion is
+        // made subcommand-aware.
         for agent in AGENTS {
             if agent.launch_subcommand.is_some() {
                 assert!(
@@ -2786,22 +2791,8 @@ mod tests {
                     Context::ManagedExclusiveStore,
                 )),
             ),
-            (
-                "qwen",
-                Some((
-                    Backend::HookSidecar,
-                    Context::PaneScoped,
-                    Context::PaneScoped,
-                )),
-            ),
-            (
-                "kiro",
-                Some((
-                    Backend::HookSidecar,
-                    Context::PaneScoped,
-                    Context::PaneScoped,
-                )),
-            ),
+            ("qwen", None),
+            ("kiro", None),
             ("antigravity", None),
             (
                 "kimi",
@@ -2830,22 +2821,30 @@ mod tests {
                 .unwrap()
                 .session_support
                 .as_ref()
-                .map(|support| {
-                    (
-                        support.capture.backend,
-                        support.capture.host,
-                        support.capture.sandbox,
-                    )
-                });
+                .and_then(|support| support.capture.as_ref())
+                .map(|capture| (capture.backend, capture.host, capture.sandbox));
             assert_eq!(actual, expected, "capture contract for {name}");
         }
+    }
+
+    #[test]
+    fn cursor_stop_hook_returns_status_to_idle() {
+        let events = get_agent("cursor")
+            .unwrap()
+            .sidecar_hooks
+            .as_ref()
+            .unwrap()
+            .events;
+        let stop = events.iter().find(|event| event.name == "stop").unwrap();
+        assert_eq!(stop.status, HookStatus::Idle);
+        assert_eq!(stop.identity_field, None);
     }
 
     #[test]
     fn pane_hook_capture_agents_declare_their_native_identity_field() {
         for agent in AGENTS {
             let expected = match agent.name {
-                "claude" | "qwen" | "kiro" => Some(HookIdentityField::SessionId),
+                "claude" => Some(HookIdentityField::SessionId),
                 "cursor" => Some(HookIdentityField::ConversationIdOrSessionId),
                 _ => None,
             };

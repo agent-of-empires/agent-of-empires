@@ -1,8 +1,8 @@
 //! Hidden `aoe __extract-session-id` subcommand.
 //!
 //! Reads an agent hook payload from stdin, extracts the configured top-level
-//! UUID field, and writes it atomically through the hardened hook sidecar.
-//! Hook failures are logged and returned as success so they never block agents.
+//! native identity field, validates its shell-safe storage form, and writes it
+//! atomically through the hardened hook sidecar. Hook failures never block agents.
 //! Stdin is capped at 1 MiB to bound memory.
 
 use std::io::Read;
@@ -56,7 +56,9 @@ fn run_inner<R: Read>(
                 anyhow!("payload has no top-level string conversation_id or session_id")
             })?,
     };
-    uuid::Uuid::parse_str(sid)?;
+    if !crate::session::capture::is_valid_session_id(sid) {
+        return Err(anyhow!("payload contains an unsafe native session id"));
+    }
     crate::hooks::write_session_id_via_guard(instance_id, sid)
 }
 
@@ -102,7 +104,7 @@ mod tests {
     #[serial_test::serial(hook_base)]
     fn conversation_identity_prefers_conversation_id_and_falls_back() {
         let (_g, base, _tmp) = BaseGuard::ready();
-        let conversation = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let conversation = "conversation_opaque.123";
         let session = "11111111-2222-3333-4444-555555555555";
         let field = crate::agents::HookIdentityField::ConversationIdOrSessionId;
 
@@ -183,11 +185,23 @@ mod tests {
 
     #[test]
     #[serial_test::serial(hook_base)]
-    fn rejects_non_uuid_string() {
+    fn accepts_safe_opaque_session_id() {
         let (_g, base, _tmp) = BaseGuard::ready();
-        let payload = r#"{"session_id":"not-a-uuid"}"#;
-        let err = extract(payload, "bad_uuid").unwrap_err();
-        assert!(read_sidecar(&base, "bad_uuid").is_none(), "got: {err}");
+        let payload = r#"{"session_id":"conversation_opaque.123"}"#;
+        extract(payload, "opaque_id").unwrap();
+        assert_eq!(
+            read_sidecar(&base, "opaque_id").as_deref(),
+            Some("conversation_opaque.123")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn rejects_unsafe_session_id() {
+        let (_g, base, _tmp) = BaseGuard::ready();
+        let payload = r#"{"session_id":"unsafe id;rm"}"#;
+        let err = extract(payload, "unsafe_id").unwrap_err();
+        assert!(read_sidecar(&base, "unsafe_id").is_none(), "got: {err}");
     }
 
     #[test]

@@ -961,8 +961,8 @@ pub struct SessionConfig {
     )]
     pub agent_extra_args: HashMap<String, String>,
 
-    /// Per-agent command override replacing the binary. Native conversation
-    /// resume is disabled for wrappers and shell commands.
+    /// Per-agent command override. Native conversation resume requires the
+    /// resolved agent binary first; wrappers and shell syntax disable it.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[setting(
         label = "Agent Command Override",
@@ -1068,7 +1068,19 @@ pub struct SessionConfig {
         category = "Agents"
     )]
     pub auto_resume_on_restart: bool,
-
+    /// Pre-assign OpenCode's session id before launch so AoE knows the exact
+    /// native identity before the first prompt. AoE creates the session through
+    /// a short-lived `opencode serve` call. This avoids guessing from the shared
+    /// SQLite store, at the cost of about two seconds on each new host launch.
+    /// Off by default. Sandboxed OpenCode automatic capture is unsupported.
+    #[serde(default)]
+    #[setting(
+        label = "Pre-assign opencode session id",
+        widget = "toggle",
+        category = "Agents",
+        advanced
+    )]
+    pub opencode_preassign_session_id: bool,
     /// Request xterm mouse tracking so the TUI handles the scroll wheel
     /// (preview-pane scroll) and click-to-select rows. Disable to hand the
     /// wheel and text selection back to the terminal, e.g. iOS Mosh +
@@ -1617,6 +1629,7 @@ impl Default for SessionConfig {
             smart_rename_agent: String::new(),
             smart_rename_model: HashMap::new(),
             auto_resume_on_restart: true,
+            opencode_preassign_session_id: false,
             mouse_capture: true,
             custom_agents: HashMap::new(),
             agent_detect_as: HashMap::new(),

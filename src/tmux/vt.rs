@@ -247,28 +247,33 @@ static OSC52_ARM_LOCKS: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 static SOCK_COUNTER: AtomicU64 = AtomicU64::new(0);
+static PIPE_OWNER_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Monotonic base for chunk-arrival timestamps. The reader stamps each chunk's
 /// arrival against this (millis), and the TUI capture worker reads the deltas
-/// via [`VtChannel::chunk_timing`] to drive its repaint-quiescence debounce.
+/// via VtChannel::chunk_timing to drive its repaint-quiescence debounce.
 static CHUNK_CLOCK: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 fn chunk_now_ms() -> u64 {
     CHUNK_CLOCK.elapsed().as_millis() as u64
 }
 
-/// This process's identity in the cross-process VT-owner lock. Per-process
-/// (not per-channel): one process never fights itself (the registry dedups),
-/// so the lock only needs to distinguish processes.
-fn vt_owner_id() -> String {
-    format!("pid-{}", std::process::id())
+/// Unique lease identity for one armed pipe generation. A process can retain
+/// a dead channel while its replacement arms under the same session name, so
+/// process identity alone cannot fence stale shutdown and heartbeat calls.
+fn new_pipe_owner_id() -> String {
+    format!(
+        "pipe-{}-{}",
+        std::process::id(),
+        PIPE_OWNER_COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// A `(Mutex, Condvar)` pair an in-process poller parks on. Registered via
 /// [`VtChannel::set_change_wakeup`]; the reader thread pokes it after every
 /// grid change (and on death) so the poller samples the moment output lands
 /// instead of after the remainder of a fixed poll interval.
-pub(crate) type ChangeWakeup = Arc<(Mutex<()>, Condvar)>;
+pub(crate) type ChangeWakeup = Arc<(Mutex<u64>, Condvar)>;
 
 /// Poke a registered change wakeup, if any. The slot lock is held only to
 /// clone the pair; the pair's own mutex is then taken so the notify
@@ -280,7 +285,8 @@ fn notify_change_wakeup(slot: &Mutex<Option<ChangeWakeup>>) {
         Err(_) => None,
     };
     if let Some(pair) = pair {
-        if let Ok(_g) = pair.0.lock() {
+        if let Ok(mut generation) = pair.0.lock() {
+            *generation = generation.wrapping_add(1);
             pair.1.notify_one();
         }
     }
@@ -341,18 +347,20 @@ fn sh_quote(s: &str) -> String {
 /// Folded into the geometry probe rather than run as a second fork because
 /// [`VtChannel::reconcile_grid`] needs both on the same once-a-second budget:
 /// the cursor is its drift detector and the geometry is its resize trigger.
-fn pane_size_cursor(target: &str) -> Option<(u16, u16, u16, u16)> {
-    let out = crate::tmux::tmux_command()
-        .args([
-            "display-message",
-            "-p",
-            "-t",
-            target,
-            "-F",
-            "#{pane_width} #{pane_height} #{cursor_x} #{cursor_y}",
-        ])
-        .output()
-        .ok()?;
+fn pane_size_cursor(
+    target: &str,
+    deadline: &crate::tmux::TmuxCommandDeadline,
+) -> Option<(u16, u16, u16, u16)> {
+    let mut command = crate::tmux::tmux_command();
+    command.args([
+        "display-message",
+        "-p",
+        "-t",
+        target,
+        "-F",
+        "#{pane_width} #{pane_height} #{cursor_x} #{cursor_y}",
+    ]);
+    let out = deadline.run(&mut command).ok()?;
     if !out.status.success() {
         return None;
     }
@@ -523,11 +531,13 @@ fn parse_seed_state(line: &str) -> PaneSeedState {
 
 /// Query the pane's seed state in one `display-message` round-trip (the live
 /// path is fork-sensitive, #2822, so modes and cursor share a single call).
-fn pane_seed_state(target: &str) -> Option<PaneSeedState> {
-    let out = crate::tmux::tmux_command()
-        .args(["display-message", "-p", "-t", target, "-F", SEED_STATE_FMT])
-        .output()
-        .ok()?;
+fn pane_seed_state(
+    target: &str,
+    deadline: &crate::tmux::TmuxCommandDeadline,
+) -> Option<PaneSeedState> {
+    let mut command = crate::tmux::tmux_command();
+    command.args(["display-message", "-p", "-t", target, "-F", SEED_STATE_FMT]);
+    let out = deadline.run(&mut command).ok()?;
     if !out.status.success() {
         return None;
     }
@@ -564,67 +574,94 @@ fn lf_to_crlf(raw: &[u8]) -> Vec<u8> {
 /// private-mode SETs, no cursor position, and no DECTCEM state. The pane's
 /// modes, cursor, and hide flag come from [`capture_seed_snapshot`] and are
 /// woven into the byte stream by [`assemble_seed_stream`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VtRefreshResult {
+    Refreshed,
+    Busy,
+    Failed,
+}
+fn refresh_commits_geometry(result: VtRefreshResult) -> bool {
+    result == VtRefreshResult::Refreshed
+}
+
 fn seed_parser(
     target: &str,
     parser: &Mutex<vt100::Parser>,
     app_cursor: &AtomicBool,
     grid_gen: &AtomicU64,
-    cols: u16,
-    rows: u16,
-) -> bool {
-    let Some(stream) = capture_seed_stream(target, rows) else {
-        return false;
+    size: (u16, u16),
+    deadline: &crate::tmux::TmuxCommandDeadline,
+    chunk_guard: Option<(&AtomicU64, &AtomicU64, u64)>,
+) -> VtRefreshResult {
+    let (_, rows) = size;
+    let Some(stream) = capture_seed_stream(target, rows, deadline) else {
+        return VtRefreshResult::Failed;
     };
-    swap_seeded_parser(parser, app_cursor, grid_gen, None, &stream, cols, rows)
+    swap_seeded_parser(
+        parser,
+        app_cursor,
+        grid_gen,
+        None,
+        &stream,
+        size,
+        chunk_guard,
+    )
 }
-
 /// Capture the pane and weave its modes and cursor into one replayable byte
 /// stream, or `None` when the pane could not be captured. Split from the swap
 /// so a caller can bracket the (forking, multi-millisecond) capture with the
 /// generation check `swap_seeded_parser` needs.
-fn capture_seed_stream(target: &str, rows: u16) -> Option<Vec<u8>> {
-    let (body, state) = capture_seed_snapshot(target)?;
+fn capture_seed_stream(
+    target: &str,
+    rows: u16,
+    deadline: &crate::tmux::TmuxCommandDeadline,
+) -> Option<Vec<u8>> {
+    let (body, state) = capture_seed_snapshot(target, deadline)?;
     Some(assemble_seed_stream(&body, &state, rows))
 }
 
 /// Replace `parser` with a fresh grid built from `stream`, unless the reader
-/// applied a chunk since generation `since`.
+/// applied a chunk since generation `since` or has not settled the expected
+/// chunk sequence.
 ///
-/// The guard is the ordering boundary between the snapshot and `pipe-pane`
+/// The guards are the ordering boundary between the snapshot and `pipe-pane`
 /// consumption (#3617). `capture_seed_stream` forks tmux, so `run_reader` can
-/// take the parser lock first and apply a chunk that the snapshot (taken
-/// before it) does not contain; replacing the parser would then drop that
-/// chunk from both grids, and pipe-pane has no way to redeliver it. Because
-/// `run_reader` bumps `grid_gen` while still holding this lock, a generation
-/// that still reads `since` here proves no chunk landed during the capture.
+/// take the parser lock first and apply a chunk that the snapshot does not
+/// contain; replacing the parser would then drop that chunk from both grids.
+/// Generation changes fence applied chunks, while the received/settled pair
+/// also fences a chunk queued on this parser lock.
+///
 /// A raced swap is abandoned rather than retried inline: the old parser holds
 /// the newer output, so leaving it alone is the safe side, and the caller
-/// reseeds again on its own cadence.
-///
-/// `since` of `None` swaps unconditionally, for callers whose current grid is
-/// stale by definition (the initial seed, and the post-resize reflow).
+/// reseeds again on its own cadence. `since` of `None` disables only the
+/// generation guard for callers whose current grid is stale by definition.
 fn swap_seeded_parser(
     parser: &Mutex<vt100::Parser>,
     app_cursor: &AtomicBool,
     grid_gen: &AtomicU64,
     since: Option<u64>,
     stream: &[u8],
-    cols: u16,
-    rows: u16,
-) -> bool {
+    size: (u16, u16),
+    chunk_guard: Option<(&AtomicU64, &AtomicU64, u64)>,
+) -> VtRefreshResult {
     let Ok(mut p) = parser.lock() else {
-        return false;
+        return VtRefreshResult::Failed;
     };
-    if since.is_some_and(|g| g != grid_gen.load(Ordering::Relaxed)) {
-        return false;
+    if since.is_some_and(|generation| generation != grid_gen.load(Ordering::Relaxed))
+        || chunk_guard.is_some_and(|(received, settled, expected)| {
+            received.load(Ordering::Acquire) != expected
+                || settled.load(Ordering::Acquire) != expected
+        })
+    {
+        return VtRefreshResult::Busy;
     }
+    let (cols, rows) = size;
     *p = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
     p.process(stream);
     app_cursor.store(p.screen().application_cursor(), Ordering::Relaxed);
     grid_gen.fetch_add(1, Ordering::Relaxed);
-    true
+    VtRefreshResult::Refreshed
 }
-
 /// How many times [`capture_seed_snapshot`] re-runs the probe/capture/probe
 /// round before settling for its last (possibly raced) snapshot. Each retry
 /// costs two forks plus a short settle sleep, and only fires while the pane is
@@ -653,7 +690,10 @@ const SEED_RETRY_SETTLE: Duration = Duration::from_millis(5);
 /// from the final snapshot (its post-probe rode the same fork as the capture,
 /// so it is the tightest pairing available, and the next live chunk heals any
 /// residue).
-fn capture_seed_snapshot(target: &str) -> Option<(Vec<u8>, PaneSeedState)> {
+fn capture_seed_snapshot(
+    target: &str,
+    deadline: &crate::tmux::TmuxCommandDeadline,
+) -> Option<(Vec<u8>, PaneSeedState)> {
     let seed_start = format!("-{SCROLLBACK_LINES}");
     let mut last: Option<(Vec<u8>, PaneSeedState)> = None;
     for attempt in 0..SEED_PROBE_ATTEMPTS {
@@ -664,7 +704,7 @@ fn capture_seed_snapshot(target: &str) -> Option<(Vec<u8>, PaneSeedState)> {
         // breaks to the tail rather than discarding an earlier attempt's
         // snapshot: every `last` is a self-consistent (body, probe) pair, and
         // seeding from it beats leaving the grid blank.
-        let Some(pre) = pane_seed_state(target) else {
+        let Some(pre) = pane_seed_state(target, deadline) else {
             break;
         };
         // The alternate screen has no scrollback, so only the normal buffer
@@ -685,7 +725,9 @@ fn capture_seed_snapshot(target: &str) -> Option<(Vec<u8>, PaneSeedState)> {
             "-F",
             SEED_STATE_FMT,
         ]);
-        let Ok(out) = crate::tmux::tmux_command().args(&args).output() else {
+        let mut command = crate::tmux::tmux_command();
+        command.args(&args);
+        let Ok(out) = deadline.run(&mut command) else {
             break;
         };
         if !out.status.success() {
@@ -829,27 +871,45 @@ fn strip_trailing_row_terminator(raw: &[u8]) -> &[u8] {
 /// crash was fixed in 3.4, so we require >= 3.4 before arming a channel. Older
 /// tmux (or a `tmux -V` we can't parse) falls back to the capture path. Cached:
 /// the server version doesn't change under a running aoe.
-fn tmux_supports_pipe_pane_io() -> bool {
-    static SUPPORTED: LazyLock<bool> = LazyLock::new(|| {
-        let Ok(out) = crate::tmux::tmux_command().arg("-V").output() else {
-            return false;
-        };
-        let v = String::from_utf8_lossy(&out.stdout);
-        // e.g. "tmux 3.6", "tmux 3.4a", "tmux next-3.5".
-        let digits: String = v
-            .trim()
-            .trim_start_matches(|c: char| !c.is_ascii_digit())
-            .chars()
-            .take_while(|c| c.is_ascii_digit() || *c == '.')
-            .collect();
-        let mut parts = digits.split('.');
-        let major: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let minor: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        (major, minor) >= (3, 4)
-    });
-    *SUPPORTED
+fn tmux_supports_pipe_pane_io(deadline: &crate::tmux::TmuxCommandDeadline) -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cached_tmux_support(&SUPPORTED, || {
+        let mut command = crate::tmux::tmux_command();
+        command.arg("-V");
+        let out = deadline.run(&mut command).ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        parse_tmux_pipe_support(&String::from_utf8_lossy(&out.stdout))
+    })
 }
 
+fn cached_tmux_support(
+    cache: &std::sync::OnceLock<bool>,
+    probe: impl FnOnce() -> Option<bool>,
+) -> bool {
+    if let Some(supported) = cache.get() {
+        return *supported;
+    }
+    let Some(supported) = probe() else {
+        return false;
+    };
+    let _ = cache.set(supported);
+    supported
+}
+
+fn parse_tmux_pipe_support(version: &str) -> Option<bool> {
+    let digits: String = version
+        .trim()
+        .trim_start_matches(|c: char| !c.is_ascii_digit())
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    let mut parts = digits.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next()?.parse().ok()?;
+    Some((major, minor) >= (3, 4))
+}
 fn cursor_from_screen(screen: &vt100::Screen, rows: u16, cols: u16) -> PaneCursor {
     let (y, x) = screen.cursor_position();
     PaneCursor {
@@ -1138,6 +1198,9 @@ struct ReaderCtx {
     /// (millis since `CHUNK_CLOCK`), and the gap between the two most recent
     /// chunks.
     chunk_seq: Arc<AtomicU64>,
+    /// Read sequences no longer waiting to mutate the parser. A seed may
+    /// commit only when this equals its arrival baseline.
+    settled_chunk_seq: Arc<AtomicU64>,
     last_chunk_ms: Arc<AtomicU64>,
     prev_gap_ms: Arc<AtomicU64>,
     /// Grid generation, bumped after every parsed chunk so `sample`'s
@@ -1145,6 +1208,11 @@ struct ReaderCtx {
     /// from `chunk_seq`: re-seeds bump this too, and the debounce's
     /// first-chunk special case must not see seed bumps.
     grid_gen: Arc<AtomicU64>,
+}
+
+fn stop_and_wake_reader(stop: &AtomicBool, sock_path: &std::path::Path) {
+    stop.store(true, Ordering::Relaxed);
+    let _ = UnixStream::connect(sock_path);
 }
 
 /// The channel's reader loop: accept the forwarder's connection, publish the
@@ -1183,45 +1251,17 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
                         *guard = Some(text.clone());
                     }
                 }
-                // Bytes that arrive before the seed are ALREADY IN IT, so they
-                // must be dropped rather than applied. `arm` orders the pipe
-                // first and the seed second (pipe-pane, wait for the forwarder
-                // to connect, then `capture-pane`), so tmux has folded every
-                // byte written during that window into the grid the seed is
-                // taken from. The old code held these bytes and replayed them
-                // once `seeded` flipped, which applied them TWICE: the pane's
-                // output appeared duplicated a screenful lower, with zsh's
-                // PROMPT_EOL_MARK duplicated onto a row tmux has none on, and
-                // every later row shifted down by the length of the double.
-                // An alternate-screen agent repaints in full and washed that
-                // out within a frame, but a shell pane only ever appends, so
-                // it stayed on screen until the next reseed.
-                //
-                // Dropping is the right side to err on: the seed carries an
-                // absolute CUP, so later output still lands on the correct cell
-                // and merely overwrites, whereas a duplicate displaces every
-                // row after it and compounds on each re-arm.
-                //
-                // Be clear about what this costs. Bytes tmux emitted after the
-                // capture body was taken but before `seeded` flips are in
-                // neither the seed nor the grid, so they are LOST, not merely
-                // reordered, and they used to be applied correctly. The window
-                // is the seed's own application time, measured at 4-5ms to take
-                // the capture plus 4-5ms to parse it into a fresh 2000-line
-                // grid, so it is milliseconds and not sub-millisecond.
-                // `reconcile_grid` heals it, but only once the pane goes quiet
-                // for two passes, since the drift check deliberately stands
-                // down while output is still arriving. A pane that streams
-                // without pause therefore carries the gap until it settles.
-                // Taking the seed BEFORE arming the pipe would make every
-                // observed byte post-capture and remove this path entirely; it
-                // is the better shape and is left as follow-up rather than
-                // folded into a bug fix.
-                if !ctx.seeded.load(Ordering::Relaxed) {
-                    // A pre-seed copy still needs a wakeup to be drained; the
-                    // grid-change wakeup below is not reached on this path. Only
-                    // wake when there was actually something to publish, so a
-                    // dropped chunk carrying no copy stays silent.
+                // Claim every read before waiting on the parser. An
+                // authoritative seed that captured this output must then see
+                // the changed sequence and return Busy instead of installing a
+                // snapshot ahead of a queued chunk and applying it twice.
+                let seq = ctx.chunk_seq.fetch_add(1, Ordering::AcqRel);
+                // The initial snapshot is taken only after `seeded` flips.
+                // Bytes received during the shorter pipe-connect window are
+                // already present in that later snapshot, so do not replay them.
+                if !ctx.seeded.load(Ordering::Acquire) {
+                    ctx.settled_chunk_seq.store(seq + 1, Ordering::Release);
+                    // OSC 52 remains independent of grid publication.
                     if copied.is_some() {
                         notify_change_wakeup(&ctx.wakeup);
                     }
@@ -1231,34 +1271,27 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
                     p.process(&buf[..n]);
                     ctx.app_cursor
                         .store(p.screen().application_cursor(), Ordering::Relaxed);
-                    // Bump while STILL HOLDING the parser lock, and before the
-                    // wakeup below. Two readers depend on it: a woken sampler
-                    // always sees the new generation, and `swap_seeded_parser`
-                    // compares generations under this same lock, so a chunk it
-                    // would otherwise discard can never hide behind a bump that
-                    // has not landed yet (#3617).
+                    // Bump while still holding the parser lock. A woken sampler
+                    // sees the new generation, and a guarded seed swap cannot
+                    // discard a chunk behind a generation bump that has not landed.
                     ctx.grid_gen.fetch_add(1, Ordering::Relaxed);
+                    // Stamp this chunk's arrival so the capture worker can tell a
+                    // lone chunk from a back-to-back stream and wait for settling.
+                    let now = chunk_now_ms();
+                    let prev = ctx.last_chunk_ms.swap(now, Ordering::Relaxed);
+                    ctx.prev_gap_ms.store(
+                        if seq == 0 {
+                            u64::MAX
+                        } else {
+                            now.saturating_sub(prev)
+                        },
+                        Ordering::Relaxed,
+                    );
+                    // Publish settlement after parser, cursor, generation, and
+                    // timing updates. Acquire readers use this completion fence.
+                    ctx.settled_chunk_seq.store(seq + 1, Ordering::Release);
+                    notify_change_wakeup(&ctx.wakeup);
                 }
-                // Stamp this chunk's arrival so the capture worker can tell a
-                // lone chunk (keystroke echo) from a back-to-back stream (a
-                // multi-chunk repaint) and hold the sample until the stream
-                // settles. Recorded before the wakeup so the woken worker reads
-                // fresh timing.
-                let seq = ctx.chunk_seq.fetch_add(1, Ordering::Relaxed);
-                let now = chunk_now_ms();
-                let prev = ctx.last_chunk_ms.swap(now, Ordering::Relaxed);
-                ctx.prev_gap_ms.store(
-                    if seq == 0 {
-                        u64::MAX
-                    } else {
-                        now.saturating_sub(prev)
-                    },
-                    Ordering::Relaxed,
-                );
-                // Wake the in-process poller (the TUI capture worker) so the
-                // just-landed output samples now, not after the remainder of
-                // its poll interval. This is the echo-latency path.
-                notify_change_wakeup(&ctx.wakeup);
             }
             Err(ref e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
@@ -1281,6 +1314,8 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
 pub(crate) struct VtChannel {
     /// tmux session name; the registry key.
     name: String,
+    /// Fencing token for this exact pipe generation.
+    owner_id: String,
     /// `name:^.0`, the pane target for tmux commands.
     target: String,
     parser: Arc<Mutex<vt100::Parser>>,
@@ -1306,6 +1341,9 @@ pub(crate) struct VtChannel {
     /// Number of chunks the reader has parsed. `0` means none yet, so
     /// `chunk_timing` reports `None` and the caller leaves pacing untouched.
     chunk_seq: Arc<AtomicU64>,
+    /// Highest contiguous read sequence that has either been applied to the
+    /// parser or deliberately discarded before the initial snapshot.
+    settled_chunk_seq: Arc<AtomicU64>,
     /// Arrival of the most recent chunk (millis since `CHUNK_CLOCK`), stamped
     /// by the reader thread on every chunk.
     last_chunk_ms: Arc<AtomicU64>,
@@ -1359,7 +1397,16 @@ impl VtChannel {
     /// step fails; callers then use the legacy capture/send-keys path. The
     /// returned `Arc` keeps the channel alive; drop it to release this viewer's
     /// hold (the channel tears down when the last `Arc` drops).
+    #[cfg(test)]
     pub(crate) fn acquire(session: &str) -> Option<Arc<VtChannel>> {
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        Self::acquire_with_deadline(session, &deadline)
+    }
+
+    pub(crate) fn acquire_with_deadline(
+        session: &str,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> Option<Arc<VtChannel>> {
         // Only a LIVE registry entry is reusable. A dead one (its pane was
         // killed and the tmux session recreated under the same name, e.g. a
         // session restart) must not be handed out: a viewer that received it
@@ -1389,7 +1436,7 @@ impl VtChannel {
             } else {
                 // No `?` here: an arm failure must still fall through to the
                 // prune below, or failed sessions would pile up in ARM_LOCKS.
-                Self::arm(session).map(|ch| {
+                Self::arm(session, deadline).map(|ch| {
                     let ch = Arc::new(ch);
                     // With arms serialized, no live competitor can exist
                     // here; insert replaces at most a dead entry (whose Drop
@@ -1406,6 +1453,7 @@ impl VtChannel {
         // Drop finished arm locks so the map tracks in-flight arms only. Our
         // own entry survives while another acquire holds a clone (count > 1
         // besides the map's).
+        drop(arm_lock);
         ARM_LOCKS
             .lock()
             .unwrap()
@@ -1413,14 +1461,14 @@ impl VtChannel {
         result
     }
 
-    fn arm(name: &str) -> Option<Self> {
-        if !tmux_supports_pipe_pane_io() {
+    fn arm(name: &str, deadline: &crate::tmux::TmuxCommandDeadline) -> Option<Self> {
+        if !tmux_supports_pipe_pane_io(deadline) {
             return None;
         }
         let target = format!("{name}:^.0");
         // Arming only needs the geometry; the cursor rides along because the
         // probe is shared with `reconcile_grid` and costs one fork either way.
-        let (cols, rows, _, _) = pane_size_cursor(&target)?;
+        let (cols, rows, _, _) = pane_size_cursor(&target, deadline)?;
         // `pipe-pane` is exclusive per pane: arming replaces (and thereby
         // kills) any other process's forwarder. Two aoe processes viewing the
         // same pane (a second TUI, the serve daemon's web live view) used to
@@ -1431,8 +1479,12 @@ impl VtChannel {
         // re-checks the lock so ownership transfers once the holder releases
         // (or its heartbeat goes stale: crash, kill -9).
         let session = crate::tmux::Session::from_name(name);
-        let owner = vt_owner_id();
-        if !session.claim_vt_owner(&owner, crate::tmux::session::VT_OWNER_TTL) {
+        let owner = new_pipe_owner_id();
+        if !session.claim_vt_owner_with_deadline(
+            &owner,
+            crate::tmux::session::VT_OWNER_TTL,
+            deadline,
+        ) {
             tracing::info!(
                 %target,
                 pid = std::process::id(),
@@ -1457,16 +1509,28 @@ impl VtChannel {
         let n = SOCK_COUNTER.fetch_add(1, Ordering::Relaxed);
         let sock_dir = std::env::temp_dir().join(format!("aoe-vt-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&sock_dir);
-        std::fs::create_dir_all(&sock_dir).ok()?;
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&sock_dir, std::fs::Permissions::from_mode(0o700)).ok()?;
-        }
-        let sock_path = sock_dir.join("s.sock");
-        let listener = UnixListener::bind(&sock_path).ok()?;
-
+        let setup = || -> Option<(PathBuf, UnixListener)> {
+            std::fs::create_dir_all(&sock_dir).ok()?;
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&sock_dir, std::fs::Permissions::from_mode(0o700)).ok()?;
+            }
+            let sock_path = sock_dir.join("s.sock");
+            Some((sock_path.clone(), UnixListener::bind(sock_path).ok()?))
+        };
+        let Some((sock_path, listener)) = setup() else {
+            let _ = std::fs::remove_dir_all(&sock_dir);
+            session.release_vt_owner_with_deadline(&owner, deadline);
+            return None;
+        };
+        let Some(exe) = std::env::current_exe().ok() else {
+            let _ = std::fs::remove_dir_all(&sock_dir);
+            session.release_vt_owner_with_deadline(&owner, deadline);
+            return None;
+        };
         let wakeup: Arc<Mutex<Option<ChangeWakeup>>> = Arc::new(Mutex::new(None));
         let chunk_seq = Arc::new(AtomicU64::new(0));
+        let settled_chunk_seq = Arc::new(AtomicU64::new(0));
         let last_chunk_ms = Arc::new(AtomicU64::new(0));
         let prev_gap_ms = Arc::new(AtomicU64::new(u64::MAX));
         let grid_gen = Arc::new(AtomicU64::new(0));
@@ -1481,6 +1545,7 @@ impl VtChannel {
                 wakeup: wakeup.clone(),
                 clipboard: clipboard.clone(),
                 chunk_seq: chunk_seq.clone(),
+                settled_chunk_seq: settled_chunk_seq.clone(),
                 last_chunk_ms: last_chunk_ms.clone(),
                 prev_gap_ms: prev_gap_ms.clone(),
                 grid_gen: grid_gen.clone(),
@@ -1488,25 +1553,20 @@ impl VtChannel {
             std::thread::spawn(move || run_reader(listener, ctx))
         };
 
-        let exe = std::env::current_exe().ok()?;
         let pipe_cmd = format!(
             "{} __vt-pipe {}",
             sh_quote(&exe.to_string_lossy()),
             sh_quote(&sock_path.to_string_lossy())
         );
-        let armed = crate::tmux::tmux_command()
-            .args(["pipe-pane", "-IO", "-t", &target, &pipe_cmd])
-            .output()
-            .ok();
-        if !armed.map(|o| o.status.success()).unwrap_or(false) {
+        let armed = session.arm_vt_pipe_if_owner_with_deadline(&owner, "-IO", &pipe_cmd, deadline);
+        if !armed {
             tracing::warn!(%target, "vt: tmux pipe-pane failed; falling back to capture");
-            stop.store(true, Ordering::Relaxed);
-            let _ = UnixStream::connect(&sock_path);
-            let _ = reader.join();
-            let _ = std::fs::remove_dir_all(&sock_dir);
+            stop_and_wake_reader(&stop, &sock_path);
             // Free the owner lock we claimed above so another process can arm
             // right away instead of waiting out the TTL on our failed attempt.
-            session.release_vt_owner(&owner);
+            session.release_vt_pipe_owner_with_deadline(&owner, deadline);
+            let _ = reader.join();
+            let _ = std::fs::remove_dir_all(&sock_dir);
             return None;
         }
 
@@ -1520,23 +1580,39 @@ impl VtChannel {
         while !alive.load(Ordering::Relaxed) {
             if Instant::now() >= connect_deadline {
                 tracing::warn!(%target, "vt: forwarder did not connect; falling back to capture");
-                stop.store(true, Ordering::Relaxed);
-                let _ = crate::tmux::tmux_command()
-                    .args(["pipe-pane", "-t", &target])
-                    .output();
-                let _ = UnixStream::connect(&sock_path);
+                stop_and_wake_reader(&stop, &sock_path);
+                session.release_vt_pipe_owner_with_deadline(&owner, deadline);
                 let _ = reader.join();
                 let _ = std::fs::remove_dir_all(&sock_dir);
-                session.release_vt_owner(&owner);
                 return None;
             }
             std::thread::sleep(Duration::from_millis(2));
         }
 
-        // Seed the current screen so an already-running agent shows up
-        // immediately instead of starting blank (pipe-pane has no backlog).
-        seed_parser(&target, &parser, &app_cursor, &grid_gen, cols, rows);
-        seeded.store(true, Ordering::Relaxed);
+        // Mark the reader live before capture. Chunks observed before this point
+        // are represented by the later snapshot; chunks observed after it are
+        // applied to the parser and advance the guard before waiting on its lock.
+        // The seed therefore either includes each chunk or returns Busy, never
+        // dropping the capture-to-install window.
+        seeded.store(true, Ordering::Release);
+        let expected_chunk_seq = chunk_seq.load(Ordering::Acquire);
+        if seed_parser(
+            &target,
+            &parser,
+            &app_cursor,
+            &grid_gen,
+            (cols, rows),
+            deadline,
+            Some((&chunk_seq, &settled_chunk_seq, expected_chunk_seq)),
+        ) != VtRefreshResult::Refreshed
+        {
+            tracing::warn!(%target, "vt: initial seed failed; falling back to capture");
+            stop_and_wake_reader(&stop, &sock_path);
+            session.release_vt_pipe_owner_with_deadline(&owner, deadline);
+            let _ = reader.join();
+            let _ = std::fs::remove_dir_all(&sock_dir);
+            return None;
+        }
         tracing::info!(
             %target,
             cols,
@@ -1547,6 +1623,7 @@ impl VtChannel {
 
         Some(Self {
             name: name.to_string(),
+            owner_id: owner,
             target,
             parser,
             stream,
@@ -1555,6 +1632,7 @@ impl VtChannel {
             wakeup,
             clipboard,
             chunk_seq,
+            settled_chunk_seq,
             last_chunk_ms,
             prev_gap_ms,
             grid_gen,
@@ -1580,14 +1658,15 @@ impl VtChannel {
     /// `set-option` fork); a lost lock needs no demote here, because the new
     /// owner's arm replaces our pipe and the reader's EOF death path already
     /// flips every consumer to the capture fallback.
-    fn refresh_owner_heartbeat(&self) {
+    fn refresh_owner_heartbeat(&self, deadline: &crate::tmux::TmuxCommandDeadline) {
         let mut guard = self.last_owner_hb.lock().unwrap();
         if guard.elapsed() < Duration::from_millis(1500) {
             return;
         }
         *guard = Instant::now();
         drop(guard);
-        let _ = crate::tmux::Session::from_name(&self.name).refresh_vt_owner(&vt_owner_id());
+        let _ = crate::tmux::Session::from_name(&self.name)
+            .refresh_vt_owner_with_deadline(&self.owner_id, deadline);
     }
 
     /// Reconcile the parser with the pane at most once a second (one
@@ -1603,17 +1682,17 @@ impl VtChannel {
     ///   `pipe-pane` is an unacknowledged one-way stream, so a missed or doubled
     ///   byte is permanent, and a pane that never resizes used to carry that
     ///   divergence forever. `reconcile_step` owns the race-vs-drift call, and
-    ///   deliberately does not reseed while output is flowing. A cursor-clean
-    ///   divergence is caught instead by the capture worker's periodic
-    ///   [`VtChannel::resync_from_pane`].
-    fn reconcile_grid(&self) {
+    ///   deliberately does not reseed while output is flowing. Cursor-clean
+    ///   cell drift is repaired by the capture worker's guarded authoritative
+    ///   refresh without adding a second resync protocol.
+    fn reconcile_grid(&self, deadline: &crate::tmux::TmuxCommandDeadline) {
         let mut guard = self.last_size_check.lock().unwrap();
         if guard.elapsed() < Duration::from_secs(1) {
             return;
         }
         *guard = Instant::now();
         drop(guard);
-        let Some((c, r, cx, cy)) = pane_size_cursor(&self.target) else {
+        let Some((c, r, cx, cy)) = pane_size_cursor(&self.target, deadline) else {
             return;
         };
         let (gc, gr) = (
@@ -1628,20 +1707,24 @@ impl VtChannel {
             return;
         };
         let (gcy, gcx) = p.screen().cursor_position();
+        // Read generation after cursor while holding the same parser lock used
+        // by the reader's generation bump. A processed cursor cannot pair with
+        // a generation from before that chunk.
         let grid_gen = self.grid_gen.load(Ordering::Relaxed);
         drop(p);
-        let pending = self.pending_drift.lock().ok().and_then(|g| *g);
+        let pending = self.pending_drift.lock().ok().and_then(|guard| *guard);
         match reconcile_step((c, r, cx, cy), (gc, gr, gcx, gcy), pending, grid_gen) {
             GridReconcile::InSync => self.clear_drift(),
             GridReconcile::ArmDrift => {
-                if let Ok(mut g) = self.pending_drift.lock() {
-                    *g = Some(grid_gen);
+                if let Ok(mut guard) = self.pending_drift.lock() {
+                    *guard = Some(grid_gen);
                 }
             }
             GridReconcile::Resize => {
-                self.cols.store(c, Ordering::Relaxed);
-                self.rows.store(r, Ordering::Relaxed);
-                self.reseed(c, r, false);
+                if refresh_commits_geometry(self.reseed(c, r, false, deadline)) {
+                    self.cols.store(c, Ordering::Relaxed);
+                    self.rows.store(r, Ordering::Relaxed);
+                }
             }
             GridReconcile::Reseed => {
                 tracing::debug!(
@@ -1651,7 +1734,7 @@ impl VtChannel {
                     grid_cursor = ?(gcx, gcy),
                     "vt: grid diverged from pane; reseeding",
                 );
-                self.reseed(c, r, true);
+                self.reseed(c, r, true, deadline);
             }
         }
     }
@@ -1660,60 +1743,77 @@ impl VtChannel {
     /// place, which at worst costs one extra reconcile pass; the alternative is
     /// panicking the render thread over a display-only heuristic.
     fn clear_drift(&self) {
-        if let Ok(mut g) = self.pending_drift.lock() {
-            *g = None;
+        if let Ok(mut guard) = self.pending_drift.lock() {
+            *guard = None;
         }
     }
 
-    /// Rebuild the grid from `capture-pane` and clear any armed drift, so the
-    /// freshly seeded cursor is not immediately re-judged against a stale
-    /// generation.
+    /// Rebuild the grid from `capture-pane` and clear any armed drift after a
+    /// successful swap.
     ///
-    /// `guarded` sets the generation the swap is conditional on (see
-    /// [`swap_seeded_parser`]), sampled here so it precedes the capture's
-    /// forks. Healing reseeds pass true: their premise is that the current
-    /// grid is right except for the drift, so a chunk arriving mid-capture is
-    /// output that only the current grid holds. A resize passes false, because
-    /// tmux reflowed and the pre-resize grid is wrong whatever it received.
-    fn reseed(&self, cols: u16, rows: u16, guarded: bool) -> bool {
+    /// `guarded` makes the swap conditional on the generation sampled before
+    /// the capture. Healing reseeds are guarded because the current grid owns
+    /// any concurrent output; resize reseeds are not, because tmux has reflowed
+    /// and made the pre-resize grid stale. Both paths retain the received and
+    /// settled chunk fence so a queued chunk cannot be duplicated or dropped.
+    fn reseed(
+        &self,
+        cols: u16,
+        rows: u16,
+        guarded: bool,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> VtRefreshResult {
         let since = guarded.then(|| self.grid_gen.load(Ordering::Relaxed));
-        let Some(stream) = capture_seed_stream(&self.target, rows) else {
-            return false;
+        let expected_chunk_seq = self.chunk_seq.load(Ordering::Acquire);
+        let Some(stream) = capture_seed_stream(&self.target, rows, deadline) else {
+            return VtRefreshResult::Failed;
         };
-        let seeded = swap_seeded_parser(
+        let result = swap_seeded_parser(
             &self.parser,
             &self.app_cursor,
             &self.grid_gen,
             since,
             &stream,
-            cols,
-            rows,
+            (cols, rows),
+            Some((&self.chunk_seq, &self.settled_chunk_seq, expected_chunk_seq)),
         );
-        self.clear_drift();
-        seeded
+        if result == VtRefreshResult::Refreshed {
+            self.clear_drift();
+        }
+        result
     }
 
-    /// Rebuild the grid from a fresh `capture-pane` at its current size, the
-    /// seed `acquire` starts from, so a grid that has stably diverged from
-    /// tmux cannot stand indefinitely. False when the pane could not be
-    /// captured or the seed raced live output, so the caller can retry sooner
-    /// than its normal interval.
-    pub(crate) fn resync_from_pane(&self) -> bool {
+    /// Rebuild from an authoritative tmux snapshot even when cursor and
+    /// geometry probes agree, healing cell drift that those probes cannot see.
+    pub(crate) fn refresh_authoritatively(
+        &self,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> VtRefreshResult {
         self.reseed(
             self.cols.load(Ordering::Relaxed),
             self.rows.load(Ordering::Relaxed),
             true,
+            deadline,
         )
     }
-
-    /// Serialise up to `max_lines` of (scrollback + screen) to per-row ANSI,
-    /// plus the authoritative cursor (with `history_size` set to the full
+    /// Serialise up to max_lines of (scrollback + screen) to per-row ANSI,
+    /// plus the authoritative cursor (with history_size set to the full
     /// scrollback depth). `max_lines` mirrors the capture path's window: both
     /// the TUI scroll and the web's virtual scroll spacer need real history
     /// here, not just the visible screen.
+    #[cfg(test)]
     pub(crate) fn sample(&self, max_lines: usize) -> (String, Option<PaneCursor>) {
-        self.reconcile_grid();
-        self.refresh_owner_heartbeat();
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        self.sample_with_deadline(max_lines, &deadline)
+    }
+
+    pub(crate) fn sample_with_deadline(
+        &self,
+        max_lines: usize,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> (String, Option<PaneCursor>) {
+        self.reconcile_grid(deadline);
+        self.refresh_owner_heartbeat(deadline);
         let cols = self.cols.load(Ordering::Relaxed);
         let rows = self.rows.load(Ordering::Relaxed);
         // Read the generation BEFORE assembling: a chunk that lands
@@ -1760,13 +1860,24 @@ impl VtChannel {
     /// briefly disagree with the grid mid-resize. Padding and truncating to the
     /// requested rectangle keeps that frame merely stale instead of shifting
     /// every pane to its right.
+    #[cfg(test)]
     pub(crate) fn sample_rows_padded(
         &self,
         want_cols: u16,
         want_rows: u16,
     ) -> Option<(Vec<String>, PaneCursor)> {
-        self.reconcile_grid();
-        self.refresh_owner_heartbeat();
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        self.sample_rows_padded_with_deadline(want_cols, want_rows, &deadline)
+    }
+
+    pub(crate) fn sample_rows_padded_with_deadline(
+        &self,
+        want_cols: u16,
+        want_rows: u16,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> Option<(Vec<String>, PaneCursor)> {
+        self.reconcile_grid(deadline);
+        self.refresh_owner_heartbeat(deadline);
         let cols = self.cols.load(Ordering::Relaxed);
         let rows = self.rows.load(Ordering::Relaxed);
         let want_cols = want_cols.max(1);
@@ -1851,34 +1962,32 @@ impl VtChannel {
             None => false,
         }
     }
+    pub(crate) fn shutdown_with_deadline(&self, deadline: &crate::tmux::TmuxCommandDeadline) {
+        if self.stop.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        crate::tmux::Session::from_name(&self.name)
+            .release_vt_pipe_owner_with_deadline(&self.owner_id, deadline);
+        let _ = UnixStream::connect(&self.sock_path);
+        if let Some(reader) = self.reader.lock().unwrap().take() {
+            let _ = reader.join();
+        }
+        let _ = std::fs::remove_dir_all(&self.sock_dir);
+    }
 }
-
 impl Drop for VtChannel {
     fn drop(&mut self) {
-        // Remove our registry entry, but only if it still points at us (a
-        // concurrent re-arm under the same name must not be clobbered): our
-        // weak no longer upgrades once we're dropping.
         {
-            let mut reg = REGISTRY.lock().unwrap();
-            if reg.get(&self.name).is_some_and(|w| w.upgrade().is_none()) {
-                reg.remove(&self.name);
+            let mut registry = REGISTRY.lock().unwrap();
+            if registry
+                .get(&self.name)
+                .is_some_and(|channel| channel.upgrade().is_none())
+            {
+                registry.remove(&self.name);
             }
         }
-        self.stop.store(true, Ordering::Relaxed);
-        let _ = crate::tmux::tmux_command()
-            .args(["pipe-pane", "-t", &self.target])
-            .output();
-        // Unblock a reader still parked in accept().
-        let _ = UnixStream::connect(&self.sock_path);
-        if let Some(h) = self.reader.lock().unwrap().take() {
-            let _ = h.join();
-        }
-        // Remove the whole per-channel 0700 dir (socket included).
-        let _ = std::fs::remove_dir_all(&self.sock_dir);
-        // Free the cross-process VT-owner lock so another viewer (a second
-        // TUI, the serve daemon) can arm immediately instead of waiting out
-        // the TTL. Best-effort like the rest of this teardown.
-        crate::tmux::Session::from_name(&self.name).release_vt_owner(&vt_owner_id());
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        self.shutdown_with_deadline(&deadline);
     }
 }
 
@@ -1887,7 +1996,8 @@ impl Drop for VtChannel {
 /// grid, so prompt redraws cannot affect the displayed frame.
 pub(crate) struct Osc52Channel {
     name: String,
-    target: String,
+    /// Fencing token for this exact pipe generation.
+    owner_id: String,
     clipboard: Arc<Mutex<Option<String>>>,
     /// Monotonically bumps after publishing a clipboard value. Consumers keep
     /// their own cursor so one dashboard viewer cannot consume an event for
@@ -1905,7 +2015,16 @@ impl Osc52Channel {
     /// Arm a read-only observer. `pipe-pane` is exclusive, so this uses the
     /// same cross-process owner lease as a VT grid and only runs when the grid
     /// transport is disabled for the displayed terminal pane.
+    #[cfg(feature = "serve")]
     pub(crate) fn acquire(name: &str) -> Option<Arc<Self>> {
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        Self::acquire_with_deadline(name, &deadline)
+    }
+
+    pub(crate) fn acquire_with_deadline(
+        name: &str,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> Option<Arc<Self>> {
         if let Some(channel) = lookup_osc52(name).filter(|channel| channel.is_alive()) {
             return Some(channel);
         }
@@ -1920,7 +2039,7 @@ impl Osc52Channel {
             if let Some(channel) = lookup_osc52(name).filter(|channel| channel.is_alive()) {
                 Some(channel)
             } else {
-                Self::arm(name).map(|channel| {
+                Self::arm(name, deadline).map(|channel| {
                     let channel = Arc::new(channel);
                     OSC52_REGISTRY
                         .lock()
@@ -1930,6 +2049,7 @@ impl Osc52Channel {
                 })
             }
         };
+        drop(arm_lock);
         OSC52_ARM_LOCKS
             .lock()
             .unwrap()
@@ -1937,14 +2057,17 @@ impl Osc52Channel {
         result
     }
 
-    fn arm(name: &str) -> Option<Self> {
-        if !tmux_supports_pipe_pane_io() {
+    fn arm(name: &str, deadline: &crate::tmux::TmuxCommandDeadline) -> Option<Self> {
+        if !tmux_supports_pipe_pane_io(deadline) {
             return None;
         }
-        let target = format!("{name}:^.0");
         let session = crate::tmux::Session::from_name(name);
-        let owner = vt_owner_id();
-        if !session.claim_vt_owner(&owner, crate::tmux::session::VT_OWNER_TTL) {
+        let owner = new_pipe_owner_id();
+        if !session.claim_vt_owner_with_deadline(
+            &owner,
+            crate::tmux::session::VT_OWNER_TTL,
+            deadline,
+        ) {
             return None;
         }
 
@@ -1961,12 +2084,12 @@ impl Osc52Channel {
         };
         let Some((sock_path, listener)) = setup() else {
             let _ = std::fs::remove_dir_all(&sock_dir);
-            session.release_vt_owner(&owner);
+            session.release_vt_owner_with_deadline(&owner, deadline);
             return None;
         };
         let Some(exe) = std::env::current_exe().ok() else {
             let _ = std::fs::remove_dir_all(&sock_dir);
-            session.release_vt_owner(&owner);
+            session.release_vt_owner_with_deadline(&owner, deadline);
             return None;
         };
 
@@ -1988,36 +2111,30 @@ impl Osc52Channel {
             sh_quote(&exe.to_string_lossy()),
             sh_quote(&sock_path.to_string_lossy())
         );
-        let armed = crate::tmux::tmux_command()
-            .args(["pipe-pane", "-O", "-t", &target, &pipe_cmd])
-            .output()
-            .ok();
-        if !armed.map(|o| o.status.success()).unwrap_or(false) {
+        let armed = session.arm_vt_pipe_if_owner_with_deadline(&owner, "-O", &pipe_cmd, deadline);
+        if !armed {
             stop.store(true, Ordering::Relaxed);
+            session.release_vt_pipe_owner_with_deadline(&owner, deadline);
             let _ = UnixStream::connect(&sock_path);
             let _ = reader.join();
             let _ = std::fs::remove_dir_all(&sock_dir);
-            session.release_vt_owner(&owner);
             return None;
         }
-        let deadline = Instant::now() + Duration::from_millis(500);
+        let connect_deadline = Instant::now() + Duration::from_millis(500);
         while !alive.load(Ordering::Relaxed) {
-            if Instant::now() >= deadline {
+            if Instant::now() >= connect_deadline {
                 stop.store(true, Ordering::Relaxed);
-                let _ = crate::tmux::tmux_command()
-                    .args(["pipe-pane", "-t", &target])
-                    .output();
+                session.release_vt_pipe_owner_with_deadline(&owner, deadline);
                 let _ = UnixStream::connect(&sock_path);
                 let _ = reader.join();
                 let _ = std::fs::remove_dir_all(&sock_dir);
-                session.release_vt_owner(&owner);
                 return None;
             }
             std::thread::sleep(Duration::from_millis(2));
         }
         Some(Self {
             name: name.to_string(),
-            target,
+            owner_id: owner,
             clipboard,
             clipboard_seq,
             alive,
@@ -2049,7 +2166,16 @@ impl Osc52Channel {
 
     /// Keep the exclusive pipe owner lease alive while the terminal snapshot
     /// worker still observes this pane.
+    #[cfg(feature = "serve")]
     pub(crate) fn refresh_owner_heartbeat(&self) {
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        self.refresh_owner_heartbeat_with_deadline(&deadline);
+    }
+
+    pub(crate) fn refresh_owner_heartbeat_with_deadline(
+        &self,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) {
         let Ok(mut last) = self.last_owner_hb.lock() else {
             return;
         };
@@ -2058,7 +2184,20 @@ impl Osc52Channel {
         }
         *last = Instant::now();
         drop(last);
-        let _ = crate::tmux::Session::from_name(&self.name).refresh_vt_owner(&vt_owner_id());
+        let _ = crate::tmux::Session::from_name(&self.name)
+            .refresh_vt_owner_with_deadline(&self.owner_id, deadline);
+    }
+    pub(crate) fn shutdown_with_deadline(&self, deadline: &crate::tmux::TmuxCommandDeadline) {
+        if self.stop.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        crate::tmux::Session::from_name(&self.name)
+            .release_vt_pipe_owner_with_deadline(&self.owner_id, deadline);
+        let _ = UnixStream::connect(&self.sock_path);
+        if let Some(reader) = self.reader.lock().unwrap().take() {
+            let _ = reader.join();
+        }
+        let _ = std::fs::remove_dir_all(&self.sock_dir);
     }
 }
 
@@ -2121,22 +2260,42 @@ impl Drop for Osc52Channel {
                 registry.remove(&self.name);
             }
         }
-        self.stop.store(true, Ordering::Relaxed);
-        let _ = crate::tmux::tmux_command()
-            .args(["pipe-pane", "-t", &self.target])
-            .output();
-        let _ = UnixStream::connect(&self.sock_path);
-        if let Some(reader) = self.reader.lock().unwrap().take() {
-            let _ = reader.join();
-        }
-        let _ = std::fs::remove_dir_all(&self.sock_dir);
-        crate::tmux::Session::from_name(&self.name).release_vt_owner(&vt_owner_id());
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        self.shutdown_with_deadline(&deadline);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pipe_owner_ids_are_unique_per_channel_generation() {
+        assert_ne!(new_pipe_owner_id(), new_pipe_owner_id());
+    }
+
+    #[test]
+    fn transient_version_failure_is_not_cached() {
+        let cache = std::sync::OnceLock::new();
+        assert!(!cached_tmux_support(&cache, || None));
+        assert!(cache.get().is_none());
+        assert!(cached_tmux_support(&cache, || parse_tmux_pipe_support(
+            "tmux 3.4"
+        )));
+        assert_eq!(cache.get(), Some(&true));
+        assert!(cached_tmux_support(&cache, || panic!(
+            "cached result must win"
+        )));
+
+        let cases = [
+            ("tmux 3.3a", Some(false)),
+            ("tmux next-3.5", Some(true)),
+            ("bad", None),
+        ];
+        for (version, expected) in cases {
+            assert_eq!(parse_tmux_pipe_support(version), expected, "{version}");
+        }
+    }
 
     #[test]
     fn grid_content_preserves_interior_padding() {
@@ -2258,6 +2417,62 @@ mod tests {
         assert_eq!(visible_width(&rows[1]), 4);
     }
 
+    #[test]
+    fn seed_install_reports_failure_and_preserves_newer_chunks() {
+        let parser = Mutex::new(vt100::Parser::new(24, 80, SCROLLBACK_LINES));
+        parser.lock().unwrap().process(b"LIVE-CHUNK");
+        let app_cursor = AtomicBool::new(false);
+        let grid_gen = AtomicU64::new(0);
+        let chunk_seq = AtomicU64::new(1);
+        let settled_chunk_seq = AtomicU64::new(0);
+
+        assert_eq!(
+            swap_seeded_parser(
+                &parser,
+                &app_cursor,
+                &grid_gen,
+                None,
+                b"STALE-SNAPSHOT",
+                (80, 24),
+                Some((&chunk_seq, &settled_chunk_seq, 0)),
+            ),
+            VtRefreshResult::Busy,
+        );
+        assert_eq!(
+            swap_seeded_parser(
+                &parser,
+                &app_cursor,
+                &grid_gen,
+                None,
+                b"STALE-SNAPSHOT",
+                (80, 24),
+                Some((&chunk_seq, &settled_chunk_seq, 1)),
+            ),
+            VtRefreshResult::Busy,
+            "a seed must not overtake a read waiting on the parser"
+        );
+        let contents = parser.lock().unwrap().screen().contents();
+        assert!(contents.contains("LIVE-CHUNK"));
+        assert!(!contents.contains("STALE-SNAPSHOT"));
+
+        let deadline = crate::tmux::TmuxCommandDeadline::with_timeout(Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(
+            seed_parser(
+                "aoe_test_missing_seed",
+                &parser,
+                &app_cursor,
+                &grid_gen,
+                (80, 24),
+                &deadline,
+                None,
+            ),
+            VtRefreshResult::Failed,
+        );
+        assert!(refresh_commits_geometry(VtRefreshResult::Refreshed));
+        assert!(!refresh_commits_geometry(VtRefreshResult::Busy));
+        assert!(!refresh_commits_geometry(VtRefreshResult::Failed));
+    }
     #[test]
     fn lf_to_crlf_unstaircases_seed_rows() {
         // capture-pane joins rows with bare LF; fed raw, the vt100 parser
@@ -2503,6 +2718,7 @@ mod tests {
         let alive = Arc::new(AtomicBool::new(false));
         let ch = Arc::new(VtChannel {
             name: name.to_string(),
+            owner_id: new_pipe_owner_id(),
             target: format!("{name}:^.0"),
             parser: Arc::new(Mutex::new(vt100::Parser::new(4, 20, SCROLLBACK_LINES))),
             stream: Arc::new(Mutex::new(None)),
@@ -2511,6 +2727,7 @@ mod tests {
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
             chunk_seq: Arc::new(AtomicU64::new(0)),
+            settled_chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
             prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
             grid_gen: Arc::new(AtomicU64::new(0)),
@@ -2526,6 +2743,41 @@ mod tests {
             last_owner_hb: Mutex::new(Instant::now()),
         });
         (ch, alive)
+    }
+
+    #[test]
+    fn expired_deadline_bounds_worker_owned_channel_shutdown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (channel, _) = dummy_channel("aoe_test_vt_shutdown", dir.path());
+        let channel = Arc::try_unwrap(channel).ok().expect("sole channel owner");
+        let deadline = crate::tmux::TmuxCommandDeadline::with_timeout(Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(5));
+        let started = Instant::now();
+        channel.shutdown_with_deadline(&deadline);
+        assert!(channel.stop.load(Ordering::Relaxed));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        drop(channel);
+
+        let late_dir = tempfile::tempdir().expect("late reader tempdir");
+        let sock_path = late_dir.path().join("late-reader.sock");
+        let listener = UnixListener::bind(&sock_path).expect("bind late reader");
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader_stop = stop.clone();
+        let reader = std::thread::spawn(move || {
+            let _ = listener.accept();
+            let deadline = Instant::now() + Duration::from_millis(750);
+            while !reader_stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let started = Instant::now();
+        stop_and_wake_reader(&stop, &sock_path);
+        reader.join().expect("late reader exits");
+        assert!(stop.load(Ordering::Relaxed));
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "arm-timeout cleanup must stop a reader accepted after the deadline",
+        );
     }
 
     #[test]
@@ -2732,6 +2984,7 @@ mod tests {
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
             chunk_seq: Arc::new(AtomicU64::new(0)),
+            settled_chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
             prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
             grid_gen: grid_gen.clone(),
@@ -2768,6 +3021,8 @@ mod tests {
         let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
         let app_cursor = Arc::new(AtomicBool::new(false));
         let grid_gen = Arc::new(AtomicU64::new(0));
+        let chunk_seq = Arc::new(AtomicU64::new(0));
+        let settled_chunk_seq = Arc::new(AtomicU64::new(0));
         let ctx = ReaderCtx {
             parser: parser.clone(),
             stop: stop.clone(),
@@ -2777,7 +3032,8 @@ mod tests {
             alive: Arc::new(AtomicBool::new(false)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
-            chunk_seq: Arc::new(AtomicU64::new(0)),
+            chunk_seq: chunk_seq.clone(),
+            settled_chunk_seq: settled_chunk_seq.clone(),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
             prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
             grid_gen: grid_gen.clone(),
@@ -2796,8 +3052,17 @@ mod tests {
         }
 
         let seed = assemble_seed_stream(b"snapshot-body\n", &PaneSeedState::default(), 24);
-        assert!(
-            !swap_seeded_parser(&parser, &app_cursor, &grid_gen, Some(since), &seed, 80, 24),
+        assert_eq!(
+            swap_seeded_parser(
+                &parser,
+                &app_cursor,
+                &grid_gen,
+                Some(since),
+                &seed,
+                (80, 24),
+                Some((&chunk_seq, &settled_chunk_seq, 0)),
+            ),
+            VtRefreshResult::Busy,
             "swap must stand down once a chunk has landed"
         );
         let grid = parser.lock().expect("parser").screen().contents();
@@ -2808,8 +3073,18 @@ mod tests {
 
         // Same swap once the grid is quiet at the sampled generation: applies.
         let quiet = grid_gen.load(Ordering::Relaxed);
-        assert!(
-            swap_seeded_parser(&parser, &app_cursor, &grid_gen, Some(quiet), &seed, 80, 24),
+        let expected_chunk_seq = chunk_seq.load(Ordering::Acquire);
+        assert_eq!(
+            swap_seeded_parser(
+                &parser,
+                &app_cursor,
+                &grid_gen,
+                Some(quiet),
+                &seed,
+                (80, 24),
+                Some((&chunk_seq, &settled_chunk_seq, expected_chunk_seq,)),
+            ),
+            VtRefreshResult::Refreshed,
             "an unraced swap must apply the snapshot"
         );
         let grid = parser.lock().expect("parser").screen().contents();
@@ -2885,6 +3160,7 @@ mod tests {
             wakeup: wakeup_slot.clone(),
             clipboard: Arc::new(Mutex::new(None)),
             chunk_seq: Arc::new(AtomicU64::new(0)),
+            settled_chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
             prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
             grid_gen: Arc::new(AtomicU64::new(0)),
@@ -2892,7 +3168,7 @@ mod tests {
         let reader = std::thread::spawn(move || run_reader(listener, ctx));
         let mut conn = UnixStream::connect(&sock).expect("connect");
 
-        let pair: ChangeWakeup = Arc::new((Mutex::new(()), Condvar::new()));
+        let pair: ChangeWakeup = Arc::new((Mutex::new(0), Condvar::new()));
         *wakeup_slot.lock().unwrap() = Some(pair.clone());
         // Hold the parker's mutex BEFORE writing: the reader's notify takes
         // the same lock, so the wakeup cannot fire into the gap between this
@@ -3042,6 +3318,7 @@ mod tests {
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: clipboard.clone(),
             chunk_seq: Arc::new(AtomicU64::new(0)),
+            settled_chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
             prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
             grid_gen: Arc::new(AtomicU64::new(0)),
@@ -3162,6 +3439,7 @@ mod tests {
         let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
         let stop = Arc::new(AtomicBool::new(false));
         let chunk_seq = Arc::new(AtomicU64::new(0));
+        let settled_chunk_seq = Arc::new(AtomicU64::new(0));
         let last_chunk_ms = Arc::new(AtomicU64::new(0));
         let prev_gap_ms = Arc::new(AtomicU64::new(u64::MAX));
         let ctx = ReaderCtx {
@@ -3174,7 +3452,8 @@ mod tests {
             alive: Arc::new(AtomicBool::new(false)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
-            chunk_seq: chunk_seq.clone(),
+            chunk_seq,
+            settled_chunk_seq: settled_chunk_seq.clone(),
             last_chunk_ms: last_chunk_ms.clone(),
             prev_gap_ms: prev_gap_ms.clone(),
             grid_gen: Arc::new(AtomicU64::new(0)),
@@ -3182,16 +3461,16 @@ mod tests {
         let reader = std::thread::spawn(move || run_reader(listener, ctx));
         let mut conn = UnixStream::connect(&sock).expect("connect");
 
-        // Wait for the reader to finish processing the `n`th chunk. Writing the
-        // next chunk only after the previous is consumed keeps them separate
-        // reads (a unix stream is a byte stream, so two pending writes could
-        // otherwise coalesce into one chunk).
+        // Wait for the reader to publish the nth chunk's complete parser
+        // and timing state. Writing the next chunk only after the previous is
+        // settled also keeps them as separate reads (a unix stream is a byte
+        // stream, so two pending writes could otherwise coalesce).
         let wait_seq = |n: u64| {
             let deadline = Instant::now() + Duration::from_secs(5);
-            while chunk_seq.load(Ordering::Relaxed) < n {
+            while settled_chunk_seq.load(Ordering::Acquire) < n {
                 assert!(
                     Instant::now() < deadline,
-                    "reader did not process {n} chunks"
+                    "reader did not settle {n} chunks"
                 );
                 std::thread::sleep(Duration::from_millis(1));
             }
@@ -3266,21 +3545,14 @@ mod tests {
     }
 
     #[test]
-    fn reader_drops_pre_seed_bytes_but_still_taps_clipboard() {
+    fn reader_fences_seed_windows_and_still_taps_clipboard() {
         use std::io::Write;
 
-        // `arm` orders the pipe first and the seed second, so every byte the
-        // pane emits while the channel is arming is already folded into the
-        // `capture-pane` the seed is built from. Replaying those bytes once
-        // `seeded` flipped applied them TWICE: the output appeared duplicated
-        // lower down, carrying a second copy of zsh's PROMPT_EOL_MARK onto a
-        // row tmux has none on, and shifting every later row. A shell pane only
-        // appends, so it never washed out. They must be dropped instead.
-        //
-        // The OSC 52 tap is deliberately NOT gated on the seed: a copy that
-        // lands while arming has no other route to the host clipboard, and it
-        // doubles here as the barrier proving the pre-seed chunk was consumed
-        // (a dropped chunk bumps neither `grid_gen` nor the chunk counters).
+        // Output received before the initial capture is not replayed because
+        // that later snapshot already contains it. The read still advances the
+        // seed fence, and OSC 52 remains observable while the grid is unseeded.
+        // Once seeded, every read advances the same fence before waiting on the
+        // parser so an authoritative refresh cannot duplicate a queued chunk.
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("s.sock");
         let listener = UnixListener::bind(&sock).expect("bind");
@@ -3289,6 +3561,8 @@ mod tests {
         let seeded = Arc::new(AtomicBool::new(false));
         let parser = Arc::new(Mutex::new(vt100::Parser::new(6, 40, 0)));
         let clipboard: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let chunk_seq = Arc::new(AtomicU64::new(0));
+        let settled_chunk_seq = Arc::new(AtomicU64::new(0));
         let ctx = ReaderCtx {
             parser: parser.clone(),
             stop: stop.clone(),
@@ -3298,7 +3572,8 @@ mod tests {
             alive: Arc::new(AtomicBool::new(false)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: clipboard.clone(),
-            chunk_seq: Arc::new(AtomicU64::new(0)),
+            chunk_seq: chunk_seq.clone(),
+            settled_chunk_seq: settled_chunk_seq.clone(),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
             prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
             grid_gen: grid_gen.clone(),
@@ -3328,15 +3603,40 @@ mod tests {
             "a dropped pre-seed chunk must not bump the grid generation"
         );
 
-        // The seed lands, then post-seed output arrives.
-        seeded.store(true, Ordering::Relaxed);
+        assert_eq!(chunk_seq.load(Ordering::Acquire), 1);
+        assert_eq!(
+            settled_chunk_seq.load(Ordering::Acquire),
+            1,
+            "a discarded pre-seed read must be settled before capture"
+        );
+
+        // Hold the parser while a live chunk arrives. The sequence must move
+        // before the reader can acquire this lock, otherwise a concurrent seed
+        // could install a snapshot containing the chunk and then apply it again.
+        let parser_guard = parser.lock().unwrap();
+        seeded.store(true, Ordering::Release);
         conn.write_all(b"POST-SEED-OUTPUT")
             .expect("write post-seed");
         let deadline = Instant::now() + Duration::from_secs(5);
-        while grid_gen.load(Ordering::Relaxed) < 1 {
-            assert!(Instant::now() < deadline, "post-seed chunk never applied");
+        while chunk_seq.load(Ordering::Acquire) < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "reader did not fence queued chunk"
+            );
             std::thread::sleep(Duration::from_millis(2));
         }
+        assert_eq!(grid_gen.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            settled_chunk_seq.load(Ordering::Acquire),
+            1,
+            "a queued chunk must remain unsettled until it mutates the parser"
+        );
+        drop(parser_guard);
+        while settled_chunk_seq.load(Ordering::Acquire) < 2 {
+            assert!(Instant::now() < deadline, "post-seed chunk never settled");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(grid_gen.load(Ordering::Relaxed), 1);
 
         let screen = {
             let p = parser.lock().unwrap();

@@ -10,15 +10,14 @@ impl Instance {
             &self.project_path,
             self.resolved_agent()
                 .map_or(self.tool.as_str(), |agent| agent.name),
-            false,
             &self.effective_profile(),
             &self.retroactive_capture_excludes,
         )
     }
 
     pub(crate) fn try_retroactive_capture(&self) -> Option<String> {
-        let (support, context) = self.resolved_session_support()?;
-        let backend = support.capture.backend;
+        let (capture, context) = self.resolved_session_support()?;
+        let backend = capture.backend;
         if matches!(
             context,
             crate::agents::SessionCaptureContext::Preassigned
