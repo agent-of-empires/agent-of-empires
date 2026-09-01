@@ -192,7 +192,7 @@ impl Instance {
     /// parseable argv. Benign arguments remain supported; store-selecting
     /// flags are interpreted by the capture resolver.
     pub(super) fn omp_capture_options(&self) -> Option<OmpCliCaptureOptions> {
-        if self.tool != "omp" || self.has_command_override() {
+        if self.resolved_capture_backend() != Some(crate::agents::SessionCaptureBackend::Omp) {
             return None;
         }
         let args = crate::session::config::quote_model_value_in_args(&self.extra_args);

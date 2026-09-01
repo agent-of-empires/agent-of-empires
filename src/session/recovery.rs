@@ -125,13 +125,17 @@ fn recovery_lock_path() -> Result<PathBuf> {
 /// transitions `Status::Stopped` to `Status::Starting` before recovery is
 /// consulted.
 pub fn is_recovery_candidate(inst: &Instance) -> bool {
+    let resumable_id = inst
+        .resolved_agent()
+        .is_some_and(|agent| should_attempt_resume(inst.agent_session_id.as_deref(), agent.name));
     !inst.is_structured()
         && !inst.is_archived()
         && !inst.is_snoozed()
         && !inst.is_trashed()
         && inst.status != super::Status::Stopped
         && inst.agent_session_id != inst.resume_probe_failed_sid
-        && should_attempt_resume(inst.agent_session_id.as_deref(), &inst.tool)
+        && inst.supports_native_resume()
+        && resumable_id
 }
 
 /// Minimum `agent_session_id` length before it is trusted as a process-argv
@@ -144,9 +148,11 @@ const ORPHAN_SCAN_MIN_SID_LEN: usize = 8;
 /// True when aoe injects `AOE_INSTANCE_ID` into this agent's environment. Gated
 /// on the same hook presence as `status_hook_env_prefix`, so it tracks exactly
 /// the agents whose live process carries the anchored env marker.
-fn agent_injects_instance_id_env(tool: &str) -> bool {
-    crate::agents::get_agent(tool)
-        .is_some_and(|a| a.hook_config.is_some() || a.sidecar_hooks.is_some())
+fn agent_injects_instance_id_env(inst: &Instance) -> bool {
+    inst.resolved_agent().is_some_and(|agent| {
+        inst.launch_invokes_resolved_agent_directly(agent)
+            && (agent.hook_config.is_some() || agent.sidecar_hooks.is_some())
+    })
 }
 
 /// The identity needles used to detect a live agent process for `inst`: the
@@ -164,7 +170,7 @@ pub fn orphan_needles(inst: &Instance) -> (String, Option<String>) {
     } else {
         format!("{}={}", crate::tmux::env::AOE_INSTANCE_ID_KEY, inst.id)
     };
-    let cmdline = if agent_injects_instance_id_env(&inst.tool) {
+    let cmdline = if agent_injects_instance_id_env(inst) {
         None
     } else {
         inst.agent_session_id
@@ -781,6 +787,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn custom_direct_alias_is_recoverable_but_wrapper_is_not() {
+        let mut inst = Instance::new("custom", "/tmp/test");
+        inst.tool = "custom-agent".to_string();
+        inst.detect_as = "claude".to_string();
+        inst.agent_session_id = Some("11111111-1111-4111-8111-111111111111".into());
+        inst.command = "claude --model opus".to_string();
+        assert!(is_recovery_candidate(&inst));
+
+        inst.command = "/opt/wrappers/claude".to_string();
+        assert!(!is_recovery_candidate(&inst));
+    }
     /// Regression: archiving a session kills its tmux pane, so the next
     /// startup observes a dead pane on a resume-capable agent. Without an
     /// archive guard on `is_recovery_candidate`, the cascade respawns the

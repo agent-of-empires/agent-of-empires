@@ -2403,11 +2403,8 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
         crate::session::ResumeIntent::Use(id) => {
             println!("✓ Set resume target for '{}': {}", title, id);
             if let Some(agent) = crate::agents::get_agent(&tool) {
-                if matches!(
-                    agent.resume_strategy,
-                    crate::agents::ResumeStrategy::Unsupported
-                ) {
-                    eprintln!("Warning: {} does not support session resume; this ID will be stored but not used.", tool);
+                if agent.session_support.is_none() {
+                    eprintln!("Warning: {} does not support exact native session resume; this ID will be stored but not used.", tool);
                 }
             }
         }

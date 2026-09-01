@@ -653,7 +653,7 @@ mod tests {
             if let Some(home_str) = home.to_str() {
                 let path = format!("{}extra/not/home", home_str);
                 let shortened = shorten_path(&path);
-                assert_eq!(shortened, format!("~extra/not/home"));
+                assert_eq!(shortened, "~extra/not/home");
             }
         }
     }

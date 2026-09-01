@@ -145,8 +145,8 @@ pub use repo_config::{
 };
 pub use scope::SessionScope;
 pub(crate) use storage::{
-    acquire_session_title_lock, atomic_write, replace_file_no_follow, resolve_symlink_chain,
-    GroupMovePlan, StorageFlock,
+    acquire_session_title_lock, acquire_storage_flock, atomic_write, replace_file_no_follow,
+    resolve_symlink_chain, GroupMovePlan, StorageFlock,
 };
 pub use storage::{
     load_recent_projects, load_workspace_ordering, recent_project_entry_for, record_recent_project,

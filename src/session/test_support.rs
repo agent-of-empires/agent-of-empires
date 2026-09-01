@@ -240,6 +240,46 @@ impl Drop for TieWorkdirToNameGuard {
     }
 }
 
+#[must_use = "AutoResumeGuard restores config on Drop"]
+pub(crate) struct AutoResumeGuard {
+    previous: bool,
+    _lock: Option<MutexGuard<'static, ()>>,
+}
+
+impl AutoResumeGuard {
+    pub(crate) fn set(enabled: bool) -> Self {
+        let lock = acquire_env_lock();
+        let previous = super::config::load_config()
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .session
+            .auto_resume_on_restart;
+        let guard = Self {
+            previous,
+            _lock: lock,
+        };
+        super::config::update_config(|config| {
+            config.session.auto_resume_on_restart = enabled;
+        })
+        .unwrap();
+        guard
+    }
+}
+
+impl Drop for AutoResumeGuard {
+    fn drop(&mut self) {
+        if let Err(error) = super::config::update_config(|config| {
+            config.session.auto_resume_on_restart = self.previous;
+        }) {
+            tracing::warn!(target: "session.test", "failed to restore auto_resume_on_restart: {error}");
+        }
+        if self._lock.is_some() {
+            ENV_LOCK_HELD.with(|held| held.set(false));
+        }
+    }
+}
+
 /// RAII guard: isolates `HOME`, `XDG_CONFIG_HOME`, and `XDG_DATA_HOME`
 /// for one test; restores them on `Drop`. See the
 /// [module documentation](crate::session::test_support) for the

@@ -1,12 +1,9 @@
 //! Hidden `aoe __extract-session-id` subcommand.
 //!
-//! Reads a Claude hook payload from stdin, extracts the top-level
-//! `session_id` UUID via `serde_json`, and writes it atomically through
-//! `hooks::write_session_id_via_guard` (per-user hardened base, `*at`-anchored).
-//!
-//! Always exits 0: the hook runs synchronously on every Claude prompt
-//! and a non-zero exit blocks the agent. Errors surface through
-//! `tracing::debug!` instead. Stdin is capped at 1 MiB to bound memory.
+//! Reads an agent hook payload from stdin, extracts the configured top-level
+//! UUID field, and writes it atomically through the hardened hook sidecar.
+//! Hook failures are logged and returned as success so they never block agents.
+//! Stdin is capped at 1 MiB to bound memory.
 
 use std::io::Read;
 
@@ -16,9 +13,12 @@ use clap::Args;
 const STDIN_BYTE_CAP: u64 = 1 << 20;
 
 #[derive(Args)]
-pub struct ExtractSessionIdArgs {}
+pub struct ExtractSessionIdArgs {
+    #[arg(long, value_enum, default_value = "session-id")]
+    field: crate::agents::HookIdentityField,
+}
 
-pub async fn run(_args: ExtractSessionIdArgs) -> Result<()> {
+pub async fn run(args: ExtractSessionIdArgs) -> Result<()> {
     let Ok(instance_id) = std::env::var("AOE_INSTANCE_ID") else {
         return Ok(());
     };
@@ -29,20 +29,33 @@ pub async fn run(_args: ExtractSessionIdArgs) -> Result<()> {
         );
         return Ok(());
     }
-    if let Err(e) = run_inner(std::io::stdin().lock(), &instance_id) {
+    if let Err(e) = run_inner(std::io::stdin().lock(), &instance_id, args.field) {
         tracing::debug!(target: "hooks.session_id", "extract failed: {e}");
     }
     Ok(())
 }
 
-fn run_inner<R: Read>(stdin: R, instance_id: &str) -> Result<()> {
+fn run_inner<R: Read>(
+    stdin: R,
+    instance_id: &str,
+    field: crate::agents::HookIdentityField,
+) -> Result<()> {
     let mut buf = String::new();
     stdin.take(STDIN_BYTE_CAP).read_to_string(&mut buf)?;
     let value: serde_json::Value = serde_json::from_str(&buf)?;
-    let sid = value
-        .get("session_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("payload has no top-level string `session_id`"))?;
+    let sid = match field {
+        crate::agents::HookIdentityField::SessionId => value
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("payload has no top-level string session_id"))?,
+        crate::agents::HookIdentityField::ConversationIdOrSessionId => value
+            .get("conversation_id")
+            .and_then(|v| v.as_str())
+            .or_else(|| value.get("session_id").and_then(|v| v.as_str()))
+            .ok_or_else(|| {
+                anyhow!("payload has no top-level string conversation_id or session_id")
+            })?,
+    };
     uuid::Uuid::parse_str(sid)?;
     crate::hooks::write_session_id_via_guard(instance_id, sid)
 }
@@ -54,7 +67,11 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     fn extract(payload: &str, instance_id: &str) -> Result<()> {
-        run_inner(payload.as_bytes(), instance_id)
+        run_inner(
+            payload.as_bytes(),
+            instance_id,
+            crate::agents::HookIdentityField::SessionId,
+        )
     }
 
     fn read_sidecar(base: &std::path::Path, instance_id: &str) -> Option<String> {
@@ -80,6 +97,28 @@ mod tests {
         let payload = format!(r#"{{"session_id":"{uuid}","cwd":"/x"}}"#);
         extract(&payload, "compact").unwrap();
         assert_eq!(read_sidecar(&base, "compact").as_deref(), Some(uuid));
+    }
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn conversation_identity_prefers_conversation_id_and_falls_back() {
+        let (_g, base, _tmp) = BaseGuard::ready();
+        let conversation = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let session = "11111111-2222-3333-4444-555555555555";
+        let field = crate::agents::HookIdentityField::ConversationIdOrSessionId;
+
+        let payload = format!(r#"{{"conversation_id":"{conversation}","session_id":"{session}"}}"#);
+        run_inner(payload.as_bytes(), "conversation_preferred", field).unwrap();
+        assert_eq!(
+            read_sidecar(&base, "conversation_preferred").as_deref(),
+            Some(conversation)
+        );
+
+        let fallback = format!(r#"{{"session_id":"{session}"}}"#);
+        run_inner(fallback.as_bytes(), "conversation_fallback", field).unwrap();
+        assert_eq!(
+            read_sidecar(&base, "conversation_fallback").as_deref(),
+            Some(session)
+        );
     }
 
     #[test]
@@ -181,7 +220,11 @@ mod tests {
             }
         }
         let (_g, base, _tmp) = BaseGuard::ready();
-        let result = run_inner(InfiniteReader, "infinite");
+        let result = run_inner(
+            InfiniteReader,
+            "infinite",
+            crate::agents::HookIdentityField::SessionId,
+        );
         assert!(result.is_err(), "should reject after the 1 MiB cap");
         assert!(read_sidecar(&base, "infinite").is_none());
     }

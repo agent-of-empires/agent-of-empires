@@ -45,10 +45,7 @@ pub(crate) fn should_attempt_resume(agent_session_id: Option<&str>, tool: &str) 
     if !valid {
         return false;
     }
-    !matches!(
-        crate::agents::get_agent(tool).map(|a| &a.resume_strategy),
-        Some(crate::agents::ResumeStrategy::Unsupported) | None,
-    )
+    crate::agents::get_agent(tool).is_some_and(|agent| agent.session_support.is_some())
 }
 
 impl Instance {
@@ -272,7 +269,7 @@ impl Instance {
                     .auto_resume_on_restart
             }
         };
-        if !should_attempt_resume(Some(&sid), &self.tool) {
+        if !is_valid_session_id(&sid) || !self.supports_native_resume() {
             return None;
         }
         if self.resume_probe_failed_sid.as_deref() == Some(&sid) {
@@ -344,7 +341,9 @@ impl Instance {
         profile: &str,
     ) -> Result<StartOutcome> {
         let (attempted_sid, pinned_prior_sid) = match launch_outcome {
-            LaunchSidOutcome::Existing { sid } if should_attempt_resume(Some(&sid), &self.tool) => {
+            LaunchSidOutcome::Existing { sid }
+                if is_valid_session_id(&sid) && self.supports_native_resume() =>
+            {
                 (Some(sid), None)
             }
             LaunchSidOutcome::Fresh { pinned_prior_sid } => (None, pinned_prior_sid),
@@ -407,7 +406,40 @@ mod tests {
 
     use serial_test::serial;
     use tempfile::tempdir;
+    fn isolate_resume_environment(
+        root: &std::path::Path,
+    ) -> crate::session::test_support::EnvGuard {
+        let roots = vec![
+            ("HOME", root.to_path_buf()),
+            ("XDG_CONFIG_HOME", root.join(".config")),
+            ("CLAUDE_CONFIG_DIR", root.join(".claude")),
+        ];
+        crate::session::test_support::EnvGuard::set(&roots)
+    }
 
+    fn install_fake_claude(
+        root: &std::path::Path,
+        script: &str,
+    ) -> crate::session::test_support::EnvGuard {
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let executable = bin.join("claude");
+        std::fs::write(&executable, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = std::env::join_paths(
+            std::iter::once(bin).chain(
+                std::env::var_os("PATH")
+                    .iter()
+                    .flat_map(|path| std::env::split_paths(path)),
+            ),
+        )
+        .unwrap();
+        crate::session::test_support::EnvGuard::set(&[("PATH", path)])
+    }
     #[test]
     fn no_sid_does_not_attempt_resume() {
         assert!(!should_attempt_resume(None, "claude"));
@@ -431,15 +463,13 @@ mod tests {
         assert!(should_attempt_resume(Some("session_abc.123"), "opencode"));
         assert!(should_attempt_resume(Some("uuid-abc-123"), "codex"));
         assert!(should_attempt_resume(Some("uuid-abc-123"), "gemini"));
-        assert!(should_attempt_resume(Some("uuid-abc-123"), "copilot"));
+        assert!(should_attempt_resume(Some("uuid-abc-123"), "cursor"));
     }
 
     #[test]
     fn unsupported_agent_does_not_attempt_resume() {
-        assert!(!should_attempt_resume(
-            Some("11111111-1111-1111-1111-111111111111"),
-            "cursor"
-        ));
+        assert!(!should_attempt_resume(Some("uuid-abc-123"), "copilot"));
+        assert!(!should_attempt_resume(Some("uuid-abc-123"), "vibe"));
     }
 
     #[test]
@@ -473,8 +503,13 @@ mod tests {
             .find(start_marker)
             .unwrap_or_else(|| panic!("start marker not found: {start_marker}"));
         let end = source[start..]
-            .find("\n#[cfg(test)]")
-            .map_or(source.len(), |offset| start + offset);
+            .find(
+                "
+#[cfg(test)]
+mod tests {",
+            )
+            .map(|offset| start + offset)
+            .expect("tests module boundary not found after start marker");
         source[start..end].to_string()
     }
 
@@ -531,9 +566,7 @@ mod tests {
     #[serial]
     fn restart_outcome_for_acp_session_is_fresh() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _env = isolate_resume_environment(temp.path());
 
         let mut inst = Instance::new("acp_test", "/tmp/x");
         inst.view = crate::session::instance::View::Structured;
@@ -557,9 +590,7 @@ mod tests {
         let project_dir = temp.path().join("project");
         std::fs::create_dir_all(&project_dir).unwrap();
         let project_path = project_dir.to_str().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _env = isolate_resume_environment(temp.path());
 
         let storage = crate::session::storage::Storage::new_unwatched("fb-test").unwrap();
 
@@ -567,7 +598,8 @@ mod tests {
         let mut inst = Instance::new("fallback_dies_test", project_path);
         inst.tool = "claude".to_string();
         inst.source_profile = "fb-test".to_string();
-        inst.command = "/bin/false".to_string();
+        let _fake_claude = install_fake_claude(temp.path(), "#!/bin/sh\nexit 1\n");
+        inst.command = "claude".to_string();
         inst.agent_session_id = Some(stale_sid.clone());
         inst.status = Status::Idle;
         // Real prior conversation on disk so acquire takes the --resume path.
@@ -633,9 +665,7 @@ mod tests {
         let project_dir = temp.path().join("project");
         std::fs::create_dir_all(&project_dir).unwrap();
         let project_path = project_dir.to_str().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _env = isolate_resume_environment(temp.path());
 
         let storage = crate::session::storage::Storage::new_unwatched("fb-test-live").unwrap();
 
@@ -643,10 +673,12 @@ mod tests {
         let mut inst = Instance::new("fallback_lives_test", project_path);
         inst.tool = "claude".to_string();
         inst.source_profile = "fb-test-live".to_string();
-        inst.command = format!(
-            "/bin/sh -c 'case \"$*\" in *{stale}*) exit 1 ;; esac; exec sleep 30' --",
+        let script = format!(
+            "#!/bin/sh\ncase \"$*\" in *{stale}*) exit 1 ;; esac\nexec sleep 30\n",
             stale = stale_sid,
         );
+        let _fake_claude = install_fake_claude(temp.path(), &script);
+        inst.command = "claude".to_string();
         inst.agent_session_id = Some(stale_sid.clone());
         inst.status = Status::Idle;
         // Real prior conversation on disk so acquire takes the --resume path.
@@ -707,14 +739,9 @@ mod tests {
         let project_dir = temp.path().join("project");
         std::fs::create_dir_all(&project_dir).unwrap();
         let project_path = project_dir.to_str().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _env = isolate_resume_environment(temp.path());
 
-        crate::session::config::update_config(|cfg| {
-            cfg.session.auto_resume_on_restart = false;
-        })
-        .unwrap();
+        let _auto_resume = crate::session::test_support::AutoResumeGuard::set(false);
 
         let storage = crate::session::storage::Storage::new_unwatched("fb-toggle-off").unwrap();
 
@@ -725,10 +752,12 @@ mod tests {
         // Would die if (and only if) `--resume <stale_sid>` reached the
         // command; with the toggle off it must never be passed, so this
         // process lives.
-        inst.command = format!(
-            "/bin/sh -c 'case \"$*\" in *{stale}*) exit 1 ;; esac; exec sleep 30' --",
+        let script = format!(
+            "#!/bin/sh\ncase \"$*\" in *{stale}*) exit 1 ;; esac\nexec sleep 30\n",
             stale = stale_sid,
         );
+        let _fake_claude = install_fake_claude(temp.path(), &script);
+        inst.command = "claude".to_string();
         inst.agent_session_id = Some(stale_sid.clone());
         inst.status = Status::Idle;
 
@@ -779,14 +808,9 @@ mod tests {
         let project_dir = temp.path().join("project");
         std::fs::create_dir_all(&project_dir).unwrap();
         let project_path = project_dir.to_str().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _env = isolate_resume_environment(temp.path());
 
-        crate::session::config::update_config(|cfg| {
-            cfg.session.auto_resume_on_restart = false;
-        })
-        .unwrap();
+        let _auto_resume = crate::session::test_support::AutoResumeGuard::set(false);
 
         let storage = crate::session::storage::Storage::new_unwatched("fb-allow-ignores").unwrap();
 
@@ -794,7 +818,8 @@ mod tests {
         let mut inst = Instance::new("fallback_allow_ignores_toggle_test", project_path);
         inst.tool = "claude".to_string();
         inst.source_profile = "fb-allow-ignores".to_string();
-        inst.command = "/bin/false".to_string();
+        let _fake_claude = install_fake_claude(temp.path(), "#!/bin/sh\nexit 1\n");
+        inst.command = "claude".to_string();
         inst.agent_session_id = Some(stale_sid.clone());
         inst.status = Status::Idle;
         // Real prior conversation on disk so acquire takes the --resume path.
@@ -845,9 +870,7 @@ mod tests {
         let project_dir = temp.path().join("project");
         std::fs::create_dir_all(&project_dir).unwrap();
         let project_path = project_dir.to_str().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _env = isolate_resume_environment(temp.path());
 
         let storage = crate::session::storage::Storage::new_unwatched("fb-loop-break").unwrap();
 
@@ -855,7 +878,8 @@ mod tests {
         let mut inst = Instance::new("fallback_loop_break_test", project_path);
         inst.tool = "claude".to_string();
         inst.source_profile = "fb-loop-break".to_string();
-        inst.command = "/bin/false".to_string();
+        let _fake_claude = install_fake_claude(temp.path(), "#!/bin/sh\nexit 1\n");
+        inst.command = "claude".to_string();
         inst.agent_session_id = Some(stale_sid.clone());
         inst.status = Status::Idle;
         // Real prior conversation on disk so the FIRST attempt takes the
@@ -935,9 +959,7 @@ mod tests {
         let project_dir = temp.path().join("project");
         std::fs::create_dir_all(&project_dir).unwrap();
         let project_path = project_dir.to_str().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _env = isolate_resume_environment(temp.path());
 
         let storage = crate::session::storage::Storage::new_unwatched("fb-test-grace").unwrap();
 
@@ -945,10 +967,12 @@ mod tests {
         let mut inst = Instance::new("fallback_grace_test", project_path);
         inst.tool = "claude".to_string();
         inst.source_profile = "fb-test-grace".to_string();
-        inst.command = format!(
-            "/bin/sh -c 'case \"$*\" in *{stale}*) exec sleep 1.2 ;; esac; exec sleep 30' --",
+        let script = format!(
+            "#!/bin/sh\ncase \"$*\" in *{stale}*) exec sleep 1.2 ;; esac\nexec sleep 30\n",
             stale = stale_sid,
         );
+        let _fake_claude = install_fake_claude(temp.path(), &script);
+        inst.command = "claude".to_string();
         inst.agent_session_id = Some(stale_sid.clone());
         inst.status = Status::Idle;
         // Real prior conversation on disk so acquire takes the --resume path.

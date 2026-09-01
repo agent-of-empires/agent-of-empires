@@ -32,10 +32,12 @@ impl HooksInstallDialog {
         let mut needs_codex_trust_note = false;
 
         if let Some(agent) = crate::agents::get_agent(tool_name) {
+            let profile_config =
+                profile.map(crate::session::profile_config::resolve_config_or_warn);
             if let Some(hook_cfg) = &agent.hook_config {
-                let host_env = profile
-                    .map(crate::session::profile_config::resolve_config_or_warn)
-                    .map(|config| config.environment)
+                let host_env = profile_config
+                    .as_ref()
+                    .map(|config| config.environment.clone())
                     .unwrap_or_default();
                 match hook_cfg.format {
                     crate::agents::HookFormat::CodexJson => {
@@ -56,10 +58,44 @@ impl HooksInstallDialog {
                 }
                 for event in hook_cfg.events {
                     let label = match event.status {
-                        Some(s) => format!("writes \"{}\"", s),
+                        Some(status) => format!("writes \"{}\"", status),
                         None => "session lifecycle".to_string(),
                     };
                     hook_commands.push((event.name.to_string(), label));
+                }
+            } else if let Some(sidecar) = &agent.sidecar_hooks {
+                let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("~"));
+                let relative: std::path::PathBuf =
+                    std::path::Path::new(sidecar.host_config_subpath)
+                        .components()
+                        .skip(1)
+                        .collect();
+                let config_root = profile_config.as_ref().and_then(|config| {
+                    config
+                        .session
+                        .agent_config_dir_for(tool_name, &home)
+                        .or_else(|| {
+                            (agent.name == "cursor")
+                                .then(|| {
+                                    config.environment.iter().find_map(|entry| {
+                                        entry
+                                            .strip_prefix("CURSOR_CONFIG_DIR=")
+                                            .filter(|root| !root.is_empty())
+                                            .map(std::path::PathBuf::from)
+                                    })
+                                })
+                                .flatten()
+                        })
+                });
+                let path = config_root
+                    .map(|root| root.join(relative))
+                    .unwrap_or_else(|| home.join(sidecar.host_config_subpath));
+                settings_paths.push(path.to_string_lossy().into_owned());
+                for event in sidecar.events {
+                    hook_commands.push((
+                        event.name.to_string(),
+                        format!("writes \"{}\"", event.status),
+                    ));
                 }
             }
         }
@@ -75,7 +111,6 @@ impl HooksInstallDialog {
             hover: HoverState::default(),
         }
     }
-
     pub fn handle_click(&self, col: u16, row: u16) -> Option<DialogResult<bool>> {
         let pos = ratatui::layout::Position::from((col, row));
         if self.accept_button_area.contains(pos) {
@@ -448,7 +483,7 @@ mod tests {
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains(".cursor/settings.json"));
+        assert!(text.contains(".cursor/hooks.json"));
     }
 
     #[test]

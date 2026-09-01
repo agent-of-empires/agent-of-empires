@@ -10751,10 +10751,28 @@ fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
     let profile = "restart-resume-failed";
     let storage = Storage::new_unwatched(profile).unwrap();
     let stale_sid = "11111111-2222-3333-4444-555555555555";
+    // Use an exact built-in binary name so the production fail-closed gate
+    // permits native resume while the fake deterministically rejects the id.
+    let bin = temp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let fake_claude = bin.join("claude");
+    std::fs::write(&fake_claude, "#!/bin/sh\nexit 1\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&fake_claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = std::env::join_paths(
+        std::iter::once(bin).chain(
+            std::env::var_os("PATH")
+                .iter()
+                .flat_map(|path| std::env::split_paths(path)),
+        ),
+    )
+    .unwrap();
+    let _path_guard = crate::session::test_support::EnvGuard::set(&[("PATH", path)]);
 
-    // The instance workdir is a created tempdir path, not a shared global like
-    // /tmp/x: tmux new-session -c on a nonexistent dir fails outright, and a
-    // pre-existing /tmp/x on a dev machine would change the launch behavior.
+    // A created workdir keeps tmux launch behavior independent of host state.
     let workdir = temp.path().join("workdir");
     std::fs::create_dir_all(&workdir).unwrap();
     let workdir_str = workdir.to_str().unwrap().to_string();
@@ -10762,7 +10780,7 @@ fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
     let mut inst = Instance::new("restart-resume-failed", &workdir_str);
     inst.source_profile = profile.to_string();
     inst.tool = "claude".to_string();
-    inst.command = "/bin/false".to_string();
+    inst.command = "claude".to_string();
     inst.agent_session_id = Some(stale_sid.to_string());
     let id = inst.id.clone();
     let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
@@ -10777,7 +10795,6 @@ fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
             Ok(())
         })
         .unwrap();
-
     // A real prior conversation on disk so the restart drives the --resume
     // cascade (and its ResumeFailed path). A stored sid with no transcript now
     // launches fresh-pinned (`--session-id`), which would not surface here.

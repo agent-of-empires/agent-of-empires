@@ -34,13 +34,14 @@ mod v023_clear_structured_container_error;
 mod v024_backfill_detect_as;
 mod v025_reenable_confirm_delete;
 mod v026_repoint_acp_default_agent;
+mod v027_clear_unverified_session_ids;
 
 use anyhow::Result;
 use std::fs;
 use std::path::PathBuf;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 26;
+const CURRENT_VERSION: u32 = 27;
 const VERSION_FILE: &str = ".schema_version";
 
 struct Migration {
@@ -179,6 +180,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 26,
         name: "repoint_acp_default_agent",
         run: v026_repoint_acp_default_agent::run,
+    },
+    Migration {
+        version: 27,
+        name: "clear_unverified_session_ids",
+        run: v027_clear_unverified_session_ids::run,
     },
 ];
 

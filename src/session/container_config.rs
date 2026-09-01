@@ -732,26 +732,41 @@ fn extract_keychain_credential(service: &str, dest: &Path) -> Result<bool> {
 fn extract_keychain_credential(_service: &str, _dest: &Path) -> Result<bool> {
     Ok(false)
 }
-
-/// Return the sandbox config path for an agent. Codex keeps live SQLite state at
-/// the root of its home, so it gets a private directory for every AoE instance.
+/// Return a sandbox config path. A supplied instance ID creates the physically
+/// isolated store mounted into that pane; no live conversation store is shared.
 fn sandbox_dir_for(
     mount: &AgentConfigMount,
     home: &Path,
     instance_id: Option<&str>,
 ) -> Result<PathBuf> {
     let sandbox_dir = home.join(mount.host_rel).join(SANDBOX_SUBDIR);
-    if mount.tool_name != "codex" {
+    let Some(instance_id) = instance_id else {
         return Ok(sandbox_dir);
-    }
-
-    let instance_id = instance_id.context("Codex sandbox config requires an instance ID")?;
+    };
     crate::session::validate_instance_id(instance_id).map_err(|e| {
-        anyhow::anyhow!("refusing to use Codex sandbox config for unsafe AOE_INSTANCE_ID: {e}")
+        anyhow::anyhow!(
+            "refusing to use sandbox config for unsafe AOE_INSTANCE_ID {instance_id:?}: {e}"
+        )
     })?;
     Ok(sandbox_dir.join(instance_id))
 }
-
+pub(crate) fn sandbox_store_dir(
+    tool: &str,
+    home: &Path,
+    declared_config_dir: Option<&Path>,
+    instance_id: &str,
+) -> Result<Option<PathBuf>> {
+    let Some(mount) = AGENT_CONFIG_MOUNTS
+        .iter()
+        .find(|mount| mount.tool_name == tool)
+    else {
+        return Ok(None);
+    };
+    declared_config_dir
+        .map(|dir| Ok(dir.join(SANDBOX_SUBDIR).join(instance_id)))
+        .unwrap_or_else(|| sandbox_dir_for(mount, home, Some(instance_id)))
+        .map(Some)
+}
 /// Seed a newly isolated Codex home from the legacy shared sandbox only for the
 /// credential that prior AoE versions migrated there. SQLite state is deliberately
 /// not copied: it is process-local and is the source of the single-instance lock.
@@ -779,7 +794,15 @@ fn prepare_sandbox_dir(
 ) -> Result<PathBuf> {
     let host_dir = home.join(mount.host_rel);
     let sandbox_dir = sandbox_dir_for(mount, home, instance_id)?;
+    prepare_sandbox_dir_from(mount, host_dir, sandbox_dir, home)
+}
 
+fn prepare_sandbox_dir_from(
+    mount: &AgentConfigMount,
+    host_dir: PathBuf,
+    sandbox_dir: PathBuf,
+    home: &Path,
+) -> Result<PathBuf> {
     // Remove stale files before syncing. This prevents leftovers from a previous
     // session (e.g. a SQLite database created by an older tool version) from
     // causing failures when the container image is updated.
@@ -960,37 +983,27 @@ fn sync_managed_skills_into_sandbox(
 /// container that already exists, and reusing one is the normal path.
 pub(crate) const PI_SIDECAR_DIR_IN_CONTAINER: &str = "/root/.pi/aoe-session";
 
-/// Host directory backing [`PI_SIDECAR_DIR_IN_CONTAINER`], and the root the
-/// extension is written under.
-pub(crate) fn pi_sandbox_dir() -> Option<std::path::PathBuf> {
-    let mount = AGENT_CONFIG_MOUNTS.iter().find(|m| m.tool_name == "pi")?;
-    let home = dirs::home_dir()?;
-    sandbox_dir_for(mount, &home, None).ok()
-}
-
 /// Write the session-id extension where a sandboxed Pi discovers it
-/// (`~/.pi/agent/extensions/` in the container). Discovery rather than `-e`:
-/// pi refuses to start when an `-e` path is missing, and the file has to
-/// survive an upgrade of AoE under a container that already exists.
-pub(crate) fn install_pi_sandbox_extension() -> Result<()> {
-    let root = pi_sandbox_dir().ok_or_else(|| anyhow::anyhow!("no Pi sandbox dir"))?;
+/// (under the agent extension directory in the container). The supplied root
+/// is both the host directory backing PI_SIDECAR_DIR_IN_CONTAINER and the
+/// extension root. Discovery rather than an explicit extension argument lets
+/// the file survive AoE upgrades in an existing container; Pi refuses to start
+/// when an explicit extension path is missing.
+pub(crate) fn install_pi_sandbox_extension_at(root: &Path) -> Result<()> {
     let rel = Path::new("agent")
         .join("extensions")
         .join("aoe-session-id.js");
     let source = crate::session::instance::PI_SESSION_EXTENSION;
-    // The bind is writable from the container, so the current content counts
-    // only when it is a regular file, and the write below follows no link.
     let path = root.join(&rel);
     let current = std::fs::symlink_metadata(&path)
         .is_ok_and(|m| m.is_file())
         .then(|| std::fs::read_to_string(&path).ok())
         .flatten();
     if current.as_deref() != Some(source) {
-        crate::session::replace_file_no_follow(&root, &rel, source.as_bytes())?;
+        crate::session::replace_file_no_follow(root, &rel, source.as_bytes())?;
     }
     Ok(())
 }
-
 pub(crate) fn compute_volume_paths(
     project_path: &Path,
     project_path_str: &str,
@@ -1223,9 +1236,7 @@ pub(crate) fn refresh_codex_agent_config_for_instance(
     }
 }
 
-/// Re-sync shared agent config plus the current instance's private Codex
-/// config. Session-start paths use this; periodic refreshes call the two
-/// narrower helpers to avoid repeating shared work for every instance.
+/// Re-sync the current instance's physically isolated agent config.
 pub(crate) fn refresh_agent_configs_for_instance(
     profile: &str,
     instance_id: &str,
@@ -1233,9 +1244,43 @@ pub(crate) fn refresh_agent_configs_for_instance(
     detect_as: Option<&str>,
 ) {
     refresh_shared_agent_configs();
-    refresh_codex_agent_config_for_instance(profile, instance_id, tool, detect_as);
+    let Some(home) = dirs::home_dir() else {
+        return;
+    };
+    let profile_config = super::profile_config::resolve_config_or_warn(profile);
+    let Some(agent) = resolve_active_agent(tool, detect_as, &profile_config.session) else {
+        return;
+    };
+    let declared = profile_config.session.agent_config_dir_for(tool, &home);
+    for mount in AGENT_CONFIG_MOUNTS
+        .iter()
+        .filter(|mount| mount.tool_name == agent.name)
+    {
+        let result = match declared.as_ref() {
+            Some(directory) => prepare_sandbox_dir_from(
+                mount,
+                directory.clone(),
+                directory.join(SANDBOX_SUBDIR).join(instance_id),
+                &home,
+            ),
+            None => prepare_sandbox_dir(mount, &home, Some(instance_id)),
+        };
+        match result {
+            Ok(sandbox_dir) => {
+                if agent.name == "codex"
+                    && profile_config.session.agent_status_hooks
+                    && should_refresh_codex_hooks(mount, &sandbox_dir, &home)
+                {
+                    refresh_codex_sandbox_hooks(mount, &sandbox_dir, &profile_config);
+                }
+            }
+            Err(error) => tracing::warn!(target: "session.profile",
+                "Failed to refresh isolated {} config for {}: {}",
+                agent.name, instance_id, error
+            ),
+        }
+    }
 }
-
 /// Refresh one instance-private Codex sandbox with its own profile settings.
 /// The old flat `.codex/sandbox` directory is intentionally ignored: it may
 /// contain the SQLite files held by a running legacy session and must never be
@@ -1313,35 +1358,6 @@ fn refresh_codex_sandbox_hooks(
     }
 }
 
-/// Whether any `sandbox.extra_volumes` entry mounts `sandbox_dir`, directly or
-/// as an ancestor. Host paths are compared as written: Docker needs them
-/// absolute, so there is nothing to expand.
-fn is_mounted_into_container(sandbox_dir: &Path, extra_volumes: &[String]) -> bool {
-    extra_volumes.iter().any(|entry| {
-        entry
-            .split(':')
-            .next()
-            .filter(|host| !host.is_empty())
-            .is_some_and(|host| sandbox_dir.starts_with(Path::new(host.trim_end_matches('/'))))
-    })
-}
-
-/// Warn when the directory a session's `agent_config_dir` resolves to reaches
-/// no container, so the trust record is written where the agent cannot read it.
-///
-/// AoE mounts the built-in agents' staged config itself; a config dir it does
-/// not own has to be bind-mounted by the user, and forgetting that mount is the
-/// silent failure this whole path exists to avoid. Only a warning: the mount
-/// may come from a source AoE cannot see, and the write itself is harmless.
-fn warn_unless_mounted(sandbox_dir: &Path, extra_volumes: &[String], tool: &str) {
-    if !is_mounted_into_container(sandbox_dir, extra_volumes) {
-        tracing::warn!(target: "session.profile",
-            "agent_config_dir for {} resolves to {}, which no sandbox.extra_volumes entry mounts into the container; {} will still open on its folder-trust prompt",
-            tool, sandbox_dir.display(), tool
-        );
-    }
-}
-
 /// Pre-trust the container workspace in the config `mount`'s agent will read.
 ///
 /// Codex and Gemini stay gated on YOLO mode: their prompts guard approvals the
@@ -1415,15 +1431,11 @@ pub(crate) fn ensure_folder_trust_config_for_active_agent(
         .iter()
         .filter(|m| m.tool_name == config_tool)
     {
-        // A declared directory stops at `sandbox`, with no per-instance segment
-        // even for Codex. That segment gives each session its own staged Codex
-        // home (its SQLite state is the single-instance lock), and AoE mounts
-        // the instance directory itself at the container's config path. Here
-        // the user writes the mount, and it can only name a fixed path, so a
-        // per-instance segment would put the record one level below whatever
-        // `CODEX_HOME` exposes, where Codex never looks.
+        // The instance segment is the ownership boundary. The mounted path is
+        // still the agent's config root inside this one container.
+
         let sandbox_dir = match agent_config_dir.as_ref() {
-            Some(dir) => Ok(dir.join(SANDBOX_SUBDIR)),
+            Some(dir) => Ok(dir.join(SANDBOX_SUBDIR).join(instance_id)),
             None => sandbox_dir_for(mount, &home, Some(instance_id)),
         };
         let sandbox_dir = match sandbox_dir {
@@ -1435,9 +1447,6 @@ pub(crate) fn ensure_folder_trust_config_for_active_agent(
                 continue;
             }
         };
-        if agent_config_dir.is_some() {
-            warn_unless_mounted(&sandbox_dir, &config.sandbox.extra_volumes, tool);
-        }
         if let Err(e) = std::fs::create_dir_all(&sandbox_dir)
             .with_context(|| format!("creating sandbox config dir {}", sandbox_dir.display()))
             .and_then(|_| {
@@ -1874,20 +1883,27 @@ pub(crate) fn build_container_config(
         }
     }
 
-    // Sync host agent config into a sandbox directory per agent and
-    // bind-mount it read-write. Only mount the config for the active tool.
-    // Agent definitions are in AGENT_CONFIG_MOUNTS -- add new agents there, not here.
+    // Bind only the resolved agent's config, including declared custom roots.
+    let declared_config_dir =
+        profile_session_config.agent_config_dir_for(agent_selection.tool, &home);
+    // Agent definitions are in AGENT_CONFIG_MOUNTS. Add new agents there.
+    let mut active_sandbox_config: Option<(&AgentConfigMount, PathBuf)> = None;
     for mount in AGENT_CONFIG_MOUNTS
         .iter()
         .filter(|m| m.tool_name == config_tool)
     {
         let container_path = agent_config_container_path(mount, CONTAINER_HOME, &environment);
 
-        let sandbox_dir = match prepare_sandbox_dir(
-            mount,
-            &home,
-            (mount.tool_name == "codex").then_some(instance_id),
-        ) {
+        let sandbox_dir = match declared_config_dir.as_ref() {
+            Some(directory) => prepare_sandbox_dir_from(
+                mount,
+                directory.clone(),
+                directory.join(SANDBOX_SUBDIR).join(instance_id),
+                &home,
+            ),
+            None => prepare_sandbox_dir(mount, &home, Some(instance_id)),
+        };
+        let sandbox_dir = match sandbox_dir {
             Ok(dir) => dir,
             Err(e) => {
                 tracing::warn!(target: "session.profile",
@@ -1898,6 +1914,7 @@ pub(crate) fn build_container_config(
                 continue;
             }
         };
+        active_sandbox_config = Some((mount, sandbox_dir.clone()));
 
         tracing::debug!(target: "session.profile",
             "Sandbox dir ready for {}, binding {} -> {}",
@@ -1925,9 +1942,20 @@ pub(crate) fn build_container_config(
         }
     }
 
-    let hooks_enabled = profile_session_config.agent_status_hooks;
+    let status_hooks_enabled = profile_session_config.agent_status_hooks;
     if let Some(agent) = active_agent {
-        if hooks_enabled {
+        let identity_hooks_required = agent.hook_config.as_ref().is_some_and(|config| {
+            config
+                .events
+                .iter()
+                .any(|event| event.identity_field.is_some())
+        }) || agent.sidecar_hooks.as_ref().is_some_and(|config| {
+            config
+                .events
+                .iter()
+                .any(|event| event.identity_field.is_some())
+        });
+        if status_hooks_enabled || identity_hooks_required {
             // Sidecar agents (hermes YAML, kiro per-agent JSON) use schemas the
             // generic hook_config path below cannot emit; they install through
             // their SidecarHooks installer at the sandbox config subpath.
@@ -1958,7 +1986,7 @@ pub(crate) fn build_container_config(
             }
 
             if let Some(sidecar) = &agent.sidecar_hooks {
-                let events = match crate::agents::resolved_sidecar_hook_events(
+                let mut events = match crate::agents::resolved_sidecar_hook_events(
                     agent,
                     &profile_config,
                 ) {
@@ -1968,87 +1996,83 @@ pub(crate) fn build_container_config(
                         Vec::new()
                     }
                 };
+                if !status_hooks_enabled {
+                    events.retain(|event| event.identity_field.is_some());
+                    for event in &mut events {
+                        event.status = None;
+                    }
+                }
                 if !events.is_empty() {
-                    // Default target: the standalone hooks agent's sandbox config.
-                    // When the user selected their own agent via the sidecar's
-                    // selected-agent flag (e.g. Kiro `--agent NAME`), the container
-                    // loads THAT agent's config (these CLIs have no global hooks), so
-                    // install into its staged file instead. The selected agent's dir
-                    // is copied into the sandbox via AGENT_CONFIG_MOUNTS, so the
-                    // staged path is the sandbox config dir plus the selected name's
-                    // file (mirrors the host path in
-                    // `Instance::install_sidecar_host_hooks`).
-                    let config_file = sidecar
-                        .selected_agent_hooks
-                        .as_ref()
-                        .zip(agent_selection.selected_agent)
-                        .and_then(|(sel, name)| {
-                            // The selected agent's dir is staged into the sandbox
-                            // (parent of sandbox_config_subpath, e.g.
-                            // `.kiro/sandbox/agents`) before this install runs, so
-                            // the resolver can match by `name` there as on the host.
-                            let agents_dir =
-                                home.join(Path::new(sidecar.sandbox_config_subpath).parent()?);
-                            Some((sel.resolve_config_file)(&agents_dir, name))
-                        })
-                        .unwrap_or_else(|| home.join(sidecar.sandbox_config_subpath));
-                    if let Err(e) = (sidecar.install)(
-                        &config_file,
-                        crate::hooks::HookInstallTarget::Sandbox,
-                        &events,
-                    ) {
-                        tracing::warn!(target: "session.profile", "Failed to install {} hooks in sandbox: {}", agent.name, e);
+                    let config_file =
+                        active_sandbox_config
+                            .as_ref()
+                            .and_then(|(mount, sandbox_dir)| {
+                                let prefix = Path::new(mount.host_rel).join(SANDBOX_SUBDIR);
+                                let relative = Path::new(sidecar.sandbox_config_subpath)
+                                    .strip_prefix(prefix)
+                                    .ok()?;
+                                sidecar
+                                    .selected_agent_hooks
+                                    .as_ref()
+                                    .zip(agent_selection.selected_agent)
+                                    .and_then(|(selected, name)| {
+                                        let agents_dir = sandbox_dir.join(relative.parent()?);
+                                        Some((selected.resolve_config_file)(&agents_dir, name))
+                                    })
+                                    .or_else(|| Some(sandbox_dir.join(relative)))
+                            });
+                    if let Some(config_file) = config_file {
+                        if let Err(e) = (sidecar.install)(
+                            &config_file,
+                            crate::hooks::HookInstallTarget::Sandbox,
+                            &events,
+                        ) {
+                            tracing::warn!(target: "session.profile", "Failed to install {} hooks in sandbox: {}", agent.name, e);
+                        }
+                    } else {
+                        tracing::warn!(target: "session.profile", "No sandbox config mount for {} hooks", agent.name);
                     }
                 }
             } else if let Some(hook_cfg) = &agent.hook_config {
-                let events = match crate::agents::resolved_hook_events(agent, &profile_config) {
+                let mut events = match crate::agents::resolved_hook_events(agent, &profile_config) {
                     Ok(events) => events,
                     Err(e) => {
                         tracing::warn!(target: "session.profile", "Failed to resolve hooks in sandbox config: {}", e);
                         Vec::new()
                     }
                 };
+                if !status_hooks_enabled {
+                    events.retain(|event| event.identity_field.is_some());
+                    for event in &mut events {
+                        event.status = None;
+                    }
+                }
                 if !events.is_empty() {
-                    // Install hooks into the sandbox config file for the containerized agent.
-                    // Shell one-liners work inside containers since they only use sh/mkdir/printf.
-                    let rel_path = std::path::Path::new(hook_cfg.settings_rel_path);
-                    let config_dir_name = rel_path.parent().unwrap_or(std::path::Path::new("."));
-                    let config_file_name = rel_path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("settings.json");
-                    // Find the matching agent config mount to locate the sandbox dir
-                    for mount in AGENT_CONFIG_MOUNTS {
-                        if std::path::Path::new(mount.host_rel) == config_dir_name {
-                            let sandbox_dir = match sandbox_dir_for(
-                                mount,
-                                &home,
-                                (mount.tool_name == "codex").then_some(instance_id),
-                            ) {
-                                Ok(dir) => dir,
-                                Err(e) => {
-                                    tracing::warn!(target: "session.profile",
-                                        "Failed to resolve sandbox hook config for {}: {}", mount.tool_name, e
-                                    );
-                                    break;
-                                }
-                            };
-                            let settings_file = sandbox_dir.join(config_file_name);
-                            let result = match hook_cfg.format {
-                                crate::agents::HookFormat::CodexJson
-                                | crate::agents::HookFormat::JsonSettings => {
-                                    crate::hooks::install_hooks(
-                                        &settings_file,
-                                        &events,
-                                        crate::hooks::HookInstallTarget::Sandbox,
-                                    )
-                                }
-                            };
-                            if let Err(e) = result {
-                                tracing::warn!(target: "session.profile", "Failed to install hooks in sandbox config: {}", e);
+                    let settings_file =
+                        active_sandbox_config
+                            .as_ref()
+                            .and_then(|(mount, sandbox_dir)| {
+                                Path::new(hook_cfg.settings_rel_path)
+                                    .strip_prefix(mount.host_rel)
+                                    .ok()
+                                    .map(|relative| sandbox_dir.join(relative))
+                            });
+                    if let Some(settings_file) = settings_file {
+                        let result = match hook_cfg.format {
+                            crate::agents::HookFormat::CodexJson
+                            | crate::agents::HookFormat::JsonSettings => {
+                                crate::hooks::install_hooks(
+                                    &settings_file,
+                                    &events,
+                                    crate::hooks::HookInstallTarget::Sandbox,
+                                )
                             }
-                            break;
+                        };
+                        if let Err(e) = result {
+                            tracing::warn!(target: "session.profile", "Failed to install hooks in sandbox config: {}", e);
                         }
+                    } else {
+                        tracing::warn!(target: "session.profile", "No sandbox config mount for {} hooks", agent.name);
                     }
                 }
             }
@@ -2272,13 +2296,12 @@ mod tests {
         )
         .unwrap();
 
-        let sandbox_dir = pi_sandbox_dir().expect("a Pi sandbox dir");
         let bind = config
             .volumes
             .iter()
             .find(|v| v.container_path == "/root/.pi")
             .expect("the Pi config dir must be bound at /root/.pi");
-        assert_eq!(bind.host_path, sandbox_dir.to_string_lossy());
+        let sandbox_dir = std::path::PathBuf::from(&bind.host_path);
         assert!(!bind.read_only, "the pane publishes into this bind");
 
         // Both container paths therefore resolve under that host directory.
@@ -2290,7 +2313,7 @@ mod tests {
         );
         assert!(host_sidecar.starts_with(&sandbox_dir));
 
-        install_pi_sandbox_extension().expect("install the extension");
+        install_pi_sandbox_extension_at(&sandbox_dir).expect("install the extension");
         assert!(
             sandbox_dir
                 .join("agent/extensions/aoe-session-id.js")
@@ -4370,6 +4393,7 @@ volume_ignores = ["node_modules"]
                 .path()
                 .join(".claude")
                 .join(SANDBOX_SUBDIR)
+                .join(&instance_id)
                 .join(".claude.json");
             let parsed: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(&seeded).unwrap()).unwrap();
@@ -4408,22 +4432,16 @@ volume_ignores = ["node_modules"]
         let app_dir = crate::session::get_app_dir().unwrap();
         fs::write(
             app_dir.join("config.toml"),
-            format!(
-                r#"
+            r#"
 [session.custom_agents]
-claude-personal = "claude-personal"
+claude-personal = "claude"
 
 [session.agent_detect_as]
 claude-personal = "claude"
 
 [session.agent_config_dir]
 claude-personal = "~/.claude-personal"
-
-[sandbox]
-extra_volumes = ["{}/sandbox:/root/.claude-personal:rw"]
 "#,
-                declared.display()
-            ),
         )
         .unwrap();
 
@@ -4451,11 +4469,20 @@ extra_volumes = ["{}/sandbox:/root/.claude-personal:rw"]
             "",
         )
         .unwrap();
+        let staged = declared.join(SANDBOX_SUBDIR).join(instance_id);
+        assert!(config.volumes.iter().any(|volume| {
+            Path::new(&volume.host_path) == staged
+                && volume.container_path == "/root/.claude"
+                && !volume.read_only
+        }));
+        assert!(
+            staged.join("settings.json").is_file(),
+            "sandbox hooks must be installed into the mounted declared store"
+        );
 
-        let seeded: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(declared.join(SANDBOX_SUBDIR).join(".claude.json")).unwrap(),
-        )
-        .unwrap();
+        let seeded: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(staged.join(".claude.json")).unwrap())
+                .unwrap();
         assert_eq!(
             seeded["projects"][&config.working_dir]["hasTrustDialogAccepted"].as_bool(),
             Some(true),
@@ -4466,6 +4493,7 @@ extra_volumes = ["{}/sandbox:/root/.claude-personal:rw"]
             .path()
             .join(".claude")
             .join(SANDBOX_SUBDIR)
+            .join(instance_id)
             .join(".claude.json");
         let default_trust = fs::read_to_string(&default_config)
             .ok()
@@ -4480,12 +4508,9 @@ extra_volumes = ["{}/sandbox:/root/.claude-personal:rw"]
         crate::hooks::cleanup_hook_status_dir(instance_id);
     }
 
-    // Codex stages one config dir per instance because its SQLite state is the
-    // single-instance lock, and AoE mounts that instance dir at the container's
-    // config path. A dir the user declares is mounted by their own
-    // `extra_volumes` entry, which can only name a fixed path, so the record
-    // has to sit directly in `sandbox` or it lands a level below whatever
-    // CODEX_HOME exposes and Codex reads an untrusted config.
+    // Declared Codex stores are mounted directly at CODEX_HOME. They remain
+    // fixed paths, so concurrent sessions sharing one store fail closed in the
+    // capture ownership gate instead of inventing a per-instance subdirectory.
     #[test]
     #[serial_test::serial]
     fn test_declared_codex_config_dir_trusts_at_the_mounted_level() {
@@ -4502,18 +4527,14 @@ extra_volumes = ["{}/sandbox:/root/.claude-personal:rw"]
             format!(
                 r#"
 [session.custom_agents]
-codex-work = "codex-work"
+codex-work = "codex"
 
 [session.agent_detect_as]
 codex-work = "codex"
 
 [session.agent_config_dir]
 codex-work = "{}"
-
-[sandbox]
-extra_volumes = ["{}/sandbox:/root/.codex-work:rw"]
 "#,
-                declared.display(),
                 declared.display()
             ),
         )
@@ -4543,18 +4564,31 @@ extra_volumes = ["{}/sandbox:/root/.codex-work:rw"]
             "",
         )
         .unwrap();
-
-        let staged = declared.join(SANDBOX_SUBDIR);
+        let codex_home = config
+            .environment
+            .iter()
+            .find(|entry| entry.key() == "CODEX_HOME")
+            .map(EnvEntry::value)
+            .expect("managed CODEX_HOME");
+        let staged = declared.join(SANDBOX_SUBDIR).join(instance_id);
+        assert!(config.volumes.iter().any(|volume| {
+            Path::new(&volume.host_path) == staged
+                && volume.container_path == codex_home
+                && !volume.read_only
+        }));
+        assert!(
+            staged.join("hooks.json").is_file(),
+            "Codex hooks must be installed into the mounted declared store"
+        );
         let trusted = fs::read_to_string(staged.join("config.toml")).unwrap();
         assert!(
             trusted.contains(&config.working_dir) && trusted.contains("trusted"),
             "the mounted directory itself must carry the trust record, got {trusted}"
         );
         assert!(
-            !staged.join(instance_id).exists(),
-            "no per-instance level: the user's mount cannot name one"
+            !declared.join(SANDBOX_SUBDIR).join("config.toml").exists(),
+            "the legacy shared store must remain unused"
         );
-
         crate::hooks::cleanup_hook_status_dir(instance_id);
     }
 
@@ -4588,31 +4622,6 @@ extra_volumes = ["{}/sandbox:/root/.codex-work:rw"]
                 assert_eq!(parsed["/workspace/wt"], serde_json::json!("TRUST_FOLDER"));
                 assert!(!settings.exists(), "folder trust must stay enabled");
             }
-        }
-    }
-
-    #[test]
-    fn test_is_mounted_into_container_covers_ancestors_only() {
-        let dir = Path::new("/home/me/.claude-personal/sandbox");
-        for (volumes, expected) in [
-            (vec!["/home/me/.claude-personal/sandbox:/root/.cp:rw"], true),
-            (vec!["/home/me/.claude-personal:/root/.cp"], true),
-            (vec!["/home/me/.claude-personal/sandbox/:/root/.cp"], true),
-            // A sibling, and a prefix that is not a path component boundary.
-            (vec!["/home/me/.claude:/root/.claude"], false),
-            (
-                vec!["/home/me/.claude-personal/sandbox-other:/root/.cp"],
-                false,
-            ),
-            (vec![], false),
-            (vec![":/root/.cp"], false),
-        ] {
-            let volumes: Vec<String> = volumes.into_iter().map(String::from).collect();
-            assert_eq!(
-                is_mounted_into_container(dir, &volumes),
-                expected,
-                "volumes: {volumes:?}"
-            );
         }
     }
 
@@ -4653,6 +4662,7 @@ extra_volumes = ["{}/sandbox:/root/.codex-work:rw"]
             .path()
             .join(".gemini")
             .join(SANDBOX_SUBDIR)
+            .join("gemini-yolo-trust-test")
             .join("settings.json");
         assert!(
             gemini_settings.exists(),
@@ -4730,7 +4740,9 @@ trust_level = "trusted"
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
         let gemini_dir = temp_home.path().join(".gemini");
-        let gemini_sandbox = gemini_dir.join(SANDBOX_SUBDIR);
+        let gemini_sandbox = gemini_dir
+            .join(SANDBOX_SUBDIR)
+            .join("gemini-yolo-refresh-test");
         fs::create_dir_all(&gemini_sandbox).unwrap();
         fs::write(gemini_dir.join("settings.json"), r#"{"theme":"host"}"#).unwrap();
         fs::write(
@@ -4830,7 +4842,16 @@ trust_level = "trusted"
             )
             .unwrap();
 
-            let sandbox_config = temp_home.path().join(sidecar.sandbox_config_subpath);
+            let mount = AGENT_CONFIG_MOUNTS
+                .iter()
+                .find(|mount| mount.tool_name == agent.name)
+                .unwrap();
+            let relative = Path::new(sidecar.sandbox_config_subpath)
+                .strip_prefix(Path::new(mount.host_rel).join(SANDBOX_SUBDIR))
+                .unwrap();
+            let sandbox_config = sandbox_dir_for(mount, temp_home.path(), Some(&instance_id))
+                .unwrap()
+                .join(relative);
             assert!(
                 sandbox_config.exists(),
                 "{} sandbox hook config should be installed at {}",
@@ -4859,6 +4880,64 @@ trust_level = "trusted"
             );
             crate::hooks::cleanup_hook_status_dir(&instance_id);
         }
+    }
+    #[test]
+    #[serial_test::serial]
+    fn sandbox_identity_hooks_remain_when_status_hooks_are_disabled() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let profile = "sandbox-identity-only-hooks";
+        let profile_dir = crate::session::get_profile_dir(profile).unwrap();
+        fs::write(
+            profile_dir.join("config.toml"),
+            "[session]\nagent_status_hooks = false\n",
+        )
+        .unwrap();
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+        let instance_id = "cursor-identity-only-sandbox-test";
+        build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &super::super::instance::SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: "test:latest".to_string(),
+                container_name: "test-container".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                container_workdir: None,
+            },
+            ContainerAgentSelection::new("cursor", None),
+            false,
+            instance_id,
+            None,
+            profile,
+        )
+        .unwrap();
+
+        let hooks: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(
+                temp_home
+                    .path()
+                    .join(".cursor")
+                    .join(SANDBOX_SUBDIR)
+                    .join(instance_id)
+                    .join("hooks.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let entries = hooks["hooks"]["beforeSubmitPrompt"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("conversation_id"));
+        crate::hooks::cleanup_hook_status_dir(instance_id);
     }
 
     // #2381 (sandbox side): a sandboxed Kiro session launched with `--agent
@@ -4905,7 +4984,10 @@ trust_level = "trusted"
         // Hooks land in the selected agent's staged sandbox config...
         let selected_config = temp_home
             .path()
-            .join(".kiro/sandbox/agents/custom-agent.json");
+            .join(".kiro")
+            .join(SANDBOX_SUBDIR)
+            .join(instance_id)
+            .join("agents/custom-agent.json");
         assert!(
             selected_config.exists(),
             "selected-agent sandbox hook config should be installed at {}",
@@ -4971,7 +5053,10 @@ trust_level = "trusted"
 
         let matched = temp_home
             .path()
-            .join(".kiro/sandbox/agents/TeamAgents-custom-agent.json");
+            .join(".kiro")
+            .join(SANDBOX_SUBDIR)
+            .join(instance_id)
+            .join("agents/TeamAgents-custom-agent.json");
         assert!(
             matched.exists(),
             "hooks should install into the name-matched staged file at {}",
@@ -4989,7 +5074,10 @@ trust_level = "trusted"
 
         let stem_clone = temp_home
             .path()
-            .join(".kiro/sandbox/agents/custom-agent.json");
+            .join(".kiro")
+            .join(SANDBOX_SUBDIR)
+            .join(instance_id)
+            .join("agents/custom-agent.json");
         assert!(
             !stem_clone.exists(),
             "must not create a filename-stem clone the CLI never loads"
@@ -6165,5 +6253,27 @@ volume_ignores = ["target"]
             "Volume for sess10 must not match the cleanup prefix for sess1: {}",
             vol_sess10
         );
+    }
+    #[test]
+    fn sandbox_stores_are_physically_isolated_per_instance() {
+        let home = Path::new("/tmp/home");
+        let declared = Path::new("/tmp/declared");
+        let default_a = sandbox_store_dir("gemini", home, None, "instance-a")
+            .unwrap()
+            .unwrap();
+        let default_b = sandbox_store_dir("gemini", home, None, "instance-b")
+            .unwrap()
+            .unwrap();
+        let declared_a = sandbox_store_dir("gemini", home, Some(declared), "instance-a")
+            .unwrap()
+            .unwrap();
+        let declared_b = sandbox_store_dir("gemini", home, Some(declared), "instance-b")
+            .unwrap()
+            .unwrap();
+
+        assert_ne!(default_a, default_b);
+        assert_ne!(declared_a, declared_b);
+        assert_eq!(default_a, home.join(".gemini/sandbox/instance-a"));
+        assert_eq!(declared_a, declared.join("sandbox/instance-a"));
     }
 }

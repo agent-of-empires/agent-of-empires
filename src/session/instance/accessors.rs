@@ -83,8 +83,8 @@ impl Instance {
             detection_rule: None,
             pending_detection: None,
             pending_host_env: Vec::new(),
+            capture_started_at: None,
             pi_extension_launched: false,
-            agent_config_dir_declared: std::sync::OnceLock::new(),
             pi_session_path: None,
             last_error: None,
             session_id_poller: None,
@@ -188,11 +188,99 @@ impl Instance {
     /// ([`status_hook_env_prefix`]) and skips hook install, so every hook the
     /// agent does have bails on `[ -n "$AOE_INSTANCE_ID" ]` and the session
     /// reports Idle forever with nothing logged.
-    pub(super) fn resolved_agent(&self) -> Option<&'static crate::agents::AgentDef> {
+    pub(crate) fn resolved_agent(&self) -> Option<&'static crate::agents::AgentDef> {
         crate::agents::get_agent(&self.tool)
             .or_else(|| crate::agents::get_agent(&self.effective_detect_as()))
     }
+    pub(crate) fn launch_invokes_resolved_agent_directly(
+        &self,
+        agent: &crate::agents::AgentDef,
+    ) -> bool {
+        let command = self.get_tool_command().trim();
+        let contains_control = |value: &str| {
+            (!value.is_empty() && value.lines().count() != 1)
+                || value
+                    .chars()
+                    .any(|ch| matches!(ch, '|' | '&' | ';' | '<' | '>' | '(' | ')'))
+        };
+        if command.is_empty() || contains_control(command) || contains_control(&self.extra_args) {
+            return false;
+        }
+        if crate::agents::get_agent(&self.tool).is_some()
+            && !self.command.is_empty()
+            && self.command.trim() != agent.binary
+        {
+            return false;
+        }
+        shell_words::split(command)
+            .ok()
+            .and_then(|words| words.into_iter().next())
+            .is_some_and(|executable| executable == agent.binary)
+    }
 
+    pub(super) fn resolved_session_support(
+        &self,
+    ) -> Option<(
+        &'static crate::agents::SessionSupport,
+        crate::agents::SessionCaptureContext,
+    )> {
+        let agent = self.resolved_agent()?;
+        if !self.launch_invokes_resolved_agent_directly(agent) {
+            return None;
+        }
+        let support = agent.session_support.as_ref()?;
+        let context = if self.is_sandboxed() {
+            support.capture.sandbox
+        } else {
+            support.capture.host
+        };
+        (context != crate::agents::SessionCaptureContext::Unsupported).then_some((support, context))
+    }
+
+    pub(super) fn resolved_capture_backend(&self) -> Option<crate::agents::SessionCaptureBackend> {
+        self.resolved_session_support()
+            .map(|(support, _)| support.capture.backend)
+    }
+
+    pub fn supports_native_resume(&self) -> bool {
+        let Some(agent) = self.resolved_agent() else {
+            return false;
+        };
+        if !self.launch_invokes_resolved_agent_directly(agent) {
+            return false;
+        }
+        let Some(support) = agent.session_support.as_ref() else {
+            return false;
+        };
+        let context = if self.is_sandboxed() {
+            support.capture.sandbox
+        } else {
+            support.capture.host
+        };
+        context != crate::agents::SessionCaptureContext::Unsupported
+            || matches!(
+                self.resume_intent,
+                ResumeIntent::Use(_) | ResumeIntent::Fork { .. }
+            )
+    }
+
+    pub(super) fn sandbox_capture_store_dir(&self) -> Option<std::path::PathBuf> {
+        if !self.is_sandboxed() {
+            return None;
+        }
+        let home = dirs::home_dir()?;
+        let config =
+            crate::session::profile_config::resolve_config_or_warn(&self.effective_profile());
+        let declared = config.session.agent_config_dir_for(&self.tool, &home);
+        crate::session::container_config::sandbox_store_dir(
+            self.resolved_agent()?.name,
+            &home,
+            declared.as_deref(),
+            &self.id,
+        )
+        .ok()
+        .flatten()
+    }
     pub fn is_sub_session(&self) -> bool {
         self.parent_session_id.is_some()
     }
@@ -541,5 +629,46 @@ mod tests {
             status_hook_env_prefix(&inst.effective_profile(), "abc123", inst.resolved_agent()),
             format!("AOE_PROFILE='{PROFILE}' AOE_INSTANCE_ID='abc123' "),
         );
+    }
+    #[test]
+    fn native_resume_requires_a_direct_local_builtin_launch() {
+        const PROFILE: &str = "resume-custom-launch-test";
+        let _registry = install_aliases(PROFILE, &[("work-claude", "claude")]);
+
+        let mut inst = Instance::new("custom", "/tmp/custom");
+        inst.source_profile = PROFILE.to_string();
+        inst.tool = "work-claude".to_string();
+
+        inst.command = "claude --model opus".to_string();
+        assert!(inst.supports_native_resume());
+
+        inst.command = "ssh -t host claude".to_string();
+        assert!(!inst.supports_native_resume());
+        inst.command = "claude > /tmp/transcript".to_string();
+        assert!(!inst.supports_native_resume());
+
+        inst.command = "/opt/wrappers/claude".to_string();
+        assert!(!inst.supports_native_resume());
+
+        inst.command = "./claude".to_string();
+        assert!(!inst.supports_native_resume());
+
+        inst.command = "claude".to_string();
+        inst.extra_args = "--model opus | tee /tmp/transcript".to_string();
+        assert!(!inst.supports_native_resume());
+    }
+
+    #[test]
+    fn capture_generation_guards_survive_serialization() {
+        let mut inst = Instance::new("claude", "/tmp/custom");
+        let floor = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(42);
+        inst.capture_started_at = Some(floor);
+        inst.retroactive_capture_excludes
+            .insert("stale-sid".to_string());
+
+        let encoded = serde_json::to_string(&inst).unwrap();
+        let decoded: Instance = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.capture_started_at, Some(floor));
+        assert!(decoded.retroactive_capture_excludes.contains("stale-sid"));
     }
 }

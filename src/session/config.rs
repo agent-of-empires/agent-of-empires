@@ -961,8 +961,8 @@ pub struct SessionConfig {
     )]
     pub agent_extra_args: HashMap<String, String>,
 
-    /// Per-agent command override replacing the binary (e.g.
-    /// claude=my-wrapper).
+    /// Per-agent command override replacing the binary. Native conversation
+    /// resume is disabled for wrappers and shell commands.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[setting(
         label = "Agent Command Override",
@@ -1069,23 +1069,6 @@ pub struct SessionConfig {
     )]
     pub auto_resume_on_restart: bool,
 
-    /// Pre-assign opencode's session id before launch instead of capturing it
-    /// afterward by polling opencode's SQLite store. AoE creates the session up
-    /// front through a short-lived `opencode serve` HTTP call, so the id is
-    /// known before the first prompt (symmetric with Claude's `--session-id`).
-    /// Eliminates the post-launch capture race, at the cost of spawning a
-    /// throwaway server (~2s) on each new host opencode launch. Off by default;
-    /// the SQLite poller stays the fallback. Host sessions only, a sandboxed
-    /// agent cannot reach the loopback server.
-    #[serde(default)]
-    #[setting(
-        label = "Pre-assign opencode session id",
-        widget = "toggle",
-        category = "Agents",
-        advanced
-    )]
-    pub opencode_preassign_session_id: bool,
-
     /// Request xterm mouse tracking so the TUI handles the scroll wheel
     /// (preview-pane scroll) and click-to-select rows. Disable to hand the
     /// wheel and text selection back to the terminal, e.g. iOS Mosh +
@@ -1138,14 +1121,11 @@ pub struct SessionConfig {
     )]
     pub agent_acp_cmd: HashMap<String, String>,
 
-    /// Config directory an agent reads instead of its built-in default, keyed
-    /// by the agent name the session runs (e.g. `claude-personal =
-    /// "~/.claude-personal"` for a wrapper that exports `CLAUDE_CONFIG_DIR`).
-    /// The value is a host path in both contexts: host sessions use the
-    /// directory itself, sandboxed sessions its `sandbox` subdirectory, which
-    /// is the layout AoE already uses for the built-in agents. Consulted for
-    /// folder-trust records only; status hooks keep resolving their config dir
-    /// from the agent's own env var.
+    /// Config directory read by the session's agent instead of its built-in
+    /// default. Host sessions use the directory directly. Sandboxed sessions
+    /// use its `sandbox` subdirectory, which AoE mounts at the resolved
+    /// built-in config path and uses for hooks, credentials, and native-session
+    /// capture.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[setting(
         label = "Agent Config Dir",
@@ -1637,7 +1617,6 @@ impl Default for SessionConfig {
             smart_rename_agent: String::new(),
             smart_rename_model: HashMap::new(),
             auto_resume_on_restart: true,
-            opencode_preassign_session_id: false,
             mouse_capture: true,
             custom_agents: HashMap::new(),
             agent_detect_as: HashMap::new(),

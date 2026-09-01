@@ -79,7 +79,10 @@ pub(super) fn build_resume_flags(
     let Some(agent) = get_agent(tool) else {
         return String::new();
     };
-    match &agent.resume_strategy {
+    let Some(support) = agent.session_support.as_ref() else {
+        return String::new();
+    };
+    match &support.resume {
         ResumeStrategy::Flag(flag) => format!("{} {}", flag, session_id),
         ResumeStrategy::FlagPair {
             existing,
@@ -93,7 +96,6 @@ pub(super) fn build_resume_flags(
             format!("{} {}", flag, session_id)
         }
         ResumeStrategy::Subcommand(sub) => format!("{} {}", sub, session_id),
-        ResumeStrategy::Unsupported => String::new(),
     }
 }
 
@@ -124,8 +126,8 @@ pub(super) fn build_fork_flags(tool: &str, parent_id: &str, child_id: &str) -> S
         ForkStrategy::Flag(fork_flag) => {
             // Resume the parent session (using the agent's own resume flag),
             // then add the fork flag; the agent mints the new id.
-            match agent.resume_strategy {
-                ResumeStrategy::Flag(resume_flag) => {
+            match agent.session_support.as_ref().map(|support| support.resume) {
+                Some(ResumeStrategy::Flag(resume_flag)) => {
                     format!("{resume_flag} {parent_id} {fork_flag}")
                 }
                 _ => String::new(),
@@ -167,8 +169,11 @@ pub(super) fn append_resume_flags(
             return false;
         }
         let is_subcommand = matches!(
-            get_agent(tool).map(|a| &a.resume_strategy),
-            Some(ResumeStrategy::Subcommand(_))
+            get_agent(tool).and_then(|agent| agent.session_support.as_ref()),
+            Some(crate::agents::SessionSupport {
+                resume: ResumeStrategy::Subcommand(_),
+                ..
+            })
         );
         splice_subcommand_or_append(cmd, &resume_part, is_subcommand);
         tracing::debug!(target: "session.store", "Added resume flags to {} command: {}", context, resume_part);
