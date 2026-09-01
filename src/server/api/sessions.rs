@@ -2924,6 +2924,15 @@ pub async fn update_session_archive(
         Err(rej) => return rej.into_response(),
     };
 
+    // Worker-stopping barrier: submission guard before `instance_lock`, per
+    // `prompt_submission` (#3650).
+    let Some(_submission) = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await
+    else {
+        return super::session_not_found();
+    };
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
 
@@ -3071,6 +3080,15 @@ pub async fn trash_session(
     }
     let body = body.map(|Json(body)| body).unwrap_or_default();
 
+    // Worker-stopping barrier: submission guard before `instance_lock`, per
+    // `prompt_submission` (#3650).
+    let Some(_submission) = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await
+    else {
+        return super::session_not_found();
+    };
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
     let (profile, snapshot) = {
@@ -3667,6 +3685,15 @@ pub async fn stop_session(
         return super::read_only_response();
     }
 
+    // Worker-stopping barrier: submission guard before `instance_lock`, per
+    // `prompt_submission` (#3650).
+    let Some(_submission) = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await
+    else {
+        return super::session_not_found();
+    };
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
 
@@ -4048,6 +4075,15 @@ pub async fn update_session_snooze(
         }
     }
 
+    // Worker-stopping barrier: submission guard before `instance_lock`, per
+    // `prompt_submission` (#3650).
+    let Some(_submission) = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await
+    else {
+        return super::session_not_found();
+    };
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
 
@@ -10535,6 +10571,81 @@ mod tests {
             "submission authority is taken first"
         );
         assert!(inst_lock < purge, "both are held across the teardown");
+    }
+
+    /// #3650's barrier applies to every handler that stops a worker, not just
+    /// the ones that delete a session. `drain_queued_prompts_once` reads the
+    /// status and the trashed/archived/snoozed flags once under the submission
+    /// guard and only then reaches `send_turn`, which respawns a worker it
+    /// finds gone. So a stop that lands inside that window is undone: the user
+    /// presses Stop and the session comes back running the queued prompt.
+    ///
+    /// Before #3639 the drain held `instance_lock` across delivery and these
+    /// four handlers were excluded by it. They take the submission guard now
+    /// for the same reason `attach_project` and the tied renames do.
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn worker_stopping_handlers_wait_for_an_in_flight_submission() {
+        use std::time::Duration;
+
+        async fn call(
+            which: &str,
+            state: std::sync::Arc<crate::server::AppState>,
+            id: String,
+        ) -> axum::response::Response {
+            match which {
+                "stop" => stop_session(State(state), Path(id)).await.into_response(),
+                "trash" => trash_session(State(state), Path(id), None)
+                    .await
+                    .into_response(),
+                "archive" => update_session_archive(
+                    State(state),
+                    Path(id),
+                    Ok(Json(UpdateArchiveBody {
+                        archived: true,
+                        kill_pane: true,
+                    })),
+                )
+                .await
+                .into_response(),
+                "snooze" => update_session_snooze(
+                    State(state),
+                    Path(id),
+                    Ok(Json(UpdateSnoozeBody { minutes: Some(30) })),
+                )
+                .await
+                .into_response(),
+                other => unreachable!("unknown handler {other}"),
+            }
+        }
+
+        for which in ["stop", "trash", "archive", "snooze"] {
+            let id = format!("sess-3650-{which}");
+            let state = delete_race_state(&id);
+            let delivering = state.session_service.prompt_submission(&id).await;
+            let handler = tokio::spawn({
+                let state = std::sync::Arc::clone(&state);
+                let id = id.clone();
+                async move { call(which, state, id).await }
+            });
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                !handler.is_finished(),
+                "{which} must not quiesce a worker a submission is mid-delivery on"
+            );
+            assert_eq!(
+                state.instances.read().await[0].status,
+                Status::Idle,
+                "{which} must not have touched the session yet"
+            );
+
+            drop(delivering);
+            tokio::time::timeout(Duration::from_secs(10), handler)
+                .await
+                .unwrap_or_else(|_| panic!("{which} must finish once the submission releases"))
+                .unwrap_or_else(|e| panic!("{which} task must not panic: {e}"));
+        }
     }
 
     /// #3651: `prompt_submission` auto-vivifies a registry entry for whatever
