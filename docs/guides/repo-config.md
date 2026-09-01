@@ -97,7 +97,7 @@ auto_cleanup = true
 default_terminal_mode = "host"   # "host" or "container"
 ```
 
-Security-sensitive sandbox settings are ignored from repo config (with a warning naming the keys): `enabled_by_default`, `default_image`, `container_runtime`, `extra_volumes`, `mount_ssh`, and `selinux_relabel`. Set them in global or profile config instead, or pass `--sandbox` / `--sandbox-image` per session. Global-only settings such as `container_runtime` are always read from the global config.
+Security-sensitive sandbox settings are ignored from repo config (with a warning naming the keys): `enabled_by_default`, `default_image`, `container_runtime`, `extra_volumes`, `mount_ssh`, and `selinux_relabel`. Set them in global or profile config instead, or pass `--sandbox` / `--sandbox-image` per session; `container_runtime` is global-only, so set it in the global config.
 
 List fields (`environment`, `volume_ignores`, `port_mappings`) accept either an array or a single string:
 
