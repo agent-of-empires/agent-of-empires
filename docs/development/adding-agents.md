@@ -30,10 +30,11 @@ Each level is additive; do only what the agent supports.
 | 5. Docker sandbox | Runs isolated; host config synced in | `AgentConfigMount` + Dockerfile install |
 
 Levels 3 and 4 are independent. Hooks are only one way to observe a session id
-(`session_id_capture`, currently Claude alone, and even there the poller falls
-back to a disk scan); every other agent is polled from its own store or sidecar
-in `src/session/capture.rs`. An agent can resume with no hooks installed, and
-`agent_status_hooks = false` costs status detection, not resume.
+(`session_id_capture`, Claude alone, and even there the poller falls back to a
+disk scan); the other agents AoE resumes are polled from their own store,
+sidecar, or transcript by `src/session/capture.rs`. A `resume_strategy` with no
+capture path behind it resumes only from a hand-pinned id, so level 4 needs both
+halves, and `agent_status_hooks = false` costs status detection, not resume.
 
 ## Steps
 
@@ -94,7 +95,7 @@ Each entry in `events: &[HookEvent]` carries:
 
 The generic JSON payload above, written to `hooks.json` in Codex's config dir rather than to a settings file: set `hook_config: Some(AgentHookConfig { settings_rel_path: ".codex/hooks.json", format: HookFormat::CodexJson, ... })`. `codex_hooks_json_path_in()` resolves `CODEX_HOME` (else `~/.codex`) and the generic `install_hooks()` writes it. Codex status weighs the hook write against its manifest rules by declared priority, so a prompt on screen outranks a `running` write.
 
-`install_codex_hooks()` / `uninstall_codex_hooks()` write Codex's `config.toml` instead; they exist only for the v015/v017/v018 migrations that repair or strip hooks AoE once wrote there.
+`install_codex_hooks_with_preserved_state()` / `uninstall_codex_hooks()` write Codex's `config.toml` instead; they exist only for the v015/v017/v018 migrations that repair or strip hooks AoE once wrote there.
 
 ### Hermes (custom YAML)
 
