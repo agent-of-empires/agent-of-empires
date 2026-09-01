@@ -192,6 +192,40 @@ impl Drop for EnvGuard {
     }
 }
 
+/// Install a PATH command that remains first after the test pane starts its
+/// login shell.
+pub(crate) fn install_login_shell_path_command(root: &Path, name: &str, script: &str) -> EnvGuard {
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).expect("create test bin directory");
+    let executable = bin.join(name);
+    std::fs::write(&executable, script).expect("write test command");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+            .expect("make test command executable");
+    }
+
+    let bin_text = bin.to_str().expect("temporary test path must be UTF-8");
+    std::fs::write(
+        root.join(".profile"),
+        format!(
+            "export PATH={}:$PATH\n",
+            crate::session::environment::shell_escape(bin_text)
+        ),
+    )
+    .expect("write test login profile");
+    let path = std::env::join_paths(
+        std::iter::once(bin).chain(
+            std::env::var_os("PATH")
+                .iter()
+                .flat_map(|value| std::env::split_paths(value)),
+        ),
+    )
+    .expect("join test PATH");
+    EnvGuard::set(&[("PATH", path), ("SHELL", OsString::from("/bin/sh"))])
+}
+
 /// Restores the process-global tied-worktree setting even when a test panics.
 ///
 /// Declare this after the app-directory isolation guard. Rust drops locals in

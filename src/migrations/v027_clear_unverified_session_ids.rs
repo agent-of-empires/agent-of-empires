@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
-use tracing::info;
+use tracing::warn;
 
 pub fn run() -> Result<()> {
     run_in(&crate::session::get_app_dir()?)
@@ -50,8 +50,8 @@ fn clear_file(path: &Path) -> Result<()> {
     let (value, cleared, changed) = migrate_content(path, &content)?;
     if changed {
         crate::session::atomic_write(path, serde_json::to_string_pretty(&value)?.as_bytes())?;
-        info!(
-            "v027: cleared {cleared} unverified session id(s) in {}",
+        warn!(
+            "v027: cleared {cleared} unverified session id(s) in {}; affected sessions will start fresh because their prior ownership cannot be proven",
             path.display()
         );
     }

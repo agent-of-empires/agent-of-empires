@@ -602,6 +602,15 @@ mod tests {
                 .args(batch_args(&[name]))
                 .output()
                 .unwrap();
+            if !output.status.success() && locale == "C.UTF-8" {
+                eprintln!("skipping unavailable locale {locale}");
+                continue;
+            }
+            assert!(
+                output.status.success(),
+                "{locale}: tmux failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
             let stdout = String::from_utf8_lossy(&output.stdout);
             assert_eq!(stdout.lines().next(), Some("@0"), "{locale}: {stdout:?}");
             let parsed = parse_batch_output(&stdout, &[name], AOE_INSTANCE_ID_KEY);

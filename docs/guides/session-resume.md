@@ -30,9 +30,13 @@ Runtime conversation changes such as `/clear`, `/new`, fork, continue, or a fres
 
 Sandbox config and conversation stores are staged under a separate directory for each AoE instance, including custom `agent_config_dir` roots. A cross-process lease guards each managed store. Two sessions in the same working directory therefore cannot claim each other's conversation.
 
-Custom agents inherit native resume only when `agent_detect_as` resolves to a built-in agent and the configured launch starts with that built-in's exact binary token. Paths, same-basename scripts, wrappers, remote launchers, redirections, pipes, and other shell control syntax fail closed.
+Custom agents inherit native resume only when `agent_detect_as` resolves to a built-in agent and the configured launch starts with that built-in's exact binary token. Paths, same-basename scripts, wrappers, remote launchers, redirections, pipes, and other shell control syntax fail closed. Built-in sessions using `agent_command_override` also start fresh because AoE cannot prove that the override executes the native binary directly.
 
 Disabling `agent_status_hooks` removes status writers only. Authoritative identity hooks remain installed for resume-capable agents.
+
+## Upgrade boundary for legacy IDs
+
+The first startup that applies migration v027 clears default resume IDs whose original capture path did not record proof of ownership. Those sessions start a fresh native conversation on their next launch. Explicit `Use` and `Fork` pins, pane-scoped Pi and OMP IDs, and isolated sandbox Codex IDs are retained. Back up `sessions.json` before upgrading if you need an old unverified ID for manual inspection or an explicit re-pin; AoE cannot restore a cleared ID automatically.
 
 To branch a conversation into a new session instead of resuming it in place, see [Forking Sessions](./session-fork.md).
 

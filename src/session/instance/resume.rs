@@ -421,24 +421,7 @@ mod tests {
         root: &std::path::Path,
         script: &str,
     ) -> crate::session::test_support::EnvGuard {
-        let bin = root.join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        let executable = bin.join("claude");
-        std::fs::write(&executable, script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let path = std::env::join_paths(
-            std::iter::once(bin).chain(
-                std::env::var_os("PATH")
-                    .iter()
-                    .flat_map(|path| std::env::split_paths(path)),
-            ),
-        )
-        .unwrap();
-        crate::session::test_support::EnvGuard::set(&[("PATH", path)])
+        crate::session::test_support::install_login_shell_path_command(root, "claude", script)
     }
     #[test]
     fn no_sid_does_not_attempt_resume() {

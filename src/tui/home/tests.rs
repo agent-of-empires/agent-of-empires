@@ -10752,25 +10752,12 @@ fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
     let storage = Storage::new_unwatched(profile).unwrap();
     let stale_sid = "11111111-2222-3333-4444-555555555555";
     // Use an exact built-in binary name so the production fail-closed gate
-    // permits native resume while the fake deterministically rejects the id.
-    let bin = temp.path().join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    let fake_claude = bin.join("claude");
-    std::fs::write(&fake_claude, "#!/bin/sh\nexit 1\n").unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&fake_claude, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    let path = std::env::join_paths(
-        std::iter::once(bin).chain(
-            std::env::var_os("PATH")
-                .iter()
-                .flat_map(|path| std::env::split_paths(path)),
-        ),
-    )
-    .unwrap();
-    let _path_guard = crate::session::test_support::EnvGuard::set(&[("PATH", path)]);
+    // permits native resume while the login-shell-safe fake rejects the id.
+    let _path_guard = crate::session::test_support::install_login_shell_path_command(
+        temp.path(),
+        "claude",
+        "#!/bin/sh\nexit 1\n",
+    );
 
     // A created workdir keeps tmux launch behavior independent of host state.
     let workdir = temp.path().join("workdir");

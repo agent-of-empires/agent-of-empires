@@ -219,27 +219,16 @@ claude-personal = "claude"
 claude-personal = "~/.claude-personal"
 ```
 
-The value is a host path in both contexts. Host sessions use the directory
-itself; sandboxed sessions use its `sandbox` subdirectory, the same split AoE
-makes for the built-in agents (`~/.claude` and `~/.claude/sandbox`), so the
-container needs that subdirectory mounted where the wrapper looks:
+The value is a host path. Host sessions use the directory itself. Each
+sandboxed session uses a separate `sandbox/<instance-id>` child that AoE
+creates and mounts at the resolved built-in config path. Do not mount the
+`agent_config_dir` tree or one of its sandbox children through
+`extra_volumes`: a shared manual mount bypasses per-instance isolation.
+The wrapper must read the resolved built-in config path inside the container.
 
-```toml
-[sandbox]
-extra_volumes = ["/Users/me/.claude-personal/sandbox:/root/.claude-personal:rw"]
-```
-
-Sandboxed sessions seed their workspace either way; host sessions still need
-`pre_trust_agent_folders`. Only folder trust reads this setting: status hooks
-resolve their config directory from the agent's own env var, so a wrapper that
-exports it needs the variable in the session environment too (see
-`agent_status_hooks`).
-
-Pi is the one agent that gives something up. A sandboxed Pi publishes its
-conversation id into the config directory AoE mounts itself; a directory you
-name reaches the container through your own `extra_volumes` entry, at a path
-AoE never sees, so such a session skips the sidecar and falls back to store
-polling.
+Host sessions still need `pre_trust_agent_folders`. Sandboxed sessions seed
+folder trust and install status and identity hooks in their own staged config
+tree, including Pi's pane-scoped identity extension.
 
 #### Status rules for custom agents
 
