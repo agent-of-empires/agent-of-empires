@@ -170,9 +170,8 @@ impl SessionResponse {
                     .unwrap_or(inst.tool.as_str());
                 (!resolved.is_empty()).then(|| resolved.to_string())
             },
-            // Shares `agent_is_structured_fork_capable` with the create-time
-            // guard so the web "Fork" affordance and server-side acceptance
-            // cannot drift: forkable = ACP-capable AND a real fork strategy.
+            // The create-time guard calls the same classifier, so the web
+            // "Fork" affordance and server-side acceptance cannot drift.
             acp_can_fork: agent_is_structured_fork_capable(&inst.tool, inst.agent_name.as_deref()),
             // Same agent resolution as `acp_agent` above; computed once here so
             // the web dashboard and native TUI stop mirroring the gate.
@@ -4901,8 +4900,9 @@ fn create_body_combines_scratch_and_worktree(body: &CreateSessionBody) -> bool {
 /// structured request (`structured == true`) forks through ACP `session/fork`
 /// against the parent's `acp_session_id`; a terminal request resumes the
 /// parent agent id with the agent's fork flag, generating a fresh child id.
-/// `Err` reports an unforkable terminal agent or missing parent id; structured
-/// forks defer that check to the live `session/fork` handshake.
+/// `Err` reports an unforkable terminal agent or missing parent id; a
+/// structured request is already rejected by the caller's
+/// `agent_is_structured_fork_capable` guard before it reaches here.
 #[cfg(feature = "serve")]
 fn resolve_create_fork_seed(
     tool: &str,
@@ -8431,9 +8431,10 @@ mod tests {
     fn structured_fork_create_guard_matches_acp_can_fork() {
         // The create-time guard and the web `acp_can_fork` projection share
         // `agent_is_structured_fork_capable`, so they must agree per agent.
-        // claude is ACP-capable with a real fork strategy: forkable.
+        // Claude is the built-in ACP adapter currently verified to implement
+        // the structured fork handshake.
         assert!(agent_is_structured_fork_capable("claude", None));
-        // aoe-agent is ACP-capable but resume-only (no fork strategy), so the
+        // aoe-agent is ACP-capable but resume-only, so the
         // create guard must reject a structured fork for it just as the web
         // suppresses the Fork affordance; gating on ACP-capability alone would
         // accept a create that can only fail later at the `session/fork`
@@ -8473,17 +8474,16 @@ mod tests {
 
     #[cfg(feature = "serve")]
     #[test]
-    fn acp_can_fork_tracks_acp_capable_and_fork_strategy() {
-        // claude is ACP-capable AND declares a real fork strategy, so the web
-        // gets a forkable signal.
+    fn acp_can_fork_tracks_structured_fork_capability() {
+        // Claude is the built-in ACP adapter verified to implement the
+        // structured fork handshake, so the web gets a forkable signal.
         let mut claude = make_test_instance();
         claude.tool = "claude".to_string();
         assert!(SessionResponse::from_instance(&claude, false).acp_can_fork);
 
-        // aoe-agent is ACP-capable (it is in the ACP registry) but declares no
-        // fork strategy, so it is NOT forkable. Gating the web Fork action on
-        // acp_session_id alone would offer a dead-end button for it; this is the
-        // signal that suppresses that.
+        // aoe-agent is ACP-capable but resume-only. Gating the web Fork action
+        // on acp_session_id alone would offer a dead-end button; this signal
+        // suppresses it.
         let mut aoe_agent = make_test_instance();
         aoe_agent.tool = "aoe-agent".to_string();
         assert!(!SessionResponse::from_instance(&aoe_agent, false).acp_can_fork);

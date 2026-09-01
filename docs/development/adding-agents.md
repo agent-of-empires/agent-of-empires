@@ -25,15 +25,22 @@ Each level is additive; do only what the agent supports.
 |-------|---------------|----------|
 | 1. Basic | Appears in `aoe agents`, sessions launch, status always "Idle" | `AgentDef` + stub `detect_status` |
 | 2. Pane-parse status | Status inferred from terminal output; no agent config | A manifest in `src/tmux/detect/manifests/`, plus a `detect_<agent>_status(&str) -> Status` calling into it |
-| 3. Hook status | Agent writes status to a file via hooks; lands the instant state changes, and carries the agent's session id for resume | `hook_config` + generic `install_hooks()` or a custom `install_<agent>_hooks()` (Claude, Cursor, Gemini generic; Codex TOML, Hermes YAML, Kiro JSON) |
-| 4. Session resume | Restart resumes the prior conversation | `resume_strategy` in `AgentDef` |
+| 3. Hook status | Agent writes status to a file via hooks; lands the instant state changes | `hook_config` + generic `install_hooks()`, or `sidecar_hooks` + a custom `install_<agent>_hooks()` |
+| 4. Session resume | Restart resumes the prior conversation | `resume_strategy` in `AgentDef`, plus a way to observe the agent's session id |
 | 5. Docker sandbox | Runs isolated; host config synced in | `AgentConfigMount` + Dockerfile install |
+
+Levels 3 and 4 are independent. Hooks are only one way to observe a session id
+(`session_id_capture`, Claude alone, and even there the poller falls back to a
+disk scan); the other agents AoE resumes are polled from their own store,
+sidecar, or transcript by `src/session/capture.rs`. A `resume_strategy` with no
+capture path behind it resumes only from a hand-pinned id, so level 4 needs both
+halves, and `agent_status_hooks = false` costs status detection, not resume.
 
 ## Steps
 
 **1. Research:** binary name, detection (`which`), YOLO/auto-approve flag, resume flag, hook support + format (JSON/YAML/TOML), config dir, install command.
 
-**2. `AgentDef` (`src/agents.rs`):** add to the `AGENTS` array. Key fields: `detection: DetectionMethod::Which(...)`, `yolo: Some(YoloMode::CliFlag(...))`, either `hook_config` (with `format: HookFormat::JsonSettings` or `HookFormat::CodexJson`) or `sidecar_hooks` (with `format: SidecarFormat::SettlToml`, `HermesYaml`, or `KiroJson`, plus `events: ..._SIDECAR_EVENTS`), `resume_strategy`, `host_only`, `install_hint`, and `lifecycle`. Use `AgentLifecycle::Active` for ordinary new agents; reserve `Deprecated { since, note, replacement }` for an upstream lifecycle change that users need to see. The format enums drive installer and marker-walker dispatch; adding a hook-based agent without picking a variant is a compile error. `set_default_command: true` only when the binary name alone is not enough to relaunch (e.g. opencode).
+**2. `AgentDef` (`src/agents.rs`):** add to the `AGENTS` array. Key fields: `detection: DetectionMethod::Which(...)`, `yolo: Some(YoloMode::CliFlag(...))`, either `hook_config` (with `format: HookFormat::JsonSettings` or `HookFormat::CodexJson`) or `sidecar_hooks` (with `format: SidecarFormat::SettlToml`, `HermesYaml`, `KiroJson`, or `KimiToml`, plus `events: ..._SIDECAR_EVENTS`), `resume_strategy`, `host_only`, `install_hint`, and `lifecycle`. Use `AgentLifecycle::Active` for ordinary new agents; reserve `Deprecated { since, note, replacement }` for an upstream lifecycle change that users need to see. The format enums drive installer and marker-walker dispatch; adding a hook-based agent without picking a variant is a compile error. `set_default_command: true` only when the binary name alone is not enough to relaunch (e.g. opencode).
 
 **3. Status detection:** an agent whose pane carries state gets a manifest in `src/tmux/detect/manifests/<agent>.toml`, and a `detect_<agent>_status` that calls into it (see `detect_claude`). Rules are `{id, state, priority, region, matcher}` and the highest-priority match wins, so a new case is a row rather than another branch. The hook file is a rule too (`region = "hook"`), which is what lets a blocking prompt on screen outrank a `running` write, and what bounds how long an unrefreshed write keeps its authority. Give a rule `visible = true` only when it reads the state off the agent's own live chrome: that is what lets the poller publish it without waiting for a confirming capture. Agents with no pane signal keep a stub returning `Status::Idle`. See `src/tmux/detect/mod.rs` for the region vocabulary.
 
@@ -84,18 +91,11 @@ Each entry in `events: &[HookEvent]` carries:
 | `session_id_capture` | `true` installs a command that extracts `session_id` from the agent's stdin JSON and writes it to `/tmp/aoe-hooks-<euid>/<AOE_INSTANCE_ID>/session_id` (host) or `/tmp/aoe-hooks/<AOE_INSTANCE_ID>/session_id` (sandbox; see issue #1844 for the host/container path split), read by [session-resume](../guides/session-resume.md). Currently only Claude (`SessionStart`, `UserPromptSubmit`). With `status` also set, both commands share the matcher block and the session-id command runs first so it consumes stdin before the status writer. |
 | `waiting_tools` | Tool names whose invocation blocks on the user for the tool's entire execution (Claude's `AskUserQuestion`). When non-empty on a status event, the status writer inspects the payload's `tool_name` on stdin and writes `waiting` for these tools instead of the event's status. Pair it with a tool-scoped event that restores the normal status once the tool completes (Claude adds `PostToolUse` with matcher `AskUserQuestion`), or the status sticks on `waiting` through the rest of the turn. |
 
-### Codex (custom TOML)
+### Codex (`hooks.json`)
 
-`[hooks]` table in `.codex/config.toml`:
+The generic JSON payload above, written to `hooks.json` in Codex's config dir rather than to a settings file: set `hook_config: Some(AgentHookConfig { settings_rel_path: ".codex/hooks.json", format: HookFormat::CodexJson, ... })`. `codex_hooks_json_path_in()` resolves `CODEX_HOME` (else `~/.codex`) and the generic `install_hooks()` writes it. Codex status weighs the hook write against its manifest rules by declared priority, so a prompt on screen outranks a `running` write.
 
-```toml
-[[hooks.PreToolUse]]
-[[hooks.PreToolUse.hooks]]
-type = "command"
-command = "sh -c '...'"
-```
-
-Set `hook_config: Some(AgentHookConfig { settings_rel_path: ".codex/config.toml", ... })`. Host installs must go through `install_codex_hooks()` / `uninstall_codex_hooks()` so `CODEX_HOME`, existing `[hooks.state]` trust data, `[features].hooks = false`, the `config.toml.lock`, and atomic replacement are respected. Codex status weighs the hook write against its manifest rules by declared priority, so a prompt on screen outranks a `running` write.
+`install_codex_hooks_with_preserved_state()` / `uninstall_codex_hooks()` write Codex's `config.toml` instead; they exist only for the v015/v017/v018 migrations that repair or strip hooks AoE once wrote there.
 
 ### Hermes (custom YAML)
 
@@ -116,6 +116,16 @@ hooks:
     "stop": [{"command": "sh -c '...'"}]
   }
 }
+```
+
+### Kimi Code (custom TOML sidecar)
+
+A flat `[[hooks]]` array in `.kimi-code/config.toml`, which also holds provider and oauth settings, so the installer rewrites only its own entries:
+
+```toml
+[[hooks]]
+event = "PreToolUse"
+command = "sh -c '...'"
 ```
 
 ## Common pitfalls
