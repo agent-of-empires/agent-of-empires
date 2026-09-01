@@ -1912,7 +1912,7 @@ impl LiveCaptureWorker {
         let generation = self.current_generation_for_test();
         if let Ok(mut latest) = self.latest.lock() {
             *latest = Some(CaptureFrame {
-                generation: generation.saturating_sub(1),
+                generation: generation.wrapping_sub(1),
                 target: self
                     .target
                     .lock()
@@ -3425,6 +3425,17 @@ mod tests {
     }
 
     #[test]
+    fn stale_generation_helper_rejects_frame_at_generation_zero() {
+        let worker = LiveCaptureWorker::spawn(std::sync::Arc::new(tokio::sync::Notify::new()));
+        assert_eq!(worker.current_generation_for_test(), 0);
+
+        worker.inject_stale_generation_frame_for_test(40, "previous pane bytes");
+        let frame = worker.take_latest().expect("injected capture frame");
+        assert_eq!(frame.generation, u64::MAX);
+        assert!(!worker.frame_is_current(&frame));
+    }
+
+    #[test]
     fn capture_target_change_detects_aba_generation() {
         assert!(!capture_target_changed("a", 7, "a", 7));
         assert!(capture_target_changed("a", 7, "b", 8));
@@ -3482,7 +3493,7 @@ mod tests {
         let generation = worker.current_generation_for_test();
         if let Ok(mut clipboard) = worker.clipboard.lock() {
             *clipboard = Some(ClipboardFrame {
-                generation: generation.saturating_sub(1),
+                generation: generation.wrapping_sub(1),
                 target: String::new(),
                 text: "stale secret".to_string(),
             });

@@ -2050,10 +2050,20 @@ impl Session {
     /// owner flag or a separate show-options result can become stale between
     /// subprocesses when another surface takes over.
     pub fn resize_window_if_owner(&self, owner_id: &str, cols: u16, rows: u16) -> bool {
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        self.resize_window_if_owner_with_deadline(owner_id, cols, rows, &deadline)
+    }
+
+    fn resize_window_if_owner_with_deadline(
+        &self,
+        owner_id: &str,
+        cols: u16,
+        rows: u16,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> bool {
         for attempt in 0..2 {
-            let deadline = crate::tmux::TmuxCommandDeadline::new();
             let Ok(Some((observed_owner, heartbeat))) =
-                self.owner_at_result_with_deadline(SIZE_OWNER_OPT, SIZE_OWNER_HB_OPT, &deadline)
+                self.owner_at_result_with_deadline(SIZE_OWNER_OPT, SIZE_OWNER_HB_OPT, deadline)
             else {
                 return false;
             };
@@ -2066,40 +2076,33 @@ impl Session {
                 owner_id,
                 &heartbeat.to_string(),
             );
-            if self.resize_window_if_format_with_deadline(&condition, cols, rows, &deadline) {
+            if self.resize_window_if_format_with_deadline(&condition, cols, rows, deadline) {
                 return true;
             }
 
-            let verify_deadline = crate::tmux::TmuxCommandDeadline::new();
-            match self.owner_at_result_with_deadline(
-                SIZE_OWNER_OPT,
-                SIZE_OWNER_HB_OPT,
-                &verify_deadline,
-            ) {
+            match self.owner_at_result_with_deadline(SIZE_OWNER_OPT, SIZE_OWNER_HB_OPT, deadline) {
                 Ok(Some((id, refreshed_heartbeat))) if id == owner_id => {
                     if attempt == 0 && refreshed_heartbeat != heartbeat {
                         continue;
                     }
-                    let cleanup_deadline = crate::tmux::TmuxCommandDeadline::new();
                     self.release_owner_pair_at_with_deadline(
                         SIZE_OWNER_OPT,
                         SIZE_OWNER_HB_OPT,
                         owner_id,
                         refreshed_heartbeat,
                         true,
-                        &cleanup_deadline,
+                        deadline,
                     );
                 }
                 Ok(_) => {}
                 Err(_) => {
-                    let cleanup_deadline = crate::tmux::TmuxCommandDeadline::new();
                     self.release_owner_pair_at_with_deadline(
                         SIZE_OWNER_OPT,
                         SIZE_OWNER_HB_OPT,
                         owner_id,
                         heartbeat,
                         true,
-                        &cleanup_deadline,
+                        deadline,
                     );
                 }
             }
@@ -3256,6 +3259,82 @@ mod tests {
         session.release_size_owner(literal_owner);
         assert!(session.size_owner().is_none());
     }
+    #[test]
+    #[serial_test::serial]
+    fn resize_window_if_owner_keeps_timeout_recovery_in_one_deadline() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let guard = TmuxTestSession::new("aoe_test_owner_resize_deadline");
+        let out = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                guard.name(),
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "sleep 30",
+                ";",
+                "set-window-option",
+                "-t",
+                guard.name(),
+                "pane-base-index",
+                "0",
+            ])
+            .output()
+            .expect("tmux new-session");
+        assert!(out.status.success());
+        refresh_session_cache();
+        let session = Session::from_name(guard.name());
+        assert!(session.steal_size_owner("owner"));
+
+        let out = crate::tmux::tmux_command()
+            .args([
+                "set-hook",
+                "-t",
+                guard.name(),
+                "after-resize-window",
+                "run-shell 'sleep 1'",
+            ])
+            .output()
+            .expect("tmux set-hook");
+        assert!(out.status.success());
+
+        let deadline = crate::tmux::TmuxCommandDeadline::with_timeout(Duration::from_millis(200));
+        let started = Instant::now();
+        assert!(!session.resize_window_if_owner_with_deadline("owner", 91, 31, &deadline,));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(150),
+            "deadline expired before the guarded resize ran: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(600),
+            "verification or cleanup received a fresh deadline: {elapsed:?}"
+        );
+
+        let out = crate::tmux::tmux_command()
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                &format!("{}:^.0", guard.name()),
+                "#{pane_width} #{pane_height}",
+            ])
+            .output()
+            .expect("tmux pane size");
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "91 31");
+        assert_eq!(
+            session.size_owner().map(|(id, _)| id),
+            Some("owner".to_string())
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn vt_owner_lock_claims_rejects_and_releases_independently() {
