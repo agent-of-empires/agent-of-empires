@@ -2885,7 +2885,7 @@ impl HomeView {
                                 inst,
                                 CachedPreview::new(
                                     self.preview_cache.parsed_text.as_ref(),
-                                    self.preview_cache.session_id.as_deref() != Some(id.as_str()),
+                                    self.preview_cache.is_pending_for(id),
                                 ),
                                 self.preview_scroll_offset,
                                 theme,
@@ -3010,7 +3010,7 @@ impl HomeView {
                             terminal_running,
                             CachedPreview::new(
                                 cache.parsed_text.as_ref(),
-                                cache.session_id.as_deref() != Some(id.as_str()),
+                                cache.is_pending_for(&id),
                             ),
                             self.preview_scroll_offset,
                             theme,
@@ -3081,7 +3081,7 @@ impl HomeView {
                             tool_running,
                             CachedPreview::new(
                                 self.tool_preview_cache.parsed_text.as_ref(),
-                                self.tool_preview_cache.session_id.as_deref() != Some(id.as_str()),
+                                self.tool_preview_cache.is_pending_for(&id),
                             ),
                             self.preview_scroll_offset,
                             theme,

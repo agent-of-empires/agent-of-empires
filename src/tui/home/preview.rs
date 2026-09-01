@@ -217,6 +217,12 @@ impl PreviewCache {
     /// the session, target, generation, and dimensions the content belongs to.
     /// Returns the captured line count so the caller can clamp scroll. Written
     /// only by `apply_worker_capture`; there is no synchronous capture source.
+    /// Whether no frame has landed yet for the displayed session `id`, so
+    /// the render paints nothing rather than a hint about an unknown pane.
+    pub(in crate::tui) fn is_pending_for(&self, id: &str) -> bool {
+        self.session_id.as_deref() != Some(id)
+    }
+
     pub(in crate::tui) fn store_capture(
         &mut self,
         content: String,

@@ -807,9 +807,9 @@ fn authoritative_refresh_is_quiet(chunk_timing: Option<(u64, u64)>) -> bool {
 const VT_REARM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// How long a selection must rest on a pane before the worker arms a channel
-/// for it. Arming is a chain of tmux forks plus a forwarder spawn that blocks
-/// the worker, so a selection moving through the list must not start one per
-/// row; until it rests, each row costs one `capture-pane` fork.
+/// for it. Arming puts a real `pipe-pane` on the pane, so a selection moving
+/// through the list must not arm and tear one down per row it passes; until
+/// it rests, each row costs one `capture-pane` fork instead.
 #[cfg(unix)]
 const CHANNEL_ARM_SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
 
@@ -830,8 +830,8 @@ fn channel_arm_due(
 
 /// A channel arm running off the worker thread, so its chain of tmux forks
 /// and the forwarder spawn never delay a frame. The result is tagged with the
-/// target generation it was started for; a stale one is dropped, and dropping
-/// the last `Arc` of a channel shuts it down.
+/// target generation it was started for; a stale one goes to the caller's
+/// teardown sink, which runs after the cycle's frame.
 #[cfg(unix)]
 struct PendingArm<T> {
     generation: u64,
@@ -859,15 +859,24 @@ impl<T: Send + Sync + 'static> PendingArm<T> {
     }
 
     /// The channel a finished arm produced for `generation`. `None` while
-    /// the arm is still running, failed, or finished for another generation.
-    fn take(pending: &mut Option<Self>, generation: u64) -> Option<std::sync::Arc<T>> {
+    /// the arm is still running, failed, or finished for another generation;
+    /// a channel armed for another generation is pushed onto `stale`.
+    fn take(
+        pending: &mut Option<Self>,
+        generation: u64,
+        stale: &mut Vec<std::sync::Arc<T>>,
+    ) -> Option<std::sync::Arc<T>> {
         let done = match pending.as_ref()?.result.try_recv() {
             Ok(done) => done,
             Err(std::sync::mpsc::TryRecvError::Empty) => return None,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
         };
-        let current = pending.take().is_some_and(|p| p.generation == generation);
-        done.filter(|_| current)
+        if pending.take().is_some_and(|p| p.generation == generation) {
+            done
+        } else {
+            stale.extend(done);
+            None
+        }
     }
 }
 
@@ -1399,10 +1408,11 @@ impl LiveCaptureWorker {
                 // the old generation for the consumer to drop.
                 let generation_now = generation_cell.load(Ordering::Relaxed);
                 let command_deadline = crate::tmux::TmuxCommandDeadline::new();
+                // Channels detached this cycle, shut down after its frame.
                 #[cfg(unix)]
-                let mut stale_vt = None;
+                let mut stale_vt = Vec::new();
                 #[cfg(unix)]
-                let mut stale_osc52 = None;
+                let mut stale_osc52 = Vec::new();
                 // A retarget resets the dedup so the new generation's first
                 // frame always publishes, even in an ABA switch A -> B -> A
                 // that happens entirely between worker cycles and leaves the
@@ -1427,11 +1437,11 @@ impl LiveCaptureWorker {
                     // dropped on arrival.
                     #[cfg(unix)]
                     {
-                        stale_vt = vt_source.take();
+                        stale_vt.extend(vt_source.take());
                         last_vt_arm = None;
                         arm_after = Some(std::time::Instant::now() + CHANNEL_ARM_SETTLE);
                         next_authoritative_capture = None;
-                        stale_osc52 = osc52_source.take();
+                        stale_osc52.extend(osc52_source.take());
                         osc52_seen = 0;
                         last_osc52_arm = None;
                     }
@@ -1442,7 +1452,9 @@ impl LiveCaptureWorker {
                 // Adopt finished arms before the enable checks below so a
                 // setting toggled off meanwhile tears the channel down at once.
                 #[cfg(unix)]
-                if let Some(v) = PendingArm::take(&mut pending_vt_arm, generation_now) {
+                if let Some(v) =
+                    PendingArm::take(&mut pending_vt_arm, generation_now, &mut stale_vt)
+                {
                     // Event-driven echo: the channel pokes our nudge condvar
                     // on every grid change, so the wait below ends the moment
                     // output lands instead of after a poll interval.
@@ -1452,7 +1464,9 @@ impl LiveCaptureWorker {
                     vt_source = Some(v);
                 }
                 #[cfg(unix)]
-                if let Some(source) = PendingArm::take(&mut pending_osc52_arm, generation_now) {
+                if let Some(source) =
+                    PendingArm::take(&mut pending_osc52_arm, generation_now, &mut stale_osc52)
+                {
                     osc52_seen = source.clipboard_sequence();
                     osc52_source = Some(source);
                 }
@@ -1733,6 +1747,7 @@ impl LiveCaptureWorker {
                                     pending_since = None;
                                     if let Some(seen) = retarget_seen.take() {
                                         tracing::debug!(
+                                            target: "tui.live_send",
                                             pane = %name,
                                             elapsed_ms = seen.elapsed().as_millis() as u64,
                                             "preview: first frame after retarget"
@@ -1760,8 +1775,12 @@ impl LiveCaptureWorker {
                 }
                 #[cfg(unix)]
                 {
-                    shutdown_vt_source(&mut stale_vt, &command_deadline);
-                    shutdown_osc52_source(&mut stale_osc52, &command_deadline);
+                    for channel in stale_vt.drain(..) {
+                        shutdown_vt_source(&mut Some(channel), &command_deadline);
+                    }
+                    for channel in stale_osc52.drain(..) {
+                        shutdown_osc52_source(&mut Some(channel), &command_deadline);
+                    }
                 }
                 // Nothing deferred this cycle means no frame is being held, so
                 // clear the debounce hold and let the next repaint's latency cap
@@ -1805,14 +1824,23 @@ impl LiveCaptureWorker {
                     None => ms,
                 };
                 // Start the settled arm on time rather than after a full idle
-                // interval.
+                // interval, while no channel of either kind is held or pending.
                 #[cfg(unix)]
-                let ms = match arm_after.filter(|_| vt_source.is_none() && pending_vt_arm.is_none())
-                {
-                    Some(t) if t > std::time::Instant::now() => ms
-                        .min((t - std::time::Instant::now()).as_millis() as u64)
-                        .max(1),
-                    _ => ms,
+                let ms = match arm_after.filter(|_| {
+                    vt_source.is_none()
+                        && pending_vt_arm.is_none()
+                        && osc52_source.is_none()
+                        && pending_osc52_arm.is_none()
+                }) {
+                    Some(t) => {
+                        let remaining = t.saturating_duration_since(std::time::Instant::now());
+                        if remaining.is_zero() {
+                            ms
+                        } else {
+                            ms.min(remaining.as_millis() as u64).max(1)
+                        }
+                    }
+                    None => ms,
                 };
                 let _ = wait_for_capture_wake(
                     &nudge_thread,
@@ -3609,21 +3637,23 @@ mod tests {
                 Some(std::sync::Arc::new(name.to_string()))
             },
         ));
+        let mut stale = Vec::new();
         assert!(
-            PendingArm::take(&mut pending, 7).is_none() && pending.is_some(),
+            PendingArm::take(&mut pending, 7, &mut stale).is_none() && pending.is_some(),
             "a running arm stays pending"
         );
         release.send(()).unwrap();
         let mut observed = 0;
         wait_for_capture_wake(&wake, &mut observed, std::time::Duration::from_secs(5));
         assert_eq!(
-            PendingArm::take(&mut pending, 7)
+            PendingArm::take(&mut pending, 7, &mut stale)
                 .as_deref()
                 .map(String::as_str),
             Some("pane"),
             "the current generation adopts its channel"
         );
         assert!(pending.is_none(), "a delivered arm is no longer pending");
+        assert!(stale.is_empty());
 
         let (release, gate) = std::sync::mpsc::channel::<()>();
         let mut pending = Some(PendingArm::spawn(
@@ -3638,8 +3668,13 @@ mod tests {
         release.send(()).unwrap();
         wait_for_capture_wake(&wake, &mut observed, std::time::Duration::from_secs(5));
         assert!(
-            PendingArm::take(&mut pending, 8).is_none(),
-            "a retarget mid-arm drops the stale channel"
+            PendingArm::take(&mut pending, 8, &mut stale).is_none(),
+            "a retarget mid-arm never adopts the stale channel"
+        );
+        assert_eq!(
+            stale.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            ["pane"],
+            "the stale channel goes to the teardown sink"
         );
         assert!(
             pending.is_none(),

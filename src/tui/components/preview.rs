@@ -24,8 +24,8 @@ pub struct CachedPreview<'a> {
     pub text: Option<&'a Text<'static>>,
     /// No frame has landed for the displayed session yet, so an empty
     /// `text` says nothing about its pane: paint nothing rather than the
-    /// "No output available" hint, which would blink for the one or two
-    /// frames a just-selected session takes to fill.
+    /// "No output available" hint, which would blink while a just-selected
+    /// session fills.
     pub pending: bool,
 }
 
@@ -929,5 +929,54 @@ mod tests {
             });
             assert_eq!(terminal_info_height(&inst), 3);
         }
+    }
+
+    /// Rows of a rendered terminal preview, for the hint assertions below.
+    fn terminal_preview_rows(pending: bool) -> Vec<String> {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let theme = crate::tui::styles::load_theme("empire");
+        let instance = Instance::new("pane", "/tmp/pane");
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal
+            .draw(|frame| {
+                Preview::render_terminal_preview(
+                    frame,
+                    frame.area(),
+                    &instance,
+                    true,
+                    CachedPreview::new(None, pending),
+                    0,
+                    &theme,
+                    false,
+                    false,
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn empty_preview_hint_waits_for_the_first_frame() {
+        let hint = |pending| {
+            terminal_preview_rows(pending)
+                .iter()
+                .any(|row| row.contains("No output available"))
+        };
+        assert!(
+            hint(false),
+            "an empty frame for the displayed session paints the hint"
+        );
+        assert!(
+            !hint(true),
+            "no frame yet for the displayed session paints nothing"
+        );
     }
 }
