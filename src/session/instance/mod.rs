@@ -486,8 +486,9 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_name: Option<String>,
     /// Optional model id, injected at spawn as `AOE_AGENT_MODEL` (e.g.,
-    /// "claude-opus-4-7", "gpt-5", "llama3.3:ollama"). Only `aoe-agent`
-    /// reads that variable.
+    /// "claude-opus-4-7", "gpt-5", "gemini-2.5-pro"). Only `aoe-agent` reads
+    /// it, and it routes Anthropic, OpenAI and Google ids only, by bare
+    /// prefix or an explicit `anthropic:`/`openai:`/`google:` prefix.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_model: Option<String>,
     /// Reasoning effort ("thought level") this session was explicitly pinned

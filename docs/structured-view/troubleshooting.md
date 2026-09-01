@@ -35,10 +35,10 @@ handshake times out after 30s.
 
 ### `aoe acp doctor` says Node is missing
 
-Install Node.js 20 or newer:
+Install Node.js 22 or newer:
 
 - macOS: `brew install node`
-- Linux: `apt install nodejs` or `nvm install 20`
+- Linux: `apt install nodejs` or `nvm install 22`
 - Windows: download from <https://nodejs.org/>
 
 Then re-run `aoe acp doctor` to verify. If you have Node installed in a

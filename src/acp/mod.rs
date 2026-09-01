@@ -5,7 +5,7 @@
 //! - aoe is an ACP **client**.
 //! - Backends are ACP **agents** spawned as subprocesses.
 //! - Day-one backends: `claude-code` (Anthropic's official ACP adapter) and
-//!   `aoe-agent` (our Node binary, Vercel AI SDK 6).
+//!   `aoe-agent` (our Node binary, Vercel AI SDK 7).
 //! - File-system access (`fs/*`) and terminal execution (`terminal/*`) are
 //!   delegated from the agent to aoe via ACP. aoe owns the disk; the agent
 //!   only orchestrates the model.
