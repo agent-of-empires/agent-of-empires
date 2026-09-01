@@ -20,14 +20,18 @@ use crate::tui::styles::Theme;
 /// frame. See `PreviewCache::ensure_parsed` for the parse-and-cache
 /// contract.
 pub struct CachedPreview<'a> {
-    /// `None` means the source `content` was empty (no pane bytes
-    /// yet, or just cleared); callers render their own placeholder.
+    /// `None` means the source `content` was empty.
     pub text: Option<&'a Text<'static>>,
+    /// No frame has landed for the displayed session yet, so an empty
+    /// `text` says nothing about its pane: paint nothing rather than the
+    /// "No output available" hint, which would blink for the one or two
+    /// frames a just-selected session takes to fill.
+    pub pending: bool,
 }
 
 impl<'a> CachedPreview<'a> {
-    pub fn from_text(text: Option<&'a Text<'static>>) -> Self {
-        Self { text }
+    pub fn new(text: Option<&'a Text<'static>>, pending: bool) -> Self {
+        Self { text, pending }
     }
 }
 
@@ -260,7 +264,7 @@ impl Preview {
                 scroll_offset,
                 Style::default().fg(theme.text),
             );
-        } else {
+        } else if !cached_output.pending {
             let hint = Paragraph::new("No output available")
                 .style(Style::default().fg(theme.dimmed))
                 .alignment(Alignment::Center);
@@ -476,7 +480,7 @@ impl Preview {
                 scroll_offset,
                 Style::default().fg(theme.text),
             );
-        } else {
+        } else if !cached_output.pending {
             let hint = Paragraph::new("No output available")
                 .style(Style::default().fg(theme.dimmed))
                 .alignment(Alignment::Center);
