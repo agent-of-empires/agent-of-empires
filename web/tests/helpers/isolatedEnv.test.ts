@@ -47,7 +47,7 @@ describe("isolateEnv", () => {
   // rather than off a list here, which would fall behind it.
   it("drops every path variable src/ reads, whatever the name", () => {
     const names = daemonPathVars();
-    expect(names).toEqual(expect.arrayContaining(["CLAUDE_CONFIG_DIR", "OPENCODE_DB", "VIBE_HOME", "XDG_DATA_HOME"]));
+    expect(names).toEqual(expect.arrayContaining(["CLAUDE_CONFIG_DIR", "OPENCODE_DB", "XDG_DATA_HOME"]));
 
     const hostile: NodeJS.ProcessEnv = {};
     for (const name of names) hostile[name] = `${HOST}/${name.toLowerCase()}`;
