@@ -147,9 +147,9 @@ export interface SessionResponse {
   acp_capable?: boolean;
   /** The session's captured ACP session id, present only once the structured
    *  view worker has minted one. The sidebar passes this as `fork_from` on a
-   *  structured fork create, and gates the "Fork" action on its presence (a
-   *  structured row with a captured id to diverge from). Absent for terminal
-   *  sessions and structured ones whose worker has not minted an id yet. */
+   *  structured fork create and gates the "Fork" action on it together with
+   *  `acp_can_fork`. Absent for terminal sessions and structured ones whose
+   *  worker has not minted an id yet. */
   acp_session_id?: string;
   /** The session's resolved ACP registry key (`agent_name` when set, else
    *  `tool`), matching the `name` entries `/api/acp/agents` returns. The
