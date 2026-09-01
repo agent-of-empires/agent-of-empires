@@ -491,7 +491,8 @@ const COLD_STATE_FIELDS: [&str; 5] = [
 /// Identity fields to seed a fresh `AcpState` with: the reducer corrects
 /// `agent` on any `AgentSwitched`, but a fold that never sees one keeps this
 /// seed, so both the WS connection fold and the on-demand
-/// [`fold_control_state`] must start from the same place.
+/// [`crate::server::session_service::SessionService::fold_control_state`]
+/// must start from the same place.
 async fn seed_identity(state: &AppState, session_id: &str) -> (AgentName, Option<String>) {
     let instances = state.instances.read().await;
     instances
@@ -504,12 +505,6 @@ async fn seed_identity(state: &AppState, session_id: &str) -> (AgentName, Option
             )
         })
         .unwrap_or_else(|| (AgentName(String::new()), None))
-}
-
-/// The daemon's current control state for a session, for HTTP handlers that
-/// hold `AppState`. See [`crate::server::session_service::SessionService::fold_control_state`].
-pub(crate) async fn fold_control_state(state: &AppState, session_id: &str) -> AcpState {
-    state.session_service.fold_control_state(session_id).await
 }
 
 fn fold_connect_history(
@@ -1055,7 +1050,7 @@ mod tests {
                 prompt_id: None,
             },
         );
-        let folded = fold_control_state(&state, "s-fold").await;
+        let folded = state.session_service.fold_control_state("s-fold").await;
         assert!(folded.turn_active, "the prompt opened a turn");
         assert!(folded.steering, "capabilities survive the fold");
         assert!(!folded.cancelling);
@@ -1078,7 +1073,7 @@ mod tests {
                 escalates_at: chrono::Utc::now(),
             },
         );
-        let folded = fold_control_state(&state, "s-fold").await;
+        let folded = state.session_service.fold_control_state("s-fold").await;
         assert!(folded.cancelling);
         assert_eq!(
             crate::acp::dispatch::decide(
@@ -1100,7 +1095,7 @@ mod tests {
                 reason: "cancelled".into(),
             },
         );
-        let folded = fold_control_state(&state, "s-fold").await;
+        let folded = state.session_service.fold_control_state("s-fold").await;
         assert!(!folded.turn_active, "Stopped closed the turn");
         assert!(!folded.cancelling, "and cleared the pending cancel");
         assert_eq!(
@@ -1117,7 +1112,7 @@ mod tests {
         // An unknown session folds to a default (idle) state rather than
         // erroring, so a prompt for a session the daemon has not seen is not
         // parked forever on a phantom turn.
-        let unknown = fold_control_state(&state, "s-missing").await;
+        let unknown = state.session_service.fold_control_state("s-missing").await;
         assert!(!unknown.turn_active);
     }
 

@@ -299,6 +299,11 @@ for the full model.
 **Ownership.** `sessions.turn.send` only reaches a session the calling plugin
 created; a plugin cannot deliver turns to a user's or another plugin's session.
 
+**Busy sessions.** A turn aimed at a session whose agent is already running a
+non-steerable turn (or cancelling, or compacting) is refused with a retryable
+`agent_busy` rather than accepted and dropped. A stopped or dormant session is
+not busy: the host resumes it and waits.
+
 **Idempotency.** `sessions.create` accepts an `idempotency_key` scoped to the
 plugin: retrying with the same key and payload returns the existing session
 (`created: false`); a different payload under the same key is a conflict.
