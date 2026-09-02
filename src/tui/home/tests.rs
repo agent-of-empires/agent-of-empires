@@ -15909,7 +15909,13 @@ mod preview_drag_select {
             (0, 3, 2, true),
             (0, 3, 3, false),
             (0, 3, 10, false),
-            // Scrolled into history: 5 lines painted from the top row.
+            // Scrolled into history: the window is full, so every pane
+            // row is painted and the gate rejects nothing.
+            (85, 105, 0, true),
+            (85, 105, 19, true),
+            // A partly-painted window is geometry `compute_scroll` and
+            // `TranscriptGeometry` both clamp away; the gate stays right
+            // without leaning on that.
             (100, 105, 4, true),
             (100, 105, 5, false),
         ];
