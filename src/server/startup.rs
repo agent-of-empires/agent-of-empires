@@ -60,14 +60,15 @@ pub(super) fn remote_serve_url_contents(
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// Post-signal shutdown: cancel the shared token, arm the force-exit
-/// deadline, then reap plugin workers.
+/// deadline, then reap plugin workers within four fifths of the window,
+/// leaving the rest for the caller's own cleanup.
 ///
-/// The deadline is armed before `reap` is awaited, and the reap gets only
-/// part of the window, so a plugin worker that never terminates can neither
-/// keep the daemon alive nor starve the post-`axum::serve` cleanup (acp
-/// detach, tunnel SIGTERM of cloudflared, removal of serve.passphrase) of
-/// its chance to run. A forced exit skips that cleanup entirely; the PID
-/// file is swept by `daemon_pid`'s stale-PID check on the next start.
+/// A worker that never terminates therefore cannot keep the daemon alive.
+/// It is not free: a reap cut short can leave a worker group SIGTERMed
+/// without the SIGKILL escalation, and a forced exit skips the
+/// post-`axum::serve` cleanup entirely (acp detach, tunnel SIGTERM of
+/// cloudflared, removal of serve.passphrase). The PID file is swept by
+/// `daemon_pid`'s stale-PID check on the next start.
 async fn run_shutdown_sequence<R, F>(
     shutdown: &CancellationToken,
     grace: Duration,
@@ -87,10 +88,7 @@ async fn run_shutdown_sequence<R, F>(
         );
         force_exit();
     });
-    if tokio::time::timeout(grace.mul_f32(0.8), reap)
-        .await
-        .is_err()
-    {
+    if tokio::time::timeout(grace * 4 / 5, reap).await.is_err() {
         tracing::warn!(
             target: "shutdown",
             "plugin worker reap did not finish in time, continuing shutdown"
