@@ -239,7 +239,7 @@ pub fn render_first_turn(user_prompt: &str, agent_prose: &str) -> String {
 }
 
 /// Project a resolved [`SessionConfig`] into the three fields the smart-rename
-/// indicator (`list_sessions` in `src/server/api/sessions.rs`) and the runtime
+/// indicator (`list_sessions` in `src/server/api/sessions/list.rs`) and the runtime
 /// gate ([`try_smart_rename`]) both consume. Shared projection so the two
 /// call sites cannot drift on which fields count: each site fetches the
 /// resolved config via
@@ -2532,7 +2532,7 @@ Rewrote the getting-started section and fixed two broken links.";
     }
 
     // Regression for #2351: pins the shared helper that both `try_smart_rename`
-    // and the sidebar indicator overlay in `src/server/api/sessions.rs` route
+    // and the sidebar indicator overlay in `src/server/api/sessions/list.rs` route
     // through. The helper is verified in isolation here; call-site coverage is
     // design-level (reverting either site to bypass the helper is visible in
     // review because both explicitly name `resolve_smart_rename_config`).

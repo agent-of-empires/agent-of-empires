@@ -1022,7 +1022,7 @@ pub fn cleanup_instance(
 }
 
 /// Structured-view (ACP) helpers for the TUI create paths. The web create
-/// path does the equivalent inline in `src/server/api/sessions.rs` (it also
+/// path does the equivalent inline in `src/server/api/sessions/create.rs` (it also
 /// handles explicit agent / model / import fields the TUI wizard doesn't
 /// expose), and the CLI in `src/cli/add.rs` with bail-vs-downgrade semantics
 /// keyed on how explicit the user's flag was. Keep the three in sync.

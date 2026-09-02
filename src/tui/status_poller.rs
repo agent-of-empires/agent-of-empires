@@ -51,7 +51,7 @@ fn polling_tier(status: Status) -> u64 {
 ///   clobbered by an unseeded snapshot.
 ///
 /// Locked by `apply_status_update_preserves_idle_entered_at_on_keep`
-/// in `src/tui/home/tests.rs` (a `#[cfg(test)]` item, so the reference
+/// in `src/tui/home/tests/status_rows_menu.rs` (a `#[cfg(test)]` item, so the reference
 /// is kept as a code-span rather than an intra-doc link that would
 /// silently degrade to literal text under `cargo doc`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

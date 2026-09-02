@@ -746,7 +746,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     // otherwise every tool would look ACP-capable via that default and
     // `--structured-view` could never be rejected for a non-ACP tool (it
     // would silently substitute the default). Mirrors the server create
-    // path in `src/server/api/sessions.rs`.
+    // path in `src/server/api/sessions/create.rs`.
     let capability_key = instance
         .agent_name
         .as_deref()
