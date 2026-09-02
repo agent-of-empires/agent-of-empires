@@ -783,6 +783,12 @@ export interface AcpState {
    *  NOT park prompts in the local queue forever; instead the POST itself
    *  is the wake path. Cleared on AcpSessionAssigned or UserPromptSent. */
   workerIdleStopped: boolean;
+  /** Set true when the daemon publishes
+   *  `Stopped { reason: "rate_limit_exhausted_retries" }`: auto-resume gave
+   *  up re-delivering the interrupted prompt after its cap and parked the
+   *  session (#3688). The banner says so; RESUME NOW and a fresh prompt
+   *  both clear it. */
+  rateLimitRetriesExhausted: boolean;
   /** Follow-up prompts the user typed and submitted while a turn was
    *  already running. The composer enqueues them client-side instead
    *  of racing the agent (claude-agent-acp serialises session/prompt
@@ -1203,6 +1209,7 @@ export function emptyAcpState(): AcpState {
     locallyResolved: [],
     thinking: false,
     rateLimit: null,
+    rateLimitRetriesExhausted: false,
     sessionUsage: null,
     usageBaseline: null,
     compactionReminderDismissed: null,
@@ -1286,6 +1293,9 @@ function applyNewTurnResets(next: AcpState): void {
   // dormancy server-side); drop the marker so the drain effect stops
   // treating the worker as wakeable-but-down.
   next.workerIdleStopped = false;
+  // A fresh prompt also recovers an exhausted-retries park (#3688): the
+  // POST wakes the worker and the turn supersedes the dropped continuation.
+  next.rateLimitRetriesExhausted = false;
   // The user is moving on. Clear any pending Retry pills and the
   // agent-unresponsive banner; if the rejection was legitimate the
   // new prompt will end up rejected too and a fresh pill will land.
@@ -1489,6 +1499,11 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       next.workerIdleStopped = true;
       next.workerStopped = false;
       next.workerRestarting = false;
+    } else if (event.Stopped.reason === "rate_limit_exhausted_retries") {
+      // Auto-resume gave up re-delivering the interrupted prompt after its
+      // cap and parked the session (#3688). RESUME NOW and a fresh prompt
+      // both recover; until then the banner explains the park.
+      next.rateLimitRetriesExhausted = true;
     }
     return next;
   }
@@ -1567,6 +1582,13 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.workerIdleStopped = false;
     next.agentUnresponsive = false;
     next.agentOrphaned = false;
+    return next;
+  }
+  if ("RateLimitAutoResumed" in event) {
+    // A resume fired (manual RESUME NOW or the auto-resume pass before it
+    // gave up): the worker is coming back, so the exhausted-retries park is
+    // over until a new streak parks it again (#3688).
+    next.rateLimitRetriesExhausted = false;
     return next;
   }
   if ("SessionContextReset" in event) {

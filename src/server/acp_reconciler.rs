@@ -433,6 +433,13 @@ pub async fn reconcile_acp_workers(
                 attempted.insert(id);
                 continue;
             }
+            // #3688: the auto-resume pass parked this session after its
+            // redelivery cap. Same hold as the adapter park above, minus the
+            // resume schedule: only a manual retry or a fresh prompt un-parks.
+            if reason == RATE_LIMIT_EXHAUSTED_RETRIES_REASON {
+                attempted.insert(id);
+                continue;
+            }
         }
         // Respawn-budget gate (#1945). Count this resume decision before we
         // know its outcome: that catches both the reattach-timeout loop and
@@ -1111,6 +1118,22 @@ const RATE_LIMIT_MIN_PARK_SECS: i64 = 30;
 /// cleared, the retry re-parks and the next one is another interval out.
 const RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS: i64 = 3600;
 
+/// How many times auto-resume may re-deliver the interrupted prompt for one
+/// rate-limit streak before the reconciler gives up and parks the session on
+/// a terminal `Stopped{rate_limit_exhausted_retries}` (#3688). Matches the
+/// #1945 respawn budget so both bounded-retry mechanisms stop at the same
+/// attempt count. Every `RateLimitAutoResumed` breadcrumb is one re-delivery;
+/// any organic turn end (a `Stopped` with another reason) resets the count.
+const RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES: i64 = 5;
+
+/// Terminal park reason the reconciler publishes when a rate-limit streak
+/// exhausts `RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES`. Distinct from
+/// the agent-reported `rate_limited` so the park predicates can hold the
+/// session parked without treating it as a fresh adapter park (no reset
+/// schedule applies), while the manual `/acp/spawn` resume and a new prompt
+/// both still work. See #3688.
+pub(crate) const RATE_LIMIT_EXHAUSTED_RETRIES_REASON: &str = "rate_limit_exhausted_retries";
+
 /// Opt-in rate-limit auto-resume pass (#1722). For structured view sessions parked
 /// on `Stopped { reason: "rate_limited" }` whose profile enabled
 /// `acp.rate_limit_auto_resume`, respawn the worker once the
@@ -1280,6 +1303,58 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
         // breadcrumb (and clear `attempted`) for an already-running
         // session. Let the manual resume win. See #1722.
         if state.acp_supervisor.is_running(&id).await {
+            continue;
+        }
+        // Bounded redeliveries (#3688): every earlier breadcrumb in this
+        // streak re-delivered the interrupted prompt and the turn still
+        // ended rate-limited. Past the cap, stop burning the same prompt:
+        // drop the pending continuation, publish the terminal exhausted
+        // park (which `latest_status_event` reports, so the main loop holds
+        // the session parked and this pass no longer sees
+        // `Stopped{rate_limited}`), and keep the `attempted` slot. A
+        // manual `/acp/spawn` resume or a fresh prompt still works; the
+        // streak only counts resumes since the last organic turn end, so
+        // either resets it.
+        let (streak, latest_seq) = {
+            let store = Arc::clone(&state.acp_event_store);
+            let id_streak = id.clone();
+            match tokio::task::spawn_blocking(move || {
+                (
+                    store.rate_limit_redelivery_streak(&id_streak),
+                    store.highest_seq(&id_streak),
+                )
+            })
+            .await
+            {
+                Ok((streak, latest_seq)) => (streak, latest_seq),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "acp.supervisor",
+                        session = %id,
+                        error = %e,
+                        "rate-limit redelivery streak probe failed"
+                    );
+                    continue;
+                }
+            }
+        };
+        if streak >= RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES {
+            state.session_service.clear_pending_initial_turn(&id).await;
+            // Seq-guarded like terminal repair (#3190): a prompt or worker
+            // event published between the probe and here must not be
+            // terminated by this park.
+            state.acp_supervisor.publish_stopped_if_seq(
+                &id,
+                RATE_LIMIT_EXHAUSTED_RETRIES_REASON,
+                latest_seq,
+            );
+            tracing::warn!(
+                target: "acp.supervisor",
+                session = %id,
+                redeliveries = streak,
+                max = RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES,
+                "rate-limit auto-resume: redelivery cap reached; parking session with a terminal stop"
+            );
             continue;
         }
         // Eligible: queue the interrupted prompt (if any) so the respawned

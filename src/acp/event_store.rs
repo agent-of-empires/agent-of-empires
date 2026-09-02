@@ -1219,6 +1219,43 @@ impl EventStore {
         }
     }
 
+    /// Count the rate-limit redeliveries in the current streak: every
+    /// `RateLimitAutoResumed` breadcrumb since the last organic turn
+    /// boundary, i.e. the last `Stopped` whose reason is not
+    /// `rate_limited`, or a worker `AgentStartupError`. Each breadcrumb
+    /// caused one re-delivery of the interrupted prompt, so this is how
+    /// often auto-resume has re-sent the same prompt without a single
+    /// turn getting through. Derived from the persisted log, so the count
+    /// survives a daemon restart. See #3688.
+    pub fn rate_limit_redelivery_streak(&self, session_id: &str) -> i64 {
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        conn.query_row(
+            "SELECT COUNT(*) FROM acp_events
+             WHERE session_id = ?1
+               AND discriminant = 'RateLimitAutoResumed'
+               AND seq > (
+                   SELECT IFNULL(MAX(seq), 0) FROM acp_events
+                   WHERE session_id = ?1
+                     AND (discriminant = 'AgentStartupError'
+                       OR (discriminant = 'Stopped'
+                           AND json_extract(event_json, '$.Stopped.reason')
+                               != 'rate_limited'))
+               )",
+            params![session_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or_else(|e| {
+            warn!(
+                target: "acp.event_store",
+                "rate_limit_redelivery_streak for {session_id}: {e}"
+            );
+            0
+        })
+    }
+
     /// The first turn's transcript for smart rename: the earliest
     /// `UserPromptSent` text plus the agent's prose (`AgentMessageChunk`)
     /// emitted before the first `Stopped` that follows it (any reason, so an
@@ -4155,6 +4192,79 @@ mod tests {
             ),
             "RateLimitAutoResumed must supersede Stopped{{rate_limited}}"
         );
+    }
+
+    // #3688: the redelivery streak is what bounds auto-resume. One table
+    // because every case shares the same recorder walk.
+    #[test]
+    fn rate_limit_redelivery_streak_counts_resumes_and_resets_organically() {
+        let (_tmp, store) = open_store(1000);
+        let resumes_at = || Event::RateLimitAutoResumed {
+            resets_at: Utc::now(),
+        };
+        let stopped = |reason: &str| Event::Stopped {
+            reason: reason.into(),
+        };
+
+        // The reporter's sequence: a prompt parks, and every hourly retry
+        // re-delivers it without a single turn getting through.
+        store
+            .record("s-1", 1, &user_prompt("run the nightly task"))
+            .unwrap();
+        store.record("s-1", 2, &rate_limit_event(0)).unwrap();
+        store.record("s-1", 3, &stopped("rate_limited")).unwrap();
+        for seq in 4..=18 {
+            let ev = if seq % 3 == 1 {
+                resumes_at()
+            } else if seq % 3 == 2 {
+                user_prompt("run the nightly task")
+            } else {
+                rate_limit_event(0)
+            };
+            // Park again after each failed delivery: the rate-limit event
+            // and its terminal stop land together.
+            store.record("s-1", seq, &ev).unwrap();
+            if seq % 3 == 0 {
+                store
+                    .record("s-1", seq + 15, &stopped("rate_limited"))
+                    .unwrap();
+            }
+        }
+        // Five full park -> resume -> redeliver -> re-park cycles.
+        assert_eq!(store.rate_limit_redelivery_streak("s-1"), 5);
+
+        // An organic turn end resets the streak: the next park starts a
+        // fresh count instead of inheriting the spent one.
+        store
+            .record("s-1", 100, &stopped("prompt_complete"))
+            .unwrap();
+        store
+            .record("s-1", 101, &user_prompt("run the nightly task"))
+            .unwrap();
+        store.record("s-1", 102, &rate_limit_event(0)).unwrap();
+        store.record("s-1", 103, &stopped("rate_limited")).unwrap();
+        store.record("s-1", 104, &resumes_at()).unwrap();
+        assert_eq!(store.rate_limit_redelivery_streak("s-1"), 1);
+
+        // A worker startup failure also breaks the streak: the resume that
+        // could not spawn a worker never re-delivered the prompt, so it
+        // must not count toward the cap.
+        store
+            .record(
+                "s-1",
+                110,
+                &Event::AgentStartupError {
+                    message: "boom".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(store.rate_limit_redelivery_streak("s-1"), 0);
+        // A resume after that boundary starts a fresh streak.
+        store.record("s-1", 111, &resumes_at()).unwrap();
+        assert_eq!(store.rate_limit_redelivery_streak("s-1"), 1);
+
+        // No history means no streak.
+        assert_eq!(store.rate_limit_redelivery_streak("s-2"), 0);
     }
 
     #[test]

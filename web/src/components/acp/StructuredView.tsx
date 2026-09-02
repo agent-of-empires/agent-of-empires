@@ -718,11 +718,12 @@ function AcpChrome({
         onPrefill={recoveryHandoffPrefill}
       >
         {({ onSwitchAgent }) =>
-          status !== "open" || state.lagged || state.rateLimit || reconnecting ? (
+          status !== "open" || state.lagged || state.rateLimit || state.rateLimitRetriesExhausted || reconnecting ? (
             <SystemNotices
               status={status}
               lagged={state.lagged}
               rateLimit={state.rateLimit}
+              rateLimitRetriesExhausted={state.rateLimitRetriesExhausted}
               hasEverOpened={hasEverOpened}
               reconnecting={reconnecting}
               retryCount={retryCount}
@@ -1758,6 +1759,7 @@ export function SystemNotices({
   status,
   lagged,
   rateLimit,
+  rateLimitRetriesExhausted,
   hasEverOpened,
   reconnecting,
   retryCount,
@@ -1772,6 +1774,7 @@ export function SystemNotices({
   status: AcpContext["status"];
   lagged: boolean;
   rateLimit: AcpState["rateLimit"];
+  rateLimitRetriesExhausted: boolean;
   hasEverOpened: boolean;
   reconnecting: boolean;
   retryCount: number;
@@ -1835,6 +1838,12 @@ export function SystemNotices({
         reset && !Number.isNaN(reset.getTime())
           ? `Rate-limited (${rateLimit.kind}); resets at ${reset.toLocaleTimeString()}.`
           : `Rate-limited (${rateLimit.kind}); ${rateLimitWording(rateLimit.status)}`,
+    });
+  }
+  if (rateLimitRetriesExhausted) {
+    messages.push({
+      kind: "warn",
+      text: "Auto-resume stopped: the same prompt was re-sent too many times without getting through. Resume manually or send a new prompt.",
     });
   }
   const resumePending = rateLimitResumeState === "retrying" || rateLimitResumeState === "ok";

@@ -21,6 +21,7 @@ function mount(overrides?: Partial<React.ComponentProps<typeof SystemNotices>>) 
     status: "open",
     lagged: false,
     rateLimit: null,
+    rateLimitRetriesExhausted: false,
     hasEverOpened: true,
     reconnecting: false,
     retryCount: 0,
@@ -54,6 +55,7 @@ describe("SystemNotices rate-limit handoff", () => {
       <SystemNotices
         status="open"
         lagged={false}
+        rateLimitRetriesExhausted={false}
         rateLimit={{
           status: "limited",
           resets_at: "2099-01-01T00:00:00Z",
@@ -87,6 +89,7 @@ describe("SystemNotices rate-limit handoff", () => {
       <SystemNotices
         status="open"
         lagged={false}
+        rateLimitRetriesExhausted={false}
         rateLimit={{
           status: "Internal error: You've hit your weekly limit · resets 4am (Europe/Paris)",
           resets_at: null,
@@ -239,5 +242,17 @@ describe("SystemNotices rate-limit handoff", () => {
   it("renders nothing for a healthy session", () => {
     const { container } = mount();
     expect(container.firstChild).toBeNull();
+  });
+
+  // #3688: when auto-resume gives up, the banner says so even though the
+  // session is otherwise quiet (status open, no lag, rate-limit info may
+  // have been superseded by the terminal Stopped).
+  it("shows the auto-resume stopped note when retries are exhausted", () => {
+    const { getByText, queryByRole } = mount({ rateLimitRetriesExhausted: true });
+    expect(getByText(/Auto-resume stopped: the same prompt was re-sent too many times/i)).toBeDefined();
+    // The park is not an adapter rate-limit snapshot, so no recovery buttons
+    // render without the snapshot.
+    expect(queryByRole("button", { name: /resume now/i })).toBeNull();
+    expect(queryByRole("button", { name: /continue in another agent/i })).toBeNull();
   });
 });

@@ -226,12 +226,21 @@ fn rate_limit_resume_marker_resets_at(
     latest_rate_limit: Option<&RateLimitInfo>,
     fallback_resets_at: DateTime<Utc>,
 ) -> Option<DateTime<Utc>> {
+    // #3688: an exhausted-retries park also continues the interrupted turn
+    // on manual resume. No schedule applies (the reconciler already gave
+    // up), so the marker's timestamp is only the resume-at instant the
+    // breadcrumb reports.
     match latest_status {
         Some(Event::Stopped { reason }) if reason == "rate_limited" => Some(
             latest_rate_limit
                 .and_then(|info| info.resets_at)
                 .unwrap_or(fallback_resets_at),
         ),
+        Some(Event::Stopped { reason })
+            if reason == crate::server::acp_reconciler::RATE_LIMIT_EXHAUSTED_RETRIES_REASON =>
+        {
+            Some(fallback_resets_at)
+        }
         _ => None,
     }
 }
@@ -3835,6 +3844,22 @@ mod tests {
     fn rate_limit_resume_marker_falls_back_when_rate_limit_event_missing() {
         let stopped = Event::Stopped {
             reason: "rate_limited".to_string(),
+        };
+        let fallback = utc_ts("2099-01-01T00:00:00Z");
+
+        assert_eq!(
+            rate_limit_resume_marker_resets_at(Some(&stopped), None, fallback),
+            Some(fallback)
+        );
+    }
+
+    /// #3688: an exhausted-retries park still resumes manually. The marker
+    /// gates whether the spawn path queues the interrupted prompt, so a
+    /// None here would leave RESUME NOW spawning an idle worker.
+    #[test]
+    fn rate_limit_resume_marker_covers_exhausted_retries_park() {
+        let stopped = Event::Stopped {
+            reason: "rate_limit_exhausted_retries".to_string(),
         };
         let fallback = utc_ts("2099-01-01T00:00:00Z");
 
