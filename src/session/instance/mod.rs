@@ -91,7 +91,6 @@ enum ResumeStaticUnavailable {
     SandboxUnsupported,
 }
 
-#[cfg(feature = "serve")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TerminalContextResume {
     Available,

@@ -657,7 +657,6 @@ impl Instance {
         )
     }
 
-    #[cfg(feature = "serve")]
     pub(crate) fn terminal_context_resume(&self) -> TerminalContextResume {
         self.terminal_context_resume_with_runtime_source(|| {
             self.tmux_session()
@@ -666,7 +665,6 @@ impl Instance {
         })
     }
 
-    #[cfg(feature = "serve")]
     fn terminal_context_resume_with_runtime_source(
         &self,
         runtime_source: impl FnOnce() -> crate::tmux::SessionExistence,
@@ -3287,7 +3285,6 @@ mod tests {
             );
         }
     }
-    #[cfg(feature = "serve")]
     #[test]
     fn terminal_context_resume_matches_emission_constraints() {
         let sid = "44444444-4444-4444-8444-444444444444".to_string();

@@ -73,7 +73,6 @@ pub use groups::{
     TRASH_SECTION_PATH,
 };
 pub(crate) use instance::ResumeAttemptPolicy;
-#[cfg(feature = "serve")]
 pub(crate) use instance::TerminalContextResume;
 pub(crate) use instance::{
     duplicate_session_error, find_duplicate_session, is_duplicate_session,
