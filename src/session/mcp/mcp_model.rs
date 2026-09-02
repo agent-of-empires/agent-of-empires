@@ -444,7 +444,15 @@ pub fn load_native_mcp_servers_checked(agent_key: &str, home: &Path) -> Result<N
         return Ok(NativeRead::empty());
     };
     match config {
-        NativeMcpConfig::StandardJson(rel) => read_standard_json(&home.join(rel)),
+        // Claude relocates `.claude.json` to `$CLAUDE_CONFIG_DIR` when that is
+        // set; read the same file the launched process will, not
+        // unconditionally the one in home.
+        NativeMcpConfig::StandardJson(rel) => {
+            let base = std::env::var_os("CLAUDE_CONFIG_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| home.to_path_buf());
+            read_standard_json(&base.join(rel))
+        }
         NativeMcpConfig::GeminiJson(rel) => read_gemini_json(&home.join(rel)),
         NativeMcpConfig::CodexToml(rel) => read_codex_toml(&home.join(rel)),
     }
