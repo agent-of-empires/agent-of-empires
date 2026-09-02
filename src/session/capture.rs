@@ -1961,10 +1961,31 @@ pub(crate) fn opencode_poll_fn(
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
         let exclusion = compose_exclusion(&instance_id, &extra_excludes);
-        try_capture_opencode_session_id(&project_path, &exclusion, Some(launch_time_ms))
-            .map_err(|e| tracing::debug!(target: "session.capture", "OpenCode poll capture failed: {}", e))
-            .ok()
-            .and_then(validated_session_id)
+        let candidate = try_capture_opencode_session_id(
+            &project_path,
+            &exclusion,
+            Some(launch_time_ms),
+        )
+        .map_err(
+            |e| tracing::debug!(target: "session.capture", "OpenCode poll capture failed: {}", e),
+        )
+        .ok()
+        .and_then(validated_session_id)?;
+
+        // Re-read cross-profile ownership after the SQLite observation, not
+        // only when the poller is constructed. An id-less peer may create its
+        // row between ticks; while it remains id-less attribution is
+        // ambiguous, and once it reports the sid that id is an owner claim.
+        let peers = opencode_shared_store_peers(&instance_id, &project_path);
+        if peers.ambiguous || peers.owner_sids.contains(&candidate) {
+            tracing::debug!(target: "session.capture",
+                instance = %instance_id,
+                sid = %candidate,
+                ambiguous = peers.ambiguous,
+                "OpenCode poll candidate rejected by shared-store ownership");
+            return None;
+        }
+        Some(candidate)
     }
 }
 
@@ -1988,6 +2009,18 @@ pub(crate) fn opencode_poll_fn_sandboxed(
         .ok()
         .and_then(validated_session_id)
     }
+}
+
+/// Cross-profile ownership state for one host OpenCode store + cwd.
+#[derive(Default)]
+pub(crate) struct OpenCodePeerState {
+    /// At least one current or parked OpenCode peer shares the store and cwd.
+    pub(crate) shared: bool,
+    /// At least one current OpenCode peer exists but has not reported a sid yet,
+    /// or ownership could not be read safely. MRU attribution must abstain.
+    pub(crate) ambiguous: bool,
+    /// Conversation ids already owned by same-store same-cwd peers.
+    pub(crate) owner_sids: HashSet<String>,
 }
 
 /// Whether another persisted host-opencode instance shares this one's
@@ -2022,20 +2055,27 @@ pub(crate) fn opencode_poll_fn_sandboxed(
 pub(crate) fn opencode_shared_store_peers(
     current_instance_id: &str,
     current_project_path: &str,
-) -> (bool, HashSet<String>) {
+) -> OpenCodePeerState {
     let canonical_current = canonicalize_or_raw(current_project_path);
+    let mut state = OpenCodePeerState::default();
     let own_store = match opencode_store_identity(&|key| std::env::var(key).ok()) {
         Ok(path) => path,
-        Err(_) => return (true, HashSet::new()),
+        Err(_) => {
+            state.shared = true;
+            state.ambiguous = true;
+            return state;
+        }
     };
     let Ok(profiles) = crate::session::list_profiles() else {
-        return (true, HashSet::new());
+        state.shared = true;
+        state.ambiguous = true;
+        return state;
     };
-    let mut owner_sids: HashSet<String> = HashSet::new();
-    let mut shared = false;
     for peer_profile in profiles {
         let Ok(peer_config) = super::profile_config::resolve_config(&peer_profile) else {
-            return (true, owner_sids);
+            state.shared = true;
+            state.ambiguous = true;
+            return state;
         };
         let peer_store = match opencode_store_identity(&|key: &str| {
             crate::session::environment::resolve_host_environment_value(
@@ -2045,45 +2085,60 @@ pub(crate) fn opencode_shared_store_peers(
             .or_else(|| std::env::var(key).ok())
         }) {
             Ok(path) => path,
-            Err(_) => return (true, owner_sids),
+            Err(_) => {
+                state.shared = true;
+                state.ambiguous = true;
+                return state;
+            }
         };
         if peer_store != own_store {
             continue;
         }
         let Ok(storage) = crate::session::storage::Storage::new_unwatched(&peer_profile) else {
-            return (true, owner_sids);
+            state.shared = true;
+            state.ambiguous = true;
+            return state;
         };
         let Ok(instances) = storage.load() else {
-            return (true, owner_sids);
+            state.shared = true;
+            state.ambiguous = true;
+            return state;
         };
         for inst in instances {
             if inst.id == current_instance_id || inst.is_sandboxed() {
                 continue;
             }
-            let mut owned: Vec<String> = Vec::new();
-            if inst.tool == "opencode" {
-                if let Some(sid) = inst.agent_session_id.as_deref().filter(|s| !s.is_empty()) {
-                    owned.push(sid.to_string());
-                }
-            }
-            if let Some(parked) = inst
+            let parked = inst
                 .prior_tool_session_ids
                 .get("opencode")
                 .and_then(|p| p.agent_session_id.as_deref())
-                .filter(|s| !s.is_empty())
-            {
-                owned.push(parked.to_string());
-            }
-            if owned.is_empty() {
+                .filter(|s| !s.is_empty());
+            let is_current_opencode = inst.tool == "opencode";
+            if !is_current_opencode && parked.is_none() {
                 continue;
             }
-            if canonicalize_or_raw(&inst.project_path) == canonical_current {
-                shared = true;
-                owner_sids.extend(owned);
+            if canonicalize_or_raw(&inst.project_path) != canonical_current {
+                continue;
+            }
+
+            // A current peer is ambiguous before its first prompt: OpenCode
+            // has not created the SQLite row or reported the sid yet, but the
+            // peer already makes directory-MRU attribution unsafe.
+            state.shared = true;
+            if is_current_opencode {
+                match inst.agent_session_id.as_deref().filter(|s| !s.is_empty()) {
+                    Some(sid) => {
+                        state.owner_sids.insert(sid.to_string());
+                    }
+                    None => state.ambiguous = true,
+                }
+            }
+            if let Some(sid) = parked {
+                state.owner_sids.insert(sid.to_string());
             }
         }
     }
-    (shared, owner_sids)
+    state
 }
 
 // ─── Codex CLI session capture ────────────────────────────────────────────────

@@ -3224,11 +3224,11 @@ impl Instance {
         )
     }
 
-    /// Same-store same-cwd OpenCode peers across every profile: whether any
-    /// exists and which conversation ids they own. See
-    /// [`super::capture::opencode_shared_store_peers`] for the ownership,
-    /// sandbox, and fail-closed rules.
-    fn opencode_shared_store_peers(&self) -> (bool, HashSet<String>) {
+    /// Same-store same-cwd OpenCode peers across every profile: whether the
+    /// store is shared, whether attribution is currently ambiguous, and which
+    /// conversation ids peers already own. See
+    /// [`super::capture::opencode_shared_store_peers`] for the rules.
+    fn opencode_shared_store_peers(&self) -> super::capture::OpenCodePeerState {
         super::capture::opencode_shared_store_peers(&self.id, &self.project_path)
     }
     /// Whether another AoE session shares this one's Kimi store, which makes
@@ -3275,7 +3275,7 @@ impl Instance {
                 // On a shared store the directory's freshest row is not
                 // attributable to this pane, so the rescan would adopt
                 // whoever wrote last (#3555). Resume trusts the stored sid.
-                if self.opencode_shared_store_peers().0 {
+                if !self.is_sandboxed() && self.opencode_shared_store_peers().shared {
                     tracing::debug!(target: "session.capture",
                         instance = %self.id,
                         "skipping opencode retroactive capture: shared store and cwd");
@@ -5858,22 +5858,11 @@ impl Instance {
                         extra_excludes.clone(),
                     ))
                 } else {
-                    let (shared, owner_sids) = self.opencode_shared_store_peers();
-                    let mut extra_excludes = extra_excludes.clone();
-                    if shared {
-                        // Same-store same-cwd peers own rows this poller's MRU
-                        // scan would otherwise adopt before their own profile
-                        // drains them; excluding their sids keeps a staggered
-                        // poller from claiming another session's conversation
-                        // (#3555). The scan itself must keep running so a
-                        // fresh session still binds its own post-prompt id.
-                        extra_excludes.extend(owner_sids);
-                    }
                     Box::new(opencode_poll_fn(
                         self.project_path.clone(),
                         self.id.clone(),
                         launch_time_ms,
-                        extra_excludes,
+                        extra_excludes.clone(),
                     ))
                 }
             }
@@ -17702,56 +17691,68 @@ mod opencode_same_cwd_clobbering_tests {
         );
     }
 
-    /// The poller's exclusion snapshot must carry the cross-profile owner
-    /// sids, or a staggered poller claims the owner's row before the owning
-    /// profile drains it.
+    /// A current OpenCode peer makes the store ambiguous before it has a sid.
+    /// The poller must re-read ownership after each candidate, because the peer
+    /// can create its SQLite row after this poller is constructed.
     #[serial_test::serial]
     #[test]
-    fn poller_excludes_cross_profile_owner_sids_on_shared_store() {
+    fn poller_revalidates_idless_cross_profile_peer_after_observation() {
         let temp = tempdir().unwrap();
         let cwd = temp.path().join("cwd");
         std::fs::create_dir_all(&cwd).unwrap();
         let db = temp.path().join("opencode.db");
         let _guard = env_guard(temp.path(), &db, &[]);
-        seed_store(&db, &[(OC_SID_PEER, cwd.to_str().unwrap(), 1_000)]);
+        seed_store(&db, &[]);
 
         let me = make_me("oc-self", &cwd);
         seed_instance("oc-self", &me);
         let mut peer = Instance::new("peer-row", cwd.to_str().unwrap());
-        peer.source_profile = "oc-peer-x".to_string();
+        peer.source_profile = "oc-peer-idless".to_string();
         peer.tool = "opencode".to_string();
         peer.status = Status::Stopped;
-        peer.agent_session_id = Some(OC_SID_PEER.to_string());
-        seed_instance("oc-peer-x", &peer);
+        peer.agent_session_id = None;
+        seed_instance("oc-peer-idless", &peer);
 
-        let (shared, owner_sids) = me.opencode_shared_store_peers();
+        let peers = me.opencode_shared_store_peers();
         assert!(
-            shared,
-            "cross-profile same-store same-cwd peer must be detected"
+            peers.shared,
+            "an id-less current peer already shares the store and cwd"
         );
-        assert!(owner_sids.contains(OC_SID_PEER));
+        assert!(
+            peers.ambiguous,
+            "an id-less peer makes MRU attribution ambiguous"
+        );
+        assert!(peers.owner_sids.is_empty());
 
-        let quiet = crate::session::capture::opencode_poll_fn(
-            cwd.to_str().unwrap().to_string(),
-            me.id.clone(),
-            0.0,
-            owner_sids,
-        );
-        assert_eq!(
-            quiet(),
-            None,
-            "with the owner sids propagated the poller must not claim the peer's row"
-        );
-        let unguarded = crate::session::capture::opencode_poll_fn(
+        // Construct the poller first, then let the peer create its row: this is
+        // the staggered cross-profile race from Jerome's review.
+        let poll = crate::session::capture::opencode_poll_fn(
             cwd.to_str().unwrap().to_string(),
             me.id.clone(),
             0.0,
             Default::default(),
         );
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO session (id, directory, time_updated) VALUES (?1, ?2, ?3)",
+            rusqlite::params![OC_SID_PEER, cwd.to_str().unwrap(), 1_000],
+        )
+        .unwrap();
+
         assert_eq!(
-            unguarded(),
-            Some(OC_SID_PEER.to_string()),
-            "without the propagation the poller adopts the peer's row; this assert is the mutation tripwire"
+            crate::session::capture::try_capture_opencode_session_id(
+                cwd.to_str().unwrap(),
+                &Default::default(),
+                Some(0.0),
+            )
+            .unwrap(),
+            OC_SID_PEER,
+            "the raw MRU scan sees the late peer row, so the poller test is not vacuous"
+        );
+        assert_eq!(
+            poll(),
+            None,
+            "the poller must abstain after dynamically re-reading the id-less peer"
         );
     }
 }
