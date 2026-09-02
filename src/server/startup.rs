@@ -62,14 +62,12 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// Post-signal shutdown: cancel the shared token, arm the force-exit
 /// deadline, then reap plugin workers.
 ///
-/// The deadline is armed before `reap` is awaited so a plugin worker that
-/// never terminates cannot keep the daemon alive indefinitely.
-///
-/// A forced exit skips the post-`axum::serve` cleanup (acp detach, tunnel
-/// SIGTERM of cloudflared, removal of serve.passphrase). The PID file is
-/// swept by `daemon_pid`'s stale-PID check on the next start, but a leftover
-/// cloudflared subprocess and residual passphrase file may survive it. The
-/// common path returns from `axum::serve` normally and runs the full cleanup.
+/// The deadline is armed before `reap` is awaited, and the reap gets only
+/// part of the window, so a plugin worker that never terminates can neither
+/// keep the daemon alive nor starve the post-`axum::serve` cleanup (acp
+/// detach, tunnel SIGTERM of cloudflared, removal of serve.passphrase) of
+/// its chance to run. A forced exit skips that cleanup entirely; the PID
+/// file is swept by `daemon_pid`'s stale-PID check on the next start.
 async fn run_shutdown_sequence<R, F>(
     shutdown: &CancellationToken,
     grace: Duration,
@@ -89,7 +87,15 @@ async fn run_shutdown_sequence<R, F>(
         );
         force_exit();
     });
-    reap.await;
+    if tokio::time::timeout(grace.mul_f32(0.8), reap)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            target: "shutdown",
+            "plugin worker reap did not finish in time, continuing shutdown"
+        );
+    }
 }
 
 /// Raise the soft `RLIMIT_NOFILE` so the server can sustain many WS
@@ -960,10 +966,10 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     //      terminal) wake from their `select!` and close cleanly,
     //      letting `axum::serve` return promptly instead of blocking
     //      on the open WebSockets the browser hasn't disconnected.
-    //   2. Arms a 5s force-exit deadline, then reaps plugin workers:
-    //      if any handler or worker ignores the cancel, the process
-    //      force-exits so `Ctrl-C` and `aoe serve --stop` never hang.
-    //      See #1198.
+    //   2. Arms a 5s force-exit deadline, then reaps plugin workers
+    //      within part of that window: if any handler or worker ignores
+    //      the cancel, the process still force-exits, so `Ctrl-C` and
+    //      terminal hangups never hang. See #1198.
     //
     // Note: this future is awaited by `with_graceful_shutdown`, which
     // signals axum to stop accepting new connections once the future
@@ -1244,40 +1250,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_sequence_force_exits_when_plugin_reap_never_finishes() {
+    async fn shutdown_sequence_bounds_a_plugin_reap_that_never_finishes() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        const GRACE: Duration = Duration::from_millis(50);
+        const GRACE: Duration = Duration::from_millis(100);
 
-        // A reap that completes lets the sequence return without forcing an exit.
-        let quick_shutdown = CancellationToken::new();
-        let quick_forced = Arc::new(AtomicBool::new(false));
-        let flag = quick_forced.clone();
-        run_shutdown_sequence(&quick_shutdown, GRACE, std::future::ready(()), move || {
-            flag.store(true, Ordering::SeqCst)
-        })
+        // Arming the deadline first must not skip the plugin teardown.
+        let shutdown = CancellationToken::new();
+        let reaped = Arc::new(AtomicBool::new(false));
+        let flag = reaped.clone();
+        run_shutdown_sequence(
+            &shutdown,
+            GRACE,
+            async move { flag.store(true, Ordering::SeqCst) },
+            || {},
+        )
         .await;
-        assert!(quick_shutdown.is_cancelled());
-        assert!(!quick_forced.load(Ordering::SeqCst));
+        assert!(shutdown.is_cancelled());
+        assert!(reaped.load(Ordering::SeqCst));
 
-        // A reap that never finishes must still arm the deadline and force the exit.
+        // A reap that never finishes is bounded, so the caller still reaches
+        // its own cleanup, and the deadline still forces the exit.
         let shutdown = CancellationToken::new();
         let forced = Arc::new(AtomicBool::new(false));
         let flag = forced.clone();
-        let sequence = tokio::spawn({
-            let shutdown = shutdown.clone();
-            async move {
-                run_shutdown_sequence(&shutdown, GRACE, std::future::pending::<()>(), move || {
-                    flag.store(true, Ordering::SeqCst)
-                })
-                .await;
-            }
-        });
+        tokio::time::timeout(
+            GRACE * 10,
+            run_shutdown_sequence(&shutdown, GRACE, std::future::pending::<()>(), move || {
+                flag.store(true, Ordering::SeqCst)
+            }),
+        )
+        .await
+        .expect("a hung reap must not block the shutdown sequence");
 
-        shutdown.cancelled().await;
-        tokio::time::sleep(GRACE * 4).await;
+        for _ in 0..200 {
+            if forced.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert!(forced.load(Ordering::SeqCst));
-        assert!(!sequence.is_finished());
-        sequence.abort();
     }
 }
