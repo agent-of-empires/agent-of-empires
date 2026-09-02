@@ -88,8 +88,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          # PR body must contain `## Checklist` + "I understand the code
-          # I am submitting" to satisfy pr-template-check.yml.
+          # pr-template-check.yml exempts this PR on the head branch plus
+          # the `<!-- nix-npm-hash: -->` marker and `## Checklist` below.
           {
             echo "<!-- nix-npm-hash: ${NEW_HASH} -->"
             echo
