@@ -7,15 +7,13 @@ pub(crate) mod capture;
 pub mod cityhall_bundle;
 pub mod civilizations;
 pub(crate) mod claim;
-// Discovery of on-disk Claude Code sessions. Lives here (not under the
-// serve-gated `acp` module) because terminal/tmux import via the CLI works in
-// every build; only the structured-view import path needs `serve`.
+// Discovery of on-disk Claude Code sessions. Lives here rather than under
+// `acp` because terminal/tmux import via the CLI does not involve ACP.
 pub mod claude_import;
 pub mod config;
 pub(crate) mod container_config;
 // Depends on `crate::acp` (Event / event store) and is only driven from the
-// serve daemon, both of which are serve-gated. See #2808.
-#[cfg(feature = "serve")]
+// serve daemon. See #2808.
 pub mod conversation_summary;
 pub mod deletion;
 pub(crate) mod environment;
@@ -83,10 +81,10 @@ pub(crate) use instance::{
     SidWrite, NEWER_GENERATION_BUSY_REASON,
 };
 pub use instance::{
-    is_valid_session_color, EnsureReadyError, EnsureReadyOutcome, Instance, LaunchSidOutcome,
-    LifecycleOperation, LifecycleReservation, LifecycleReservationError, PluginCreateIdempotency,
-    SandboxInfo, SessionBucket, StartOutcome, Status, TerminalInfo, View, WorkspaceInfo,
-    WorkspaceRepo, WorktreeInfo, SESSION_COLORS, TMUX_SESSION_GONE_ERROR,
+    is_valid_session_color, DetectionState, EnsureReadyError, EnsureReadyOutcome, Instance,
+    LaunchSidOutcome, LifecycleOperation, LifecycleReservation, LifecycleReservationError,
+    PluginCreateIdempotency, SandboxInfo, SessionBucket, StartOutcome, Status, TerminalInfo, View,
+    WorkspaceInfo, WorkspaceRepo, WorktreeInfo, SESSION_COLORS, TMUX_SESSION_GONE_ERROR,
 };
 #[cfg(test)]
 pub(crate) use move_journal::{

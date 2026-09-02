@@ -27,7 +27,12 @@
 // rattle spinner, ApprovalCard) and slot them into assistant-ui's
 // component-injection points.
 
-import { AssistantRuntimeProvider, useExternalStoreRuntime, type ThreadMessageLike } from "@assistant-ui/react";
+import {
+  AssistantRuntimeProvider,
+  useExternalStoreRuntime,
+  type ExternalStoreAdapter,
+  type ThreadMessageLike,
+} from "@assistant-ui/react";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { useAcpSession } from "../../hooks/useAcpSession";
@@ -42,6 +47,7 @@ import type {
 import { hasTodoArrayArgsText, parseJsonObject } from "../../lib/acpArgs";
 import { clearDraft, getDraftAttachments, setDraftAttachments } from "../../lib/acpDrafts";
 import { useHistoryWindow } from "../../hooks/useHistoryWindow";
+import { lastClearIndex } from "../../lib/acpHistoryWindow";
 import { canOfferEarlier, earlierAction } from "../../lib/historyScroll";
 import { useAgentProfile } from "../../lib/agentProfileContext";
 import { type AgentProfile, DEFAULT_AGENT_PROFILE, isSubagentToolName } from "../../lib/agentProfiles";
@@ -121,6 +127,19 @@ export interface AcpContext {
   /** True while an older-history page fetch is in flight, for a spinner
    *  on the "Load earlier" affordance. See #2236. */
   loadingEarlierHistory: boolean;
+}
+
+/** Owns the external-store hook so a change of `key` builds a fresh runtime.
+ *
+ *  A `/clear` shortens the part list of a message the fold keeps, and
+ *  assistant-ui reads parts by absolute index while keeping the committed list
+ *  when a snapshot throws (assistant-ui#5708). The stale part child then reads
+ *  past the end inside useSyncExternalStore, where React cannot recover, and
+ *  the ErrorBoundary replaces the view. The stale state lives in the store, so
+ *  remounting the message list is not enough. See #3640. */
+function RuntimeHost({ adapter, children }: { adapter: ExternalStoreAdapter<ThreadMessageLike>; children: ReactNode }) {
+  const runtime = useExternalStoreRuntime<ThreadMessageLike>(adapter);
+  return <AssistantRuntimeProvider runtime={runtime}>{children}</AssistantRuntimeProvider>;
 }
 
 /**
@@ -230,7 +249,13 @@ export function AcpRuntime({
     [displayActivity, acp.state.turnActive, showClearedTurns, agentProfile],
   );
 
-  const runtime = useExternalStoreRuntime<ThreadMessageLike>({
+  // Read from the same rows as the fold, so the key and the truncation agree.
+  const foldGeneration = useMemo(
+    () => clearFoldGeneration(displayActivity, showClearedTurns),
+    [displayActivity, showClearedTurns],
+  );
+
+  const adapter: ExternalStoreAdapter<ThreadMessageLike> = {
     messages,
     isRunning: acp.state.turnActive,
     convertMessage: (m) => m,
@@ -268,10 +293,10 @@ export function AcpRuntime({
       await acp.sendPrompt(text, attachments);
     },
     onCancel,
-  });
+  };
 
   return (
-    <AssistantRuntimeProvider runtime={runtime}>
+    <RuntimeHost key={foldGeneration} adapter={adapter}>
       {children({
         state: acp.state,
         status: acp.status,
@@ -305,8 +330,17 @@ export function AcpRuntime({
         loadEarlierHistory,
         loadingEarlierHistory: loadingOlder,
       })}
-    </AssistantRuntimeProvider>
+    </RuntimeHost>
   );
+}
+
+/** React `key` identifying the current fold point: the id of the last `/clear`,
+ *  `"none"` before the first one, `"all"` when nothing is folded. Only a moved
+ *  fold changes it, so an ordinary turn does not rebuild the runtime. */
+export function clearFoldGeneration(rows: readonly ActivityRow[], showClearedTurns: boolean): string {
+  if (showClearedTurns) return "all";
+  const i = lastClearIndex(rows);
+  return i < 0 ? "none" : rows[i]!.id;
 }
 
 /**
@@ -327,23 +361,13 @@ export function activityToThreadMessages(
   todosEnabled = true,
   profile: AgentProfile = DEFAULT_AGENT_PROFILE,
 ): ThreadMessageLike[] {
-  // Fold pre-clear turns by default. When the user has run `/clear`,
-  // earlier rows describe a conversation the model has forgotten; the
-  // banner in StructuredView surfaces a count + "show" toggle that lifts
-  // `showClearedTurns` to true. We pin to the LAST clear so multiple
-  // /clears collapse cumulatively. See #1101.
+  // Fold pre-clear turns by default: after a `/clear` those rows describe a
+  // conversation the model has forgotten. The ClearedTurnsBanner in
+  // StructuredView lifts `showClearedTurns` to reveal them. See #1101.
   let effectiveRows: readonly ActivityRow[] = rows;
   if (!showClearedTurns) {
-    let lastClearIndex = -1;
-    for (let i = rows.length - 1; i >= 0; i -= 1) {
-      if (rows[i]!.kind === "session_cleared") {
-        lastClearIndex = i;
-        break;
-      }
-    }
-    if (lastClearIndex >= 0) {
-      effectiveRows = rows.slice(lastClearIndex);
-    }
+    const start = lastClearIndex(rows);
+    if (start >= 0) effectiveRows = rows.slice(start);
   }
 
   const messages: ThreadMessageLike[] = [];

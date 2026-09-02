@@ -26,15 +26,17 @@ Each level is additive; do only what the agent supports.
 | 1. Basic | Appears in `aoe agents`, sessions launch, status always "Idle" | `AgentDef` + stub `detect_status` |
 | 2. Pane-parse status | Status inferred from terminal output; no agent config | A manifest in `src/tmux/detect/manifests/`, plus a `detect_<agent>_status(&str) -> Status` calling into it |
 | 3. Hook status | Agent writes status to a file via hooks; lands the instant state changes | `hook_config` + generic `install_hooks()`, or `sidecar_hooks` + a custom `install_<agent>_hooks()` |
-| 4. Session resume | Restart resumes the prior conversation | `resume_strategy` in `AgentDef`, plus a way to observe the agent's session id |
+| 4. Session resume | Restart resumes the prior conversation | Non-`Unsupported` `resume_strategy` plus a project-agnostic way to observe the agent's session ID |
 | 5. Docker sandbox | Runs isolated; host config synced in | `AgentConfigMount` + Dockerfile install |
 
-Levels 3 and 4 are independent. Hooks are only one way to observe a session id
+Levels 3 and 4 are independent. Hooks are only one way to observe a session ID
 (`session_id_capture`, Claude alone, and even there the poller falls back to a
 disk scan); the other agents AoE resumes are polled from their own store,
-sidecar, or transcript by `src/session/capture.rs`. A `resume_strategy` with no
-capture path behind it resumes only from a hand-pinned id, so level 4 needs both
-halves, and `agent_status_hooks = false` costs status detection, not resume.
+sidecar, or transcript by `src/session/capture.rs`. Level 4 needs both halves:
+a `resume_strategy` with no automatic capture path behind it is reachable only
+from a hand-pinned ID, which is not an AoE resume contract, so leave the agent
+on `ResumeStrategy::Unsupported` until capture lands. `agent_status_hooks =
+false` costs status detection, not resume.
 
 ## Steps
 
@@ -95,7 +97,7 @@ Each entry in `events: &[HookEvent]` carries:
 
 The generic JSON payload above, written to `hooks.json` in Codex's config dir rather than to a settings file: set `hook_config: Some(AgentHookConfig { settings_rel_path: ".codex/hooks.json", format: HookFormat::CodexJson, ... })`. `codex_hooks_json_path_in()` resolves `CODEX_HOME` (else `~/.codex`) and the generic `install_hooks()` writes it. Codex status weighs the hook write against its manifest rules by declared priority, so a prompt on screen outranks a `running` write.
 
-`install_codex_hooks_with_preserved_state()` / `uninstall_codex_hooks()` write Codex's `config.toml` instead; they exist only for the v015/v017/v018 migrations that repair or strip hooks AoE once wrote there.
+Codex's separate `config.toml` stores `[hooks.state]` trust data and `[features].hooks = false`; its mutations are serialized with `config.toml.lock` and committed by atomic replacement. `install_codex_hooks_with_preserved_state()` / `uninstall_codex_hooks()` exist only for the v015/v017/v018 migrations that repair or strip hooks AoE once wrote there. Do not point `settings_rel_path` at `config.toml`.
 
 ### Hermes (custom YAML)
 

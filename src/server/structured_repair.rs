@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use super::state::AppState;
 
-#[cfg(feature = "serve")]
 pub(super) struct StructuredRowRepair {
     session_id: String,
     source_profile: String,
@@ -15,11 +14,9 @@ pub(super) struct StructuredRowRepair {
     acp_session_id: String,
 }
 
-#[cfg(feature = "serve")]
 pub(super) type LiveStructuredWorkerRecord =
     (crate::process::worker_registry::WorkerRecord, String);
 
-#[cfg(feature = "serve")]
 pub(super) fn live_structured_worker_records() -> Vec<LiveStructuredWorkerRecord> {
     use crate::process::worker_registry::{self, is_record_live};
 
@@ -50,7 +47,6 @@ pub(super) fn live_structured_worker_records() -> Vec<LiveStructuredWorkerRecord
 
 /// Runs before the ACP overlay so freshly repaired rows pass the
 /// `is_structured()` gate and keep their live worker status.
-#[cfg(feature = "serve")]
 pub(super) fn repair_structured_rows_from_live_workers(
     merged: &mut [Instance],
     records: Vec<LiveStructuredWorkerRecord>,
@@ -104,7 +100,6 @@ pub(super) fn repair_structured_rows_from_live_workers(
     repairs
 }
 
-#[cfg(feature = "serve")]
 pub(super) fn persist_structured_row_repairs(
     state: &Arc<AppState>,
     repairs: Vec<StructuredRowRepair>,
@@ -181,7 +176,6 @@ pub(super) fn persist_structured_row_repairs(
     );
 }
 
-#[cfg(feature = "serve")]
 pub(super) async fn rollback_structured_row_repairs(state: &Arc<AppState>, failed_ids: &[String]) {
     let mut instances = state.instances.write().await;
     for inst in instances.iter_mut() {
@@ -196,7 +190,6 @@ pub(super) async fn rollback_structured_row_repairs(state: &Arc<AppState>, faile
 mod tests {
     use super::*;
 
-    #[cfg(feature = "serve")]
     #[test]
     #[serial_test::serial]
     fn repair_structured_rows_from_live_workers_restores_structured_session_rows() {

@@ -1,9 +1,9 @@
 //! `aoe mcp` CLI: inspect the effective MCP server set (#1996).
 //!
 //! Mirrors the read model the web and TUI surfaces render, so a user can debug
-//! "which MCP servers will my agent reach, and where did each come from" without
-//! a serve build. Top-level (not under the serve-gated `aoe acp` group) and
-//! always compiled, because inspecting config is useful before any session runs.
+//! "which MCP servers will my agent reach, and where did each come from".
+//! Top-level rather than under the `aoe acp` group, because inspecting config
+//! is useful before any session runs.
 //! Every value is redacted: command/args/url identify a server, env and header
 //! VALUES are reduced to names.
 

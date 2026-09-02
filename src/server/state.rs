@@ -16,7 +16,6 @@ use super::serve_snapshot::{
 use super::token::TokenManager;
 use crate::server::{api, login, session_service};
 
-#[cfg(feature = "serve")]
 pub(super) const ACP_CHANNEL_CAPACITY: usize = 256;
 
 /// Per-profile cleanup defaults with a refresh timestamp. Re-resolved from
@@ -236,7 +235,6 @@ pub struct AppState {
     /// channel carries `(session_id, serialized event JSON)` frames so
     /// clients can filter by session. Empty when no clients are
     /// connected; senders never need to check before emitting.
-    #[cfg(feature = "serve")]
     pub acp_events_tx: broadcast::Sender<AcpBroadcastFrame>,
     /// Disk-backed acp event log. The single source of truth for
     /// replay: `ChannelSink::publish` writes here on every event, the
@@ -244,20 +242,16 @@ pub struct AppState {
     /// endpoint reads from here, and `Supervisor::next_seqs` is seeded
     /// from here at startup so a fresh publish gets `max_seq + 1`
     /// rather than 1.
-    #[cfg(feature = "serve")]
     pub acp_event_store: Arc<crate::acp::event_store::EventStore>,
     /// Live control-state projection per session, folded at the publish choke
     /// point and shared with `ChannelSink`. Prompt dispatch reads it instead
     /// of replaying the log on every POST; see `crate::acp::control_cache`.
-    #[cfg(feature = "serve")]
     pub acp_control_cache: Arc<crate::acp::control_cache::ControlStateCache>,
     /// Owns the per-session ACP agent subprocesses.
-    #[cfg(feature = "serve")]
     pub acp_supervisor:
         Arc<crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>>,
     /// The Tier 1 plugin worker host. `None` in test harnesses that do not
     /// stand up a host; `Some` in a live daemon.
-    #[cfg(feature = "serve")]
     pub plugin_host: Option<Arc<crate::plugin::host::PluginHost>>,
     /// Tracks in-flight web plugin install / update / uninstall jobs so the
     /// dashboard can tail their host-side log. In-memory; see
@@ -463,7 +457,6 @@ mod tests {
     /// `idempotency_locks` must not grow for the daemon's lifetime: keys are
     /// caller-supplied and unbounded, so an entry nobody holds is pruned on
     /// the next miss. A key whose lock is still held must survive. See #3156.
-    #[cfg(feature = "serve")]
     #[tokio::test]
     async fn idempotency_lock_prunes_unreferenced_keys() {
         let state = test_support::build_test_app_state(vec![]);

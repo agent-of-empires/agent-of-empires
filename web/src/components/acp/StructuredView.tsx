@@ -34,6 +34,7 @@ import { AskUserQuestionCard } from "./AskUserQuestionCard";
 import { AcpFileRefContext } from "./AcpFileRefContext";
 import type { FileRef, FileRefSession } from "../../lib/fileRef";
 import { anchorIsStale, autoLoadDecision, isPinnedToBottom, scrollRestoreDelta } from "../../lib/historyScroll";
+import { lastClearIndex } from "../../lib/acpHistoryWindow";
 import { loadScrollState, saveScrollState } from "../../lib/acpScrollState";
 import { repinOnResize } from "../../lib/repinOnResize";
 import { ToolDensityToggle, ToolDisplayModeProvider, useToolDensityPref } from "./ToolDisplayMode";
@@ -340,22 +341,11 @@ function AcpChrome({
   onRestore?: () => Promise<boolean> | void;
   isSandboxed?: boolean;
 }) {
-  // Count how many activity rows precede the latest `session_cleared`
-  // divider so the banner can say "12 earlier turns hidden". The
-  // reducer always appends the divider as the last row at clear time,
-  // so the count is `lastClearIndex` (rows before it are the cleared
-  // history). See #1101.
-  const clearedSummary = (() => {
-    let lastClearIndex = -1;
-    for (let i = state.activity.length - 1; i >= 0; i -= 1) {
-      if (state.activity[i]!.kind === "session_cleared") {
-        lastClearIndex = i;
-        break;
-      }
-    }
-    if (lastClearIndex < 0) return null;
-    return { hiddenCount: lastClearIndex };
-  })();
+  // Rows preceding the latest `/clear` divider are the hidden history, so the
+  // divider's index is the count the banner reports ("12 earlier turns
+  // hidden"). See #1101.
+  const clearIndex = lastClearIndex(state.activity);
+  const clearedSummary = clearIndex < 0 ? null : { hiddenCount: clearIndex };
   // Composer prefill keyed for re-fires; set by the
   // ContextPrimerBanner on click. Local rather than on AcpState
   // because it's a one-shot UI action, not part of the event log.

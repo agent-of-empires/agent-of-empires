@@ -835,6 +835,15 @@ pub async fn shutdown_acp(
     if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
+    // Worker-stopping barrier: submission guard before any teardown, per
+    // `prompt_submission` (#3650).
+    let Some(_submission) = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await
+    else {
+        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    };
     match state.acp_supervisor.shutdown(&id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => supervisor_error_response("shutdown failed", &e),
@@ -957,6 +966,15 @@ pub async fn switch_acp_agent(
     if target.is_empty() {
         return (StatusCode::BAD_REQUEST, "target is required").into_response();
     }
+    // Worker-stopping barrier: submission guard before any teardown, per
+    // `prompt_submission` (#3650).
+    let Some(_submission) = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await
+    else {
+        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    };
 
     // Look up the instance first: custom agents are profile-specific, so
     // validation needs the session's source_profile and project_path. This
@@ -1334,15 +1352,21 @@ pub async fn acp_prompt(
         Ok(a) => a,
         Err((code, msg)) => return (code, msg).into_response(),
     };
-    // Claim the session's prompt-submission authority for the rest of the
-    // handler: the decision below and the dispatch it picks must be one
-    // atomic step. Releasing between them let a queue drain read a fold this
-    // prompt had not published into yet, so both delivered and whichever lost
-    // the agent's race came back `agent_busy` after its queue row was already
-    // retired (#3621). Not `instance_lock`, for the reason `prompt_submission`
-    // documents: holding that one here stalls this handler's own resume
-    // (#3172).
-    let _submission = state.session_service.prompt_submission(&id).await;
+    // Claim the session's prompt-submission authority and decide under it, so
+    // every client follows the same send, steer, or queue rules and the
+    // decision and the dispatch it picks are one atomic step. Releasing
+    // between them let a queue drain read a fold this prompt had not published
+    // into yet, so both delivered and whichever lost the agent's race came
+    // back `agent_busy` after its queue row was already retired (#3621).
+    // `woke_idle_dormant` is passed rather than re-read: the wake above
+    // already cleared the marker, so the instance now says "awake".
+    let Some((_submission, dispatch)) = state
+        .session_service
+        .begin_prompt_submission(&id, woke_idle_dormant)
+        .await
+    else {
+        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    };
     // A fresh user prompt supersedes any queued rate-limit resume
     // continuation, so drop it before sending: otherwise the reconciler could
     // later replay the older interrupted prompt after this newer one (#3028).
@@ -1353,18 +1377,6 @@ pub async fn acp_prompt(
     // and returns. Resume + publish + forward live in the shared service so
     // the plugin host delivers turns through the same path (#2897).
     state.session_service.clear_pending_initial_turn(&id).await;
-    // Decide here so every client follows the same send, steer, or queue rules.
-    let dispatch = {
-        let control = crate::server::acp_ws::fold_control_state(&state, &id).await;
-        let liveness = crate::acp::dispatch::WorkerLiveness {
-            running: state.acp_supervisor.is_running(&id).await,
-            // `touch_on_prompt_and_wake_if_sunk` above already cleared the marker for a
-            // dormant session, so read the pre-clear answer it returned rather
-            // than the instance, which now says "awake".
-            idle_dormant: woke_idle_dormant,
-        };
-        crate::acp::dispatch::decide(&control, liveness)
-    };
     if let crate::acp::dispatch::PromptDispatch::Queued { reason } = dispatch {
         // Park it on the server-owned queue the turn-end drain already
         // services. A client-minted id reconciles the caller's optimistic row;
@@ -1455,6 +1467,33 @@ pub async fn acp_prompt(
     }
 }
 
+/// Why a diff-comments prompt cannot start a turn right now. Each reason is
+/// transient, and the dialog keeps the user's comments and shows the text, so
+/// the answer is "try again", not a lost review.
+fn diff_comments_not_now(reason: crate::acp::dispatch::QueueReason) -> axum::response::Response {
+    use crate::acp::dispatch::QueueReason;
+    match reason {
+        QueueReason::WorkerDown => {
+            (StatusCode::SERVICE_UNAVAILABLE, "worker_not_ready").into_response()
+        }
+        QueueReason::TurnActive => (
+            StatusCode::CONFLICT,
+            "the agent is mid-turn; wait for it to finish, then send the comments again",
+        )
+            .into_response(),
+        QueueReason::Cancelling => (
+            StatusCode::CONFLICT,
+            "the turn is still cancelling; send the comments again once it stops",
+        )
+            .into_response(),
+        QueueReason::Compacting => (
+            StatusCode::CONFLICT,
+            "the agent is compacting its context; send the comments again when it finishes",
+        )
+            .into_response(),
+    }
+}
+
 /// `POST /api/sessions/{id}/acp/prompt/diff-comments`: the typed
 /// successor to the diff-comments sentinel hack. The frontend sends the
 /// structured review plus the `assembled_markdown` it previewed; the
@@ -1476,17 +1515,23 @@ pub async fn acp_prompt_diff_comments(
         Err(rej) => return rej.into_response(),
     };
     let woke_idle_dormant = touch_on_prompt_and_wake_if_sunk(&state, &id).await;
-    {
-        let instances = state.instances.read().await;
-        if !instances.iter().any(|i| i.id == id) {
-            return (StatusCode::NOT_FOUND, "session not found").into_response();
-        }
-    }
     // This opens a turn (`UserDiffCommentsPrompt` folds to `turn_active`) just
-    // as an ordinary prompt does, so it takes the same submission authority:
-    // otherwise it can publish between a queue drain's idle check and its
-    // send, and the agent rejects whichever of the two it sees second (#3621).
-    let _submission = state.session_service.prompt_submission(&id).await;
+    // as an ordinary prompt does, so it takes the same submission authority
+    // and settles the same disposition under it (#3621, #3649).
+    let Some((_submission, dispatch)) = state
+        .session_service
+        .begin_prompt_submission(&id, woke_idle_dormant)
+        .await
+    else {
+        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    };
+    // A typed diff-comments prompt has no queue row to park on, so anything
+    // but send-or-steer is refused here rather than published and then
+    // rejected asynchronously as `agent_busy`, which would strand the card in
+    // the transcript and lose the review the user just wrote.
+    if let crate::acp::dispatch::PromptDispatch::Queued { reason } = dispatch {
+        return diff_comments_not_now(reason);
+    }
     // Idle-dormant wake: respawn synchronously-reserved + detached so the
     // send_prompt below waits for the worker instead of 404ing. Mirrors
     // acp_prompt. See #1748.
@@ -2190,12 +2235,15 @@ pub async fn acp_disable(
     if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
-    {
-        let instances = state.instances.read().await;
-        if !instances.iter().any(|i| i.id == id) {
-            return (StatusCode::NOT_FOUND, "session not found").into_response();
-        }
-    }
+    // Worker-stopping barrier: submission guard before any teardown, per
+    // `prompt_submission` (#3650).
+    let Some(_submission) = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await
+    else {
+        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    };
     let inst_lock = state.instance_lock(&id).await;
     let _guard = inst_lock.lock().await;
     let (mut instance, profile) = {
@@ -3515,6 +3563,143 @@ mod tests {
             ["prompt"],
             "exactly one prompt reaches the agent; a second would be refused as agent_busy"
         );
+    }
+
+    /// #3649: the diff-comments endpoint is a turn-starting surface, so it
+    /// must settle a disposition under the submission guard rather than
+    /// publish and forward unconditionally once it gets the guard.
+    ///
+    /// The winner of the guard is standing in for a queue drain that publishes
+    /// its prompt before releasing. `send_prompt` reports success as soon as
+    /// the command is queued, so a loser that forwarded anyway would answer
+    /// 202, leave a `UserDiffCommentsPrompt` card in the transcript, and only
+    /// then have the agent refuse the prompt as `agent_busy`.
+    #[tokio::test]
+    async fn diff_comments_refuse_to_open_a_turn_another_submission_started() {
+        use std::time::Duration;
+
+        let mut inst = crate::session::Instance::new("dc-3649", "/tmp/aoe-3649-diff");
+        inst.id = "sess-3649-diff".to_string();
+        inst.view = crate::session::View::Structured;
+        inst.status = crate::session::Status::Idle;
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let cmds = state
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(&id)
+            .await;
+
+        let winner = state.session_service.prompt_submission(&id).await;
+        let handler = tokio::spawn({
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            async move {
+                acp_prompt_diff_comments(
+                    State(state),
+                    Path(id),
+                    Ok(Json(DiffCommentsPromptRequest {
+                        intro: String::new(),
+                        outro: String::new(),
+                        is_multi_repo: false,
+                        comments: Vec::new(),
+                        assembled_markdown: "review this".to_string(),
+                    })),
+                )
+                .await
+                .into_response()
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !handler.is_finished(),
+            "diff comments must not decide their disposition while another submission owns the session"
+        );
+
+        // What the winner does before it releases: the publish is the choke
+        // point that flips the fold to `turn_active`.
+        state
+            .acp_supervisor
+            .publish_user_prompt_with_attachments(&id, "the winning turn".into(), &[], None)
+            .await;
+        drop(winner);
+
+        let response = tokio::time::timeout(Duration::from_secs(10), handler)
+            .await
+            .expect("the handler must finish once the winner releases the session")
+            .expect("handler task must not panic");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            *cmds.lock().expect("cmd log mutex poisoned"),
+            Vec::<&'static str>::new(),
+            "nothing may reach the agent: the refusal is the whole point"
+        );
+        let published = state
+            .acp_event_store
+            .replay_from(&id, 0)
+            .into_iter()
+            .any(|(_, e)| matches!(e, Event::UserDiffCommentsPrompt { .. }));
+        assert!(
+            !published,
+            "a refused review must not leave a card in the transcript"
+        );
+    }
+
+    /// The ACP-side half of the #3650 worker-stopping barrier. `shutdown_acp`,
+    /// `switch_acp_agent` and `acp_disable` all tear the worker down, so a
+    /// queue drain mid-delivery must finish first: `send_turn` respawns a
+    /// worker it finds gone, which would undo the shutdown and, for the
+    /// switch, deliver the prompt to the agent the user just switched away
+    /// from.
+    #[tokio::test]
+    async fn worker_stopping_acp_endpoints_wait_for_an_in_flight_submission() {
+        use std::time::Duration;
+
+        async fn call(which: &str, state: Arc<AppState>, id: String) -> axum::response::Response {
+            match which {
+                "shutdown" => shutdown_acp(State(state), Path(id)).await.into_response(),
+                "switch" => switch_acp_agent(
+                    State(state),
+                    Path(id),
+                    Json(SwitchAgentRequest {
+                        target: "codex".to_string(),
+                        model: None,
+                        reason: None,
+                    }),
+                )
+                .await
+                .into_response(),
+                "disable" => acp_disable(State(state), Path(id)).await.into_response(),
+                other => unreachable!("unknown handler {other}"),
+            }
+        }
+
+        for which in ["shutdown", "switch", "disable"] {
+            let mut inst = crate::session::Instance::new("acp-3650", "/tmp/aoe-3650-acp");
+            inst.id = format!("sess-3650-acp-{which}");
+            inst.view = crate::session::View::Structured;
+            inst.status = crate::session::Status::Idle;
+            let id = inst.id.clone();
+            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+            let delivering = state.session_service.prompt_submission(&id).await;
+            let handler = tokio::spawn({
+                let state = Arc::clone(&state);
+                let id = id.clone();
+                async move { call(which, state, id).await }
+            });
+
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                !handler.is_finished(),
+                "{which} must not tear the worker down under an in-flight submission"
+            );
+
+            drop(delivering);
+            tokio::time::timeout(Duration::from_secs(10), handler)
+                .await
+                .unwrap_or_else(|_| panic!("{which} must finish once the submission releases"))
+                .unwrap_or_else(|e| panic!("{which} task must not panic: {e}"));
+        }
     }
 
     #[tokio::test]

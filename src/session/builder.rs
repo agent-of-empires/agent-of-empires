@@ -839,19 +839,10 @@ pub fn build_instance(
             } => {
                 // Structured fork: force the structured view, seed the parent
                 // for the ACP session/fork handshake, and replay history into
-                // the (empty) event store on first connect. The marker fields
-                // live behind the serve feature, so without it a structured
-                // fork is inapplicable and this arm is a no-op. Bind the field
-                // to `_` on bare-core so the destructure reads it without an
-                // `allow(unused_variables)` suppression (AGENTS.md).
-                #[cfg(feature = "serve")]
-                {
-                    instance.view = crate::session::View::Structured;
-                    instance.fork_pending = Some(parent_acp_session_id);
-                    instance.import_pending = Some(true);
-                }
-                #[cfg(not(feature = "serve"))]
-                let _ = parent_acp_session_id;
+                // the (empty) event store on first connect.
+                instance.view = crate::session::View::Structured;
+                instance.fork_pending = Some(parent_acp_session_id);
+                instance.import_pending = Some(true);
             }
         }
     }
@@ -1035,7 +1026,6 @@ pub fn cleanup_instance(
 /// handles explicit agent / model / import fields the TUI wizard doesn't
 /// expose), and the CLI in `src/cli/add.rs` with bail-vs-downgrade semantics
 /// keyed on how explicit the user's flag was. Keep the three in sync.
-#[cfg(feature = "serve")]
 pub mod structured {
     use super::Instance;
 
@@ -2385,7 +2375,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     #[serial_test::serial]
     fn build_instance_applies_structured_fork_seed() {
@@ -2440,7 +2429,6 @@ mod tests {
         const RULE_AGENT: &str = "fork-seed-registry-rule";
         let cases: &[(&str, fn())] = &[
             ("terminal", build_instance_applies_terminal_fork_seed),
-            #[cfg(feature = "serve")]
             ("structured", build_instance_applies_structured_fork_seed),
         ];
 

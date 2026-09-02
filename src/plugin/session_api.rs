@@ -557,32 +557,37 @@ async fn sessions_turn_send(
 
     let result = async {
         deps.policy.admit_turn(&plugin_id)?;
-        // Reject an unknown session before claiming the submission guard:
-        // `prompt_submission` auto-vivifies a lock-registry entry for any id
-        // it is asked for, and nothing ever prunes it, so a plugin probing
-        // distinct nonexistent ids could otherwise grow the registry without
-        // bound within its turn quota.
-        if !deps
+        // Same per-session submission authority the HTTP surfaces and the
+        // queue drain take, and the same disposition decided under it, so a
+        // plugin turn cannot land between the drain's idle check and its send
+        // (#3621, #3649). An unknown session is refused here rather than by
+        // `send_turn`, so a plugin probing distinct nonexistent ids cannot
+        // grow the lock registry within its turn quota.
+        let Some((_submission, dispatch)) = deps
             .session_service
-            .instances
-            .read()
+            .begin_prompt_submission(&req.session_id, false)
             .await
-            .iter()
-            .any(|i| i.id == req.session_id)
-        {
+        else {
             return Err(DispatchError::with_kind(
                 codes::INVALID_PARAMS,
                 "session_not_found",
                 "session not found",
             ));
+        };
+        // A cold worker is not a refusal on this path: `send_turn` resumes it
+        // and waits, which is how a scheduler wakes a session it created. The
+        // turn gates are, because a second prompt at a busy non-steerable
+        // agent is refused asynchronously and the plugin would have been told
+        // its turn landed.
+        if let crate::acp::dispatch::PromptDispatch::Queued { reason } = dispatch {
+            if !matches!(reason, crate::acp::dispatch::QueueReason::WorkerDown) {
+                return Err(DispatchError::with_kind(
+                    codes::SERVICE_UNAVAILABLE,
+                    "agent_busy",
+                    "the session's agent is mid-turn; retry when it finishes",
+                ));
+            }
         }
-        // Same per-session submission authority the HTTP surfaces and the
-        // queue drain take, so a plugin turn cannot land between the drain's
-        // idle check and its send (#3621).
-        let _submission = deps
-            .session_service
-            .prompt_submission(&req.session_id)
-            .await;
         deps.session_service
             .send_turn(
                 &SessionCaller::Plugin {
@@ -868,6 +873,69 @@ mod tests {
             assert_eq!(err.code, expected_code, "{session}");
             assert_eq!(kind(&err), expected_kind, "{session}");
         }
+    }
+
+    /// #3649: a plugin turn is a turn-starting surface, so it must settle a
+    /// disposition under the submission guard instead of forwarding
+    /// unconditionally once the guard is its own. `send_prompt` acknowledges
+    /// the channel enqueue, so the pre-fix path answered `{}` for a prompt the
+    /// agent then refused as `agent_busy`, and the plugin's audit trail
+    /// recorded a turn that never ran.
+    #[tokio::test]
+    async fn turn_send_refuses_a_turn_another_submission_already_started() {
+        use std::time::Duration;
+
+        let mut inst = Instance::new("plugin-3649", "/tmp/aoe-3649-plugin");
+        inst.id = "sess-3649".to_string();
+        inst.view = crate::session::View::Structured;
+        inst.status = crate::session::Status::Idle;
+        inst.created_by_plugin = Some("cron".to_string());
+        let (deps, _dir) = test_deps(vec![inst]);
+        let cmds = deps
+            .session_service
+            .acp_supervisor
+            .test_insert_worker_cmd_recording("sess-3649")
+            .await;
+
+        let winner = deps.session_service.prompt_submission("sess-3649").await;
+        let send = tokio::spawn({
+            let deps = Arc::clone(&deps);
+            async move {
+                dispatch(
+                    &deps,
+                    &ctx_with(&["session.prompt"]),
+                    "sessions.turn.send",
+                    &serde_json::json!({ "session_id": "sess-3649", "text": "hi" }),
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !send.is_finished(),
+            "a plugin turn must not decide its disposition while another submission owns the session"
+        );
+
+        // What the winner does before releasing: publishing is the choke point
+        // that flips the control fold to `turn_active`.
+        deps.session_service
+            .acp_supervisor
+            .publish_user_prompt_with_attachments("sess-3649", "the winning turn".into(), &[], None)
+            .await;
+        drop(winner);
+
+        let err = tokio::time::timeout(Duration::from_secs(10), send)
+            .await
+            .expect("the RPC must finish once the winner releases the session")
+            .expect("dispatch task must not panic")
+            .expect_err("a turn that cannot start must not report success");
+        assert_eq!(err.code, codes::SERVICE_UNAVAILABLE);
+        assert_eq!(kind(&err), "agent_busy");
+        assert_eq!(
+            *cmds.lock().expect("cmd log mutex poisoned"),
+            Vec::<&'static str>::new(),
+            "nothing may reach the agent behind the running turn"
+        );
     }
 
     /// `prompt_submission` auto-vivifies a per-session lock-registry entry

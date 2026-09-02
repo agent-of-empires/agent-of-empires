@@ -1663,7 +1663,6 @@ fn test_enter_on_session_returns_attach_action() {
     assert!(matches!(action, Some(Action::AttachSession(_))));
 }
 
-#[cfg(feature = "serve")]
 #[test]
 #[serial]
 fn test_enter_on_acp_session_opens_structured_view() {
@@ -2898,6 +2897,26 @@ fn switching_view_retargets_capture_worker_pane() {
     assert_eq!(view.preview_capture_target, terminal_pane);
     view.sync_preview_capture_worker(agent_pane.clone());
     assert_eq!(view.preview_capture_target, agent_pane);
+}
+
+#[test]
+#[serial]
+fn retarget_same_session_tool_clears_previous_pane_content() {
+    let env = create_test_env_with_sessions(1);
+    let mut view = env.view;
+    view.view_mode = ViewMode::Tool("lazygit".to_string());
+    view.sync_preview_capture_worker(Some("aoe_test_tool_a".to_string()));
+    view.tool_preview_cache.content = "tool A screen".to_string();
+    view.tool_preview_cache.capture_target = Some("aoe_test_tool_a".to_string());
+    view.tool_preview_cache.session_id = view.selected_session.clone();
+
+    view.sync_preview_capture_worker(Some("aoe_test_tool_b".to_string()));
+
+    assert!(
+        view.tool_preview_cache.content.is_empty(),
+        "a cold pane must not render another tool's bytes from the same session",
+    );
+    assert!(view.tool_preview_cache.capture_target.is_none());
 }
 
 #[test]
@@ -5030,10 +5049,7 @@ fn test_strict_mode_ctrl_d_r_p_reach_secondary_actions() {
         "Ctrl+R in strict mode must NOT open the rename dialog (it targets serve)"
     );
     env.view.info_dialog = None;
-    #[cfg(feature = "serve")]
-    {
-        env.view.serve_view = None;
-    }
+    env.view.serve_view = None;
 
     // P follows the same relocation rule as D/R/T/N: the bare-`p` (primary)
     // action -> Shift+P, the Shift+P (secondary) action -> Ctrl+P. So in strict
@@ -6750,7 +6766,6 @@ fn fork_from_selection_preselects_parent_tool() {
 /// A structured (ACP) parent forks via the ACP `session/fork` handshake, so the
 /// seed must be `Structured` carrying the parent's captured ACP session id, not
 /// a terminal resume-with-fork-flag seed.
-#[cfg(feature = "serve")]
 #[test]
 #[serial]
 fn fork_from_selection_structured_parent_seeds_structured_fork() {
@@ -6783,7 +6798,6 @@ fn fork_from_selection_structured_parent_seeds_structured_fork() {
 
 /// A structured parent with no captured ACP session id yet has no conversation
 /// to fork; the dialog must not open and an explanatory info dialog is shown.
-#[cfg(feature = "serve")]
 #[test]
 #[serial]
 fn fork_from_selection_structured_parent_without_acp_id_denies() {
@@ -6815,7 +6829,6 @@ fn fork_from_selection_structured_parent_without_acp_id_denies() {
 /// the fork would silently downgrade to session/new at the handshake. This is
 /// the exact silent-downgrade the reviewer flagged; the gate mirrors the REST
 /// create guard and the web `acp_can_fork` projection.
-#[cfg(feature = "serve")]
 #[test]
 #[serial]
 fn fork_from_selection_structured_unforkable_agent_denies() {
@@ -8164,16 +8177,11 @@ fn wants_text_selection_tracks_copy_friendly_surfaces() {
     env.view.changelog_dialog = None;
     assert!(!env.view.wants_text_selection());
 
-    // serve_view is feature-gated; only assert it when the feature is on,
-    // since the field isn't present otherwise.
-    #[cfg(feature = "serve")]
-    {
-        use crate::tui::dialogs::ServeView;
-        env.view.serve_view = Some(ServeView::new());
-        assert!(env.view.wants_text_selection());
-        env.view.serve_view = None;
-        assert!(!env.view.wants_text_selection());
-    }
+    use crate::tui::dialogs::ServeView;
+    env.view.serve_view = Some(ServeView::new());
+    assert!(env.view.wants_text_selection());
+    env.view.serve_view = None;
+    assert!(!env.view.wants_text_selection());
 }
 
 // -- apply_one_status_update -------------------------------------------------
@@ -8213,6 +8221,7 @@ fn apply_status_update_propagates_idle_entered_at_into_live_instance() {
         last_accessed_at: None,
         pane_dead: false,
         live_status_baseline: None,
+        detection: None,
     });
 
     let inst = env.view.get_instance(&id).unwrap();
@@ -8265,6 +8274,104 @@ fn apply_status_update_propagates_live_status_baseline_from_poller() {
     );
 }
 
+// #3642: the poller decides on a *clone* too (see `status_poller.rs`), so
+// the detection bookkeeping `update_status_from_manifest` writes reaches the
+// next cycle only through `StatusUpdate`. Dropped, every cycle started with
+// no proposal on record, so a `Running -> Idle` that no rule read off the
+// agent's own chrome proposed itself forever and the row never left Running.
+//
+// Two real cycles over a live pane parked on a screen no Claude rule matches:
+// the first proposes, the second publishes.
+#[test]
+#[serial]
+fn poll_cycles_confirm_an_unwitnessed_idle_through_the_status_update() {
+    use crate::session::Status;
+    use crate::tui::status_poller::{poll_statuses_once, StatusPollState};
+
+    if crate::tmux::tmux_command()
+        .arg("-V")
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        eprintln!("skipping: tmux not available");
+        return;
+    }
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = match env.view.flat_items.first() {
+        Some(Item::Session { id, .. }) => id.clone(),
+        _ => panic!("expected the fixture to seed a single Session item"),
+    };
+
+    let session_name = {
+        let inst = env.view.get_instance(&id).unwrap();
+        assert_eq!(
+            inst.tool, "claude",
+            "fixture invariant: this test needs an agent with a manifest"
+        );
+        crate::tmux::Session::generate_name(&inst.id, &inst.title)
+    };
+    let _kill = crate::tmux::test_helpers::TmuxTestSession::from_name(session_name.clone());
+    let created = crate::tmux::tmux_command()
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            &session_name,
+            "-x",
+            "120",
+            "-y",
+            "40",
+            // `exec` so tmux reports the pane's command as `sleep` rather
+            // than the launching shell, which the stale-shell check would
+            // read as an agent that exited.
+            "printf 'turn over\n'; exec sleep 300",
+        ])
+        .output()
+        .expect("spawn tmux");
+    assert!(
+        created.status.success(),
+        "tmux new-session failed: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+
+    // Mid-turn, as the poller last left it.
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = Status::Running;
+        inst.live_status_baseline = Some(Status::Running);
+    });
+
+    // The launch is asynchronous: poll until the frame is drawn and the
+    // shell has `exec`ed, so the first cycle reads the parked pane rather
+    // than a pane still being set up.
+    let ready = (0..100).any(|_| {
+        if crate::tmux::utils::pane_current_command(&session_name).as_deref() == Some("sleep") {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        false
+    });
+    assert!(ready, "pane never settled on its parked command");
+
+    let mut poll_state = StatusPollState::new();
+    let mut published = Vec::new();
+    for _ in 0..2 {
+        let updates = poll_statuses_once(env.view.pollable_instances(), &mut poll_state);
+        for update in updates {
+            env.view.apply_one_status_update(update);
+        }
+        published.push(env.view.get_instance(&id).unwrap().status);
+    }
+
+    assert_eq!(
+        published,
+        vec![Status::Running, Status::Idle],
+        "an unwitnessed Idle waits one cycle, then publishes on the cycle \
+         that agrees with it (#3642)"
+    );
+}
+
 // #2690: `IdleIntent::Keep` means the producer has no observation for
 // `idle_entered_at`. The consumer must not touch the field, or an
 // unseeded `attached_status_hooks` snapshot on attach exit would clobber
@@ -8299,6 +8406,7 @@ fn apply_status_update_preserves_idle_entered_at_on_keep() {
         last_accessed_at: None,
         pane_dead: false,
         live_status_baseline: None,
+        detection: None,
     });
 
     assert_eq!(
@@ -8335,6 +8443,7 @@ fn apply_status_update_persists_genuine_transition_to_disk() {
         last_accessed_at: Some(now),
         pane_dead: false,
         live_status_baseline: None,
+        detection: None,
     });
 
     let reloaded = Storage::new_unwatched("test").unwrap().load().unwrap();
@@ -8369,6 +8478,7 @@ fn apply_status_update_clears_idle_entered_at_on_idle_to_running() {
         last_accessed_at: None,
         pane_dead: false,
         live_status_baseline: None,
+        detection: None,
     });
     assert_eq!(
         env.view.get_instance(&id).unwrap().idle_entered_at,
@@ -8387,6 +8497,7 @@ fn apply_status_update_clears_idle_entered_at_on_idle_to_running() {
         last_accessed_at: None,
         pane_dead: false,
         live_status_baseline: None,
+        detection: None,
     });
 
     let inst = env.view.get_instance(&id).unwrap();
@@ -8485,6 +8596,7 @@ fn apply_status_update_skips_terminal_states() {
         last_accessed_at: None,
         pane_dead: false,
         live_status_baseline: None,
+        detection: None,
     });
 
     // Status and timestamp should both stay untouched.
@@ -8560,6 +8672,7 @@ fn apply_status_update_runs_status_hook_on_transition() {
         last_accessed_at: None,
         pane_dead: false,
         live_status_baseline: None,
+        detection: None,
     });
 
     let launches = take_recorded_launches();
@@ -8624,6 +8737,7 @@ fn apply_status_update_does_not_run_status_hook_for_same_status() {
         last_accessed_at: None,
         pane_dead: false,
         live_status_baseline: None,
+        detection: None,
     });
 
     assert!(take_recorded_launches().is_empty());
@@ -8657,6 +8771,7 @@ fn apply_status_updates_without_hooks_does_not_run_status_hook() {
             last_accessed_at: None,
             pane_dead: false,
             live_status_baseline: None,
+            detection: None,
         }]);
 
     assert_eq!(env.view.get_instance(&id).unwrap().status, Status::Waiting);
@@ -13312,9 +13427,6 @@ mod scroll_pane_isolation {
         setup_panes(&mut env);
         env.view.cursor = 1;
         env.view.update_selected();
-        env.view.preview_cache.dimensions = (80, 24);
-        env.view.preview_cache.captured_lines = 200;
-        env.view.preview_scroll_offset = 10;
         env.view.live_send = Some(LiveSendState {
             session_id: "fake".to_string(),
             title: "fake".to_string(),
@@ -13326,15 +13438,19 @@ mod scroll_pane_isolation {
             leader: None,
         });
         env.view.live_send_worker = Some(LiveSendWorker::spawn("fake".to_string(), None));
-        // Spawn the capture worker, then inject the cursor (set_target
-        // clears it, so the injection must come after).
         env.view
             .sync_preview_capture_worker(Some("fake".to_string()));
-        env.view
+        env.view.preview_cache.dimensions = (80, 24);
+        env.view.preview_cache.captured_lines = 200;
+        env.view.preview_scroll_offset = 10;
+        env.view.preview_cache.cursor = Some(cursor);
+        env.view.preview_cache.capture_target = Some("fake".to_string());
+        env.view.preview_cache.capture_generation = env
+            .view
             .preview_capture_worker
             .as_ref()
-            .expect("capture worker spawned")
-            .set_cursor_for_test(Some(cursor));
+            .expect("capture worker")
+            .current_generation_for_test();
         env
     }
 
@@ -13348,17 +13464,20 @@ mod scroll_pane_isolation {
         setup_panes(&mut env);
         env.view.cursor = 1;
         env.view.update_selected();
+        env.view
+            .sync_preview_capture_worker(Some("fake".to_string()));
         env.view.preview_cache.dimensions = (80, 24);
         env.view.preview_cache.captured_lines = 200;
         env.view.preview_scroll_offset = 10;
-        env.view
-            .sync_preview_capture_worker(Some("fake".to_string()));
         env.view.preview_capture_target = Some("fake".to_string());
-        env.view
+        env.view.preview_cache.cursor = Some(cursor);
+        env.view.preview_cache.capture_target = Some("fake".to_string());
+        env.view.preview_cache.capture_generation = env
+            .view
             .preview_capture_worker
             .as_ref()
-            .expect("capture worker spawned")
-            .set_cursor_for_test(Some(cursor));
+            .expect("capture worker")
+            .current_generation_for_test();
         env
     }
 
@@ -15279,7 +15398,6 @@ mod click_to_select {
 
     /// Acp-mode sessions are not tmux-backed, so click cannot
     /// enter live mode for them; selection still updates.
-    #[cfg(feature = "serve")]
     #[test]
     #[serial]
     fn single_click_on_acp_session_returns_no_action() {
@@ -16307,7 +16425,6 @@ mod preview_drag_select {
         env.view.preview_cache.content = "alpha beta gamma\nsecond line\nthird line\n".to_string();
         env.view.preview_cache.dimensions = (80, 24);
         env.view.preview_cache.captured_lines = 3;
-        env.view.preview_cache.last_refresh = std::time::Instant::now();
         env.view.preview_cache.session_id = Some("fake-id".to_string());
 
         // First render seeds preview_text_view + paints content. We need
@@ -16781,12 +16898,6 @@ mod live_send_mode {
         );
     }
 
-    /// Acp-mode is a `serve` feature; the `structured_view` field on
-    /// Instance only exists when that feature is compiled in. Without
-    /// it, `is_structured()` is hard-coded to false and the gate is
-    /// a no-op, so there's nothing meaningful to verify in the default
-    /// build.
-    #[cfg(feature = "serve")]
     #[test]
     #[serial]
     fn tab_does_not_start_live_send_for_acp_session() {
@@ -16967,6 +17078,55 @@ mod live_send_mode {
 
     #[test]
     #[serial]
+    fn accepted_capture_keeps_content_and_cursor_in_one_cache_frame() {
+        let mut env = create_test_env_with_sessions(1);
+        let id = env.view.selected_session.clone().expect("selected session");
+        env.view
+            .sync_preview_capture_worker(Some("aoe_test_atomic_cursor".to_string()));
+        let first = crate::tmux::PaneCursor {
+            x: 1,
+            y: 2,
+            visible: true,
+            pane_height: 24,
+            history_size: 0,
+            pane_width: 80,
+            alternate_on: false,
+            mouse_tracking: false,
+            mouse_sgr: false,
+            mouse_all: false,
+            position_reliable: true,
+            composite_pane0: None,
+        };
+        env.view
+            .preview_capture_worker
+            .as_ref()
+            .expect("capture worker")
+            .inject_frame_with_cursor_for_test(40, "stable content", Some(first));
+        env.view.refresh_preview_cache_if_needed(80, 24);
+        assert_eq!(env.view.preview_cache.session_id, Some(id));
+        assert_eq!(env.view.preview_cache.content, "stable content");
+        assert_eq!(env.view.preview_cache.cursor, Some(first));
+
+        let second = crate::tmux::PaneCursor { x: 7, ..first };
+        env.view
+            .preview_capture_worker
+            .as_ref()
+            .expect("capture worker")
+            .inject_frame_with_cursor_for_test(40, "stable content", Some(second));
+        env.view.refresh_preview_cache_if_needed(80, 24);
+        assert_eq!(env.view.preview_cache.cursor, Some(second));
+        env.view
+            .sync_preview_capture_worker(Some("aoe_test_atomic_other".to_string()));
+        assert!(env.view.active_preview_cursor().is_none());
+        env.view
+            .sync_preview_capture_worker(Some("aoe_test_atomic_cursor".to_string()));
+        // Simulate an old cache surviving an A -> B -> A switch. Matching the
+        // target string is insufficient; the accepted generation must match.
+        env.view.preview_cache.cursor = Some(second);
+        assert!(env.view.active_preview_cursor().is_none());
+    }
+    #[test]
+    #[serial]
     fn warm_predicates_stay_cold_without_a_live_pane() {
         // The EnterLiveSend / SendMessage handlers skip the "Reviving
         // session..." toast only when the target pane is provably warm; every
@@ -17036,32 +17196,342 @@ mod live_send_mode {
             .expect("test env has one session");
         env.view.selected_session = Some(id.clone());
         // Steady state: pane already synced to the toast-free geometry.
-        env.view.preview_pane_synced = Some((id.clone(), 141, 43));
+        let synced = crate::tui::home::PassiveSynced {
+            cols: 141,
+            rows: 43,
+            window_rows: 43,
+            adopted_at: std::time::Instant::now(),
+        };
+        env.view.passive_pane_synced.insert(id.clone(), synced);
 
         // Toast frame: one row shorter. Armed only; the synced geometry (and
         // with it the real pane) must stay untouched.
         env.view.refresh_preview_cache_if_needed(141, 42);
         assert_eq!(env.view.preview_pane_pending, Some((id.clone(), 141, 42)));
-        assert_eq!(env.view.preview_pane_synced, Some((id.clone(), 141, 43)));
+        assert_eq!(env.view.passive_pane_synced.get(&id), Some(&synced));
 
         // Post-toast frame: back in sync; the transient arm is dropped so a
         // later real change still needs two consecutive sightings.
         env.view.refresh_preview_cache_if_needed(141, 43);
         assert_eq!(env.view.preview_pane_pending, None);
-        assert_eq!(env.view.preview_pane_synced, Some((id, 141, 43)));
+        assert_eq!(env.view.passive_pane_synced.get(&id), Some(&synced));
+    }
+
+    #[test]
+    #[serial]
+    fn fleet_reconcile_presizes_open_sessions_once_per_epoch() {
+        let mut env = create_test_env_with_sessions(3);
+        let ids: Vec<String> = env
+            .view
+            .flat_items
+            .iter()
+            .filter_map(|item| match item {
+                crate::session::Item::Session { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 3);
+        let selected = ids[0].clone();
+        env.view.selected_session = Some(selected.clone());
+        let inner = ratatui::layout::Rect::new(0, 0, 141, 45);
+
+        // First sighting of a fleet geometry arms only; nothing reaches the
+        // worker until the same geometry holds for a second refresh.
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        assert!(env.view.passive_fleet_armed.is_some());
+        assert!(env.view.passive_pane_queued.is_empty());
+
+        // Second sighting queues every open session except the excluded
+        // (selected) one.
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        assert!(!env.view.passive_pane_queued.contains_key(&selected));
+        for id in &ids[1..] {
+            assert!(
+                env.view.passive_pane_queued.contains_key(id),
+                "open session {id} must be handed to the worker"
+            );
+        }
+
+        // The fixture sessions have no tmux panes, so the worker declines
+        // each intent. Once the declines are adopted, the same epoch must not
+        // re-queue them.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            env.view
+                .reconcile_passive_fleet(inner, false, Some(&selected));
+            if ids[1..]
+                .iter()
+                .all(|id| env.view.passive_pane_declined.contains_key(id))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "declined completions never arrived"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        assert!(
+            ids[1..]
+                .iter()
+                .all(|id| !env.view.passive_pane_queued.contains_key(id)),
+            "a declined geometry must not be retried within its epoch"
+        );
+
+        // A different fleet geometry is a new epoch: arming clears the
+        // declines and the follow-up refresh retries each session once.
+        let inner2 = ratatui::layout::Rect::new(0, 0, 120, 38);
+        env.view
+            .reconcile_passive_fleet(inner2, false, Some(&selected));
+        assert!(env.view.passive_pane_declined.is_empty());
+        env.view
+            .reconcile_passive_fleet(inner2, false, Some(&selected));
+        for id in &ids[1..] {
+            assert!(
+                env.view.passive_pane_queued.contains_key(id),
+                "a new epoch must retry {id} once"
+            );
+        }
+
+        // Moving the selection is NOT an epoch: the armed key is pure
+        // geometry, so switching the excluded session must not re-arm, and
+        // the previously excluded session fires on the same refresh.
+        let armed_before = env.view.passive_fleet_armed.clone();
+        env.view.selected_session = Some(ids[1].clone());
+        env.view
+            .reconcile_passive_fleet(inner2, false, Some(&ids[1]));
+        assert_eq!(env.view.passive_fleet_armed, armed_before);
+        assert!(
+            env.view.passive_pane_queued.contains_key(&ids[0]),
+            "the newly deselected session must be handed to the worker without re-arming"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn fleet_reconcile_reasserts_after_external_resize() {
+        let _cache_guard = crate::tmux::PaneMetaCacheGuard::capture();
+        let mut env = create_test_env_with_sessions(2);
+        let ids: Vec<String> = env
+            .view
+            .flat_items
+            .iter()
+            .filter_map(|item| match item {
+                crate::session::Item::Session { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        let selected = ids[0].clone();
+        env.view.selected_session = Some(selected.clone());
+        let inner = ratatui::layout::Rect::new(0, 0, 141, 45);
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+
+        // Pretend ids[1]'s resize was applied at its wanted geometry (read
+        // back from the armed epoch so the fixture can't drift from the real
+        // layout math).
+        let (cols, rows) = env
+            .view
+            .passive_fleet_armed
+            .as_ref()
+            .and_then(|armed| armed.iter().find(|(id, ..)| id == &ids[1]))
+            .map(|&(_, cols, rows)| (cols, rows))
+            .expect("armed epoch covers ids[1]");
+        env.view.passive_pane_synced.insert(
+            ids[1].clone(),
+            crate::tui::home::PassiveSynced {
+                cols,
+                rows,
+                window_rows: rows,
+                adopted_at: std::time::Instant::now(),
+            },
+        );
+        let title = env.view.get_instance(&ids[1]).unwrap().title.clone();
+        let name = crate::tmux::Session::resolve_name_for_display(&ids[1], &title);
+
+        // A fresher observation MATCHING the applied size is not a
+        // contradiction: the session stays in sync, nothing queued.
+        crate::tmux::test_inject_pane_window_size(&name, (cols, rows));
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        assert!(env.view.passive_pane_synced.contains_key(&ids[1]));
+        assert!(!env.view.passive_pane_queued.contains_key(&ids[1]));
+
+        // Another client resizes the window (external attach, web live
+        // view): the contradicted entry is dropped and the pane re-asserted.
+        crate::tmux::test_inject_pane_window_size(&name, (cols + 10, rows));
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        assert!(!env.view.passive_pane_synced.contains_key(&ids[1]));
+        assert!(env.view.passive_pane_queued.contains_key(&ids[1]));
+    }
+
+    #[test]
+    #[serial]
+    fn stale_observation_published_after_adoption_does_not_invalidate() {
+        // The cache boundary of the timestamp race: a `list-panes` that read
+        // the pane BEFORE our resize can finish publishing AFTER the resize's
+        // adoption. The snapshot's time is the observation instant (captured
+        // pre-fork), so the pre-resize sizes it carries must read as older
+        // than the adoption and leave the synced entry alone. Re-stamping
+        // `cache.time` at publication would make this observation look
+        // fresher than the adoption and turns this test red (the injector
+        // routes through the real publication path).
+        let _cache_guard = crate::tmux::PaneMetaCacheGuard::capture();
+        let mut env = create_test_env_with_sessions(2);
+        let ids: Vec<String> = env
+            .view
+            .flat_items
+            .iter()
+            .filter_map(|item| match item {
+                crate::session::Item::Session { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        let selected = ids[0].clone();
+        env.view.selected_session = Some(selected.clone());
+        let inner = ratatui::layout::Rect::new(0, 0, 141, 45);
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        let (cols, rows) = env
+            .view
+            .passive_fleet_armed
+            .as_ref()
+            .and_then(|armed| armed.iter().find(|(id, ..)| id == &ids[1]))
+            .map(|&(_, cols, rows)| (cols, rows))
+            .expect("armed epoch covers ids[1]");
+
+        // The listing reads the pane's pre-resize size...
+        let listed_at = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        // ...then our resize applies and is adopted...
+        env.view.passive_pane_synced.insert(
+            ids[1].clone(),
+            crate::tui::home::PassiveSynced {
+                cols,
+                rows,
+                window_rows: rows,
+                adopted_at: std::time::Instant::now(),
+            },
+        );
+        // ...and only then does the stale listing get published.
+        let title = env.view.get_instance(&ids[1]).unwrap().title.clone();
+        let name = crate::tmux::Session::resolve_name_for_display(&ids[1], &title);
+        crate::tmux::test_inject_pane_window_size_at(&name, (cols + 10, rows), listed_at);
+
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        assert!(
+            env.view.passive_pane_synced.contains_key(&ids[1]),
+            "a pre-resize observation must not invalidate the adopted size"
+        );
+        assert!(!env.view.passive_pane_queued.contains_key(&ids[1]));
+    }
+
+    #[test]
+    #[serial]
+    fn fleet_reconcile_retries_expired_declines() {
+        let mut env = create_test_env_with_sessions(2);
+        let ids: Vec<String> = env
+            .view
+            .flat_items
+            .iter()
+            .filter_map(|item| match item {
+                crate::session::Item::Session { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        let selected = ids[0].clone();
+        env.view.selected_session = Some(selected.clone());
+        let inner = ratatui::layout::Rect::new(0, 0, 141, 45);
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        let want = env
+            .view
+            .passive_fleet_armed
+            .as_ref()
+            .and_then(|armed| armed.iter().find(|(id, ..)| id == &ids[1]))
+            .map(|&(_, cols, rows)| (cols, rows))
+            .expect("armed epoch covers ids[1]");
+
+        // A decline older than the retry window reads as absent, so the
+        // session recovers once its blocking attach or size owner may have
+        // gone away, instead of staying parked until a geometry change.
+        let expired = std::time::Instant::now()
+            .checked_sub(
+                crate::tui::home::render::PASSIVE_DECLINE_RETRY + std::time::Duration::from_secs(1),
+            )
+            .expect("test clock predates the retry window");
+        env.view
+            .passive_pane_declined
+            .insert(ids[1].clone(), (want, expired));
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        assert!(env.view.passive_pane_queued.contains_key(&ids[1]));
+
+        // A fresh decline parks it again.
+        env.view.passive_pane_queued.clear();
+        env.view
+            .passive_pane_declined
+            .insert(ids[1].clone(), (want, std::time::Instant::now()));
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        assert!(!env.view.passive_pane_queued.contains_key(&ids[1]));
+    }
+
+    #[test]
+    #[serial]
+    fn fleet_reconcile_is_single_tui_only() {
+        // With two aoe TUIs alive, each would treat the other's fleet
+        // resizes as external (observed-size invalidation) and re-assert its
+        // own geometry, oscillating every open pane. The presence count gates
+        // the whole fleet pass; only the selected-session sync stays on.
+        let mut env = create_test_env_with_sessions(2);
+        let ids: Vec<String> = env
+            .view
+            .flat_items
+            .iter()
+            .filter_map(|item| match item {
+                crate::session::Item::Session { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        let selected = ids[0].clone();
+        env.view.selected_session = Some(selected.clone());
+        let inner = ratatui::layout::Rect::new(0, 0, 141, 45);
+
+        env.view.active_tui_count = 2;
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        assert!(env.view.passive_fleet_armed.is_none());
+        assert!(env.view.passive_pane_queued.is_empty());
+
+        // Back down to one TUI: the fleet resumes on the usual two-sighting
+        // debounce.
+        env.view.active_tui_count = 1;
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        assert!(env.view.passive_fleet_armed.is_some());
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        assert!(env.view.passive_pane_queued.contains_key(&ids[1]));
     }
 
     #[test]
     #[serial]
     fn refresh_terminal_cache_overwrites_on_empty_capture() {
         // Counterpart to `refresh_preserves_cache_when_live_capture_fails`:
-        // the agent cache and the host-terminal cache now share
-        // `refresh_preview_cache_core`, but only the agent wrapper carries the
-        // live-send kill switch. The terminal path must keep its old semantics
-        // (overwrite to empty so the preview surfaces "session looks gone")
-        // even when the unit fixture's backing tmux session does not exist and
-        // the capture comes back empty. Guards against the kill switch leaking
-        // into the shared core for the non-agent wrappers.
+        // only the agent path carries the live-send kill switch. The terminal
+        // path must overwrite to empty so the preview surfaces "session looks
+        // gone". With the worker as the ONLY capture source, the empty frame
+        // arrives through the mailbox (the worker forwards empties for
+        // terminal panes); paint applies it without any synchronous fork.
         let mut env = create_test_env_with_sessions(1);
         let id = env
             .view
@@ -17077,6 +17547,12 @@ mod live_send_mode {
         env.view.terminal_preview_cache.captured_lines = 1;
         env.view.terminal_preview_cache.dimensions = (10, 10);
         env.view.terminal_preview_cache.session_id = Some(id.clone());
+
+        env.view
+            .sync_preview_capture_worker(Some("aoe_test_missing_terminal".to_string()));
+        if let Some(worker) = env.view.preview_capture_worker.as_ref() {
+            worker.inject_frame_for_test(40, "");
+        }
 
         env.view.refresh_terminal_preview_cache_if_needed(80, 24);
 
@@ -17275,7 +17751,6 @@ mod post_create_attach_mode {
         assert!(mode.is_none());
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     #[serial]
     fn returns_none_for_acp_session() {
@@ -17779,7 +18254,6 @@ mod default_attach_mode {
     /// `OpenStructuredView`/transient-status before we get to the view-mode
     /// match), so the resolver also returns None for them; the setting
     /// must not be able to misroute a structured view row into live mode.
-    #[cfg(feature = "serve")]
     #[test]
     #[serial]
     fn acp_session_ignores_default_attach_mode() {
@@ -17860,7 +18334,6 @@ mod default_attach_mode {
     /// a structured row, structured for a terminal row whose tool is
     /// ACP-capable (only when the structured-view opt-in is on), and nothing
     /// for rows mid-lifecycle.
-    #[cfg(feature = "serve")]
     #[test]
     #[serial]
     fn switch_view_target_gates_by_view_and_state() {
@@ -17887,7 +18360,6 @@ mod default_attach_mode {
     /// `offer_structured_in_new_session` opt-in, so with it off an ACP-capable
     /// terminal row offers no switch. A structured row can always switch back
     /// to terminal regardless, so a session is never stranded.
-    #[cfg(feature = "serve")]
     #[test]
     #[serial]
     fn switch_view_target_gated_on_structured_opt_in() {
@@ -17908,7 +18380,6 @@ mod default_attach_mode {
 
     /// Accepting the switch-view confirm emits the action with the stashed
     /// session id, mirroring the other confirm-carrying actions.
-    #[cfg(feature = "serve")]
     #[test]
     #[serial]
     fn switch_view_confirm_dispatches_action_with_stashed_id() {
@@ -20204,7 +20675,7 @@ mod live_send_boot_size_tests {
     #[serial_test::serial]
     fn boots_agent_at_visible_preview_size() {
         let mut env = create_test_env_empty();
-        // The rect `finalize_live_send_resize` would resize the pane to.
+        // The visible rect the post-toast draw queues to LiveSendWorker.
         env.view.preview_pane_area = Rect::new(35, 1, 123, 38);
 
         assert_eq!(
@@ -20534,7 +21005,6 @@ mod settings_scroll_wiring {
 /// `apply_acp_overlay_inplace`). Before this wiring existed the pill sat frozen
 /// at whatever creation or an explicit start/stop wrote, for the whole life of
 /// the session.
-#[cfg(feature = "serve")]
 mod daemon_status_apply_tests {
     use super::*;
     use crate::session::Status;
@@ -21233,57 +21703,296 @@ mod profile_duplicate_reconciliation {
     }
 }
 
-/// The two guards on the idle-fork suppression that survived deletion with a
-/// green suite (njbrake on #3559). Driven against a REAL spawned worker
-/// because the mutants that matter are in the wiring, not in the pure
-/// `worker_pulse_step` helper: deleting the retarget reset, which is the one
-/// place a missed path leaves a genuinely stale preview, and deleting the
-/// pulse plumbing entirely.
+/// Regression: the TUI paint path must never fork tmux, no matter how cold
+/// the shared snapshots are. Every tmux question a frame needs is answered
+/// from `SESSION_CACHE` / `PANE_META_CACHE` by a background poller and from
+/// `LiveCaptureWorker` frames; this walks Structured / Terminal / Tool view
+/// modes across an empty cache, a fresh-but-absent snapshot, and an expired
+/// one (the states that used to trigger synchronous refreshes from render)
+/// and counts forks on the paint thread via the probe at
+/// `tmux_command()`. Worker threads are NOT armed, so their legitimate
+/// captures don't count.
 #[test]
-fn observe_worker_pulse_needs_a_moving_counter_and_resets_on_retarget() {
+#[serial]
+fn paint_never_forks_tmux_even_with_empty_absent_or_expired_caches() {
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+    let theme = load_theme("empire");
+
+    let session_guard = crate::tmux::SessionCacheGuard::capture();
+    let pane_guard = crate::tmux::PaneMetaCacheGuard::capture();
+
+    let modes = [
+        ViewMode::Structured,
+        ViewMode::Terminal,
+        ViewMode::Tool("lazygit".to_string()),
+    ];
+    for mode in modes {
+        env.view.view_mode = mode.clone();
+        // Cache states: (session snapshot, pane snapshot). "Cold boot" is the
+        // never-refreshed state; "absent" is fresh but without our session;
+        // "expired" is populated but past CACHE_TTL. All three used to make
+        // paint refresh synchronously.
+        let states = [("cold-boot", 0), ("fresh-absent", 1), ("expired", 2)];
+        for (label, state) in states {
+            match state {
+                0 => {
+                    session_guard.force_unreachable();
+                    session_guard.force_stale();
+                    pane_guard.force_failed_refresh();
+                    pane_guard.force_stale();
+                }
+                1 => {
+                    session_guard.force_present(&["aoe_someone_elses_session"]);
+                    pane_guard.force_failed_refresh();
+                }
+                _ => {
+                    session_guard.force_present(&["aoe_someone_elses_session"]);
+                    session_guard.force_stale();
+                    pane_guard.force_failed_refresh();
+                    pane_guard.force_stale();
+                }
+            }
+
+            crate::tmux::fork_probe::take();
+            let _armed = crate::tmux::fork_probe::arm();
+            // Two frames: the first exercises cold paths (worker empty,
+            // debounces arming), the second steady state.
+            for _frame in 0..2 {
+                let backend = TestBackend::new(120, 40);
+                let mut terminal = Terminal::new(backend).unwrap();
+                terminal
+                    .draw(|f| env.view.render(f, f.area(), &theme, None, None, None))
+                    .unwrap();
+            }
+            let forks = crate::tmux::fork_probe::take();
+            assert_eq!(
+                forks, 0,
+                "{mode:?} with {label} caches: paint forked tmux {forks}x; \
+                 display answers must come from poller-refreshed snapshots"
+            );
+        }
+    }
+}
+
+/// Regression: a frozen (scrolled-back) preview must still be able to GROW
+/// its capture. Only worker frames write the cache now, so the reading-depth
+/// budget has to reach the worker while frozen and an adequate frame has to
+/// be applied; otherwise scrollback reads hit a hard wall at the live-edge
+/// window (~CAPTURE_BUFFER rows past the viewport). An inadequate frame is
+/// skipped rather than applied: it would clamp the held offset against too
+/// few lines and snap the view toward the live edge.
+#[test]
+#[serial]
+fn frozen_preview_grows_only_on_coverage_extending_frames() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+    env.view
+        .sync_preview_capture_worker(Some("aoe_test_frozen_read".to_string()));
+    env.view.preview_scroll_offset = 40; // non-zero offset freezes the preview
+
+    // A frame that does not cover viewport + offset is skipped while frozen.
+    if let Some(worker) = env.view.preview_capture_worker.as_ref() {
+        worker.inject_frame_for_test(100, &"line\n".repeat(30));
+    }
+    env.view.refresh_preview_cache_if_needed(80, 24);
+    assert_eq!(
+        env.view.preview_cache.content.lines().count(),
+        0,
+        "an inadequate frame must not shift the held content under the reader"
+    );
+    // The skipped frame must be back in the mailbox: the worker's content
+    // dedup would otherwise never republish it.
+    assert!(
+        env.view
+            .preview_capture_worker
+            .as_ref()
+            .map(|w| w.take_latest().is_some())
+            .unwrap_or(false),
+        "a frame rejected while frozen must be restored for later consumption"
+    );
+
+    // A coverage-extending frame grows the cache even though frozen.
+    if let Some(worker) = env.view.preview_capture_worker.as_ref() {
+        worker.inject_frame_for_test(200, &"line\n".repeat(120));
+    }
+    env.view.refresh_preview_cache_if_needed(80, 24);
+    assert_eq!(
+        env.view.preview_cache.content.lines().count(),
+        120,
+        "the frozen read must be able to grow its capture off-thread"
+    );
+}
+
+/// Regression: a frame captured before the last retarget must never land
+/// under the new view. The consumer-side `frame_is_current` guard is the
+/// last line of defense against the race where the worker publishes an
+/// old-generation frame after `set_target` cleared the mailbox; without
+/// this test, deleting the guard reintroduces the previous pane's bytes
+/// under the new header.
+#[test]
+#[serial]
+fn preview_rejects_frames_from_previous_generation() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+    env.view
+        .sync_preview_capture_worker(Some("aoe_test_new_target".to_string()));
+    if let Some(worker) = env.view.preview_capture_worker.as_ref() {
+        // Idle the real capture thread before injection, so it cannot
+        // overwrite the synthetic stale frame and make the test pass by
+        // accident even if the consumer guard is deleted.
+        worker.set_target(String::new());
+        worker.inject_stale_generation_frame_for_test(40, "previous pane bytes");
+    }
+
+    env.view.refresh_preview_cache_if_needed(80, 24);
+
+    assert_ne!(
+        env.view.preview_cache.content, "previous pane bytes",
+        "a stale-generation frame must be dropped, never applied"
+    );
+}
+
+/// Regression: entering live-send while a blocking capture is in flight must
+/// revalidate the empty-frame policy on the consumer. An empty frame captured
+/// just before the transition cannot blank the agent/tool pane under the
+/// user's cursor (#1501); the same restored frame must clear stale content
+/// after live-send exits.
+#[test]
+#[serial]
+fn preview_revalidates_empty_policy_across_live_transition() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+    let target = "aoe_test_live_transition".to_string();
+    env.view.sync_preview_capture_worker(Some(target.clone()));
+    env.view.preview_cache.content = "last good frame".to_string();
+    env.view.preview_cache.captured_lines = 1;
+    env.view.preview_cache.dimensions = (80, 24);
+    env.view.preview_cache.session_id = Some(id);
+    env.view.preview_cache.capture_target = Some(target);
+    env.view.preview_cache.capture_generation = env
+        .view
+        .preview_capture_worker
+        .as_ref()
+        .expect("worker spawned")
+        .current_generation_for_test();
+    let worker = env
+        .view
+        .preview_capture_worker
+        .as_ref()
+        .expect("worker spawned");
+    worker.inject_frame_for_test(40, "");
+    worker.set_live(true);
+
+    env.view.refresh_preview_cache_if_needed(80, 24);
+    assert_eq!(
+        env.view.preview_cache.content, "last good frame",
+        "live transition must preserve the last-good agent frame"
+    );
+
+    env.view
+        .preview_capture_worker
+        .as_ref()
+        .expect("worker retained")
+        .set_live(false);
+    env.view.refresh_preview_cache_if_needed(80, 24);
+    assert_eq!(
+        env.view.preview_cache.content, "",
+        "the restored empty frame must clear stale content after live exit"
+    );
+}
+/// A passive completion that lands after live ownership must invalidate the
+/// matching agent resize dedup, but never another session or target.
+#[test]
+fn passive_completion_invalidates_only_matching_agent_live_geometry() {
+    use super::live_send::LiveSendTarget;
+    use super::render::passive_resize_invalidates_live_geometry;
+
+    let cases = [
+        (
+            Some(&LiveSendTarget::Agent),
+            Some("selected"),
+            "selected",
+            true,
+        ),
+        (
+            Some(&LiveSendTarget::Agent),
+            Some("selected"),
+            "other",
+            false,
+        ),
+        (
+            Some(&LiveSendTarget::Terminal),
+            Some("selected"),
+            "selected",
+            false,
+        ),
+        (None, Some("selected"), "selected", false),
+    ];
+    for (target, selected, completed, expected) in cases {
+        assert_eq!(
+            passive_resize_invalidates_live_geometry(target, selected, completed),
+            expected,
+        );
+    }
+}
+/// A worker that stops advancing is replaced after the tmux deadline, while a
+/// normal retarget clears heartbeat history. Removing either reset leaves the
+/// old worker or old target's liveness attached to the displayed pane.
+#[test]
+fn stalled_preview_worker_restarts_and_retarget_resets_heartbeat() {
     let mut env = create_test_env_empty();
+    let first_target = "aoe_test_stalled_worker".to_string();
+    env.view
+        .sync_preview_capture_worker(Some(first_target.clone()));
 
-    // No worker: nothing can be trusted, and the observation stays cleared.
-    assert!(!env.view.observe_worker_pulse());
-    assert!(env.view.preview_worker_pulse.is_none());
-
-    env.view.preview_capture_worker = Some(crate::tui::home::live_send::LiveCaptureWorker::spawn(
-        std::sync::Arc::new(tokio::sync::Notify::new()),
+    let worker = env
+        .view
+        .preview_capture_worker
+        .as_mut()
+        .expect("worker spawned");
+    let old_worker_id = worker.id_for_test();
+    worker.stop_for_test();
+    worker.set_cycles_for_test(17);
+    env.view.preview_worker_pulse = Some((
+        17,
+        std::time::Instant::now()
+            - crate::tmux::TMUX_COMMAND_TIMEOUT
+            - std::time::Duration::from_secs(3),
     ));
 
-    // First observation has no history to compare, so a cold start forks.
-    assert!(
-        !env.view.observe_worker_pulse(),
-        "the first observation must not suppress the cold-start fork"
-    );
-    assert!(env.view.preview_worker_pulse.is_some());
-
-    // The loop cycles on its own; wait for the counter to move rather than
-    // sleeping a fixed window, since the first iteration forks tmux.
-    let mut pulsing = false;
-    for _ in 0..100 {
-        if env.view.observe_worker_pulse() {
-            pulsing = true;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    assert!(
-        pulsing,
-        "a running worker must be observed pulsing, so the idle fork is suppressed"
-    );
-
-    // Retarget: the new pane has no observed history, so its cold-start fork
-    // must not be suppressed by the previous pane's pulse.
     env.view
-        .sync_preview_capture_worker(Some("aoe_test_pulse_retarget".to_string()));
+        .sync_preview_capture_worker(Some(first_target.clone()));
+    let replacement = env
+        .view
+        .preview_capture_worker
+        .as_ref()
+        .expect("stalled worker replaced");
+    assert_ne!(
+        replacement.id_for_test(),
+        old_worker_id,
+        "a stalled capture worker must be replaced"
+    );
+    assert_eq!(
+        env.view.preview_capture_target.as_deref(),
+        Some(first_target.as_str()),
+        "replacement must retain the displayed target"
+    );
+
+    env.view.preview_worker_pulse = Some((replacement.cycles(), std::time::Instant::now()));
+    env.view
+        .sync_preview_capture_worker(Some("aoe_test_retarget".to_string()));
     assert!(
         env.view.preview_worker_pulse.is_none(),
-        "a retarget must clear the pulse observation"
-    );
-    assert!(
-        !env.view.observe_worker_pulse(),
-        "the retargeted pane must fork once before the pulse is trusted again"
+        "a retarget must start a fresh heartbeat window"
     );
 }
 

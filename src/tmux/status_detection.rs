@@ -3637,9 +3637,8 @@ Final prose line.\n";
                 "stale loader ignored",
                 format!("⠋ Working… ⟦esc⟧\nCompleted response.\nAdditional output.\nOK\n{MINIMAL_COMPOSER_BOX}"),
             ),
-            // Live loader pushed one line past the 3-line footer window:
-            // the miss reads Idle, the same bounded flapping other agents
-            // accept between polls.
+            // A live loader pushed one line past the footer window becomes an
+            // unwitnessed Idle candidate, so the poller waits for confirmation.
             (
                 "loader pushed past footer",
                 format!("⠋ Working… ⟦esc⟧\nOK\n{MINIMAL_COMPOSER_BOX}"),
@@ -3650,6 +3649,11 @@ Final prose line.\n";
         for (name, pane) in &cases {
             assert_eq!(detect_omp_status(pane), Status::Idle, "case: {name}");
         }
+
+        let detection = crate::tmux::detect::detect("omp", MINIMAL_COMPOSER_BOX, "", None)
+            .expect("omp manifest");
+        assert_eq!(detection.status, Some(Status::Idle));
+        assert!(!detection.visible);
     }
 
     #[test]
@@ -4253,6 +4257,170 @@ Final prose line.\n";
     }
 
     #[test]
+    fn test_detect_omp_status_running_on_active_brand() {
+        let cases = [
+            (
+                "captured default band",
+                "  ⎋ Working…\n ⠸ 1s  > ⬢ RCA Slow Turn > 🌳 …-rca ▶─13%─┃128K─\n╰─",
+            ),
+            (
+                "captured bordered default band",
+                "  ⎋ Waiting\n╭── ⠋ 16s  > ⬢ GPT-5.6-Terra · ◒ high > 📁 …4260 ▶─4%─┃272K───╮\n╰─                                                                      ─╯",
+            ),
+            (
+                "bordered ascii band",
+                "  esc Working...\n+-- - 1s > [M] RCA Slow Turn >-13%--:|128K--+\n+-------------------------------------------+",
+            ),
+            (
+                "narrow unicode band",
+                "  ⎋ Working…\n ⠧ 37s > ⬢ RCA Slow Turn ▶─13%─┃128K─\n╰─",
+            ),
+            (
+                "nerd symbols",
+                "  󱊷 Working…\n ⠹ 59s  host  model\n╰─",
+            ),
+            (
+                "ascii symbols",
+                "  esc Working...\n - 1m > model default\n+-",
+            ),
+            (
+                "configured single-cell symbols",
+                "  CANCEL Working…\n X 2h / model status\n╰─",
+            ),
+            (
+                "configured interrupt and separator",
+                "  CANCEL Frobnicate quux\n ⠋ 2s ▶ RCA Slow Turn ▶ branch\n╰─",
+            ),
+            (
+                "separator none",
+                "  ⎋ Working…\n ⠋ 3s ⬢ Model status\n╰─",
+            ),
+            (
+                "pipe separator",
+                "  esc Working...\n / 4s | Model status\n+-",
+            ),
+            (
+                "wrapped working message",
+                "  ⎋ Locating files in the parent tree\n continuation\n ⠋ 0s > model status\n╰─",
+            ),
+            (
+                "timer-only narrow band",
+                "  ⎋ Waiting\n╭── ⠋ 16s ─╮\n╰─",
+            ),
+            (
+                "status preset without pi segment",
+                "  ⎋ Working…",
+            ),
+            (
+                "timer-only nerd band",
+                "  󱊷 Working…\n ⠋ 0s ",
+            ),
+        ];
+        for (name, pane) in cases {
+            assert_eq!(detect_omp_status(pane), Status::Running, "case: {name}");
+        }
+    }
+
+    #[test]
+    fn test_detect_omp_status_active_brand_near_misses_idle() {
+        let cases = [
+            (
+                "activity timer without interrupt row",
+                "Completed response.\n⠸ 1s > historical timing\n╰─",
+            ),
+            (
+                "indented prose is not an interrupt row",
+                "  Completed response.\n⠸ 1s > historical timing\n╰─",
+            ),
+            (
+                "interrupt row without activity timer",
+                "⎋ Working…\nπ > idle status\n╰─",
+            ),
+            (
+                "digitless timer",
+                "⎋ Working…\n⠸ .s > model status\n╰─",
+            ),
+            (
+                "multi-decimal timer",
+                "⎋ Working…\n⠸ 1..2s > model status\n╰─",
+            ),
+            (
+                "leading-zero timer",
+                "⎋ Working…\n⠸ 01s > model status\n╰─",
+            ),
+            (
+                "duration prose below interrupt row",
+                "⎋ Working…\nThe probe took 1s > historical timing\n╰─",
+            ),
+            (
+                "stale interrupt rows around completed output",
+                "⎋ Working…\nDone. Wrote 3 files.\nesc Working...",
+            ),
+            (
+                "duration prose with a single-cell prefix",
+                "esc Working...\nx 30m saved per run",
+            ),
+            (
+                "active band pushed above current composer",
+                "⎋ Working…\n⠸ 1s > model status\nCompleted response.\n╭── π > idle ─╮\n╰─           ─╯",
+            ),
+            (
+                "persistent elapsed segment",
+                "⎋ Working…\nπ > RCA Slow Turn > ⏱ 5m\n╰─",
+            ),
+            (
+                "clock-only first segment",
+                "  ⎋ Working…\n\n❯\n ⏱ 5m · RCA Slow Turn",
+            ),
+            (
+                "nerd clock-only first segment",
+                "  󱊷 Working…\n\n❯\n  5m  RCA Slow Turn",
+            ),
+            (
+                "ascii clock-only first segment",
+                "  esc Working...\n\n>\n t: 5m > RCA Slow Turn",
+            ),
+            (
+                "decorated nerd clock-only first segment",
+                "  󱊷 Working…\n\n❯\n  5m  RCA Slow Turn",
+            ),
+            (
+                "decorated unicode clock-only first segment",
+                "  ⎋ Working…\n❯\n╭── ⏱ 5m ─╮\n╰─",
+            ),
+        ];
+        for (name, pane) in cases {
+            assert_eq!(detect_omp_status(pane), Status::Idle, "case: {name}");
+        }
+    }
+
+    #[test]
+    fn test_detect_omp_status_active_brand_uses_lowest_marker() {
+        let band = "⎋ Working…\n⠸ 1s > model status";
+        let approval = "│ ❯ Approve │\n│ Deny │\n│ up/down navigate  enter select  esc cancel │";
+        let cases = [
+            (
+                "lower approval wins",
+                format!("{band}\n{approval}"),
+                Status::Waiting,
+            ),
+            (
+                "lower terminal error wins",
+                format!("{band}\nError: Retry budget exhausted after 10 retries"),
+                Status::Error,
+            ),
+            (
+                "lower active band wins",
+                format!("{approval}\n{band}\n╰─"),
+                Status::Running,
+            ),
+        ];
+        for (name, pane, expected) in cases {
+            assert_eq!(detect_omp_status(&pane), expected, "case: {name}");
+        }
+    }
+
+    #[test]
     fn test_detect_omp_status_waiting_on_ask_dialog() {
         // The built-in ask tool swaps its dialog into the composer slot and
         // blocks the turn; the footer hint rows are the stable anchor.
@@ -4281,6 +4449,19 @@ Final prose line.\n";
             // Input-guard footer: shown while a composer draft exists.
             "\
 │ Finish or clear the current prompt to answer · Esc cancel │
+╰──────────────────────────────────────────────╯",
+            // The composer remains visible below a blocked ask dialog.
+            "\
+╭─ Ask ────────────────────────────────────────╮
+│ Enter select · n note · ↑/↓ move · Esc       │
+╰──────────────────────────────────────────────╯
+╭── π > draft ─────────────────────────────────╮
+╰──────────────────────────────────────────────╯",
+            "\
+╭─ Ask ────────────────────────────────────────╮
+│ Finish or clear the current prompt to answer · Esc cancel │
+╰──────────────────────────────────────────────╯
+╭── π > draft ─────────────────────────────────╮
 ╰──────────────────────────────────────────────╯",
         ];
         for (i, pane) in cases.iter().enumerate() {
@@ -4363,6 +4544,11 @@ Final prose line.\n";
             // Panel help plus approval prose is not a real approval panel.
             format!("│ up/down navigate  enter select  esc cancel │\nI will approve or deny later\n{box_}"),
             format!("I would approve and execute refine plan steps\n{box_}"),
+            // A footer phrase inside the live composer is draft text.
+            "╭── π > GPT-5.6 Sol ─╮\n│ Enter select · n note while documenting the UI │\n│ second draft line │\n╰──────────────────╯"
+                .to_string(),
+            "│ Enter submit · ↑/↓ scroll · current prompt to answer │\n╭── \u{f0d57} > ─╮"
+                .to_string(),
             // Ask-arm verbs without the dialog's exact footer phrasing.
             format!("press enter to select an option\n{box_}"),
         ];

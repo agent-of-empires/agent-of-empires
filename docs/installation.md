@@ -4,7 +4,12 @@
 
 - [tmux](https://github.com/tmux/tmux/wiki) (required)
 - [Docker](https://www.docker.com/) (optional, for sandboxing agents in containers)
-- [Node.js](https://nodejs.org/) (optional, only needed when building the web dashboard from source with `--features serve`)
+- [Node.js](https://nodejs.org/) (optional, only needed when building the web dashboard from source with `--features web`)
+
+Building from source also needs a C toolchain for the bundled native
+dependencies (SQLite, libgit2, OpenSSL, liblzma, and AWS-LC). Most platforms
+are covered by a stock `cc`; targets without pre-generated AWS-LC bindings
+also need CMake.
 
 ## Install Agent of Empires
 
@@ -37,7 +42,7 @@ The binary will be at `target/release/aoe`.
 To include the web dashboard (browser access):
 
 ```bash
-cargo build --release --features serve
+cargo build --release --features web
 ```
 
 This requires Node.js and npm. The web frontend is built automatically during compilation.

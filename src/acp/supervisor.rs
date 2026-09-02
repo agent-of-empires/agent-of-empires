@@ -4072,7 +4072,7 @@ mod tests {
         let codex_map = [("codex".to_string(), "claude".to_string())].into();
         let cursor_map = [("claude-personal".to_string(), "cursor".to_string())].into();
         // (tool, agent, from registry, detect_as map), one row per guard.
-        let cases: [(&str, &str, &str, bool, &HashMap<String, String>); 9] = [
+        let cases = [
             // Built-in tool on its own registry spec.
             ("s-builtin", "claude", "claude", true, &detect_as),
             // A mapping whose key is itself a built-in changes nothing: the

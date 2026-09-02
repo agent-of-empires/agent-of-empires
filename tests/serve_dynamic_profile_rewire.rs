@@ -13,8 +13,6 @@
 //!   trigger `add_profile_disk_watch` / `remove_profile_disk_watch` / `rename_profile_disk_watch` in production, so this layer guards
 //!   the daemon-boot path.
 
-#![cfg(feature = "serve")]
-
 mod common;
 mod home_isolation;
 
@@ -251,8 +249,7 @@ struct ServeDaemon {
 impl ServeDaemon {
     /// Spawn `aoe serve --no-auth --host 127.0.0.1 --port <free>` against
     /// a fresh `HOME`. Panics on startup failure so the test gives a
-    /// useful diagnostic. The whole file is `#![cfg(feature = "serve")]`,
-    /// so the binary always has the feature enabled at this point.
+    /// useful diagnostic.
     fn spawn() -> Self {
         let aoe = env!("CARGO_BIN_EXE_aoe");
         let home = tempfile::tempdir().expect("home tempdir");
@@ -275,10 +272,7 @@ impl ServeDaemon {
         if !wait_for_port(port, Duration::from_secs(15)) {
             let _ = child.kill();
             let _ = child.wait();
-            panic!(
-                "aoe serve did not bind 127.0.0.1:{} within 15s; likely missing serve feature",
-                port
-            );
+            panic!("aoe serve did not bind 127.0.0.1:{} within 15s", port);
         }
         Self {
             child: Some(child),

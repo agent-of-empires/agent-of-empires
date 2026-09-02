@@ -32,18 +32,38 @@ impl ToolSession {
     /// live and the shorter one's is not. Resolution is skipped entirely rather
     /// than guessing whenever more than one candidate matches.
     pub fn new(session_id: &str, session_title: &str, tool_name: &str) -> Self {
+        Self::from_resolution(session_id, session_title, tool_name, false)
+    }
+
+    /// [`Self::new`] for **render paths**: resolved from the shared snapshot
+    /// only, never refreshing. A stale snapshot yields the derived name until
+    /// the background snapshot poller refreshes it; paint must never wait on
+    /// tmux.
+    pub fn for_display(session_id: &str, session_title: &str, tool_name: &str) -> Self {
+        Self::from_resolution(session_id, session_title, tool_name, true)
+    }
+
+    fn from_resolution(
+        session_id: &str,
+        session_title: &str,
+        tool_name: &str,
+        display_only: bool,
+    ) -> Self {
         // The tool name sits in the prefix, so it discriminates between a
         // session's several tool sub-sessions without reference to the title.
         let prefix = Self::name_prefix(tool_name);
         let suffix = format!("_{}", truncate_id(session_id, 8));
-        let name = crate::tmux::live_session_name(
-            &Self::generate_name(session_id, session_title, tool_name),
-            &crate::tmux::NameShape {
-                prefix: &prefix,
-                suffix: &suffix,
-                excluded_prefixes: &[],
-            },
-        );
+        let derived = Self::generate_name(session_id, session_title, tool_name);
+        let shape = crate::tmux::NameShape {
+            prefix: &prefix,
+            suffix: &suffix,
+            excluded_prefixes: &[],
+        };
+        let name = if display_only {
+            crate::tmux::session_name_for_display(&derived, &shape)
+        } else {
+            crate::tmux::live_session_name(&derived, &shape)
+        };
         Self { name }
     }
 
@@ -202,12 +222,6 @@ impl ToolSession {
 
     pub fn capture_pane(&self, lines: usize) -> Result<String> {
         super::Session::from_name(&self.name).capture_pane(lines)
-    }
-
-    /// Passive-preview capture with the window's other panes composited in;
-    /// see [`super::Session::capture_window_composited`].
-    pub fn capture_window_composited(&self, lines: usize) -> Result<String> {
-        super::Session::from_name(&self.name).capture_window_composited(lines)
     }
 
     fn get_pane_pid(&self) -> Option<u32> {

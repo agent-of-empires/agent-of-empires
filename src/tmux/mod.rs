@@ -40,7 +40,7 @@ use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 /// Environment variable that overrides the tmux socket path. Set by the e2e
@@ -175,6 +175,8 @@ fn socket_from_config_name(name: Option<String>) -> Option<TmuxSocket> {
 /// `Command::new("tmux")` would fall back to the default socket and split state
 /// across two servers.
 pub(crate) fn tmux_command() -> Command {
+    #[cfg(test)]
+    fork_probe::record();
     let mut cmd = Command::new("tmux");
     match tmux_socket() {
         Some(TmuxSocket::Path(path)) => {
@@ -256,19 +258,25 @@ pub struct PaneMetadata {
     /// tmux's last-output timestamp for the pane's window, used to skip a
     /// capture when nothing has been drawn since the last one.
     pub window_activity: Option<i64>,
+    /// Observed `(window_width, window_height)`. Window, not pane: a resize
+    /// by another client changes the window, while pane splits and status-bar
+    /// chrome only redistribute rows inside an unchanged window, so this is
+    /// the signal the passive-resize reconcile can compare against what it
+    /// applied without false mismatches.
+    pub window_size: Option<(u16, u16)>,
 }
 
+static SESSION_REFRESH_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(test)]
 static FORCED_SESSION_CACHE_GUARDS: AtomicUsize = AtomicUsize::new(0);
 
-/// Whether a test owns [`SESSION_CACHE`] through a live [`SessionCacheGuard`],
-/// in which case [`refresh_session_cache`] must leave the forced snapshot
-/// alone. `#[serial_test::serial]` only orders serial tests against each
-/// other, so a parallel test can already be past its staleness check and
-/// blocked on the `list-sessions` fork when the guard forces a snapshot, then
-/// land its write mid-test. On a host with no tmux server that write is
-/// `data: None`, which reads back as [`SessionExistence::Unknown`] and flips
-/// the status assertion the guard was meant to pin.
+/// Whether a test owns SESSION_CACHE through a live SessionCacheGuard, in
+/// which case refresh_session_cache must leave the forced snapshot alone.
+/// serial_test only orders serial tests against each other, so a parallel test
+/// can already be past its staleness check and blocked on the list-sessions
+/// fork when the guard forces a snapshot, then land its write mid-test. On a
+/// host with no tmux server that write is data: None, which reads back as
+/// SessionExistence::Unknown and flips the assertion the guard meant to pin.
 #[cfg(test)]
 fn forced_session_cache_active() -> bool {
     FORCED_SESSION_CACHE_GUARDS.load(Ordering::SeqCst) > 0
@@ -278,31 +286,99 @@ fn forced_session_cache_active() -> bool {
 fn forced_session_cache_active() -> bool {
     false
 }
-
 static SESSION_CACHE: RwLock<SessionCache> = RwLock::new(SessionCache {
     data: None,
     time: None,
+    refresh_id: 0,
+    outcome: SessionCacheRefresh::Unknown,
 });
 
 struct SessionCache {
     data: Option<HashMap<String, i64>>,
     time: Option<Instant>,
+    refresh_id: u64,
+    outcome: SessionCacheRefresh,
 }
 
-/// Shared `tmux list-panes -a` snapshot behind [`pane_dead_for_display`],
-/// mirroring [`SESSION_CACHE`]'s TTL and its `data: None` "the server could
-/// not answer" state.
+/// Shared tmux list-panes snapshot behind pane_dead_for_display, mirroring
+/// SESSION_CACHE's TTL and its data: None "the server could not answer" state.
+static PANE_META_REFRESH_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PANE_META_CACHE: RwLock<PaneMetaCache> = RwLock::new(PaneMetaCache {
     data: None,
     time: None,
+    refresh_id: 0,
 });
 
 struct PaneMetaCache {
-    data: Option<HashMap<String, PaneMetadata>>,
+    data: Option<std::sync::Arc<HashMap<String, PaneMetadata>>>,
     time: Option<Instant>,
+    refresh_id: u64,
 }
-const TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// One wall-clock budget shared by every tmux subprocess in a logical
+/// operation. Composite capture uses this so its layout fallback cannot turn
+/// one stalled preview sample into two consecutive full timeouts.
+pub(crate) struct TmuxCommandDeadline {
+    deadline: Instant,
+    #[cfg(test)]
+    budget: Option<CommandBudget>,
+}
+
+/// Test-only stand-in for the wall clock: the first `commands` runs get the
+/// standard timeout and every later one reports the budget as spent. Lets a
+/// test expire a deadline at a chosen command instead of racing the tmux
+/// forks that precede it.
+#[cfg(test)]
+struct CommandBudget(std::sync::atomic::AtomicI64);
+
+impl TmuxCommandDeadline {
+    pub(crate) fn new() -> Self {
+        Self {
+            deadline: Instant::now() + TMUX_COMMAND_TIMEOUT,
+            #[cfg(test)]
+            budget: None,
+        }
+    }
+    #[cfg(test)]
+    fn with_timeout(timeout: Duration) -> Self {
+        Self {
+            deadline: Instant::now() + timeout,
+            budget: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn expiring_after_commands(commands: i64) -> Self {
+        Self {
+            deadline: Instant::now() + TMUX_COMMAND_TIMEOUT,
+            budget: Some(CommandBudget(std::sync::atomic::AtomicI64::new(commands))),
+        }
+    }
+
+    fn remaining(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(budget) = &self.budget {
+            return if budget.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) > 0 {
+                TMUX_COMMAND_TIMEOUT
+            } else {
+                Duration::ZERO
+            };
+        }
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+
+    pub(crate) fn run(&self, cmd: &mut Command) -> std::io::Result<Output> {
+        let remaining = self.remaining();
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "tmux operation deadline elapsed",
+            ));
+        }
+        run_tmux_command_with_timeout_inner(cmd, remaining)
+    }
+}
 fn run_tmux_command_with_timeout_inner(
     cmd: &mut Command,
     timeout: Duration,
@@ -318,7 +394,7 @@ fn run_tmux_command_with_timeout_inner(
 }
 
 pub(crate) fn run_tmux_command_with_timeout(cmd: &mut Command) -> std::io::Result<Output> {
-    run_tmux_command_with_timeout_inner(cmd, TMUX_COMMAND_TIMEOUT)
+    TmuxCommandDeadline::new().run(cmd)
 }
 
 /// Result of the authoritative `list-sessions` scan performed by
@@ -333,19 +409,17 @@ pub enum SessionCacheRefresh {
     Unknown,
 }
 
-// Field separator for multi-field tmux `-F` format strings. Must be a
-// printable ASCII byte that does not appear in `sanitize_session_name` output
-// (which preserves `[A-Za-z0-9_-]` and replaces everything else with `_`).
-// tmux 3.4 mangles whitespace (tab, newline become `_`) and octal-escapes
-// control bytes (ASCII 0x1F is emitted as the literal 4-char sequence
-// `\037`), so anything non-printable is unreliable. Pipe is safe.
+// Field separator for the fixed tmux -F head. Must be printable ASCII and
+// absent from sanitize_session_name output (which preserves [A-Za-z0-9_-]
+// and replaces everything else with _). C0 bytes are reserved for the tail,
+// whose parser handles tmux 3.4's octal escaping explicitly.
 const FIELD_SEP: char = '|';
-/// Separator for the two trailing fields. `pane_start_command` may itself
-/// contain [`FIELD_SEP`], which is why it was last in the original format, and
-/// a pane title may contain anything its program writes. A C0 control byte
-/// belongs to neither: terminals strip it from an OSC string, and it cannot
-/// appear in a shell command line tmux echoes back.
+/// Separator for the two trailing fields. pane_start_command may itself
+/// contain FIELD_SEP, which is why it was last in the original format. A C0
+/// control byte cannot appear in a shell command or terminal title. tmux 3.4
+/// escapes it as ESCAPED_TAIL_SEP, while newer versions emit it raw.
 const TAIL_SEP: char = '\x1f';
+const ESCAPED_TAIL_SEP: &str = r"\037";
 
 /// tmux exits non-zero with `no server running on <socket>` on stderr when
 /// there is no server on the resolved socket (zero sessions, or the socket's
@@ -378,7 +452,39 @@ fn tmux_no_server_running(stderr: &[u8]) -> bool {
     })
 }
 
+fn next_refresh_id(counter: &std::sync::atomic::AtomicU64) -> u64 {
+    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+fn publish_session_cache(
+    refresh_id: u64,
+    data: Option<HashMap<String, i64>>,
+    outcome: SessionCacheRefresh,
+    respect_forced_guard: bool,
+) -> SessionCacheRefresh {
+    let Ok(mut cache) = SESSION_CACHE.write() else {
+        return SessionCacheRefresh::Unknown;
+    };
+    if respect_forced_guard && forced_session_cache_active() {
+        return outcome;
+    }
+    if refresh_id <= cache.refresh_id {
+        return cache.outcome;
+    }
+    // An unexpected refresh failure says nothing about the last successful
+    // session list. Keep that list for display-only lookups while exposing the
+    // failed outcome to authoritative lifecycle callers. A populated response
+    // replaces it, and a recognized no-server response clears it.
+    if outcome != SessionCacheRefresh::Unknown {
+        cache.data = data;
+    }
+    cache.time = Some(Instant::now());
+    cache.refresh_id = refresh_id;
+    cache.outcome = outcome;
+    outcome
+}
 pub fn refresh_session_cache() -> SessionCacheRefresh {
+    let refresh_id = next_refresh_id(&SESSION_REFRESH_ID);
     let start = Instant::now();
     let mut command = tmux_query_command();
     command.args(["list-sessions", "-F", "#{session_name}|#{session_activity}"]);
@@ -424,16 +530,7 @@ pub fn refresh_session_cache() -> SessionCacheRefresh {
         "session cache refreshed",
     );
 
-    // Checked under the write lock, which `SessionCacheGuard::capture` also
-    // takes: either the guard registers first and this refresh skips, or this
-    // write lands first and the guard captures it as the state to restore.
-    if let Ok(mut cache) = SESSION_CACHE.write() {
-        if !forced_session_cache_active() {
-            cache.data = new_data;
-            cache.time = Some(Instant::now());
-        }
-    }
-    outcome
+    publish_session_cache(refresh_id, new_data, outcome, true)
 }
 
 /// Classify the currently selected agent session without letting an
@@ -675,23 +772,21 @@ impl LiveSessionSnapshot {
         snapshot
     }
 
-    /// Live session names, or `None` when the tmux server could not be reached.
+    /// Live session names, or None when the tmux server could not be reached.
+    /// The fresh observation also warms the display cache, so TUI startup can
+    /// reuse this pass instead of issuing another list-sessions command.
     pub(crate) fn names(&self) -> Option<&[String]> {
         self.names
             .get_or_init(|| {
-                tmux_query_command()
-                    .args(["list-sessions", "-F", "#{session_name}"])
-                    .output()
-                    .ok()
-                    .filter(|out| out.status.success())
-                    .map(|out| {
-                        String::from_utf8_lossy(&out.stdout)
-                            .lines()
-                            .map(str::trim)
-                            .filter(|l| !l.is_empty())
-                            .map(String::from)
-                            .collect()
-                    })
+                if refresh_session_cache() != SessionCacheRefresh::Populated {
+                    return None;
+                }
+                SESSION_CACHE.read().ok().and_then(|cache| {
+                    cache
+                        .data
+                        .as_ref()
+                        .map(|sessions| sessions.keys().cloned().collect())
+                })
             })
             .as_deref()
     }
@@ -860,15 +955,46 @@ pub(crate) fn live_session_name(derived: &str, shape: &NameShape) -> String {
     session_name_from_cache(derived, shape).unwrap_or_else(|| derived.to_string())
 }
 
+/// Display variant of live_session_name, answered from the last successful
+/// snapshot only and never refreshing. Display keeps using that map while it
+/// is stale or an unexpected refresh fails; only a populated miss or recognized
+/// no-server response changes visible liveness. Paint must never wait on tmux,
+/// so this path has no synchronous fallback.
+pub(crate) fn session_name_for_display(derived: &str, shape: &NameShape) -> String {
+    let Ok(cache) = SESSION_CACHE.read() else {
+        return derived.to_string();
+    };
+    resolve_session_name_from_snapshot(cache.data.as_ref(), derived, shape)
+}
+
+/// `session_name_for_display` for the agent pane.
+pub(crate) fn agent_session_name_for_display(session_id: &str, derived: &str) -> String {
+    let suffix = id_suffix(session_id);
+    session_name_for_display(derived, &NameShape::agent(&suffix))
+}
+
 /// `live_session_name` for the agent pane.
 pub fn live_agent_session_name(session_id: &str, derived: &str) -> String {
     let suffix = id_suffix(session_id);
     live_session_name(derived, &NameShape::agent(&suffix))
 }
 
-/// Resolve from the current cache snapshot without spawning. `None` only when
-/// the snapshot is stale or the lock is poisoned, so the caller knows a refresh
-/// could still change the answer.
+fn resolve_session_name_from_snapshot(
+    names: Option<&HashMap<String, i64>>,
+    derived: &str,
+    shape: &NameShape,
+) -> String {
+    let Some(names) = names else {
+        return derived.to_string();
+    };
+    if names.contains_key(derived) {
+        return derived.to_string();
+    }
+    resolve_session_name(names.keys().map(String::as_str), derived, shape)
+}
+
+/// Resolve from the current authoritative cache snapshot without spawning.
+/// Returns None only when the snapshot is stale or the lock is poisoned, so
 fn session_name_from_cache(derived: &str, shape: &NameShape) -> Option<String> {
     let cache = SESSION_CACHE.read().ok()?;
     let fresh = cache
@@ -878,21 +1004,11 @@ fn session_name_from_cache(derived: &str, shape: &NameShape) -> Option<String> {
     if !fresh {
         return None;
     }
-    // A fresh snapshot with no data means the last `list-sessions` produced
-    // either no-server or an unexpected failure. Neither selects a live name,
-    // and this is an answer rather than a stale snapshot: returning `None`
-    // would make every caller re-refresh into the same result, one subprocess
-    // per call from render loops.
-    let Some(names) = cache.data.as_ref() else {
-        return Some(derived.to_string());
-    };
-    // Fast path: the derived name is live, which is the overwhelmingly common
-    // case, so skip the scan.
-    if names.contains_key(derived) {
+    if cache.outcome == SessionCacheRefresh::Unknown {
         return Some(derived.to_string());
     }
-    Some(resolve_session_name(
-        names.keys().map(String::as_str),
+    Some(resolve_session_name_from_snapshot(
+        cache.data.as_ref(),
         derived,
         shape,
     ))
@@ -959,21 +1075,22 @@ fn stop_aoe_sessions<'a>(
 /// successful empty map is authoritative and means there are no panes.
 pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
     let start = Instant::now();
-    let output = tmux_query_command()
-        .args([
-            "list-panes",
-            "-a",
-            "-F",
-            // `pane_pid` stays at the end of the pipe-separated head, where
-            // the parser splits it back off the start command's tail; the two
-            // fields after it ride [`TAIL_SEP`], because a start command or a
-            // title may carry a pipe of its own.
-            concat!(
-                "#{session_name}|#{pane_index}|#{pane_dead}|#{pane_current_command}",
-                "|#{pane_start_command}|#{pane_pid}\x1f#{window_activity}\x1f#{pane_title}"
-            ),
-        ])
-        .output();
+    let mut command = tmux_query_command();
+    command.args([
+        "list-panes",
+        "-a",
+        "-F",
+        // `pane_pid` stays at the end of the pipe-separated head, where
+        // the parser splits it back off the start command's tail; the two
+        // fields after it ride [`TAIL_SEP`], because a start command or a
+        // title may carry a pipe of its own.
+        concat!(
+            "#{session_name}|#{pane_index}|#{pane_dead}|#{window_width}|#{window_height}",
+            "|#{pane_current_command}",
+            "|#{pane_start_command}|#{pane_pid}\x1f#{window_activity}\x1f#{pane_title}"
+        ),
+    ]);
+    let output = run_tmux_command_with_timeout(&mut command);
 
     let result: anyhow::Result<HashMap<String, PaneMetadata>> = match output {
         Ok(out) if out.status.success() => {
@@ -1066,27 +1183,78 @@ pub fn attached_session_names() -> anyhow::Result<HashSet<String>> {
     }
 }
 
+fn find_escaped_tail_sep(line: &str, from: usize) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let separator = ESCAPED_TAIL_SEP.as_bytes();
+    let mut offset = from;
+    while offset + separator.len() <= bytes.len() {
+        if bytes[offset..].starts_with(separator) {
+            let preceding_slashes = bytes[..offset]
+                .iter()
+                .rev()
+                .take_while(|&&byte| byte == b'\\')
+                .count();
+            if preceding_slashes % 2 == 0 {
+                return Some(offset);
+            }
+        }
+        offset += 1;
+    }
+    None
+}
+
+fn split_pane_metadata_tail(line: &str) -> (&str, Option<&str>, Option<&str>) {
+    if let Some(first) = line.find(TAIL_SEP) {
+        let rest = &line[first + TAIL_SEP.len_utf8()..];
+        return match rest.find(TAIL_SEP) {
+            Some(second) => (
+                &line[..first],
+                Some(&rest[..second]),
+                Some(&rest[second + 1..]),
+            ),
+            None => (&line[..first], Some(rest), None),
+        };
+    }
+
+    let Some(first) = find_escaped_tail_sep(line, 0) else {
+        return (line, None, None);
+    };
+    let rest_start = first + ESCAPED_TAIL_SEP.len();
+    match find_escaped_tail_sep(line, rest_start) {
+        Some(second) => (
+            &line[..first],
+            Some(&line[rest_start..second]),
+            Some(&line[second + ESCAPED_TAIL_SEP.len()..]),
+        ),
+        None => (&line[..first], Some(&line[rest_start..]), None),
+    }
+}
+
 /// Parse the output of `tmux list-panes -a` into a map of session name to pane metadata.
 /// Filters to aoe sessions, pane index 0, and takes only the first window per session.
 fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
     let mut map = HashMap::new();
 
     for line in output.lines() {
-        // The two trailing fields ride their own separator (see [`TAIL_SEP`]),
-        // so the pipe-separated head parses exactly as it did before them; a
-        // line with no tail is all head.
-        let mut tail = line.splitn(3, TAIL_SEP);
-        let line = tail.next().unwrap_or(line);
-        let window_activity = tail.next().and_then(|a| a.trim().parse::<i64>().ok());
-        let pane_title = tail.next().unwrap_or("");
-        let mut parts = line.splitn(5, FIELD_SEP);
+        // The two trailing fields ride their own separator (see TAIL_SEP), so
+        // the pipe-separated head parses exactly as it did before them; a line
+        // with no tail is all head. Accept tmux 3.4's octal rendering as well
+        // as the raw byte emitted by newer versions.
+        let (line, activity, pane_title) = split_pane_metadata_tail(line);
+        let window_activity = activity.and_then(|a| a.trim().parse::<i64>().ok());
+        let pane_title = pane_title.unwrap_or("");
+        let mut parts = line.splitn(7, FIELD_SEP);
         let (
             Some(session_name),
             Some(pane_index),
             Some(pane_dead),
+            Some(window_width),
+            Some(window_height),
             Some(pane_current_command),
             Some(rest),
         ) = (
+            parts.next(),
+            parts.next(),
             parts.next(),
             parts.next(),
             parts.next(),
@@ -1096,6 +1264,10 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
         else {
             continue;
         };
+        let window_size = window_width
+            .parse::<u16>()
+            .ok()
+            .zip(window_height.parse::<u16>().ok());
         // The start command may itself contain the separator, so the pid is
         // split off the tail rather than the command off the head.
         let (pane_start_command, pane_pid) = match rest.rsplit_once(FIELD_SEP) {
@@ -1131,11 +1303,23 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
                     .contains(utils::PANE_ENV_FILE_PREFIX),
                 pane_title: (!pane_title.is_empty()).then(|| pane_title.to_string()),
                 window_activity,
+                window_size,
             },
         );
     }
 
     map
+}
+
+/// Observed window geometry for `session_name` from the shared list-panes
+/// snapshot, with the snapshot's observation time: the instant captured
+/// before the `list-panes` fork, not when the result was published. `None`
+/// when the snapshot is absent, failed, or does not include the session.
+pub(crate) fn observed_window_size_from_cache(session_name: &str) -> Option<((u16, u16), Instant)> {
+    let cache = PANE_META_CACHE.read().ok()?;
+    let time = cache.time?;
+    let size = cache.data.as_ref()?.get(session_name)?.window_size?;
+    Some((size, time))
 }
 
 /// Test-only: inject a synthetic session name into the cache so
@@ -1154,6 +1338,91 @@ pub fn test_inject_session_into_cache(name: &str) {
     }
 }
 
+/// Test-only: publish a pane snapshot carrying a window size for `name`, so
+/// the render-side observed-size invalidation can be exercised without a
+/// real tmux server. Observed "now", the common case.
+#[cfg(test)]
+pub fn test_inject_pane_window_size(name: &str, size: (u16, u16)) {
+    test_inject_pane_window_size_at(name, size, Instant::now());
+}
+
+/// Test-only: like [`test_inject_pane_window_size`], but with an explicit
+/// observation time. Routes through [`publish_pane_meta_cache`], the real
+/// publication path, so a regression that re-stamped `cache.time` at publish
+/// instead of observation is caught by the tests using this.
+#[cfg(test)]
+pub fn test_inject_pane_window_size_at(name: &str, size: (u16, u16), taken_at: Instant) {
+    let map = {
+        let Ok(cache) = PANE_META_CACHE.read() else {
+            return;
+        };
+        let mut map = cache.data.as_deref().cloned().unwrap_or_default();
+        map.insert(
+            name.to_string(),
+            PaneMetadata {
+                pane_dead: false,
+                pane_current_command: None,
+                pane_start_command_is_protected: false,
+                pane_pid: None,
+                pane_title: None,
+                window_activity: None,
+                window_size: Some(size),
+            },
+        );
+        map
+    };
+    publish_pane_meta_cache(
+        next_refresh_id(&PANE_META_REFRESH_ID),
+        Some(std::sync::Arc::new(map)),
+        taken_at,
+    );
+}
+
+/// Test-only instrumentation at the process's single tmux entry point.
+///
+/// `tmux_command()` records one hit per invocation on the *current* thread
+/// while that thread is armed, so a paint-path regression test can assert
+/// zero forks from the render thread while worker threads (capture, live
+/// send) fork freely. Never compiled outside `cfg(test)`.
+#[cfg(test)]
+pub(crate) mod fork_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+        static COUNT: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Arms fork counting for the calling thread until the guard drops.
+    pub(crate) struct Guard;
+
+    pub(crate) fn arm() -> Guard {
+        ARMED.with(|a| a.set(true));
+        Guard
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ARMED.with(|a| a.set(false));
+        }
+    }
+
+    pub(crate) fn record() {
+        if ARMED.with(Cell::get) {
+            COUNT.with(|c| c.set(c.get() + 1));
+        }
+    }
+
+    /// Returns the armed thread's fork count since the last call.
+    pub(crate) fn take() -> u64 {
+        COUNT.with(|c| {
+            let n = c.get();
+            c.set(0);
+            n
+        })
+    }
+}
+
 /// Test-only RAII guard for tests that force [`SESSION_CACHE`] into a known
 /// state (e.g. simulating a server-unreachable snapshot for
 /// [`probe_session_existence`]). Captures the prior cache on construction and
@@ -1164,18 +1433,35 @@ pub fn test_inject_session_into_cache(name: &str) {
 pub(crate) struct SessionCacheGuard {
     prev_data: Option<HashMap<String, i64>>,
     prev_time: Option<Instant>,
+    prev_refresh_id: u64,
+    prev_outcome: SessionCacheRefresh,
+    forced_snapshot: bool,
 }
 
 #[cfg(test)]
 impl SessionCacheGuard {
     pub(crate) fn capture() -> Self {
-        // Write lock, not read: registering the guard and reading the state
-        // to restore must be one step against a concurrent refresh.
+        Self::capture_inner(true)
+    }
+
+    /// Save and restore the cache without suppressing refresh publication.
+    pub(crate) fn capture_restore_only() -> Self {
+        Self::capture_inner(false)
+    }
+
+    fn capture_inner(forced_snapshot: bool) -> Self {
+        // The lock makes guard registration and the state snapshot atomic
+        // against a concurrent refresh publisher.
         let cache = SESSION_CACHE.write().expect("session cache lock");
-        FORCED_SESSION_CACHE_GUARDS.fetch_add(1, Ordering::SeqCst);
+        if forced_snapshot {
+            FORCED_SESSION_CACHE_GUARDS.fetch_add(1, Ordering::SeqCst);
+        }
         Self {
             prev_data: cache.data.clone(),
             prev_time: cache.time,
+            prev_refresh_id: cache.refresh_id,
+            prev_outcome: cache.outcome,
+            forced_snapshot,
         }
     }
 
@@ -1185,6 +1471,7 @@ impl SessionCacheGuard {
         if let Ok(mut cache) = SESSION_CACHE.write() {
             cache.data = None;
             cache.time = Some(Instant::now());
+            cache.outcome = SessionCacheRefresh::Unknown;
         }
     }
 
@@ -1193,6 +1480,16 @@ impl SessionCacheGuard {
         if let Ok(mut cache) = SESSION_CACHE.write() {
             cache.data = Some(names.iter().map(|n| (n.to_string(), 0)).collect());
             cache.time = Some(Instant::now());
+            cache.outcome = SessionCacheRefresh::Populated;
+        }
+    }
+
+    /// Force an EXPIRED snapshot with data intact: what the shared cache
+    /// looks like just past [`CACHE_TTL`] after a successful refresh. Paint
+    /// must answer from it anyway instead of re-forking.
+    pub(crate) fn force_stale(&self) {
+        if let Ok(mut cache) = SESSION_CACHE.write() {
+            cache.time = Some(Instant::now() - CACHE_TTL - Duration::from_secs(1));
         }
     }
 }
@@ -1207,8 +1504,12 @@ impl Drop for SessionCacheGuard {
         if let Ok(cache) = cache.as_mut() {
             cache.data = self.prev_data.take();
             cache.time = self.prev_time;
+            cache.refresh_id = self.prev_refresh_id;
+            cache.outcome = self.prev_outcome;
         }
-        FORCED_SESSION_CACHE_GUARDS.fetch_sub(1, Ordering::SeqCst);
+        if self.forced_snapshot {
+            FORCED_SESSION_CACHE_GUARDS.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 }
 
@@ -1217,8 +1518,9 @@ impl Drop for SessionCacheGuard {
 /// into a later test. Pair with `#[serial_test::serial]`.
 #[cfg(test)]
 pub(crate) struct PaneMetaCacheGuard {
-    prev_data: Option<HashMap<String, PaneMetadata>>,
+    prev_data: Option<std::sync::Arc<HashMap<String, PaneMetadata>>>,
     prev_time: Option<Instant>,
+    prev_refresh_id: u64,
 }
 
 #[cfg(test)]
@@ -1228,6 +1530,7 @@ impl PaneMetaCacheGuard {
         Self {
             prev_data: cache.data.clone(),
             prev_time: cache.time,
+            prev_refresh_id: cache.refresh_id,
         }
     }
 
@@ -1239,14 +1542,21 @@ impl PaneMetaCacheGuard {
             cache.time = Some(Instant::now());
         }
     }
+    /// Force an EXPIRED snapshot: the past-`CACHE_TTL` state that paint must
+    /// answer from without re-forking once display helpers are cache-only.
+    pub(crate) fn force_stale(&self) {
+        if let Ok(mut cache) = PANE_META_CACHE.write() {
+            cache.time = Some(Instant::now() - CACHE_TTL - Duration::from_secs(1));
+        }
+    }
 }
-
 #[cfg(test)]
 impl Drop for PaneMetaCacheGuard {
     fn drop(&mut self) {
         if let Ok(mut cache) = PANE_META_CACHE.write() {
             cache.data = self.prev_data.take();
             cache.time = self.prev_time;
+            cache.refresh_id = self.prev_refresh_id;
         }
     }
 }
@@ -1258,7 +1568,9 @@ const CACHE_TTL: Duration = Duration::from_secs(2);
 pub fn session_exists_from_cache(name: &str) -> Option<bool> {
     let cache = SESSION_CACHE.read().ok()?;
 
-    if cache.time.map(|t| t.elapsed() > CACHE_TTL).unwrap_or(true) {
+    if cache.time.map(|t| t.elapsed() > CACHE_TTL).unwrap_or(true)
+        || cache.outcome == SessionCacheRefresh::Unknown
+    {
         return None;
     }
 
@@ -1305,22 +1617,15 @@ fn session_existence_from_cache(name: &str) -> Option<SessionExistence> {
     if !fresh {
         return None;
     }
+    if cache.outcome == SessionCacheRefresh::Unknown {
+        return Some(SessionExistence::Unknown);
+    }
 
     Some(match &cache.data {
         Some(map) if map.contains_key(name) => SessionExistence::Present,
         Some(_) => SessionExistence::Absent,
-        // The last refresh could not produce a session list (recognized
-        // no-server response or unexpected query failure): a definitive
-        // "can't tell" for status polling, not "absent". Do not fall back to a
-        // fresh `has-session` probe here; during an outage that call fails the
-        // same way and just burns a subprocess per session per poll for no new
-        // information.
-        //
-        // Resolving this arm to `Unknown` freezes every polled instance at its
-        // prior status until the bounded-window escalation in
-        // `update_status_with_metadata_inner` kicks in; do not collapse it to
-        // `Absent`. Rekeying separately consumes `SessionCacheRefresh` so it
-        // can treat a recognized no-server result as an absent rename target.
+        // A recognized no-server response is conservative for lifecycle
+        // callers: it still means the session cannot be proven absent.
         None => SessionExistence::Unknown,
     })
 }
@@ -1355,15 +1660,15 @@ pub fn session_exists(name: &str) -> bool {
         return true;
     }
 
-    tmux_command()
-        .args(["has-session", "-t", name])
-        .output()
+    let mut command = tmux_command();
+    command.args(["has-session", "-t", name]);
+    run_tmux_command_with_timeout(&mut command)
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
 /// Session liveness for a **render path**, answered from the shared snapshot
-/// and never from a per-name probe.
+/// only: never a per-name probe, never a synchronous refresh.
 ///
 /// [`session_exists`] falls through to a live `has-session` on a cache miss so
 /// teardown and drift decisions can't act on a cached false negative. A row
@@ -1373,15 +1678,19 @@ pub fn session_exists(name: &str) -> bool {
 /// rows read `Instance.status` straight from the poller's batched snapshot.
 ///
 /// The trade is that a session created since the last scan reads as absent for
-/// up to `CACHE_TTL`. Call sites that start or kill a pane already force a
-/// [`refresh_session_cache`], so the glyph flips immediately there; the TTL
-/// only covers panes created behind this process's back.
-///
-/// An unreachable tmux server resolves to `false` (nothing to draw as live)
-/// without re-forking per row, because [`probe_session_existence`] treats a
-/// fresh "server did not answer" snapshot as an answer.
+/// up to `CACHE_TTL`, and an expired snapshot reads as absent until the
+/// background [`spawn_snapshot_poller`] refreshes it. Call sites that start or
+/// kill a pane already force a [`refresh_session_cache`], so the glyph flips
+/// immediately there; the poller covers panes created behind this process's
+/// back. Paint must never wait on tmux, so there is no synchronous fallback.
+/// An expired or unexpectedly failed refresh retains the last successful map;
+/// a populated miss or recognized no-server response removes the session.
 pub fn session_exists_for_display(name: &str) -> bool {
-    matches!(probe_session_existence(name), SessionExistence::Present)
+    SESSION_CACHE
+        .read()
+        .ok()
+        .and_then(|cache| cache.data.as_ref().map(|map| map.contains_key(name)))
+        .unwrap_or(false)
 }
 
 /// Pane-dead state for a **render path**, from a shared `list-panes -a`
@@ -1398,10 +1707,6 @@ pub fn session_exists_for_display(name: &str) -> bool {
 /// than "everything is dead". Callers gate on existence first, so a missing
 /// key is an absent session rather than a live pane.
 pub fn pane_dead_for_display(name: &str) -> bool {
-    if let Some(dead) = pane_dead_from_cache(name) {
-        return dead;
-    }
-    refresh_pane_meta_cache();
     pane_dead_from_cache(name).unwrap_or(false)
 }
 
@@ -1425,16 +1730,383 @@ fn pane_dead_from_cache(name: &str) -> Option<bool> {
 }
 
 /// Repopulate [`PANE_META_CACHE`]. The timestamp is stamped even when the
-/// query fails, so a tmux outage costs one fork per [`CACHE_TTL`] instead of
-/// one per row per frame.
-fn refresh_pane_meta_cache() {
-    let data = batch_pane_metadata().ok();
-    if let Ok(mut cache) = PANE_META_CACHE.write() {
-        cache.data = data;
-        cache.time = Some(Instant::now());
+/// query fails, so a tmux outage costs one fork per poller cycle
+/// ([`CACHE_TTL`] / 2) instead of one per row per frame.
+///
+/// `taken_at` must be captured BEFORE the `list-panes` fork: consumers
+/// compare it against their own write times (`passive_synced_contradicted`),
+/// and a publish-time stamp would let a listing that read pre-resize sizes,
+/// then stalled past the resize's adoption, masquerade as a fresher
+/// observation.
+fn publish_pane_meta_cache(
+    refresh_id: u64,
+    data: Option<std::sync::Arc<HashMap<String, PaneMetadata>>>,
+    taken_at: Instant,
+) -> bool {
+    let Ok(mut cache) = PANE_META_CACHE.write() else {
+        return false;
+    };
+    if refresh_id <= cache.refresh_id {
+        return false;
+    }
+    cache.data = data;
+    cache.time = Some(taken_at);
+    cache.refresh_id = refresh_id;
+    true
+}
+
+pub(crate) fn refresh_pane_meta_cache(
+) -> anyhow::Result<std::sync::Arc<HashMap<String, PaneMetadata>>> {
+    let refresh_id = next_refresh_id(&PANE_META_REFRESH_ID);
+    let taken_at = Instant::now();
+    let result = batch_pane_metadata().map(std::sync::Arc::new);
+    if publish_pane_meta_cache(refresh_id, result.as_ref().ok().cloned(), taken_at) {
+        return result;
+    }
+    PANE_META_CACHE
+        .read()
+        .ok()
+        .and_then(|cache| cache.data.clone())
+        .ok_or_else(|| anyhow::anyhow!("a newer pane metadata refresh is unavailable"))
+}
+
+fn snapshot_refresh_due(last_refresh: Option<Instant>) -> bool {
+    last_refresh.is_none_or(|at| at.elapsed() >= CACHE_TTL / 2)
+}
+
+fn session_snapshot_refresh_due() -> bool {
+    SESSION_CACHE
+        .read()
+        .map_or(true, |cache| snapshot_refresh_due(cache.time))
+}
+
+pub(crate) fn refresh_session_cache_if_due() {
+    if session_snapshot_refresh_due() {
+        refresh_session_cache();
     }
 }
 
+fn pane_snapshot_refresh_due() -> bool {
+    PANE_META_CACHE
+        .read()
+        .map_or(true, |cache| snapshot_refresh_due(cache.time))
+}
+/// One queued passive preview resize, pushed by the render thread when its
+/// debounce fires and executed by the dedicated passive-resize worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PassiveResizeIntent {
+    pub session_id: String,
+    pub session_name: String,
+    pub cols: u16,
+    pub rows: u16,
+    /// Resize before any queued non-priority work: this is the session the
+    /// user is currently viewing, so its pane must be correct first.
+    pub priority: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PassiveResizeWork {
+    intent: PassiveResizeIntent,
+    generation: u64,
+}
+
+/// A passive resize the worker finished. The render thread consumes these to
+/// adopt the per-session (cols, rows) dedup on success, or to park a declined
+/// geometry so background sessions get one attempt per geometry change
+/// instead of a per-frame retry loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PassiveResizeDone {
+    pub session_id: String,
+    pub cols: u16,
+    pub rows: u16,
+    /// The window row count actually applied (`rows` plus status-bar chrome)
+    /// so render can later spot an external resize by comparing the observed
+    /// window size against `(cols, this)`. `None` when the resize did not
+    /// happen: the session is missing, a client is attached, a size owner is
+    /// active, or tmux errored.
+    pub applied_window_rows: Option<u16>,
+    generation: u64,
+}
+
+/// Geometry the worker is executing (or has finished, pending render
+/// adoption). Suppresses identical re-queues until the completion is adopted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PassiveResizeTicket {
+    session_id: String,
+    cols: u16,
+    rows: u16,
+    generation: u64,
+}
+
+static PASSIVE_RESIZE_INTENTS: Mutex<Vec<PassiveResizeWork>> = Mutex::new(Vec::new());
+static PASSIVE_RESIZE_DONES: Mutex<Vec<PassiveResizeDone>> = Mutex::new(Vec::new());
+static PASSIVE_RESIZE_IN_FLIGHT: Mutex<Vec<PassiveResizeTicket>> = Mutex::new(Vec::new());
+static PASSIVE_RESIZE_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+static PASSIVE_RESIZE_WORKER_THREAD: OnceLock<std::thread::Thread> = OnceLock::new();
+#[cfg(test)]
+thread_local! {
+    static PASSIVE_RESIZE_EXECUTION_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Replace any queued resize for the same session with the latest geometry.
+/// Paint can queue every frame while the pending slot stays armed; an exact
+/// in-flight geometry is ignored until render consumes its completion. A
+/// different geometry supersedes the pending slot. This bounds the queue by
+/// the number of sessions even if the worker is delayed or restarts.
+fn queue_latest_passive_resize(
+    queue: &mut Vec<PassiveResizeWork>,
+    in_flight: &[PassiveResizeTicket],
+    work: PassiveResizeWork,
+) {
+    // Any newly wanted geometry supersedes the queued one for this session,
+    // even when it returns to the currently in-flight geometry.
+    let intent = &work.intent;
+    queue.retain(|prev| prev.intent.session_id != intent.session_id);
+    if in_flight.iter().any(|active| {
+        active.session_id == intent.session_id
+            && active.cols == intent.cols
+            && active.rows == intent.rows
+    }) {
+        return;
+    }
+    if work.intent.priority {
+        let at = queue
+            .iter()
+            .position(|prev| !prev.intent.priority)
+            .unwrap_or(queue.len());
+        queue.insert(at, work);
+    } else {
+        queue.push(work);
+    }
+}
+
+/// Queue a passive preview resize for its worker. Non-blocking by contract:
+/// this is called from paint. Spawns the worker on first use (a fresh worker
+/// drains the queue before its first park, so no wakeup is lost).
+pub(crate) fn queue_passive_resize(intent: PassiveResizeIntent) {
+    spawn_passive_resize_worker();
+    {
+        let mut queue = PASSIVE_RESIZE_INTENTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let work = PassiveResizeWork {
+            intent,
+            generation: PASSIVE_RESIZE_GENERATION
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        };
+        let in_flight = PASSIVE_RESIZE_IN_FLIGHT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        queue_latest_passive_resize(&mut queue, &in_flight, work);
+    }
+    if let Some(thread) = PASSIVE_RESIZE_WORKER_THREAD.get() {
+        thread.unpark();
+    }
+}
+
+fn remove_pending_passive_resize(queue: &mut Vec<PassiveResizeWork>, session_id: &str) {
+    queue.retain(|work| work.intent.session_id != session_id);
+}
+
+/// Cancel queued geometry once render observes that the completed geometry is
+/// already the one wanted. Any other pending size for this session is stale.
+pub(crate) fn cancel_pending_passive_resize(session_id: &str) {
+    let mut queue = PASSIVE_RESIZE_INTENTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    remove_pending_passive_resize(&mut queue, session_id);
+}
+
+/// Drain completions and release matching in-flight geometry only when render
+/// can adopt the dedup. A newer geometry for the same session remains active.
+fn take_current_passive_completions(
+    in_flight: &mut Vec<PassiveResizeTicket>,
+    dones: Vec<PassiveResizeDone>,
+) -> Vec<PassiveResizeDone> {
+    let current: Vec<_> = dones
+        .into_iter()
+        .filter(|done| {
+            in_flight
+                .iter()
+                .any(|active| active.generation == done.generation)
+        })
+        .collect();
+    in_flight.retain(|active| {
+        !current
+            .iter()
+            .any(|done| active.generation == done.generation)
+    });
+    current
+}
+
+pub(crate) fn take_passive_resize_dones() -> Vec<PassiveResizeDone> {
+    let dones = {
+        let mut slot = PASSIVE_RESIZE_DONES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *slot)
+    };
+    let mut in_flight = PASSIVE_RESIZE_IN_FLIGHT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    take_current_passive_completions(&mut in_flight, dones)
+}
+
+/// Execute one queued passive resize under an atomic final tmux guard. The
+/// worker first rejects a missing session; the Session helper then fences both
+/// a newly attached client and a size-owner takeover at resize execution. A
+/// resize the guard refuses (or that errors) still completes, as declined, so
+/// render can park the geometry instead of retrying it every frame.
+fn execute_passive_resize(work: &PassiveResizeWork) -> PassiveResizeDone {
+    let intent = &work.intent;
+    let deadline = TmuxCommandDeadline::new();
+    let session = Session::from_name(&intent.session_name);
+    let applied_window_rows = if session.exists_with_deadline(&deadline) {
+        session.resize_window_if_detached_without_active_owner_after_exists_with_deadline(
+            intent.cols,
+            intent.rows,
+            &deadline,
+        )
+    } else {
+        None
+    };
+    PassiveResizeDone {
+        session_id: intent.session_id.clone(),
+        cols: intent.cols,
+        rows: intent.rows,
+        applied_window_rows,
+        generation: work.generation,
+    }
+}
+
+fn publish_latest_passive_resize_done(dones: &mut Vec<PassiveResizeDone>, done: PassiveResizeDone) {
+    dones.retain(|previous| previous.session_id != done.session_id);
+    dones.push(done);
+}
+
+/// Pop the head of the queue. One item at a time, not a batch snapshot: a
+/// priority intent (the session the user is viewing) queued mid-drain is
+/// front-inserted and picked on the very next iteration instead of waiting
+/// out a fleet-sized batch.
+fn take_next_passive_resize() -> Option<PassiveResizeWork> {
+    let mut queue = PASSIVE_RESIZE_INTENTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if queue.is_empty() {
+        None
+    } else {
+        Some(queue.remove(0))
+    }
+}
+
+fn execute_passive_resizes() {
+    #[cfg(test)]
+    PASSIVE_RESIZE_EXECUTION_COUNT.with(|count| count.set(count.get() + 1));
+    while let Some(work) = take_next_passive_resize() {
+        {
+            let intent = &work.intent;
+            let mut in_flight = PASSIVE_RESIZE_IN_FLIGHT
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            in_flight.retain(|active| active.session_id != intent.session_id);
+            in_flight.push(PassiveResizeTicket {
+                session_id: intent.session_id.clone(),
+                cols: intent.cols,
+                rows: intent.rows,
+                generation: work.generation,
+            });
+        }
+        let done = execute_passive_resize(&work);
+        let mut dones = PASSIVE_RESIZE_DONES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        publish_latest_passive_resize_done(&mut dones, done);
+    }
+}
+fn clear_all_passive_resizes_in_flight() {
+    PASSIVE_RESIZE_IN_FLIGHT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+}
+
+fn spawn_passive_resize_worker() {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if STARTED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    let spawn_result = std::thread::Builder::new()
+        .name("aoe-passive-resize".to_string())
+        .spawn(|| {
+            let _ = PASSIVE_RESIZE_WORKER_THREAD.set(std::thread::current());
+            loop {
+                if std::panic::catch_unwind(execute_passive_resizes).is_err() {
+                    clear_all_passive_resizes_in_flight();
+                    tracing::error!(
+                        target: "tmux.cache",
+                        "passive resize worker cycle panicked; retrying"
+                    );
+                }
+                std::thread::park();
+            }
+        });
+    if let Err(error) = spawn_result {
+        STARTED.store(false, std::sync::atomic::Ordering::Release);
+        tracing::warn!(
+            target: "tmux.cache",
+            %error,
+            "failed to spawn passive resize worker; a later call may retry"
+        );
+    }
+}
+
+fn refresh_display_snapshots() {
+    refresh_session_cache_if_due();
+    if pane_snapshot_refresh_due() {
+        let _ = refresh_pane_meta_cache();
+    }
+}
+/// Background poller that keeps the session and pane metadata snapshots fresh
+/// so every cache-only display helper can answer without forking from paint.
+/// Commands run under the shared timeout; a tmux outage costs two bounded forks
+/// per cycle, never per row or per frame. A panicking cycle is logged and
+/// retried by the same thread; a failed thread spawn clears the latch so a
+/// later call retries.
+///
+/// Idempotent while the poller is running. The daemon thread dies with the
+/// process.
+pub fn spawn_snapshot_poller() {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if STARTED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    let spawn_result = std::thread::Builder::new()
+        .name("aoe-display-snapshot".to_string())
+        .spawn(|| loop {
+            let cycle = std::panic::catch_unwind(refresh_display_snapshots);
+            if cycle.is_err() {
+                tracing::error!(
+                    target: "tmux.cache",
+                    "display snapshot poller cycle panicked; retrying"
+                );
+            }
+            // Half the TTL, not the TTL: the refresh work itself takes time
+            // and the timestamps are stamped when each query lands, so a
+            // full-TTL period would guarantee an expired-snapshot window
+            // every cycle. Half keeps each snapshot fresh across the whole
+            // cycle at one extra bounded fork pair per ~1s.
+            std::thread::park_timeout(CACHE_TTL / 2);
+        });
+    if let Err(error) = spawn_result {
+        STARTED.store(false, std::sync::atomic::Ordering::Release);
+        tracing::warn!(
+            target: "tmux.cache",
+            %error,
+            "failed to spawn display snapshot poller; a later call may retry"
+        );
+    }
+}
 pub fn get_current_session_name() -> Option<String> {
     let output = tmux_query_command()
         .args(["display-message", "-p", "#{session_name}"])
@@ -1659,6 +2331,171 @@ mod tests {
     const P: &str = SESSION_PREFIX;
 
     #[test]
+    #[serial_test::serial]
+    fn snapshot_refresh_cycle_excludes_passive_resizes() {
+        let before = PASSIVE_RESIZE_EXECUTION_COUNT.with(std::cell::Cell::get);
+        refresh_display_snapshots();
+        let after = PASSIVE_RESIZE_EXECUTION_COUNT.with(std::cell::Cell::get);
+        assert_eq!(
+            after, before,
+            "snapshot refresh must not execute deadline-bound passive work",
+        );
+    }
+    #[test]
+    fn passive_resize_queue_keeps_latest_intent_per_session() {
+        let work = |generation, session_id: &str, cols, rows| PassiveResizeWork {
+            intent: PassiveResizeIntent {
+                session_id: session_id.to_string(),
+                session_name: format!("aoe_test_{session_id}"),
+                cols,
+                rows,
+                priority: false,
+            },
+            generation,
+        };
+        let mut queue = Vec::new();
+        queue_latest_passive_resize(&mut queue, &[], work(1, "a", 80, 24));
+        queue_latest_passive_resize(&mut queue, &[], work(2, "b", 90, 30));
+        queue_latest_passive_resize(&mut queue, &[], work(3, "a", 120, 40));
+
+        assert_eq!(queue.len(), 2, "one bounded slot per session");
+        assert_eq!(
+            (queue[0].intent.session_id.as_str(), queue[0].intent.cols),
+            ("b", 90)
+        );
+        assert_eq!(
+            (queue[1].intent.session_id.as_str(), queue[1].intent.cols),
+            ("a", 120)
+        );
+
+        // A priority intent (the viewed session) is inserted ahead of queued
+        // non-priority work so the worker resizes it first.
+        let mut viewed = work(4, "sel", 100, 30);
+        viewed.intent.priority = true;
+        queue_latest_passive_resize(&mut queue, &[], viewed);
+        assert_eq!(queue[0].intent.session_id, "sel");
+        assert_eq!(queue.len(), 3);
+
+        let in_flight = vec![PassiveResizeTicket {
+            session_id: "a".to_string(),
+            cols: 120,
+            rows: 40,
+            generation: 4,
+        }];
+        let mut while_running = Vec::new();
+        queue_latest_passive_resize(&mut while_running, &in_flight, work(5, "a", 120, 40));
+        let mut completed_then_in_sync = vec![work(6, "a", 140, 50)];
+        remove_pending_passive_resize(&mut completed_then_in_sync, "a");
+        assert!(
+            completed_then_in_sync.is_empty(),
+            "adopting the in-sync completion cancels stale queued geometry"
+        );
+        assert!(
+            while_running.is_empty(),
+            "identical in-flight resize is suppressed"
+        );
+        queue_latest_passive_resize(&mut while_running, &in_flight, work(7, "a", 140, 50));
+        assert_eq!(
+            (while_running[0].intent.cols, while_running[0].intent.rows),
+            (140, 50)
+        );
+        // If the desired geometry returns to the in-flight one before G2 is
+        // drained, the now-stale queued G2 must be removed as well.
+        queue_latest_passive_resize(&mut while_running, &in_flight, work(8, "a", 120, 40));
+        assert!(
+            while_running.is_empty(),
+            "returning to the in-flight geometry drops stale queued geometry"
+        );
+
+        let old_done = PassiveResizeDone {
+            session_id: "a".to_string(),
+            cols: 120,
+            rows: 40,
+            applied_window_rows: Some(40),
+            generation: 9,
+        };
+        let mut newer_same_geometry = vec![PassiveResizeTicket {
+            session_id: "a".to_string(),
+            cols: 120,
+            rows: 40,
+            generation: 10,
+        }];
+        let stale = take_current_passive_completions(&mut newer_same_geometry, vec![old_done]);
+        assert!(stale.is_empty(), "stale completion must not reach render");
+        assert_eq!(
+            newer_same_geometry[0].generation, 10,
+            "an old identical completion must not clear newer in-flight work"
+        );
+        let current_done = PassiveResizeDone {
+            session_id: "a".to_string(),
+            cols: 120,
+            rows: 40,
+            applied_window_rows: Some(40),
+            generation: 10,
+        };
+        let current =
+            take_current_passive_completions(&mut newer_same_geometry, vec![current_done]);
+        assert_eq!(current[0].generation, 10);
+        assert!(newer_same_geometry.is_empty());
+
+        let mut published = Vec::new();
+        publish_latest_passive_resize_done(&mut published, current[0].clone());
+        publish_latest_passive_resize_done(
+            &mut published,
+            PassiveResizeDone {
+                generation: 11,
+                ..current[0].clone()
+            },
+        );
+        publish_latest_passive_resize_done(
+            &mut published,
+            PassiveResizeDone {
+                session_id: "b".to_string(),
+                cols: 90,
+                rows: 30,
+                applied_window_rows: Some(30),
+                generation: 12,
+            },
+        );
+        assert_eq!(published.len(), 2, "one completion slot per session");
+        assert_eq!(published[0].generation, 11);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn failed_passive_resize_publishes_declined_completion() {
+        const ID: &str = "resize_failure_id";
+        const TITLE: &str = "Missing resize target";
+        let name = Session::generate_name(ID, TITLE);
+        let cache = SessionCacheGuard::capture();
+        cache.force_stale();
+        let intent = PassiveResizeWork {
+            intent: PassiveResizeIntent {
+                session_id: ID.to_string(),
+                session_name: name.clone(),
+                cols: 100,
+                rows: 30,
+                priority: false,
+            },
+            generation: 1,
+        };
+        let _ = fork_probe::take();
+        let probe = fork_probe::arm();
+
+        assert!(
+            execute_passive_resize(&intent)
+                .applied_window_rows
+                .is_none(),
+            "a failed or timed-out resize must complete as declined"
+        );
+        drop(probe);
+        assert_eq!(
+            fork_probe::take(),
+            1,
+            "a missing session must short-circuit before attachment and ownership probes",
+        );
+    }
+    #[test]
     fn test_tmux_command_carries_socket_flag() {
         // Under `cfg(test)` the socket resolves to a shared temp path, so the
         // command must lead with `-S <path>` before any subcommand. This is
@@ -1669,6 +2506,74 @@ mod tests {
         assert_eq!(args.first().map(|a| a.to_str().unwrap()), Some("-S"));
         assert!(args.get(1).is_some(), "socket path arg present");
         assert_eq!(cmd.get_program().to_str(), Some("tmux"));
+    }
+
+    #[test]
+    fn shared_snapshot_refresh_skips_fresh_scans() {
+        assert!(snapshot_refresh_due(None));
+        assert!(!snapshot_refresh_due(Some(Instant::now())));
+        assert!(snapshot_refresh_due(Some(
+            Instant::now() - CACHE_TTL / 2 - Duration::from_millis(1)
+        )));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn later_started_snapshot_publication_wins() {
+        let _session_guard = SessionCacheGuard::capture_restore_only();
+        let _pane_guard = PaneMetaCacheGuard::capture();
+
+        let session_older = next_refresh_id(&SESSION_REFRESH_ID);
+        let session_newer = next_refresh_id(&SESSION_REFRESH_ID);
+        assert_eq!(
+            publish_session_cache(
+                session_newer,
+                Some(HashMap::from([("new-session".to_string(), 0)])),
+                SessionCacheRefresh::Populated,
+                false,
+            ),
+            SessionCacheRefresh::Populated,
+        );
+        assert_eq!(
+            publish_session_cache(session_older, None, SessionCacheRefresh::NoServer, false,),
+            SessionCacheRefresh::Populated,
+            "the superseded caller must observe the newer committed outcome",
+        );
+        assert_eq!(session_exists_from_cache("new-session"), Some(true));
+        assert_eq!(session_exists_from_cache("old-session"), Some(false));
+
+        let pane_older = next_refresh_id(&PANE_META_REFRESH_ID);
+        let pane_newer = next_refresh_id(&PANE_META_REFRESH_ID);
+        assert!(publish_pane_meta_cache(
+            pane_newer,
+            Some(std::sync::Arc::new(HashMap::from([(
+                "new-pane".to_string(),
+                dead_pane_meta(true),
+            )]))),
+            Instant::now(),
+        ));
+        assert!(!publish_pane_meta_cache(
+            pane_older,
+            Some(std::sync::Arc::new(HashMap::from([(
+                "old-pane".to_string(),
+                dead_pane_meta(true),
+            )]))),
+            Instant::now(),
+        ));
+        assert_eq!(pane_dead_from_cache("new-pane"), Some(true));
+        assert_eq!(pane_dead_from_cache("old-pane"), Some(false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmux_operation_deadline_rejects_a_second_budget() {
+        let deadline = TmuxCommandDeadline::with_timeout(Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(5));
+        let mut command = Command::new("true");
+        let error = deadline
+            .run(&mut command)
+            .expect_err("an expired operation must not start another command budget");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     }
 
     #[test]
@@ -1690,6 +2595,26 @@ mod tests {
                 .find(|(key, _)| key.to_str() == Some("LC_ALL"))
                 .is_some_and(|(_, value)| value.is_none()),
             "LC_ALL must not override LC_MESSAGES=C"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn live_snapshot_warms_display_cache_without_second_fork() {
+        let cache = SessionCacheGuard::capture_restore_only();
+        cache.force_stale();
+        let _ = fork_probe::take();
+        let probe = fork_probe::arm();
+
+        let snapshot = LiveSessionSnapshot::new();
+        let _ = snapshot.names();
+        refresh_session_cache_if_due();
+
+        drop(probe);
+        assert_eq!(
+            fork_probe::take(),
+            1,
+            "startup liveness and display warmup must share one list-sessions observation",
         );
     }
 
@@ -1921,6 +2846,7 @@ mod tests {
                             pane_pid: None,
                             pane_title: None,
                             window_activity: None,
+                            window_size: None,
                         },
                     )
                 })
@@ -1991,6 +2917,7 @@ mod tests {
             pane_pid: None,
             pane_title: None,
             window_activity: None,
+            window_size: None,
         }
     }
 
@@ -2202,7 +3129,7 @@ mod tests {
 
     #[test]
     fn test_parse_pane_metadata_basic() {
-        let output = format!("{P}my_proj_abc12345|0|0|claude|claude|4242\n");
+        let output = format!("{P}my_proj_abc12345|0|0|190|52|claude|claude|4242\n");
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
         let meta = map.get(&format!("{P}my_proj_abc12345")).unwrap();
@@ -2210,6 +3137,7 @@ mod tests {
         assert_eq!(meta.pane_current_command.as_deref(), Some("claude"));
         assert!(!meta.pane_start_command_is_protected);
         assert_eq!(meta.pane_pid, Some(4242));
+        assert_eq!(meta.window_size, Some((190, 52)));
     }
 
     #[test]
@@ -2217,29 +3145,50 @@ mod tests {
         // Built from TAIL_SEP itself, so a drift between the constant and the
         // `list-panes` format literal fails here instead of degrading silently
         // (no activity gate, every title rule dark).
-        let output =
-            format!("{P}proj_abc12345|0|0|claude|claude{TAIL_SEP}1770000000{TAIL_SEP}✶ Working\n");
+        let output = format!(
+            "{P}proj_abc12345|0|0|190|52|claude|claude{TAIL_SEP}1770000000{TAIL_SEP}✶ Working\n"
+        );
         let meta = parse_pane_metadata(&output)
             .remove(&format!("{P}proj_abc12345"))
             .unwrap();
         assert_eq!(meta.window_activity, Some(1770000000));
         assert_eq!(meta.pane_title.as_deref(), Some("✶ Working"));
 
-        // An unparsable activity reads as absent, an empty title as `None`,
-        // and a head with no tail at all parses as it did before the fields.
-        let odd = format!("{P}proj_def67890|0|0|claude|claude{TAIL_SEP}{TAIL_SEP}\n");
+        // tmux 3.4 renders the control separators as unescaped octal tokens.
+        // A doubled backslash belongs to the title and must not split it.
+        let escaped_output = format!(
+            "{P}proj_escaped_abc12345|0|0|190|52|claude|claude literal{}{ESCAPED_TAIL_SEP}|4242{ESCAPED_TAIL_SEP}1770000001{ESCAPED_TAIL_SEP}literal{}{ESCAPED_TAIL_SEP}title{}",
+            char::from(92),
+            char::from(92),
+            char::from(10)
+        );
+        let escaped_meta = parse_pane_metadata(&escaped_output)
+            .remove(&format!("{P}proj_escaped_abc12345"))
+            .unwrap();
+        assert_eq!(escaped_meta.pane_pid, Some(4242));
+        assert_eq!(escaped_meta.window_activity, Some(1770000001));
+        assert_eq!(
+            escaped_meta.pane_title,
+            Some(format!("literal{}{ESCAPED_TAIL_SEP}title", char::from(92)))
+        );
+
+        // An unparsable activity or window size reads as absent, an empty
+        // title as `None`, and a head with no tail at all parses as it did
+        // before the fields.
+        let odd = format!("{P}proj_def67890|0|0|||claude|claude{TAIL_SEP}{TAIL_SEP}\n");
         let meta = parse_pane_metadata(&odd)
             .remove(&format!("{P}proj_def67890"))
             .unwrap();
         assert_eq!(meta.window_activity, None);
         assert_eq!(meta.pane_title, None);
+        assert_eq!(meta.window_size, None);
     }
 
     #[test]
     fn test_parse_pane_metadata_protected_wrapper_shell_is_not_stale() {
         let output = format!(
-            "{P}protected_abc12345|0|0|sh|/bin/sh -c 'prepare | . /tmp/aoe-pane-env-123 | exec claude'\n\
-             {P}interactive_def67890|0|0|sh|sh\n"
+            "{P}protected_abc12345|0|0|190|52|sh|/bin/sh -c 'prepare | . /tmp/aoe-pane-env-123 | exec claude'\n\
+             {P}interactive_def67890|0|0|190|52|sh|sh\n"
         );
         let map = parse_pane_metadata(&output);
 
@@ -2262,7 +3211,7 @@ mod tests {
 
     #[test]
     fn test_parse_pane_metadata_dead_pane() {
-        let output = format!("{P}proj_abc12345|0|1|bash|bash\n");
+        let output = format!("{P}proj_abc12345|0|1|190|52|bash|bash\n");
         let map = parse_pane_metadata(&output);
         let meta = map.get(&format!("{P}proj_abc12345")).unwrap();
         assert!(meta.pane_dead);
@@ -2271,7 +3220,7 @@ mod tests {
     #[test]
     fn test_parse_pane_metadata_filters_non_aoe_sessions() {
         let output = format!(
-            "user_session|0|0|bash|bash\n{P}proj_abc12345|0|0|claude|claude\nmy_tmux|0|0|vim|vim\n"
+            "user_session|0|0|190|52|bash|bash\n{P}proj_abc12345|0|0|190|52|claude|claude\nmy_tmux|0|0|190|52|vim|vim\n"
         );
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
@@ -2280,8 +3229,9 @@ mod tests {
 
     #[test]
     fn test_parse_pane_metadata_filters_non_zero_panes() {
-        let output =
-            format!("{P}proj_abc12345|0|0|claude|claude\n{P}proj_abc12345|1|0|bash|bash\n");
+        let output = format!(
+            "{P}proj_abc12345|0|0|190|52|claude|claude\n{P}proj_abc12345|1|0|190|52|bash|bash\n"
+        );
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
         let meta = map.get(&format!("{P}proj_abc12345")).unwrap();
@@ -2291,8 +3241,9 @@ mod tests {
     #[test]
     fn test_parse_pane_metadata_first_window_wins() {
         // Two windows both have pane 0, first window's data should be kept
-        let output =
-            format!("{P}proj_abc12345|0|0|claude|claude\n{P}proj_abc12345|0|1|bash|bash\n");
+        let output = format!(
+            "{P}proj_abc12345|0|0|190|52|claude|claude\n{P}proj_abc12345|0|1|190|52|bash|bash\n"
+        );
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
         let meta = map.get(&format!("{P}proj_abc12345")).unwrap();
@@ -2307,14 +3258,14 @@ mod tests {
 
     #[test]
     fn test_parse_pane_metadata_malformed_lines() {
-        let output = format!("too|few|fields\n{P}proj_abc12345|0|0|claude|claude\n\n");
+        let output = format!("too|few|fields\n{P}proj_abc12345|0|0|190|52|claude|claude\n\n");
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
     }
 
     #[test]
     fn test_parse_pane_metadata_empty_command() {
-        let output = format!("{P}proj_abc12345|0|0||sh\n");
+        let output = format!("{P}proj_abc12345|0|0|190|52||sh\n");
         let map = parse_pane_metadata(&output);
         let meta = map.get(&format!("{P}proj_abc12345")).unwrap();
         assert!(meta.pane_current_command.is_none());
@@ -2323,7 +3274,7 @@ mod tests {
     #[test]
     fn test_parse_pane_metadata_multiple_sessions() {
         let output = format!(
-            "{P}proj_a_abc12345|0|0|claude|claude\n{P}proj_b_def67890|0|0|opencode|opencode\n{P}proj_c_ghi11111|0|1|bash|bash\n"
+            "{P}proj_a_abc12345|0|0|190|52|claude|claude\n{P}proj_b_def67890|0|0|190|52|opencode|opencode\n{P}proj_c_ghi11111|0|1|190|52|bash|bash\n"
         );
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 3);
@@ -2357,10 +3308,10 @@ mod tests {
     fn a_failed_pane_snapshot_is_an_answer_so_rows_do_not_re_fork() {
         // `refresh_pane_meta_cache` stamps `time` even when `batch_pane_metadata`
         // fails, and `pane_dead_from_cache` gates on `time` alone. That pairing is
-        // what bounds a tmux outage to one fork per CACHE_TTL instead of one per
-        // row per frame: if a fresh-but-empty snapshot resolved to `None`, every
-        // Tool row would drive another doomed refresh, which is the per-row fork
-        // this whole change removes.
+        // what bounds a tmux outage to one fork per poller cycle (CACHE_TTL / 2)
+        // instead of one per row per frame: if a fresh-but-empty snapshot
+        // resolved to `None`, every Tool row would drive another doomed refresh,
+        // which is the per-row fork this whole change removes.
         let guard = PaneMetaCacheGuard::capture();
         guard.force_failed_refresh();
 
@@ -2374,6 +3325,57 @@ mod tests {
             !pane_dead_for_display("aoe_tool_absent_00000000"),
             "and the display helper must not claim a pane it cannot see is dead"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn display_lookups_keep_last_good_snapshot_until_authoritative_absence() {
+        let guard = SessionCacheGuard::capture();
+        let derived = format!("{P}Current_{ID8}");
+        let last_good = format!("{P}Previous_{ID8}");
+        let suffix = id_suffix(ID);
+        let shape = NameShape::agent(&suffix);
+
+        guard.force_present(&[last_good.as_str()]);
+        guard.force_stale();
+        assert!(session_exists_for_display(&last_good));
+        assert_eq!(session_name_for_display(&derived, &shape), last_good);
+        let unknown_refresh_id = SESSION_CACHE.read().expect("session cache").refresh_id + 1;
+        assert_eq!(
+            publish_session_cache(
+                unknown_refresh_id,
+                None,
+                SessionCacheRefresh::Unknown,
+                false,
+            ),
+            SessionCacheRefresh::Unknown,
+        );
+        assert_eq!(
+            session_existence_from_cache(&last_good),
+            Some(SessionExistence::Unknown),
+        );
+        assert_eq!(session_exists_from_cache(&last_good), None);
+        assert_eq!(
+            session_name_from_cache(&derived, &shape),
+            Some(derived.clone())
+        );
+        assert!(session_exists_for_display(&last_good));
+        assert_eq!(session_name_for_display(&derived, &shape), last_good);
+
+        guard.force_present(&[]);
+        assert!(!session_exists_for_display(&last_good));
+        assert_eq!(session_name_for_display(&derived, &shape), derived);
+
+        guard.force_present(&[last_good.as_str()]);
+        let no_server_refresh_id = SESSION_CACHE.read().expect("session cache").refresh_id + 1;
+        publish_session_cache(
+            no_server_refresh_id,
+            None,
+            SessionCacheRefresh::NoServer,
+            false,
+        );
+        assert!(!session_exists_for_display(&last_good));
+        assert_eq!(session_name_for_display(&derived, &shape), derived);
     }
 
     #[test]

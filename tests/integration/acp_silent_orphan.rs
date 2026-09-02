@@ -15,7 +15,7 @@
 //! Skipped automatically if `node` is missing.
 //!
 //! Note: the parent `main.rs` only compiles this module under
-//! `cfg(all(feature = "serve", debug_assertions))`. Debug-only because
+//! `cfg(debug_assertions)`. Debug-only because
 //! the watchdog grace is tunable via `AOE_SILENT_ORPHAN_GRACE_MS` /
 //! `AOE_SILENT_ORPHAN_FAST_GRACE_MS` only under `cfg(debug_assertions)`;
 //! release builds would wait the full 60s production default.
