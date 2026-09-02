@@ -2334,22 +2334,6 @@ impl HomeView {
         }
     }
 
-    /// Keep every open session's detached agent pane pre-sized to the preview
-    /// output rect it would be shown at, so selecting a row or entering live
-    /// view lands on an already-correct pane instead of waiting out a resize
-    /// round-trip. `exclude` is the session whose per-frame sync in
-    /// `refresh_preview_cache_if_needed` owns its geometry this frame; the
-    /// live-send session is skipped because its worker owns the pane.
-    ///
-    /// The per-session target is fully predictable: `PreviewLayout::compute`
-    /// over the shared preview rect and that instance's own header height,
-    /// the same split the renderer will use when the row is selected. Work
-    /// runs on the passive-resize worker under its atomic detached/no-owner
-    /// guard. Two debounces bound the SIGWINCH cost: resizes fire only when
-    /// the same fleet geometry is wanted on two consecutive refreshes (the
-    /// fleet analogue of `passive_resize_step`'s one-frame-toast rule), and a
-    /// geometry the worker declined is not retried until the wanted fleet
-    /// geometry changes again.
     /// Drop synced entries contradicted by a newer pane snapshot: an
     /// external `tmux attach` or the web live view resized the window after
     /// we set it, and treating the entry as in-sync would leave the preview
@@ -2376,6 +2360,22 @@ impl HomeView {
         }
     }
 
+    /// Keep every open session's detached agent pane pre-sized to the preview
+    /// output rect it would be shown at, so selecting a row or entering live
+    /// view lands on an already-correct pane instead of waiting out a resize
+    /// round-trip. `exclude` is the session whose per-frame sync in
+    /// `refresh_preview_cache_if_needed` owns its geometry this frame; the
+    /// live-send session is skipped because its worker owns the pane.
+    ///
+    /// The per-session target is fully predictable: `PreviewLayout::compute`
+    /// over the shared preview rect and that instance's own header height,
+    /// the same split the renderer will use when the row is selected. Work
+    /// runs on the passive-resize worker under its atomic detached/no-owner
+    /// guard. Two debounces bound the SIGWINCH cost: resizes fire only when
+    /// the same fleet geometry is wanted on two consecutive refreshes (the
+    /// fleet analogue of `passive_resize_step`'s one-frame-toast rule), and a
+    /// geometry the worker declined is not retried until the wanted fleet
+    /// geometry changes or [`PASSIVE_DECLINE_RETRY`] elapses.
     pub(super) fn reconcile_passive_fleet(
         &mut self,
         inner: Rect,
