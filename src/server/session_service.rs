@@ -584,11 +584,11 @@ impl SessionService {
     ///
     /// Single drain owner: callers (the create fast path and the reconciler
     /// tick) race through the `pending_drains` claim, and the delivery runs
-    /// under the session's [`Self::prompt_submission`] guard, so the turn
-    /// cannot be published twice concurrently and a direct prompt cannot
-    /// decide its own disposition mid-delivery. A delivery failure leaves the
-    /// field set; the reconciler tick retries once the worker is live.
-    /// Clearing writes memory first,
+    /// under the session's [`Self::prompt_submission_for_session`] guard, so
+    /// the turn cannot be published twice concurrently and a direct prompt
+    /// cannot decide its own disposition mid-delivery. A delivery failure
+    /// leaves the field set; the reconciler tick retries once the worker is
+    /// live. Clearing writes memory first,
     /// then disk: a crash (or failed persist) between the forward and the
     /// disk clear re-delivers after restart, which is the documented
     /// at-least-once contract.
@@ -1129,9 +1129,10 @@ impl SessionService {
     /// Drain the leading batch of a session's server-owned queue into the live
     /// worker once the current turn has ended. Mirrors
     /// `drain_pending_initial_turn`'s single-owner `pending_drains` claim +
-    /// [`Self::prompt_submission`] delivery, so a batch is never sent twice
-    /// concurrently and the idle check below cannot be invalidated by a direct
-    /// prompt deciding its own disposition before this one reaches the agent.
+    /// [`Self::prompt_submission_for_session`] delivery, so a batch is never
+    /// sent twice concurrently and the idle check below cannot be invalidated
+    /// by a direct prompt deciding its own disposition before this one reaches
+    /// the agent.
     ///
     /// Only drains an idle turn, and asks the live control fold rather than
     /// `Instance.status`: dispatch parks a prompt on that fold, so gating the
