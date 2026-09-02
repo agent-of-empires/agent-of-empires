@@ -202,10 +202,11 @@ pub enum Commands {
         command: SkillCommands,
     },
 
-    /// Start a web dashboard for remote session access
+    /// Start the aoe daemon: REST/WebSocket API, plus the web dashboard in
+    /// builds that embed it
     Serve(ServeArgs),
 
-    /// Print the current dashboard URL of a running `aoe serve` daemon
+    /// Print the URL of a running `aoe serve` daemon
     Url(UrlArgs),
 
     /// Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...).
