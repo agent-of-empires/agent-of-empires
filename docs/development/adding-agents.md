@@ -32,7 +32,7 @@ Each level is additive; do only what the agent supports.
 Levels 3 and 4 are independent. Hooks are only one way to observe a session ID
 (`session_id_capture`, Claude alone, and even there the poller falls back to a
 disk scan); the other agents AoE resumes are polled from their own store,
-sidecar, or transcript by `src/session/capture.rs`. Level 4 needs both halves:
+sidecar, or transcript by `src/session/capture/mod.rs`. Level 4 needs both halves:
 a `resume_strategy` with no automatic capture path behind it is reachable only
 from a hand-pinned ID, which is not an AoE resume contract, so leave the agent
 on `ResumeStrategy::Unsupported` until capture lands. `agent_status_hooks =

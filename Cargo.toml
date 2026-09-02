@@ -274,7 +274,8 @@ debug-assertions = false
 # Explicit target so the `e2e-tests` feature gate applies. Without this entry
 # Cargo auto-discovers tests/e2e/main.rs unconditionally; the gate lets CI split
 # the suite into "everything except e2e" and "e2e only" shards. The other
-# standalone test binaries stay auto-discovered.
+# test targets (the consolidated `integration` harness and the standalone
+# `branch_exists_spawn_failure`) stay auto-discovered.
 name = "e2e"
 path = "tests/e2e/main.rs"
 required-features = ["e2e-tests"]

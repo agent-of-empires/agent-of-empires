@@ -19,7 +19,7 @@ const SID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 const REPLAY_TEXT = "round-trip transcript line qwerty";
 const PROJECT_SUBDIR = "kc-project";
 
-// Mirror src/session/capture.rs encode_claude_project_path over the canonical
+// Mirror src/session/capture/mod.rs encode_claude_project_path over the canonical
 // path (std::fs::canonicalize == realpathSync): non-alphanumeric (except '-')
 // becomes '-'.
 function encodeClaudeProjectPath(canonicalPath: string): string {
