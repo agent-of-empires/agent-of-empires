@@ -306,7 +306,7 @@ mod tests {
             (
                 "api/sessions/delete.rs",
                 include_str!("sessions/delete.rs"),
-                &["delete_session"],
+                &["delete_session", "delete_workspace"],
             ),
             (
                 "api/sessions/rename.rs",
@@ -539,7 +539,7 @@ mod tests {
             (
                 "api/sessions/delete.rs",
                 include_str!("sessions/delete.rs"),
-                &["delete_session"],
+                &["delete_session", "delete_workspace"],
             ),
             (
                 "api/sessions/rename.rs",

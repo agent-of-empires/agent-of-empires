@@ -184,11 +184,6 @@ pub(super) fn agent_is_structured_fork_capable(tool: &str, agent_name: Option<&s
     crate::session::fork::structured_fork_capable(tool, agent_name)
 }
 
-/// True iff the agent can run a structured (ACP) session in this project: a
-/// built-in ACP agent in the registry, or a custom tool with a valid
-/// `agent_acp_cmd`. Mirrors the post-build capability check (below) so
-/// CityHall mode can reject a non-ACP agent up front instead of letting the
-/// session silently downgrade to the terminal view. See #7.
 /// The ACP registry key a create request resolves to: an explicit `agent_name`
 /// when present, else the tool name. Shared by the capability check and the
 /// allowlist check (#3241) so the two cannot judge different agents.
@@ -196,6 +191,11 @@ fn acp_agent_key<'a>(tool: &'a str, agent_name: Option<&'a str>) -> &'a str {
     agent_name.filter(|s| !s.is_empty()).unwrap_or(tool)
 }
 
+/// True iff the agent can run a structured (ACP) session in this project: a
+/// built-in ACP agent in the registry, or a custom tool with a valid
+/// `agent_acp_cmd`. Mirrors the post-build capability check (below) so
+/// CityHall mode can reject a non-ACP agent up front instead of letting the
+/// session silently downgrade to the terminal view. See #7.
 pub(crate) fn agent_is_acp_capable(
     profile: &str,
     project_path: &std::path::Path,
