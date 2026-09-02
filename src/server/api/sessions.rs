@@ -7977,6 +7977,7 @@ mod tests {
     #[derive(Deserialize)]
     struct DecodedSessionsEnvelope {
         sessions: Vec<DecodedSession>,
+        session_attach: BTreeMap<String, AttachAvailability>,
     }
 
     #[derive(Deserialize)]
@@ -8086,6 +8087,34 @@ mod tests {
             }
         );
     }
+    #[tokio::test]
+    async fn list_sessions_projects_attach_from_request_capabilities() {
+        let mut structured = Instance::new("structured", "/tmp/structured");
+        structured.id = "structured".to_string();
+        structured.view = crate::session::View::Structured;
+        let state = crate::server::test_support::build_test_app_state(vec![structured]);
+
+        let envelope = decode_sessions_response(
+            list_sessions(
+                axum::extract::State(state),
+                capability_headers("acp_ws_v1"),
+                axum::extract::Query(ListSessionsQuery { state: None }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(
+            envelope.session_attach,
+            BTreeMap::from([(
+                "structured".to_string(),
+                AttachAvailability::Available {
+                    transport: AttachTransport::AcpWebsocketV1,
+                },
+            )])
+        );
+    }
+
     #[test]
     fn remove_instance_bumps_the_epoch_only_when_it_removes_a_row() {
         let epoch = std::sync::atomic::AtomicU64::new(0);
