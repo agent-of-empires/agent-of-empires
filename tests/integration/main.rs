@@ -7,7 +7,10 @@
 //!
 //! Per-test isolation still relies on `#[serial]` (see `serial_test`) for
 //! anything that touches process-global state (env vars, tmux sessions,
-//! `HOME`).
+//! `HOME`). `#[serial]` does not exclude unmarked tests, so a test whose
+//! seam poisons every concurrent subprocess spawn (for example clobbering
+//! `PATH`) cannot live in this binary; `tests/branch_exists_spawn_failure.rs`
+//! stays standalone for that reason.
 
 mod common;
 mod home_isolation;
@@ -51,7 +54,6 @@ mod acp_silent_orphan;
 mod acp_runner_control;
 mod acp_runner_orphan;
 mod agent_lifecycle_cli;
-mod branch_exists_spawn_failure;
 mod build_cache_config;
 mod build_version_rerun;
 mod daemon_core_web_optional;
