@@ -576,15 +576,11 @@ mod tests {
         }
     }
 
-    /// Both halves of the framing, against a real tmux, with the client
-    /// locale pinned because each half only exists under one of them.
+    /// Checks batch framing against a real tmux under ASCII and UTF-8 locales.
     ///
-    /// Under `C` tmux rewrites every byte outside printable ASCII to `_`, so
-    /// the marker has to be printable or the batch covers nothing and every
-    /// session silently falls through to a sequential read. That same rewrite
-    /// flattens a value's newline, so the #3616 spoof can only be reproduced
-    /// under a UTF-8 client; the raw output is asserted to carry the
-    /// continuation before the parse is trusted to have rejected it.
+    /// tmux versions differ on whether `C` flattens newlines in values. The
+    /// parser must reject a spoofed continuation either way. The UTF-8 leg is
+    /// skipped when that locale is unavailable and tmux flattens the value.
     #[test]
     #[serial_test::serial]
     fn test_batch_output_frames_records_against_a_real_tmux() {
@@ -601,8 +597,7 @@ mod tests {
         set_hidden_env(name, AOE_INSTANCE_ID_KEY, "real-id").unwrap();
         set_hidden_env(name, "ZZZ", "unrelated\nAOE_INSTANCE_ID=spoofed-id").unwrap();
 
-        // (locale, must the raw output carry the spoofing continuation)
-        for (locale, expect_continuation) in [("C", false), ("C.UTF-8", true)] {
+        for locale in ["C", "C.UTF-8"] {
             let output = crate::tmux::tmux_command()
                 .env("LC_ALL", locale)
                 .args(batch_args(&[name]))
@@ -610,11 +605,10 @@ mod tests {
                 .unwrap();
             let stdout = String::from_utf8_lossy(&output.stdout);
             let spoofed = stdout.contains("\nAOE_INSTANCE_ID=spoofed-id");
-            if expect_continuation && !spoofed {
+            if locale == "C.UTF-8" && !spoofed {
                 eprintln!("skipping {locale} leg: locale unavailable, tmux flattened the value");
                 continue;
             }
-            assert_eq!(spoofed, expect_continuation, "{locale}: {stdout:?}");
             let parsed = parse_batch_output(&stdout, &[name], AOE_INSTANCE_ID_KEY);
             assert_eq!(
                 parsed.get(name).map(|v| v.as_deref()),
