@@ -553,13 +553,13 @@ const CLIENT_CAPABILITIES_HEADER: &str = "x-aoe-client-capabilities";
 pub enum ContextResumeUnavailableReason {
     AgentUnsupported,
     SandboxUnsupported,
+    CommandUnsupported,
     ForcedFresh,
     InvalidTarget,
     ForkPending,
     PreviousFailure,
     NoTarget,
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextResumeIndeterminateReason {
@@ -780,6 +780,9 @@ fn context_resume_for(inst: &Instance) -> ContextResumeAvailability {
         },
         TerminalContextResume::SandboxUnsupported => ContextResumeAvailability::Unavailable {
             reason: ContextResumeUnavailableReason::SandboxUnsupported,
+        },
+        TerminalContextResume::CommandUnsupported => ContextResumeAvailability::Unavailable {
+            reason: ContextResumeUnavailableReason::CommandUnsupported,
         },
         TerminalContextResume::ForcedFresh => ContextResumeAvailability::Unavailable {
             reason: ContextResumeUnavailableReason::ForcedFresh,

@@ -652,21 +652,29 @@ impl Instance {
 
     fn terminal_resume_static_unavailable(&self) -> Option<ResumeStaticUnavailable> {
         let Some(agent) = self.resolved_agent() else {
-            return Some(ResumeStaticUnavailable::AgentUnsupported);
+            return Some(ResumeStaticUnavailable::Agent);
         };
         if matches!(
             agent.resume_strategy,
             crate::agents::ResumeStrategy::Unsupported
         ) {
-            return Some(ResumeStaticUnavailable::AgentUnsupported);
+            return Some(ResumeStaticUnavailable::Agent);
         }
         // These agents keep session stores inside the container, where a host
         // resume target cannot exist.
         if self.is_sandboxed() && matches!(agent.name, "copilot" | "kimi" | "prime-agent") {
-            return Some(ResumeStaticUnavailable::SandboxUnsupported);
+            return Some(ResumeStaticUnavailable::Sandbox);
+        }
+        if matches!(
+            agent.resume_strategy,
+            crate::agents::ResumeStrategy::Subcommand(_)
+        ) && !self.subcommand_splice_is_safe(agent)
+        {
+            return Some(ResumeStaticUnavailable::Command);
         }
         None
     }
+
     fn terminal_resume_explicit_target_invalid(&self) -> bool {
         matches!(
             &self.resume_intent,
@@ -688,12 +696,9 @@ impl Instance {
     ) -> TerminalContextResume {
         if let Some(unavailable) = self.terminal_resume_static_unavailable() {
             return match unavailable {
-                ResumeStaticUnavailable::AgentUnsupported => {
-                    TerminalContextResume::AgentUnsupported
-                }
-                ResumeStaticUnavailable::SandboxUnsupported => {
-                    TerminalContextResume::SandboxUnsupported
-                }
+                ResumeStaticUnavailable::Agent => TerminalContextResume::AgentUnsupported,
+                ResumeStaticUnavailable::Sandbox => TerminalContextResume::SandboxUnsupported,
+                ResumeStaticUnavailable::Command => TerminalContextResume::CommandUnsupported,
             };
         }
         match &self.resume_intent {
@@ -798,25 +803,16 @@ impl Instance {
         );
         // Apply the same deterministic constraints used by the client-context
         // projection before emitting any resume target.
-        if self.terminal_resume_static_unavailable().is_some() || invalid_explicit_target {
-            session_id = None;
+        let static_unavailable = self.terminal_resume_static_unavailable();
+        if matches!(static_unavailable, Some(ResumeStaticUnavailable::Command)) {
+            tracing::warn!(target: "session.store",
+                tool = %self.tool,
+                command = %self.command,
+                "resume subcommand needs the binary's position and this command hides it behind a launcher; starting fresh"
+            );
         }
-        // Same fail-closed rule for a subcommand-shaped resume whose splice
-        // point this command hides: a mangled launch line is worse than a
-        // fresh conversation.
-        if let Some(agent) = crate::agents::get_agent(resume_tool) {
-            if matches!(
-                agent.resume_strategy,
-                crate::agents::ResumeStrategy::Subcommand(_)
-            ) && !self.subcommand_splice_is_safe(agent)
-            {
-                tracing::warn!(target: "session.store",
-                    tool = %self.tool,
-                    command = %self.command,
-                    "resume subcommand needs the binary's position and this command hides it behind a launcher; starting fresh"
-                );
-                session_id = None;
-            }
+        if static_unavailable.is_some() || invalid_explicit_target {
+            session_id = None;
         }
         // A transcript the pane published outranks its id: `--session <path>`
         // resolves the conversation wherever it was started, while
@@ -1631,6 +1627,10 @@ mod tests {
         wrapped.command = "ssh -t lenovo codex".to_string();
         wrapped.agent_session_id = Some(sid.to_string());
         wrapped.resume_intent = ResumeIntent::Use(sid.to_string());
+        assert_eq!(
+            wrapped.terminal_context_resume_cached(),
+            TerminalContextResume::CommandUnsupported
+        );
         let mut cmd = wrapped.command.clone();
         assert!(!wrapped.apply_session_flags(&mut cmd, "test"));
         assert_eq!(
@@ -1645,6 +1645,10 @@ mod tests {
         direct.command = "codex --model o3".to_string();
         direct.agent_session_id = Some(sid.to_string());
         direct.resume_intent = ResumeIntent::Use(sid.to_string());
+        assert_eq!(
+            direct.terminal_context_resume_cached(),
+            TerminalContextResume::Available
+        );
         let mut direct_cmd = direct.command.clone();
         assert!(direct.apply_session_flags(&mut direct_cmd, "test"));
         assert_eq!(direct_cmd, format!("codex resume {sid} --model o3"));
@@ -1661,6 +1665,11 @@ mod tests {
             bare.command = command.to_string();
             bare.agent_session_id = Some(sid.to_string());
             bare.resume_intent = ResumeIntent::Use(sid.to_string());
+            assert_eq!(
+                bare.terminal_context_resume_cached(),
+                TerminalContextResume::Available,
+                "{command}"
+            );
             let mut bare_cmd = bare.command.clone();
             assert!(bare.apply_session_flags(&mut bare_cmd, "test"), "{command}");
             assert_eq!(bare_cmd, format!("{command} resume {sid}"));

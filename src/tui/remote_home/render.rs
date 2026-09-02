@@ -104,6 +104,7 @@ fn context_resume_detail(availability: ContextResumeAvailability) -> &'static st
         ContextResumeAvailability::Unavailable { reason } => match reason {
             ContextResumeUnavailableReason::AgentUnsupported => "agent unsupported",
             ContextResumeUnavailableReason::SandboxUnsupported => "sandbox unsupported",
+            ContextResumeUnavailableReason::CommandUnsupported => "command unsupported",
             ContextResumeUnavailableReason::ForcedFresh => "forced fresh",
             ContextResumeUnavailableReason::InvalidTarget => "invalid target",
             ContextResumeUnavailableReason::ForkPending => "fork pending",

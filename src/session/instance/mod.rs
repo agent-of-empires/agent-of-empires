@@ -88,8 +88,9 @@ pub(crate) use tmux_session::{
 };
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResumeStaticUnavailable {
-    AgentUnsupported,
-    SandboxUnsupported,
+    Agent,
+    Sandbox,
+    Command,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +100,7 @@ pub(crate) enum TerminalContextResume {
     NoTarget,
     AgentUnsupported,
     SandboxUnsupported,
+    CommandUnsupported,
     ForcedFresh,
     InvalidTarget,
     ForkPending,

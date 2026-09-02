@@ -188,10 +188,12 @@ over 1,024 bytes return `400`. The response includes
 `Vary: x-aoe-client-capabilities`.
 
 Each session row includes `context_resume`, the request-invariant availability
-of preserving that agent's context. The `session_attach` object contains one
-request-scoped attach result per returned session id. Without the capability
-header, each attach result is `unavailable` with reason
-`client_missing_transport`.
+of preserving that agent's context. Unavailable reasons are
+`agent_unsupported`, `sandbox_unsupported`, `command_unsupported`,
+`forced_fresh`, `invalid_target`, `fork_pending`, `previous_failure`, and
+`no_target`. The `session_attach` object contains one request-scoped attach
+result per returned session id. Without the capability header, each attach
+result is `unavailable` with reason `client_missing_transport`.
 
 **Example**
 
