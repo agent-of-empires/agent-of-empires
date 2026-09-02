@@ -224,19 +224,14 @@ impl Instance {
         expected_prior_intent: ResumeIntent,
     ) -> SidPersistOutcome {
         let new_sid = self.agent_session_id.clone();
-        // Cleared, Fork, and Use are all one-shot launch directives: after the
-        // launch they ran with completes, the session resumes its own id
-        // normally, so the intent must auto-promote to Default. A fork left as
-        // Fork on disk would re-fork the parent on the next restart
-        // (double-fork). A Use pin left durable would let the drain never
-        // adopt a post-launch capture (e.g. the resume-probe fallback minting
-        // a fresh sid, or a later `/clear`), so a launched pin hands control
-        // back to normal capture; a pin on a session that never launches keeps
-        // Use and stays authoritative (see #2708).
+        // Cleared and Fork are one-shot launch directives. Use stays durable
+        // only when no pane-scoped capture backend can observe a later `/new`;
+        // capture-backed agents hand ownership back to their poller.
         let promote_one_shot = matches!(
             expected_prior_intent,
-            ResumeIntent::Cleared | ResumeIntent::Fork { .. } | ResumeIntent::Use(_)
-        );
+            ResumeIntent::Cleared | ResumeIntent::Fork { .. }
+        ) || matches!(expected_prior_intent, ResumeIntent::Use(_))
+            && self.launch_has_session_publisher();
 
         let instance_id = self.id.clone();
         let new_sid_for_closure = new_sid.clone();
@@ -726,7 +721,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn use_intent_promotes_to_default_after_launch() {
+    fn use_intent_remains_sticky_after_launch() {
         let temp = tempdir().unwrap();
         std::env::set_var("HOME", temp.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -737,7 +732,7 @@ mod tests {
         let pinned = "019342ab-1234-7def-8901-abcdef012345";
 
         let mut inst = Instance::new("Pinned", "/tmp/x");
-        inst.tool = "claude".into();
+        inst.tool = "copilot".into();
         inst.source_profile = profile.into();
         inst.agent_session_id = Some(pinned.into());
         inst.resume_intent = ResumeIntent::Use(pinned.into());
@@ -763,15 +758,61 @@ mod tests {
         let disk = reloaded.iter().find(|i| i.id == inst.id).unwrap();
         assert_eq!(
             disk.resume_intent,
-            ResumeIntent::Default,
-            "Use must auto-promote to Default after the launch consumes the pin so the drain adopts subsequent post-launch captures (#2708)",
+            ResumeIntent::Use(pinned.to_string()),
+            "an explicit pin must remain authoritative across later launches",
         );
         assert_eq!(
             inst.resume_intent,
-            ResumeIntent::Default,
-            "In-memory resume_intent must also promote so the drain PIN guard stops firing on the same tick",
+            ResumeIntent::Use(pinned.to_string()),
+            "the in-memory pin must remain aligned with durable state",
         );
         assert_eq!(disk.agent_session_id.as_deref(), Some(pinned));
+    }
+
+    #[test]
+    #[serial]
+    fn capture_backed_use_promotes_so_a_later_conversation_can_be_adopted() {
+        let temp = tempdir().unwrap();
+        std::env::set_var("HOME", temp.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let profile = "use-capture-promote";
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        let pinned = "019342ab-1234-7def-8901-abcdef012345";
+        let mut inst = Instance::new("Pinned Claude", "/tmp/x");
+        inst.tool = "claude".into();
+        inst.source_profile = profile.into();
+        inst.agent_session_id = Some(pinned.into());
+        inst.resume_intent = ResumeIntent::Use(pinned.into());
+        let on_disk = inst.clone();
+        storage
+            .update(|instances, groups| {
+                *instances = vec![on_disk.clone()];
+                *groups =
+                    crate::session::GroupTree::new_with_groups(std::slice::from_ref(&on_disk), &[])
+                        .get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+
+        let expected_sid = inst.agent_session_id.clone();
+        let _ =
+            inst.persist_session_id(profile, expected_sid.as_deref(), inst.resume_intent.clone());
+        assert_eq!(
+            inst.resume_intent,
+            ResumeIntent::Use(pinned.into()),
+            "configured capture support is not enough without a launch publisher"
+        );
+
+        inst.identity_publisher_launched = true;
+        let _ =
+            inst.persist_session_id(profile, expected_sid.as_deref(), inst.resume_intent.clone());
+
+        assert_eq!(inst.resume_intent, ResumeIntent::Default);
+        assert_eq!(
+            storage.load().unwrap()[0].resume_intent,
+            ResumeIntent::Default
+        );
     }
 
     #[test]
@@ -1124,6 +1165,7 @@ mod tests {
             let storage = Storage::new_unwatched(profile).unwrap();
             let mut live = pinned.clone();
             live.agent_session_id = Some(SID_X.to_string());
+            live.identity_publisher_launched = true;
             let outcome = live.persist_session_id_with_storage(
                 &storage,
                 None,
@@ -1135,7 +1177,7 @@ mod tests {
             assert_eq!(
                 live.resume_intent,
                 ResumeIntent::Default,
-                "consumed pin must promote to Default"
+                "capture-backed pins must hand ownership back after launch"
             );
             let disk = load(profile);
             assert_eq!(

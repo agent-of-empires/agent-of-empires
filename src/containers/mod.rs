@@ -166,6 +166,15 @@ impl DockerContainer {
         self.runtime.container_working_dir(&self.name)
     }
 
+    pub fn sandbox_store_generation_matches(&self) -> Result<Option<bool>> {
+        self.runtime.sandbox_store_generation_matches(&self.name)
+    }
+
+    pub fn mount_fingerprint_matches(&self, config: &ContainerConfig) -> Result<Option<bool>> {
+        self.runtime
+            .mount_fingerprint_matches(&self.name, &config.mount_fingerprint())
+    }
+
     pub fn build_create_args(&self, config: &ContainerConfig) -> Vec<String> {
         self.runtime
             .build_create_args(&self.name, &self.image, config)

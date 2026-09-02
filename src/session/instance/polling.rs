@@ -54,6 +54,19 @@ impl Instance {
     /// Pi polls its sidecar or nothing: the pane publishes its own
     /// conversation, and a store keyed by cwd cannot say which pane owns what.
     /// Reads memory only: this runs per session on every TUI refresh.
+    pub(crate) fn launch_has_session_publisher(&self) -> bool {
+        let Some((capture, context)) = self.resolved_session_support() else {
+            return false;
+        };
+        match capture.backend {
+            crate::agents::SessionCaptureBackend::Pi => self.pi_extension_launched,
+            crate::agents::SessionCaptureBackend::OpenCode
+            | crate::agents::SessionCaptureBackend::Omp => false,
+            _ if context == crate::agents::SessionCaptureContext::ManagedExclusiveStore => true,
+            _ => self.identity_publisher_launched,
+        }
+    }
+
     pub fn supports_session_poller(&self) -> bool {
         let Some((capture, context)) = self.resolved_session_support() else {
             return false;

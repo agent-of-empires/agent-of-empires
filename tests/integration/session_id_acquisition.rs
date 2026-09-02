@@ -43,6 +43,13 @@ impl Drop for EnvRestore {
     }
 }
 
+fn acknowledge_agent_hooks() {
+    agent_of_empires::session::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })
+    .expect("acknowledge agent hooks in isolated test home");
+}
+
 fn tmux_available() -> bool {
     Command::new("tmux")
         .arg("-V")
@@ -106,6 +113,7 @@ fn start_with_size_opts_relaunches_a_dead_pane() {
         return;
     }
     let temp = setup_temp_home();
+    acknowledge_agent_hooks();
     let workdir = temp.path().join("workdir");
     std::fs::create_dir_all(&workdir).expect("create workdir");
 
@@ -174,6 +182,7 @@ fn restart_surfaces_a_pinned_fresh_launch_that_dies() {
         return;
     }
     let temp = setup_temp_home();
+    acknowledge_agent_hooks();
     // The transcript probe reads this dir; an empty one is what makes the
     // stored sid launch fresh-pinned rather than with `--resume`. Restored on
     // drop: unlike `HOME`, this var is not part of `setup_temp_home`'s set, so

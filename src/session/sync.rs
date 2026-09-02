@@ -135,10 +135,9 @@ fn drain_and_persist_session_ids_inner(
             filtered_ids.insert(inst.id.clone());
             continue;
         }
-        // An explicit set-session-id pin is authoritative until the session
-        // itself launches (which promotes Use -> Default). While pinned, the
-        // poller must not overwrite it, even with an unowned fresher jsonl the
-        // collision guard below would otherwise wave through (#2708 invariant 1).
+        // While an explicit set-session-id pin is armed, the poller must not
+        // overwrite it with an unowned fresher jsonl that the collision guard
+        // below would otherwise wave through (#2708 invariant 1).
         if let ResumeIntent::Use(pinned) = &inst.resume_intent {
             if sid != *pinned {
                 tracing::debug!(

@@ -51,6 +51,8 @@ impl Instance {
             worktree_info: None,
             workspace_info: None,
             sandbox_info: None,
+            sandbox_store_generation:
+                crate::session::container_config::CURRENT_SANDBOX_STORE_GENERATION,
             terminal_info: None,
             agent_session_id: None,
             omp_capture_generation: None,
@@ -82,6 +84,7 @@ impl Instance {
             pending_host_env: Vec::new(),
             capture_started_at: None,
             pi_extension_launched: false,
+            identity_publisher_launched: false,
             pi_session_path: None,
             last_error: None,
             session_id_poller: None,
@@ -194,20 +197,32 @@ impl Instance {
         &self,
         agent: &crate::agents::AgentDef,
     ) -> bool {
-        let command = self.get_tool_command().trim();
+        let raw_command = self.get_tool_command();
+        let command = raw_command.trim();
         let contains_control = |value: &str| {
-            (!value.is_empty() && value.lines().count() != 1)
-                || value
-                    .chars()
-                    .any(|ch| matches!(ch, '|' | '&' | ';' | '<' | '>' | '(' | ')' | '#' | '`'))
+            value.chars().any(|ch| {
+                matches!(
+                    ch,
+                    '\n' | '\r' | '|' | '&' | ';' | '<' | '>' | '(' | ')' | '#' | '`'
+                )
+            })
         };
-        if command.is_empty() || contains_control(command) || contains_control(&self.extra_args) {
+        if command.is_empty() || contains_control(raw_command) || contains_control(&self.extra_args)
+        {
             return false;
         }
-        shell_words::split(command)
-            .ok()
-            .and_then(|words| words.into_iter().next())
+        let Ok(mut words) = shell_words::split(command) else {
+            return false;
+        };
+        if let Ok(extra) = shell_words::split(&self.extra_args) {
+            words.extend(extra);
+        } else {
+            return false;
+        }
+        words
+            .first()
             .is_some_and(|executable| executable == agent.binary)
+            && !words.iter().any(|word| word == "--")
     }
 
     pub(super) fn resolved_session_support(
@@ -268,8 +283,19 @@ impl Instance {
         let config =
             crate::session::profile_config::resolve_config_or_warn(&self.effective_profile());
         let declared = config.session.agent_config_dir_for(&self.tool, &home);
+        let agent = self.resolved_agent()?;
+        if self.sandbox_store_generation
+            < crate::session::container_config::CURRENT_SANDBOX_STORE_GENERATION
+        {
+            return crate::session::container_config::legacy_sandbox_store_dir(
+                agent.name,
+                &home,
+                declared.as_deref(),
+                (self.sandbox_store_generation == 0).then_some(self.id.as_str()),
+            );
+        }
         crate::session::container_config::sandbox_store_dir(
-            self.resolved_agent()?.name,
+            agent.name,
             &home,
             declared.as_deref(),
             &self.id,
@@ -662,6 +688,24 @@ mod tests {
         inst.command = "claude".to_string();
         inst.extra_args = "--model opus # local note".to_string();
         assert!(!inst.supports_native_resume());
+
+        for value in ["claude\n", "claude\r", "claude\r\n"] {
+            inst.command = value.to_string();
+            inst.extra_args.clear();
+            assert!(!inst.supports_native_resume(), "accepted {value:?}");
+        }
+        inst.command = "claude --".to_string();
+        inst.extra_args.clear();
+        assert!(!inst.supports_native_resume());
+        inst.command = "claude".to_string();
+        inst.extra_args = "--".to_string();
+        assert!(!inst.supports_native_resume());
+
+        inst.command = "claude".to_string();
+        for value in ["--model opus\n", "--model opus\r", "--model opus\r\n"] {
+            inst.extra_args = value.to_string();
+            assert!(!inst.supports_native_resume(), "accepted {value:?}");
+        }
     }
 
     #[test]

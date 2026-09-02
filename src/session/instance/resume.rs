@@ -419,7 +419,12 @@ mod tests {
             ("XDG_CONFIG_HOME", root.join(".config")),
             ("CLAUDE_CONFIG_DIR", root.join(".claude")),
         ];
-        crate::session::test_support::EnvGuard::set(&roots)
+        let guard = crate::session::test_support::EnvGuard::set(&roots);
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })
+        .unwrap();
+        guard
     }
 
     fn install_fake_claude(

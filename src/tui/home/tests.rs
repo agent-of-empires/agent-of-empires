@@ -10875,6 +10875,10 @@ fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
     let claude_home = temp.path().join(".claude");
     let _claude_config_guard =
         crate::session::test_support::EnvGuard::set(&[("CLAUDE_CONFIG_DIR", claude_home.clone())]);
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })
+    .unwrap();
     let profile = "restart-resume-failed";
     let storage = Storage::new_unwatched(profile).unwrap();
     let stale_sid = "11111111-2222-3333-4444-555555555555";

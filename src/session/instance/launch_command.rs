@@ -401,6 +401,7 @@ impl Instance {
             // Pi publishes its conversation from inside the container through
             // the same extension, reaching the instance dir and the extension
             // file by bind-mount (see `container_config`).
+            self.pi_extension_launched = false;
             let pi_extension = self.pi_extension_launch();
             if let Some((ref flag, _)) = pi_extension {
                 // Empty for a container: the extension is discovered there
@@ -515,8 +516,9 @@ impl Instance {
 
         let profile = self.effective_profile();
         let mut env_prefix = status_hook_env_prefix(&profile, &self.id, agent);
-        // Pi publishes its own conversation through an AoE extension; the flag
-        // rides the built-in command only, an override being unvouched.
+        // A verified direct Pi command publishes through the same extension
+        // whether it came from the built-in command or an exact alias.
+        self.pi_extension_launched = false;
         let pi_extension = self.pi_extension_launch();
         if let Some((_, ref env)) = pi_extension {
             env_prefix.push_str(env);
@@ -565,6 +567,9 @@ impl Instance {
             }
         } else {
             let mut cmd = self.command.clone();
+            if let Some((ref flag, _)) = pi_extension {
+                cmd.push_str(flag);
+            }
             if !self.extra_args.is_empty() {
                 cmd = format!("{} {}", cmd, self.extra_args);
             }
@@ -673,6 +678,62 @@ mod tests {
             )
         );
     }
+    #[test]
+    #[serial_test::serial]
+    fn direct_pi_alias_emits_the_extension_it_marks_as_launched() {
+        let home = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+        let mut inst = Instance::new("pi alias", "/tmp/pi-alias-launch");
+        inst.tool = "company-pi".to_string();
+        inst.detect_as = "pi".to_string();
+        inst.command = "pi".to_string();
+        let agent = inst.resolved_agent();
+
+        let (command, _, _) = inst.build_host_command(agent).unwrap();
+        let command = command.unwrap();
+
+        assert!(command.contains(" -e "), "missing Pi extension: {command}");
+        assert!(command.contains("AOE_PI_SESSION_ID_FILE="));
+        assert!(inst.pi_extension_launched);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pi_alias_with_non_pi_command_does_not_get_extension() {
+        let home = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+        let mut inst = Instance::new("pi alias wrapper", "/tmp/pi-alias-wrapper");
+        inst.tool = "company-pi".to_string();
+        inst.detect_as = "pi".to_string();
+        inst.command = "echo not-pi".to_string();
+        let agent = inst.resolved_agent();
+
+        assert!(inst.pi_extension_launch().is_none());
+        let (command, _, _) = inst.build_host_command(agent).unwrap();
+        let command = command.unwrap();
+
+        assert!(!command.contains("pi-aoe-session-id.js"));
+        assert!(!command.contains("AOE_PI_SESSION_ID_FILE="));
+        assert!(!inst.pi_extension_launched);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pi_option_terminator_disables_extension_injection() {
+        let home = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+        let mut inst = Instance::new("pi terminator", "/tmp/pi-terminator");
+        inst.tool = "pi".to_string();
+        inst.extra_args = "--".to_string();
+        let agent = inst.resolved_agent();
+
+        let (command, _, _) = inst.build_host_command(agent).unwrap();
+        let command = command.unwrap();
+
+        assert!(!command.contains(" -e "), "extension follows --: {command}");
+        assert!(!inst.pi_extension_launched);
+    }
+
     use super::*;
 
     use crate::session::test_support::EnvGuard;

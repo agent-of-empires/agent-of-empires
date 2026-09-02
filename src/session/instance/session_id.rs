@@ -2,6 +2,8 @@
 
 use super::*;
 
+const PI_SIDECAR_MAX_BYTES: usize = 4096;
+
 impl Instance {
     /// Acquire a pre-launch session ID for the agent.
     ///
@@ -331,6 +333,22 @@ impl Instance {
             {
                 return None;
             }
+            let config = self.build_container_config().ok()?;
+            if !config.uses_default_container_home()
+                || !config.path_is_mounted(&bind_dir, std::path::Path::new("/root/.pi"), true)
+            {
+                return None;
+            }
+            let container = crate::containers::DockerContainer::from_session_id(&self.id);
+            let container_known = self
+                .sandbox_info
+                .as_ref()
+                .and_then(|sandbox| sandbox.container_id.as_ref())
+                .is_some()
+                || container.exists().ok() == Some(true);
+            if container_known && container.mount_fingerprint_matches(&config).ok()? != Some(true) {
+                return None;
+            }
             return Some((
                 String::new(),
                 format!(
@@ -340,8 +358,7 @@ impl Instance {
                 ),
             ));
         }
-        if self.get_tool_command().trim() != "pi"
-            || super::launch_command::environment_defines_path(&self.resolved_host_environment())
+        if super::launch_command::environment_defines_path(&self.resolved_host_environment())
             || !crate::agents::pi_supports_extension_flag()
         {
             return None;
@@ -376,9 +393,9 @@ impl Instance {
                     crate::hooks::read_hook_session_id(&self.id)
                 }
             }
-            PiSidecarSource::SandboxDir(dir) => {
-                let raw = std::fs::read_to_string(dir.join("session_id")).ok()?;
-                let id = raw.trim();
+            PiSidecarSource::SandboxDir(_) => {
+                let raw = self.read_pi_sandbox_file("session_id")?;
+                let id = std::str::from_utf8(&raw).ok()?.trim();
                 uuid::Uuid::parse_str(id).ok().map(|_| id.to_string())
             }
         }
@@ -390,9 +407,9 @@ impl Instance {
     pub(crate) fn pi_published_session_path(&self) -> Option<String> {
         match self.pi_sidecar_source()? {
             PiSidecarSource::HostHooks => crate::hooks::read_hook_session_path(&self.id),
-            PiSidecarSource::SandboxDir(dir) => {
-                let raw = std::fs::read_to_string(dir.join("session_path")).ok()?;
-                let path = raw.trim();
+            PiSidecarSource::SandboxDir(_) => {
+                let raw = self.read_pi_sandbox_file("session_path")?;
+                let path = std::str::from_utf8(&raw).ok()?.trim();
                 path.starts_with('/').then(|| path.to_string())
             }
         }
@@ -426,6 +443,18 @@ impl Instance {
         )
     }
 
+    fn read_pi_sandbox_file(&self, leaf: &str) -> Option<Vec<u8>> {
+        let root = crate::session::AnchoredDir::open(&self.pi_config_bind_dir()?).ok()?;
+        let relative = Path::new("aoe-session").join(&self.id).join(leaf);
+        root.read_regular(&relative, PI_SIDECAR_MAX_BYTES).ok()?
+    }
+
+    fn pi_sandbox_regular_exists(&self, relative: &Path) -> bool {
+        self.pi_config_bind_dir()
+            .and_then(|root| crate::session::AnchoredDir::open(&root).ok())
+            .is_some_and(|root| root.regular_exists(relative))
+    }
+
     /// A published path as the host filesystem sees it.
     fn pi_host_view_of(&self, published: &str) -> Option<std::path::PathBuf> {
         if !self.is_sandboxed() {
@@ -443,9 +472,13 @@ impl Instance {
             .rsplit_once('_')
             .and_then(|(_, tail)| tail.strip_suffix(".jsonl"))
             .is_some_and(|uuid| uuid == id);
-        let exists = self
-            .pi_host_view_of(path)
-            .is_some_and(|host_path| host_path.is_file());
+        let exists = if self.is_sandboxed() {
+            path.strip_prefix("/root/.pi/")
+                .is_some_and(|relative| self.pi_sandbox_regular_exists(Path::new(relative)))
+        } else {
+            self.pi_host_view_of(path)
+                .is_some_and(|host_path| host_path.is_file())
+        };
         (names_this_conversation && exists).then(|| path.to_string())
     }
 
@@ -474,7 +507,10 @@ impl Instance {
     /// silent one: no poller repair, and a final flush that returns early.
     fn pi_sidecar_exists(&self) -> bool {
         match self.pi_sidecar_source() {
-            Some(PiSidecarSource::SandboxDir(dir)) => dir.join("session_id").is_file(),
+            Some(PiSidecarSource::SandboxDir(_)) => {
+                let relative = Path::new("aoe-session").join(&self.id).join("session_id");
+                self.pi_sandbox_regular_exists(&relative)
+            }
             Some(PiSidecarSource::HostHooks) => crate::hooks::session_id_sidecar_exists(&self.id),
             None => false,
         }
@@ -491,9 +527,14 @@ impl Instance {
                 Some(PiSidecarSource::HostHooks) => {
                     let _ = crate::hooks::unlink_session_id_via_guard(&self.id);
                 }
-                Some(PiSidecarSource::SandboxDir(dir)) => {
-                    let _ = std::fs::remove_file(dir.join("session_id"));
-                    let _ = std::fs::remove_file(dir.join("session_path"));
+                Some(PiSidecarSource::SandboxDir(_)) => {
+                    if let Some(root_path) = self.pi_config_bind_dir() {
+                        if let Ok(root) = crate::session::AnchoredDir::open(&root_path) {
+                            let base = Path::new("aoe-session").join(&self.id);
+                            let _ = root.remove_file(&base.join("session_id"));
+                            let _ = root.remove_file(&base.join("session_path"));
+                        }
+                    }
                 }
                 None => {}
             },
@@ -503,14 +544,9 @@ impl Instance {
 
     /// Whether this session may pin its Pi conversation with `--session-id`.
     ///
-    /// Requires a host binary AoE can probe directly. Command overrides,
-    /// sandbox launches, and profile-owned PATH values start unpinned; the Pi
-    /// extension may still publish the pane's exact id after launch.
-    /// The tool check comes first so no other agent's launch pays for the
-    /// `pi --help` probe.
+    /// Requires a directly verified host Pi launch with an unmodified PATH.
     fn pi_session_id_pinnable(&self) -> bool {
-        self.tool == "pi"
-            && !self.has_command_override()
+        self.resolved_capture_backend() == Some(crate::agents::SessionCaptureBackend::Pi)
             && !self.is_sandboxed()
             && !super::launch_command::environment_defines_path(&self.resolved_host_environment())
             && crate::agents::pi_supports_session_id_flag()
@@ -1136,6 +1172,59 @@ mod tests {
             reloaded.pi_published_session_id(true).as_deref(),
             Some("01a053b6-c470-78de-9d8f-bc00ef05332a"),
             "and the final flush must read it"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn sandbox_pi_sidecar_reads_are_bounded_and_nonblocking() {
+        use nix::sys::stat::Mode;
+        use nix::unistd::mkfifo;
+
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::EnvGuard::set(&[("HOME", temp.path())]);
+        let mut inst = Instance::new("piboundedsidecar", "/tmp/pi-bounded");
+        inst.tool = "pi".to_string();
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "aoe-pi-bounded".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: None,
+            before_start_env: Vec::new(),
+        });
+        let dir = inst.pi_sandbox_sidecar().unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let sidecar = dir.join("session_id");
+        std::fs::write(&sidecar, vec![b'x'; PI_SIDECAR_MAX_BYTES + 1]).unwrap();
+        assert_eq!(inst.pi_published_session_id(true), None);
+
+        std::fs::remove_file(&sidecar).unwrap();
+        mkfifo(&sidecar, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        assert_eq!(inst.pi_published_session_id(true), None);
+        let poll = crate::session::capture::pi_sidecar_poll_fn(
+            inst.id.clone(),
+            PiSidecarSource::SandboxDir(dir.clone()),
+        );
+        assert!(poll().is_none());
+
+        std::fs::remove_file(&sidecar).unwrap();
+        let root = dir.parent().and_then(std::path::Path::parent).unwrap();
+        std::fs::remove_dir_all(root.join("aoe-session")).unwrap();
+        let foreign = temp.path().join("foreign-aoe-session");
+        std::fs::create_dir_all(foreign.join(&inst.id)).unwrap();
+        std::fs::write(
+            foreign.join(&inst.id).join("session_id"),
+            "99999999-9999-4999-8999-999999999999",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&foreign, root.join("aoe-session")).unwrap();
+        assert!(
+            poll().is_none(),
+            "the poller must anchor above the replaceable aoe-session ancestor"
         );
     }
 

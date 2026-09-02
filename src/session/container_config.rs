@@ -17,6 +17,8 @@ use super::instance::SandboxInfo;
 
 /// Subdirectory name inside each agent's config dir for sandbox config.
 const SANDBOX_SUBDIR: &str = "sandbox";
+const SANDBOX_PRIVATE_SUBDIR: &str = "sandbox-v2";
+pub(crate) const CURRENT_SANDBOX_STORE_GENERATION: u8 = 2;
 
 /// Content seeded into the Claude sandbox `.sandbox-gitconfig`. Scoped to github.com;
 /// the helper emits credentials only on `get` and only when GH_TOKEN is non-empty, so
@@ -748,8 +750,28 @@ fn sandbox_dir_for(
             "refusing to use sandbox config for unsafe AOE_INSTANCE_ID {instance_id:?}: {e}"
         )
     })?;
-    Ok(sandbox_dir.join(instance_id))
+    Ok(home
+        .join(mount.host_rel)
+        .join(SANDBOX_PRIVATE_SUBDIR)
+        .join(instance_id))
 }
+pub(crate) fn legacy_sandbox_store_dir(
+    tool: &str,
+    home: &Path,
+    declared_config_dir: Option<&Path>,
+    instance_id: Option<&str>,
+) -> Option<PathBuf> {
+    AGENT_CONFIG_MOUNTS
+        .iter()
+        .find(|mount| mount.tool_name == tool)
+        .map(|mount| {
+            let root = declared_config_dir
+                .map(|dir| dir.join(SANDBOX_SUBDIR))
+                .unwrap_or_else(|| home.join(mount.host_rel).join(SANDBOX_SUBDIR));
+            instance_id.map_or(root.clone(), |id| root.join(id))
+        })
+}
+
 pub(crate) fn sandbox_store_dir(
     tool: &str,
     home: &Path,
@@ -763,7 +785,7 @@ pub(crate) fn sandbox_store_dir(
         return Ok(None);
     };
     declared_config_dir
-        .map(|dir| Ok(dir.join(SANDBOX_SUBDIR).join(instance_id)))
+        .map(|dir| Ok(dir.join(SANDBOX_PRIVATE_SUBDIR).join(instance_id)))
         .unwrap_or_else(|| sandbox_dir_for(mount, home, Some(instance_id)))
         .map(Some)
 }
@@ -786,7 +808,13 @@ pub(crate) fn sandbox_store_migration_paths(
         let shared = declared_config_dir
             .map(|dir| dir.join(SANDBOX_SUBDIR))
             .unwrap_or_else(|| home.join(mount.host_rel).join(SANDBOX_SUBDIR));
-        let private = shared.join(instance_id);
+        let private = declared_config_dir
+            .map(|dir| dir.join(SANDBOX_PRIVATE_SUBDIR).join(instance_id))
+            .unwrap_or_else(|| {
+                home.join(mount.host_rel)
+                    .join(SANDBOX_PRIVATE_SUBDIR)
+                    .join(instance_id)
+            });
         if !paths
             .iter()
             .any(|pair| pair == &(shared.clone(), private.clone()))
@@ -1023,11 +1051,11 @@ pub(crate) fn install_pi_sandbox_extension_at(root: &Path) -> Result<()> {
         .join("extensions")
         .join("aoe-session-id.js");
     let source = crate::session::instance::PI_SESSION_EXTENSION;
-    let path = root.join(&rel);
-    let current = std::fs::symlink_metadata(&path)
-        .is_ok_and(|m| m.is_file())
-        .then(|| std::fs::read_to_string(&path).ok())
-        .flatten();
+    let current = crate::session::AnchoredDir::open(root)
+        .ok()
+        .filter(|anchored| anchored.regular_exists(&rel))
+        .and_then(|anchored| anchored.read_regular(&rel, source.len()).ok().flatten())
+        .and_then(|bytes| String::from_utf8(bytes).ok());
     if current.as_deref() != Some(source) {
         crate::session::replace_file_no_follow(root, &rel, source.as_bytes())?;
     }
@@ -1205,66 +1233,6 @@ fn compute_workspace_volume_paths(
     Ok((volumes, ws_container))
 }
 
-/// Re-sync shared sandbox directories from the host so containers pick up
-/// credential changes (e.g. re-auth) since they were created.
-pub(crate) fn refresh_shared_agent_configs() {
-    let Some(home) = dirs::home_dir() else {
-        return;
-    };
-
-    for mount in AGENT_CONFIG_MOUNTS {
-        if mount.tool_name == "codex" {
-            continue;
-        }
-
-        match prepare_sandbox_dir(mount, &home, None) {
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(target: "session.profile",
-                    "Failed to refresh agent config for {}: {}",
-                    mount.host_rel,
-                    e
-                );
-            }
-        }
-    }
-}
-
-/// Re-sync an instance-private Codex sandbox with its own profile settings.
-pub(crate) fn refresh_codex_agent_config_for_instance(
-    profile: &str,
-    instance_id: &str,
-    tool: &str,
-    detect_as: Option<&str>,
-) {
-    let Some(home) = dirs::home_dir() else {
-        return;
-    };
-
-    let is_codex = match managed_codex_home(tool, detect_as, profile, instance_id) {
-        Ok(Some(_)) => true,
-        Ok(None) => false,
-        Err(e) => {
-            tracing::warn!(target: "session.profile",
-                "Failed to resolve managed Codex home for {}: {}", instance_id, e
-            );
-            false
-        }
-    };
-    if !is_codex {
-        return;
-    }
-
-    let profile_config = super::profile_config::resolve_config_or_warn(profile);
-    let hooks_enabled = profile_config.session.agent_status_hooks;
-    for mount in AGENT_CONFIG_MOUNTS
-        .iter()
-        .filter(|mount| mount.tool_name == "codex")
-    {
-        refresh_codex_sandbox_dir(mount, &home, instance_id, hooks_enabled, &profile_config);
-    }
-}
-
 /// Re-sync the current instance's physically isolated agent config.
 pub(crate) fn refresh_agent_configs_for_instance(
     profile: &str,
@@ -1272,7 +1240,6 @@ pub(crate) fn refresh_agent_configs_for_instance(
     tool: &str,
     detect_as: Option<&str>,
 ) {
-    refresh_shared_agent_configs();
     let Some(home) = dirs::home_dir() else {
         return;
     };
@@ -1289,7 +1256,7 @@ pub(crate) fn refresh_agent_configs_for_instance(
             Some(directory) => prepare_sandbox_dir_from(
                 mount,
                 directory.clone(),
-                directory.join(SANDBOX_SUBDIR).join(instance_id),
+                directory.join(SANDBOX_PRIVATE_SUBDIR).join(instance_id),
                 &home,
             ),
             None => prepare_sandbox_dir(mount, &home, Some(instance_id)),
@@ -1310,44 +1277,16 @@ pub(crate) fn refresh_agent_configs_for_instance(
         }
     }
 }
-/// Refresh one instance-private Codex sandbox with its own profile settings.
-/// The old flat `.codex/sandbox` directory is intentionally ignored: it may
-/// contain the SQLite files held by a running legacy session and must never be
-/// mounted again.
-fn refresh_codex_sandbox_dir(
-    mount: &AgentConfigMount,
-    home: &Path,
-    instance_id: &str,
-    hooks_enabled: bool,
-    profile_config: &super::config::Config,
-) {
-    match prepare_sandbox_dir(mount, home, Some(instance_id)) {
-        Ok(sandbox_dir) => {
-            if hooks_enabled && should_refresh_codex_hooks(mount, &sandbox_dir, home) {
-                refresh_codex_sandbox_hooks(mount, &sandbox_dir, profile_config);
-            }
-        }
-        Err(e) => tracing::warn!(target: "session.profile",
-            "Failed to refresh isolated Codex config for {}: {}", instance_id, e
-        ),
-    }
-}
-
-/// True iff `tool_name` resolves to a registered agent declaring
-/// [`crate::agents::HookFormat::CodexJson`]. Centralises the dispatch
-/// predicate so `prepare_sandbox_dir` and `should_refresh_codex_hooks`
-/// stay aligned.
 fn agent_format_is_codex_json(tool_name: &str) -> bool {
     crate::agents::get_agent(tool_name)
-        .and_then(|a| a.hook_config.as_ref())
-        .is_some_and(|c| c.format == crate::agents::HookFormat::CodexJson)
+        .and_then(|agent| agent.hook_config.as_ref())
+        .is_some_and(|config| config.format == crate::agents::HookFormat::CodexJson)
 }
 
 fn should_refresh_codex_hooks(mount: &AgentConfigMount, sandbox_dir: &Path, home: &Path) -> bool {
     if !agent_format_is_codex_json(mount.tool_name) {
         return false;
     }
-
     let host_hooks = home.join(mount.host_rel).join("hooks.json");
     let sandbox_hooks = sandbox_dir.join("hooks.json");
     host_hooks.exists() || sandbox_hooks.exists()
@@ -1464,7 +1403,7 @@ pub(crate) fn ensure_folder_trust_config_for_active_agent(
         // still the agent's config root inside this one container.
 
         let sandbox_dir = match agent_config_dir.as_ref() {
-            Some(dir) => Ok(dir.join(SANDBOX_SUBDIR).join(instance_id)),
+            Some(dir) => Ok(dir.join(SANDBOX_PRIVATE_SUBDIR).join(instance_id)),
             None => sandbox_dir_for(mount, &home, Some(instance_id)),
         };
         let sandbox_dir = match sandbox_dir {
@@ -1826,6 +1765,14 @@ pub(crate) fn build_container_config(
     const CONTAINER_HOME: &str = "/root";
 
     let mut environment = collect_environment(&sandbox_config, sandbox_info);
+    // Pin the home used to place agent hooks. Container images may declare a
+    // different ENV HOME, so absence is not proof that `/root` is effective.
+    if !environment.iter().any(|entry| entry.key() == "HOME") {
+        environment.push(EnvEntry::Literal {
+            key: "HOME".to_string(),
+            value: CONTAINER_HOME.to_string(),
+        });
+    }
     if !environment.iter().any(|entry| entry.key() == "CODEX_HOME") {
         if let Some(codex_home) = managed_codex_home(
             agent_selection.tool,
@@ -1917,6 +1864,9 @@ pub(crate) fn build_container_config(
         profile_session_config.agent_config_dir_for(agent_selection.tool, &home);
     // Agent definitions are in AGENT_CONFIG_MOUNTS. Add new agents there.
     let mut active_sandbox_config: Option<(&AgentConfigMount, PathBuf)> = None;
+    let mut identity_publisher_installed = false;
+    let mut identity_publisher_path: Option<(PathBuf, String)> = None;
+    let mut identity_output_path: Option<(PathBuf, String)> = None;
     for mount in AGENT_CONFIG_MOUNTS
         .iter()
         .filter(|m| m.tool_name == config_tool)
@@ -1927,7 +1877,7 @@ pub(crate) fn build_container_config(
             Some(directory) => prepare_sandbox_dir_from(
                 mount,
                 directory.clone(),
-                directory.join(SANDBOX_SUBDIR).join(instance_id),
+                directory.join(SANDBOX_PRIVATE_SUBDIR).join(instance_id),
                 &home,
             ),
             None => prepare_sandbox_dir(mount, &home, Some(instance_id)),
@@ -2000,6 +1950,8 @@ pub(crate) fn build_container_config(
                             "{}/{instance_id}",
                             crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER
                         );
+                        identity_output_path =
+                            Some((hook_dir.clone(), container_hook_path.clone()));
                         volumes.push(VolumeMount {
                             host_path: hook_dir.to_string_lossy().to_string(),
                             container_path: container_hook_path,
@@ -2051,12 +2003,39 @@ pub(crate) fn build_container_config(
                                     .or_else(|| Some(sandbox_dir.join(relative)))
                             });
                     if let Some(config_file) = config_file {
-                        if let Err(e) = (sidecar.install)(
+                        match (sidecar.install)(
                             &config_file,
                             crate::hooks::HookInstallTarget::Sandbox,
                             &events,
                         ) {
-                            tracing::warn!(target: "session.profile", "Failed to install {} hooks in sandbox: {}", agent.name, e);
+                            Ok(()) => {
+                                let publishes_identity =
+                                    events.iter().any(|event| event.identity_field.is_some());
+                                identity_publisher_installed |= publishes_identity;
+                                if publishes_identity {
+                                    if let Some((mount, sandbox_dir)) =
+                                        active_sandbox_config.as_ref()
+                                    {
+                                        if let Ok(relative) = config_file.strip_prefix(sandbox_dir)
+                                        {
+                                            identity_publisher_path = Some((
+                                                config_file.clone(),
+                                                Path::new(&agent_config_container_path(
+                                                    mount,
+                                                    CONTAINER_HOME,
+                                                    &environment,
+                                                ))
+                                                .join(relative)
+                                                .to_string_lossy()
+                                                .into_owned(),
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(target: "session.profile", "Failed to install {} hooks in sandbox: {}", agent.name, e)
+                            }
                         }
                     } else {
                         tracing::warn!(target: "session.profile", "No sandbox config mount for {} hooks", agent.name);
@@ -2097,8 +2076,36 @@ pub(crate) fn build_container_config(
                                 )
                             }
                         };
-                        if let Err(e) = result {
-                            tracing::warn!(target: "session.profile", "Failed to install hooks in sandbox config: {}", e);
+                        match result {
+                            Ok(()) => {
+                                let publishes_identity =
+                                    events.iter().any(|event| event.identity_field.is_some());
+                                identity_publisher_installed |= publishes_identity;
+                                if publishes_identity {
+                                    if let Some((mount, sandbox_dir)) =
+                                        active_sandbox_config.as_ref()
+                                    {
+                                        if let Ok(relative) =
+                                            settings_file.strip_prefix(sandbox_dir)
+                                        {
+                                            identity_publisher_path = Some((
+                                                settings_file.clone(),
+                                                Path::new(&agent_config_container_path(
+                                                    mount,
+                                                    CONTAINER_HOME,
+                                                    &environment,
+                                                ))
+                                                .join(relative)
+                                                .to_string_lossy()
+                                                .into_owned(),
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(target: "session.profile", "Failed to install hooks in sandbox config: {}", e)
+                            }
                         }
                     } else {
                         tracing::warn!(target: "session.profile", "No sandbox config mount for {} hooks", agent.name);
@@ -2228,6 +2235,25 @@ pub(crate) fn build_container_config(
     }
     deduped.reverse();
 
+    if identity_publisher_installed {
+        let candidate = ContainerConfig {
+            volumes: deduped.clone(),
+            environment: environment.clone(),
+            ..ContainerConfig::default()
+        };
+        identity_publisher_installed = candidate.uses_default_container_home()
+            && identity_publisher_path
+                .as_ref()
+                .is_some_and(|(host, container)| {
+                    candidate.path_is_mounted(host, Path::new(container), false)
+                })
+            && identity_output_path
+                .as_ref()
+                .is_some_and(|(host, container)| {
+                    candidate.path_is_mounted(host, Path::new(container), true)
+                });
+    }
+
     Ok(ContainerConfig {
         working_dir: workspace_path,
         volumes: deduped,
@@ -2239,6 +2265,7 @@ pub(crate) fn build_container_config(
         port_mappings: sandbox_config.port_mappings.clone(),
         network: sanitize_network(sandbox_config.network.as_deref()),
         selinux_relabel: sandbox_config.selinux_relabel,
+        identity_publisher_installed,
     })
 }
 
@@ -4206,7 +4233,7 @@ volume_ignores = ["node_modules"]
         let codex_sandbox = temp_home
             .path()
             .join(".codex")
-            .join(SANDBOX_SUBDIR)
+            .join(SANDBOX_PRIVATE_SUBDIR)
             .join(instance_id);
         assert!(codex_sandbox.join("hooks.json").exists());
         assert!(!codex_sandbox.join("config.toml").exists());
@@ -4284,7 +4311,7 @@ volume_ignores = ["node_modules"]
                 temp_home
                     .path()
                     .join(".codex")
-                    .join(SANDBOX_SUBDIR)
+                    .join(SANDBOX_PRIVATE_SUBDIR)
                     .join(instance_id)
             })
             .collect();
@@ -4359,7 +4386,7 @@ volume_ignores = ["node_modules"]
         let codex_config = temp_home
             .path()
             .join(".codex")
-            .join(SANDBOX_SUBDIR)
+            .join(SANDBOX_PRIVATE_SUBDIR)
             .join(instance_id)
             .join("config.toml");
         assert!(
@@ -4421,7 +4448,7 @@ volume_ignores = ["node_modules"]
             let seeded = temp_home
                 .path()
                 .join(".claude")
-                .join(SANDBOX_SUBDIR)
+                .join(SANDBOX_PRIVATE_SUBDIR)
                 .join(&instance_id)
                 .join(".claude.json");
             let parsed: serde_json::Value =
@@ -4498,7 +4525,7 @@ claude-personal = "~/.claude-personal"
             "",
         )
         .unwrap();
-        let staged = declared.join(SANDBOX_SUBDIR).join(instance_id);
+        let staged = declared.join(SANDBOX_PRIVATE_SUBDIR).join(instance_id);
         assert!(config.volumes.iter().any(|volume| {
             Path::new(&volume.host_path) == staged
                 && volume.container_path == "/root/.claude"
@@ -4521,7 +4548,7 @@ claude-personal = "~/.claude-personal"
         let default_config = temp_home
             .path()
             .join(".claude")
-            .join(SANDBOX_SUBDIR)
+            .join(SANDBOX_PRIVATE_SUBDIR)
             .join(instance_id)
             .join(".claude.json");
         let default_trust = fs::read_to_string(&default_config)
@@ -4598,7 +4625,7 @@ codex-work = "{}"
             .find(|entry| entry.key() == "CODEX_HOME")
             .map(EnvEntry::value)
             .expect("managed CODEX_HOME");
-        let staged = declared.join(SANDBOX_SUBDIR).join(instance_id);
+        let staged = declared.join(SANDBOX_PRIVATE_SUBDIR).join(instance_id);
         assert!(config.volumes.iter().any(|volume| {
             Path::new(&volume.host_path) == staged
                 && volume.container_path == codex_home
@@ -4689,7 +4716,7 @@ codex-work = "{}"
         let gemini_settings = temp_home
             .path()
             .join(".gemini")
-            .join(SANDBOX_SUBDIR)
+            .join(SANDBOX_PRIVATE_SUBDIR)
             .join("gemini-yolo-trust-test")
             .join("settings.json");
         assert!(
@@ -4717,7 +4744,7 @@ codex-work = "{}"
 
         let codex_dir = temp_home.path().join(".codex");
         let instance_id = "codex-yolo-refresh-test";
-        let codex_sandbox = codex_dir.join(SANDBOX_SUBDIR).join(instance_id);
+        let codex_sandbox = codex_dir.join(SANDBOX_PRIVATE_SUBDIR).join(instance_id);
         fs::create_dir_all(&codex_sandbox).unwrap();
         fs::write(codex_dir.join("config.toml"), r#"model = "host""#).unwrap();
         fs::write(
@@ -4769,7 +4796,7 @@ trust_level = "trusted"
 
         let gemini_dir = temp_home.path().join(".gemini");
         let gemini_sandbox = gemini_dir
-            .join(SANDBOX_SUBDIR)
+            .join(SANDBOX_PRIVATE_SUBDIR)
             .join("gemini-yolo-refresh-test");
         fs::create_dir_all(&gemini_sandbox).unwrap();
         fs::write(gemini_dir.join("settings.json"), r#"{"theme":"host"}"#).unwrap();
@@ -4809,6 +4836,108 @@ trust_level = "trusted"
             restored["security"]["folderTrust"]["enabled"].as_bool(),
             Some(false)
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn user_volume_shadowing_hook_config_disables_publisher_evidence() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let shadow = temp_home.path().join("shadow-cursor");
+        fs::create_dir_all(&shadow).unwrap();
+        crate::session::config::update_config(|config| {
+            config.sandbox.extra_volumes =
+                vec![format!("{}:/root/.cursor", shadow.to_string_lossy())];
+        })
+        .unwrap();
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+        let sandbox_info = super::super::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
+
+        let config = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("cursor", None),
+            false,
+            "cursor-shadow-test",
+            None,
+            "",
+        )
+        .unwrap();
+
+        assert!(!config.identity_publisher_installed);
+
+        let output_shadow = temp_home.path().join("shadow-output");
+        fs::create_dir_all(&output_shadow).unwrap();
+        crate::session::config::update_config(|config| {
+            config.sandbox.extra_volumes = vec![format!(
+                "{}:{}/cursor-output-shadow",
+                output_shadow.to_string_lossy(),
+                crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER
+            )];
+        })
+        .unwrap();
+        let config = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("cursor", None),
+            false,
+            "cursor-output-shadow",
+            None,
+            "",
+        )
+        .unwrap();
+        assert!(!config.identity_publisher_installed);
+
+        let hook_dir = crate::hooks::ensure_instance_dir_path("cursor-readonly").unwrap();
+        crate::session::config::update_config(|config| {
+            config.sandbox.extra_volumes = vec![format!(
+                "{}:{}/cursor-readonly:ro",
+                hook_dir.to_string_lossy(),
+                crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER
+            )];
+        })
+        .unwrap();
+        let config = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("cursor", None),
+            false,
+            "cursor-readonly",
+            None,
+            "",
+        )
+        .unwrap();
+        assert!(!config.identity_publisher_installed);
+
+        crate::session::config::update_config(|config| {
+            config.sandbox.extra_volumes.clear();
+            config.sandbox.environment = vec!["HOME=/alternate-home".to_string()];
+        })
+        .unwrap();
+        let config = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("cursor", None),
+            false,
+            "cursor-home-override",
+            None,
+            "",
+        )
+        .unwrap();
+        assert!(!config.identity_publisher_installed);
     }
 
     // Regression guard for the trap in #958: a sidecar agent (settl TOML,
@@ -4869,6 +4998,19 @@ trust_level = "trusted"
                 "",
             )
             .unwrap();
+
+            let expects_identity = crate::agents::resolved_sidecar_hook_events(
+                agent,
+                &crate::session::profile_config::resolve_config_or_warn(""),
+            )
+            .unwrap()
+            .iter()
+            .any(|event| event.identity_field.is_some());
+            assert_eq!(
+                config.identity_publisher_installed, expects_identity,
+                "{} publisher evidence",
+                agent.name
+            );
 
             let mount = AGENT_CONFIG_MOUNTS
                 .iter()
@@ -4952,7 +5094,7 @@ trust_level = "trusted"
                 temp_home
                     .path()
                     .join(".cursor")
-                    .join(SANDBOX_SUBDIR)
+                    .join(SANDBOX_PRIVATE_SUBDIR)
                     .join(instance_id)
                     .join("hooks.json"),
             )
@@ -5013,7 +5155,7 @@ trust_level = "trusted"
         let selected_config = temp_home
             .path()
             .join(".kiro")
-            .join(SANDBOX_SUBDIR)
+            .join(SANDBOX_PRIVATE_SUBDIR)
             .join(instance_id)
             .join("agents/custom-agent.json");
         assert!(
@@ -5082,7 +5224,7 @@ trust_level = "trusted"
         let matched = temp_home
             .path()
             .join(".kiro")
-            .join(SANDBOX_SUBDIR)
+            .join(SANDBOX_PRIVATE_SUBDIR)
             .join(instance_id)
             .join("agents/TeamAgents-custom-agent.json");
         assert!(
@@ -5103,7 +5245,7 @@ trust_level = "trusted"
         let stem_clone = temp_home
             .path()
             .join(".kiro")
-            .join(SANDBOX_SUBDIR)
+            .join(SANDBOX_PRIVATE_SUBDIR)
             .join(instance_id)
             .join("agents/custom-agent.json");
         assert!(
@@ -5200,7 +5342,7 @@ trust_level = "trusted"
         let codex_sandbox = temp_home
             .path()
             .join(".codex")
-            .join(SANDBOX_SUBDIR)
+            .join(SANDBOX_PRIVATE_SUBDIR)
             .join(instance_id);
         assert!(!codex_sandbox.join("config.toml").exists());
 
@@ -5275,7 +5417,7 @@ agent_detect_as = { "wrapped-codex" = "codex" }
         let codex_sandbox = temp_home
             .path()
             .join(".codex")
-            .join(SANDBOX_SUBDIR)
+            .join(SANDBOX_PRIVATE_SUBDIR)
             .join(instance_id);
         assert!(codex_sandbox.join("hooks.json").exists());
         assert!(config.volumes.iter().any(|v| {
@@ -5340,7 +5482,7 @@ agent_detect_as = { "wrapped-codex" = "codex" }
         )
         .unwrap();
 
-        let codex_sandbox = codex_dir.join(SANDBOX_SUBDIR).join(instance_id);
+        let codex_sandbox = codex_dir.join(SANDBOX_PRIVATE_SUBDIR).join(instance_id);
         let sandbox_config_path = codex_sandbox.join("config.toml");
         let mut sandbox_config = fs::read_to_string(&sandbox_config_path).unwrap();
         sandbox_config.push_str(
@@ -5454,7 +5596,7 @@ trusted_hash = "keep"
 
         for (instance_id, _, expected_status) in instances {
             let hooks_path = codex_dir
-                .join(SANDBOX_SUBDIR)
+                .join(SANDBOX_PRIVATE_SUBDIR)
                 .join(instance_id)
                 .join("hooks.json");
             let hooks: serde_json::Value =
@@ -5507,7 +5649,7 @@ trusted_hash = "keep"
         let codex_sandbox = temp_home
             .path()
             .join(".codex")
-            .join(SANDBOX_SUBDIR)
+            .join(SANDBOX_PRIVATE_SUBDIR)
             .join(instance_id);
         assert!(codex_sandbox.join("hooks.json").exists());
         assert!(config.volumes.iter().any(|v| {
@@ -5567,7 +5709,7 @@ environment = ["CODEX_HOME=/root/profile-codex"]
         let codex_sandbox = temp_home
             .path()
             .join(".codex")
-            .join(SANDBOX_SUBDIR)
+            .join(SANDBOX_PRIVATE_SUBDIR)
             .join(instance_id);
         assert!(codex_sandbox.join("hooks.json").exists());
         assert!(config.volumes.iter().any(|v| {
@@ -6301,21 +6443,21 @@ volume_ignores = ["target"]
 
         assert_ne!(default_a, default_b);
         assert_ne!(declared_a, declared_b);
-        assert_eq!(default_a, home.join(".gemini/sandbox/instance-a"));
-        assert_eq!(declared_a, declared.join("sandbox/instance-a"));
+        assert_eq!(default_a, home.join(".gemini/sandbox-v2/instance-a"));
+        assert_eq!(declared_a, declared.join("sandbox-v2/instance-a"));
 
         assert_eq!(
             sandbox_store_migration_paths("gemini", home, None, "instance-a").unwrap(),
             vec![(
                 home.join(".gemini/sandbox"),
-                home.join(".gemini/sandbox/instance-a")
+                home.join(".gemini/sandbox-v2/instance-a")
             )]
         );
         assert_eq!(
             sandbox_store_migration_paths("gemini", home, Some(declared), "instance-a").unwrap(),
             vec![(
                 declared.join("sandbox"),
-                declared.join("sandbox/instance-a")
+                declared.join("sandbox-v2/instance-a")
             )]
         );
         assert_eq!(

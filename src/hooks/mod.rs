@@ -148,7 +148,7 @@ pub(crate) fn codex_config_path_display_for_host_environment(entries: &[String])
         .unwrap_or_else(codex_config_path_display)
 }
 
-/// Home-injectable variant of [`codex_hooks_json_path_for_host_environment`]:
+/// Resolve Codex hooks under an injected home directory:
 /// resolves Codex's `hooks.json` under the given `home` directory, honoring
 /// an explicit `CODEX_HOME` in `host_env` (or the AoE process env), then
 /// falling back to `<home>/.codex/hooks.json`.
@@ -161,15 +161,6 @@ pub(crate) fn codex_hooks_json_path_in(home: &Path, host_env: &[String]) -> Path
         return PathBuf::from(codex_home).join("hooks.json");
     }
     home.join(".codex").join("hooks.json")
-}
-
-/// Process-env variant of [`codex_hooks_json_path_in`]: resolves Codex's
-/// `hooks.json` against the live `dirs::home_dir()` so install paths
-/// outside the migration boot loop share a single call shape.
-pub(crate) fn codex_hooks_json_path_for_host_environment(entries: &[String]) -> Result<PathBuf> {
-    let home =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
-    Ok(codex_hooks_json_path_in(&home, entries))
 }
 
 /// Display-string variant of [`codex_hooks_json_path_for_host_environment`]
@@ -207,6 +198,7 @@ pub(crate) fn codex_hooks_json_path_display_for_host_environment(entries: &[Stri
 /// `settings_rel_path` (the env var replaces the whole `~/.claude`-style dir,
 /// matching how the agents themselves interpret it). Otherwise it falls back to
 /// the home-relative `settings_rel_path`.
+#[cfg(test)]
 pub(crate) fn agent_settings_path_for_host_environment(
     hook_cfg: &crate::agents::AgentHookConfig,
     host_env: &[String],

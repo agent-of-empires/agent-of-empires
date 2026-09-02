@@ -6,6 +6,10 @@ pub(super) fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
+pub(super) fn is_zero_u8(value: &u8) -> bool {
+    *value == 0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TerminalInfo {
     #[serde(default)]

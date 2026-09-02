@@ -53,6 +53,7 @@ impl Instance {
         disk.pane_dead_observed = self.pane_dead_observed;
         disk.force_fresh_next_launch = self.force_fresh_next_launch;
         disk.pending_host_env = std::mem::take(&mut self.pending_host_env);
+        disk.identity_publisher_launched = self.identity_publisher_launched;
         disk.source_profile = std::mem::take(&mut self.source_profile);
         disk.ever_confirmed_present = self.ever_confirmed_present;
         disk.unknown_since = self.unknown_since;
@@ -165,6 +166,34 @@ mod tests {
         assert_eq!(inst.agent_session_id.as_deref(), Some("old-sid"));
         inst.reconcile_from_disk();
         assert_eq!(inst.agent_session_id.as_deref(), Some("new-sid"));
+    }
+
+    #[test]
+    #[serial]
+    fn reconcile_from_disk_preserves_publisher_launch_proof() {
+        let temp = tempdir().unwrap();
+        std::env::set_var("HOME", temp.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let storage =
+            crate::session::storage::Storage::new_unwatched("reconcile-publisher").unwrap();
+        let mut inst = Instance::new("publisher proof", "/tmp/test");
+        inst.source_profile = "reconcile-publisher".to_string();
+        let on_disk = inst.clone();
+        storage
+            .update(|instances, groups| {
+                *instances = vec![on_disk.clone()];
+                *groups =
+                    crate::session::GroupTree::new_with_groups(std::slice::from_ref(&on_disk), &[])
+                        .get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+        inst.identity_publisher_launched = true;
+
+        inst.reconcile_from_disk();
+
+        assert!(inst.identity_publisher_launched);
     }
 
     #[test]

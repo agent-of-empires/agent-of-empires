@@ -243,7 +243,6 @@ pub(crate) fn extract_pi_cwd_from_header(path: &Path) -> Option<String> {
 
 /// Polling closure over the sidecar Pi's AoE extension writes: the pane's own
 /// conversation, `/new` included, with no store scan involved.
-/// Polling closure over the sidecar Pi's AoE extension writes.
 ///
 /// The source says where the pane publishes: a container's bind-backed
 /// directory or the per-instance hook dir. Getting it wrong is silent, the
@@ -256,8 +255,22 @@ pub(crate) fn pi_sidecar_poll_fn(
     move || {
         use crate::session::instance::PiSidecarSource;
         let id = match source {
-            PiSidecarSource::SandboxDir(ref dir) => std::fs::read_to_string(dir.join("session_id"))
-                .ok()
+            PiSidecarSource::SandboxDir(ref dir) => dir
+                .parent()
+                .and_then(Path::parent)
+                .filter(|root| root.join("aoe-session").join(&instance_id) == *dir)
+                .and_then(|root| crate::session::AnchoredDir::open(root).ok())
+                .and_then(|root| {
+                    root.read_regular(
+                        &Path::new("aoe-session")
+                            .join(&instance_id)
+                            .join("session_id"),
+                        4096,
+                    )
+                    .ok()
+                    .flatten()
+                })
+                .and_then(|raw| String::from_utf8(raw).ok())
                 .map(|raw| raw.trim().to_string())
                 .filter(|id| Uuid::parse_str(id).is_ok()),
             PiSidecarSource::HostHooks => crate::hooks::read_hook_session_id(&instance_id),

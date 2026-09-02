@@ -83,6 +83,7 @@ pub use types::{
 };
 
 // Re-exported so each submodule can reach its siblings through `use super::*`.
+pub(crate) use hooks::sidecar_host_config_path_for;
 use hooks::status_hook_env_prefix;
 use launch_command::{
     append_resume_flags, build_fork_flags, shell_stdin_command, splice_subcommand_or_append,
@@ -93,7 +94,7 @@ use pane_status::{resolve_detected_status, summarize_error_from_pane};
 use sid_persist::{override_if_distinct, persist_session_to_storage_guarded};
 use status::{UNKNOWN_ERROR_WINDOW_CONFIRMED_PRESENT, UNKNOWN_ERROR_WINDOW_NEVER_PRESENT};
 use tmux_session::tmux_env_session_name_for_instance_id;
-use types::{deserialize_session_id, is_zero_u64};
+use types::{deserialize_session_id, is_zero_u64, is_zero_u8};
 
 /// Runtime bookkeeping that one pane detection leaves for the next.
 ///
@@ -384,6 +385,9 @@ pub struct Instance {
     // Docker sandbox integration
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_info: Option<SandboxInfo>,
+    /// Filesystem generation used by this container's private agent stores.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub(crate) sandbox_store_generation: u8,
 
     // Paired terminal session
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -618,7 +622,7 @@ pub struct Instance {
     pending_host_env: Vec<(String, String)>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    capture_started_at: Option<std::time::SystemTime>,
+    pub(crate) capture_started_at: Option<std::time::SystemTime>,
 
     /// Set when this pane's launch line carried the Pi session-id extension.
     /// Runtime only: after an AoE restart the pane is still running with it,
@@ -626,6 +630,8 @@ pub struct Instance {
     /// `uses_pi_session_sidecar`).
     #[serde(skip)]
     pi_extension_launched: bool,
+    #[serde(skip)]
+    identity_publisher_launched: bool,
     /// Absolute transcript path this Pi pane last published. Pi indexes
     /// sessions by their starting cwd, so this is what resumes a conversation
     /// whose managed worktree has since moved; the id alone would resolve to
