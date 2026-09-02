@@ -118,9 +118,12 @@ jobs:
           # from an identically named branch can land in this list. The
           # selector keeps only the base-repo PR and fails closed on an
           # ambiguous set, before anything below edits or auto-merges a PR.
+          # --limit raises the default page of 30 so a crowd of same-named
+          # fork PRs cannot push ours out of the result window.
           PR_NUMBER=$(gh pr list \
             --head "$HEAD_BRANCH" \
             --state open \
+            --limit 100 \
             --json number,headRefName,headRepository,baseRefName \
             | python3 .github/scripts/select-internal-pr.py \
                 --repo "$BASE_REPO" --head "$HEAD_BRANCH" --base main)
