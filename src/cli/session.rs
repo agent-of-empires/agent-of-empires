@@ -1556,7 +1556,7 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
     // Refresh status from tmux so the output reflects current state
     // rather than the stale persisted value.
     crate::tmux::refresh_session_cache();
-    inst.update_status();
+    inst.update_status_once(None, None);
     let contended = crate::session::Instance::contended_capture_cwds(&instances);
     inst.self_heal_session_id(profile, &contended);
 
@@ -1851,10 +1851,15 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
             // Persisted status can lag the live tmux pane; recompute only when
             // the request will mutate the checkout. A cwd/branch-stable title
             // no-op must remain valid for an active session.
+            //
+            // Deliberately the holding entry point rather than
+            // `update_status_once`: a held proposal leaves the row on Running,
+            // so an ambiguous frame refuses the edit instead of moving a
+            // worktree out from under a live agent.
             let mut live = inst.clone();
             live.source_profile = profile.to_string();
             crate::tmux::refresh_session_cache();
-            live.update_status();
+            live.update_status_with_metadata(None, None);
             let container_holds = !live.status.blocks_worktree_edit()
                 && moves_worktree
                 && crate::session::worktree_edit::ensure_sandbox_container_released(
@@ -2206,10 +2211,11 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
     }
     // Persisted status can lag the real tmux pane, and moving the worktree of
     // a still-running session is unsafe. Recompute from live tmux state before
-    // enforcing the guard.
+    // enforcing the guard. The holding entry point, for the reason
+    // `rename_session` gives: an ambiguous frame must refuse the move.
     let mut live = inst.clone();
     crate::tmux::refresh_session_cache();
-    live.update_status();
+    live.update_status_with_metadata(None, None);
     // A sandbox container keeps the worktree dir mounted even while the agent
     // is Idle, so the move would fail. The gate drops a merely-stopped
     // container to free the mount and only reports held for a live one, which

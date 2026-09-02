@@ -258,6 +258,12 @@ pub struct PaneMetadata {
     /// tmux's last-output timestamp for the pane's window, used to skip a
     /// capture when nothing has been drawn since the last one.
     pub window_activity: Option<i64>,
+    /// Observed `(window_width, window_height)`. Window, not pane: a resize
+    /// by another client changes the window, while pane splits and status-bar
+    /// chrome only redistribute rows inside an unchanged window, so this is
+    /// the signal the passive-resize reconcile can compare against what it
+    /// applied without false mismatches.
+    pub window_size: Option<(u16, u16)>,
 }
 
 static SESSION_REFRESH_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1079,7 +1085,8 @@ pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
         // fields after it ride [`TAIL_SEP`], because a start command or a
         // title may carry a pipe of its own.
         concat!(
-            "#{session_name}|#{pane_index}|#{pane_dead}|#{pane_current_command}",
+            "#{session_name}|#{pane_index}|#{pane_dead}|#{window_width}|#{window_height}",
+            "|#{pane_current_command}",
             "|#{pane_start_command}|#{pane_pid}\x1f#{window_activity}\x1f#{pane_title}"
         ),
     ]);
@@ -1236,14 +1243,18 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
         let (line, activity, pane_title) = split_pane_metadata_tail(line);
         let window_activity = activity.and_then(|a| a.trim().parse::<i64>().ok());
         let pane_title = pane_title.unwrap_or("");
-        let mut parts = line.splitn(5, FIELD_SEP);
+        let mut parts = line.splitn(7, FIELD_SEP);
         let (
             Some(session_name),
             Some(pane_index),
             Some(pane_dead),
+            Some(window_width),
+            Some(window_height),
             Some(pane_current_command),
             Some(rest),
         ) = (
+            parts.next(),
+            parts.next(),
             parts.next(),
             parts.next(),
             parts.next(),
@@ -1253,6 +1264,10 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
         else {
             continue;
         };
+        let window_size = window_width
+            .parse::<u16>()
+            .ok()
+            .zip(window_height.parse::<u16>().ok());
         // The start command may itself contain the separator, so the pid is
         // split off the tail rather than the command off the head.
         let (pane_start_command, pane_pid) = match rest.rsplit_once(FIELD_SEP) {
@@ -1288,11 +1303,23 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
                     .contains(utils::PANE_ENV_FILE_PREFIX),
                 pane_title: (!pane_title.is_empty()).then(|| pane_title.to_string()),
                 window_activity,
+                window_size,
             },
         );
     }
 
     map
+}
+
+/// Observed window geometry for `session_name` from the shared list-panes
+/// snapshot, with the snapshot's observation time: the instant captured
+/// before the `list-panes` fork, not when the result was published. `None`
+/// when the snapshot is absent, failed, or does not include the session.
+pub(crate) fn observed_window_size_from_cache(session_name: &str) -> Option<((u16, u16), Instant)> {
+    let cache = PANE_META_CACHE.read().ok()?;
+    let time = cache.time?;
+    let size = cache.data.as_ref()?.get(session_name)?.window_size?;
+    Some((size, time))
 }
 
 /// Test-only: inject a synthetic session name into the cache so
@@ -1309,6 +1336,46 @@ pub fn test_inject_session_into_cache(name: &str) {
         map.insert(name.to_string(), 0);
         cache.time = Some(Instant::now());
     }
+}
+
+/// Test-only: publish a pane snapshot carrying a window size for `name`, so
+/// the render-side observed-size invalidation can be exercised without a
+/// real tmux server. Observed "now", the common case.
+#[cfg(test)]
+pub fn test_inject_pane_window_size(name: &str, size: (u16, u16)) {
+    test_inject_pane_window_size_at(name, size, Instant::now());
+}
+
+/// Test-only: like [`test_inject_pane_window_size`], but with an explicit
+/// observation time. Routes through [`publish_pane_meta_cache`], the real
+/// publication path, so a regression that re-stamped `cache.time` at publish
+/// instead of observation is caught by the tests using this.
+#[cfg(test)]
+pub fn test_inject_pane_window_size_at(name: &str, size: (u16, u16), taken_at: Instant) {
+    let map = {
+        let Ok(cache) = PANE_META_CACHE.read() else {
+            return;
+        };
+        let mut map = cache.data.as_deref().cloned().unwrap_or_default();
+        map.insert(
+            name.to_string(),
+            PaneMetadata {
+                pane_dead: false,
+                pane_current_command: None,
+                pane_start_command_is_protected: false,
+                pane_pid: None,
+                pane_title: None,
+                window_activity: None,
+                window_size: Some(size),
+            },
+        );
+        map
+    };
+    publish_pane_meta_cache(
+        next_refresh_id(&PANE_META_REFRESH_ID),
+        Some(std::sync::Arc::new(map)),
+        taken_at,
+    );
 }
 
 /// Test-only instrumentation at the process's single tmux entry point.
@@ -1665,9 +1732,16 @@ fn pane_dead_from_cache(name: &str) -> Option<bool> {
 /// Repopulate [`PANE_META_CACHE`]. The timestamp is stamped even when the
 /// query fails, so a tmux outage costs one fork per poller cycle
 /// ([`CACHE_TTL`] / 2) instead of one per row per frame.
+///
+/// `taken_at` must be captured BEFORE the `list-panes` fork: consumers
+/// compare it against their own write times (`passive_synced_contradicted`),
+/// and a publish-time stamp would let a listing that read pre-resize sizes,
+/// then stalled past the resize's adoption, masquerade as a fresher
+/// observation.
 fn publish_pane_meta_cache(
     refresh_id: u64,
     data: Option<std::sync::Arc<HashMap<String, PaneMetadata>>>,
+    taken_at: Instant,
 ) -> bool {
     let Ok(mut cache) = PANE_META_CACHE.write() else {
         return false;
@@ -1676,7 +1750,7 @@ fn publish_pane_meta_cache(
         return false;
     }
     cache.data = data;
-    cache.time = Some(Instant::now());
+    cache.time = Some(taken_at);
     cache.refresh_id = refresh_id;
     true
 }
@@ -1684,8 +1758,9 @@ fn publish_pane_meta_cache(
 pub(crate) fn refresh_pane_meta_cache(
 ) -> anyhow::Result<std::sync::Arc<HashMap<String, PaneMetadata>>> {
     let refresh_id = next_refresh_id(&PANE_META_REFRESH_ID);
+    let taken_at = Instant::now();
     let result = batch_pane_metadata().map(std::sync::Arc::new);
-    if publish_pane_meta_cache(refresh_id, result.as_ref().ok().cloned()) {
+    if publish_pane_meta_cache(refresh_id, result.as_ref().ok().cloned(), taken_at) {
         return result;
     }
     PANE_META_CACHE
@@ -1724,6 +1799,9 @@ pub(crate) struct PassiveResizeIntent {
     pub session_name: String,
     pub cols: u16,
     pub rows: u16,
+    /// Resize before any queued non-priority work: this is the session the
+    /// user is currently viewing, so its pane must be correct first.
+    pub priority: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1732,20 +1810,37 @@ struct PassiveResizeWork {
     generation: u64,
 }
 
-/// A passive resize the worker completed. The render thread consumes these to
-/// adopt the (session, cols, rows) dedup exactly as the old in-paint path did
-/// on success.
+/// A passive resize the worker finished. The render thread consumes these to
+/// adopt the per-session (cols, rows) dedup on success, or to park a declined
+/// geometry so background sessions get one attempt per geometry change
+/// instead of a per-frame retry loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PassiveResizeDone {
     pub session_id: String,
     pub cols: u16,
     pub rows: u16,
+    /// The window row count actually applied (`rows` plus status-bar chrome)
+    /// so render can later spot an external resize by comparing the observed
+    /// window size against `(cols, this)`. `None` when the resize did not
+    /// happen: the session is missing, a client is attached, a size owner is
+    /// active, or tmux errored.
+    pub applied_window_rows: Option<u16>,
+    generation: u64,
+}
+
+/// Geometry the worker is executing (or has finished, pending render
+/// adoption). Suppresses identical re-queues until the completion is adopted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PassiveResizeTicket {
+    session_id: String,
+    cols: u16,
+    rows: u16,
     generation: u64,
 }
 
 static PASSIVE_RESIZE_INTENTS: Mutex<Vec<PassiveResizeWork>> = Mutex::new(Vec::new());
 static PASSIVE_RESIZE_DONES: Mutex<Vec<PassiveResizeDone>> = Mutex::new(Vec::new());
-static PASSIVE_RESIZE_IN_FLIGHT: Mutex<Vec<PassiveResizeDone>> = Mutex::new(Vec::new());
+static PASSIVE_RESIZE_IN_FLIGHT: Mutex<Vec<PassiveResizeTicket>> = Mutex::new(Vec::new());
 static PASSIVE_RESIZE_GENERATION: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 static PASSIVE_RESIZE_WORKER_THREAD: OnceLock<std::thread::Thread> = OnceLock::new();
@@ -1761,7 +1856,7 @@ thread_local! {
 /// the number of sessions even if the worker is delayed or restarts.
 fn queue_latest_passive_resize(
     queue: &mut Vec<PassiveResizeWork>,
-    in_flight: &[PassiveResizeDone],
+    in_flight: &[PassiveResizeTicket],
     work: PassiveResizeWork,
 ) {
     // Any newly wanted geometry supersedes the queued one for this session,
@@ -1775,12 +1870,22 @@ fn queue_latest_passive_resize(
     }) {
         return;
     }
-    queue.push(work);
+    if work.intent.priority {
+        let at = queue
+            .iter()
+            .position(|prev| !prev.intent.priority)
+            .unwrap_or(queue.len());
+        queue.insert(at, work);
+    } else {
+        queue.push(work);
+    }
 }
 
 /// Queue a passive preview resize for its worker. Non-blocking by contract:
-/// this is called from paint.
+/// this is called from paint. Spawns the worker on first use (a fresh worker
+/// drains the queue before its first park, so no wakeup is lost).
 pub(crate) fn queue_passive_resize(intent: PassiveResizeIntent) {
+    spawn_passive_resize_worker();
     {
         let mut queue = PASSIVE_RESIZE_INTENTS
             .lock()
@@ -1816,7 +1921,7 @@ pub(crate) fn cancel_pending_passive_resize(session_id: &str) {
 /// Drain completions and release matching in-flight geometry only when render
 /// can adopt the dedup. A newer geometry for the same session remains active.
 fn take_current_passive_completions(
-    in_flight: &mut Vec<PassiveResizeDone>,
+    in_flight: &mut Vec<PassiveResizeTicket>,
     dones: Vec<PassiveResizeDone>,
 ) -> Vec<PassiveResizeDone> {
     let current: Vec<_> = dones
@@ -1848,35 +1953,31 @@ pub(crate) fn take_passive_resize_dones() -> Vec<PassiveResizeDone> {
     take_current_passive_completions(&mut in_flight, dones)
 }
 
-fn clear_passive_resize_in_flight(work: &PassiveResizeWork) {
-    let mut in_flight = PASSIVE_RESIZE_IN_FLIGHT
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    in_flight.retain(|active| active.generation != work.generation);
-}
-
 /// Execute one queued passive resize under an atomic final tmux guard. The
 /// worker first rejects a missing session; the Session helper then fences both
-/// a newly attached client and a size-owner takeover at resize execution.
-fn execute_passive_resize(work: &PassiveResizeWork) -> Option<PassiveResizeDone> {
+/// a newly attached client and a size-owner takeover at resize execution. A
+/// resize the guard refuses (or that errors) still completes, as declined, so
+/// render can park the geometry instead of retrying it every frame.
+fn execute_passive_resize(work: &PassiveResizeWork) -> PassiveResizeDone {
     let intent = &work.intent;
     let deadline = TmuxCommandDeadline::new();
     let session = Session::from_name(&intent.session_name);
-    if !session.exists_with_deadline(&deadline) {
-        return None;
-    }
-    session
-        .resize_window_if_detached_without_active_owner_after_exists_with_deadline(
+    let applied_window_rows = if session.exists_with_deadline(&deadline) {
+        session.resize_window_if_detached_without_active_owner_after_exists_with_deadline(
             intent.cols,
             intent.rows,
             &deadline,
         )
-        .then(|| PassiveResizeDone {
-            session_id: intent.session_id.clone(),
-            cols: intent.cols,
-            rows: intent.rows,
-            generation: work.generation,
-        })
+    } else {
+        None
+    };
+    PassiveResizeDone {
+        session_id: intent.session_id.clone(),
+        cols: intent.cols,
+        rows: intent.rows,
+        applied_window_rows,
+        generation: work.generation,
+    }
 }
 
 fn publish_latest_passive_resize_done(dones: &mut Vec<PassiveResizeDone>, done: PassiveResizeDone) {
@@ -1884,35 +1985,39 @@ fn publish_latest_passive_resize_done(dones: &mut Vec<PassiveResizeDone>, done: 
     dones.push(done);
 }
 
+/// Pop the head of the queue. One item at a time, not a batch snapshot: a
+/// priority intent (the session the user is viewing) queued mid-drain is
+/// front-inserted and picked on the very next iteration instead of waiting
+/// out a fleet-sized batch.
+fn take_next_passive_resize() -> Option<PassiveResizeWork> {
+    let mut queue = PASSIVE_RESIZE_INTENTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if queue.is_empty() {
+        None
+    } else {
+        Some(queue.remove(0))
+    }
+}
+
 fn execute_passive_resizes() {
     #[cfg(test)]
     PASSIVE_RESIZE_EXECUTION_COUNT.with(|count| count.set(count.get() + 1));
-    let intents = {
-        let mut queue = PASSIVE_RESIZE_INTENTS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let intents = std::mem::take(&mut *queue);
-        let mut in_flight = PASSIVE_RESIZE_IN_FLIGHT
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for work in &intents {
+    while let Some(work) = take_next_passive_resize() {
+        {
             let intent = &work.intent;
+            let mut in_flight = PASSIVE_RESIZE_IN_FLIGHT
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             in_flight.retain(|active| active.session_id != intent.session_id);
-            in_flight.push(PassiveResizeDone {
+            in_flight.push(PassiveResizeTicket {
                 session_id: intent.session_id.clone(),
                 cols: intent.cols,
                 rows: intent.rows,
                 generation: work.generation,
             });
         }
-        intents
-    };
-
-    for work in intents {
-        let Some(done) = execute_passive_resize(&work) else {
-            clear_passive_resize_in_flight(&work);
-            continue;
-        };
+        let done = execute_passive_resize(&work);
         let mut dones = PASSIVE_RESIZE_DONES
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1972,7 +2077,6 @@ fn refresh_display_snapshots() {
 /// Idempotent while the poller is running. The daemon thread dies with the
 /// process.
 pub fn spawn_snapshot_poller() {
-    spawn_passive_resize_worker();
     static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if STARTED.swap(true, std::sync::atomic::Ordering::AcqRel) {
         return;
@@ -2245,6 +2349,7 @@ mod tests {
                 session_name: format!("aoe_test_{session_id}"),
                 cols,
                 rows,
+                priority: false,
             },
             generation,
         };
@@ -2263,7 +2368,15 @@ mod tests {
             ("a", 120)
         );
 
-        let in_flight = vec![PassiveResizeDone {
+        // A priority intent (the viewed session) is inserted ahead of queued
+        // non-priority work so the worker resizes it first.
+        let mut viewed = work(4, "sel", 100, 30);
+        viewed.intent.priority = true;
+        queue_latest_passive_resize(&mut queue, &[], viewed);
+        assert_eq!(queue[0].intent.session_id, "sel");
+        assert_eq!(queue.len(), 3);
+
+        let in_flight = vec![PassiveResizeTicket {
             session_id: "a".to_string(),
             cols: 120,
             rows: 40,
@@ -2298,11 +2411,14 @@ mod tests {
             session_id: "a".to_string(),
             cols: 120,
             rows: 40,
+            applied_window_rows: Some(40),
             generation: 9,
         };
-        let mut newer_same_geometry = vec![PassiveResizeDone {
+        let mut newer_same_geometry = vec![PassiveResizeTicket {
+            session_id: "a".to_string(),
+            cols: 120,
+            rows: 40,
             generation: 10,
-            ..old_done.clone()
         }];
         let stale = take_current_passive_completions(&mut newer_same_geometry, vec![old_done]);
         assert!(stale.is_empty(), "stale completion must not reach render");
@@ -2310,7 +2426,13 @@ mod tests {
             newer_same_geometry[0].generation, 10,
             "an old identical completion must not clear newer in-flight work"
         );
-        let current_done = newer_same_geometry[0].clone();
+        let current_done = PassiveResizeDone {
+            session_id: "a".to_string(),
+            cols: 120,
+            rows: 40,
+            applied_window_rows: Some(40),
+            generation: 10,
+        };
         let current =
             take_current_passive_completions(&mut newer_same_geometry, vec![current_done]);
         assert_eq!(current[0].generation, 10);
@@ -2331,6 +2453,7 @@ mod tests {
                 session_id: "b".to_string(),
                 cols: 90,
                 rows: 30,
+                applied_window_rows: Some(30),
                 generation: 12,
             },
         );
@@ -2340,7 +2463,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn failed_passive_resize_does_not_publish_completion() {
+    fn failed_passive_resize_publishes_declined_completion() {
         const ID: &str = "resize_failure_id";
         const TITLE: &str = "Missing resize target";
         let name = Session::generate_name(ID, TITLE);
@@ -2352,6 +2475,7 @@ mod tests {
                 session_name: name.clone(),
                 cols: 100,
                 rows: 30,
+                priority: false,
             },
             generation: 1,
         };
@@ -2359,8 +2483,10 @@ mod tests {
         let probe = fork_probe::arm();
 
         assert!(
-            execute_passive_resize(&intent).is_none(),
-            "a failed or timed-out resize must not publish a completion"
+            execute_passive_resize(&intent)
+                .applied_window_rows
+                .is_none(),
+            "a failed or timed-out resize must complete as declined"
         );
         drop(probe);
         assert_eq!(
@@ -2424,6 +2550,7 @@ mod tests {
                 "new-pane".to_string(),
                 dead_pane_meta(true),
             )]))),
+            Instant::now(),
         ));
         assert!(!publish_pane_meta_cache(
             pane_older,
@@ -2431,6 +2558,7 @@ mod tests {
                 "old-pane".to_string(),
                 dead_pane_meta(true),
             )]))),
+            Instant::now(),
         ));
         assert_eq!(pane_dead_from_cache("new-pane"), Some(true));
         assert_eq!(pane_dead_from_cache("old-pane"), Some(false));
@@ -2718,6 +2846,7 @@ mod tests {
                             pane_pid: None,
                             pane_title: None,
                             window_activity: None,
+                            window_size: None,
                         },
                     )
                 })
@@ -2788,6 +2917,7 @@ mod tests {
             pane_pid: None,
             pane_title: None,
             window_activity: None,
+            window_size: None,
         }
     }
 
@@ -2999,7 +3129,7 @@ mod tests {
 
     #[test]
     fn test_parse_pane_metadata_basic() {
-        let output = format!("{P}my_proj_abc12345|0|0|claude|claude|4242\n");
+        let output = format!("{P}my_proj_abc12345|0|0|190|52|claude|claude|4242\n");
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
         let meta = map.get(&format!("{P}my_proj_abc12345")).unwrap();
@@ -3007,6 +3137,7 @@ mod tests {
         assert_eq!(meta.pane_current_command.as_deref(), Some("claude"));
         assert!(!meta.pane_start_command_is_protected);
         assert_eq!(meta.pane_pid, Some(4242));
+        assert_eq!(meta.window_size, Some((190, 52)));
     }
 
     #[test]
@@ -3014,8 +3145,9 @@ mod tests {
         // Built from TAIL_SEP itself, so a drift between the constant and the
         // `list-panes` format literal fails here instead of degrading silently
         // (no activity gate, every title rule dark).
-        let output =
-            format!("{P}proj_abc12345|0|0|claude|claude{TAIL_SEP}1770000000{TAIL_SEP}✶ Working\n");
+        let output = format!(
+            "{P}proj_abc12345|0|0|190|52|claude|claude{TAIL_SEP}1770000000{TAIL_SEP}✶ Working\n"
+        );
         let meta = parse_pane_metadata(&output)
             .remove(&format!("{P}proj_abc12345"))
             .unwrap();
@@ -3025,7 +3157,7 @@ mod tests {
         // tmux 3.4 renders the control separators as unescaped octal tokens.
         // A doubled backslash belongs to the title and must not split it.
         let escaped_output = format!(
-            "{P}proj_escaped_abc12345|0|0|claude|claude literal{}{ESCAPED_TAIL_SEP}|4242{ESCAPED_TAIL_SEP}1770000001{ESCAPED_TAIL_SEP}literal{}{ESCAPED_TAIL_SEP}title{}",
+            "{P}proj_escaped_abc12345|0|0|190|52|claude|claude literal{}{ESCAPED_TAIL_SEP}|4242{ESCAPED_TAIL_SEP}1770000001{ESCAPED_TAIL_SEP}literal{}{ESCAPED_TAIL_SEP}title{}",
             char::from(92),
             char::from(92),
             char::from(10)
@@ -3040,21 +3172,23 @@ mod tests {
             Some(format!("literal{}{ESCAPED_TAIL_SEP}title", char::from(92)))
         );
 
-        // An unparsable activity reads as absent, an empty title as `None`,
-        // and a head with no tail at all parses as it did before the fields.
-        let odd = format!("{P}proj_def67890|0|0|claude|claude{TAIL_SEP}{TAIL_SEP}\n");
+        // An unparsable activity or window size reads as absent, an empty
+        // title as `None`, and a head with no tail at all parses as it did
+        // before the fields.
+        let odd = format!("{P}proj_def67890|0|0|||claude|claude{TAIL_SEP}{TAIL_SEP}\n");
         let meta = parse_pane_metadata(&odd)
             .remove(&format!("{P}proj_def67890"))
             .unwrap();
         assert_eq!(meta.window_activity, None);
         assert_eq!(meta.pane_title, None);
+        assert_eq!(meta.window_size, None);
     }
 
     #[test]
     fn test_parse_pane_metadata_protected_wrapper_shell_is_not_stale() {
         let output = format!(
-            "{P}protected_abc12345|0|0|sh|/bin/sh -c 'prepare | . /tmp/aoe-pane-env-123 | exec claude'\n\
-             {P}interactive_def67890|0|0|sh|sh\n"
+            "{P}protected_abc12345|0|0|190|52|sh|/bin/sh -c 'prepare | . /tmp/aoe-pane-env-123 | exec claude'\n\
+             {P}interactive_def67890|0|0|190|52|sh|sh\n"
         );
         let map = parse_pane_metadata(&output);
 
@@ -3077,7 +3211,7 @@ mod tests {
 
     #[test]
     fn test_parse_pane_metadata_dead_pane() {
-        let output = format!("{P}proj_abc12345|0|1|bash|bash\n");
+        let output = format!("{P}proj_abc12345|0|1|190|52|bash|bash\n");
         let map = parse_pane_metadata(&output);
         let meta = map.get(&format!("{P}proj_abc12345")).unwrap();
         assert!(meta.pane_dead);
@@ -3086,7 +3220,7 @@ mod tests {
     #[test]
     fn test_parse_pane_metadata_filters_non_aoe_sessions() {
         let output = format!(
-            "user_session|0|0|bash|bash\n{P}proj_abc12345|0|0|claude|claude\nmy_tmux|0|0|vim|vim\n"
+            "user_session|0|0|190|52|bash|bash\n{P}proj_abc12345|0|0|190|52|claude|claude\nmy_tmux|0|0|190|52|vim|vim\n"
         );
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
@@ -3095,8 +3229,9 @@ mod tests {
 
     #[test]
     fn test_parse_pane_metadata_filters_non_zero_panes() {
-        let output =
-            format!("{P}proj_abc12345|0|0|claude|claude\n{P}proj_abc12345|1|0|bash|bash\n");
+        let output = format!(
+            "{P}proj_abc12345|0|0|190|52|claude|claude\n{P}proj_abc12345|1|0|190|52|bash|bash\n"
+        );
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
         let meta = map.get(&format!("{P}proj_abc12345")).unwrap();
@@ -3106,8 +3241,9 @@ mod tests {
     #[test]
     fn test_parse_pane_metadata_first_window_wins() {
         // Two windows both have pane 0, first window's data should be kept
-        let output =
-            format!("{P}proj_abc12345|0|0|claude|claude\n{P}proj_abc12345|0|1|bash|bash\n");
+        let output = format!(
+            "{P}proj_abc12345|0|0|190|52|claude|claude\n{P}proj_abc12345|0|1|190|52|bash|bash\n"
+        );
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
         let meta = map.get(&format!("{P}proj_abc12345")).unwrap();
@@ -3122,14 +3258,14 @@ mod tests {
 
     #[test]
     fn test_parse_pane_metadata_malformed_lines() {
-        let output = format!("too|few|fields\n{P}proj_abc12345|0|0|claude|claude\n\n");
+        let output = format!("too|few|fields\n{P}proj_abc12345|0|0|190|52|claude|claude\n\n");
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
     }
 
     #[test]
     fn test_parse_pane_metadata_empty_command() {
-        let output = format!("{P}proj_abc12345|0|0||sh\n");
+        let output = format!("{P}proj_abc12345|0|0|190|52||sh\n");
         let map = parse_pane_metadata(&output);
         let meta = map.get(&format!("{P}proj_abc12345")).unwrap();
         assert!(meta.pane_current_command.is_none());
@@ -3138,7 +3274,7 @@ mod tests {
     #[test]
     fn test_parse_pane_metadata_multiple_sessions() {
         let output = format!(
-            "{P}proj_a_abc12345|0|0|claude|claude\n{P}proj_b_def67890|0|0|opencode|opencode\n{P}proj_c_ghi11111|0|1|bash|bash\n"
+            "{P}proj_a_abc12345|0|0|190|52|claude|claude\n{P}proj_b_def67890|0|0|190|52|opencode|opencode\n{P}proj_c_ghi11111|0|1|190|52|bash|bash\n"
         );
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 3);

@@ -461,6 +461,7 @@ mod tests {
             pane_pid: pid,
             pane_title: None,
             window_activity: None,
+            window_size: None,
         }
     }
 
