@@ -497,10 +497,19 @@ pub fn load_native_mcp_servers_from_home(agent_key: &str) -> Result<Vec<ProjectM
 pub fn load_native_mcp_servers_checked_from_home(agent_key: &str) -> Result<NativeRead> {
     let home = dirs::home_dir().context("could not resolve home dir for native MCP config")?;
     // The session's declared config dir is what the launch exports to the
-    // agent, and the daemon's own environment does not carry it.
-    let config_dir = crate::session::Config::load_or_warn()
+    // agent, and the daemon's own environment does not carry it. The reader
+    // treats `claude` and `claude-code` as one agent (`native_config_for`),
+    // but `agent_config_dir` is an exact-key map, so a directory declared
+    // under either spelling must satisfy a lookup by the other.
+    let cfg = crate::session::Config::load_or_warn();
+    let config_dir = cfg
         .session
-        .agent_config_dir_for(agent_key, &home);
+        .agent_config_dir_for(agent_key, &home)
+        .or_else(|| match agent_key {
+            "claude" => cfg.session.agent_config_dir_for("claude-code", &home),
+            "claude-code" => cfg.session.agent_config_dir_for("claude", &home),
+            _ => None,
+        });
     load_native_mcp_servers_checked_in(agent_key, &home, config_dir.as_deref())
 }
 
