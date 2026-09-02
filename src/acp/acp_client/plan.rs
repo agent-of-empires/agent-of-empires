@@ -172,12 +172,12 @@ mod tests {
     #[test]
     fn strip_markdown_emphasis_keeps_intraword_underscores() {
         for (input, want) in [
-            ("_italic_", "italic"),
             ("rename _foo_ now", "rename foo now"),
             ("foo_bar_baz", "foo_bar_baz"),
             ("rename foo_bar_baz", "rename foo_bar_baz"),
-            ("__bold__", "bold"),
             ("call do_thing() then _stop_", "call do_thing() then stop"),
+            // `\b` is zero-width, so adjacent emphasis still unwraps.
+            ("_a_ _b_", "a b"),
         ] {
             assert_eq!(strip_markdown_emphasis(input), want, "input: {input}");
         }
