@@ -750,7 +750,7 @@ pub(crate) fn snapshot_codex_hooks_state(config_path: &Path) -> Result<Option<to
 /// Write `state` back into the `[hooks.state]` table of `config_path`,
 /// taking the codex config lock. Inverse of [`snapshot_codex_hooks_state`];
 /// together they bracket destructive rewrites of `config.toml` (e.g. the
-/// host-to-sandbox refresh in [`crate::session::container_config`]) so
+/// host-to-sandbox refresh in [`crate::session::config::container_config`]) so
 /// Codex's user-trust block survives. Unconditionally overwrites any
 /// `state` already present at `config_path`; pair only with a fresh
 /// snapshot from the authoritative source.

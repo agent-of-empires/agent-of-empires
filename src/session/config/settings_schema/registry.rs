@@ -57,7 +57,7 @@ pub fn descriptor(section: &str, field: &str) -> Option<FieldDescriptor> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::settings_schema::{WebWritePolicy, WidgetKind};
+    use crate::session::config::settings_schema::{WebWritePolicy, WidgetKind};
 
     #[test]
     fn schema_has_no_duplicate_paths() {

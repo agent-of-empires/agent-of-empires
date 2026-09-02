@@ -29,7 +29,7 @@ const SOURCE_BADGE: Record<HookSource, { label: string; className: string }> = {
  *  destroy, so a hooks section set through the API would be remote code
  *  execution. The `hooks` section is absent from the settings schema, so the
  *  server rejects hook writes (validate_patch in
- *  src/session/settings_schema/policy.rs) and this panel deliberately renders
+ *  src/session/config/settings_schema/policy.rs) and this panel deliberately renders
  *  display-only: it takes no onChange/save props and exposes no inputs, so
  *  there is no path from here to a profile PATCH. */
 export function HooksReadOnlyPanel({ groups }: Props) {

@@ -304,7 +304,7 @@ fn take_pending_watcher_theme_clears_the_field() {
 #[test]
 #[serial]
 fn watcher_refresh_stashes_global_theme_not_profile_override() {
-    use crate::session::profile_config::{save_profile_config, ProfileConfig};
+    use crate::session::config::profile_config::{save_profile_config, ProfileConfig};
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
     let _storage = Storage::new_unwatched("test").unwrap();
@@ -14806,7 +14806,7 @@ mod click_to_select {
         // SelectOnly via SessionConfigOverride. The resolver must
         // pick the profile override, not the global default, so a
         // single click returns None and the cursor still moves.
-        use crate::session::profile_config::{save_profile_config, ProfileConfig};
+        use crate::session::config::profile_config::{save_profile_config, ProfileConfig};
         let mut env = create_test_env_with_sessions(3);
         setup_inner(&mut env);
         env.view.cursor = 0;

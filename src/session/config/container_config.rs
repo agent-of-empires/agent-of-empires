@@ -12,8 +12,8 @@ use crate::containers::{ContainerConfig, EnvEntry, NamedVolumeMount, VolumeMount
 use crate::git::GitWorktree;
 use crate::session::config::VolumeIgnoresStrategy;
 
-use super::environment::collect_environment;
-use super::instance::SandboxInfo;
+use crate::session::environment::collect_environment;
+use crate::session::instance::SandboxInfo;
 
 /// Subdirectory name inside each agent's config dir for sandbox config.
 const SANDBOX_SUBDIR: &str = "sandbox";
@@ -1107,7 +1107,7 @@ pub(crate) fn compute_volume_paths(
 /// under `/workspace/` preserving relative structure.
 fn compute_workspace_volume_paths(
     workspace_path: &Path,
-    ws_info: &super::WorkspaceInfo,
+    ws_info: &crate::session::WorkspaceInfo,
 ) -> Result<(Vec<VolumeMount>, String)> {
     let workspace_canonical = workspace_path
         .canonicalize()
@@ -1245,7 +1245,7 @@ fn refresh_codex_sandbox_dir(
     home: &Path,
     instance_id: &str,
     hooks_enabled: bool,
-    profile_config: &super::config::Config,
+    profile_config: &super::Config,
 ) {
     match prepare_sandbox_dir(mount, home, Some(instance_id)) {
         Ok(sandbox_dir) => {
@@ -1282,7 +1282,7 @@ fn should_refresh_codex_hooks(mount: &AgentConfigMount, sandbox_dir: &Path, home
 fn refresh_codex_sandbox_hooks(
     mount: &AgentConfigMount,
     sandbox_dir: &Path,
-    profile_config: &super::config::Config,
+    profile_config: &super::Config,
 ) {
     let Some(agent) = crate::agents::get_agent(mount.tool_name) else {
         return;
@@ -1401,7 +1401,7 @@ pub(crate) fn ensure_folder_trust_config_for_active_agent(
         return;
     };
 
-    let resolved_profile = super::config::effective_profile(profile);
+    let resolved_profile = super::effective_profile(profile);
     let config = super::profile_config::resolve_config_or_warn(&resolved_profile);
     let session_config = config.session;
     let active_agent = resolve_active_agent(tool, detect_as, &session_config);
@@ -1463,7 +1463,7 @@ pub(crate) fn ensure_folder_trust_config_for_active_agent(
 fn resolve_active_agent(
     tool: &str,
     detect_as: Option<&str>,
-    session_config: &super::config::SessionConfig,
+    session_config: &super::SessionConfig,
 ) -> Option<&'static crate::agents::AgentDef> {
     crate::agents::get_agent(tool)
         .or_else(|| {
@@ -1491,7 +1491,7 @@ pub(crate) fn managed_codex_home(
     crate::session::validate_instance_id(instance_id).map_err(|e| {
         anyhow::anyhow!("refusing to build Codex home for unsafe AOE_INSTANCE_ID: {e}")
     })?;
-    let resolved_profile = super::config::effective_profile(profile);
+    let resolved_profile = super::effective_profile(profile);
     let session_config = super::profile_config::resolve_config_or_warn(&resolved_profile).session;
     let config_tool =
         resolve_active_agent(tool, detect_as, &session_config).map_or(tool, |a| a.name);
@@ -1638,7 +1638,7 @@ pub(crate) struct GlobIgnoreExpansion {
 /// excluded; an `Ok(vec![])` means nothing needs confirming.
 pub(crate) fn preview_glob_volume_ignores(
     project_path_str: &str,
-    workspace_info: Option<&super::WorkspaceInfo>,
+    workspace_info: Option<&crate::session::WorkspaceInfo>,
     volume_ignores: &[String],
 ) -> Result<Vec<GlobIgnoreExpansion>> {
     // An empty project path (scratch session) has no workspace to expand
@@ -1721,7 +1721,7 @@ pub(crate) fn build_container_config(
     agent_selection: ContainerAgentSelection<'_>,
     is_yolo_mode: bool,
     instance_id: &str,
-    workspace_info: Option<&super::WorkspaceInfo>,
+    workspace_info: Option<&crate::session::WorkspaceInfo>,
     profile: &str,
 ) -> Result<ContainerConfig> {
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
@@ -1730,7 +1730,7 @@ pub(crate) fn build_container_config(
     })?;
 
     let project_path = Path::new(project_path_str);
-    let resolved_profile = super::config::effective_profile(profile);
+    let resolved_profile = super::effective_profile(profile);
     let profile_config = super::profile_config::resolve_config_or_warn(&resolved_profile);
     let profile_session_config = &profile_config.session;
     let active_agent = resolve_active_agent(
@@ -1805,15 +1805,15 @@ pub(crate) fn build_container_config(
     // Bind-mount the session's managed artifact dir and point the agent at it
     // via AOE_ARTIFACT_DIR, so screenshots/status files the agent writes land
     // in the host dir the dashboard can serve. See #2587.
-    if let Ok(host_artifact_dir) = super::artifacts::session_artifact_dir(instance_id) {
+    if let Ok(host_artifact_dir) = crate::session::artifacts::session_artifact_dir(instance_id) {
         volumes.push(VolumeMount {
             host_path: host_artifact_dir.to_string_lossy().to_string(),
-            container_path: super::artifacts::CONTAINER_ARTIFACT_DIR.to_string(),
+            container_path: crate::session::artifacts::CONTAINER_ARTIFACT_DIR.to_string(),
             read_only: false,
         });
         environment.push(EnvEntry::Literal {
-            key: super::artifacts::ARTIFACT_DIR_ENV.to_string(),
-            value: super::artifacts::CONTAINER_ARTIFACT_DIR.to_string(),
+            key: crate::session::artifacts::ARTIFACT_DIR_ENV.to_string(),
+            value: crate::session::artifacts::CONTAINER_ARTIFACT_DIR.to_string(),
         });
     }
 
@@ -1843,7 +1843,7 @@ pub(crate) fn build_container_config(
     // just because the user has the flag exported globally.
     // `GOOGLE_APPLICATION_CREDENTIALS` is not forwarded as an env var; client libraries
     // discover the well-known path automatically.
-    if agent_selection.tool == "claude" && super::environment::host_vertex_enabled() {
+    if agent_selection.tool == "claude" && crate::session::environment::host_vertex_enabled() {
         let container_cred_path = format!(
             "{}/.config/gcloud/application_default_credentials.json",
             CONTAINER_HOME
@@ -2250,7 +2250,7 @@ mod tests {
 
         let project_dir = TempDir::new().unwrap();
         git2::Repository::init(project_dir.path()).unwrap();
-        let sandbox_info = super::super::instance::SandboxInfo {
+        let sandbox_info = crate::session::instance::SandboxInfo {
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -3806,7 +3806,7 @@ mount_ssh = true
         // Initialize a git repo so compute_volume_paths works
         git2::Repository::init(project_dir.path()).unwrap();
 
-        let sandbox_info = super::super::instance::SandboxInfo {
+        let sandbox_info = crate::session::instance::SandboxInfo {
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -3873,7 +3873,7 @@ mount_ssh = true
         // #2587: the session artifact dir is bind-mounted at the fixed
         // container path and exported via AOE_ARTIFACT_DIR.
         assert!(
-            env_keys.contains(&super::super::artifacts::ARTIFACT_DIR_ENV),
+            env_keys.contains(&crate::session::artifacts::ARTIFACT_DIR_ENV),
             "AOE_ARTIFACT_DIR should be in environment, got: {:?}",
             config.environment
         );
@@ -3881,9 +3881,9 @@ mount_ssh = true
             config
                 .volumes
                 .iter()
-                .any(|v| v.container_path == super::super::artifacts::CONTAINER_ARTIFACT_DIR),
+                .any(|v| v.container_path == crate::session::artifacts::CONTAINER_ARTIFACT_DIR),
             "artifact dir should be mounted at {}, got: {:?}",
-            super::super::artifacts::CONTAINER_ARTIFACT_DIR,
+            crate::session::artifacts::CONTAINER_ARTIFACT_DIR,
             volume_pairs
         );
     }
@@ -3932,7 +3932,7 @@ volume_ignores = ["**/bin", "**/obj", "target"]
 
         git2::Repository::init(project_dir.path()).unwrap();
 
-        let sandbox_info = super::super::instance::SandboxInfo {
+        let sandbox_info = crate::session::instance::SandboxInfo {
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -4077,7 +4077,7 @@ volume_ignores = ["node_modules"]
             return;
         }
 
-        let sandbox_info = super::super::instance::SandboxInfo {
+        let sandbox_info = crate::session::instance::SandboxInfo {
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -4129,7 +4129,7 @@ volume_ignores = ["node_modules"]
         let project_dir = TempDir::new().unwrap();
         git2::Repository::init(project_dir.path()).unwrap();
 
-        let sandbox_info = super::super::instance::SandboxInfo {
+        let sandbox_info = crate::session::instance::SandboxInfo {
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -4282,7 +4282,7 @@ volume_ignores = ["node_modules"]
         let project_dir = TempDir::new().unwrap();
         git2::Repository::init(project_dir.path()).unwrap();
 
-        let sandbox_info = super::super::instance::SandboxInfo {
+        let sandbox_info = crate::session::instance::SandboxInfo {
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -4344,7 +4344,7 @@ volume_ignores = ["node_modules"]
             let project_dir = TempDir::new().unwrap();
             git2::Repository::init(project_dir.path()).unwrap();
 
-            let sandbox_info = super::super::instance::SandboxInfo {
+            let sandbox_info = crate::session::instance::SandboxInfo {
                 enabled: true,
                 container_id: None,
                 image: "test:latest".to_string(),
@@ -4430,7 +4430,7 @@ extra_volumes = ["{}/sandbox:/root/.claude-personal:rw"]
         let project_dir = TempDir::new().unwrap();
         git2::Repository::init(project_dir.path()).unwrap();
 
-        let sandbox_info = super::super::instance::SandboxInfo {
+        let sandbox_info = crate::session::instance::SandboxInfo {
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -4522,7 +4522,7 @@ extra_volumes = ["{}/sandbox:/root/.codex-work:rw"]
         let project_dir = TempDir::new().unwrap();
         git2::Repository::init(project_dir.path()).unwrap();
 
-        let sandbox_info = super::super::instance::SandboxInfo {
+        let sandbox_info = crate::session::instance::SandboxInfo {
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -4628,7 +4628,7 @@ extra_volumes = ["{}/sandbox:/root/.codex-work:rw"]
         let project_dir = TempDir::new().unwrap();
         git2::Repository::init(project_dir.path()).unwrap();
 
-        let sandbox_info = super::super::instance::SandboxInfo {
+        let sandbox_info = crate::session::instance::SandboxInfo {
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -4808,7 +4808,7 @@ trust_level = "trusted"
                 agent.name
             );
 
-            let sandbox_info = super::super::instance::SandboxInfo {
+            let sandbox_info = crate::session::instance::SandboxInfo {
                 enabled: true,
                 container_id: None,
                 image: "test:latest".to_string(),
@@ -4880,7 +4880,7 @@ trust_level = "trusted"
 
         let kiro = crate::agents::get_agent("kiro").unwrap();
         let sidecar = kiro.sidecar_hooks.as_ref().unwrap();
-        let sandbox_info = super::super::instance::SandboxInfo {
+        let sandbox_info = crate::session::instance::SandboxInfo {
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -4951,7 +4951,7 @@ trust_level = "trusted"
         let instance_id = "kiro-managed-agent-sandbox-test";
         build_container_config(
             project_dir.path().to_str().unwrap(),
-            &super::super::instance::SandboxInfo {
+            &crate::session::instance::SandboxInfo {
                 enabled: true,
                 container_id: None,
                 image: "test:latest".to_string(),
@@ -5009,7 +5009,7 @@ trust_level = "trusted"
         let project_dir = TempDir::new().unwrap();
         git2::Repository::init(project_dir.path()).unwrap();
 
-        let sandbox_info = super::super::instance::SandboxInfo {
+        let sandbox_info = crate::session::instance::SandboxInfo {
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -5059,7 +5059,7 @@ trust_level = "trusted"
         let project_dir = TempDir::new().unwrap();
         git2::Repository::init(project_dir.path()).unwrap();
 
-        let sandbox_info = super::super::instance::SandboxInfo {
+        let sandbox_info = crate::session::instance::SandboxInfo {
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -5129,7 +5129,7 @@ agent_detect_as = { "wrapped-codex" = "codex" }
         let project_dir = TempDir::new().unwrap();
         git2::Repository::init(project_dir.path()).unwrap();
 
-        let sandbox_info = super::super::instance::SandboxInfo {
+        let sandbox_info = crate::session::instance::SandboxInfo {
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -5202,7 +5202,7 @@ agent_detect_as = { "wrapped-codex" = "codex" }
         let project_dir = TempDir::new().unwrap();
         git2::Repository::init(project_dir.path()).unwrap();
 
-        let sandbox_info = super::super::instance::SandboxInfo {
+        let sandbox_info = crate::session::instance::SandboxInfo {
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -5304,7 +5304,7 @@ trusted_hash = "keep"
         let project_dir = TempDir::new().unwrap();
         git2::Repository::init(project_dir.path()).unwrap();
 
-        let sandbox_info = super::super::instance::SandboxInfo {
+        let sandbox_info = crate::session::instance::SandboxInfo {
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -5366,7 +5366,7 @@ trusted_hash = "keep"
         let project_dir = TempDir::new().unwrap();
         git2::Repository::init(project_dir.path()).unwrap();
 
-        let sandbox_info = super::super::instance::SandboxInfo {
+        let sandbox_info = crate::session::instance::SandboxInfo {
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -5426,7 +5426,7 @@ environment = ["CODEX_HOME=/root/profile-codex"]
         .unwrap();
         git2::Repository::init(project_dir.path()).unwrap();
 
-        let sandbox_info = super::super::instance::SandboxInfo {
+        let sandbox_info = crate::session::instance::SandboxInfo {
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -5520,7 +5520,7 @@ extra_volumes = ["/host/personal-only:/container/personal-only:ro"]
         git2::Repository::init(project_dir.path()).unwrap();
         let project_path_str = project_dir.path().to_str().unwrap();
 
-        let sandbox_info = super::super::instance::SandboxInfo {
+        let sandbox_info = crate::session::instance::SandboxInfo {
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -5672,7 +5672,7 @@ volume_ignores = ["target", "node_modules"]
         )
         .unwrap();
 
-        let sandbox_info = super::super::instance::SandboxInfo {
+        let sandbox_info = crate::session::instance::SandboxInfo {
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -5767,7 +5767,7 @@ volume_ignores = ["target"]
         )
         .unwrap();
 
-        let sandbox_info = super::super::instance::SandboxInfo {
+        let sandbox_info = crate::session::instance::SandboxInfo {
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),
@@ -5922,8 +5922,8 @@ volume_ignores = ["target"]
     // They use `serial_test::serial` because they mutate process-wide env vars,
     // and isolate `HOME`/`XDG_CONFIG_HOME` so global config doesn't bleed in.
 
-    fn build_minimal_sandbox_info() -> super::super::instance::SandboxInfo {
-        super::super::instance::SandboxInfo {
+    fn build_minimal_sandbox_info() -> crate::session::instance::SandboxInfo {
+        crate::session::instance::SandboxInfo {
             enabled: true,
             container_id: None,
             image: "test:latest".to_string(),

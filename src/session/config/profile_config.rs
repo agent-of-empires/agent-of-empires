@@ -7,8 +7,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::fs;
 
-use super::config::Config;
-use super::get_profile_dir;
+use super::Config;
+use crate::session::get_profile_dir;
 
 /// Profile-specific settings, stored as a sparse override tree (#1692).
 ///
@@ -47,7 +47,7 @@ impl ProfileConfig {
 /// (which the dashboard fires on mount before profiles resolve) does
 /// not pollute `profiles/` with a stub directory.
 pub fn load_profile_config(profile: &str) -> Result<ProfileConfig> {
-    let path = super::get_profile_dir_path(profile)?.join("config.toml");
+    let path = crate::session::get_profile_dir_path(profile)?.join("config.toml");
     if !path.exists() {
         return Ok(ProfileConfig::default());
     }
@@ -72,7 +72,7 @@ pub fn load_profile_config(profile: &str) -> Result<ProfileConfig> {
 /// unknown keys).
 fn merged_onto_default(overrides: &serde_json::Value) -> Result<serde_json::Value> {
     let mut base = serde_json::to_value(Config::default())?;
-    crate::session::settings_schema::merge_json(&mut base, overrides);
+    crate::session::config::settings_schema::merge_json(&mut base, overrides);
     Ok(base)
 }
 
@@ -112,7 +112,7 @@ pub(crate) fn profile_config_ignored_keys(cfg: &ProfileConfig) -> Vec<String> {
 pub fn save_profile_config(profile: &str, config: &ProfileConfig) -> Result<()> {
     let path = get_profile_config_path(profile)?;
     let content = toml::to_string_pretty(config)?;
-    super::atomic_write(&path, content.as_bytes())?;
+    crate::session::atomic_write(&path, content.as_bytes())?;
     Ok(())
 }
 
@@ -199,7 +199,7 @@ pub fn merge_configs(global: Config, profile: &ProfileConfig) -> Config {
 /// type-checks against the schema first; see `validate_overrides_typecheck`.
 pub fn merge_configs_generic(global: &Config, overrides: &serde_json::Value) -> Config {
     let mut base = serde_json::to_value(global).expect("Config serializes to JSON");
-    crate::session::settings_schema::merge_json(&mut base, overrides);
+    crate::session::config::settings_schema::merge_json(&mut base, overrides);
     serde_json::from_value(base).expect("merged config deserializes")
 }
 

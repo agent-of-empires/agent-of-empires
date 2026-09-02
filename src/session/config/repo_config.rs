@@ -44,9 +44,9 @@ pub struct HookTimeout {
     pub timeout_secs: u64,
 }
 
-use super::config::Config;
 use super::profile_config::ProfileConfig;
-use super::project_mcp::ProjectMcpServer;
+use super::Config;
+use crate::session::mcp::project_mcp::ProjectMcpServer;
 
 /// Config sections a repo `.agent-of-empires/config.toml` may override.
 /// Personal/global sections (theme, status_hooks, acp, web, logging, host
@@ -173,7 +173,7 @@ pub struct HooksConfig {
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",
-        deserialize_with = "super::serde_helpers::string_or_vec"
+        deserialize_with = "crate::session::serde_helpers::string_or_vec"
     )]
     pub on_create: Vec<String>,
 
@@ -181,7 +181,7 @@ pub struct HooksConfig {
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",
-        deserialize_with = "super::serde_helpers::string_or_vec"
+        deserialize_with = "crate::session::serde_helpers::string_or_vec"
     )]
     pub on_launch: Vec<String>,
 
@@ -190,7 +190,7 @@ pub struct HooksConfig {
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",
-        deserialize_with = "super::serde_helpers::string_or_vec"
+        deserialize_with = "crate::session::serde_helpers::string_or_vec"
     )]
     pub on_destroy: Vec<String>,
 }
@@ -230,7 +230,7 @@ pub struct HostHooksConfig {
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",
-        deserialize_with = "super::serde_helpers::string_or_vec"
+        deserialize_with = "crate::session::serde_helpers::string_or_vec"
     )]
     pub before_start: Vec<String>,
 
@@ -254,7 +254,7 @@ pub struct HostHooksConfig {
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",
-        deserialize_with = "super::serde_helpers::string_or_vec"
+        deserialize_with = "crate::session::serde_helpers::string_or_vec"
     )]
     pub before_session: Vec<String>,
 }
@@ -272,11 +272,11 @@ const REPO_CONFIG_PATH: &str = ".agent-of-empires/config.toml";
 const LEGACY_REPO_CONFIG_PATH: &str = ".aoe/config.toml";
 
 /// The user's global `config.toml`, resolved without creating the app dir
-/// (unlike [`super::config::config_path`], which goes through `get_app_dir`).
+/// (unlike [`super::config_path`], which goes through `get_app_dir`).
 /// `None` when the app dir cannot be resolved at all; no collision is provable
 /// then, so the repo layer proceeds as before.
 fn global_config_path() -> Option<PathBuf> {
-    super::get_app_dir_path()
+    crate::session::get_app_dir_path()
         .ok()
         .map(|dir| dir.join("config.toml"))
 }
@@ -310,7 +310,7 @@ fn resolves_to_global_config(candidate: &Path) -> bool {
 /// Returns `None` if neither file exists.
 pub fn load_repo_config(project_path: &Path) -> Result<Option<RepoConfig>> {
     // An empty path is how a project-less session (scratch, see
-    // `super::builder::build_instance`) says "no repo". Joining onto it yields
+    // `crate::session::builder::build_instance`) says "no repo". Joining onto it yields
     // the *relative* `.agent-of-empires/config.toml`, which would otherwise
     // read whatever directory the process was launched in.
     if project_path.as_os_str().is_empty() {
@@ -414,7 +414,7 @@ pub fn save_repo_config(project_path: &Path, config: &RepoConfig) -> Result<()> 
     let content = toml::to_string_pretty(&sanitized)
         .with_context(|| "Failed to serialize repo config".to_string())?;
 
-    super::atomic_write(&config_path, content.as_bytes())
+    crate::session::atomic_write(&config_path, content.as_bytes())
         .with_context(|| format!("Failed to write {}", config_path.display()))?;
 
     // Clean up legacy .aoe/config.toml to prevent stale config from reactivating
@@ -530,7 +530,7 @@ pub fn profile_to_repo_config(profile: &ProfileConfig) -> RepoConfig {
 /// walking up to an unrelated ancestor repo, e.g. a dotfile-managed `$HOME`).
 pub fn repo_config_source_path(project_path: &Path) -> PathBuf {
     // An empty path means "no project repo" (scratch sessions, see
-    // `super::builder::build_instance`). Every probe below is relative to it,
+    // `crate::session::builder::build_instance`). Every probe below is relative to it,
     // so it would interrogate the *launch directory* instead: a cwd whose
     // `.git` is a file (a linked worktree) resolves to that worktree's main
     // repo and hands `load_repo_config` a real path, putting back the repo
@@ -640,7 +640,7 @@ pub fn compute_hooks_hash(hooks: &HooksConfig) -> String {
 /// profiles so that a repo trusted in one profile doesn't require re-approval
 /// in another.
 fn trusted_repos_path() -> Result<PathBuf> {
-    Ok(super::get_app_dir()?.join("trusted_repos.toml"))
+    Ok(crate::session::get_app_dir()?.join("trusted_repos.toml"))
 }
 
 fn load_trusted_repos() -> Result<TrustedRepos> {
@@ -716,7 +716,7 @@ pub fn trust_repo(
     let normalized = normalize_path(project_path);
     let path = trusted_repos_path()?;
 
-    super::storage::locked_update(
+    crate::session::storage::locked_update(
         &path,
         |content| toml::from_str(content).context("Failed to parse trusted_repos.toml"),
         |trusted: &TrustedRepos| Ok(toml::to_string_pretty(trusted)?),
@@ -814,20 +814,21 @@ pub fn check_repo_trust(project_path: &Path) -> Result<RepoTrust> {
     // here would otherwise make the whole call fail and silently drop
     // already-trusted hooks. Treat a load error as "no project MCP" (the
     // supervisor is the real MCP gate and logs/skips a broken file at spawn).
-    let servers = super::project_mcp::load_project_mcp_servers(Path::new(&normalized))
-        .unwrap_or_else(|e| {
-            tracing::warn!(
-                target: "session.store",
-                path = %normalized,
-                error = %e,
-                "failed to load project .mcp.json for trust; treating as absent"
-            );
-            Vec::new()
-        });
+    let servers =
+        crate::session::mcp::project_mcp::load_project_mcp_servers(Path::new(&normalized))
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    target: "session.store",
+                    path = %normalized,
+                    error = %e,
+                    "failed to load project .mcp.json for trust; treating as absent"
+                );
+                Vec::new()
+            });
     let mcp = if servers.is_empty() {
         TrustSurface::Absent
     } else {
-        let hash = super::project_mcp::fingerprint(&servers);
+        let hash = crate::session::mcp::project_mcp::fingerprint(&servers);
         if row.and_then(|r| r.mcp_hash.as_deref()) == Some(hash.as_str()) {
             TrustSurface::Trusted(servers)
         } else {
@@ -1016,7 +1017,7 @@ fn build_hook_command(
 
     let mut command = match target {
         HookTarget::Local { project_path } => {
-            let shell = super::environment::user_shell();
+            let shell = crate::session::environment::user_shell();
             let mut command = std::process::Command::new(shell);
             command.arg("-c").arg(shell_cmd).current_dir(project_path);
             for (k, v) in extra_env {
@@ -1089,7 +1090,9 @@ fn build_hook_command(
 /// only present when the session has a worktree; `AOE_REPO_SLUG` only when the
 /// project has an `origin` remote that parses to `owner/repo`; other fields may
 /// be empty strings (e.g., `AOE_GROUP_PATH` for ungrouped sessions).
-pub(crate) fn lifecycle_env_vars(instance: &super::Instance) -> Vec<(&'static str, String)> {
+pub(crate) fn lifecycle_env_vars(
+    instance: &crate::session::Instance,
+) -> Vec<(&'static str, String)> {
     let mut env = vec![
         ("AOE_SESSION_ID", instance.id.clone()),
         ("AOE_SESSION_TITLE", instance.title.clone()),
@@ -1354,7 +1357,7 @@ pub fn execute_hooks_in_container(
 /// contribute host commands; this is belt-and-suspenders on top of
 /// `host_hooks` being excluded from `REPO_OVERRIDABLE_SECTIONS`.
 pub fn resolve_before_start_hooks(profile: &str) -> Vec<String> {
-    let resolved = super::config::effective_profile(profile);
+    let resolved = super::effective_profile(profile);
     super::profile_config::resolve_config_or_warn(&resolved)
         .host_hooks
         .before_start
@@ -1367,7 +1370,7 @@ pub fn resolve_before_start_hooks(profile: &str) -> Vec<String> {
 /// hook runs for host (non-sandboxed) sessions, where its output lands in the
 /// agent's own environment rather than a container's.
 pub fn resolve_before_session_hooks(profile: &str) -> Vec<String> {
-    let resolved = super::config::effective_profile(profile);
+    let resolved = super::effective_profile(profile);
     super::profile_config::resolve_config_or_warn(&resolved)
         .host_hooks
         .before_session
@@ -1385,7 +1388,7 @@ fn parse_env_kv_lines(stdout: &str) -> Vec<(String, String)> {
             continue;
         };
         let key = key.trim();
-        if !super::environment::is_valid_env_key(key) {
+        if !crate::session::environment::is_valid_env_key(key) {
             if warn_on_malformed_key(key) {
                 // Hook stdout is the documented secret channel, so never log a
                 // malformed key derived from it.
@@ -3004,7 +3007,7 @@ trusted_at = "2026-01-31T00:00:00Z"
     /// have to update both the helper and the docs in lockstep.
     #[test]
     fn lifecycle_env_vars_shape() {
-        use super::super::instance::WorktreeInfo;
+        use crate::session::instance::WorktreeInfo;
         use crate::session::Instance;
 
         let mut instance = Instance::new("My Session", "/tmp/proj");

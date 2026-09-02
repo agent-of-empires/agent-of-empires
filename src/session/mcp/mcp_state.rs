@@ -112,7 +112,7 @@ pub struct McpReconcile {
 /// Path to the drift store, shared across all profiles (a server's drift is a
 /// property of the host config, not of a session profile).
 fn mcp_state_path() -> Result<PathBuf> {
-    Ok(super::get_app_dir()?.join("mcp_state.json"))
+    Ok(crate::session::get_app_dir()?.join("mcp_state.json"))
 }
 
 /// Reconcile one agent's CURRENT native read against the stored snapshot,
@@ -309,7 +309,7 @@ pub fn resolve_conflict(
 /// as the user's mcp.json and native configs.
 fn with_locked_state<R>(f: impl FnOnce(&mut McpState) -> R) -> Result<R> {
     let path = mcp_state_path()?;
-    super::storage::locked_update(
+    crate::session::storage::locked_update(
         &path,
         |content| serde_json::from_str(content).context("parsing mcp_state.json"),
         |state| Ok(serde_json::to_string_pretty(state)?),
@@ -320,7 +320,7 @@ fn with_locked_state<R>(f: impl FnOnce(&mut McpState) -> R) -> Result<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::project_mcp::parse_standard_mcp_servers;
+    use crate::session::mcp::project_mcp::parse_standard_mcp_servers;
 
     /// The drift store path derives from HOME; the env mutation is serialized
     /// across the whole suite by `#[serial_test::serial]` on each test (the same
@@ -385,9 +385,9 @@ mod tests {
         assert_eq!(c.agent, "claude");
         // previous = snapshot (old), current = native (new).
         assert!(matches!(&c.previous.transport,
-            crate::session::project_mcp::ProjectMcpTransport::Stdio { command, .. } if command == "old"));
+            crate::session::mcp::project_mcp::ProjectMcpTransport::Stdio { command, .. } if command == "old"));
         assert!(matches!(&c.current.transport,
-            crate::session::project_mcp::ProjectMcpTransport::Stdio { command, .. } if command == "new"));
+            crate::session::mcp::project_mcp::ProjectMcpTransport::Stdio { command, .. } if command == "new"));
 
         // Unresolved conflict re-surfaces on the next open (snapshot kept old).
         let r2 = reconcile_agent(
@@ -450,10 +450,10 @@ mod tests {
 
         // AoE's old definition is promoted into global mcp.json.
         let app_dir = crate::session::get_app_dir().unwrap();
-        let global = crate::session::mcp_model::load_global_mcp_servers(&app_dir).unwrap();
+        let global = crate::session::mcp::mcp_model::load_global_mcp_servers(&app_dir).unwrap();
         assert_eq!(global.len(), 1);
         assert!(matches!(&global[0].transport,
-            crate::session::project_mcp::ProjectMcpTransport::Stdio { command, .. } if command == "old"));
+            crate::session::mcp::project_mcp::ProjectMcpTransport::Stdio { command, .. } if command == "old"));
 
         // Conflict no longer surfaces (snapshot re-baselined to native).
         let r = reconcile_agent(
@@ -475,7 +475,7 @@ mod tests {
             ResolveStatus::Applied
         );
         let app_dir = crate::session::get_app_dir().unwrap();
-        let global = crate::session::mcp_model::load_global_mcp_servers(&app_dir).unwrap();
+        let global = crate::session::mcp::mcp_model::load_global_mcp_servers(&app_dir).unwrap();
         assert!(global.is_empty(), "native wins must not write global");
         let r = reconcile_agent(
             "claude",
@@ -496,9 +496,11 @@ mod tests {
 
         // Nothing changed: conflict still surfaces, global untouched.
         let app_dir = crate::session::get_app_dir().unwrap();
-        assert!(crate::session::mcp_model::load_global_mcp_servers(&app_dir)
-            .unwrap()
-            .is_empty());
+        assert!(
+            crate::session::mcp::mcp_model::load_global_mcp_servers(&app_dir)
+                .unwrap()
+                .is_empty()
+        );
         let r = reconcile_agent(
             "claude",
             &read(r#"{ "mcpServers": { "fs": { "command": "new" } } }"#),
@@ -533,9 +535,11 @@ mod tests {
         let status = resolve_conflict(&newer, ConflictWinner::Aoe, &token).unwrap();
         assert_eq!(status, ResolveStatus::Stale);
         let app_dir = crate::session::get_app_dir().unwrap();
-        assert!(crate::session::mcp_model::load_global_mcp_servers(&app_dir)
-            .unwrap()
-            .is_empty());
+        assert!(
+            crate::session::mcp::mcp_model::load_global_mcp_servers(&app_dir)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

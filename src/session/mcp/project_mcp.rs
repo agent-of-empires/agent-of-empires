@@ -144,7 +144,7 @@ pub fn load_project_mcp_servers(repo_path: &Path) -> Result<Vec<ProjectMcpServer
 /// transport-resolved servers. A missing file yields an empty list; a
 /// present-but-malformed file is an error the caller surfaces. Shared by the
 /// project-local layer and the AoE-owned global/per-profile `mcp.json` layers
-/// (`session::mcp_model`), which all use this exact on-disk shape.
+/// (`session::mcp::mcp_model`), which all use this exact on-disk shape.
 pub(crate) fn load_standard_mcp_servers(path: &Path) -> Result<Vec<ProjectMcpServer>> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
@@ -159,7 +159,7 @@ pub(crate) fn load_standard_mcp_servers(path: &Path) -> Result<Vec<ProjectMcpSer
 
 /// Parse standard `.mcp.json` text into transport-resolved servers. Split from
 /// the file read so the conversion rules are unit-testable without touching
-/// disk. Public so `session::mcp_model` reuses the exact same standard-shape
+/// disk. Public so `session::mcp::mcp_model` reuses the exact same standard-shape
 /// parse for the global and per-profile layers.
 pub fn parse_standard_mcp_servers(text: &str) -> Result<Vec<ProjectMcpServer>> {
     let parsed: ProjectMcpFile = serde_json::from_str(text)?;

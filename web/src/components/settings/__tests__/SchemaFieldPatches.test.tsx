@@ -15,7 +15,7 @@
 //
 // Each tab is a SchemaSection fed by `GET /api/settings/schema`, so the mock
 // schema below mirrors the real `#[setting(...)]` shapes (labels, widgets,
-// options) from src/session/config.rs / src/sound/config.rs. What this pins is
+// options) from src/session/config/mod.rs / src/sound/config.rs. What this pins is
 // the exact (profile, { section: { field: value } }) PATCH leaf each control
 // emits; server-side persistence of the PATCH is the server's contract, not
 // the dashboard's.

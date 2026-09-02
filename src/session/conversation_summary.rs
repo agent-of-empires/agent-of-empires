@@ -332,7 +332,7 @@ mod serve {
             return;
         };
 
-        let resolved = crate::session::repo_config::resolve_config_with_repo_or_warn(
+        let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
             &profile,
             std::path::Path::new(&project_path),
         );

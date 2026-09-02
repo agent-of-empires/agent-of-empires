@@ -590,7 +590,7 @@ fn resolve_session_cfg<'a>(
         .or_insert_with(|| {
             #[cfg(test)]
             LIST_SESSIONS_RESOLVER_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            crate::session::repo_config::resolve_config_with_repo_or_warn(
+            crate::session::config::repo_config::resolve_config_with_repo_or_warn(
                 profile,
                 std::path::Path::new(project_path),
             )
@@ -744,7 +744,9 @@ pub async fn list_sessions(
         let mut fresh: HashMap<String, CleanupDefaults> = HashMap::new();
         for session in &sessions {
             fresh.entry(session.profile.clone()).or_insert_with(|| {
-                let cfg = crate::session::profile_config::resolve_config_or_warn(&session.profile);
+                let cfg = crate::session::config::profile_config::resolve_config_or_warn(
+                    &session.profile,
+                );
                 CleanupDefaults {
                     delete_worktree: cfg.worktree.auto_cleanup,
                     delete_branch: cfg.worktree.should_delete_branch_on_cleanup(),
@@ -771,7 +773,7 @@ pub async fn list_sessions(
                 continue;
             }
             let tied = *tie_cache.entry(session.profile.clone()).or_insert_with(|| {
-                crate::session::profile_config::resolve_config_or_warn(&session.profile)
+                crate::session::config::profile_config::resolve_config_or_warn(&session.profile)
                     .session
                     .tie_workdir_to_name
             });
@@ -1362,7 +1364,7 @@ pub async fn rename_session(
     // Tied mode (#1927): renaming an aoe-managed worktree session also moves
     // its directory leaf to match the title, so title and dir cannot drift.
     let tied = fresh.tie_workdir_applies(
-        crate::session::profile_config::resolve_config_or_warn(&profile)
+        crate::session::config::profile_config::resolve_config_or_warn(&profile)
             .session
             .tie_workdir_to_name,
     );
@@ -1814,7 +1816,7 @@ pub async fn set_worktree_name(
     // the title. Reject the standalone edit so no client can drift the two
     // apart, pointing callers at the unified rename.
     if worktree_info.managed_by_aoe
-        && crate::session::profile_config::resolve_config_or_warn(&profile)
+        && crate::session::config::profile_config::resolve_config_or_warn(&profile)
             .session
             .tie_workdir_to_name
     {
@@ -3428,7 +3430,7 @@ pub async fn force_smart_rename(
     // Passes `setting_on = true` because this is the manual "Auto-name now"
     // action, which runs on demand even when auto-rename-on-start is disabled
     // (#3039); the spawned try_smart_rename gets `force = true` below to match.
-    let resolved = crate::session::repo_config::resolve_config_with_repo_or_warn(
+    let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
         &profile,
         std::path::Path::new(&project_path),
     );
@@ -3578,7 +3580,7 @@ pub async fn summarize_session(
             .into_response();
     };
 
-    let config = crate::session::profile_config::resolve_config_or_warn(&profile);
+    let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
     if let Err(reason) = crate::session::conversation_summary::resolve_summary_agent(
         structured,
         &tool,
@@ -4585,7 +4587,7 @@ pub(crate) async fn purge_expired_trash(state: &Arc<AppState>) {
         let retention = *retention_by_profile
             .entry(profile.clone())
             .or_insert_with(|| {
-                crate::session::profile_config::resolve_config_or_warn(&profile)
+                crate::session::config::profile_config::resolve_config_or_warn(&profile)
                     .session
                     .trash_retention_days
             });
@@ -4622,7 +4624,9 @@ pub(crate) async fn purge_expired_trash(state: &Arc<AppState>) {
         // Permanent retention purge cleans sidecars per the profile defaults,
         // but forces removal so a dirty worktree can't keep an expired
         // session pinned in the trash forever.
-        let cfg = crate::session::profile_config::resolve_config_or_warn(&instance.source_profile);
+        let cfg = crate::session::config::profile_config::resolve_config_or_warn(
+            &instance.source_profile,
+        );
         let body = DeleteSessionBody {
             delete_worktree: cfg.worktree.auto_cleanup,
             delete_branch: cfg.worktree.should_delete_branch_on_cleanup(),
@@ -5310,9 +5314,11 @@ pub(super) fn agent_is_acp_capable(
     // custom map by that same name. Looking up `tool` here would report
     // not-capable for an agent that spawns fine, skipping the up-front 403 in
     // favor of a late refusal at spawn.
-    let session =
-        crate::session::repo_config::resolve_config_with_repo_or_warn(profile, project_path)
-            .session;
+    let session = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+        profile,
+        project_path,
+    )
+    .session;
     session
         .agent_acp_cmd
         .get(resolved)
@@ -5331,7 +5337,7 @@ fn validate_session_tool_identity(
         return true;
     }
 
-    match crate::session::repo_config::resolve_config_with_repo(profile, project_path) {
+    match crate::session::config::repo_config::resolve_config_with_repo(profile, project_path) {
         Ok(config) => config
             .session
             .custom_agents
@@ -5451,7 +5457,7 @@ pub(crate) fn resolve_create_hook_plan(
     scratch: bool,
     trust_hooks_requested: bool,
 ) -> anyhow::Result<CreateHookPlan> {
-    use crate::session::repo_config::{self, TrustSurface};
+    use crate::session::config::repo_config::{self, TrustSurface};
 
     // Scratch sessions have no `.agent-of-empires/config.toml` anchored on a
     // repo path, so skip the repo trust check entirely and fall back to
@@ -5555,7 +5561,7 @@ pub(crate) fn run_create_hooks(
     plan: &CreateHookPlan,
     project_path: &std::path::Path,
 ) -> anyhow::Result<()> {
-    use crate::session::repo_config;
+    use crate::session::config::repo_config;
 
     if let Some((hooks_hash, mcp_hash)) = &plan.trust_write {
         repo_config::trust_repo(project_path, hooks_hash.as_deref(), mcp_hash.as_deref())?;
@@ -6199,18 +6205,20 @@ pub async fn create_session(
             // not run on this create response, so a managed worktree would
             // otherwise report untied until the next list refresh.
             if resp.has_managed_worktree {
-                resp.tie_workdir_to_name = crate::session::profile_config::resolve_config_or_warn(
-                    &instance.source_profile,
-                )
-                .session
-                .tie_workdir_to_name;
+                resp.tie_workdir_to_name =
+                    crate::session::config::profile_config::resolve_config_or_warn(
+                        &instance.source_profile,
+                    )
+                    .session
+                    .tie_workdir_to_name;
             }
             if !resp.acp_capable {
-                let session = crate::session::repo_config::resolve_config_with_repo_or_warn(
-                    &instance.source_profile,
-                    std::path::Path::new(&instance.project_path),
-                )
-                .session;
+                let session =
+                    crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+                        &instance.source_profile,
+                        std::path::Path::new(&instance.project_path),
+                    )
+                    .session;
                 resp.acp_capable = custom_agent_acp_capable(&session, &instance.tool);
             }
 
@@ -7578,11 +7586,11 @@ pub async fn preview_volume_ignores_globs(
 ) -> impl IntoResponse {
     let result = tokio::task::spawn_blocking(move || {
         let profile = query.profile.unwrap_or_default();
-        let config = crate::session::repo_config::resolve_config_with_repo(
+        let config = crate::session::config::repo_config::resolve_config_with_repo(
             &profile,
             std::path::Path::new(&query.path),
         )?;
-        let expansions = crate::session::container_config::preview_glob_volume_ignores(
+        let expansions = crate::session::config::container_config::preview_glob_volume_ignores(
             &query.path,
             None,
             &config.sandbox.volume_ignores,
@@ -9740,9 +9748,9 @@ mod tests {
             "session".to_string(),
             serde_json::json!({ "tie_workdir_to_name": false }),
         );
-        crate::session::profile_config::save_profile_config(
+        crate::session::config::profile_config::save_profile_config(
             "test",
-            &crate::session::profile_config::ProfileConfig {
+            &crate::session::config::profile_config::ProfileConfig {
                 description: None,
                 overrides,
             },
@@ -11221,7 +11229,7 @@ mod tests {
         assert!(mcp_hash.is_none(), "no .mcp.json means no mcp hash");
 
         // And the recorded trust makes a later create succeed without opting in.
-        crate::session::repo_config::trust_repo(
+        crate::session::config::repo_config::trust_repo(
             project.path(),
             hooks_hash.as_deref(),
             mcp_hash.as_deref(),
@@ -11331,12 +11339,12 @@ mod tests {
             .unwrap();
 
         // Trust the main repo at its current hooks hash.
-        let hooks = crate::session::repo_config::load_repo_config(&root)
+        let hooks = crate::session::config::repo_config::load_repo_config(&root)
             .unwrap()
             .and_then(|rc| rc.hooks())
             .unwrap();
-        let hash = crate::session::repo_config::compute_hooks_hash(&hooks);
-        crate::session::repo_config::trust_repo(&root, Some(&hash), None).unwrap();
+        let hash = crate::session::config::repo_config::compute_hooks_hash(&hooks);
+        crate::session::config::repo_config::trust_repo(&root, Some(&hash), None).unwrap();
 
         // A worktree of that repo inherits the trust.
         let main_wt = crate::git::GitWorktree::new(root.clone()).unwrap();
@@ -11711,7 +11719,7 @@ fn write_paste_image(
 /// reuse `compute_volume_paths` so the pasted path matches that mount.
 fn pane_visible_paste_path(project_path: &str, is_sandboxed: bool, file_name: &str) -> String {
     if is_sandboxed {
-        if let Ok((_, working_dir)) = crate::session::container_config::compute_volume_paths(
+        if let Ok((_, working_dir)) = crate::session::config::container_config::compute_volume_paths(
             std::path::Path::new(project_path),
             project_path,
         ) {

@@ -1,7 +1,13 @@
-//! User configuration management
+//! User configuration management: the app `Config` plus the profile, repo,
+//! container, and settings-schema layers that derive from it.
 
+pub(crate) mod container_config;
+pub mod profile_config;
+pub mod repo_config;
+pub mod settings_schema;
+
+use self::repo_config::{HooksConfig, HostHooksConfig};
 use super::get_app_dir;
-use super::repo_config::{HooksConfig, HostHooksConfig};
 use anyhow::Result;
 use aoe_settings_derive::SettingsSection;
 use serde::{Deserialize, Serialize};
@@ -2868,7 +2874,7 @@ pub enum TmuxSettingAction {
 ///
 /// Takes the already-resolved config so the caller decides which layer that is.
 /// Every tmux call site passes the profile-merged config from
-/// [`crate::session::profile_config::resolve_config_or_warn`]; reading the
+/// [`crate::session::config::profile_config::resolve_config_or_warn`]; reading the
 /// global config here would silently drop a profile's `[tmux]` overrides, which
 /// is the second half of #3207.
 pub fn resolve_tmux_setting(setting: TmuxSetting, config: &Config) -> TmuxSettingAction {
@@ -4343,7 +4349,7 @@ mod tests {
     fn test_vt_live_in_settings_schema() {
         // The single-source schema must expose the toggle so both the TUI
         // and web settings render it (docs/development/adding-settings.md).
-        let schema = crate::session::settings_schema::schema();
+        let schema = crate::session::config::settings_schema::schema();
         let field = schema
             .iter()
             .find(|f| f.section == "tmux" && f.field == "vt_live")

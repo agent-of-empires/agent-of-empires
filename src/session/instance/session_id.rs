@@ -186,7 +186,7 @@ impl Instance {
             return false;
         }
         let profile = self.effective_profile();
-        if !crate::session::profile_config::resolve_config_or_warn(&profile)
+        if !crate::session::config::profile_config::resolve_config_or_warn(&profile)
             .session
             .opencode_preassign_session_id
         {
@@ -416,14 +416,14 @@ impl Instance {
             // extension is written where pi discovers it, inside the config
             // bind every Pi container already has, and the sidecar is published
             // into that same bind.
-            if crate::session::container_config::install_pi_sandbox_extension().is_err() {
+            if crate::session::config::container_config::install_pi_sandbox_extension().is_err() {
                 return None;
             }
             return Some((
                 String::new(),
                 format!(
                     "AOE_PI_SESSION_ID_FILE={}/{}/session_id ",
-                    crate::session::container_config::PI_SIDECAR_DIR_IN_CONTAINER,
+                    crate::session::config::container_config::PI_SIDECAR_DIR_IN_CONTAINER,
                     self.id
                 ),
             ));
@@ -510,10 +510,12 @@ impl Instance {
     fn declares_agent_config_dir(&self) -> bool {
         *self.agent_config_dir_declared.get_or_init(|| {
             dirs::home_dir().is_some_and(|home| {
-                crate::session::profile_config::resolve_config_or_warn(&self.effective_profile())
-                    .session
-                    .agent_config_dir_for(&self.tool, &home)
-                    .is_some()
+                crate::session::config::profile_config::resolve_config_or_warn(
+                    &self.effective_profile(),
+                )
+                .session
+                .agent_config_dir_for(&self.tool, &home)
+                .is_some()
             })
         })
     }
@@ -529,7 +531,7 @@ impl Instance {
         if self.declares_agent_config_dir() {
             return None;
         }
-        crate::session::container_config::pi_sandbox_dir()
+        crate::session::config::container_config::pi_sandbox_dir()
     }
 
     /// Host directory backing this sandboxed pane's sidecar.
@@ -1343,7 +1345,7 @@ mod tests {
             .pi_host_view_of(published)
             .expect("a container path maps to the sandbox dir");
         assert!(
-            host.starts_with(crate::session::container_config::pi_sandbox_dir().unwrap()),
+            host.starts_with(crate::session::config::container_config::pi_sandbox_dir().unwrap()),
             "resolved under the sandbox dir, got {host:?}"
         );
         assert!(host.ends_with("sessions/--proj--/2026-01-01T00-00-00-000Z_x.jsonl"));
@@ -3288,13 +3290,17 @@ mod tests {
             let _shared = EnvGuard::set(&[("KIMI_SHARED", kimi_home.to_str().unwrap())]);
 
             let mut peer_config =
-                crate::session::profile_config::load_profile_config("kimi-var-peer").unwrap();
+                crate::session::config::profile_config::load_profile_config("kimi-var-peer")
+                    .unwrap();
             peer_config.overrides.insert(
                 "environment".to_string(),
                 serde_json::json!(["KIMI_CODE_HOME=$KIMI_SHARED"]),
             );
-            crate::session::profile_config::save_profile_config("kimi-var-peer", &peer_config)
-                .unwrap();
+            crate::session::config::profile_config::save_profile_config(
+                "kimi-var-peer",
+                &peer_config,
+            )
+            .unwrap();
 
             seed_kimi_index(&kimi_home, &project, "kimi-stored", "kimi-peer-fresh");
             let mut peer = Instance::new("var-peer", &project);
@@ -3424,13 +3430,17 @@ mod tests {
 
             let caller_profile = "kimi-invalid-config-caller";
             let mut caller_config =
-                crate::session::profile_config::load_profile_config(caller_profile).unwrap();
+                crate::session::config::profile_config::load_profile_config(caller_profile)
+                    .unwrap();
             caller_config.overrides.insert(
                 "environment".to_string(),
                 serde_json::json!([format!("KIMI_CODE_HOME={}", kimi_home.display())]),
             );
-            crate::session::profile_config::save_profile_config(caller_profile, &caller_config)
-                .unwrap();
+            crate::session::config::profile_config::save_profile_config(
+                caller_profile,
+                &caller_config,
+            )
+            .unwrap();
 
             let peer_profile = "kimi-invalid-config-peer";
             let mut peer = Instance::new("invalid-config-peer", &project);

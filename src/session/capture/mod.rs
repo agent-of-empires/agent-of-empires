@@ -2808,7 +2808,7 @@ pub(crate) fn kimi_store_is_shared(
         // sessions.json holds. A successful resolve idempotently reinstalls
         // that profile's status rules; a failed resolve returns shared without
         // installing fallback rules or clearing the prior registry state.
-        let Ok(peer_config) = super::profile_config::resolve_config(&peer_profile) else {
+        let Ok(peer_config) = super::config::profile_config::resolve_config(&peer_profile) else {
             return true;
         };
         let Some(peer_home) = kimi_home_for_environment(&peer_config.environment) else {

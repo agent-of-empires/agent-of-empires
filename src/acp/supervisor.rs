@@ -595,7 +595,7 @@ fn resolve_mcp_layers(
     profile: Option<&str>,
     cwd: &std::path::Path,
 ) -> Vec<agent_client_protocol::schema::v1::McpServer> {
-    use crate::session::mcp_model::{resolve_effective, summarize};
+    use crate::session::mcp::mcp_model::{resolve_effective, summarize};
 
     // One resolver for forwarding and the management surfaces (#1996): assemble
     // the trust-gated, provenance-tagged effective set, then convert only the
@@ -1004,10 +1004,13 @@ impl<S: BroadcastSink> Supervisor<S> {
         let profile = profile.to_string();
         let project_path = project_path.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            crate::session::repo_config::resolve_config_with_repo_or_warn(&profile, &project_path)
-                .acp
-                .resolved_default_agent()
-                .to_string()
+            crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+                &profile,
+                &project_path,
+            )
+            .acp
+            .resolved_default_agent()
+            .to_string()
         })
         .await
         .unwrap_or_else(|_| crate::session::config::DEFAULT_ACP_AGENT.to_string())
@@ -1028,7 +1031,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         tokio::task::spawn_blocking(move || {
             crate::acp::inherited_acp_base(
                 &tool,
-                &crate::session::repo_config::resolve_config_with_repo_or_warn(
+                &crate::session::config::repo_config::resolve_config_with_repo_or_warn(
                     &profile,
                     &project_path,
                 )
@@ -1052,11 +1055,14 @@ impl<S: BroadcastSink> Supervisor<S> {
         let profile = profile.to_string();
         let project_path = project_path.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            crate::session::repo_config::resolve_config_with_repo_or_warn(&profile, &project_path)
-                .session
-                .agent_acp_cmd
-                .get(&tool)
-                .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(&tool, cmd).is_ok())
+            crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+                &profile,
+                &project_path,
+            )
+            .session
+            .agent_acp_cmd
+            .get(&tool)
+            .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(&tool, cmd).is_ok())
         })
         .await
         .unwrap_or(false)
@@ -1658,7 +1664,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         let cwd_for_cfg = cwd.clone();
         let (resolved_cfg, policy) = tokio::task::spawn_blocking(move || {
             (
-                crate::session::repo_config::resolve_config_with_repo_or_warn(
+                crate::session::config::repo_config::resolve_config_with_repo_or_warn(
                     &profile_for_cfg,
                     &cwd_for_cfg,
                 ),
@@ -1760,8 +1766,9 @@ impl<S: BroadcastSink> Supervisor<S> {
             let session_for_hook = session_id.clone();
             let tool_for_hook = tool.clone();
             let minted = tokio::task::spawn_blocking(move || {
-                let commands =
-                    crate::session::repo_config::resolve_before_session_hooks(&profile_for_hook);
+                let commands = crate::session::config::repo_config::resolve_before_session_hooks(
+                    &profile_for_hook,
+                );
                 if commands.is_empty() {
                     return Ok(Vec::new());
                 }
@@ -1778,7 +1785,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                         cwd_for_hook.to_string_lossy().to_string(),
                     ),
                 ];
-                crate::session::repo_config::run_before_session_hooks(
+                crate::session::config::repo_config::run_before_session_hooks(
                     &commands,
                     &cwd_for_hook,
                     &hook_env,
@@ -2376,7 +2383,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                         let tool_for_hook = respawn_config.tool.clone();
                         let minted = tokio::task::spawn_blocking(move || {
                             let commands =
-                                crate::session::repo_config::resolve_before_session_hooks(
+                                crate::session::config::repo_config::resolve_before_session_hooks(
                                     &profile_for_hook,
                                 );
                             if commands.is_empty() {
@@ -2391,7 +2398,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                                     cwd_for_hook.to_string_lossy().to_string(),
                                 ),
                             ];
-                            crate::session::repo_config::run_before_session_hooks(
+                            crate::session::config::repo_config::run_before_session_hooks(
                                 &commands,
                                 &cwd_for_hook,
                                 &hook_env,
@@ -4655,9 +4662,9 @@ cursor-acp-bridge = "agent acp"
         );
 
         // Trust the repo at the file's current fingerprint, then re-resolve.
-        let servers = crate::session::project_mcp::load_project_mcp_servers(&repo).unwrap();
-        let hash = crate::session::project_mcp::fingerprint(&servers);
-        crate::session::repo_config::trust_repo(&repo, None, Some(&hash)).unwrap();
+        let servers = crate::session::mcp::project_mcp::load_project_mcp_servers(&repo).unwrap();
+        let hash = crate::session::mcp::project_mcp::fingerprint(&servers);
+        crate::session::config::repo_config::trust_repo(&repo, None, Some(&hash)).unwrap();
 
         let cwd = repo.clone();
         let merged = tokio::task::spawn_blocking(move || {

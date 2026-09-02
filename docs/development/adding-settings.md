@@ -8,7 +8,7 @@ the common case, adding a setting is a single edit.
 ## The one-edit case
 
 Add the field to the relevant `#[derive(SettingsSection)]` struct (in
-`src/session/config.rs`, `src/sound/config.rs`, or `src/status_hooks.rs`) with a
+`src/session/config/mod.rs`, `src/sound/config.rs`, or `src/status_hooks.rs`) with a
 doc comment and a `#[setting(...)]` annotation:
 
 ```rust
@@ -61,7 +61,7 @@ Pick a `widget` for the field's type:
 
 - `validate`: server-authoritative value check (`range:MIN[:MAX]`, `nonempty`,
   `memory_limit`, `volume_list`, `env_list`, `port_mapping_list`). Add a new
-  `ValidationKind` variant (`src/session/settings_schema/`) and a `validate=`
+  `ValidationKind` variant (`src/session/config/settings_schema/`) and a `validate=`
   keyword (`aoe-settings-derive`) if none fits; that is what drives both the
   client UX validator and the server gate from one rule.
 - `web`: `elevation:<reason>` (passphrase step-up required to save from the
@@ -144,7 +144,7 @@ fallback.
 ## Tests
 
 - The schema, server policy, and validators have unit tests under
-  `src/session/settings_schema/`.
+  `src/session/config/settings_schema/`.
 - A custom widget should have a TUI round-trip test
   (`src/tui/settings/fields.rs`) and a web contract test
   (`web/src/components/settings/__tests__/customWidgets.test.tsx`).

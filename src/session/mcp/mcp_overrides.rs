@@ -23,7 +23,7 @@ use super::project_mcp::{ProjectMcpServer, ProjectMcpTransport};
 
 /// Path to the global `mcp.json` AoE owns and may write.
 fn global_mcp_path() -> Result<PathBuf> {
-    Ok(super::get_app_dir()?.join("mcp.json"))
+    Ok(crate::session::get_app_dir()?.join("mcp.json"))
 }
 
 /// The standard `.mcp.json` entry object for a server: stdio carries
@@ -89,7 +89,7 @@ fn read_root(content: &str) -> Result<Map<String, Value>> {
 /// race against a concurrent surface write).
 fn mutate_servers<T>(mutate: impl FnOnce(&mut Map<String, Value>) -> T) -> Result<T> {
     let path = global_mcp_path()?;
-    super::storage::locked_update(
+    crate::session::storage::locked_update(
         &path,
         read_root,
         |root| Ok(serde_json::to_string_pretty(root)?),
@@ -128,7 +128,7 @@ enum SkipWrite {
 /// touch nothing on disk.
 fn try_mutate_servers(mutate: impl FnOnce(&mut Map<String, Value>) -> bool) -> Result<bool> {
     let path = global_mcp_path()?;
-    let outcome = super::storage::locked_update(
+    let outcome = crate::session::storage::locked_update(
         &path,
         read_root,
         |root| Ok(serde_json::to_string_pretty(root)?),
@@ -210,8 +210,8 @@ pub fn replace_global_server_if_present(server: &ProjectMcpServer) -> Result<boo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::mcp_model::load_global_mcp_servers;
-    use crate::session::project_mcp::ProjectMcpTransport;
+    use crate::session::mcp::mcp_model::load_global_mcp_servers;
+    use crate::session::mcp::project_mcp::ProjectMcpTransport;
 
     /// Serialized across the suite by `#[serial_test::serial]`; the returned
     /// `TempDir` must outlive the test body.

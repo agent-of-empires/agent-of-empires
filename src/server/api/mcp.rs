@@ -18,8 +18,9 @@ use axum::{
 use serde::Deserialize;
 
 use super::AppState;
-use crate::session::mcp_state::{self, ConflictWinner};
-use crate::session::{mcp_model, profile_config};
+use crate::session::config::profile_config;
+use crate::session::mcp::mcp_model;
+use crate::session::mcp::mcp_state::{self, ConflictWinner};
 
 #[derive(Debug, Deserialize)]
 pub struct AgentQuery {

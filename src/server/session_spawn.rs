@@ -264,7 +264,7 @@ pub(crate) async fn spawn_structured_session(
                 .filter(|s| !s.is_empty())
                 .unwrap_or(instance.tool.as_str())
                 .to_string();
-            let resolved_config = crate::session::repo_config::resolve_config_with_repo_or_warn(
+            let resolved_config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
                 &instance.source_profile,
                 std::path::Path::new(&instance.project_path),
             );
@@ -313,7 +313,7 @@ pub(crate) async fn spawn_structured_session(
                     .filter(|s| !s.is_empty())
                     .unwrap_or(instance.tool.as_str());
                 let resolved_session =
-                    crate::session::repo_config::resolve_config_with_repo_or_warn(
+                    crate::session::config::repo_config::resolve_config_with_repo_or_warn(
                         &instance.source_profile,
                         std::path::Path::new(&instance.project_path),
                     )

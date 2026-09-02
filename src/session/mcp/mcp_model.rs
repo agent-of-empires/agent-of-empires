@@ -226,7 +226,7 @@ pub fn resolve_effective(
         Vec::new()
     });
 
-    let global = match super::get_app_dir() {
+    let global = match crate::session::get_app_dir() {
         Ok(app_dir) => load_global_mcp_servers(&app_dir).unwrap_or_else(|e| {
             warn!(target: "acp.mcp", error = %e, "failed to load global MCP config; contributing none from it");
             Vec::new()
@@ -237,7 +237,7 @@ pub fn resolve_effective(
         }
     };
 
-    let per_profile = match super::get_profile_dir_path(profile.unwrap_or_default()) {
+    let per_profile = match crate::session::get_profile_dir_path(profile.unwrap_or_default()) {
         Ok(profile_dir) => load_profile_mcp_servers(&profile_dir).unwrap_or_else(|e| {
             warn!(target: "acp.mcp", error = %e, "failed to load per-profile MCP config; contributing none from it");
             Vec::new()
@@ -248,12 +248,12 @@ pub fn resolve_effective(
         }
     };
 
-    let source = super::repo_config::repo_config_source_path(cwd);
+    let source = crate::session::config::repo_config::repo_config_source_path(cwd);
     let project_local = match super::project_mcp::load_project_mcp_servers(&source) {
         Ok(servers) if servers.is_empty() => Vec::new(),
         Ok(servers) => {
             let hash = super::project_mcp::fingerprint(&servers);
-            match super::repo_config::is_repo_trusted(&source, None, Some(&hash)) {
+            match crate::session::config::repo_config::is_repo_trusted(&source, None, Some(&hash)) {
                 Ok(true) => servers,
                 Ok(false) => {
                     warn!(

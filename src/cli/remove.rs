@@ -80,7 +80,7 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
     let removed_id = inst.id.clone();
     let removed_title = inst.title.clone();
 
-    let config = crate::session::repo_config::resolve_config_with_repo_or_warn(
+    let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
         profile,
         std::path::Path::new(&inst.project_path),
     );
