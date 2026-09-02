@@ -12,7 +12,11 @@ import {
   type CellRun,
 } from "../lib/liveTermLines";
 import { cursorLineIndex, pointerPaneCell, wheelNotches } from "../lib/liveMouse";
-import { registerMobileKeyboardProxyReceiver, type MobileKeyboardProxyInput } from "../lib/mobileKeyboardProxy";
+import {
+  forwardTerminalBeforeInput,
+  registerMobileKeyboardProxyReceiver,
+  type MobileKeyboardProxyInput,
+} from "../lib/mobileKeyboardProxy";
 import { bracketedPaste, writeClipboard } from "../lib/clipboard";
 import type { LiveFrame, LiveStats } from "../hooks/useLiveTerminal";
 import { useWebSettings } from "../hooks/useWebSettings";
@@ -1751,24 +1755,7 @@ export function MobileLiveTerminal({
     [sendKeys, sendData, typedWordRef],
   );
   const handleBeforeInput = useCallback(
-    (ev: InputEvent) => {
-      switch (ev.inputType) {
-        case "insertText":
-        case "insertLineBreak":
-        case "insertParagraph":
-        case "deleteContentBackward":
-        case "insertFromPaste":
-          ev.preventDefault();
-          handleMobileKeyboardProxyInput({
-            inputType: ev.inputType,
-            data: ev.data,
-            isComposing: ev.isComposing,
-          });
-          break;
-        default:
-          break;
-      }
-    },
+    (ev: InputEvent) => forwardTerminalBeforeInput(ev, handleMobileKeyboardProxyInput),
     [handleMobileKeyboardProxyInput],
   );
   useEffect(() => {
@@ -1785,6 +1772,9 @@ export function MobileLiveTerminal({
       if (seq) {
         e.preventDefault();
         sendData(seq);
+        // Typed text accumulates in the hidden textarea as IME context (see
+        // forwardTerminalBeforeInput); Enter is the safe point to drop it.
+        if (e.key === "Enter" && e.target instanceof HTMLTextAreaElement) e.target.value = "";
         return;
       }
       // Ctrl+Shift+C copies the current terminal selection (the terminal-
@@ -1900,7 +1890,9 @@ export function MobileLiveTerminal({
       // result must not become a run for the next composition to strip.
       if (!rest) typedWordRef.current = run;
       else if (sendKeys(rest) && retroactive) typedWordRef.current = plainRunAfter(run, rest);
-      if (e.currentTarget instanceof HTMLTextAreaElement) e.currentTarget.value = "";
+      // Leave the committed text in the textarea: an IME that re-edits a
+      // committed syllable (delete + reinsert) needs it there for the delete
+      // to surface as a beforeinput. See forwardTerminalBeforeInput.
     },
     [sendKeys, typedWordRef],
   );
