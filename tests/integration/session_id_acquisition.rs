@@ -194,17 +194,34 @@ fn restart_surfaces_a_pinned_fresh_launch_that_dies() {
     // Print the line in red: `capture_pane` captures with `-e`, so an agent
     // whose error is styled (every real one is) would otherwise splice raw SGR
     // sequences into the persisted `last_error`.
-    let agent = temp.path().join("id-taken-agent");
+    let bin = temp.path().join("bin");
+    std::fs::create_dir_all(&bin).expect("create test bin directory");
+    let agent = bin.join("claude");
     std::fs::write(
         &agent,
         "#!/bin/sh\nprintf '\\033[31mError: Session ID is already in use.\\033[0m\\n'\nexit 1\n",
     )
     .expect("write agent");
     std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).expect("chmod agent");
+    std::fs::write(
+        temp.path().join(".profile"),
+        format!("export PATH={}:$PATH\n", bin.display()),
+    )
+    .expect("write test login profile");
+    let path = std::env::join_paths(
+        std::iter::once(bin.clone()).chain(
+            std::env::var_os("PATH")
+                .iter()
+                .flat_map(|value| std::env::split_paths(value)),
+        ),
+    )
+    .expect("join test PATH");
+    let _path = EnvRestore::set("PATH", path);
+    let _shell = EnvRestore::set("SHELL", "/bin/sh");
 
     let mut inst = Instance::new("F1Pinned", workdir.to_str().unwrap());
     inst.tool = "claude".to_string();
-    inst.command = agent.to_string_lossy().to_string();
+    inst.command = "claude".to_string();
     inst.agent_session_id = Some(VALID_CLAUDE_UUID.to_string());
     let session_name = tmux::Session::generate_name(&inst.id, &inst.title);
     let _cleanup = TmuxCleanup(&session_name);
