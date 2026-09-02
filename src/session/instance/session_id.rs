@@ -578,9 +578,57 @@ impl Instance {
         is_existing && !takes_pinning_arm
     }
 
-    pub(super) fn apply_session_flags(&mut self, cmd: &mut String, context: &str) -> bool {
+    fn existing_session_selector(&self, cmd: &str) -> Option<String> {
+        let agent = self.resolved_agent()?;
+        let strategy = agent.session_support.as_ref()?.resume;
+        let words = shell_words::split(cmd).ok()?;
+        if words.first().map(String::as_str) != Some(agent.binary) {
+            return None;
+        }
+        let flag_present = |flag: &str| {
+            words.iter().skip(1).any(|word| {
+                word == flag
+                    || word
+                        .strip_prefix(flag)
+                        .is_some_and(|rest| rest.starts_with('='))
+            })
+        };
+        match strategy {
+            crate::agents::ResumeStrategy::Flag(flag) => {
+                flag_present(flag).then(|| flag.to_string())
+            }
+            crate::agents::ResumeStrategy::FlagPair {
+                existing,
+                new_session,
+            } => [existing, new_session]
+                .into_iter()
+                .find(|flag| flag_present(flag))
+                .map(str::to_string),
+            crate::agents::ResumeStrategy::Subcommand(subcommand) => words
+                .get(1)
+                .is_some_and(|word| word == subcommand)
+                .then(|| subcommand.to_string()),
+        }
+    }
+
+    pub(super) fn apply_session_flags(&mut self, cmd: &mut String, context: &str) -> Result<bool> {
+        if let Some(selector) = self.existing_session_selector(cmd) {
+            let aoe_has_state = self.agent_session_id.is_some()
+                || matches!(
+                    self.resume_intent,
+                    ResumeIntent::Use(_) | ResumeIntent::Fork { .. }
+                );
+            if aoe_has_state {
+                anyhow::bail!(
+                    "{context} command already contains native session selector {selector}; remove it or clear the AoE-managed resume state before launching"
+                );
+            }
+            tracing::info!(target: "session.store", %context, %selector,
+                "command supplies its own native session selector; skipping AoE session injection");
+            return Ok(false);
+        }
         if !self.supports_native_resume() {
-            return false;
+            return Ok(false);
         }
         if let ResumeIntent::Fork { from } = self.resume_intent.clone() {
             let child = self.agent_session_id.clone();
@@ -601,7 +649,7 @@ impl Instance {
                 }
             }
             // A fork is a fresh session, not an in-place resume.
-            return false;
+            return Ok(false);
         }
         // Read before acquisition: the `Use` intent is what marks an id the
         // user pinned rather than one AoE minted or captured.
@@ -640,7 +688,7 @@ impl Instance {
                 let flags = format!("--session {}", shell_escape(&path));
                 splice_subcommand_or_append(cmd, &flags, false);
                 tracing::debug!(target: "session.store", "Added resume flags to {} command: {}", context, flags);
-                return true;
+                return Ok(true);
             }
         }
         let resume_tool = self
@@ -653,7 +701,7 @@ impl Instance {
             cmd,
             context,
         );
-        is_existing && emitted
+        Ok(is_existing && emitted)
     }
 
     /// Persist an ambiguous resume-probe failure without clearing the durable
@@ -933,7 +981,7 @@ mod tests {
             from: "parent-1111-2222-3333-444444444444".to_string(),
         };
         let mut cmd = "claude".to_string();
-        let is_existing = inst.apply_session_flags(&mut cmd, "test");
+        let is_existing = inst.apply_session_flags(&mut cmd, "test").unwrap();
         assert_eq!(
             cmd,
             "claude --resume parent-1111-2222-3333-444444444444 --fork-session --session-id child-5555-6666-7777-888888888888"
@@ -971,7 +1019,7 @@ mod tests {
             });
             let mut cmd = tool.to_string();
             assert_eq!(
-                inst.apply_session_flags(&mut cmd, "test"),
+                inst.apply_session_flags(&mut cmd, "test").unwrap(),
                 resumed,
                 "{tool}"
             );
@@ -993,7 +1041,9 @@ mod tests {
             container_workdir: None,
         });
         let mut automatic_cmd = "copilot".to_string();
-        assert!(!automatic_copilot.apply_session_flags(&mut automatic_cmd, "test"));
+        assert!(!automatic_copilot
+            .apply_session_flags(&mut automatic_cmd, "test")
+            .unwrap());
         assert_eq!(automatic_cmd, "copilot");
 
         let mut host_prime = Instance::new("test", "/tmp/test");
@@ -1001,7 +1051,7 @@ mod tests {
         host_prime.agent_session_id = Some(sid.to_string());
         host_prime.resume_intent = ResumeIntent::Use(sid.to_string());
         let mut cmd = "prime-agent".to_string();
-        assert!(host_prime.apply_session_flags(&mut cmd, "test"));
+        assert!(host_prime.apply_session_flags(&mut cmd, "test").unwrap());
         assert_eq!(cmd, format!("prime-agent --resume {sid}"));
     }
     #[test]
@@ -1042,6 +1092,7 @@ mod tests {
         });
 
         assert_eq!(inst.try_retroactive_capture(), None);
+        std::fs::create_dir_all(inst.sandbox_capture_store_dir().unwrap()).unwrap();
         inst.capture_started_at = Some(std::time::SystemTime::now());
         inst.maybe_start_poller_since(None);
         assert!(inst.session_id_poller.is_some());
@@ -1285,7 +1336,7 @@ pi = "~/.pi-personal"
         assert_eq!(declared.pi_published_session_id(true), None);
 
         let mut cmd = String::from("pi");
-        declared.apply_session_flags(&mut cmd, "test");
+        declared.apply_session_flags(&mut cmd, "test").unwrap();
         assert!(
             !cmd.contains(STALE_ID) && !cmd.contains("--session"),
             "a sidecar from the unmounted default store must not reach the launch line: {cmd:?}"
@@ -1547,12 +1598,12 @@ pi = "~/.pi-personal"
         // Fresh mint (no prior transcript): acquire reports a new session
         // (`--session-id`), so apply_session_flags returns false.
         let mut cmd = String::from("claude");
-        assert!(!inst.apply_session_flags(&mut cmd, "test"));
+        assert!(!inst.apply_session_flags(&mut cmd, "test").unwrap());
         // A user-pinned resume intent reports an existing session
         // unconditionally, so apply_session_flags returns true.
         inst.resume_intent = ResumeIntent::Use("019342ab-1234-7def-8901-abcdef012345".to_string());
         let mut cmd2 = String::from("claude");
-        assert!(inst.apply_session_flags(&mut cmd2, "test"));
+        assert!(inst.apply_session_flags(&mut cmd2, "test").unwrap());
     }
     #[test]
     fn unsupported_context_without_identity_neither_resumes_nor_polls() {
@@ -1563,7 +1614,7 @@ pi = "~/.pi-personal"
         assert_eq!(inst.agent_session_id, None);
 
         let mut cmd = String::from("codex");
-        assert!(!inst.apply_session_flags(&mut cmd, "test"));
+        assert!(!inst.apply_session_flags(&mut cmd, "test").unwrap());
         assert_eq!(cmd, "codex");
 
         inst.capture_started_at = Some(std::time::SystemTime::now());
@@ -2106,5 +2157,78 @@ pi = "~/.pi-personal"
             assert_eq!(unpinnable.acquire_session_id_with(&|_| None), (None, false));
             assert_eq!(unpinnable.agent_session_id, None);
         }
+    }
+    #[test]
+    fn external_session_selectors_skip_aoe_injection_without_managed_state() {
+        for command in [
+            "claude --resume external",
+            "claude --resume=external",
+            "claude --session-id=external",
+        ] {
+            let mut inst = Instance::new("claude", "/tmp/x");
+            inst.tool = "claude".to_string();
+            let mut actual = command.to_string();
+            assert!(!inst.apply_session_flags(&mut actual, "test").unwrap());
+            assert_eq!(actual, command);
+            assert!(inst.agent_session_id.is_none());
+        }
+    }
+
+    #[test]
+    fn external_session_selector_conflicts_with_managed_state() {
+        let sid = "11111111-2222-3333-4444-555555555555";
+        for (stored, intent) in [
+            (Some(sid.to_string()), ResumeIntent::Default),
+            (None, ResumeIntent::Use(sid.to_string())),
+            (
+                Some("child-session".to_string()),
+                ResumeIntent::Fork {
+                    from: sid.to_string(),
+                },
+            ),
+        ] {
+            let mut inst = Instance::new("claude", "/tmp/x");
+            inst.tool = "claude".to_string();
+            inst.agent_session_id = stored;
+            inst.resume_intent = intent;
+            let error = inst
+                .apply_session_flags(&mut "claude --resume external".to_string(), "test")
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("already contains native session selector"));
+            assert!(error
+                .to_string()
+                .contains("clear the AoE-managed resume state"));
+        }
+    }
+
+    #[test]
+    fn codex_selector_requires_subcommand_position_and_resolves_alias() {
+        let mut external = Instance::new("codex", "/tmp/x");
+        external.tool = "codex".to_string();
+        let mut command = "codex resume external".to_string();
+        assert!(!external.apply_session_flags(&mut command, "test").unwrap());
+        assert_eq!(command, "codex resume external");
+
+        let sid = "11111111-2222-3333-4444-555555555555";
+        let mut value_token = Instance::new("codex", "/tmp/x");
+        value_token.tool = "codex".to_string();
+        value_token.resume_intent = ResumeIntent::Use(sid.to_string());
+        let mut command = "codex --model resume".to_string();
+        assert!(value_token
+            .apply_session_flags(&mut command, "test")
+            .unwrap());
+        assert_eq!(command, format!("codex resume {sid} --model resume"));
+
+        const PROFILE: &str = "selector-detect-as-alias";
+        let _registry = install_aliases(PROFILE, &[("work-claude", "claude")]);
+        let mut alias = Instance::new("alias", "/tmp/x");
+        alias.source_profile = PROFILE.to_string();
+        alias.tool = "work-claude".to_string();
+        alias.command = "claude --resume external".to_string();
+        let mut command = alias.command.clone();
+        assert!(!alias.apply_session_flags(&mut command, "test").unwrap());
+        assert!(alias.agent_session_id.is_none());
     }
 }

@@ -163,32 +163,6 @@ pub(crate) fn codex_hooks_json_path_in(home: &Path, host_env: &[String]) -> Path
     home.join(".codex").join("hooks.json")
 }
 
-/// Display-string variant of [`codex_hooks_json_path_for_host_environment`]
-/// used by the TUI consent dialog; falls back to the literal
-/// `~/.codex/hooks.json` string when the home directory cannot be resolved.
-pub(crate) fn codex_hooks_json_path_display_for_host_environment(entries: &[String]) -> String {
-    crate::session::environment::resolve_host_environment_value(entries, "CODEX_HOME")
-        .filter(|v| !v.is_empty())
-        .map(|codex_home| {
-            PathBuf::from(codex_home)
-                .join("hooks.json")
-                .display()
-                .to_string()
-        })
-        .unwrap_or_else(|| {
-            std::env::var("CODEX_HOME")
-                .ok()
-                .filter(|v| !v.is_empty())
-                .map(|codex_home| {
-                    PathBuf::from(codex_home)
-                        .join("hooks.json")
-                        .display()
-                        .to_string()
-                })
-                .unwrap_or_else(|| "~/.codex/hooks.json".to_string())
-        })
-}
-
 /// Resolve the host settings-file path for an agent whose config directory may
 /// be overridden by an environment variable (e.g. Claude's `CLAUDE_CONFIG_DIR`).
 ///
@@ -225,24 +199,6 @@ pub(crate) fn agent_settings_path_in(
         }
     }
     home.join(hook_cfg.settings_rel_path)
-}
-
-/// Display variant of [`agent_settings_path_for_host_environment`] for UI
-/// consent dialogs. Returns the absolute override path when a config-dir env
-/// var is set, otherwise the `~/`-relative default so the displayed path
-/// matches where hooks are actually written.
-pub(crate) fn agent_settings_path_display_for_host_environment(
-    hook_cfg: &crate::agents::AgentHookConfig,
-    host_env: &[String],
-) -> String {
-    if let Some(var) = hook_cfg.config_dir_env_var {
-        if let Some(dir) = resolve_config_dir_override(var, host_env) {
-            if let Some(file) = Path::new(hook_cfg.settings_rel_path).file_name() {
-                return PathBuf::from(dir).join(file).display().to_string();
-            }
-        }
-    }
-    format!("~/{}", hook_cfg.settings_rel_path)
 }
 
 /// Resolve a config-dir override env var, preferring an explicit value in the
@@ -432,9 +388,9 @@ fn hook_command_with_write(write: &str, base: &str, target: HookInstallTarget) -
 /// substring so hooks installed before the trailing marker was added stay
 /// detectable on uninstall.
 ///
-/// Host-side absence is fail-closed: if `aoe` is missing from PATH or too old
-/// to provide `__extract-session-id`, no sidecar is written and no shared
-/// filesystem artifact substitutes for pane identity.
+/// Host-side absence is fail-closed: the launch prefix pins `AOE_HOOK_BIN` to
+/// the current AoE executable. If it is absent or not executable, no sidecar is
+/// written and no shared filesystem artifact substitutes for pane identity.
 fn hook_command_session_id(
     target: HookInstallTarget,
     field: crate::agents::HookIdentityField,
@@ -465,8 +421,9 @@ fn hook_command_session_id_host(field: crate::agents::HookIdentityField) -> Stri
     };
     format!(
         "sh -c '[ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
-         command -v aoe >/dev/null 2>&1 || exit 0; \
-         aoe __extract-session-id --field {field} 2>/dev/null; exit 0 # {AOE_HOOK_MARKER}'"
+         [ -n \"$AOE_HOOK_BIN\" ] || exit 0; \
+         [ -x \"$AOE_HOOK_BIN\" ] || exit 0; \
+         \"$AOE_HOOK_BIN\" __extract-session-id --field {field} 2>/dev/null; exit 0 # {AOE_HOOK_MARKER}'"
     )
 }
 
@@ -619,6 +576,9 @@ pub fn install_cursor_hooks_with_events(
     target: HookInstallTarget,
     events: &[crate::agents::ResolvedHookEvent],
 ) -> Result<()> {
+    if events.is_empty() && !config_path.exists() {
+        return Ok(());
+    }
     with_config_lock(config_path, "json.lock", || {
         let mut config: Value = if config_path.exists() {
             serde_json::from_str(&std::fs::read_to_string(config_path)?)
@@ -722,6 +682,9 @@ pub fn install_hooks(
     events: impl AsRef<[crate::agents::ResolvedHookEvent]>,
     target: HookInstallTarget,
 ) -> Result<()> {
+    if events.as_ref().is_empty() && !settings_path.exists() {
+        return Ok(());
+    }
     with_config_lock(settings_path, "json.lock", || {
         let mut settings: Value = if settings_path.exists() {
             let content = std::fs::read_to_string(settings_path)?;
@@ -1677,6 +1640,9 @@ pub fn install_settl_hooks_with_events(
     target: HookInstallTarget,
     events: &[crate::agents::ResolvedHookEvent],
 ) -> Result<()> {
+    if events.is_empty() && !config_path.exists() {
+        return Ok(());
+    }
     with_config_lock(config_path, "toml.lock", || {
         let mut config: toml::Value = if config_path.exists() {
             let content = std::fs::read_to_string(config_path)?;
@@ -1800,6 +1766,9 @@ pub fn install_kimi_hooks_with_events(
     target: HookInstallTarget,
     events: &[crate::agents::ResolvedHookEvent],
 ) -> Result<()> {
+    if events.is_empty() && !config_path.exists() {
+        return Ok(());
+    }
     with_config_lock(config_path, "toml.lock", || {
         let mut config = if config_path.exists() {
             let content = std::fs::read_to_string(config_path)?;
@@ -1978,6 +1947,9 @@ pub fn install_hermes_hooks_with_events(
     target: HookInstallTarget,
     events: &[crate::agents::ResolvedHookEvent],
 ) -> Result<()> {
+    if events.is_empty() && !config_path.exists() {
+        return Ok(());
+    }
     with_config_lock(config_path, "yaml.lock", || {
         let mut config: serde_yaml::Value = if config_path.exists() {
             let content = std::fs::read_to_string(config_path)?;
@@ -2256,6 +2228,9 @@ pub fn install_kiro_hooks_with_events(
     target: HookInstallTarget,
     events: &[crate::agents::ResolvedHookEvent],
 ) -> Result<()> {
+    if events.is_empty() && !agent_config_path.exists() {
+        return Ok(());
+    }
     with_config_lock(agent_config_path, "json.lock", || {
         let mut config: serde_json::Map<String, Value> = if agent_config_path.exists() {
             let content = std::fs::read_to_string(agent_config_path)?;
@@ -2621,25 +2596,6 @@ mod tests {
         let _guard = EnvGuard::set(&[("CLAUDE_CONFIG_DIR", "/tmp/claude-proc")]);
         let path = agent_settings_path_for_host_environment(claude_hook_config(), &[]).unwrap();
         assert_eq!(path, PathBuf::from("/tmp/claude-proc/settings.json"));
-    }
-
-    #[test]
-    #[serial_test::serial(shell_env)]
-    fn test_agent_settings_path_display_matches_resolution() {
-        let _guard = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
-
-        // Default: tilde-relative, matching how the path is shown elsewhere.
-        assert_eq!(
-            agent_settings_path_display_for_host_environment(claude_hook_config(), &[]),
-            "~/.claude/settings.json"
-        );
-
-        // Override: absolute path the user will actually see hooks land in.
-        let host_env = vec!["CLAUDE_CONFIG_DIR=/home/me/.claude-work".to_string()];
-        assert_eq!(
-            agent_settings_path_display_for_host_environment(claude_hook_config(), &host_env),
-            "/home/me/.claude-work/settings.json"
-        );
     }
 
     #[test]
@@ -5093,12 +5049,16 @@ hooks_auto_accept: false
             crate::agents::HookIdentityField::SessionId,
         );
         assert!(
-            cmd.contains("aoe __extract-session-id"),
-            "host hook should invoke the Rust subcommand, got: {cmd}"
+            cmd.contains(r#""$AOE_HOOK_BIN" __extract-session-id"#),
+            "host hook should invoke the pinned Rust subcommand, got: {cmd}"
         );
         assert!(
-            cmd.contains("command -v aoe"),
-            "host hook should guard on `aoe` being on PATH, got: {cmd}"
+            cmd.contains(r#"[ -n "$AOE_HOOK_BIN" ]"#) && cmd.contains(r#"[ -x "$AOE_HOOK_BIN" ]"#),
+            "host hook should validate the pinned executable, got: {cmd}"
+        );
+        assert!(
+            !cmd.contains("command -v aoe"),
+            "host hook must not depend on a bare aoe in PATH, got: {cmd}"
         );
         assert!(
             cmd.contains(AOE_HOOK_MARKER),

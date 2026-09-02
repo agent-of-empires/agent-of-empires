@@ -105,6 +105,12 @@ pub struct WorkspaceInfo {
     pub cleanup_on_delete: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SandboxStoreTransitionPath {
+    pub(crate) source: PathBuf,
+    pub(crate) destination: PathBuf,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxInfo {
     pub enabled: bool,

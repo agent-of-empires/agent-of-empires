@@ -1,13 +1,16 @@
 //! File operations rooted at a directory descriptor.
 
 use anyhow::{bail, Context, Result};
+use nix::dir::Dir;
 use nix::errno::Errno;
 use nix::fcntl::{open, openat, AtFlags, OFlag};
 use nix::sys::stat::{fstat, fstatat, mkdirat, Mode};
 use nix::unistd::{unlinkat, UnlinkatFlags};
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Component, Path, PathBuf};
 
 pub(crate) struct AnchoredDir {
@@ -17,21 +20,36 @@ pub(crate) struct AnchoredDir {
 
 impl AnchoredDir {
     pub(crate) fn open(path: &Path) -> Result<Self> {
-        let metadata = std::fs::symlink_metadata(path)
-            .with_context(|| format!("inspecting anchored directory {}", path.display()))?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            bail!(
-                "anchored root is a symlink or non-directory: {}",
-                path.display()
-            );
-        }
         let root = path.to_path_buf();
-        let fd = open(
-            path,
+        let mut fd = open(
+            if path.is_absolute() {
+                Path::new("/")
+            } else {
+                Path::new(".")
+            },
             OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
             Mode::empty(),
-        )
-        .with_context(|| format!("opening anchored directory {}", root.display()))?;
+        )?;
+        for component in path.components() {
+            match component {
+                Component::RootDir | Component::CurDir => {}
+                Component::Normal(value) => {
+                    fd = openat(
+                        &fd,
+                        value,
+                        OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
+                        Mode::empty(),
+                    )
+                    .with_context(|| {
+                        format!("opening anchored directory component {}", root.display())
+                    })?;
+                }
+                _ => bail!(
+                    "anchored root contains a non-normal component: {}",
+                    path.display()
+                ),
+            }
+        }
         Ok(Self { root, fd })
     }
 
@@ -74,11 +92,7 @@ impl AnchoredDir {
         Ok(self.root.join(relative))
     }
 
-    pub(crate) fn read_regular(
-        &self,
-        relative: &Path,
-        max_bytes: usize,
-    ) -> Result<Option<Vec<u8>>> {
+    pub(crate) fn open_regular(&self, relative: &Path, max_bytes: usize) -> Result<Option<File>> {
         let (parent, leaf) = self.open_parent(relative)?;
         let fd = match openat(
             &parent,
@@ -91,17 +105,65 @@ impl AnchoredDir {
             Err(error) => return Err(error).context("opening anchored file"),
         };
         let stat = fstat(&fd)?;
-        if (stat.st_mode & nix::libc::S_IFMT) != nix::libc::S_IFREG {
+        if (stat.st_mode & nix::libc::S_IFMT) != nix::libc::S_IFREG
+            || stat.st_size < 0
+            || u64::try_from(stat.st_size).unwrap_or(u64::MAX)
+                > u64::try_from(max_bytes).unwrap_or(u64::MAX)
+        {
             return Ok(None);
         }
+        Ok(Some(File::from(fd)))
+    }
+
+    pub(crate) fn read_regular(
+        &self,
+        relative: &Path,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(file) = self.open_regular(relative, max_bytes)? else {
+            return Ok(None);
+        };
         let mut bytes = Vec::with_capacity(max_bytes.min(4096));
-        File::from(fd)
-            .take(u64::try_from(max_bytes.saturating_add(1)).unwrap_or(u64::MAX))
+        file.take(u64::try_from(max_bytes.saturating_add(1)).unwrap_or(u64::MAX))
             .read_to_end(&mut bytes)?;
         if bytes.len() > max_bytes {
             return Ok(None);
         }
         Ok(Some(bytes))
+    }
+
+    pub(crate) fn read_dir(&self, relative: &Path, max_entries: usize) -> Result<Vec<OsString>> {
+        let fd = self.open_dir(relative)?;
+        let mut dir = Dir::from_fd(fd)?;
+        let mut names = Vec::with_capacity(max_entries.min(64));
+        for entry in dir.iter() {
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let name = entry.file_name().to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            if names.len() == max_entries {
+                break;
+            }
+            names.push(OsString::from_vec(name.to_vec()));
+        }
+        Ok(names)
+    }
+
+    pub(crate) fn regular_modified(
+        &self,
+        relative: &Path,
+    ) -> Result<Option<std::time::SystemTime>> {
+        self.modified(relative, false)
+    }
+
+    pub(crate) fn directory_modified(
+        &self,
+        relative: &Path,
+    ) -> Result<Option<std::time::SystemTime>> {
+        self.modified(relative, true)
     }
 
     pub(crate) fn regular_exists(&self, relative: &Path) -> bool {
@@ -119,6 +181,48 @@ impl AnchoredDir {
             Ok(()) | Err(Errno::ENOENT) => Ok(()),
             Err(error) => Err(error).context("removing anchored file"),
         }
+    }
+
+    fn modified(&self, relative: &Path, directory: bool) -> Result<Option<std::time::SystemTime>> {
+        let fd = if directory {
+            match self.open_dir(relative) {
+                Ok(fd) => fd,
+                Err(error) if missing_or_hostile(&error) => return Ok(None),
+                Err(error) => return Err(error),
+            }
+        } else {
+            let Some(file) = self.open_regular(relative, usize::MAX)? else {
+                return Ok(None);
+            };
+            file.into()
+        };
+        let stat = fstat(&fd)?;
+        let seconds = u64::try_from(stat.st_mtime).unwrap_or(0);
+        let nanos = u32::try_from(stat.st_mtime_nsec)
+            .unwrap_or(0)
+            .min(999_999_999);
+        Ok(Some(
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::new(seconds, nanos),
+        ))
+    }
+
+    fn open_dir(&self, relative: &Path) -> Result<OwnedFd> {
+        let mut current = openat(
+            &self.fd,
+            ".",
+            OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
+            Mode::empty(),
+        )?;
+        for component in normal_components(relative)? {
+            current = openat(
+                &current,
+                component.as_os_str(),
+                OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
+                Mode::empty(),
+            )
+            .context("opening anchored directory component")?;
+        }
+        Ok(current)
     }
 
     fn open_parent(&self, relative: &Path) -> Result<(OwnedFd, std::ffi::OsString)> {
@@ -143,6 +247,12 @@ impl AnchoredDir {
         }
         Ok((current, leaf))
     }
+}
+
+fn missing_or_hostile(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<Errno>()
+        .is_some_and(|errno| matches!(*errno, Errno::ENOENT | Errno::ELOOP | Errno::ENOTDIR))
 }
 
 fn normal_components(path: &Path) -> Result<Vec<std::ffi::OsString>> {
@@ -181,7 +291,23 @@ mod tests {
         );
 
         symlink(outside.path(), root.join("escape")).unwrap();
+        symlink(root.join("safe/id"), root.join("linked-id")).unwrap();
+        let pipe = root.join("pipe");
+        nix::unistd::mkfifo(&pipe, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        use std::os::unix::fs::OpenOptionsExt;
+        let pipe_guard = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(nix::libc::O_NONBLOCK)
+            .open(&pipe)
+            .unwrap();
         assert!(anchored.read_regular(Path::new("escape/id"), 8).is_err());
+        assert_eq!(
+            anchored.read_regular(Path::new("linked-id"), 8).unwrap(),
+            None
+        );
+        assert_eq!(anchored.read_regular(Path::new("pipe"), 8).unwrap(), None);
+        drop(pipe_guard);
         assert!(anchored.ensure_dir(Path::new("escape/child")).is_err());
         assert!(!outside.path().join("child").exists());
     }

@@ -57,32 +57,26 @@ impl HooksInstallDialog {
                     .unwrap_or_default();
                 let profile_home =
                     crate::session::environment::resolve_host_environment_value(&host_env, "HOME")
-                        .map(std::path::PathBuf::from);
-                match hook_cfg.format {
-                    crate::agents::HookFormat::CodexJson => {
-                        needs_codex_trust_note = true;
-                        settings_paths.push(if let Some(home) = profile_home.as_deref() {
-                            crate::hooks::codex_hooks_json_path_in(home, &host_env)
-                                .to_string_lossy()
-                                .into_owned()
-                        } else {
-                            crate::hooks::codex_hooks_json_path_display_for_host_environment(
-                                &host_env,
-                            )
-                        });
-                    }
-                    crate::agents::HookFormat::JsonSettings => {
-                        settings_paths.push(if let Some(home) = profile_home.as_deref() {
-                            crate::hooks::agent_settings_path_in(home, hook_cfg, &host_env)
-                                .to_string_lossy()
-                                .into_owned()
-                        } else {
-                            crate::hooks::agent_settings_path_display_for_host_environment(
-                                hook_cfg, &host_env,
-                            )
-                        });
-                    }
-                }
+                        .map(std::path::PathBuf::from)
+                        .or_else(dirs::home_dir)
+                        .unwrap_or_else(|| std::path::PathBuf::from("~"));
+                let default_config = crate::session::config::SessionConfig::default();
+                let session_config = profile_config
+                    .as_ref()
+                    .map(|config| &config.session)
+                    .unwrap_or(&default_config);
+                needs_codex_trust_note = hook_cfg.format == crate::agents::HookFormat::CodexJson;
+                settings_paths.push(
+                    crate::session::generic_host_config_path_for(
+                        tool_name,
+                        hook_cfg,
+                        &profile_home,
+                        session_config,
+                        &host_env,
+                    )
+                    .to_string_lossy()
+                    .into_owned(),
+                );
                 for event in hook_cfg.events {
                     let label = match event.status {
                         Some(status) => format!("writes \"{}\"", status),
@@ -634,5 +628,37 @@ corp-cursor = "cursor"
 
         assert!(!text.contains("trust these hooks in /hooks"));
         assert!(!text.contains("pane-based status detection"));
+    }
+    #[test]
+    #[serial_test::serial]
+    fn declared_agent_config_root_is_disclosed_for_generic_hooks() {
+        let temp = TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp.path());
+        let claude_root = temp.path().join("claude-custom");
+        let codex_root = temp.path().join("codex-custom");
+        let profile_dir = crate::session::get_profile_dir("declared-hook-roots").unwrap();
+        std::fs::write(
+            profile_dir.join("config.toml"),
+            format!(
+                r#"[session.agent_config_dir]
+claude = "{}"
+codex = "{}"
+"#,
+                claude_root.display(),
+                codex_root.display()
+            ),
+        )
+        .unwrap();
+
+        let claude = HooksInstallDialog::new_for_profile("claude", Some("declared-hook-roots"));
+        assert_eq!(
+            claude.settings_paths,
+            vec![claude_root.join("settings.json").to_string_lossy()]
+        );
+        let codex = HooksInstallDialog::new_for_profile("codex", Some("declared-hook-roots"));
+        assert_eq!(
+            codex.settings_paths,
+            vec![codex_root.join("hooks.json").to_string_lossy()]
+        );
     }
 }

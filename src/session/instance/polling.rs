@@ -9,17 +9,13 @@ const MANAGED_CAPTURE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::
 fn try_acquire_managed_capture_lease(
     backend: crate::agents::SessionCaptureBackend,
     store: &Path,
-    container_workdir: &str,
 ) -> Option<std::fs::File> {
     let lock_dir = crate::session::get_app_dir().ok()?.join("capture-locks");
     std::fs::create_dir_all(&lock_dir).ok()?;
-    let store = crate::session::capture::canonicalize_or_raw(&store.to_string_lossy());
-    let workdir = crate::session::capture::canonicalize_or_raw(container_workdir);
+    let store = std::fs::canonicalize(store).ok()?;
     let mut digest = Sha256::new();
     digest.update(format!("{backend:?}\0"));
     digest.update(store.as_os_str().as_encoded_bytes());
-    digest.update(b"\0");
-    digest.update(workdir.as_os_str().as_encoded_bytes());
     let mut key = String::with_capacity(64);
     for byte in digest.finalize() {
         use std::fmt::Write as _;
@@ -88,9 +84,9 @@ impl Instance {
         let Some(current_store) = self.sandbox_capture_store_dir() else {
             return false;
         };
-        let current_store =
-            crate::session::capture::canonicalize_or_raw(&current_store.to_string_lossy());
-        let current_path = crate::session::capture::canonicalize_or_raw(&self.project_path);
+        let Ok(current_store) = std::fs::canonicalize(current_store) else {
+            return false;
+        };
         let current_profile = self.effective_profile();
         let Ok(mut profiles) = crate::session::list_profiles() else {
             return false;
@@ -105,10 +101,11 @@ impl Instance {
             let Ok(instances) = storage.load() else {
                 return false;
             };
-            for peer in instances {
+            for mut peer in instances {
                 if peer.id == self.id && profile == current_profile {
                     continue;
                 }
+                peer.source_profile = profile.clone();
                 if !peer.is_sandboxed()
                     || peer.archived_at.is_some()
                     || peer.trashed_at.is_some()
@@ -120,13 +117,10 @@ impl Instance {
                 let Some(peer_store) = peer.sandbox_capture_store_dir() else {
                     return false;
                 };
-                let peer_store =
-                    crate::session::capture::canonicalize_or_raw(&peer_store.to_string_lossy());
-                if peer_store != current_store {
-                    continue;
-                }
-                let peer_path = crate::session::capture::canonicalize_or_raw(&peer.project_path);
-                if peer_path == current_path {
+                let Ok(peer_store) = std::fs::canonicalize(peer_store) else {
+                    return false;
+                };
+                if peer_store == current_store {
                     return false;
                 }
             }
@@ -139,6 +133,10 @@ impl Instance {
     }
 
     pub(super) fn maybe_start_poller_since(&mut self, omp_metadata: Option<OmpCaptureMetadata>) {
+        if self.session_id_poller_is_running() {
+            return;
+        }
+        self.session_id_poller = None;
         let Some((capture, context)) = self.resolved_session_support() else {
             return;
         };
@@ -146,34 +144,31 @@ impl Instance {
         if !self.supports_session_poller() {
             return;
         }
-        let managed_lease = if context
-            == crate::agents::SessionCaptureContext::ManagedExclusiveStore
-        {
-            let Some(store) = self.sandbox_capture_store_dir() else {
-                return;
-            };
-            // Lease contention is the common multi-process loser path. Check it
-            // before loading every profile to prove store exclusivity.
-            let Some(lease) =
-                try_acquire_managed_capture_lease(backend, &store, &self.container_workdir())
-            else {
-                self.session_id_poller_retry_after =
-                    Some(std::time::Instant::now() + MANAGED_CAPTURE_RETRY_BACKOFF);
-                tracing::warn!(target: "session.capture", session = %self.id, ?backend,
-                    "Session capture deferred because another process owns this store and workspace");
-                return;
-            };
-            if !self.managed_capture_store_is_exclusive(backend) {
-                self.session_id_poller_retry_after =
-                    Some(std::time::Instant::now() + MANAGED_CAPTURE_RETRY_BACKOFF);
-                tracing::warn!(target: "session.capture", session = %self.id, ?backend,
+        let managed_lease =
+            if context == crate::agents::SessionCaptureContext::ManagedExclusiveStore {
+                let Some(store) = self.sandbox_capture_store_dir() else {
+                    return;
+                };
+                // Lease contention is the common multi-process loser path. Check it
+                // before loading every profile to prove store exclusivity.
+                let Some(lease) = try_acquire_managed_capture_lease(backend, &store) else {
+                    self.session_id_poller_retry_after =
+                        Some(std::time::Instant::now() + MANAGED_CAPTURE_RETRY_BACKOFF);
+                    tracing::warn!(target: "session.capture", session = %self.id, ?backend,
+                    "Session capture deferred because another process owns this store");
+                    return;
+                };
+                if !self.managed_capture_store_is_exclusive(backend) {
+                    self.session_id_poller_retry_after =
+                        Some(std::time::Instant::now() + MANAGED_CAPTURE_RETRY_BACKOFF);
+                    tracing::warn!(target: "session.capture", session = %self.id, ?backend,
                     "Session capture deferred because store ownership is ambiguous");
-                return;
-            }
-            Some(lease)
-        } else {
-            None
-        };
+                    return;
+                }
+                Some(lease)
+            } else {
+                None
+            };
         self.session_id_poller_retry_after = None;
 
         let tmux_session_name = self
@@ -440,11 +435,10 @@ impl Instance {
 
 #[cfg(test)]
 mod tests {
-    use crate::session::{Instance, SandboxInfo};
+    use crate::session::{Instance, SandboxInfo, Status};
 
-    // Restart, stop, and the sid_persist path all tear down through this
-    // helper, so flushing here covers each of them. Restart is the one that
-    // was missed when only `stop` flushed.
+    // Restart, stop, standalone attach, and sid_persist all tear down through
+    // this helper. Restart was missed when only `stop` flushed.
     #[test]
     #[serial_test::serial]
     fn teardown_flushes_the_published_pi_conversation() {
@@ -590,32 +584,111 @@ mod tests {
         assert!(inst.session_id_poller_is_running());
     }
 
+    fn sandboxed_gemini(title: &str, project_path: &str, workdir: &str) -> Instance {
+        let mut inst = Instance::new(title, project_path);
+        inst.tool = "gemini".to_string();
+        inst.status = Status::Running;
+        inst.sandbox_info = Some(SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test-image".to_string(),
+            container_name: format!("test-{}", inst.id),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: Some(workdir.to_string()),
+        });
+        inst
+    }
+
     #[test]
     #[serial_test::serial]
-    fn managed_capture_lease_serializes_store_and_workspace() {
+    fn managed_capture_exclusivity_is_store_based_across_profiles() {
+        let app = tempfile::tempdir().unwrap();
+        let _app_guard = crate::session::test_support::isolate_app_dir_at(app.path());
+        let backend = crate::agents::SessionCaptureBackend::Gemini;
+        let current_profile = "capture-owner-a";
+        let peer_profile = "capture-owner-b";
+        let current_storage = crate::session::Storage::new_unwatched(current_profile).unwrap();
+        let peer_storage = crate::session::Storage::new_unwatched(peer_profile).unwrap();
+
+        let mut current = sandboxed_gemini("current", "/repos/current", "/workspace/current");
+        current.source_profile = current_profile.to_string();
+        current.sandbox_store_generation = 1;
+        let mut peer = sandboxed_gemini("peer", "/repos/peer", "/workspace/peer");
+        peer.source_profile = peer_profile.to_string();
+        peer.sandbox_store_generation = 1;
+        let shared_store = current.sandbox_capture_store_dir().unwrap();
+        assert_eq!(peer.sandbox_capture_store_dir().unwrap(), shared_store);
+        std::fs::create_dir_all(&shared_store).unwrap();
+
+        current_storage
+            .update(|instances, _| {
+                *instances = vec![current.clone()];
+                Ok(())
+            })
+            .unwrap();
+        peer_storage
+            .update(|instances, _| {
+                *instances = vec![peer.clone()];
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            !current.managed_capture_store_is_exclusive(backend),
+            "different rows and workdirs sharing one store are not exclusive"
+        );
+
+        peer.sandbox_store_generation =
+            crate::session::container_config::CURRENT_SANDBOX_STORE_GENERATION;
+        let peer_store = peer.sandbox_capture_store_dir().unwrap();
+        assert_ne!(peer_store, shared_store);
+        std::fs::create_dir_all(&peer_store).unwrap();
+        peer_storage
+            .update(|instances, _| {
+                *instances = vec![peer.clone()];
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            current.managed_capture_store_is_exclusive(backend),
+            "distinct physical stores do not conflict"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn managed_capture_lease_serializes_the_physical_store() {
         let app = tempfile::tempdir().unwrap();
         let _app_guard = crate::session::test_support::isolate_app_dir_at(app.path());
         let store = tempfile::tempdir().unwrap();
+        let other_store = tempfile::tempdir().unwrap();
         let backend = crate::agents::SessionCaptureBackend::Gemini;
         let first =
-            super::try_acquire_managed_capture_lease(backend, store.path(), "/workspace/shared")
-                .expect("first owner");
+            super::try_acquire_managed_capture_lease(backend, store.path()).expect("first owner");
         assert!(
-            super::try_acquire_managed_capture_lease(backend, store.path(), "/workspace/shared",)
-                .is_none(),
-            "a concurrent owner for the same store and workspace must fail closed"
+            super::try_acquire_managed_capture_lease(backend, store.path()).is_none(),
+            "another row using the same store must contend regardless of workspace"
         );
-        let other_workspace =
-            super::try_acquire_managed_capture_lease(backend, store.path(), "/workspace/other")
-                .expect("different workspace");
+        #[cfg(unix)]
+        {
+            let alias = app.path().join("store-alias");
+            std::os::unix::fs::symlink(store.path(), &alias).unwrap();
+            assert!(
+                super::try_acquire_managed_capture_lease(backend, &alias).is_none(),
+                "a symlink to the same physical store must contend"
+            );
+        }
+        assert!(
+            super::try_acquire_managed_capture_lease(backend, &app.path().join("missing"))
+                .is_none(),
+            "an unresolved store identity must fail closed"
+        );
+        let distinct = super::try_acquire_managed_capture_lease(backend, other_store.path())
+            .expect("a distinct store has a distinct lease");
 
         drop(first);
-        assert!(super::try_acquire_managed_capture_lease(
-            backend,
-            store.path(),
-            "/workspace/shared",
-        )
-        .is_some());
-        drop(other_workspace);
+        assert!(super::try_acquire_managed_capture_lease(backend, store.path()).is_some());
+        drop(distinct);
     }
 }

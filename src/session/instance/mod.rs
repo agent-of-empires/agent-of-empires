@@ -68,7 +68,7 @@ pub(crate) use lifecycle::NEWER_GENERATION_BUSY_REASON;
 pub use lifecycle::{LifecycleOperation, LifecycleReservation, LifecycleReservationError};
 pub(crate) use omp::persist_omp_session_to_storage;
 pub use ready::{EnsureReadyError, EnsureReadyOutcome};
-pub(crate) use resume::{should_attempt_resume, ResumeAttemptPolicy};
+pub(crate) use resume::ResumeAttemptPolicy;
 pub(crate) use sid_persist::{persist_session_to_storage, SidPersistOutcome, SidWrite};
 pub use start::{LaunchSidOutcome, StartOutcome};
 pub(crate) use status::PassiveStatusPatch;
@@ -76,15 +76,17 @@ pub use status::{Status, TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR}
 pub(crate) use tmux_session::{
     duplicate_session_error, find_duplicate_session, is_duplicate_session,
 };
-pub(crate) use types::{PiSidecarSource, PriorToolSession, ResumeIntent};
+pub(crate) use types::{
+    PiSidecarSource, PriorToolSession, ResumeIntent, SandboxStoreTransitionPath,
+};
 pub use types::{
     PluginCreateIdempotency, SandboxInfo, TerminalInfo, View, WorkspaceInfo, WorkspaceRepo,
     WorktreeInfo,
 };
 
 // Re-exported so each submodule can reach its siblings through `use super::*`.
-pub(crate) use hooks::sidecar_host_config_path_for;
 use hooks::status_hook_env_prefix;
+pub(crate) use hooks::{generic_host_config_path_for, sidecar_host_config_path_for};
 use launch_command::{
     append_resume_flags, build_fork_flags, shell_stdin_command, splice_subcommand_or_append,
     PreparedLaunch,
@@ -384,6 +386,9 @@ pub struct Instance {
     /// Filesystem generation used by this container's private agent stores.
     #[serde(default, skip_serializing_if = "is_zero_u8")]
     pub(crate) sandbox_store_generation: u8,
+    /// Immutable source and destination pairs while a v027 transition is pending.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) sandbox_store_transition_paths: Vec<SandboxStoreTransitionPath>,
 
     // Paired terminal session
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -1692,6 +1692,39 @@ fn named_volume_for(session_id: &str, container_path: &str) -> String {
 /// `profile` selects which profile's overrides (volumes, mount_ssh, volume_ignores)
 /// are merged on top of the global config. An empty `profile` falls back to the
 /// user's globally configured default profile.
+fn validate_managed_container_environment(
+    environment: &[EnvEntry],
+    active_agent: Option<&crate::agents::AgentDef>,
+    container_home: &str,
+) -> Result<()> {
+    let require_path = |key: &str, expected: &str| -> Result<()> {
+        if let Some(actual) = environment
+            .iter()
+            .find(|entry| entry.key() == key)
+            .map(EnvEntry::value)
+        {
+            if Path::new(actual) != Path::new(expected) {
+                anyhow::bail!(
+                    "sandbox environment sets {key}={actual}, but AoE mounts the managed agent config at {expected}; remove this sandbox environment or per-session override, or set it to {expected}"
+                );
+            }
+        }
+        Ok(())
+    };
+
+    require_path("HOME", container_home)?;
+    if let Some(agent) = active_agent {
+        for &(key, expected) in agent
+            .container_env
+            .iter()
+            .filter(|(key, _)| matches!(*key, "CLAUDE_CONFIG_DIR" | "CURSOR_CONFIG_DIR"))
+        {
+            require_path(key, expected)?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn build_container_config(
     project_path_str: &str,
     sandbox_info: &SandboxInfo,
@@ -1773,6 +1806,7 @@ pub(crate) fn build_container_config(
             value: CONTAINER_HOME.to_string(),
         });
     }
+    validate_managed_container_environment(&environment, active_agent, CONTAINER_HOME)?;
     if !environment.iter().any(|entry| entry.key() == "CODEX_HOME") {
         if let Some(codex_home) = managed_codex_home(
             agent_selection.tool,
@@ -1934,11 +1968,11 @@ pub(crate) fn build_container_config(
                 .iter()
                 .any(|event| event.identity_field.is_some())
         });
-        if status_hooks_enabled || identity_hooks_required {
+        if agent.sidecar_hooks.is_some() || agent.hook_config.is_some() {
             // Sidecar agents (hermes YAML, kiro per-agent JSON) use schemas the
             // generic hook_config path below cannot emit; they install through
             // their SidecarHooks installer at the sandbox config subpath.
-            if agent.sidecar_hooks.is_some() || agent.hook_config.is_some() {
+            if status_hooks_enabled || identity_hooks_required {
                 crate::session::validate_instance_id(instance_id).map_err(|e| {
                     anyhow::anyhow!(
                         "refusing to mount hook directory: AOE_INSTANCE_ID failed validation: {e}"
@@ -1983,63 +2017,58 @@ pub(crate) fn build_container_config(
                         event.status = None;
                     }
                 }
-                if !events.is_empty() {
-                    let config_file =
-                        active_sandbox_config
-                            .as_ref()
-                            .and_then(|(mount, sandbox_dir)| {
-                                let prefix = Path::new(mount.host_rel).join(SANDBOX_SUBDIR);
-                                let relative = Path::new(sidecar.sandbox_config_subpath)
-                                    .strip_prefix(prefix)
-                                    .ok()?;
-                                sidecar
-                                    .selected_agent_hooks
-                                    .as_ref()
-                                    .zip(agent_selection.selected_agent)
-                                    .and_then(|(selected, name)| {
-                                        let agents_dir = sandbox_dir.join(relative.parent()?);
-                                        Some((selected.resolve_config_file)(&agents_dir, name))
-                                    })
-                                    .or_else(|| Some(sandbox_dir.join(relative)))
-                            });
-                    if let Some(config_file) = config_file {
-                        match (sidecar.install)(
-                            &config_file,
-                            crate::hooks::HookInstallTarget::Sandbox,
-                            &events,
-                        ) {
-                            Ok(()) => {
-                                let publishes_identity =
-                                    events.iter().any(|event| event.identity_field.is_some());
-                                identity_publisher_installed |= publishes_identity;
-                                if publishes_identity {
-                                    if let Some((mount, sandbox_dir)) =
-                                        active_sandbox_config.as_ref()
-                                    {
-                                        if let Ok(relative) = config_file.strip_prefix(sandbox_dir)
-                                        {
-                                            identity_publisher_path = Some((
-                                                config_file.clone(),
-                                                Path::new(&agent_config_container_path(
-                                                    mount,
-                                                    CONTAINER_HOME,
-                                                    &environment,
-                                                ))
-                                                .join(relative)
-                                                .to_string_lossy()
-                                                .into_owned(),
-                                            ));
-                                        }
+                let config_file =
+                    active_sandbox_config
+                        .as_ref()
+                        .and_then(|(mount, sandbox_dir)| {
+                            let prefix = Path::new(mount.host_rel).join(SANDBOX_SUBDIR);
+                            let relative = Path::new(sidecar.sandbox_config_subpath)
+                                .strip_prefix(prefix)
+                                .ok()?;
+                            sidecar
+                                .selected_agent_hooks
+                                .as_ref()
+                                .zip(agent_selection.selected_agent)
+                                .and_then(|(selected, name)| {
+                                    let agents_dir = sandbox_dir.join(relative.parent()?);
+                                    Some((selected.resolve_config_file)(&agents_dir, name))
+                                })
+                                .or_else(|| Some(sandbox_dir.join(relative)))
+                        });
+                if let Some(config_file) = config_file {
+                    match (sidecar.install)(
+                        &config_file,
+                        crate::hooks::HookInstallTarget::Sandbox,
+                        &events,
+                    ) {
+                        Ok(()) => {
+                            let publishes_identity =
+                                events.iter().any(|event| event.identity_field.is_some());
+                            identity_publisher_installed |= publishes_identity;
+                            if publishes_identity {
+                                if let Some((mount, sandbox_dir)) = active_sandbox_config.as_ref() {
+                                    if let Ok(relative) = config_file.strip_prefix(sandbox_dir) {
+                                        identity_publisher_path = Some((
+                                            config_file.clone(),
+                                            Path::new(&agent_config_container_path(
+                                                mount,
+                                                CONTAINER_HOME,
+                                                &environment,
+                                            ))
+                                            .join(relative)
+                                            .to_string_lossy()
+                                            .into_owned(),
+                                        ));
                                     }
                                 }
                             }
-                            Err(e) => {
-                                tracing::warn!(target: "session.profile", "Failed to install {} hooks in sandbox: {}", agent.name, e)
-                            }
                         }
-                    } else {
-                        tracing::warn!(target: "session.profile", "No sandbox config mount for {} hooks", agent.name);
+                        Err(e) => {
+                            tracing::warn!(target: "session.profile", "Failed to install {} hooks in sandbox: {}", agent.name, e)
+                        }
                     }
+                } else {
+                    tracing::warn!(target: "session.profile", "No sandbox config mount for {} hooks", agent.name);
                 }
             } else if let Some(hook_cfg) = &agent.hook_config {
                 let mut events = match crate::agents::resolved_hook_events(agent, &profile_config) {
@@ -2055,61 +2084,53 @@ pub(crate) fn build_container_config(
                         event.status = None;
                     }
                 }
-                if !events.is_empty() {
-                    let settings_file =
-                        active_sandbox_config
-                            .as_ref()
-                            .and_then(|(mount, sandbox_dir)| {
-                                Path::new(hook_cfg.settings_rel_path)
-                                    .strip_prefix(mount.host_rel)
-                                    .ok()
-                                    .map(|relative| sandbox_dir.join(relative))
-                            });
-                    if let Some(settings_file) = settings_file {
-                        let result = match hook_cfg.format {
-                            crate::agents::HookFormat::CodexJson
-                            | crate::agents::HookFormat::JsonSettings => {
-                                crate::hooks::install_hooks(
-                                    &settings_file,
-                                    &events,
-                                    crate::hooks::HookInstallTarget::Sandbox,
-                                )
-                            }
-                        };
-                        match result {
-                            Ok(()) => {
-                                let publishes_identity =
-                                    events.iter().any(|event| event.identity_field.is_some());
-                                identity_publisher_installed |= publishes_identity;
-                                if publishes_identity {
-                                    if let Some((mount, sandbox_dir)) =
-                                        active_sandbox_config.as_ref()
-                                    {
-                                        if let Ok(relative) =
-                                            settings_file.strip_prefix(sandbox_dir)
-                                        {
-                                            identity_publisher_path = Some((
-                                                settings_file.clone(),
-                                                Path::new(&agent_config_container_path(
-                                                    mount,
-                                                    CONTAINER_HOME,
-                                                    &environment,
-                                                ))
-                                                .join(relative)
-                                                .to_string_lossy()
-                                                .into_owned(),
-                                            ));
-                                        }
+                let settings_file =
+                    active_sandbox_config
+                        .as_ref()
+                        .and_then(|(mount, sandbox_dir)| {
+                            Path::new(hook_cfg.settings_rel_path)
+                                .strip_prefix(mount.host_rel)
+                                .ok()
+                                .map(|relative| sandbox_dir.join(relative))
+                        });
+                if let Some(settings_file) = settings_file {
+                    let result = match hook_cfg.format {
+                        crate::agents::HookFormat::CodexJson
+                        | crate::agents::HookFormat::JsonSettings => crate::hooks::install_hooks(
+                            &settings_file,
+                            &events,
+                            crate::hooks::HookInstallTarget::Sandbox,
+                        ),
+                    };
+                    match result {
+                        Ok(()) => {
+                            let publishes_identity =
+                                events.iter().any(|event| event.identity_field.is_some());
+                            identity_publisher_installed |= publishes_identity;
+                            if publishes_identity {
+                                if let Some((mount, sandbox_dir)) = active_sandbox_config.as_ref() {
+                                    if let Ok(relative) = settings_file.strip_prefix(sandbox_dir) {
+                                        identity_publisher_path = Some((
+                                            settings_file.clone(),
+                                            Path::new(&agent_config_container_path(
+                                                mount,
+                                                CONTAINER_HOME,
+                                                &environment,
+                                            ))
+                                            .join(relative)
+                                            .to_string_lossy()
+                                            .into_owned(),
+                                        ));
                                     }
                                 }
                             }
-                            Err(e) => {
-                                tracing::warn!(target: "session.profile", "Failed to install hooks in sandbox config: {}", e)
-                            }
                         }
-                    } else {
-                        tracing::warn!(target: "session.profile", "No sandbox config mount for {} hooks", agent.name);
+                        Err(e) => {
+                            tracing::warn!(target: "session.profile", "Failed to install hooks in sandbox config: {}", e)
+                        }
                     }
+                } else {
+                    tracing::warn!(target: "session.profile", "No sandbox config mount for {} hooks", agent.name);
                 }
             }
         }
@@ -4927,7 +4948,7 @@ trust_level = "trusted"
             config.sandbox.environment = vec!["HOME=/alternate-home".to_string()];
         })
         .unwrap();
-        let config = build_container_config(
+        let error = build_container_config(
             project_dir.path().to_str().unwrap(),
             &sandbox_info,
             ContainerAgentSelection::new("cursor", None),
@@ -4936,8 +4957,16 @@ trust_level = "trusted"
             None,
             "",
         )
-        .unwrap();
-        assert!(!config.identity_publisher_installed);
+        .err()
+        .expect("conflicting HOME must be rejected");
+        assert!(error.to_string().contains("HOME=/alternate-home"));
+        assert!(error
+            .to_string()
+            .contains("remove this sandbox environment"));
+        assert!(!temp_home
+            .path()
+            .join(".cursor/sandbox-v2/cursor-home-override")
+            .exists());
     }
 
     // Regression guard for the trap in #958: a sidecar agent (settl TOML,
@@ -6473,5 +6502,134 @@ volume_ignores = ["target"]
             1,
             "a declared root shared by both OpenCode mounts must be copied once"
         );
+    }
+    #[test]
+    fn managed_container_environment_rejects_conflicting_active_roots() {
+        let literal = |key: &str, value: &str| EnvEntry::Literal {
+            key: key.to_string(),
+            value: value.to_string(),
+        };
+        let claude = crate::agents::get_agent("claude");
+        let cursor = crate::agents::get_agent("cursor");
+
+        for (environment, agent, rejected_key) in [
+            (vec![literal("HOME", "/home/user")], claude, "HOME"),
+            (
+                vec![
+                    literal("HOME", "/root"),
+                    literal("CLAUDE_CONFIG_DIR", "/other"),
+                ],
+                claude,
+                "CLAUDE_CONFIG_DIR",
+            ),
+            (
+                vec![
+                    literal("HOME", "/root"),
+                    literal("CURSOR_CONFIG_DIR", "/other"),
+                ],
+                cursor,
+                "CURSOR_CONFIG_DIR",
+            ),
+        ] {
+            let error =
+                validate_managed_container_environment(&environment, agent, "/root").unwrap_err();
+            assert!(error.to_string().contains(rejected_key));
+            assert!(error
+                .to_string()
+                .contains("remove this sandbox environment"));
+        }
+
+        validate_managed_container_environment(
+            &[
+                literal("HOME", "/root"),
+                literal("CLAUDE_CONFIG_DIR", "/root/.claude"),
+            ],
+            claude,
+            "/root",
+        )
+        .unwrap();
+        validate_managed_container_environment(
+            &[
+                literal("HOME", "/root"),
+                literal("CURSOR_CONFIG_DIR", "/other"),
+            ],
+            claude,
+            "/root",
+        )
+        .unwrap();
+    }
+    #[test]
+    #[serial_test::serial]
+    fn sandbox_empty_desired_hooks_remove_stale_aoe_entries() {
+        let (_hook_guard, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let profile = "sandbox-empty-hook-cleanup";
+        let profile_dir = crate::session::get_profile_dir(profile).unwrap();
+        fs::write(
+            profile_dir.join("config.toml"),
+            "[session]
+agent_status_hooks = false
+",
+        )
+        .unwrap();
+
+        let instance_id = "gemini-empty-hook-cleanup";
+        let settings_path = temp_home
+            .path()
+            .join(".gemini")
+            .join(SANDBOX_PRIVATE_SUBDIR)
+            .join(instance_id)
+            .join("settings.json");
+        let events = crate::agents::resolved_hook_events(
+            crate::agents::get_agent("gemini").unwrap(),
+            &crate::session::config::Config::default(),
+        )
+        .unwrap();
+        crate::hooks::install_hooks(
+            &settings_path,
+            &events,
+            crate::hooks::HookInstallTarget::Sandbox,
+        )
+        .unwrap();
+        let mut settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        settings["hooks"]["ForeignEvent"] = serde_json::json!([{
+            "hooks": [{"type": "command", "command": "printf foreign"}]
+        }]);
+        fs::write(
+            &settings_path,
+            serde_json::to_vec_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+        let sandbox_info = super::super::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
+        build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("gemini", None),
+            false,
+            instance_id,
+            None,
+            profile,
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(settings_path).unwrap();
+        assert!(content.contains("printf foreign"));
+        assert!(!content.contains("aoe-hooks"));
     }
 }

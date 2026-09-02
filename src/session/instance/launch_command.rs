@@ -409,7 +409,7 @@ impl Instance {
                 tool_cmd.push_str(flag);
                 self.pi_extension_launched = true;
             }
-            let is_existing = self.apply_session_flags(&mut tool_cmd, "sandboxed");
+            let is_existing = self.apply_session_flags(&mut tool_cmd, "sandboxed")?;
             apply_agent_launch_env(&mut tool_cmd, agent);
 
             let sandbox = self
@@ -556,7 +556,7 @@ impl Instance {
                             apply_yolo_mode(&mut cmd, yolo, false);
                         }
                     }
-                    let is_existing = self.apply_session_flags(&mut cmd, "host agent");
+                    let is_existing = self.apply_session_flags(&mut cmd, "host agent")?;
                     apply_agent_launch_env(&mut cmd, agent);
                     let raw_command = format!("{}{}", env_prefix, cmd);
                     let command = if let Some(plan) = omp_capture_plan.as_ref() {
@@ -586,7 +586,7 @@ impl Instance {
                     apply_yolo_mode(&mut cmd, yolo, false);
                 }
             }
-            let is_existing = self.apply_session_flags(&mut cmd, "host custom");
+            let is_existing = self.apply_session_flags(&mut cmd, "host custom")?;
             apply_agent_launch_env(&mut cmd, agent);
             let raw_command = format!("{}{}", env_prefix, cmd);
             let command = if let Some(plan) = omp_capture_plan.as_ref() {
@@ -1041,7 +1041,7 @@ mod tests {
             from: "parent-1234".to_string(),
         };
         let mut cmd = "codex --some-flag".to_string();
-        inst.apply_session_flags(&mut cmd, "test");
+        inst.apply_session_flags(&mut cmd, "test").unwrap();
         assert_eq!(cmd, "codex fork parent-1234 --some-flag");
     }
 
@@ -1054,7 +1054,7 @@ mod tests {
             from: "parent-9999".to_string(),
         };
         let mut cmd = "opencode".to_string();
-        inst.apply_session_flags(&mut cmd, "test");
+        inst.apply_session_flags(&mut cmd, "test").unwrap();
         assert_eq!(cmd, "opencode --session parent-9999 --fork");
     }
 

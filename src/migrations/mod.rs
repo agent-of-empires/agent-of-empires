@@ -34,13 +34,13 @@ mod v023_clear_structured_container_error;
 mod v024_backfill_detect_as;
 mod v025_reenable_confirm_delete;
 mod v026_repoint_acp_default_agent;
-pub(crate) mod v028_isolate_sandbox_stores;
+pub(crate) mod v027_isolate_sandbox_stores;
 
 use anyhow::Result;
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 28;
+const CURRENT_VERSION: u32 = 27;
 const VERSION_FILE: &str = ".schema_version";
 
 struct Migration {
@@ -181,9 +181,9 @@ const MIGRATIONS: &[Migration] = &[
         run: v026_repoint_acp_default_agent::run,
     },
     Migration {
-        version: 28,
-        name: "isolate_sandbox_stores_v2",
-        run: v028_isolate_sandbox_stores::run,
+        version: 27,
+        name: "isolate_sandbox_stores",
+        run: v027_isolate_sandbox_stores::run,
     },
 ];
 
@@ -211,7 +211,7 @@ pub fn run_migrations() -> Result<()> {
         );
     }
     if current == CURRENT_VERSION {
-        return v028_isolate_sandbox_stores::reconcile_pending();
+        return v027_isolate_sandbox_stores::reconcile_pending();
     }
 
     for migration in MIGRATIONS {

@@ -1,4 +1,4 @@
-//! Migration v028: move shared sandbox stores to the private v2 layout.
+//! Migration v027: move shared sandbox stores to the private v2 layout.
 //!
 //! A live legacy cohort remains readable until it stops. Stopped cohorts are
 //! copied under a global transition lock, synced, atomically published, and
@@ -12,8 +12,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const JOURNAL: &str = ".v028-sandbox-transition.json";
-pub(crate) const LOCK: &str = ".v028-sandbox-transition.lock";
+const JOURNAL: &str = ".v027-sandbox-transition.json";
+pub(crate) const LOCK: &str = ".v027-sandbox-transition.lock";
 
 type RunningProbe<'a> = dyn Fn(&str) -> Result<bool> + 'a;
 
@@ -24,8 +24,7 @@ struct Target {
     id: String,
     shared: PathBuf,
     private: PathBuf,
-    exclude_instance_children: bool,
-    overlay_shared_root: Option<PathBuf>,
+    cleanup_root: PathBuf,
 }
 
 struct Registry {
@@ -36,7 +35,7 @@ struct Registry {
 pub fn run() -> Result<()> {
     let app_dir = crate::session::get_app_dir()?;
     let home = dirs::home_dir().context("home directory unavailable for sandbox migration")?;
-    run_in(&app_dir, &home, super::get_current_version() == 27, &|id| {
+    run_in(&app_dir, &home, &|id| {
         Ok(crate::containers::DockerContainer::from_session_id(id).is_running()?)
     })
 }
@@ -49,7 +48,7 @@ pub(crate) fn reconcile_pending() -> Result<()> {
         return Ok(());
     }
     let home = dirs::home_dir().context("home directory unavailable for sandbox migration")?;
-    run_in(&app_dir, &home, true, &|id| {
+    run_in(&app_dir, &home, &|id| {
         Ok(crate::containers::DockerContainer::from_session_id(id).is_running()?)
     })
 }
@@ -72,8 +71,7 @@ fn transition_may_be_pending(app_dir: &Path) -> Result<bool> {
                     .and_then(Value::as_u64)
                     .unwrap_or(0)
                     < u64::from(crate::session::container_config::CURRENT_SANDBOX_STORE_GENERATION)
-                    || transition_paths(row).is_some()
-                    || row.get("sandbox_store_transition_sources").is_some())
+                    || transition_paths(row).ok().flatten().is_some())
         }) {
             return Ok(true);
         }
@@ -81,12 +79,7 @@ fn transition_may_be_pending(app_dir: &Path) -> Result<bool> {
     Ok(false)
 }
 
-fn run_in(
-    app_dir: &Path,
-    home: &Path,
-    resume_schema_27: bool,
-    is_running: &RunningProbe<'_>,
-) -> Result<()> {
+fn run_in(app_dir: &Path, home: &Path, is_running: &RunningProbe<'_>) -> Result<()> {
     fs::create_dir_all(app_dir)?;
     let _lock = crate::session::acquire_storage_flock(app_dir, LOCK)?;
     let registry_paths = registry_paths(app_dir)?;
@@ -108,18 +101,67 @@ fn run_in(
     match fs::read(&journal) {
         Ok(bytes) => {
             let _: Vec<String> =
-                serde_json::from_slice(&bytes).context("parsing v028 transition journal")?;
+                serde_json::from_slice(&bytes).context("parsing v027 transition journal")?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
     let mut targets = Vec::new();
     let mut affected_rows = BTreeSet::new();
-    let mut all_sandbox_ids = BTreeSet::new();
     let mut known_sources = BTreeSet::new();
     let mut cleanup_roots = BTreeSet::new();
     let mut needs_registry_write = false;
     let mut defer_source_retirement = false;
+    let mut row_ids_by_root: BTreeMap<PathBuf, BTreeSet<std::ffi::OsString>> = BTreeMap::new();
+
+    for registry in &registries {
+        let profile = profile_for_registry(app_dir, &registry.path);
+        let Some(rows) = registry.value.as_array() else {
+            continue;
+        };
+        let config = crate::session::profile_config::resolve_config_or_warn(&profile);
+        for row in rows {
+            if !row
+                .pointer("/sandbox_info/enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let (Some(id), Some(tool)) = (
+                row.get("id").and_then(Value::as_str),
+                row.get("tool").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            if crate::session::validate_instance_id(id).is_err() {
+                continue;
+            }
+            let detect_as = row
+                .get("detect_as")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .or_else(|| config.session.agent_detect_as.get(tool).map(String::as_str));
+            let Some(agent) = crate::agents::get_agent(tool)
+                .or_else(|| detect_as.and_then(crate::agents::get_agent))
+            else {
+                continue;
+            };
+            let declared = config.session.agent_config_dir_for(tool, home);
+            for (source, _) in crate::session::container_config::sandbox_store_migration_paths(
+                agent.name,
+                home,
+                declared.as_deref(),
+                id,
+            )? {
+                let root = fs::canonicalize(&source).unwrap_or(source);
+                row_ids_by_root
+                    .entry(root)
+                    .or_default()
+                    .insert(std::ffi::OsString::from(id));
+            }
+        }
+    }
 
     for (registry_index, registry) in registries.iter_mut().enumerate() {
         let profile = profile_for_registry(app_dir, &registry.path);
@@ -127,13 +169,6 @@ fn run_in(
             continue;
         };
         for (row_index, row) in rows.iter_mut().enumerate() {
-            if row
-                .as_object_mut()
-                .and_then(|object| object.remove("sandbox_store_transition_sources"))
-                .is_some()
-            {
-                needs_registry_write = true;
-            }
             if !row
                 .pointer("/sandbox_info/enabled")
                 .and_then(Value::as_bool)
@@ -150,7 +185,6 @@ fn run_in(
                 continue;
             };
             crate::session::validate_instance_id(&id)?;
-            all_sandbox_ids.insert(std::ffi::OsString::from(&id));
             if generation
                 >= u64::from(crate::session::container_config::CURRENT_SANDBOX_STORE_GENERATION)
             {
@@ -182,7 +216,8 @@ fn run_in(
                 declared.as_deref(),
                 &id,
             )?;
-            let stored_plans = transition_paths(row);
+            let stored_plans = transition_paths(row)
+                .with_context(|| format!("validating v027 transition plan for {id}"))?;
             let stored_private = stored_plans.as_ref().is_some_and(|plans| {
                 plans.iter().all(|(source, _)| {
                     source.file_name().is_some_and(|name| name == id.as_str())
@@ -192,76 +227,41 @@ fn run_in(
                             .is_some_and(|name| name == "sandbox")
                 })
             });
-            let old_private =
-                agent.name == "codex" || (resume_schema_27 && generation == 0) || stored_private;
+            let old_private = agent.name == "codex" || stored_private;
             if old_private {
                 for (shared, _) in &mut fresh_plans {
                     *shared = shared.join(&id);
                 }
             }
-            let mut trusted_sources: BTreeSet<PathBuf> = fresh_plans
-                .iter()
-                .map(|(source, _)| source.clone())
-                .collect();
-            let mut default_plans =
-                crate::session::container_config::sandbox_store_migration_paths(
-                    agent.name, home, None, &id,
-                )?;
-            if old_private {
-                for (source, _) in &mut default_plans {
-                    *source = source.join(&id);
-                }
-            }
-            trusted_sources.extend(default_plans.into_iter().map(|(source, _)| source));
-            trusted_sources = trusted_sources
-                .into_iter()
-                .map(|source| fs::canonicalize(&source).unwrap_or(source))
-                .collect();
             let mut plans = if let Some(stored) = stored_plans.as_ref() {
-                if stored.len() != fresh_plans.len() {
-                    bail!("v028 stored transition plan count changed for {id}");
-                }
-                let mut resumed = Vec::with_capacity(stored.len());
-                for ((source, _), (fresh_source, destination)) in
-                    stored.iter().zip(fresh_plans.iter())
+                if stored.len() != fresh_plans.len()
+                    || stored.iter().zip(&fresh_plans).any(
+                        |((source, destination), (fresh_source, fresh_destination))| {
+                            !same_authorized_path(destination, fresh_destination)
+                                || !same_authorized_path(source, fresh_source)
+                        },
+                    )
                 {
-                    let canonical = fs::canonicalize(source).unwrap_or_else(|_| source.clone());
-                    if trusted_sources.contains(source) || trusted_sources.contains(&canonical) {
-                        resumed.push((source.clone(), destination.clone()));
-                        continue;
-                    }
-                    match fs::symlink_metadata(source) {
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                            // A previous custom root may have been absent when its plan was
-                            // checkpointed. It carries no data and grants no authority: replace
-                            // it with the currently trusted source instead of touching the stale
-                            // absolute path.
-                            resumed.push((fresh_source.clone(), destination.clone()));
-                        }
-                        Ok(_) => bail!(
-                            "v028 stored transition source is outside the expected sandbox roots for {id}: {}",
-                            source.display()
-                        ),
-                        Err(error) => {
-                            return Err(error)
-                                .with_context(|| format!("inspecting {}", source.display()))
-                        }
-                    }
+                    bail!(
+                        "v027 checkpointed transition plan is outside the expected sandbox roots for {id}; restore the previous session.agent_config_dir before retrying"
+                    );
                 }
-                resumed
+                stored.clone()
             } else {
                 fresh_plans
             };
-            for (shared, _) in &mut plans {
+            for (shared, destination) in &mut plans {
                 match fs::symlink_metadata(&*shared) {
                     Ok(metadata) => {
                         if metadata.file_type().is_symlink() || !metadata.is_dir() {
                             bail!(
-                                "v028 source is a symlink or non-directory: {}",
+                                "v027 source is a symlink or non-directory: {}",
                                 shared.display()
                             );
                         }
-                        *shared = fs::canonicalize(&*shared)?;
+                        if stored_plans.is_none() {
+                            *shared = fs::canonicalize(&*shared)?;
+                        }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => {
@@ -269,15 +269,19 @@ fn run_in(
                             .with_context(|| format!("inspecting {}", shared.display()))
                     }
                 }
+                if stored_plans.is_none() {
+                    *destination = resolve_existing_ancestor(destination)
+                        .unwrap_or_else(|| destination.clone());
+                }
             }
-            if old_private {
-                cleanup_roots.extend(
-                    plans
-                        .iter()
-                        .filter_map(|(source, _)| source.parent().map(Path::to_path_buf)),
-                );
-            }
-            if stored_plans.as_ref() != Some(&plans) {
+            cleanup_roots.extend(plans.iter().filter_map(|(source, _)| {
+                if old_private {
+                    source.parent().map(Path::to_path_buf)
+                } else {
+                    Some(source.clone())
+                }
+            }));
+            if stored_plans.is_none() {
                 set_transition_paths(row, &plans);
                 needs_registry_write = true;
             }
@@ -294,18 +298,18 @@ fn run_in(
             }
             affected_rows.insert((registry_index, row_index));
             targets.extend(plans.into_iter().map(|(shared, private)| {
-                let overlay_shared_root =
-                    (resume_schema_27 && old_private && agent.name != "codex")
-                        .then(|| shared.parent().map(Path::to_path_buf))
-                        .flatten();
+                let cleanup_root = if old_private {
+                    shared.parent().unwrap_or(&shared).to_path_buf()
+                } else {
+                    shared.clone()
+                };
                 Target {
                     registry: registry_index,
                     row: row_index,
                     id: id.clone(),
                     shared,
                     private,
-                    exclude_instance_children: !old_private,
-                    overlay_shared_root,
+                    cleanup_root,
                 }
             }));
         }
@@ -343,6 +347,106 @@ fn run_in(
 
     let mut ready_rows = affected_rows.clone();
     let mut pending = Vec::new();
+    let mut blocked_roots = BTreeSet::new();
+    let mut orphan_blocked_roots = BTreeSet::new();
+    let mut orphan_ready_ids = BTreeSet::new();
+    let mut excluded_by_root = BTreeMap::new();
+    let private_roots: BTreeSet<PathBuf> = cohorts
+        .values()
+        .flatten()
+        .filter(|target| target.shared != target.cleanup_root)
+        .map(|target| target.cleanup_root.clone())
+        .collect();
+
+    for root in &cleanup_roots {
+        let mut excluded = BTreeSet::new();
+        if private_roots.contains(root) {
+            excluded = instance_children(root)?;
+            excluded.extend(row_ids_by_root.get(root).into_iter().flatten().cloned());
+            excluded.extend(
+                cohorts
+                    .values()
+                    .flatten()
+                    .filter(|target| &target.cleanup_root == root)
+                    .map(|target| std::ffi::OsString::from(&target.id)),
+            );
+        }
+        excluded_by_root.insert(root.clone(), excluded);
+    }
+
+    // Codex already used per-instance legacy children before this migration.
+    // Preserve an unregistered child independently instead of overlaying it
+    // into a registered peer or deleting it with the parent.
+    for root in &private_roots {
+        let mut row_ids: BTreeSet<std::ffi::OsString> = row_ids_by_root
+            .get(root)
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect();
+        row_ids.extend(
+            cohorts
+                .values()
+                .flatten()
+                .filter(|target| &target.cleanup_root == root)
+                .map(|target| std::ffi::OsString::from(&target.id)),
+        );
+        let destination_parents: BTreeSet<PathBuf> = cohorts
+            .values()
+            .flatten()
+            .filter(|target| &target.cleanup_root == root)
+            .filter_map(|target| target.private.parent().map(Path::to_path_buf))
+            .collect();
+        let Some(destination_parent) = destination_parents
+            .iter()
+            .next()
+            .filter(|_| destination_parents.len() == 1)
+        else {
+            if excluded_by_root
+                .get(root)
+                .is_some_and(|children| children.iter().any(|id| !row_ids.contains(id)))
+            {
+                blocked_roots.insert(root.clone());
+                orphan_blocked_roots.insert(root.clone());
+            }
+            continue;
+        };
+        for orphan in excluded_by_root
+            .get(root)
+            .into_iter()
+            .flatten()
+            .filter(|id| !row_ids.contains(*id))
+        {
+            let id = orphan.to_string_lossy();
+            let source = root.join(orphan);
+            let metadata = fs::symlink_metadata(&source)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() || is_running(&id)? {
+                tracing::warn!(
+                    "v027 preserving ambiguous or live orphan store: {}",
+                    source.display()
+                );
+                blocked_roots.insert(root.clone());
+                orphan_blocked_roots.insert(root.clone());
+                continue;
+            }
+            publish_store(
+                &source,
+                &destination_parent.join(orphan),
+                excluded_by_root
+                    .get(root)
+                    .context("missing orphan cleanup-root exclusions")?,
+                Some(root),
+                false,
+            )?;
+            orphan_ready_ids.insert(id.into_owned());
+        }
+    }
+
+    for target in cohorts.values().flatten() {
+        if orphan_blocked_roots.contains(&target.cleanup_root) {
+            ready_rows.remove(&(target.registry, target.row));
+        }
+    }
 
     for (shared, cohort) in &cohorts {
         let ids: BTreeSet<&str> = cohort.iter().map(|target| target.id.as_str()).collect();
@@ -352,24 +456,30 @@ fn run_in(
         if live {
             for target in cohort {
                 ready_rows.remove(&(target.registry, target.row));
+                blocked_roots.insert(target.cleanup_root.clone());
             }
             pending.push(shared.to_string_lossy().into_owned());
             continue;
         }
-        let excluded = all_sandbox_ids.clone();
         for target in cohort {
+            let excluded = excluded_by_root
+                .get(&target.cleanup_root)
+                .context("missing cleanup-root exclusions")?;
             publish_store(
                 shared,
                 &target.private,
-                &excluded,
-                target.overlay_shared_root.as_deref(),
-                target.exclude_instance_children,
+                excluded,
+                (shared != &target.cleanup_root).then_some(target.cleanup_root.as_path()),
+                shared == &target.cleanup_root,
             )?;
         }
     }
 
-    if defer_source_retirement {
-        ready_rows.clear();
+    for id in orphan_ready_ids {
+        let container = crate::containers::DockerContainer::from_session_id(&id);
+        if container.exists()? {
+            container.remove(false)?;
+        }
     }
 
     // Remove stopped containers only after every store for the row is durable.
@@ -391,49 +501,20 @@ fn run_in(
         }
     }
 
-    // Retire a legacy source only after every related row has a durable private
-    // store and its stopped container has been removed. Retirement deliberately
-    // precedes the generation-2 commit: if AoE crashes during the rename or
-    // deletion, the still-pre-v2 row makes the next run finish the quarantine
-    // cleanup before committing. A committed row never has to trust persisted
-    // absolute paths again.
-    let all_cohorts_ready = cohorts.values().all(|cohort| {
-        cohort
-            .iter()
-            .all(|target| ready_rows.contains(&(target.registry, target.row)))
-    });
-    for shared in &known_sources {
-        if defer_source_retirement {
-            pending.push(shared.to_string_lossy().into_owned());
-            continue;
-        }
-        if cleanup_roots
-            .iter()
-            .any(|root| root != shared && shared.starts_with(root))
-        {
-            continue;
-        }
-        if cleanup_roots.contains(shared) {
-            if all_cohorts_ready {
-                retire_legacy(shared)?;
-            } else {
-                pending.push(shared.to_string_lossy().into_owned());
-            }
-            continue;
-        }
+    for root in &cleanup_roots {
         let related: Vec<&Target> = cohorts
-            .iter()
-            .filter(|(source, _)| *source == shared || source.starts_with(shared))
-            .flat_map(|(_, cohort)| cohort)
+            .values()
+            .flatten()
+            .filter(|target| &target.cleanup_root == root)
             .collect();
         let all_ready = !related.is_empty()
             && related
                 .iter()
                 .all(|target| ready_rows.contains(&(target.registry, target.row)));
-        if all_ready {
-            retire_legacy(shared)?;
+        if !defer_source_retirement && !blocked_roots.contains(root) && all_ready {
+            retire_legacy(root)?;
         } else {
-            pending.push(shared.to_string_lossy().into_owned());
+            pending.push(root.to_string_lossy().into_owned());
         }
     }
 
@@ -472,7 +553,7 @@ fn run_in(
         match fs::remove_file(&journal) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("removing v028 journal"),
+            Err(error) => return Err(error).context("removing v027 journal"),
         }
         sync_parent(&journal)?;
     } else {
@@ -484,17 +565,54 @@ fn run_in(
     Ok(())
 }
 
-fn transition_paths(row: &Value) -> Option<Vec<(PathBuf, PathBuf)>> {
-    let entries = row.get("sandbox_store_transition_paths")?.as_array()?;
-    entries
+fn transition_paths(row: &Value) -> Result<Option<Vec<(PathBuf, PathBuf)>>> {
+    let Some(value) = row.get("sandbox_store_transition_paths") else {
+        return Ok(None);
+    };
+    let entries = value
+        .as_array()
+        .context("sandbox_store_transition_paths must be an array")?;
+    let paths = entries
         .iter()
         .map(|entry| {
-            Some((
-                PathBuf::from(entry.get("source")?.as_str()?),
-                PathBuf::from(entry.get("destination")?.as_str()?),
-            ))
+            let source = entry
+                .get("source")
+                .and_then(Value::as_str)
+                .context("transition source must be a path string")?;
+            let destination = entry
+                .get("destination")
+                .and_then(Value::as_str)
+                .context("transition destination must be a path string")?;
+            if source.is_empty() || destination.is_empty() {
+                bail!("transition paths must not be empty");
+            }
+            Ok((PathBuf::from(source), PathBuf::from(destination)))
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(paths))
+}
+
+fn same_authorized_path(stored: &Path, fresh: &Path) -> bool {
+    stored == fresh
+        || matches!(
+            (resolve_existing_ancestor(stored), resolve_existing_ancestor(fresh)),
+            (Some(stored), Some(fresh)) if stored == fresh
+        )
+}
+
+fn resolve_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut ancestor = path;
+    let mut suffix = Vec::new();
+    loop {
+        if let Ok(mut resolved) = fs::canonicalize(ancestor) {
+            for component in suffix.iter().rev() {
+                resolved.push(component);
+            }
+            return Some(resolved);
+        }
+        suffix.push(ancestor.file_name()?.to_os_string());
+        ancestor = ancestor.parent()?;
+    }
 }
 
 fn set_transition_paths(row: &mut Value, plans: &[(PathBuf, PathBuf)]) {
@@ -516,9 +634,7 @@ fn clear_transition_metadata(row: &mut Value) -> bool {
     let Some(object) = row.as_object_mut() else {
         return false;
     };
-    let removed_paths = object.remove("sandbox_store_transition_paths").is_some();
-    let removed_sources = object.remove("sandbox_store_transition_sources").is_some();
-    removed_paths || removed_sources
+    object.remove("sandbox_store_transition_paths").is_some()
 }
 
 fn mark_current(row: &mut Value, generation: u64, dirty: &mut bool) {
@@ -585,6 +701,33 @@ fn profile_for_registry(app_dir: &Path, path: &Path) -> String {
         .to_string()
 }
 
+fn instance_children(root: &Path) -> Result<BTreeSet<std::ffi::OsString>> {
+    match fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => bail!(
+            "v027 cleanup root is a symlink or non-directory: {}",
+            root.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(error) => return Err(error).with_context(|| format!("inspecting {}", root.display())),
+    }
+    let mut children = BTreeSet::new();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let bytes = name.to_string_lossy();
+        if bytes.len() == 16
+            && bytes
+                .as_bytes()
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+        {
+            children.insert(name);
+        }
+    }
+    Ok(children)
+}
+
 fn publish_store(
     source: &Path,
     destination: &Path,
@@ -598,7 +741,7 @@ fn publish_store(
     let source_exists = match fs::symlink_metadata(source) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => true,
         Ok(_) => bail!(
-            "v028 source is a symlink or non-directory: {}",
+            "v027 source is a symlink or non-directory: {}",
             source.display()
         ),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -613,9 +756,9 @@ fn publish_store(
     let leaf = destination
         .file_name()
         .context("private store has no leaf")?;
-    let stage_leaf = format!(".v028-stage-{}", leaf.to_string_lossy());
+    let stage_leaf = format!(".v027-stage-{}", leaf.to_string_lossy());
     let stage = anchored_parent.path().join(&stage_leaf);
-    let quarantine_leaf = format!(".v028-quarantine-{}", leaf.to_string_lossy());
+    let quarantine_leaf = format!(".v027-quarantine-{}", leaf.to_string_lossy());
     let quarantine = anchored_parent.path().join(&quarantine_leaf);
     remove_tree_no_links(&stage)?;
     remove_tree_no_links(&quarantine)?;
@@ -640,7 +783,7 @@ fn publish_store(
     let destination_exists = match fs::symlink_metadata(destination) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             remove_tree_no_links(&stage)?;
-            bail!("v028 destination is a symlink: {}", destination.display());
+            bail!("v027 destination is a symlink: {}", destination.display());
         }
         Ok(_) => true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -719,18 +862,33 @@ fn copy_tree_from_fd(
         if kind == nix::libc::S_IFLNK {
             let link = readlinkat(&dir, name)?;
             if !relative_symlink_stays_in_root(relative, Path::new(&link)) {
-                bail!("v028 source symlink escapes its sandbox root");
+                tracing::warn!(
+                    "v027 skipping source symlink that escapes its sandbox root: {}",
+                    relative.join(name).display()
+                );
+                continue;
             }
             match fs::symlink_metadata(&target) {
                 Ok(_) if overwrite_newer && source_stat_is_newer(&stat, &target)? => {
                     remove_tree_no_links(&target)?;
                 }
                 Ok(_) if overwrite_newer => continue,
-                Ok(_) => bail!("v028 copy destination already exists: {}", target.display()),
+                Ok(_) => bail!("v027 copy destination already exists: {}", target.display()),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
             std::os::unix::fs::symlink(&link, &target)?;
+            #[cfg(not(target_os = "redox"))]
+            {
+                let target_dir = fs::File::open(destination)?;
+                nix::sys::stat::utimensat(
+                    &target_dir,
+                    name,
+                    &TimeSpec::new(stat.st_atime, stat.st_atime_nsec),
+                    &TimeSpec::new(stat.st_mtime, stat.st_mtime_nsec),
+                    nix::sys::stat::UtimensatFlags::NoFollowSymlink,
+                )?;
+            }
             continue;
         }
         if kind == nix::libc::S_IFDIR {
@@ -749,7 +907,7 @@ fn copy_tree_from_fd(
                     true
                 }
                 Ok(_) => bail!(
-                    "v028 copy destination has conflicting type: {}",
+                    "v027 copy destination has conflicting type: {}",
                     target.display()
                 ),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -771,7 +929,7 @@ fn copy_tree_from_fd(
             )?;
             let opened = fstat(&file)?;
             if (opened.st_mode & nix::libc::S_IFMT) != nix::libc::S_IFREG {
-                bail!("v028 source entry changed type during copy");
+                bail!("v027 source entry changed type during copy");
             }
             let mut input = fs::File::from(file);
             let target_exists = match fs::symlink_metadata(&target) {
@@ -786,7 +944,7 @@ fn copy_tree_from_fd(
                     true
                 }
                 Ok(_) => bail!(
-                    "v028 copy destination has conflicting type: {}",
+                    "v027 copy destination has conflicting type: {}",
                     target.display()
                 ),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -853,7 +1011,10 @@ fn copy_tree_no_links(
         }
         let metadata = fs::symlink_metadata(entry.path())?;
         if metadata.file_type().is_symlink() {
-            continue;
+            bail!(
+                "v027 cannot safely copy source symlink on this platform: {}",
+                entry.path().display()
+            );
         }
         let target = destination.join(entry.file_name());
         if metadata.is_dir() {
@@ -899,12 +1060,12 @@ fn sync_tree(path: &Path) -> Result<()> {
 fn retire_legacy(source: &Path) -> Result<()> {
     let parent = source.parent().context("legacy store has no parent")?;
     let quarantine = parent.join(format!(
-        ".{}.v028-quarantine",
+        ".{}.v027-quarantine",
         source.file_name().unwrap_or_default().to_string_lossy()
     ));
     match fs::symlink_metadata(source) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
-            bail!("v028 legacy source became a symlink: {}", source.display())
+            bail!("v027 legacy source became a symlink: {}", source.display())
         }
         Ok(_) => {
             remove_tree_no_links(&quarantine)?;
@@ -982,19 +1143,16 @@ mod tests {
         fs::create_dir_all(&app).unwrap();
         fs::create_dir_all(home.join(".gemini/sandbox/history")).unwrap();
         fs::write(home.join(".gemini/sandbox/history/id.json"), b"legacy").unwrap();
-        fs::create_dir_all(home.join(".gemini/sandbox/one/history")).unwrap();
-        fs::write(home.join(".gemini/sandbox/one/partial.json"), b"partial").unwrap();
-        fs::write(home.join(".gemini/sandbox/one/history/id.json"), b"legacy").unwrap();
         fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
 
-        run_in(&app, &home, false, &|_| Ok(true)).unwrap();
+        run_in(&app, &home, &|_| Ok(true)).unwrap();
         let pending: Value =
             serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
         assert_eq!(pending[0]["sandbox_store_generation"], 1);
         assert!(app.join(JOURNAL).is_file());
         assert!(home.join(".gemini/sandbox").is_dir());
 
-        run_in(&app, &home, false, &|_| Ok(false)).unwrap();
+        run_in(&app, &home, &|_| Ok(false)).unwrap();
         let committed: Value =
             serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
         assert_eq!(committed[0]["sandbox_store_generation"], 2);
@@ -1002,25 +1160,21 @@ mod tests {
             fs::read(home.join(".gemini/sandbox-v2/one/history/id.json")).unwrap(),
             b"legacy"
         );
-        assert!(!home.join(".gemini/sandbox-v2/one/one").exists());
         assert!(!home.join(".gemini/sandbox").exists());
         assert!(!app.join(JOURNAL).exists());
         assert!(committed[0].get("sandbox_store_transition_paths").is_none());
-        assert!(committed[0]
-            .get("sandbox_store_transition_sources")
-            .is_none());
         assert!(fs::read_dir(home.join(".gemini/sandbox-v2"))
             .unwrap()
             .all(|entry| !entry
                 .unwrap()
                 .file_name()
                 .to_string_lossy()
-                .starts_with(".v028")));
+                .starts_with(".v027")));
     }
 
     #[test]
     #[serial_test::serial]
-    fn pending_cohort_keeps_its_journaled_paths_when_config_changes() {
+    fn pending_cohort_refuses_destination_drift_before_writing_it() {
         let temp = tempfile::tempdir().unwrap();
         let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
         let app = crate::session::get_app_dir().unwrap();
@@ -1031,7 +1185,7 @@ mod tests {
         fs::write(source.join("conversation.json"), b"original").unwrap();
         fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
 
-        run_in(&app, &home, false, &|_| Ok(true)).unwrap();
+        run_in(&app, &home, &|_| Ok(true)).unwrap();
         fs::write(
             app.join("config.toml"),
             format!(
@@ -1041,27 +1195,65 @@ mod tests {
         )
         .unwrap();
 
-        run_in(&app, &home, true, &|_| Ok(true)).unwrap();
-        run_in(&app, &home, true, &|_| Ok(true)).unwrap();
-        assert!(
-            home.join(".gemini/sandbox/conversation.json").is_file(),
-            "a still-live second reconciliation must retain the legacy source"
-        );
-        run_in(&app, &home, true, &|_| Ok(false)).unwrap();
-
+        let changed_destination = temp.path().join("changed-gemini/sandbox-v2/one");
+        let error = run_in(&app, &home, &|_| Ok(false)).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("restore the previous session.agent_config_dir"));
+        assert!(!changed_destination.exists());
         assert_eq!(
-            fs::read(
-                temp.path()
-                    .join("changed-gemini/sandbox-v2/one/conversation.json")
-            )
-            .unwrap(),
+            fs::read(home.join(".gemini/sandbox/conversation.json")).unwrap(),
             b"original"
         );
     }
 
     #[test]
     #[serial_test::serial]
-    fn pending_absent_custom_source_uses_the_current_trusted_path() {
+    fn destination_drift_after_publication_keeps_the_checkpointed_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        let home = dirs::home_dir().unwrap();
+        let custom_a = temp.path().join("custom-a");
+        let custom_b = temp.path().join("custom-b");
+        fs::create_dir_all(custom_a.join("sandbox/one")).unwrap();
+        fs::write(custom_a.join("sandbox/one/data"), b"source").unwrap();
+        fs::write(
+            app.join("config.toml"),
+            format!(
+                "[session.agent_config_dir]\ngemini = \"{}\"\n",
+                custom_a.display()
+            ),
+        )
+        .unwrap();
+        fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
+        run_in(&app, &home, &|_| Ok(true)).unwrap();
+        fs::create_dir_all(custom_a.join("sandbox-v2/one")).unwrap();
+        fs::write(custom_a.join("sandbox-v2/one/data"), b"published").unwrap();
+        fs::write(
+            app.join("config.toml"),
+            format!(
+                "[session.agent_config_dir]\ngemini = \"{}\"\n",
+                custom_b.display()
+            ),
+        )
+        .unwrap();
+
+        let error = run_in(&app, &home, &|_| Ok(false)).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("restore the previous session.agent_config_dir"));
+        assert!(!custom_b.join("sandbox-v2/one").exists());
+        assert_eq!(
+            fs::read(custom_a.join("sandbox-v2/one/data")).unwrap(),
+            b"published"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pending_absent_custom_source_still_refuses_plan_drift() {
         let temp = tempfile::tempdir().unwrap();
         let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
         let app = crate::session::get_app_dir().unwrap();
@@ -1078,7 +1270,7 @@ mod tests {
         .unwrap();
         fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
 
-        run_in(&app, &home, true, &|_| Ok(true)).unwrap();
+        run_in(&app, &home, &|_| Ok(true)).unwrap();
         let checkpoint: Value =
             serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
         assert_eq!(
@@ -1086,11 +1278,8 @@ mod tests {
                 .get("sandbox_store_generation")
                 .and_then(Value::as_u64)
                 .unwrap_or(0),
-            0
+            1
         );
-        assert!(checkpoint[0]
-            .get("sandbox_store_transition_sources")
-            .is_none());
         fs::write(
             app.join("config.toml"),
             format!(
@@ -1099,17 +1288,24 @@ mod tests {
             ),
         )
         .unwrap();
-        run_in(&app, &home, true, &|_| Ok(false)).unwrap();
+        let error = run_in(&app, &home, &|_| Ok(false)).unwrap_err();
 
-        assert!(custom_b.join("sandbox-v2/one").is_dir());
-        assert!(!custom_a.join("sandbox").exists());
-        let committed: Value =
+        assert!(error
+            .to_string()
+            .contains("restore the previous session.agent_config_dir"));
+        assert!(!custom_b.join("sandbox-v2/one").exists());
+        let checkpoint: Value =
             serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
-        assert_eq!(committed[0]["sandbox_store_generation"], 2);
-        assert!(committed[0].get("sandbox_store_transition_paths").is_none());
-        assert!(committed[0]
-            .get("sandbox_store_transition_sources")
-            .is_none());
+        assert_eq!(
+            checkpoint[0]
+                .get("sandbox_store_generation")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            1
+        );
+        assert!(checkpoint[0]
+            .get("sandbox_store_transition_paths")
+            .is_some());
     }
 
     #[test]
@@ -1135,7 +1331,7 @@ gemini = "{}"
         .unwrap();
         fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
 
-        run_in(&app, &home, true, &|_| Ok(true)).unwrap();
+        run_in(&app, &home, &|_| Ok(true)).unwrap();
         fs::write(
             app.join("config.toml"),
             format!(
@@ -1147,106 +1343,15 @@ gemini = "{}"
         )
         .unwrap();
 
-        let error = run_in(&app, &home, true, &|_| Ok(false)).unwrap_err();
+        let error = run_in(&app, &home, &|_| Ok(false)).unwrap_err();
         assert!(error
             .to_string()
-            .contains("outside the expected sandbox roots"));
+            .contains("restore the previous session.agent_config_dir"));
         assert_eq!(
             fs::read(custom_a.join("sandbox/one/data")).unwrap(),
             b"data"
         );
         assert!(!custom_b.join("sandbox-v2/one").exists());
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn schema_27_private_snapshot_merges_later_shared_root_writes() {
-        let temp = tempfile::tempdir().unwrap();
-        let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
-        let app = crate::session::get_app_dir().unwrap();
-        let home = dirs::home_dir().unwrap();
-        let root = home.join(".gemini/sandbox");
-        fs::create_dir_all(root.join("one")).unwrap();
-        fs::write(root.join("one/state"), b"old").unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        fs::write(root.join("state"), b"new").unwrap();
-        fs::write(root.join("after"), b"after").unwrap();
-        fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
-
-        run_in(&app, &home, true, &|_| Ok(false)).unwrap();
-
-        let destination = home.join(".gemini/sandbox-v2/one");
-        assert_eq!(fs::read(destination.join("state")).unwrap(), b"new");
-        assert_eq!(fs::read(destination.join("after")).unwrap(), b"after");
-        assert!(!root.exists());
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn schema_27_staggered_cohorts_do_not_copy_a_committed_peer() {
-        let temp = tempfile::tempdir().unwrap();
-        let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
-        let app = crate::session::get_app_dir().unwrap();
-        let home = dirs::home_dir().unwrap();
-        for id in ["one", "two"] {
-            fs::create_dir_all(home.join(".gemini/sandbox").join(id)).unwrap();
-            fs::write(
-                home.join(".gemini/sandbox").join(id).join("secret"),
-                id.as_bytes(),
-            )
-            .unwrap();
-        }
-        fs::write(
-            app.join("sessions.json"),
-            format!("[{},{}]", row("one"), row("two")),
-        )
-        .unwrap();
-
-        run_in(&app, &home, true, &|id| Ok(id == "two")).unwrap();
-        run_in(&app, &home, true, &|_| Ok(false)).unwrap();
-
-        assert_eq!(
-            fs::read(home.join(".gemini/sandbox-v2/two/secret")).unwrap(),
-            b"two"
-        );
-        assert!(!home.join(".gemini/sandbox-v2/two/one").exists());
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn reconciles_the_already_private_v028_layout_without_copying_peers() {
-        let temp = tempfile::tempdir().unwrap();
-        let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
-        let app = crate::session::get_app_dir().unwrap();
-        let home = dirs::home_dir().unwrap();
-        fs::create_dir_all(&app).unwrap();
-        for (id, contents) in [("one", b"one".as_slice()), ("two", b"two".as_slice())] {
-            let root = home.join(".gemini/sandbox").join(id);
-            fs::create_dir_all(&root).unwrap();
-            fs::write(root.join("conversation.json"), contents).unwrap();
-        }
-        fs::write(
-            app.join("sessions.json"),
-            format!("[{},{}]", row("one"), row("two")),
-        )
-        .unwrap();
-
-        run_in(&app, &home, true, &|_| Ok(true)).unwrap();
-        run_in(&app, &home, true, &|_| Ok(true)).unwrap();
-        assert!(home.join(".gemini/sandbox/one/conversation.json").is_file());
-        run_in(&app, &home, true, &|_| Ok(false)).unwrap();
-
-        assert_eq!(
-            fs::read(home.join(".gemini/sandbox-v2/one/conversation.json")).unwrap(),
-            b"one"
-        );
-        assert_eq!(
-            fs::read(home.join(".gemini/sandbox-v2/two/conversation.json")).unwrap(),
-            b"two"
-        );
-        assert!(!home.join(".gemini/sandbox-v2/one/two").exists());
-        assert!(!home.join(".gemini/sandbox-v2/two/one").exists());
-        assert!(!home.join(".gemini/sandbox").exists());
     }
 
     #[test]
@@ -1266,7 +1371,7 @@ gemini = "{}"
         )
         .unwrap();
 
-        run_in(&app, &home, false, &|_| Ok(false)).unwrap();
+        run_in(&app, &home, &|_| Ok(false)).unwrap();
 
         assert_eq!(
             fs::read(home.join(".codex/sandbox-v2/codex-one/auth.json")).unwrap(),
@@ -1290,8 +1395,8 @@ gemini = "{}"
         fs::write(source.join("legacy"), b"legacy").unwrap();
         fs::create_dir_all(&destination).unwrap();
         fs::write(destination.join("published"), b"published").unwrap();
-        let quarantine = destination.parent().unwrap().join(".v028-quarantine-one");
-        let stage = destination.parent().unwrap().join(".v028-stage-one");
+        let quarantine = destination.parent().unwrap().join(".v027-quarantine-one");
+        let stage = destination.parent().unwrap().join(".v027-stage-one");
         fs::create_dir_all(&quarantine).unwrap();
         fs::create_dir_all(&stage).unwrap();
         fs::write(quarantine.join("secret"), b"secret").unwrap();
@@ -1316,7 +1421,7 @@ gemini = "{}"
         )
         .unwrap();
 
-        run_in(&app, &home, false, &|_| Ok(false)).unwrap();
+        run_in(&app, &home, &|_| Ok(false)).unwrap();
 
         assert!(!destination.join("published").exists());
         assert_eq!(fs::read(destination.join("legacy")).unwrap(), b"legacy");
@@ -1328,7 +1433,6 @@ gemini = "{}"
             serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
         assert_eq!(rows[0]["sandbox_store_generation"], 2);
         assert!(rows[0].get("sandbox_store_transition_paths").is_none());
-        assert!(rows[0].get("sandbox_store_transition_sources").is_none());
     }
 
     #[test]
@@ -1340,7 +1444,7 @@ gemini = "{}"
         let home = dirs::home_dir().unwrap();
         let source = home.join(".gemini/sandbox");
         let destination = home.join(".gemini/sandbox-v2/one");
-        let legacy_quarantine = home.join(".gemini/.sandbox.v028-quarantine");
+        let legacy_quarantine = home.join(".gemini/.sandbox.v027-quarantine");
         fs::create_dir_all(&destination).unwrap();
         fs::write(destination.join("published"), b"published").unwrap();
         fs::create_dir_all(&legacy_quarantine).unwrap();
@@ -1366,7 +1470,7 @@ gemini = "{}"
         )
         .unwrap();
 
-        run_in(&app, &home, false, &|_| Ok(false)).unwrap();
+        run_in(&app, &home, &|_| Ok(false)).unwrap();
 
         assert_eq!(
             fs::read(destination.join("published")).unwrap(),
@@ -1391,8 +1495,8 @@ gemini = "{}"
         let source = home.join(".gemini/sandbox");
         let destination = home.join(".gemini/sandbox-v2/one");
         let parent = destination.parent().unwrap();
-        fs::create_dir_all(parent.join(".v028-stage-one")).unwrap();
-        fs::create_dir_all(parent.join(".v028-quarantine-one")).unwrap();
+        fs::create_dir_all(parent.join(".v027-stage-one")).unwrap();
+        fs::create_dir_all(parent.join(".v027-quarantine-one")).unwrap();
         let row = serde_json::json!({
             "id": "one",
             "tool": "gemini",
@@ -1414,17 +1518,17 @@ gemini = "{}"
         )
         .unwrap();
 
-        run_in(&app, &home, false, &|_| Ok(false)).unwrap();
+        run_in(&app, &home, &|_| Ok(false)).unwrap();
 
         assert!(destination.is_dir());
-        assert!(!parent.join(".v028-stage-one").exists());
-        assert!(!parent.join(".v028-quarantine-one").exists());
+        assert!(!parent.join(".v027-stage-one").exists());
+        assert!(!parent.join(".v027-quarantine-one").exists());
     }
 
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
-    fn rejects_untrusted_persisted_transition_sources() {
+    fn rejects_untrusted_persisted_transition_paths() {
         let temp = tempfile::tempdir().unwrap();
         let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
         let app = crate::session::get_app_dir().unwrap();
@@ -1432,8 +1536,6 @@ gemini = "{}"
         let victim = home.join("documents/sandbox");
         fs::create_dir_all(&victim).unwrap();
         fs::write(victim.join("keep"), b"keep").unwrap();
-        use std::os::unix::fs::MetadataExt;
-        let victim_metadata = fs::symlink_metadata(&victim).unwrap();
         let row = serde_json::json!({
             "id": "one",
             "tool": "gemini",
@@ -1442,11 +1544,6 @@ gemini = "{}"
             "sandbox_store_transition_paths": [{
                 "source": victim,
                 "destination": home.join(".gemini/sandbox-v2/one")
-            }],
-            "sandbox_store_transition_sources": [{
-                "source": fs::canonicalize(&victim).unwrap(),
-                "device": victim_metadata.dev(),
-                "inode": victim_metadata.ino()
             }]
         });
         fs::write(
@@ -1460,7 +1557,7 @@ gemini = "{}"
         )
         .unwrap();
 
-        let error = run_in(&app, &home, false, &|_| Ok(false)).unwrap_err();
+        let error = run_in(&app, &home, &|_| Ok(false)).unwrap_err();
 
         assert!(error
             .to_string()
@@ -1486,11 +1583,6 @@ gemini = "{}"
             "sandbox_store_transition_paths": [{
                 "source": victim,
                 "destination": home.join(".gemini/sandbox-v2/one")
-            }],
-            "sandbox_store_transition_sources": [{
-                "source": victim,
-                "device": 1,
-                "inode": 1
             }]
         });
         fs::write(
@@ -1504,7 +1596,7 @@ gemini = "{}"
         )
         .unwrap();
 
-        run_in(&app, &home, false, &|_| Ok(false)).unwrap();
+        run_in(&app, &home, &|_| Ok(false)).unwrap();
 
         assert_eq!(fs::read(victim.join("keep")).unwrap(), b"keep");
         assert!(!home.join(".gemini/sandbox-v2/one").exists());
@@ -1512,54 +1604,6 @@ gemini = "{}"
         let rows: Value =
             serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
         assert!(rows[0].get("sandbox_store_transition_paths").is_none());
-        assert!(rows[0].get("sandbox_store_transition_sources").is_none());
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn scrubs_obsolete_source_fingerprints_from_ignored_rows() {
-        let temp = tempfile::tempdir().unwrap();
-        let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
-        let app = crate::session::get_app_dir().unwrap();
-        let home = dirs::home_dir().unwrap();
-        let fingerprint = serde_json::json!([{
-            "source": "/tmp/untrusted",
-            "device": 1,
-            "inode": 1
-        }]);
-        let rows = serde_json::json!([
-            {
-                "id": "disabled",
-                "tool": "gemini",
-                "sandbox_info": {"enabled": false},
-                "sandbox_store_transition_sources": fingerprint
-            },
-            {
-                "tool": "gemini",
-                "sandbox_info": {"enabled": true},
-                "sandbox_store_transition_sources": fingerprint
-            },
-            {
-                "id": "missing-tool",
-                "sandbox_info": {"enabled": true},
-                "sandbox_store_transition_sources": fingerprint
-            }
-        ]);
-        fs::write(
-            app.join("sessions.json"),
-            serde_json::to_vec(&rows).unwrap(),
-        )
-        .unwrap();
-
-        run_in(&app, &home, false, &|_| Ok(false)).unwrap();
-
-        let committed: Value =
-            serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
-        assert!(committed
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|row| row.get("sandbox_store_transition_sources").is_none()));
     }
 
     #[test]
@@ -1579,7 +1623,7 @@ gemini = "{}"
         )
         .unwrap();
 
-        run_in(&app, &home, false, &|_| Ok(false)).unwrap();
+        run_in(&app, &home, &|_| Ok(false)).unwrap();
 
         assert_eq!(fs::read(victim.join("keep")).unwrap(), b"keep");
         assert!(!app.join(JOURNAL).exists());
@@ -1587,22 +1631,18 @@ gemini = "{}"
 
     #[test]
     #[serial_test::serial]
-    fn unresolved_rows_and_current_rows_without_provenance_are_not_retired() {
+    fn unresolved_rows_do_not_block_ready_rows_or_retire_the_shared_source() {
         let temp = tempfile::tempdir().unwrap();
         let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
         let app = crate::session::get_app_dir().unwrap();
         let home = dirs::home_dir().unwrap();
         let legacy = home.join(".gemini/sandbox");
-        fs::create_dir_all(legacy.join("unknown")).unwrap();
-        fs::create_dir_all(legacy.join("known")).unwrap();
-        fs::create_dir_all(legacy.join("malformed")).unwrap();
-        fs::write(legacy.join("unknown/keep"), b"keep").unwrap();
-        fs::write(legacy.join("malformed/keep"), b"keep").unwrap();
-        fs::write(legacy.join("known/data"), b"data").unwrap();
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("data"), b"data").unwrap();
         let rows = serde_json::json!([
-            {"id":"unknown","tool":"missing-agent","sandbox_info":{"enabled":true}},
+            {"id":"1111111111111111","tool":"missing-agent","sandbox_info":{"enabled":true}},
             {"tool":"missing-agent","sandbox_info":{"enabled":true}},
-            {"id":"known","tool":"gemini","sandbox_info":{"enabled":true}}
+            {"id":"2222222222222222","tool":"gemini","sandbox_info":{"enabled":true}}
         ]);
         fs::write(
             app.join("sessions.json"),
@@ -1610,18 +1650,24 @@ gemini = "{}"
         )
         .unwrap();
 
-        run_in(&app, &home, true, &|_| Ok(false)).unwrap();
+        run_in(&app, &home, &|_| Ok(false)).unwrap();
 
         let rows: Value =
             serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
         assert!(rows[0].get("sandbox_store_generation").is_none());
-        assert!(rows[2].get("sandbox_store_generation").is_none());
-        assert_eq!(fs::read(legacy.join("unknown/keep")).unwrap(), b"keep");
-        assert_eq!(fs::read(legacy.join("malformed/keep")).unwrap(), b"keep");
+        assert_eq!(rows[2]["sandbox_store_generation"], 2);
+        assert_eq!(
+            fs::read(home.join(".gemini/sandbox-v2/2222222222222222/data")).unwrap(),
+            b"data"
+        );
+        assert!(
+            legacy.exists(),
+            "an unresolved row must protect the shared source"
+        );
 
         let repaired = serde_json::json!([
-            {"id":"unknown","tool":"gemini","sandbox_info":{"enabled":true}},
-            {"id":"malformed","tool":"gemini","sandbox_info":{"enabled":true}},
+            {"id":"1111111111111111","tool":"gemini","sandbox_info":{"enabled":true}},
+            {"id":"3333333333333333","tool":"gemini","sandbox_info":{"enabled":true}},
             rows[2].clone()
         ]);
         fs::write(
@@ -1629,16 +1675,22 @@ gemini = "{}"
             serde_json::to_vec(&repaired).unwrap(),
         )
         .unwrap();
-        run_in(&app, &home, true, &|_| Ok(false)).unwrap();
+        run_in(&app, &home, &|_| Ok(false)).unwrap();
+
         let rows: Value =
             serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
-        assert_eq!(rows[2]["sandbox_store_generation"], 2);
-        assert_eq!(
-            fs::read(home.join(".gemini/sandbox-v2/known/data")).unwrap(),
-            b"data"
-        );
-        assert!(!home.join(".gemini/sandbox-v2/known/unknown").exists());
-        assert!(!home.join(".gemini/sandbox-v2/known/malformed").exists());
+        assert!(rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["sandbox_store_generation"] == 2));
+        for id in ["1111111111111111", "2222222222222222", "3333333333333333"] {
+            assert_eq!(
+                fs::read(home.join(".gemini/sandbox-v2").join(id).join("data")).unwrap(),
+                b"data"
+            );
+        }
+        assert!(!legacy.exists());
     }
 
     #[test]
@@ -1651,21 +1703,148 @@ gemini = "{}"
         let app = crate::session::get_app_dir().unwrap();
         let home = dirs::home_dir().unwrap();
         let external = temp.path().join("external-gemini");
-        fs::create_dir_all(external.join("sandbox/one")).unwrap();
-        fs::write(external.join("sandbox/one/data"), b"data").unwrap();
+        fs::create_dir_all(external.join("sandbox")).unwrap();
+        fs::write(external.join("sandbox/data"), b"data").unwrap();
         symlink(&external, home.join(".gemini")).unwrap();
         fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
 
-        run_in(&app, &home, true, &|_| Ok(true)).unwrap();
-        run_in(&app, &home, true, &|_| Ok(true)).unwrap();
-        assert!(external.join("sandbox/one/data").is_file());
-        run_in(&app, &home, true, &|_| Ok(false)).unwrap();
+        run_in(&app, &home, &|_| Ok(true)).unwrap();
+        run_in(&app, &home, &|_| Ok(true)).unwrap();
+        assert!(external.join("sandbox/data").is_file());
+        run_in(&app, &home, &|_| Ok(false)).unwrap();
 
         assert_eq!(
             fs::read(external.join("sandbox-v2/one/data")).unwrap(),
             b"data"
         );
         assert!(!external.join("sandbox").exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn orphan_store_is_preserved_without_contaminating_a_peer() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        let home = dirs::home_dir().unwrap();
+        let root = home.join(".codex/sandbox");
+        let peer = "1111111111111111";
+        let orphan = "2222222222222222";
+        fs::create_dir_all(root.join(peer)).unwrap();
+        fs::create_dir_all(root.join(orphan)).unwrap();
+        fs::write(root.join(peer).join("peer"), b"peer").unwrap();
+        fs::write(root.join(orphan).join("orphan"), b"orphan").unwrap();
+        fs::write(root.join("common"), b"common").unwrap();
+        fs::write(
+            app.join("sessions.json"),
+            format!(r#"[{{"id":"{peer}","tool":"codex","sandbox_info":{{"enabled":true}}}}]"#),
+        )
+        .unwrap();
+
+        run_in(&app, &home, &|_| Ok(false)).unwrap();
+
+        let destination = home.join(".codex/sandbox-v2");
+        assert_eq!(
+            fs::read(destination.join(peer).join("peer")).unwrap(),
+            b"peer"
+        );
+        assert_eq!(
+            fs::read(destination.join(orphan).join("orphan")).unwrap(),
+            b"orphan"
+        );
+        assert_eq!(
+            fs::read(destination.join(peer).join("common")).unwrap(),
+            b"common"
+        );
+        assert_eq!(
+            fs::read(destination.join(orphan).join("common")).unwrap(),
+            b"common"
+        );
+        assert!(!destination.join(peer).join(orphan).exists());
+        assert!(!root.exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn storage_update_preserves_a_checkpointed_plan() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let mut value = serde_json::to_value(crate::session::Instance::new("one", "/tmp")).unwrap();
+        value["sandbox_store_generation"] = 1.into();
+        value["sandbox_store_transition_paths"] = serde_json::json!([{
+            "source": source,
+            "destination": destination,
+        }]);
+        fs::write(
+            app.join("sessions.json"),
+            serde_json::to_vec(&vec![value]).unwrap(),
+        )
+        .unwrap();
+        let storage = crate::session::Storage::new_for_test_path(
+            "v027-plan-roundtrip",
+            app.join("sessions.json"),
+        );
+
+        storage
+            .update(|instances, _| {
+                instances[0].title = "updated".to_string();
+                Ok(())
+            })
+            .unwrap();
+
+        let written: Value =
+            serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
+        assert_eq!(
+            written[0]["sandbox_store_transition_paths"][0]["source"],
+            serde_json::json!(source)
+        );
+        assert_eq!(
+            written[0]["sandbox_store_transition_paths"][0]["destination"],
+            serde_json::json!(destination)
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn preserves_symlink_mtimes() {
+        use nix::sys::stat::{utimensat, UtimensatFlags};
+        use nix::sys::time::TimeSpec;
+        use std::os::unix::fs::{symlink, MetadataExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("v2/one");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("target"), b"target").unwrap();
+        let link = source.join("link");
+        symlink("target", &link).unwrap();
+        let atime = TimeSpec::new(1_600_000_000, 123_000_000);
+        let mtime = TimeSpec::new(1_600_000_001, 456_000_000);
+        let source_dir = fs::File::open(&source).unwrap();
+        utimensat(
+            &source_dir,
+            "link",
+            &atime,
+            &mtime,
+            UtimensatFlags::NoFollowSymlink,
+        )
+        .unwrap();
+
+        publish_store(&source, &destination, &BTreeSet::new(), None, false).unwrap();
+
+        let copied = fs::symlink_metadata(destination.join("link")).unwrap();
+        assert_eq!(
+            (copied.atime(), copied.atime_nsec()),
+            (atime.tv_sec(), atime.tv_nsec())
+        );
+        assert_eq!(
+            (copied.mtime(), copied.mtime_nsec()),
+            (mtime.tv_sec(), mtime.tv_nsec())
+        );
     }
 
     #[test]
@@ -1684,7 +1863,7 @@ gemini = "{}"
         fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
 
-        run_in(&app, &home, false, &|_| Ok(false)).unwrap();
+        run_in(&app, &home, &|_| Ok(false)).unwrap();
 
         let destination = home.join(".gemini/sandbox-v2/one");
         assert_eq!(
@@ -1708,7 +1887,7 @@ gemini = "{}"
     #[test]
     #[cfg(unix)]
     #[serial_test::serial]
-    fn skips_source_symlinks_and_refuses_destination_symlink() {
+    fn skips_escaping_source_symlinks_and_refuses_destination_symlink() {
         use std::os::unix::fs::{symlink, PermissionsExt};
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");
@@ -1721,11 +1900,8 @@ gemini = "{}"
         fs::set_permissions(source.join("credential"), fs::Permissions::from_mode(0o600)).unwrap();
         symlink(outside.join("secret"), source.join("escape")).unwrap();
         symlink("credential", source.join("credential-link")).unwrap();
-        assert!(publish_store(&source, &destination, &BTreeSet::new(), None, false).is_err());
-        assert!(!destination.exists());
-
-        fs::remove_file(source.join("escape")).unwrap();
         publish_store(&source, &destination, &BTreeSet::new(), None, false).unwrap();
+        assert!(!destination.join("escape").exists());
         assert_eq!(
             fs::read(destination.join("credential-link")).unwrap(),
             b"credential"

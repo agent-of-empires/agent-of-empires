@@ -14,10 +14,9 @@ Docker sandboxing runs your AI coding agents (Claude Code, OpenCode, Mistral Vib
 - Automatic container lifecycle management
 - Full project access via volume mounts
 
-Agent credentials are copied into per-agent `sandbox/` directories and shared
-across containers, so agents authenticate without re-login. These directories
-persist after sessions are deleted; remove one to reset that agent's sandbox
-state.
+Agent credentials are seeded from the host config into a private per-session
+sandbox directory, so agents authenticate without re-login. Containers do not
+share a writable agent store.
 
 ## CLI vs TUI Behavior
 
@@ -164,10 +163,12 @@ Trust does activate the repo's own `.claude/settings.json`, whose
 what holds a session before startup, a pre-trusted workspace runs that file's
 hooks unprompted.
 
-AoE seeds the config it stages for the container. A custom agent whose wrapper
-points the CLI at another directory (one CLI, two accounts) reads a config AoE
-does not stage, so name that directory in `session.agent_config_dir` and mount
-its `sandbox` subdirectory into the container; AoE warns when nothing does.
+AoE seeds the config it stages for the container. For a custom agent whose
+wrapper points the CLI at another directory, set that host root in
+`session.agent_config_dir`. AoE stages a private per-session child and mounts it
+at the agent's canonical container config path. Remove any
+`sandbox.extra_volumes` entry for that path because it would shadow AoE's
+managed mount.
 
 To pre-trust worktrees for host sessions too, see `session.pre_trust_agent_folders`
 in the [configuration guide](configuration.md).

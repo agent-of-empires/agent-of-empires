@@ -50,6 +50,7 @@ impl Instance {
             sandbox_info: None,
             sandbox_store_generation:
                 crate::session::container_config::CURRENT_SANDBOX_STORE_GENERATION,
+            sandbox_store_transition_paths: Vec::new(),
             terminal_info: None,
             agent_session_id: None,
             omp_capture_generation: None,
@@ -220,6 +221,58 @@ impl Instance {
             .first()
             .is_some_and(|executable| executable == agent.binary)
             && !words.iter().any(|word| word == "--")
+    }
+
+    /// Whether this launch shape leaves Claude user hooks enabled.
+    ///
+    /// This is evidence for the identity publisher only. It does not change
+    /// native resume support.
+    pub(crate) fn hook_session_publisher_allowed_by_argv(&self) -> bool {
+        if !self
+            .resolved_agent()
+            .is_some_and(|agent| agent.name == "claude")
+        {
+            return true;
+        }
+        let Ok(mut words) = shell_words::split(self.get_tool_command().trim()) else {
+            return false;
+        };
+        let Ok(extra) = shell_words::split(&self.extra_args) else {
+            return false;
+        };
+        words.extend(extra);
+        if words.iter().any(|word| {
+            matches!(word.as_str(), "--safe-mode" | "--bare")
+                || word.starts_with("--safe-mode=")
+                || word.starts_with("--bare=")
+        }) {
+            return false;
+        }
+
+        let mut setting_sources: Option<Option<&str>> = None;
+        let mut index = 0;
+        while index < words.len() {
+            let word = words[index].as_str();
+            if word == "--setting-sources" {
+                setting_sources = Some(
+                    words
+                        .get(index + 1)
+                        .map(String::as_str)
+                        .filter(|value| !value.starts_with('-')),
+                );
+                index += 2;
+                continue;
+            }
+            if let Some(value) = word.strip_prefix("--setting-sources=") {
+                setting_sources = Some(Some(value));
+            }
+            index += 1;
+        }
+        match setting_sources {
+            None => true,
+            Some(Some(value)) => value.split(',').any(|source| source.trim() == "user"),
+            Some(None) => false,
+        }
     }
 
     pub(super) fn resolved_session_support(
@@ -640,7 +693,10 @@ mod tests {
         );
         assert_eq!(
             status_hook_env_prefix(&inst.effective_profile(), "abc123", inst.resolved_agent()),
-            format!("AOE_PROFILE='{PROFILE}' AOE_INSTANCE_ID='abc123' "),
+            format!(
+                "AOE_PROFILE='{PROFILE}' AOE_INSTANCE_ID='abc123' AOE_HOOK_BIN={} ",
+                shell_escape(&std::env::current_exe().unwrap().to_string_lossy())
+            ),
         );
     }
     #[test]
@@ -711,5 +767,37 @@ mod tests {
         let decoded: Instance = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded.capture_started_at, Some(floor));
         assert!(decoded.retroactive_capture_excludes.contains("stale-sid"));
+    }
+    #[test]
+    fn claude_hook_publisher_proof_respects_hook_disabling_argv() {
+        let cases = [
+            ("", true),
+            ("--model opus", true),
+            ("--setting-sources user", true),
+            ("--setting-sources=project,user", true),
+            ("--safe-mode", false),
+            ("--bare", false),
+            ("--setting-sources project", false),
+            ("--setting-sources=user --setting-sources project", false),
+            (
+                "--setting-sources=project --setting-sources local,user",
+                true,
+            ),
+            ("--setting-sources", false),
+        ];
+        for (args, expected) in cases {
+            let mut inst = Instance::new("claude", "/tmp/x");
+            inst.tool = "claude".to_string();
+            inst.extra_args = args.to_string();
+            assert_eq!(
+                inst.hook_session_publisher_allowed_by_argv(),
+                expected,
+                "args={args:?}"
+            );
+            assert!(
+                inst.supports_native_resume(),
+                "hook-disabling argv must not disable native resume: {args:?}"
+            );
+        }
     }
 }

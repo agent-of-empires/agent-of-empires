@@ -56,7 +56,6 @@ use std::time::Instant;
 use anyhow::Result;
 use fs2::FileExt;
 
-use super::instance::should_attempt_resume;
 use super::{Instance, StartOutcome};
 
 /// File-system claim that the holder is the sole recovery owner for this
@@ -124,8 +123,9 @@ fn recovery_lock_path() -> Result<PathBuf> {
 /// consulted.
 pub fn is_recovery_candidate(inst: &Instance) -> bool {
     let resumable_id = inst
-        .resolved_agent()
-        .is_some_and(|agent| should_attempt_resume(inst.agent_session_id.as_deref(), agent.name));
+        .agent_session_id
+        .as_deref()
+        .is_some_and(super::is_valid_session_id);
     !inst.is_structured()
         && !inst.is_archived()
         && !inst.is_snoozed()

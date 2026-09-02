@@ -79,13 +79,15 @@ pub(crate) use instance::{
     persist_omp_session_to_storage, persist_session_to_storage, PassiveStatusPatch, ResumeIntent,
     SidWrite, NEWER_GENERATION_BUSY_REASON,
 };
+pub(crate) use instance::{
+    generic_host_config_path_for, sidecar_host_config_path_for, ResumeAttemptPolicy,
+};
 pub use instance::{
     is_valid_session_color, DetectionState, EnsureReadyError, EnsureReadyOutcome, Instance,
     LaunchSidOutcome, LifecycleOperation, LifecycleReservation, LifecycleReservationError,
     PluginCreateIdempotency, SandboxInfo, SessionBucket, StartOutcome, Status, TerminalInfo, View,
     WorkspaceInfo, WorkspaceRepo, WorktreeInfo, SESSION_COLORS, TMUX_SESSION_GONE_ERROR,
 };
-pub(crate) use instance::{sidecar_host_config_path_for, ResumeAttemptPolicy};
 #[cfg(test)]
 pub(crate) use move_journal::{
     record as record_move_journal, MoveJournalEntry, MOVE_JOURNAL_VERSION,

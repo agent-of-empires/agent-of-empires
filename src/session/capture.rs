@@ -284,6 +284,7 @@ pub(crate) const MAX_SESSION_ID_LEN: usize = 256;
 
 pub(crate) fn is_valid_session_id(id: &str) -> bool {
     !id.is_empty()
+        && !id.starts_with('-')
         && id.len() <= MAX_SESSION_ID_LEN
         && id
             .bytes()
@@ -769,43 +770,94 @@ fn is_codex_rollout(path: &Path) -> bool {
             .is_some_and(|name| name.ends_with(".jsonl.zst"))
 }
 
-/// Opens a Codex rollout, transparently decoding zstd-compressed files.
-fn open_codex_rollout(path: &Path) -> Result<Box<dyn Read>> {
-    let file = std::fs::File::open(path)?;
-    if path.extension().and_then(|e| e.to_str()) == Some("zst") {
-        Ok(Box::new(zstd::stream::read::Decoder::new(file)?))
+const CODEX_ROLLOUT_MAX_BYTES: usize = 16 * 1024 * 1024;
+const CODEX_METADATA_MAX_BYTES: usize = 64 * 1024;
+const CODEX_SCAN_MAX_DEPTH: usize = 4;
+const CODEX_SCAN_MAX_ENTRIES: usize = 8 * 1024;
+const CODEX_SCAN_MAX_CANDIDATES: usize = 4 * 1024;
+
+fn read_limited_first_line(reader: impl Read, max_bytes: usize) -> Option<String> {
+    let mut bytes = Vec::with_capacity(max_bytes.min(4096));
+    let mut limited = reader.take(max_bytes.saturating_add(1) as u64);
+    std::io::BufRead::read_until(
+        &mut std::io::BufReader::new(&mut limited),
+        b'\n',
+        &mut bytes,
+    )
+    .ok()?;
+    if bytes.len() > max_bytes {
+        return None;
+    }
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn read_codex_metadata(root: &crate::session::AnchoredDir, relative: &Path) -> Option<String> {
+    let file = root
+        .open_regular(relative, CODEX_ROLLOUT_MAX_BYTES)
+        .ok()??;
+    if relative.extension().and_then(|e| e.to_str()) == Some("zst") {
+        let decoder = zstd::stream::read::Decoder::new(file).ok()?;
+        read_limited_first_line(decoder, CODEX_METADATA_MAX_BYTES)
     } else {
-        Ok(Box::new(file))
+        read_limited_first_line(file, CODEX_METADATA_MAX_BYTES)
     }
 }
 
-/// Recursively collect Codex session `.jsonl` files, descending into date-partitioned dirs.
-///
-/// Directories whose names are all ASCII digits (e.g. `2025`, `03`, `06`) are treated as
-/// date components and recursed into. Files ending in `.jsonl` or `.jsonl.zst` are collected as
-/// session entries.
-pub(crate) fn collect_codex_sessions(
-    dir: &Path,
+fn collect_codex_sessions_anchored(
+    root: &crate::session::AnchoredDir,
+    relative: &Path,
+    depth: usize,
+    visited: &mut usize,
     entries: &mut Vec<(PathBuf, std::time::SystemTime)>,
 ) -> Result<()> {
-    for entry in resilient_read_dir(dir)? {
-        let path = entry.path();
-        if path.is_dir() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str.chars().all(|c| c.is_ascii_digit()) {
-                collect_codex_sessions(&path, entries)?;
+    if depth > CODEX_SCAN_MAX_DEPTH || *visited >= CODEX_SCAN_MAX_ENTRIES {
+        return Ok(());
+    }
+    let names = root.read_dir(relative, CODEX_SCAN_MAX_ENTRIES.saturating_sub(*visited))?;
+    for name in names {
+        *visited = visited.saturating_add(1);
+        if *visited > CODEX_SCAN_MAX_ENTRIES || entries.len() >= CODEX_SCAN_MAX_CANDIDATES {
+            break;
+        }
+        let path = relative.join(&name);
+        let numeric = name
+            .to_str()
+            .is_some_and(|name| !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_digit()));
+        if numeric && depth < CODEX_SCAN_MAX_DEPTH {
+            if root.directory_modified(&path).ok().flatten().is_some() {
+                let _ = collect_codex_sessions_anchored(root, &path, depth + 1, visited, entries);
             }
         } else if is_codex_rollout(&path) {
-            let modified = entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            entries.push((path, modified));
+            if let Some(modified) = root.regular_modified(&path).ok().flatten() {
+                entries.push((path, modified));
+            }
         }
     }
     Ok(())
 }
+
+#[cfg(test)]
+fn collect_codex_sessions(
+    dir: &Path,
+    entries: &mut Vec<(PathBuf, std::time::SystemTime)>,
+) -> Result<()> {
+    let root = crate::session::AnchoredDir::open(dir)?;
+    let mut relative_entries = Vec::new();
+    collect_codex_sessions_anchored(&root, Path::new(""), 0, &mut 0, &mut relative_entries)?;
+    entries.extend(
+        relative_entries
+            .into_iter()
+            .map(|(relative, modified)| (dir.join(relative), modified)),
+    );
+    Ok(())
+}
+
 /// Poll the mounted Codex store for a post-launch rollout whose CWD matches the container.
 pub(crate) fn codex_poll_fn_sandboxed_store(
     store: PathBuf,
@@ -815,23 +867,22 @@ pub(crate) fn codex_poll_fn_sandboxed_store(
     extra_excludes: HashSet<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let sessions_dir = store.join("sessions");
+        let root = crate::session::AnchoredDir::open(&store).ok()?;
+        let sessions = Path::new("sessions");
+        root.directory_modified(sessions).ok().flatten()?;
         let mut entries = Vec::new();
-        collect_codex_sessions(&sessions_dir, &mut entries).ok()?;
+        collect_codex_sessions_anchored(&root, sessions, 0, &mut 0, &mut entries).ok()?;
         entries.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
         let exclusion = compose_exclusion(&instance_id, &extra_excludes);
-        entries.into_iter().find_map(|(path, modified)| {
+        entries.into_iter().find_map(|(relative, modified)| {
             if modified <= capture_floor {
                 return None;
             }
-            let id = extract_codex_uuid_from_filename(&path)?;
+            let id = extract_codex_uuid_from_filename(&relative)?;
             if exclusion.contains(&id) {
                 return None;
             }
-            let reader = open_codex_rollout(&path).ok()?;
-            let first_line = std::io::BufRead::lines(std::io::BufReader::new(reader))
-                .next()?
-                .ok()?;
+            let first_line = read_codex_metadata(&root, &relative)?;
             (parse_codex_cwd_from_json(&first_line, &id).as_deref() == Some(container_cwd.as_str()))
                 .then_some(id)
                 .and_then(validated_session_id)
@@ -853,25 +904,26 @@ pub(crate) fn extract_gemini_project_hash_from_file(path: &std::path::Path) -> O
     extract_gemini_fields(path).and_then(|(_, hash)| hash)
 }
 
+const GEMINI_SESSION_MAX_BYTES: usize = 8 * 1024 * 1024;
+const GEMINI_METADATA_MAX_BYTES: usize = 128 * 1024;
+const GEMINI_SCAN_MAX_CANDIDATES: usize = 4 * 1024;
+const GEMINI_PROJECT_HASH_MAX_BYTES: usize = 128;
+
 /// Parse the metadata of a Gemini session file (already in memory).
-///
-/// Handles both legacy single-object `.json` files (whole content is one object)
-/// and current line-delimited `.jsonl` files (the metadata header is the first
-/// line, with subsequent lines holding individual conversation records). Tries
-/// to parse the whole content first, falling back to just the first line.
-///
-/// Shared by the host scanner and the container scanner, which receives the
-/// metadata line via `docker exec` rather than a direct filesystem read.
-/// Returns `(sessionId, projectHash)`.
 fn parse_gemini_session_json(content: &str) -> Option<(Option<String>, Option<String>)> {
+    if content.len() > GEMINI_SESSION_MAX_BYTES {
+        return None;
+    }
     let extract = |v: &serde_json::Value| {
         let session_id = v
             .get("sessionId")
             .and_then(|x| x.as_str())
+            .filter(|value| value.len() <= MAX_SESSION_ID_LEN)
             .map(String::from);
         let project_hash = v
             .get("projectHash")
             .and_then(|x| x.as_str())
+            .filter(|value| value.len() <= GEMINI_PROJECT_HASH_MAX_BYTES)
             .map(String::from);
         (session_id, project_hash)
     };
@@ -879,19 +931,38 @@ fn parse_gemini_session_json(content: &str) -> Option<(Option<String>, Option<St
         return Some(extract(&parsed));
     }
     let first_line = content.lines().next()?;
+    if first_line.len() > GEMINI_METADATA_MAX_BYTES {
+        return None;
+    }
     let parsed: serde_json::Value = serde_json::from_str(first_line).ok()?;
     Some(extract(&parsed))
 }
 
-/// Read a Gemini session file once and return both sessionId and projectHash.
-/// Falls back to filename stem for sessionId if the JSON field is absent.
-fn extract_gemini_fields(path: &std::path::Path) -> Option<(Option<String>, Option<String>)> {
-    let content = std::fs::read_to_string(path).ok()?;
+fn extract_gemini_fields_anchored(
+    root: &crate::session::AnchoredDir,
+    relative: &Path,
+) -> Option<(Option<String>, Option<String>)> {
+    let content = root
+        .read_regular(relative, GEMINI_SESSION_MAX_BYTES)
+        .ok()??;
+    let content = String::from_utf8(content).ok()?;
     let (session_id, project_hash) = parse_gemini_session_json(&content)?;
-    let session_id =
-        session_id.or_else(|| path.file_stem().and_then(|s| s.to_str()).map(String::from));
+    let session_id = session_id.or_else(|| {
+        relative
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .filter(|value| value.len() <= MAX_SESSION_ID_LEN)
+            .map(String::from)
+    });
     Some((session_id, project_hash))
 }
+
+#[cfg(test)]
+fn extract_gemini_fields(path: &std::path::Path) -> Option<(Option<String>, Option<String>)> {
+    let parent = crate::session::AnchoredDir::open(path.parent()?).ok()?;
+    extract_gemini_fields_anchored(&parent, Path::new(path.file_name()?))
+}
+
 /// Poll the mounted Gemini store for a post-launch chat in the exact project-hash directory.
 pub(crate) fn gemini_poll_fn_sandboxed_store(
     store: PathBuf,
@@ -907,12 +978,15 @@ pub(crate) fn gemini_poll_fn_sandboxed_store(
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     move || {
-        let chats = store.join("tmp").join(&expected_hash).join("chats");
-        let mut candidates = resilient_read_dir(&chats)
+        let root = crate::session::AnchoredDir::open(&store).ok()?;
+        let chats = Path::new("tmp").join(&expected_hash).join("chats");
+        let mut candidates = root
+            .read_dir(&chats, GEMINI_SCAN_MAX_CANDIDATES)
             .ok()?
-            .filter_map(|entry| {
-                let path = entry.path();
-                let modified = entry.metadata().ok()?.modified().ok()?;
+            .into_iter()
+            .filter_map(|name| {
+                let path = chats.join(name);
+                let modified = root.regular_modified(&path).ok().flatten()?;
                 let valid_name = path
                     .file_name()
                     .and_then(|name| name.to_str())
@@ -928,7 +1002,7 @@ pub(crate) fn gemini_poll_fn_sandboxed_store(
         candidates.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
         let exclusion = compose_exclusion(&instance_id, &extra_excludes);
         candidates.into_iter().find_map(|(path, _)| {
-            let (id, project_hash) = extract_gemini_fields(&path)?;
+            let (id, project_hash) = extract_gemini_fields_anchored(&root, &path)?;
             let id = id?;
             (project_hash.as_deref() == Some(expected_hash.as_str()) && !exclusion.contains(&id))
                 .then_some(id)
@@ -945,22 +1019,34 @@ struct KimiSession {
     work_dir: String,
 }
 
-/// Parse Kimi's append-only session index (`session_index.jsonl`) into the set
-/// of live sessions. Each line is a JSON object: either a session record
-/// (`{sessionId, sessionDir, workDir}`) or a deletion tombstone
-/// (`{sessionId, deleted: true}`). Later lines win, and a tombstone removes an
-/// earlier record, mirroring Kimi's own `readSessionIndex`. Malformed lines are
-/// skipped rather than failing the whole read.
-fn read_kimi_session_index(index_path: &Path) -> Result<Vec<KimiSession>> {
-    if !index_path.exists() {
-        anyhow::bail!("Kimi session index not found at {}", index_path.display());
-    }
-    let content = std::fs::read_to_string(index_path)
-        .with_context(|| format!("Failed to read {}", index_path.display()))?;
+const KIMI_INDEX_MAX_BYTES: usize = 8 * 1024 * 1024;
+const KIMI_INDEX_MAX_LINE_BYTES: usize = 64 * 1024;
+const KIMI_INDEX_MAX_LINES: usize = 32 * 1024;
+const KIMI_INDEX_MAX_LIVE_SESSIONS: usize = 8 * 1024;
+const KIMI_PATH_MAX_BYTES: usize = 16 * 1024;
+
+fn read_kimi_session_index_anchored(
+    root: &crate::session::AnchoredDir,
+    relative: &Path,
+) -> Result<Vec<KimiSession>> {
+    let content = root
+        .read_regular(relative, KIMI_INDEX_MAX_BYTES)?
+        .ok_or_else(|| {
+            anyhow::anyhow!("Kimi session index is missing or not a bounded regular file")
+        })?;
 
     let mut live: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
-    for line in content.lines() {
+    for (index, raw_line) in content.split(|byte| *byte == b'\n').enumerate() {
+        if index >= KIMI_INDEX_MAX_LINES {
+            anyhow::bail!("Kimi session index exceeds the line limit");
+        }
+        if raw_line.len() > KIMI_INDEX_MAX_LINE_BYTES {
+            continue;
+        }
+        let Ok(line) = std::str::from_utf8(raw_line) else {
+            continue;
+        };
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -968,7 +1054,11 @@ fn read_kimi_session_index(index_path: &Path) -> Result<Vec<KimiSession>> {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        let Some(session_id) = value.get("sessionId").and_then(|v| v.as_str()) else {
+        let Some(session_id) = value
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .filter(|value| value.len() <= MAX_SESSION_ID_LEN)
+        else {
             continue;
         };
         if value.get("deleted").and_then(|v| v.as_bool()) == Some(true) {
@@ -976,11 +1066,20 @@ fn read_kimi_session_index(index_path: &Path) -> Result<Vec<KimiSession>> {
             continue;
         }
         let (Some(session_dir), Some(work_dir)) = (
-            value.get("sessionDir").and_then(|v| v.as_str()),
-            value.get("workDir").and_then(|v| v.as_str()),
+            value
+                .get("sessionDir")
+                .and_then(|v| v.as_str())
+                .filter(|value| value.len() <= KIMI_PATH_MAX_BYTES),
+            value
+                .get("workDir")
+                .and_then(|v| v.as_str())
+                .filter(|value| value.len() <= KIMI_PATH_MAX_BYTES),
         ) else {
             continue;
         };
+        if !live.contains_key(session_id) && live.len() >= KIMI_INDEX_MAX_LIVE_SESSIONS {
+            continue;
+        }
         live.insert(
             session_id.to_string(),
             (session_dir.to_string(), work_dir.to_string()),
@@ -997,6 +1096,19 @@ fn read_kimi_session_index(index_path: &Path) -> Result<Vec<KimiSession>> {
         .collect())
 }
 
+#[cfg(test)]
+fn read_kimi_session_index(index_path: &Path) -> Result<Vec<KimiSession>> {
+    let parent = crate::session::AnchoredDir::open(
+        index_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Kimi index has no parent"))?,
+    )?;
+    read_kimi_session_index_anchored(
+        &parent,
+        Path::new(index_path.file_name().unwrap_or_default()),
+    )
+}
+
 /// Strict launch-time floor. Timestamp uncertainty fails closed rather than
 /// admitting a transcript that existed before this pane launched.
 const KIMI_MTIME_FLOOR_SLACK_MS: f64 = 0.0;
@@ -1011,8 +1123,10 @@ pub(crate) fn kimi_poll_fn_sandboxed_store(
     extra_excludes: HashSet<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
+        let root = crate::session::AnchoredDir::open(&store).ok()?;
         let exclusion = compose_exclusion(&instance_id, &extra_excludes);
-        let sessions = read_kimi_session_index(&store.join("session_index.jsonl")).ok()?;
+        let sessions =
+            read_kimi_session_index_anchored(&root, Path::new("session_index.jsonl")).ok()?;
         let canonical_match = canonicalize_or_raw(&container_workdir);
         let mut candidates = sessions
             .into_iter()
@@ -1020,10 +1134,11 @@ pub(crate) fn kimi_poll_fn_sandboxed_store(
             .filter(|session| canonicalize_or_raw(&session.work_dir) == canonical_match)
             .filter_map(|session| {
                 let leaf = Path::new(&session.session_dir).file_name()?;
-                let mtime_ms = std::fs::metadata(store.join("sessions").join(leaf))
-                    .and_then(|metadata| metadata.modified())
-                    .map(crate::util::system_time_to_ms)
-                    .ok()?;
+                let mtime = root
+                    .directory_modified(&Path::new("sessions").join(leaf))
+                    .ok()
+                    .flatten()?;
+                let mtime_ms = crate::util::system_time_to_ms(mtime);
                 ((mtime_ms as f64) + KIMI_MTIME_FLOOR_SLACK_MS >= launch_time_ms)
                     .then_some((session.id, mtime_ms))
             })
@@ -1282,6 +1397,10 @@ fn select_hermes_session_id(
     }
 }
 
+const HERMES_MAX_ROWS: usize = 4 * 1024;
+const HERMES_MAX_SCHEMA_COLUMNS: usize = 1024;
+const HERMES_SIGNAL_MAX_BYTES: usize = 16 * 1024;
+
 /// Read active CLI session rows from Hermes's SQLite state database.
 ///
 /// Returns the full active CLI set, newest first, with each row's `cwd` and
@@ -1294,13 +1413,11 @@ fn read_hermes_sessions_from_sqlite(
 ) -> Result<HermesSessionScan> {
     use rusqlite::{Connection, OpenFlags};
 
-    if !db_path.exists() {
-        anyhow::bail!("Hermes state.db not found at {}", db_path.display());
-    }
-
     let conn = Connection::open_with_flags(
         db_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .with_context(|| format!("Failed to open Hermes state.db at {}", db_path.display()))?;
     conn.busy_timeout(Duration::from_millis(100))
@@ -1322,7 +1439,10 @@ fn read_hermes_sessions_from_sqlite(
             .context("Failed to read Hermes sessions table columns")?;
         let mut has_cwd = false;
         let mut has_git_repo_root = false;
-        for col in cols {
+        for (index, col) in cols.enumerate() {
+            if index >= HERMES_MAX_SCHEMA_COLUMNS {
+                anyhow::bail!("Hermes sessions table exceeds the column limit");
+            }
             let col = col.context("Failed to read Hermes session column name")?;
             has_cwd |= col == "cwd";
             has_git_repo_root |= col == "git_repo_root";
@@ -1340,28 +1460,42 @@ fn read_hermes_sessions_from_sqlite(
         "SELECT id, {cwd_expr}, {root_expr} FROM sessions \
          WHERE source='cli' AND ended_at IS NULL \
          AND (?1 IS NULL OR started_at > ?1) \
-         ORDER BY started_at DESC, id DESC"
+         AND length(id) <= ?2 \
+         AND ({cwd_expr} IS NULL OR length({cwd_expr}) <= ?3) \
+         AND ({root_expr} IS NULL OR length({root_expr}) <= ?3) \
+         ORDER BY started_at DESC, id DESC LIMIT ?4"
     );
     let mut stmt = conn
         .prepare(&sql)
         .context("Hermes sessions table missing or schema mismatch")?;
 
     let rows = stmt
-        .query_map(rusqlite::params![started_after], |row| {
-            let id: String = row.get(0)?;
-            let cwd: Option<String> = row.get(1)?;
-            let root: Option<String> = row.get(2)?;
-            Ok(HermesSessionRow {
-                id,
-                cwd: normalize_hermes_signal(cwd),
-                git_repo_root: normalize_hermes_signal(root),
-            })
-        })
+        .query_map(
+            rusqlite::params![
+                started_after,
+                MAX_SESSION_ID_LEN as i64,
+                HERMES_SIGNAL_MAX_BYTES as i64,
+                (HERMES_MAX_ROWS + 1) as i64
+            ],
+            |row| {
+                let id: String = row.get(0)?;
+                let cwd: Option<String> = row.get(1)?;
+                let root: Option<String> = row.get(2)?;
+                Ok(HermesSessionRow {
+                    id,
+                    cwd: normalize_hermes_signal(cwd),
+                    git_repo_root: normalize_hermes_signal(root),
+                })
+            },
+        )
         .context("Failed to query Hermes sessions table")?;
 
     let mut out: Vec<HermesSessionRow> = Vec::new();
     for row in rows {
         out.push(row.context("Failed to read Hermes session row")?);
+    }
+    if out.len() > HERMES_MAX_ROWS {
+        anyhow::bail!("Hermes active session count exceeds the row limit");
     }
 
     Ok(HermesSessionScan {
@@ -1382,8 +1516,14 @@ pub(crate) fn hermes_poll_fn_sandboxed_store(
         .map(|duration| duration.as_secs_f64())
         .unwrap_or(f64::MAX);
     move || {
+        let root = crate::session::AnchoredDir::open(&store).ok()?;
+        let db_relative = Path::new("state.db");
+        if !root.regular_exists(db_relative) {
+            return None;
+        }
         let scan =
-            read_hermes_sessions_from_sqlite(&store.join("state.db"), Some(started_after)).ok()?;
+            read_hermes_sessions_from_sqlite(&root.path().join(db_relative), Some(started_after))
+                .ok()?;
         let exclusion = compose_exclusion(&instance_id, &extra_excludes);
         select_hermes_session_id(&scan, &container_cwd, &exclusion)
             .ok()
@@ -1394,6 +1534,18 @@ pub(crate) fn hermes_poll_fn_sandboxed_store(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn open_fifo_guard(path: &Path) -> std::fs::File {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK);
+        options.open(path).unwrap()
+    }
 
     fn write_prime_session(dir: &Path, name: &str, id: &str, cwd: &str) -> PathBuf {
         let path = dir.join(name);
@@ -1455,6 +1607,7 @@ mod tests {
         assert!(is_valid_session_id("ABC-def_123.456"));
 
         assert!(!is_valid_session_id(""));
+        assert!(!is_valid_session_id("-looks-like-an-option"));
         assert!(!is_valid_session_id("bad id!@#"));
         assert!(!is_valid_session_id("has space"));
         assert!(!is_valid_session_id("semi;colon"));
@@ -1971,6 +2124,93 @@ mod tests {
         assert_eq!(poll().as_deref(), Some(fresh_id));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_codex_poller_skips_hostile_artifacts_without_blocking() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let good_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let good = sessions.join(format!("rollout-good-{good_id}.jsonl"));
+        std::fs::write(
+            &good,
+            format!(
+                r#"{{"payload":{{"id":"{good_id}","cwd":"/workspace"}}}}
+"#
+            ),
+        )
+        .unwrap();
+        set_mtime_seconds(&good, 3_000);
+
+        let linked_id = "11111111-2222-4333-8444-555555555555";
+        let outside_file = outside
+            .path()
+            .join(format!("rollout-linked-{linked_id}.jsonl"));
+        std::fs::write(
+            &outside_file,
+            format!(
+                r#"{{"payload":{{"id":"{linked_id}","cwd":"/workspace"}}}}
+"#
+            ),
+        )
+        .unwrap();
+        symlink(
+            &outside_file,
+            sessions.join(outside_file.file_name().unwrap()),
+        )
+        .unwrap();
+        std::fs::create_dir(outside.path().join("06")).unwrap();
+        symlink(outside.path().join("06"), sessions.join("2026")).unwrap();
+
+        let fifo_id = "22222222-3333-4444-8555-666666666666";
+        let fifo = sessions.join(format!("rollout-fifo-{fifo_id}.jsonl"));
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let _fifo_guard = open_fifo_guard(&fifo);
+        let oversized_id = "33333333-4444-4555-8666-777777777777";
+        let mut oversized = format!(
+            r#"{{"payload":{{"id":"{oversized_id}","cwd":"/workspace"}}}}
+"#
+        )
+        .into_bytes();
+        oversized.resize(CODEX_ROLLOUT_MAX_BYTES + 1, b' ');
+        std::fs::write(
+            sessions.join(format!("rollout-large-{oversized_id}.jsonl")),
+            oversized,
+        )
+        .unwrap();
+        let bomb_id = "44444444-5555-4666-8777-888888888888";
+        let bomb = zstd::stream::encode_all(
+            std::io::Cursor::new(vec![b' '; CODEX_METADATA_MAX_BYTES + 1]),
+            1,
+        )
+        .unwrap();
+        std::fs::write(
+            sessions.join(format!("rollout-bomb-{bomb_id}.jsonl.zst")),
+            bomb,
+        )
+        .unwrap();
+
+        let poll = codex_poll_fn_sandboxed_store(
+            tmp.path().to_path_buf(),
+            "/workspace".to_string(),
+            "current".to_string(),
+            capture_floor(100),
+            HashSet::new(),
+        );
+        let started = Instant::now();
+        assert_eq!(poll().as_deref(), Some(good_id));
+        std::fs::remove_file(good).unwrap();
+        assert_eq!(poll(), None);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
     #[test]
     fn sandbox_gemini_poller_only_claims_post_launch_matching_chat() {
         use sha2::{Digest, Sha256};
@@ -2014,6 +2254,72 @@ mod tests {
         assert_eq!(poll().as_deref(), Some(fresh_id));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_gemini_poller_skips_symlinks_fifo_and_oversized_json() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let cwd = "/workspace";
+        let hash = Sha256::digest(cwd.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let chats = tmp.path().join("tmp").join(&hash).join("chats");
+        std::fs::create_dir_all(&chats).unwrap();
+        let good = chats.join("session-good.json");
+        std::fs::write(
+            &good,
+            format!(r#"{{"sessionId":"gemini_good","projectHash":"{hash}"}}"#),
+        )
+        .unwrap();
+        let outside_file = outside.path().join("outside.json");
+        std::fs::write(
+            &outside_file,
+            format!(r#"{{"sessionId":"gemini_linked","projectHash":"{hash}"}}"#),
+        )
+        .unwrap();
+        symlink(&outside_file, chats.join("session-linked.json")).unwrap();
+        let fifo = chats.join("session-pipe.json");
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let _fifo_guard = open_fifo_guard(&fifo);
+        std::fs::write(
+            chats.join("session-large.json"),
+            vec![b' '; GEMINI_SESSION_MAX_BYTES + 1],
+        )
+        .unwrap();
+
+        let poll = gemini_poll_fn_sandboxed_store(
+            tmp.path().to_path_buf(),
+            cwd.to_string(),
+            "current".to_string(),
+            capture_floor(100),
+            HashSet::new(),
+        );
+        let started = Instant::now();
+        assert_eq!(poll().as_deref(), Some("gemini_good"));
+        std::fs::remove_file(good).unwrap();
+        assert_eq!(poll(), None);
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        let intermediate = tempfile::tempdir().unwrap();
+        symlink(outside.path(), intermediate.path().join("tmp")).unwrap();
+        let poll = gemini_poll_fn_sandboxed_store(
+            intermediate.path().to_path_buf(),
+            cwd.to_string(),
+            "current".to_string(),
+            capture_floor(100),
+            HashSet::new(),
+        );
+        assert_eq!(poll(), None);
+    }
+
     #[test]
     fn sandbox_hermes_poller_only_claims_post_launch_matching_row() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2044,6 +2350,63 @@ mod tests {
             HashSet::new(),
         );
         assert_eq!(poll().as_deref(), Some("hermes_fresh"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_hermes_poller_refuses_symlink_fifo_and_excess_rows() {
+        use std::os::unix::fs::symlink;
+
+        let store = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_db = outside.path().join("state.db");
+        let conn = rusqlite::Connection::open(&outside_db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT, source TEXT, started_at REAL, ended_at REAL, cwd TEXT, git_repo_root TEXT); \
+             INSERT INTO sessions VALUES ('linked', 'cli', 10, NULL, '/workspace', NULL);",
+        )
+        .unwrap();
+        drop(conn);
+        symlink(&outside_db, store.path().join("state.db")).unwrap();
+        let poll = hermes_poll_fn_sandboxed_store(
+            store.path().to_path_buf(),
+            "/workspace".to_string(),
+            "current".to_string(),
+            capture_floor(0),
+            HashSet::new(),
+        );
+        assert_eq!(poll(), None);
+        std::fs::remove_file(store.path().join("state.db")).unwrap();
+        let fifo = store.path().join("state.db");
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let fifo_guard = open_fifo_guard(&fifo);
+        let started = Instant::now();
+        assert_eq!(poll(), None);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(fifo_guard);
+        std::fs::remove_file(&fifo).unwrap();
+
+        let conn = rusqlite::Connection::open(store.path().join("state.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT, source TEXT, started_at REAL, ended_at REAL, cwd TEXT, git_repo_root TEXT);",
+        )
+        .unwrap();
+        let transaction = conn.unchecked_transaction().unwrap();
+        for index in 0..=HERMES_MAX_ROWS {
+            transaction
+                .execute(
+                    "INSERT INTO sessions VALUES (?1, 'cli', ?2, NULL, '/workspace', NULL)",
+                    rusqlite::params![format!("hermes_{index}"), index as f64 + 1.0],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        drop(conn);
+        assert_eq!(poll(), None);
     }
 
     #[test]
@@ -2084,6 +2447,59 @@ mod tests {
             HashSet::new(),
         );
         assert_eq!(poll().as_deref(), Some("kimi_fresh"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_kimi_poller_skips_hostile_index_and_session_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let good = sessions.join("good");
+        std::fs::create_dir(&good).unwrap();
+        std::fs::create_dir(outside.path().join("linked")).unwrap();
+        symlink(outside.path().join("linked"), sessions.join("linked")).unwrap();
+        let index = tmp.path().join("session_index.jsonl");
+        let index_content = concat!(
+            r#"{"sessionId":"kimi_linked","sessionDir":"/sessions/linked","workDir":"/workspace"}"#,
+            "\n",
+            r#"{"sessionId":"kimi_good","sessionDir":"/sessions/good","workDir":"/workspace"}"#,
+            "\n",
+        );
+        std::fs::write(&index, index_content).unwrap();
+        let poll = kimi_poll_fn_sandboxed_store(
+            tmp.path().to_path_buf(),
+            "/workspace".to_string(),
+            "current".to_string(),
+            0.0,
+            HashSet::new(),
+        );
+        assert_eq!(poll().as_deref(), Some("kimi_good"));
+        std::fs::remove_dir(good).unwrap();
+        assert_eq!(poll(), None);
+
+        std::fs::remove_file(&index).unwrap();
+        let outside_index = outside.path().join("session_index.jsonl");
+        std::fs::write(&outside_index, &index_content).unwrap();
+        symlink(&outside_index, &index).unwrap();
+        assert_eq!(poll(), None);
+        std::fs::remove_file(&index).unwrap();
+        nix::unistd::mkfifo(
+            &index,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let fifo_guard = open_fifo_guard(&index);
+        let started = Instant::now();
+        assert_eq!(poll(), None);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(fifo_guard);
+        std::fs::remove_file(&index).unwrap();
+        std::fs::write(&index, vec![b' '; KIMI_INDEX_MAX_BYTES + 1]).unwrap();
+        assert_eq!(poll(), None);
     }
 
     #[test]

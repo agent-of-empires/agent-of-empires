@@ -468,7 +468,7 @@ fn acquire_transition_flocks_for_profile_dirs(profile_dirs: &[&Path]) -> Result<
     app_dirs
         .iter()
         .map(|dir| {
-            acquire_storage_shared_flock(dir, crate::migrations::v028_isolate_sandbox_stores::LOCK)
+            acquire_storage_shared_flock(dir, crate::migrations::v027_isolate_sandbox_stores::LOCK)
         })
         .collect()
 }
@@ -1196,7 +1196,7 @@ impl Storage {
         })?;
         let _transition = acquire_storage_shared_flock(
             app_dir_for_profile_dir(profile_dir),
-            crate::migrations::v028_isolate_sandbox_stores::LOCK,
+            crate::migrations::v027_isolate_sandbox_stores::LOCK,
         )?;
         let _flock = acquire_storage_flock(profile_dir, STORAGE_LOCK_FILENAME)?;
         self.update_under_lock(f)

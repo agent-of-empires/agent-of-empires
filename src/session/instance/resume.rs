@@ -37,17 +37,6 @@ const RESUME_PROBE_POLL: std::time::Duration = std::time::Duration::from_millis(
 /// restart path's latency, not in agent responsiveness afterward.
 const RESUME_PROBE_POST_SHELL_GRACE: std::time::Duration = std::time::Duration::from_millis(2000);
 
-/// Pure decision: should a launch with this sid/tool use the resume probe?
-/// Extracted for unit-testability: the probe path itself needs a real tmux
-/// session to test end-to-end.
-pub(crate) fn should_attempt_resume(agent_session_id: Option<&str>, tool: &str) -> bool {
-    let valid = agent_session_id.map(is_valid_session_id).unwrap_or(false);
-    if !valid {
-        return false;
-    }
-    crate::agents::get_agent(tool).is_some_and(|agent| agent.session_support.is_some())
-}
-
 impl Instance {
     pub fn restart_with_size(&mut self, size: Option<(u16, u16)>) -> Result<StartOutcome> {
         self.restart_with_size_opts(size, false)
@@ -147,7 +136,7 @@ impl Instance {
     ///
     /// `resume_policy` gates step 1: `HonorAutoResumeSetting` additionally
     /// requires `SessionConfig::auto_resume_on_restart`; `Allow` always
-    /// permits an attempt (subject to `should_attempt_resume`). Independent
+    /// permits an attempt when the resolved agent supports native resume. Independent
     /// of policy, a sid that already equals `resume_probe_failed_sid` from a
     /// prior call never re-attempts resume: it returns
     /// `StartOutcome::FreshAfterFailedResume` instead of repeating the same
@@ -334,6 +323,10 @@ impl Instance {
             .unwrap_or_default()
     }
 
+    fn should_probe_pinned_fresh_launch(&self, sid: Option<&str>) -> bool {
+        sid.is_some_and(is_valid_session_id) && self.supports_native_resume()
+    }
+
     fn finish_resume_launch(
         &mut self,
         launch_outcome: LaunchSidOutcome,
@@ -347,7 +340,7 @@ impl Instance {
                 (Some(sid), None)
             }
             LaunchSidOutcome::Fresh { pinned_prior_sid }
-                if should_attempt_resume(pinned_prior_sid.as_deref(), &self.tool) =>
+                if self.should_probe_pinned_fresh_launch(pinned_prior_sid.as_deref()) =>
             {
                 (None, pinned_prior_sid)
             }
@@ -409,6 +402,7 @@ mod tests {
     use super::*;
 
     use crate::session::instance::launch_command::build_resume_flags;
+    use crate::session::instance::test_helpers::install_aliases;
     use serial_test::serial;
     use tempfile::tempdir;
     fn isolate_resume_environment(
@@ -433,31 +427,6 @@ mod tests {
     ) -> crate::session::test_support::EnvGuard {
         crate::session::test_support::install_login_shell_path_command(root, "claude", script)
     }
-    #[test]
-    fn no_sid_does_not_attempt_resume() {
-        assert!(!should_attempt_resume(None, "claude"));
-        assert!(!should_attempt_resume(Some(""), "claude"));
-        assert!(!should_attempt_resume(Some("   "), "claude"));
-    }
-
-    #[test]
-    fn invalid_sid_does_not_attempt_resume() {
-        assert!(!should_attempt_resume(Some("bad id!"), "claude"));
-        assert!(!should_attempt_resume(Some("path/slash"), "claude"));
-        assert!(!should_attempt_resume(Some(&"x".repeat(257)), "claude"));
-    }
-
-    #[test]
-    fn valid_sid_for_resume_supporting_agent_attempts() {
-        assert!(should_attempt_resume(
-            Some("11111111-1111-1111-1111-111111111111"),
-            "claude"
-        ));
-        assert!(should_attempt_resume(Some("session_abc.123"), "opencode"));
-        assert!(should_attempt_resume(Some("uuid-abc-123"), "codex"));
-        assert!(should_attempt_resume(Some("uuid-abc-123"), "gemini"));
-        assert!(should_attempt_resume(Some("uuid-abc-123"), "cursor"));
-    }
 
     #[test]
     fn resume_and_capture_capabilities_control_each_path() {
@@ -479,7 +448,7 @@ mod tests {
             inst.resume_intent = ResumeIntent::Use(sid.to_string());
 
             assert_eq!(
-                should_attempt_resume(Some(sid), tool),
+                inst.supports_native_resume(),
                 resume_supported,
                 "{tool}: resume-probe decision"
             );
@@ -498,7 +467,7 @@ mod tests {
                 .unwrap()
                 .launch_base_command();
             let base_command = command.clone();
-            let resumed = inst.apply_session_flags(&mut command, "test");
+            let resumed = inst.apply_session_flags(&mut command, "test").unwrap();
             assert_eq!(resumed, resume_supported, "{tool}: launch resume decision");
             assert_eq!(
                 command != base_command,
@@ -525,11 +494,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn unknown_tool_does_not_attempt_resume() {
-        assert!(!should_attempt_resume(Some("uuid-abc-123"), "nonexistent"));
     }
 
     #[test]
@@ -1069,5 +1033,15 @@ mod tests {",
             inst.resume_probe_failed_sid.as_deref(),
             Some(stale_sid.as_str())
         );
+    }
+    #[test]
+    fn pinned_fresh_probe_uses_resolved_alias_capability() {
+        const PROFILE: &str = "pinned-probe-alias";
+        let _registry = install_aliases(PROFILE, &[("work-claude", "claude")]);
+        let mut inst = Instance::new("alias", "/tmp/x");
+        inst.source_profile = PROFILE.to_string();
+        inst.tool = "work-claude".to_string();
+        inst.command = "claude".to_string();
+        assert!(inst.should_probe_pinned_fresh_launch(Some("11111111-2222-3333-4444-555555555555")));
     }
 }
