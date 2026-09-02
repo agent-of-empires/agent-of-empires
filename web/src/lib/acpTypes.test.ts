@@ -1213,6 +1213,21 @@ describe("applyEvent / AgentSwitched", () => {
     expect(next.workerRestarting).toBe(false);
     expect(next.agentUnresponsive).toBe(false);
   });
+
+  it("clears the exhausted retry notice from the prior backend", () => {
+    const seeded: AcpState = {
+      ...emptyAcpState(),
+      rateLimitRetriesExhausted: true,
+    };
+    const next = applyEvent(seeded, {
+      session_id: "s-1",
+      seq: 13,
+      event: {
+        AgentSwitched: { from: "claude", to: "codex", reason: "rate_limited" },
+      },
+    });
+    expect(next.rateLimitRetriesExhausted).toBe(false);
+  });
 });
 
 describe("turnActive: daemon truth plus an optimistic overlay (#3417)", () => {

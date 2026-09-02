@@ -1655,6 +1655,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.workerStopped = false;
     next.workerRestarting = false;
     next.agentUnresponsive = false;
+    next.rateLimitRetriesExhausted = false;
     // Per-adapter selectors belong to the previous backend. See #1403.
     next.configOptions = [];
     next.configOptionSwitchFailed = null;
