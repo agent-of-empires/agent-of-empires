@@ -580,6 +580,7 @@ mod tests {
         assert!(inst.session_id_poller.is_none());
 
         inst.session_id_poller_retry_after = None;
+        std::fs::create_dir_all(inst.sandbox_capture_store_dir().unwrap()).unwrap();
         assert!(inst.repair_session_id_poller_if_needed(&live));
         assert!(inst.session_id_poller_is_running());
     }
