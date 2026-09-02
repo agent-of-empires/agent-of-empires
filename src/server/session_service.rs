@@ -78,7 +78,6 @@ enum IdempotentMatch {
 /// The `Instance` fields `mutate_instance_persisted` copies from memory to
 /// disk. Deliberately explicit: the disk write no longer re-runs the caller's
 /// closure, so a field that is not listed here is simply not persisted.
-#[cfg(feature = "serve")]
 struct MirroredFields {
     queued_prompts: Vec<crate::acp::state::QueuedPromptEntry>,
     queued_prompt_next_seq: u64,
@@ -103,7 +102,6 @@ struct MirroredFields {
 }
 
 /// Result of `SessionService::edit_queued_prompt`.
-#[cfg(feature = "serve")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EditQueuedOutcome {
     Updated,
@@ -122,7 +120,6 @@ pub(crate) enum EditQueuedOutcome {
 /// combines with blank-line separators (empty-text rows skipped). An agent with
 /// no clear aliases combines the whole queue. Pure, so the boundary logic is
 /// unit-tested without a live worker.
-#[cfg(feature = "serve")]
 fn queue_drain_batch<'a>(
     queue: &'a [crate::acp::state::QueuedPromptEntry],
     profile: &crate::acp::agent_profiles::AgentProfile,
@@ -169,18 +166,15 @@ pub struct SessionService {
     pub mutation_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Owns the per-session ACP agent subprocesses, shared with
     /// `AppState.acp_supervisor`.
-    #[cfg(feature = "serve")]
     pub acp_supervisor:
         Arc<crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>>,
     /// Durable ACP event store, shared with `AppState.acp_event_store`. Used
     /// by the pending-turn drain to reload attachment blobs for a rate-limit
     /// resume continuation (#3028).
-    #[cfg(feature = "serve")]
     pub acp_event_store: Arc<crate::acp::event_store::EventStore>,
     /// Live control-state projection, shared with `AppState.acp_control_cache`.
     /// The queue drain reads turn liveness from it so it agrees with prompt
     /// dispatch; see [`SessionService::fold_control_state`].
-    #[cfg(feature = "serve")]
     pub acp_control_cache: Arc<crate::acp::control_cache::ControlStateCache>,
     /// In-flight plugin creates keyed by `(plugin_id, idempotency_key)`.
     /// Sync mutex: critical sections are tiny and never span an `await`.
@@ -199,7 +193,6 @@ pub struct SessionService {
     persist_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Per-session prompt-submission locks. See
     /// [`SessionService::prompt_submission`].
-    #[cfg(feature = "serve")]
     prompt_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
@@ -207,7 +200,6 @@ pub struct SessionService {
 /// transport layer (HTTP handler, plugin RPC connection context, or the
 /// drain reconstructing the creator), never decoded from a request payload,
 /// so a caller cannot forge an identity (#2897).
-#[cfg(feature = "serve")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SessionCaller {
     /// A human-facing surface (HTTP dashboard, TUI).
@@ -221,7 +213,6 @@ pub(crate) enum SessionCaller {
 /// stream, so callers can map each stage faithfully (the HTTP handler keeps
 /// its exact pre-extraction status codes, and only fires the post-publish
 /// smart-rename hook when a publish actually happened).
-#[cfg(feature = "serve")]
 pub(crate) enum SendTurnError {
     /// Pre-publish: the session vanished (or was triaged) before the resume
     /// snapshot. Nothing was published; the honest answer is "not found",
@@ -247,7 +238,6 @@ pub(crate) enum SendTurnError {
     Send(crate::acp::supervisor::SupervisorError),
 }
 
-#[cfg(feature = "serve")]
 impl std::fmt::Display for SendTurnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -264,7 +254,6 @@ impl std::fmt::Display for SendTurnError {
 /// The ACP collaborators `SessionService` shares with `AppState`. Grouped so
 /// the constructor keeps one parameter for "the ACP side" rather than one per
 /// handle.
-#[cfg(feature = "serve")]
 pub struct AcpDeps {
     pub supervisor: Arc<crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>>,
     pub event_store: Arc<crate::acp::event_store::EventStore>,
@@ -272,7 +261,6 @@ pub struct AcpDeps {
 }
 
 impl SessionService {
-    #[cfg(feature = "serve")]
     pub fn new(
         instances: Arc<RwLock<Vec<Instance>>>,
         instance_locks: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
@@ -294,26 +282,6 @@ impl SessionService {
             pending_drains: std::sync::Mutex::new(std::collections::HashSet::new()),
             persist_locks: RwLock::new(HashMap::new()),
             prompt_locks: RwLock::new(HashMap::new()),
-        }
-    }
-
-    #[cfg(not(feature = "serve"))]
-    pub fn new(
-        instances: Arc<RwLock<Vec<Instance>>>,
-        instance_locks: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
-        file_watch: Arc<crate::file_watch::FileWatchService>,
-        telemetry_session_creates: Arc<std::sync::atomic::AtomicU32>,
-        mutation_epoch: Arc<std::sync::atomic::AtomicU64>,
-    ) -> Self {
-        Self {
-            instances,
-            instance_locks,
-            file_watch,
-            telemetry_session_creates,
-            mutation_epoch,
-            create_in_flight: std::sync::Mutex::new(HashMap::new()),
-            pending_drains: std::sync::Mutex::new(std::collections::HashSet::new()),
-            persist_locks: RwLock::new(HashMap::new()),
         }
     }
 
@@ -485,7 +453,6 @@ impl SessionService {
     ///
     /// `woke_idle_dormant` forces the resume trigger even when the worker
     /// looks alive, mirroring the handler's idle-dormant wake (#1689).
-    #[cfg(feature = "serve")]
     pub(crate) async fn send_turn(
         self: &Arc<Self>,
         caller: &SessionCaller,
@@ -625,7 +592,6 @@ impl SessionService {
     /// then disk: a crash (or failed persist) between the forward and the
     /// disk clear re-delivers after restart, which is the documented
     /// at-least-once contract.
-    #[cfg(feature = "serve")]
     pub(crate) async fn drain_pending_initial_turn(self: &Arc<Self>, id: &str) {
         {
             let mut drains = self
@@ -750,7 +716,6 @@ impl SessionService {
     /// clobber a create/plugin turn) or the session is gone. Persists so a
     /// daemon restart mid-resume still re-delivers. Used to continue a
     /// rate-limit-interrupted turn on resume (#3028).
-    #[cfg(feature = "serve")]
     pub(crate) async fn set_pending_initial_turn(
         self: &Arc<Self>,
         id: &str,
@@ -803,7 +768,6 @@ impl SessionService {
     /// session, in memory and on disk. A newer user prompt supersedes a queued
     /// rate-limit resume continuation, so the stale continuation must not
     /// replay after the newer message (#3028). No-op when nothing is queued.
-    #[cfg(feature = "serve")]
     pub(crate) async fn clear_pending_initial_turn(self: &Arc<Self>, id: &str) {
         let profile = {
             let mut instances = self.instances.write().await;
@@ -875,7 +839,6 @@ impl SessionService {
     /// it on the next daemon restart. Copying a whole snapshot makes ordering
     /// load-bearing in a way that re-running the closure did not, so the lock
     /// comes with it.
-    #[cfg(feature = "serve")]
     async fn mutate_instance_persisted<T, F>(self: &Arc<Self>, id: &str, mutate: F) -> Option<T>
     where
         T: Send + 'static,
@@ -955,7 +918,6 @@ impl SessionService {
     /// the guard is not reentrant. The `queue_enqueue` handler claims it
     /// instead, so the row rewrite this does for an existing id still cannot
     /// land inside a drain's snapshot-to-send window.
-    #[cfg(feature = "serve")]
     pub(crate) async fn enqueue_prompt(
         self: &Arc<Self>,
         id: &str,
@@ -1002,7 +964,6 @@ impl SessionService {
     /// then sends, so an unserialized edit landing inside that window is
     /// written to a row the drain has already copied. It delivers the old
     /// text and retires the row, and the edit is lost with nothing to retry.
-    #[cfg(feature = "serve")]
     pub(crate) async fn edit_queued_prompt(
         self: &Arc<Self>,
         id: &str,
@@ -1039,7 +1000,6 @@ impl SessionService {
     /// agent would see the prompt twice. Serialized, the removal either beats
     /// the drain's snapshot (the drain never sees the row) or follows its
     /// retire (the removal reports `false`, and the caller sends nothing).
-    #[cfg(feature = "serve")]
     pub(crate) async fn remove_queued_prompt(
         self: &Arc<Self>,
         id: &str,
@@ -1071,7 +1031,6 @@ impl SessionService {
     /// inside the drain's snapshot-to-send window empties the durable rows
     /// while the batch the drain already copied still goes to the agent, so
     /// the user watches the queue empty and then sees it sent anyway.
-    #[cfg(feature = "serve")]
     pub(crate) async fn clear_queued_prompts(self: &Arc<Self>, id: &str) {
         let Some(_submission) = self.prompt_submission_for_session(id).await else {
             return;
@@ -1091,7 +1050,6 @@ impl SessionService {
     }
 
     /// Snapshot the session's queue, ordered by `seq`.
-    #[cfg(feature = "serve")]
     pub(crate) async fn queued_prompts_snapshot(
         &self,
         id: &str,
@@ -1119,7 +1077,6 @@ impl SessionService {
     /// The fold is cached because rebuilding it per call measured 68ms at 20k
     /// events and 342ms at 100k, holding the event store's connection mutex
     /// for the whole scan, which stalls event recording daemon-wide.
-    #[cfg(feature = "serve")]
     pub(crate) async fn fold_control_state(&self, id: &str) -> crate::acp::state::AcpState {
         use crate::acp::state::{AcpSessionId, AcpState, AgentName};
         let (agent, model) = {
@@ -1187,7 +1144,6 @@ impl SessionService {
     /// (`useAcpSession`): a clear-command row fires as its own turn; a leading
     /// run of non-clear rows combines into one with blank-line separators.
     /// A batch's buffered attachment bytes are reloaded and forwarded with it.
-    #[cfg(feature = "serve")]
     pub(crate) async fn drain_queued_prompts_once(self: &Arc<Self>, id: &str) {
         {
             let mut drains = self
@@ -1308,7 +1264,6 @@ impl SessionService {
     /// Drop a set of queue rows and the attachment bytes buffered for them.
     /// Shared by the delivered path and the undeliverable-husk path so both
     /// leave the queue and the pending-attachment store consistent.
-    #[cfg(feature = "serve")]
     async fn retire_drained_rows(self: &Arc<Self>, id: &str, ids: Vec<String>) {
         for pid in &ids {
             self.acp_event_store
@@ -1333,7 +1288,6 @@ impl SessionService {
     /// keeps the session awake and the write never blocks a spawn. Guards on
     /// `is_idle_dormant` so a session woken by another path between the
     /// reconciler snapshot and this call is left untouched.
-    #[cfg(feature = "serve")]
     pub(crate) async fn wake_dormant_for_queue_drain(self: &Arc<Self>, id: &str) {
         self.mutate_instance_persisted(id, |inst| {
             if inst.is_idle_dormant() {
@@ -1350,7 +1304,6 @@ impl SessionService {
     /// `mutate_instance_persisted`. Always acquired BEFORE `instances.write()`
     /// and never while holding it, and nothing acquires `instance_lock` while
     /// holding this, so it cannot form a cycle with either.
-    #[cfg(feature = "serve")]
     async fn persist_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
         {
             let guard = self.persist_locks.read().await;
@@ -1418,7 +1371,6 @@ impl SessionService {
     /// `send_turn`'s resume trigger, which answers `AlreadyResuming` or
     /// `AlreadyRunning` for a worker that is already there, so it costs a
     /// lookup rather than a wrong disposition.
-    #[cfg(feature = "serve")]
     pub(crate) async fn prompt_submission(&self, id: &str) -> tokio::sync::OwnedMutexGuard<()> {
         let lock = {
             let guard = self.prompt_locks.read().await;
@@ -1449,7 +1401,6 @@ impl SessionService {
     /// teardown and removes the session row before dropping its lock, so both
     /// a waiter parked on that lock and one that vivified a fresh entry after
     /// `forget_prompt_lock` observe the removal and decline.
-    #[cfg(feature = "serve")]
     pub(crate) async fn prompt_submission_for_session(
         &self,
         id: &str,
@@ -1470,7 +1421,6 @@ impl SessionService {
     /// disposition under it, so every turn-starting surface decides and
     /// dispatches as one step instead of dispatching unconditionally after
     /// the wait (#3649). `None` for a session that no longer exists.
-    #[cfg(feature = "serve")]
     pub(crate) async fn begin_prompt_submission(
         &self,
         id: &str,
@@ -1488,7 +1438,6 @@ impl SessionService {
         Some((guard, dispatch))
     }
 
-    #[cfg(feature = "serve")]
     async fn session_exists(&self, id: &str) -> bool {
         self.instances.read().await.iter().any(|i| i.id == id)
     }
@@ -1497,7 +1446,6 @@ impl SessionService {
     /// removal the same delete paths already do. The registry is keyed by
     /// session id and nothing prunes it otherwise, so without this a long-lived
     /// daemon retains one entry per session it has ever seen.
-    #[cfg(feature = "serve")]
     pub(crate) async fn forget_prompt_lock(&self, id: &str) {
         self.prompt_locks.write().await.remove(id);
     }
@@ -1505,7 +1453,7 @@ impl SessionService {
     /// Registry size for a test asserting `prompt_locks` stays bounded (e.g.
     /// does not grow for ids that were never admitted past an existence
     /// check).
-    #[cfg(all(test, feature = "serve"))]
+    #[cfg(test)]
     pub(crate) async fn prompt_locks_len(&self) -> usize {
         self.prompt_locks.read().await.len()
     }
@@ -1513,13 +1461,11 @@ impl SessionService {
 
 /// Releases a session's `pending_drains` claim on every exit path of
 /// [`SessionService::drain_pending_initial_turn`], including panics.
-#[cfg(feature = "serve")]
 struct PendingDrainGuard {
     service: Arc<SessionService>,
     id: String,
 }
 
-#[cfg(feature = "serve")]
 impl Drop for PendingDrainGuard {
     fn drop(&mut self) {
         self.service
@@ -1634,23 +1580,20 @@ fn spec_payload_hash(spec: &StructuredSessionSpec) -> String {
         "acp_mode_id",
         spec.acp_mode_id.as_deref().unwrap_or_default(),
     );
-    #[cfg(feature = "serve")]
-    {
-        field("view", &format!("{:?}", spec.view));
-        field("agent_name", spec.agent_name.as_deref().unwrap_or_default());
-        field(
-            "agent_model",
-            spec.agent_model.as_deref().unwrap_or_default(),
-        );
-        field(
-            "agent_effort",
-            spec.agent_effort.as_deref().unwrap_or_default(),
-        );
-        field(
-            "import_acp_session_id",
-            spec.import_acp_session_id.as_deref().unwrap_or_default(),
-        );
-    }
+    field("view", &format!("{:?}", spec.view));
+    field("agent_name", spec.agent_name.as_deref().unwrap_or_default());
+    field(
+        "agent_model",
+        spec.agent_model.as_deref().unwrap_or_default(),
+    );
+    field(
+        "agent_effort",
+        spec.agent_effort.as_deref().unwrap_or_default(),
+    );
+    field(
+        "import_acp_session_id",
+        spec.import_acp_session_id.as_deref().unwrap_or_default(),
+    );
     use std::fmt::Write;
     let digest = hasher.finalize();
     let mut out = String::with_capacity(digest.len() * 2);
@@ -1702,17 +1645,11 @@ mod tests {
             plugin_create_idempotency: None,
             pending_initial_turn: None,
             acp_mode_id: None,
-            #[cfg(feature = "serve")]
             view: crate::session::View::Structured,
-            #[cfg(feature = "serve")]
             agent_name: Some("claude".to_string()),
-            #[cfg(feature = "serve")]
             agent_model: None,
-            #[cfg(feature = "serve")]
             agent_effort: None,
-            #[cfg(feature = "serve")]
             import_acp_session_id: None,
-            #[cfg(feature = "serve")]
             fork_seed: None,
         }
     }
@@ -1797,7 +1734,6 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "serve")]
     #[tokio::test]
     async fn in_flight_claim_waits_same_hash_and_conflicts_on_mismatch() {
         let service = crate::server::test_support::build_test_app_state(Vec::new())
@@ -1833,7 +1769,6 @@ mod tests {
         };
     }
 
-    #[cfg(feature = "serve")]
     #[tokio::test]
     async fn probe_resolves_replay_conflict_and_new() {
         // Seed a prior create whose stored hash matches `test_spec()`; the probe
@@ -1881,7 +1816,6 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "serve")]
     #[tokio::test]
     async fn send_turn_enforces_plugin_ownership_before_any_side_effect() {
         let mut user_session = Instance::new("user-owned", "/tmp/aoe-2897-project");
@@ -1940,7 +1874,6 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "serve")]
     #[tokio::test]
     async fn drain_is_a_noop_without_a_pending_turn_and_releases_its_claim() {
         let mut inst = Instance::new("no-pending", "/tmp/aoe-2897-project");
@@ -1975,7 +1908,6 @@ mod tests {
     /// drain retried the same head-of-queue batch every reconciler tick,
     /// nothing behind it drained, and `reap_idle_workers` skips a session
     /// holding a queue, so the agent subprocess was never reaped.
-    #[cfg(feature = "serve")]
     #[tokio::test]
     async fn an_undeliverable_queue_row_is_retired_instead_of_wedging_the_queue() {
         let mut inst = Instance::new("queue", "/tmp/aoe-queue-husk");
@@ -2058,7 +1990,6 @@ mod tests {
     /// bytes), because retiring a husk is the drain's only externally visible
     /// effect in a test with no live worker: the idle session's row is retired,
     /// the mid-turn session's row survives untouched.
-    #[cfg(feature = "serve")]
     #[tokio::test]
     async fn a_queued_prompt_is_not_drained_into_a_turn_status_has_not_caught_up_with() {
         use crate::acp::state::Event;
@@ -2147,7 +2078,6 @@ mod tests {
     /// fixture `acp::wake_prompt_frees_instance_lock_and_publishes_nothing_without_a_worker`
     /// uses: it makes `wait_for_worker` park exactly as it does mid-respawn,
     /// with no process, sandbox, or agent involved.
-    #[cfg(feature = "serve")]
     #[tokio::test]
     async fn the_queue_drain_frees_instance_lock_while_it_waits_for_a_resuming_worker() {
         use crate::acp::supervisor::{ResumeKind, ResumeReservationOutcome};
@@ -2227,7 +2157,6 @@ mod tests {
     /// the new text with nothing to retry, and a clear empties the durable
     /// queue for a batch that goes out anyway. `remove_queued_prompt` was
     /// already serialized for this reason; `edit` and `clear` were not.
-    #[cfg(feature = "serve")]
     #[tokio::test]
     async fn queue_mutations_wait_for_an_in_flight_delivery() {
         use std::time::Duration;
@@ -2309,7 +2238,6 @@ mod tests {
     /// The sink assertion is the other half: mirroring this field with
     /// `touch_last_accessed()` instead of a monotone max would pass the recency
     /// checks and reintroduce #3465's wipe.
-    #[cfg(feature = "serve")]
     #[tokio::test]
     #[serial_test::serial]
     async fn enqueueing_a_prompt_advances_recency_without_clearing_a_peer_sink() {
@@ -2389,7 +2317,6 @@ mod tests {
     /// would drop `b`), and the lock exists to make that ordering guaranteed
     /// rather than incidental, but 32-way concurrency here never reordered the
     /// two `Storage::update` calls, so the lock is defensive and unproven.
-    #[cfg(feature = "serve")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial_test::serial]
     async fn concurrent_enqueues_all_survive_to_disk() {
@@ -2459,7 +2386,6 @@ mod tests {
         assert_eq!(disk_seqs.len(), 32, "no two persisted rows share a seq");
     }
 
-    #[cfg(feature = "serve")]
     #[tokio::test]
     async fn queue_store_enqueue_edit_remove_clear() {
         let mut inst = Instance::new("queue", "/tmp/aoe-queue-project");
@@ -2574,7 +2500,6 @@ mod tests {
             .is_none());
     }
 
-    #[cfg(feature = "serve")]
     #[tokio::test]
     async fn wake_dormant_for_queue_drain_clears_only_when_dormant() {
         // A session the idle reaper auto-stopped: dormant, so the resume pass
@@ -2612,7 +2537,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn queue_drain_batch_splits_on_clear_boundary() {
         use crate::acp::state::QueuedPromptEntry;

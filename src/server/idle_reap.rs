@@ -7,14 +7,12 @@ use super::state::AppState;
 /// How often the serve daemon evaluates plain tmux sessions for idle
 /// auto-stop. Mirrors the acp reaper's cadence so a 2s status tick does
 /// not drive a storage + tmux sweep on every iteration.
-#[cfg(feature = "serve")]
 pub(super) const SESSION_IDLE_REAP_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(60);
 
 /// Cap on concurrent `perform_stop` calls during one reap pass. `Instance::stop`
 /// can block ~10s on `docker stop`; without a bound, a fleet of sessions all
 /// crossing the threshold on the same tick would stampede the Docker daemon.
-#[cfg(feature = "serve")]
 pub(super) const SESSION_IDLE_REAP_MAX_CONCURRENT: usize = 4;
 
 /// Auto-stop plain (non-acp) tmux sessions that have been `Idle` past
@@ -23,7 +21,6 @@ pub(super) const SESSION_IDLE_REAP_MAX_CONCURRENT: usize = 4;
 /// under the per-profile storage lock (so a concurrently running TUI cannot
 /// double-stop it) and stopped on a detached task with bounded concurrency,
 /// keeping the status poll loop responsive.
-#[cfg(feature = "serve")]
 pub(super) async fn reap_idle_sessions(
     state: &Arc<AppState>,
     last_reap: &mut Option<std::time::Instant>,

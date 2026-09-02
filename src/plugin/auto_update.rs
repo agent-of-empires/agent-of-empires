@@ -18,14 +18,13 @@ use crate::session::Config;
 
 use super::{install, update_check};
 
-/// Surfaces a consent-needed auto-update skip in-product. Kept abstract so this
-/// module (which compiles in TUI-only builds) never references the serve-gated
-/// plugin host. The `aoe serve` daemon implements it on `PluginHost`.
+/// Surfaces a consent-needed auto-update skip in-product. Kept abstract so the
+/// sweep never reaches into the plugin host; the `aoe serve` daemon implements
+/// it on `PluginHost`.
 pub trait UpdateNotifier: Send + Sync {
     fn needs_approval(&self, plugin_id: &str, reason: &str);
 }
 
-#[cfg(feature = "serve")]
 impl UpdateNotifier for super::host::PluginHost {
     fn needs_approval(&self, plugin_id: &str, reason: &str) {
         self.notify_host(
@@ -126,7 +125,7 @@ fn already_dismissed(id: &str, fingerprint: &str) -> bool {
 /// startup is never delayed by network or git; the registry is reloaded inside
 /// `install::update_clean` as each update lands. `notifier` is the running
 /// plugin host (`aoe serve`), used to surface consent-needed skips as
-/// notifications; `None` in TUI-only contexts, where there is no ring.
+/// notifications; `None` where there is no ring.
 pub fn spawn_if_enabled(config: &Config, notifier: Option<Arc<dyn UpdateNotifier>>) {
     if !config.updates.auto_update_plugins {
         return;

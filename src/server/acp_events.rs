@@ -13,7 +13,6 @@ use crate::server::{acp_ws, api};
 /// One task instead of two halves the broadcast clone count and locks
 /// `state.instances` once per event instead of twice for the events
 /// (e.g. `AcpSessionAssigned`) that both consumers care about.
-#[cfg(feature = "serve")]
 pub(super) async fn acp_event_listener(state: Arc<AppState>) {
     let mut rx = state.acp_events_tx.subscribe();
     loop {
@@ -450,7 +449,6 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
 /// Acts via the same `apply_status_intent` path as the live listener
 /// so push subscribers and the broadcast channel see the seeded
 /// transitions as ordinary StatusChange events. See #1103 (B).
-#[cfg(feature = "serve")]
 pub(crate) async fn seed_acp_statuses(state: Arc<AppState>) {
     let acp_ids: Vec<String> = state
         .instances
@@ -493,7 +491,6 @@ pub(crate) async fn seed_acp_statuses(state: Arc<AppState>) {
 /// callers hold the write lock. Sends a `StatusChange` on
 /// `status_tx` so push notifications and the dashboard see the
 /// transition like any tmux-driven one.
-#[cfg(feature = "serve")]
 pub(crate) fn apply_status_intent(
     inst: &mut Instance,
     intent: Option<StatusIntent>,
@@ -574,7 +571,6 @@ pub(crate) fn apply_status_intent(
 /// user, who is by construction present for it. Every `Stopped` reason maps to
 /// `Idle`, so a rate-limit park marks unread too; that is the same policy
 /// terminal sessions get, and a parked session does want attention.
-#[cfg(feature = "serve")]
 pub(super) fn should_mark_acp_unread(
     inst: &Instance,
     old_status: Status,
@@ -611,7 +607,6 @@ pub(super) fn should_mark_acp_unread(
 /// A stale-profile write is not retried. The row is left read rather than
 /// half-marked, the turn's mark is simply lost, and the move is rare enough that
 /// a re-resolve loop is not worth the added failure surface here.
-#[cfg(feature = "serve")]
 pub(super) async fn persist_and_mirror_unread(
     instances: &RwLock<Vec<Instance>>,
     instance_lock: &tokio::sync::Mutex<()>,
@@ -682,7 +677,6 @@ pub(super) async fn persist_and_mirror_unread(
 ///   daemon that died mid-turn would otherwise trap the dot grey. Mid-run a
 ///   `Stopped` in memory is a deliberate stop, so `apply_status_intent`'s guard
 ///   should keep it.
-#[cfg(feature = "serve")]
 pub(super) async fn recover_structured_unread_after_lag(
     instances: &RwLock<Vec<Instance>>,
     event_store: &crate::acp::event_store::EventStore,
@@ -735,7 +729,6 @@ pub(super) async fn recover_structured_unread_after_lag(
 /// owning profile when sessions.json needs to be re-saved (so the new
 /// `acp_session_id` survives daemon restart), or `None` if the
 /// change was a no-op or no change was emitted.
-#[cfg(feature = "serve")]
 pub(super) fn apply_acp_session_change(
     inst: &mut Instance,
     session_id: &str,
@@ -850,7 +843,6 @@ pub(super) fn apply_acp_session_change(
 /// What an event tells the ACP-session-id listener to do. `None` means
 /// the event is irrelevant. Extracted so the JSON-shape parsing has a
 /// pure-function test surface.
-#[cfg(feature = "serve")]
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub(super) enum AcpSessionChange {
     Assigned(String),
@@ -861,7 +853,6 @@ pub(super) enum AcpSessionChange {
     Cleared,
 }
 
-#[cfg(feature = "serve")]
 pub(super) fn derive_acp_session_change(event: &crate::acp::Event) -> Option<AcpSessionChange> {
     use crate::acp::Event;
     match event {
@@ -879,14 +870,12 @@ pub(super) fn derive_acp_session_change(event: &crate::acp::Event) -> Option<Acp
 /// current status is `Error` (used to recover the sidebar from a
 /// sticky `AgentStartupError` banner after a successful respawn
 /// without clobbering an in-progress Running/Waiting turn).
-#[cfg(feature = "serve")]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum StatusIntent {
     Set(Status),
     HealError,
 }
 
-#[cfg(feature = "serve")]
 pub(crate) fn derive_acp_status(event: &crate::acp::Event) -> Option<StatusIntent> {
     use crate::acp::Event;
     match event {
@@ -938,7 +927,6 @@ mod tests {
     /// #3181: the automatic mark's predicate for a structured row, driven off
     /// the live ACP turn-end event. One table rather than a test per case, per
     /// the repo's compile-cost rule.
-    #[cfg(feature = "serve")]
     #[test]
     fn should_mark_acp_unread_only_on_a_structured_running_to_idle_turn_end() {
         // (name, structured, old_status, new_status, unread_enabled, already_unread, expected)
@@ -1043,7 +1031,6 @@ mod tests {
     /// Seed `profile`'s store with `rows`, so a persist closure has a matching
     /// id to mark. Mirrors the shape used by the `flush_passive_transition_*`
     /// tests in `status_poll.rs`.
-    #[cfg(feature = "serve")]
     fn seed_profile_store(profile: &str, rows: Vec<Instance>) {
         crate::session::Storage::new_unwatched(profile)
             .expect("storage")
@@ -1054,7 +1041,6 @@ mod tests {
             .expect("seed write");
     }
 
-    #[cfg(feature = "serve")]
     fn load_profile_row(profile: &str, id: &str) -> Option<Instance> {
         crate::session::Storage::new_unwatched(profile)
             .expect("storage")
@@ -1072,7 +1058,6 @@ mod tests {
     /// nothing, so mirroring on `is_ok()` alone would mark memory off a
     /// successful no-op against a profile the row no longer lives in, and the
     /// next disk reload would silently drop the notification.
-    #[cfg(feature = "serve")]
     #[tokio::test]
     #[serial_test::serial]
     async fn persist_and_mirror_unread_mirrors_only_a_committed_mutation() {
@@ -1140,7 +1125,6 @@ mod tests {
     /// `flush_passive_transition_defers_unread_until_persist_ok` (in
     /// `status_poll.rs`) locks for the tmux poller. Separate test rather than a
     /// row in the one above because it needs the store deliberately broken.
-    #[cfg(feature = "serve")]
     #[tokio::test]
     #[serial_test::serial]
     async fn persist_and_mirror_unread_skips_the_mirror_on_a_failed_write() {
@@ -1190,7 +1174,6 @@ mod tests {
     /// lifecycle event, so the discriminator is the row rather than the event:
     /// only the structured row still sitting at `Running` represents a turn that
     /// ended unobserved.
-    #[cfg(feature = "serve")]
     #[tokio::test]
     #[serial_test::serial]
     async fn recover_structured_unread_after_lag_marks_only_a_missed_turn_end() {
@@ -1291,7 +1274,6 @@ mod tests {
     /// is dropped, or the mirror is reordered, because none of them run the
     /// listener. This one drives a real `Event::Stopped` frame through the
     /// broadcast and asserts both halves of the write.
-    #[cfg(feature = "serve")]
     #[tokio::test]
     #[serial_test::serial]
     async fn acp_event_listener_marks_a_finished_turn_unread_on_disk_and_in_memory() {
@@ -1382,7 +1364,6 @@ mod tests {
     // session/load reattach reuses it). Without this, a stale marker left by a
     // non-user respawn keeps the reconciler's resume filter skipping the
     // session forever once the worker dies, deadlocking a queued prompt.
-    #[cfg(feature = "serve")]
     #[test]
     fn acp_session_assigned_clears_stale_dormant_marker_on_same_id() {
         let mut inst = Instance::new("seed", "/tmp/seed");
@@ -1411,7 +1392,6 @@ mod tests {
     // new-assignment path. That path must consume the one-shot fork_pending seed
     // and persist, so a restart resumes the child via session/load rather than
     // re-forking the parent.
-    #[cfg(feature = "serve")]
     #[test]
     fn assigning_forked_id_clears_fork_pending_and_persists() {
         let mut inst = Instance::new("seed", "/tmp/seed");
@@ -1445,7 +1425,6 @@ mod tests {
     // None) must leave import_pending alone: that marker belongs to the import
     // flow, which lands on the same-id path, and clearing it here would block a
     // legitimate import retry from re-seeding the transcript.
-    #[cfg(feature = "serve")]
     #[test]
     fn non_fork_assignment_preserves_import_pending() {
         let mut inst = Instance::new("seed", "/tmp/seed");
@@ -1476,7 +1455,6 @@ mod tests {
     // reconciler nor the supervisor re-issues the same failing session/fork on
     // the next reattach. This is the reducer side of the fork-failure retry-loop
     // fix; the reset carries no new id, so acp_session_id is cleared too.
-    #[cfg(feature = "serve")]
     #[test]
     fn reset_clears_fork_pending_and_import_pending() {
         let mut inst = Instance::new("seed", "/tmp/seed");
@@ -1507,7 +1485,6 @@ mod tests {
     // must clear the dead id but leave import_pending untouched: that marker
     // belongs to the import flow, and clearing it here would block a legitimate
     // import retry. Mirrors the non-fork assignment guard.
-    #[cfg(feature = "serve")]
     #[test]
     fn reset_without_fork_pending_preserves_import_pending() {
         let mut inst = Instance::new("seed", "/tmp/seed");
@@ -1530,7 +1507,6 @@ mod tests {
         assert!(profile.is_some(), "the reset must persist");
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn acp_session_assigned_same_id_no_marker_is_noop() {
         let mut inst = Instance::new("seed", "/tmp/seed");
@@ -1552,7 +1528,6 @@ mod tests {
     // derived no session change, so the stale ACP id survived on disk and the
     // next worker restart replayed the pre-clear conversation via session/load.
     // It must now derive a Cleared change so the stored id is dropped.
-    #[cfg(feature = "serve")]
     #[test]
     fn session_cleared_derives_cleared_change() {
         assert_eq!(
@@ -1566,7 +1541,6 @@ mod tests {
     // dropping the paired fork/import markers too: a /clear issued before a
     // pending fork/import resolves must still restart as session/new, not
     // re-session/fork the parent. See #3080.
-    #[cfg(feature = "serve")]
     #[test]
     fn cleared_nulls_stored_id_and_pending_markers() {
         let mut inst = Instance::new("seed", "/tmp/seed");
@@ -1592,7 +1566,6 @@ mod tests {
 
     // Regression for the event-ordering the listener sees: an id assigned at
     // connect followed by a later /clear must end with no stored id. See #3080.
-    #[cfg(feature = "serve")]
     #[test]
     fn assign_then_clear_leaves_no_stored_id() {
         let mut inst = Instance::new("seed", "/tmp/seed");
@@ -1612,7 +1585,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn derive_acp_status_maps_terminal_events() {
         use crate::acp::approvals::{ApprovalDecision, Nonce};
@@ -1714,7 +1686,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn derive_acp_session_change_extracts_assigned_id() {
         use crate::acp::Event;
@@ -1727,7 +1698,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn derive_acp_session_change_extracts_reset_reason() {
         use crate::acp::Event;
@@ -1742,7 +1712,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn derive_acp_session_change_ignores_unrelated_events() {
         use crate::acp::Event;
@@ -1759,7 +1728,6 @@ mod tests {
         assert_eq!(derive_acp_session_change(&Event::ThinkingStarted), None);
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn derive_acp_status_running_on_agent_activity() {
         use crate::acp::state::ToolCall;
@@ -1797,7 +1765,6 @@ mod tests {
 
     // --- #2248: a structured session must heal out of a stale Stopped ---
 
-    #[cfg(feature = "serve")]
     fn stopped_structured_instance() -> Instance {
         let mut inst = Instance::new("s", "/tmp/s");
         inst.view = crate::session::View::Structured;
@@ -1805,13 +1772,11 @@ mod tests {
         inst
     }
 
-    #[cfg(feature = "serve")]
     fn apply(inst: &mut Instance, intent: StatusIntent) {
         let tx = broadcast::channel(8).0;
         apply_status_intent(inst, Some(intent), &tx);
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn heal_error_wakes_a_stopped_session() {
         // AcpSessionAssigned / RateLimitAutoResumed -> HealError: a fresh
@@ -1826,7 +1791,6 @@ mod tests {
         assert_eq!(inst.status, Status::Running);
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn trailing_acp_event_cannot_change_a_trashed_session_status() {
         let mut inst = stopped_structured_instance();
@@ -1842,7 +1806,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn agent_activity_wakes_an_idle_session_after_a_fired_wakeup() {
         // A session that paused on ScheduleWakeup sits Idle. When the wake
@@ -1856,7 +1819,6 @@ mod tests {
         assert_eq!(inst.idle_entered_at, None);
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn heal_error_still_heals_a_sticky_error() {
         let mut inst = stopped_structured_instance();
@@ -1865,7 +1827,6 @@ mod tests {
         assert_eq!(inst.status, Status::Idle);
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn status_intent_transitions_preserve_last_accessed_at() {
         // #3465 residual: the intent applier used to restamp
@@ -1899,7 +1860,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn relayed_intent_stamp_wipes_concurrent_archive() {
         // Full #3465 residual chain on structured rows:
@@ -1932,7 +1892,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn trailing_set_intents_do_not_wake_a_stopped_session() {
         // A deliberate Stop, or a session mid-stop, keeps emitting acp
@@ -1950,7 +1909,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn deleting_and_creating_block_every_intent() {
         for terminal in [Status::Deleting, Status::Creating] {
@@ -1963,7 +1921,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "serve")]
     #[tokio::test]
     async fn seed_unblocks_a_stopped_session_with_an_in_flight_turn() {
         use crate::acp::Event;
@@ -1989,7 +1946,6 @@ mod tests {
         assert_eq!(state.instances.read().await[0].status, Status::Running);
     }
 
-    #[cfg(feature = "serve")]
     #[tokio::test]
     async fn seed_preserves_a_deliberate_stop_across_restart() {
         use crate::acp::Event;

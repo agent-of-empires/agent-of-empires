@@ -10,12 +10,11 @@
 //!
 //! Both stand up a real `aoe serve --daemon` and the shared Node
 //! fake-ACP agent so the daemon can actually spawn a worker for the
-//! structured session. Compiled only with the `serve` feature. Run:
+//! structured session. Run:
 //!
 //! ```sh
 //! cargo test --features e2e-tests --test e2e -- structured_tui_flows
 //! ```
-#![cfg(feature = "serve")]
 
 use std::time::Duration;
 

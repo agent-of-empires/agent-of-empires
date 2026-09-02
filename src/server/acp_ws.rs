@@ -888,7 +888,7 @@ where
     }
 }
 
-#[cfg(all(test, feature = "serve"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 

@@ -844,7 +844,6 @@ impl HomeView {
         }
 
         // Serve view takes over the whole screen
-        #[cfg(feature = "serve")]
         if let Some(ref serve) = self.serve_view {
             self.divider_col = None;
             self.main_area_width = 0;
@@ -1479,10 +1478,7 @@ impl HomeView {
     }
 
     fn has_overlay_above_search(&self) -> bool {
-        #[cfg(feature = "serve")]
         let serve_open = self.serve_view.is_some();
-        #[cfg(not(feature = "serve"))]
-        let serve_open = false;
 
         self.show_help
             || self.new_dialog.is_some()
@@ -2619,10 +2615,7 @@ impl HomeView {
             // transcript scrolls inside the embedded view); the generic
             // indicator below reads the tmux capture cache and home's
             // wheel offset, both of which are stale or empty for it.
-            #[cfg(feature = "serve")]
             let structured_mounted = self.structured_preview.is_some();
-            #[cfg(not(feature = "serve"))]
-            let structured_mounted = false;
             let scroll_indicator = if !self.show_preview_info && !structured_mounted {
                 let inner_height = area.height.saturating_sub(2);
                 let visible_height = inner_height as usize;
@@ -2758,65 +2751,62 @@ impl HomeView {
             // content: info header on top (same `i` toggle and layout as
             // the terminal previews), the streaming transcript below, and
             // the drag-select machinery pointed at the painted rows.
-            #[cfg(feature = "serve")]
-            {
-                let selected_id = self.selected_session.clone();
-                let mounted_matches = self
-                    .structured_preview
-                    .as_ref()
-                    .zip(selected_id.as_deref())
-                    .is_some_and(|(v, id)| v.session_id() == id);
-                if mounted_matches {
-                    // Take/put-back so the view's `&mut` render can't
-                    // fight the instance lookup's shared borrow of self.
-                    let mut view = self.structured_preview.take();
-                    let inst = selected_id.as_deref().and_then(|id| self.get_instance(id));
-                    let layout = preview::PreviewLayout::compute(
-                        inner,
-                        compact,
-                        self.show_preview_info,
-                        inst.map(preview::agent_info_height).unwrap_or(0),
+            let selected_id = self.selected_session.clone();
+            let mounted_matches = self
+                .structured_preview
+                .as_ref()
+                .zip(selected_id.as_deref())
+                .is_some_and(|(v, id)| v.session_id() == id);
+            if mounted_matches {
+                // Take/put-back so the view's `&mut` render can't
+                // fight the instance lookup's shared borrow of self.
+                let mut view = self.structured_preview.take();
+                let inst = selected_id.as_deref().and_then(|id| self.get_instance(id));
+                let layout = preview::PreviewLayout::compute(
+                    inner,
+                    compact,
+                    self.show_preview_info,
+                    inst.map(preview::agent_info_height).unwrap_or(0),
+                );
+                if let (Some(info_area), Some(inst)) = (layout.info, inst) {
+                    preview::Preview::render_info(
+                        frame,
+                        info_area,
+                        inst,
+                        theme,
+                        self.idle_decay_window,
                     );
-                    if let (Some(info_area), Some(inst)) = (layout.info, inst) {
-                        preview::Preview::render_info(
-                            frame,
-                            info_area,
-                            inst,
-                            theme,
-                            self.idle_decay_window,
-                        );
-                    }
-                    // No ` Output ` banner row: the transcript block has
-                    // its own titled border, so the banner slot stays a
-                    // blank separator under the header.
-                    let geometry = view
-                        .as_mut()
-                        .and_then(|v| v.render(frame, layout.output, theme));
-                    self.structured_preview = view;
-                    self.preview_pane_area = layout.output;
-                    if let Some(g) = geometry {
-                        self.preview_visible_rows = g.text_area.height as usize;
-                        self.preview_text_view = crate::tui::home::PreviewTextView {
-                            pane: g.text_area,
-                            first_line: g.first_line,
-                            total_lines: g.total_lines,
-                        };
-                    }
-                    self.paint_preview_selection(frame, theme);
-                    return;
                 }
-                if self.structured_preview_pending {
-                    // A mount is underway (or about to start): render a
-                    // quiet beat instead of the wordy "press Enter" page,
-                    // which otherwise flashes on every selection.
-                    let para = Paragraph::new(Line::from(Span::styled(
-                        "…",
-                        Style::default().fg(theme.dimmed),
-                    )))
-                    .alignment(Alignment::Center);
-                    frame.render_widget(para, inner);
-                    return;
+                // No ` Output ` banner row: the transcript block has
+                // its own titled border, so the banner slot stays a
+                // blank separator under the header.
+                let geometry = view
+                    .as_mut()
+                    .and_then(|v| v.render(frame, layout.output, theme));
+                self.structured_preview = view;
+                self.preview_pane_area = layout.output;
+                if let Some(g) = geometry {
+                    self.preview_visible_rows = g.text_area.height as usize;
+                    self.preview_text_view = crate::tui::home::PreviewTextView {
+                        pane: g.text_area,
+                        first_line: g.first_line,
+                        total_lines: g.total_lines,
+                    };
                 }
+                self.paint_preview_selection(frame, theme);
+                return;
+            }
+            if self.structured_preview_pending {
+                // A mount is underway (or about to start): render a
+                // quiet beat instead of the wordy "press Enter" page,
+                // which otherwise flashes on every selection.
+                let para = Paragraph::new(Line::from(Span::styled(
+                    "…",
+                    Style::default().fg(theme.dimmed),
+                )))
+                .alignment(Alignment::Center);
+                frame.render_widget(para, inner);
+                return;
             }
             self.render_structured_preview(frame, inner, theme);
             self.paint_preview_selection(frame, theme);
@@ -3745,23 +3735,27 @@ impl HomeView {
         // The TUI does not own the daemon, so we probe the PID file each
         // render. Mode comes from a PID-keyed cache so we don't read the
         // serve.mode file from disk on every frame.
-        #[cfg(feature = "serve")]
-        {
-            let mode_label = crate::cli::serve::cached_serve_mode_label();
-            if crate::cli::serve::daemon_pid().is_some() {
-                let label = match mode_label {
-                    Some(m) => format!(" \u{25CF} Serving ({}) ", m),
-                    None => " \u{25CF} Serving ".to_string(),
-                };
-                groups.push((
-                    0,
-                    None,
-                    vec![Span::styled(
-                        label,
-                        Style::default().fg(theme.running).bold(),
-                    )],
-                ));
-            }
+        let mode_label = crate::cli::serve::cached_serve_mode_label();
+        if crate::cli::serve::daemon_pid().is_some() {
+            // A build without the dashboard bundle answers the API only, so
+            // the badge must not read as "the dashboard is up".
+            let what = if cfg!(feature = "web") {
+                "Serving"
+            } else {
+                "Serving API"
+            };
+            let label = match mode_label {
+                Some(m) => format!(" \u{25CF} {} ({}) ", what, m),
+                None => format!(" \u{25CF} {} ", what),
+            };
+            groups.push((
+                0,
+                None,
+                vec![Span::styled(
+                    label,
+                    Style::default().fg(theme.running).bold(),
+                )],
+            ));
         }
 
         // Other-TUI indicator: shown only when more than one `aoe` TUI is

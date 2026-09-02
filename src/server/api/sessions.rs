@@ -179,7 +179,6 @@ pub struct SessionResponse {
     /// How this session is rendered: `structured` (ACP native rendering) or
     /// `terminal` (tmux-backed PTY). The web dashboard branches on this to
     /// pick the structured panels vs the terminal view.
-    #[cfg(feature = "serve")]
     #[serde(default, skip_serializing_if = "crate::session::View::is_terminal")]
     pub view: crate::session::View,
     /// Live structured view worker lifecycle. `absent` for tmux sessions or
@@ -188,20 +187,17 @@ pub struct SessionResponse {
     /// `running` once the supervisor holds a live worker. Drives the
     /// sidebar `Resuming…` chip and the per-session banner in the
     /// structured view. See #1088.
-    #[cfg(feature = "serve")]
     pub acp_worker_state: crate::acp::supervisor::AcpWorkerState,
     /// True when this session's agent can run in structured view: a built-in
     /// with an ACP adapter, or a custom agent whose profile config
     /// declares a valid `agent_acp_cmd`. The web terminal view reads
     /// this to decide whether the "switch to structured view" affordance is
     /// available, replacing the hardcoded client-side tool list.
-    #[cfg(feature = "serve")]
     pub acp_capable: bool,
     /// The session's server-owned prompt queue (follow-ups the user lined up
     /// while a turn was busy), ordered by `seq`. The daemon owns it, so it is
     /// visible across the user's devices and survives a client reload; the
     /// structured view renders it and drains happen server-side.
-    #[cfg(feature = "serve")]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queued_prompts: Vec<crate::acp::state::QueuedPromptEntry>,
     /// The session's captured ACP session id, present only once the
@@ -209,7 +205,6 @@ pub struct SessionResponse {
     /// as `fork_from` on a structured fork create and gates the "Fork" action
     /// on it together with `acp_can_fork`. Omitted when absent (terminal
     /// sessions, or structured ones whose worker has not minted an id yet).
-    #[cfg(feature = "serve")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acp_session_id: Option<String>,
     /// The session's resolved ACP registry key (`agent_name` when set, else
@@ -219,7 +214,6 @@ pub struct SessionResponse {
     /// only event that populates the reduced `state.agent`), so it can gray
     /// out the running backend on a never-switched session. Omitted for
     /// sessions with no resolved agent. See #2803.
-    #[cfg(feature = "serve")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acp_agent: Option<String>,
     /// True when this session's agent can run a structured ACP `session/fork`,
@@ -228,7 +222,6 @@ pub struct SessionResponse {
     /// gates "Fork" on this AND `acp_session_id` rather than on a captured id
     /// alone. Omitted (read as not-forkable) for terminal sessions and
     /// non-forkable agents.
-    #[cfg(feature = "serve")]
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub acp_can_fork: bool,
     /// Whether switching this session between terminal and structured view
@@ -237,7 +230,6 @@ pub struct SessionResponse {
     /// `agents::acp_transcript_cli_resumable` so the dashboard and TUI stop
     /// each recomputing it from `tool` + `acp_agent`. Omitted for
     /// non-preserving pairings.
-    #[cfg(feature = "serve")]
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub keeps_context: bool,
     /// Slash-command aliases that reset the conversation for this session's
@@ -245,7 +237,6 @@ pub struct SessionResponse {
     /// `acp::agent_profiles::resolve(...).clear_aliases` so the composer's `/`
     /// palette and queued-prompt batching do not mirror the per-agent list.
     /// Omitted for agents with no clear alias.
-    #[cfg(feature = "serve")]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub clear_aliases: Vec<String>,
     /// True when the session is a Claude Code session AND the user has
@@ -339,7 +330,6 @@ impl SessionResponse {
             inst,
             claude_fullscreen,
             None,
-            #[cfg(feature = "serve")]
             crate::acp::supervisor::AcpWorkerState::Absent,
             None,
             None,
@@ -354,7 +344,7 @@ impl SessionResponse {
         inst: &Instance,
         claude_fullscreen: bool,
         plan_summary: Option<PlanSummary>,
-        #[cfg(feature = "serve")] acp_worker_state: crate::acp::supervisor::AcpWorkerState,
+        acp_worker_state: crate::acp::supervisor::AcpWorkerState,
         next_wakeup_at: Option<String>,
         next_wakeup_reason: Option<String>,
         // `Some(description)` when the session has an armed `Monitor` (the
@@ -440,21 +430,17 @@ impl SessionResponse {
             notify_on_waiting: inst.notify_on_waiting,
             notify_on_idle: inst.notify_on_idle,
             notify_on_error: inst.notify_on_error,
-            #[cfg(feature = "serve")]
             view: inst.view,
-            #[cfg(feature = "serve")]
             queued_prompts: {
                 let mut q = inst.queued_prompts.clone();
                 q.sort_by_key(|e| e.seq);
                 q
             },
-            #[cfg(feature = "serve")]
             acp_worker_state,
             // Built-in ACP capability is resolved here from a process-wide
             // registry (cheap, no IO). Custom agents depend on profile
             // config; the list and create handlers overlay that without a
             // per-row config read.
-            #[cfg(feature = "serve")]
             acp_capable: {
                 let resolved = inst
                     .agent_name
@@ -463,13 +449,11 @@ impl SessionResponse {
                     .unwrap_or(inst.tool.as_str());
                 builtin_acp_registry().get(resolved).is_some()
             },
-            #[cfg(feature = "serve")]
             acp_session_id: inst.acp_session_id.clone(),
             // Resolved the same way as `acp_capable` above: `agent_name` when
             // set and non-empty, else `tool`. This is the ACP registry key,
             // so it matches `/api/acp/agents` names the switch-agent modal
             // filters against. See #2803.
-            #[cfg(feature = "serve")]
             acp_agent: {
                 let resolved = inst
                     .agent_name
@@ -481,11 +465,9 @@ impl SessionResponse {
             // Shares `agent_is_structured_fork_capable` with the create-time
             // guard so the web "Fork" affordance and server-side acceptance
             // cannot drift: forkable = built-in ACP adapter verified to fork.
-            #[cfg(feature = "serve")]
             acp_can_fork: agent_is_structured_fork_capable(&inst.tool, inst.agent_name.as_deref()),
             // Same agent resolution as `acp_agent` above; computed once here so
             // the web dashboard and native TUI stop mirroring the gate.
-            #[cfg(feature = "serve")]
             keeps_context: crate::agents::acp_transcript_cli_resumable(
                 &inst.tool,
                 inst.agent_name
@@ -496,7 +478,6 @@ impl SessionResponse {
             // Same agent resolution as `acp_agent` above; the composer palette
             // and queued-prompt clear-boundary hint read these instead of a
             // client-side per-agent mirror.
-            #[cfg(feature = "serve")]
             clear_aliases: crate::acp::agent_profiles::resolve(
                 inst.agent_name
                     .as_deref()
@@ -578,7 +559,6 @@ pub struct SessionsEnvelope {
 /// Process-wide built-in ACP registry, built once. Used to compute
 /// `SessionResponse.acp_capable` for built-in agents without allocating
 /// a registry per response row.
-#[cfg(feature = "serve")]
 fn builtin_acp_registry() -> &'static crate::acp::AgentRegistry {
     static REG: std::sync::OnceLock<crate::acp::AgentRegistry> = std::sync::OnceLock::new();
     REG.get_or_init(crate::acp::AgentRegistry::with_defaults)
@@ -588,7 +568,6 @@ fn builtin_acp_registry() -> &'static crate::acp::AgentRegistry {
 /// `agent_acp_cmd`, or it inherits a registry-backed base via
 /// `agent_detect_as`. Built-in capability is handled separately in the
 /// constructor, so this only covers the custom case.
-#[cfg(feature = "serve")]
 fn custom_agent_acp_capable(session: &crate::session::config::SessionConfig, tool: &str) -> bool {
     session
         .agent_acp_cmd
@@ -666,7 +645,6 @@ pub async fn list_sessions(
     let claude_fullscreen = crate::claude_settings::read_tui_fullscreen();
     // Snapshot the supervisor's worker lifecycle map once per request
     // rather than locking it per row. See #1088.
-    #[cfg(feature = "serve")]
     let worker_states = state.acp_supervisor.worker_states_snapshot().await;
     // Filtered once up front; every positional zip with `instances` below
     // (ACP capability overlay, smart-rename overlay) must walk this same
@@ -711,7 +689,6 @@ pub async fn list_sessions(
             } else {
                 None
             };
-            #[cfg(feature = "serve")]
             let acp_worker_state = worker_states
                 .get(&inst.id)
                 .copied()
@@ -720,7 +697,6 @@ pub async fn list_sessions(
                 inst,
                 claude_fullscreen,
                 plan_summary,
-                #[cfg(feature = "serve")]
                 acp_worker_state,
                 next_wakeup_at,
                 next_wakeup_reason,
@@ -739,19 +715,16 @@ pub async fn list_sessions(
     // Overlay custom-agent ACP capability (built-ins were resolved in the
     // constructor). Distinct `(profile, project_path)` pairs each resolve
     // once via the shared cache above.
-    #[cfg(feature = "serve")]
-    {
-        for (resp, inst) in sessions.iter_mut().zip(scoped_instances.iter().copied()) {
-            if resp.acp_capable {
-                continue;
-            }
-            let cfg = resolve_session_cfg(
-                &mut session_cfg_cache,
-                &inst.source_profile,
-                &inst.project_path,
-            );
-            resp.acp_capable = custom_agent_acp_capable(cfg, &inst.tool);
+    for (resp, inst) in sessions.iter_mut().zip(scoped_instances.iter().copied()) {
+        if resp.acp_capable {
+            continue;
         }
+        let cfg = resolve_session_cfg(
+            &mut session_cfg_cache,
+            &inst.source_profile,
+            &inst.project_path,
+        );
+        resp.acp_capable = custom_agent_acp_capable(cfg, &inst.tool);
     }
 
     // Resolve per-profile cleanup defaults with a TTL cache on AppState
@@ -2985,15 +2958,8 @@ pub async fn update_session_archive(
         }
         let response =
             SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
-        let structured_view;
-        #[cfg(feature = "serve")]
-        {
-            structured_view = inst.is_structured();
-        }
-        #[cfg(not(feature = "serve"))]
-        {
-            structured_view = false;
-        }
+
+        let structured_view = inst.is_structured();
         let inst_snap = inst.clone();
         drop(instances);
 
@@ -3011,7 +2977,6 @@ pub async fn update_session_archive(
         // Worker shutdown before ancillary kill so in-flight tool output
         // settles (mirrors acp.rs:1304-1310). shutdown() preserves the
         // transcript (#1710).
-        #[cfg(feature = "serve")]
         match state.acp_supervisor.shutdown(&id).await {
             Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
             Err(e) => tracing::warn!(
@@ -3152,7 +3117,6 @@ pub async fn trash_session(
     }
 
     if was_structured_view {
-        #[cfg(feature = "serve")]
         match state.acp_supervisor.shutdown(&id).await {
             Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
             Err(error) => tracing::warn!(
@@ -3700,15 +3664,8 @@ pub async fn stop_session(
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
             return super::session_not_found();
         };
-        let structured;
-        #[cfg(feature = "serve")]
-        {
-            structured = inst.is_structured();
-        }
-        #[cfg(not(feature = "serve"))]
-        {
-            structured = false;
-        }
+
+        let structured = inst.is_structured();
         // Mirror the TUI's `stop_selected` guard: a session that is already
         // stopped or mid-lifecycle has nothing to stop.
         let already = matches!(
@@ -3776,7 +3733,6 @@ pub async fn stop_session(
         // Structured view: shut down the worker so the reconciler does not
         // race to respawn it. `shutdown` preserves the transcript, so the
         // session resumes the conversation when reopened.
-        #[cfg(feature = "serve")]
         match state.acp_supervisor.shutdown(&id).await {
             Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
             Err(e) => tracing::warn!(
@@ -3871,15 +3827,8 @@ pub async fn start_session(
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
             return super::session_not_found();
         };
-        let structured;
-        #[cfg(feature = "serve")]
-        {
-            structured = inst.is_structured();
-        }
-        #[cfg(not(feature = "serve"))]
-        {
-            structured = false;
-        }
+
+        let structured = inst.is_structured();
         (
             inst.source_profile.clone(),
             structured,
@@ -4087,15 +4036,8 @@ pub async fn update_session_snooze(
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
             return super::session_not_found();
         };
-        let structured_view;
-        #[cfg(feature = "serve")]
-        {
-            structured_view = inst.is_structured();
-        }
-        #[cfg(not(feature = "serve"))]
-        {
-            structured_view = false;
-        }
+
+        let structured_view = inst.is_structured();
         (structured_view, inst.source_profile.clone())
     };
 
@@ -4150,7 +4092,6 @@ pub async fn update_session_snooze(
     // `shutdown` preserves the agent transcript (no session/delete), so
     // that respawn resumes the conversation instead of resetting it
     // (#1710).
-    #[cfg(feature = "serve")]
     if was_structured_view && minutes.is_some() {
         match state.acp_supervisor.shutdown(&id).await {
             Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
@@ -4161,8 +4102,6 @@ pub async fn update_session_snooze(
             ),
         }
     }
-    #[cfg(not(feature = "serve"))]
-    let _ = was_structured_view;
 
     let instances = state.instances.read().await;
     let response = match instances.iter().find(|i| i.id == id) {
@@ -4307,7 +4246,6 @@ async fn mark_delete_error(state: &AppState, id: &str, message: String) {
 /// removed, and `false` when a concurrent restore won the race and the row was
 /// deliberately kept (see the `kept_restored` branch). Callers must not report
 /// a kept row as deleted.
-#[cfg_attr(not(feature = "serve"), allow(unused_variables))]
 async fn purge_session_artifacts(
     state: &Arc<AppState>,
     id: &str,
@@ -4376,10 +4314,7 @@ async fn purge_session_artifacts(
         .await
         .map_err(|e| format!("Deletion hook task failed: {e}"))?;
 
-    #[cfg(feature = "serve")]
     let transcript_purged = instance.is_structured();
-    #[cfg(not(feature = "serve"))]
-    let transcript_purged = false;
 
     let deletion_result = if transcript_purged {
         // Commit the row removal before deleting the ACP transcript. A lost
@@ -4404,22 +4339,18 @@ async fn purge_session_artifacts(
 
                 // The worker may still use the worktree, so ACP teardown stays
                 // ahead of sidecar cleanup. The durable row is already gone.
-                #[cfg(feature = "serve")]
-                {
-                    match state.acp_supervisor.shutdown_and_delete(id).await {
-                        Ok(())
-                        | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
-                        Err(e) => {
-                            tracing::warn!(
-                                target: "acp.supervisor",
-                                session = %id,
-                                "shutdown during purge failed: {e}"
-                            );
-                        }
+                match state.acp_supervisor.shutdown_and_delete(id).await {
+                    Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "acp.supervisor",
+                            session = %id,
+                            "shutdown during purge failed: {e}"
+                        );
                     }
-                    state.acp_supervisor.forget_session(id);
-                    state.acp_event_store.delete_session(id);
                 }
+                state.acp_supervisor.forget_session(id);
+                state.acp_event_store.delete_session(id);
 
                 tokio::task::spawn_blocking(move || committed.finish())
                     .await
@@ -4633,7 +4564,6 @@ pub(crate) async fn reconcile_trashed_worktrees(state: &Arc<AppState>) {
 /// per-instance locked and its trashed+expired state re-validated under the
 /// lock, so a concurrent restore wins the race and is never purged. See
 /// #2489.
-#[cfg(feature = "serve")]
 pub(crate) async fn purge_expired_trash(state: &Arc<AppState>) {
     use std::collections::HashMap;
 
@@ -5229,16 +5159,12 @@ pub struct CreateSessionBody {
     /// case it defaults to `terminal`. The value is re-validated against real
     /// ACP capability below before being persisted, so a tampered request
     /// can't force the structured view on a non-ACP tool.
-    #[cfg(feature = "serve")]
     #[serde(default)]
     pub view: crate::session::View,
-    #[cfg(feature = "serve")]
     #[serde(default)]
     pub agent_name: Option<String>,
-    #[cfg(feature = "serve")]
     #[serde(default)]
     pub agent_model: Option<String>,
-    #[cfg(feature = "serve")]
     #[serde(default)]
     pub agent_effort: Option<String>,
     /// Scratch session: server provisions a fresh directory under
@@ -5260,7 +5186,6 @@ pub struct CreateSessionBody {
     /// new session adopts this id as its `acp_session_id`, is forced to the
     /// structured view, and seeds its transcript from the agent's history
     /// replay. `path` must be the session's original cwd. See #2276.
-    #[cfg(feature = "serve")]
     #[serde(default)]
     pub import_acp_session_id: Option<String>,
     /// Fork an existing session: the source session's captured session id to
@@ -5272,7 +5197,6 @@ pub struct CreateSessionBody {
     /// resumes the parent `agent_session_id` with the agent's fork flag. A
     /// structured fork requested for a non-ACP agent is rejected rather than
     /// silently downgraded.
-    #[cfg(feature = "serve")]
     #[serde(default)]
     pub fork_from: Option<String>,
     /// External work-queue dispatcher completion callback: an HTTP POST
@@ -5322,7 +5246,6 @@ fn create_body_combines_scratch_and_worktree(body: &CreateSessionBody) -> bool {
 /// `Err` reports an unforkable terminal agent or missing parent id; a
 /// structured request is already rejected by the caller's
 /// `agent_is_structured_fork_capable` guard before it reaches here.
-#[cfg(feature = "serve")]
 fn resolve_create_fork_seed(
     tool: &str,
     parent_id: &str,
@@ -5344,7 +5267,6 @@ fn resolve_create_fork_seed(
 /// a parent. The two seed the new session from different sources, so allowing
 /// both would produce a contradictory half-imported, half-forked session.
 /// Trailing whitespace is treated as unset, matching the per-field guards.
-#[cfg(feature = "serve")]
 fn both_import_and_fork_set(body: &CreateSessionBody) -> bool {
     let set = |v: &Option<String>| v.as_deref().map(str::trim).is_some_and(|s| !s.is_empty());
     set(&body.import_acp_session_id) && set(&body.fork_from)
@@ -5354,7 +5276,6 @@ fn both_import_and_fork_set(body: &CreateSessionBody) -> bool {
 /// the single source of truth for "can this agent run the ACP `session/fork`
 /// handshake?". Shared by the `SessionResponse.acp_can_fork` projection (the web
 /// "Fork" affordance) and the create-time guard so they cannot drift.
-#[cfg(feature = "serve")]
 fn agent_is_structured_fork_capable(tool: &str, agent_name: Option<&str>) -> bool {
     crate::session::fork::structured_fork_capable(tool, agent_name)
 }
@@ -5364,7 +5285,6 @@ fn agent_is_structured_fork_capable(tool: &str, agent_name: Option<&str>) -> boo
 /// `agent_acp_cmd`. Mirrors the post-build capability check (below) so
 /// CityHall mode can reject a non-ACP agent up front instead of letting the
 /// session silently downgrade to the terminal view. See #7.
-#[cfg(feature = "serve")]
 /// The ACP registry key a create request resolves to: an explicit `agent_name`
 /// when present, else the tool name. Shared by the capability check and the
 /// allowlist check (#3241) so the two cannot judge different agents.
@@ -5683,7 +5603,6 @@ pub(crate) fn run_create_hooks(
 /// binary via `build_host_command`), destroy it, or edit it. Returns the
 /// canonical CityHall 403 (never a 404, so the mode does not leak which ids
 /// exist); `None` in normal mode or for a genuine structured target. See #7.
-#[cfg(feature = "serve")]
 async fn cityhall_block_non_structured(
     state: &AppState,
     id: &str,
@@ -5704,7 +5623,6 @@ async fn cityhall_block_non_structured(
 /// Plural [`cityhall_block_non_structured`]: refuse unless EVERY id resolves to
 /// a structured session this mode created. Used by multi-session teardown
 /// (`delete_workspace`), which acts on all ids, not just the owner. See #7.
-#[cfg(feature = "serve")]
 async fn cityhall_block_any_non_structured(
     state: &AppState,
     ids: &[String],
@@ -5854,32 +5772,29 @@ pub async fn create_session(
         let mut paths = projects.into_iter().map(|p| p.path);
         body.path = paths.next().unwrap();
         body.extra_repo_paths = paths.collect();
-        #[cfg(feature = "serve")]
-        {
-            body.view = crate::session::View::Structured;
-            // Fork / import resume an existing agent session and would bypass the
-            // server-derived path + ACP gate, so they are not honored in the mode.
-            body.fork_from = None;
-            body.import_acp_session_id = None;
-            let profile = body
-                .profile
-                .clone()
-                .unwrap_or_else(|| state.profile.clone());
-            if !agent_is_acp_capable(
-                &profile,
-                std::path::Path::new(&body.path),
-                &body.tool,
-                body.agent_name.as_deref(),
-            ) {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": "cityhall_agent_not_acp",
-                        "message": "CityHall mode requires an ACP-capable agent"
-                    })),
-                )
-                    .into_response();
-            }
+        body.view = crate::session::View::Structured;
+        // Fork / import resume an existing agent session and would bypass the
+        // server-derived path + ACP gate, so they are not honored in the mode.
+        body.fork_from = None;
+        body.import_acp_session_id = None;
+        let profile = body
+            .profile
+            .clone()
+            .unwrap_or_else(|| state.profile.clone());
+        if !agent_is_acp_capable(
+            &profile,
+            std::path::Path::new(&body.path),
+            &body.tool,
+            body.agent_name.as_deref(),
+        ) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "cityhall_agent_not_acp",
+                    "message": "CityHall mode requires an ACP-capable agent"
+                })),
+            )
+                .into_response();
         }
     }
 
@@ -6025,7 +5940,6 @@ pub async fn create_session(
     // non-ACP tool is downgraded to a terminal session further down, and terminal
     // sessions are deliberately out of scope (a pane can exec any binary), so
     // refusing here would reject a session the policy does not govern.
-    #[cfg(feature = "serve")]
     if body.view == crate::session::View::Structured {
         let agent_key = acp_agent_key(&body.tool, body.agent_name.as_deref());
         let profile = validation_profile.to_string();
@@ -6056,7 +5970,6 @@ pub async fn create_session(
     // different source (import adopts an on-disk session id; fork resumes a
     // parent's captured id), and honoring both would leave the session in a
     // contradictory half-imported, half-forked state. Reject up front.
-    #[cfg(feature = "serve")]
     if both_import_and_fork_set(&body) {
         return (
             StatusCode::BAD_REQUEST,
@@ -6077,7 +5990,6 @@ pub async fn create_session(
     // so a stale or hand-written request can't seed the transcript in the
     // wrong place. Runs after tool-identity validation so it sits ahead of
     // the build's spawn_blocking but behind the agent check.
-    #[cfg(feature = "serve")]
     if let Some(import_id) = body
         .import_acp_session_id
         .as_deref()
@@ -6127,7 +6039,6 @@ pub async fn create_session(
     // later. The builder applies the seed: a structured seed forces the
     // structured view and sets the one-shot `fork_pending`/`import_pending`
     // markers; a terminal seed pre-pins the child id and the Fork intent.
-    #[cfg(feature = "serve")]
     let fork_seed = match body
         .fork_from
         .as_deref()
@@ -6264,17 +6175,11 @@ pub async fn create_session(
         plugin_create_idempotency: None,
         pending_initial_turn: None,
         acp_mode_id: None,
-        #[cfg(feature = "serve")]
         view: body.view,
-        #[cfg(feature = "serve")]
         agent_name: body.agent_name,
-        #[cfg(feature = "serve")]
         agent_model: body.agent_model,
-        #[cfg(feature = "serve")]
         agent_effort: body.agent_effort,
-        #[cfg(feature = "serve")]
         import_acp_session_id: body.import_acp_session_id,
-        #[cfg(feature = "serve")]
         fork_seed,
     };
 
@@ -6293,24 +6198,20 @@ pub async fn create_session(
             // Carry the resolved tie value (#1927); list_sessions' overlay does
             // not run on this create response, so a managed worktree would
             // otherwise report untied until the next list refresh.
-            #[cfg(feature = "serve")]
-            {
-                if resp.has_managed_worktree {
-                    resp.tie_workdir_to_name =
-                        crate::session::profile_config::resolve_config_or_warn(
-                            &instance.source_profile,
-                        )
-                        .session
-                        .tie_workdir_to_name;
-                }
-                if !resp.acp_capable {
-                    let session = crate::session::repo_config::resolve_config_with_repo_or_warn(
-                        &instance.source_profile,
-                        std::path::Path::new(&instance.project_path),
-                    )
-                    .session;
-                    resp.acp_capable = custom_agent_acp_capable(&session, &instance.tool);
-                }
+            if resp.has_managed_worktree {
+                resp.tie_workdir_to_name = crate::session::profile_config::resolve_config_or_warn(
+                    &instance.source_profile,
+                )
+                .session
+                .tie_workdir_to_name;
+            }
+            if !resp.acp_capable {
+                let session = crate::session::repo_config::resolve_config_with_repo_or_warn(
+                    &instance.source_profile,
+                    std::path::Path::new(&instance.project_path),
+                )
+                .session;
+                resp.acp_capable = custom_agent_acp_capable(&session, &instance.tool);
             }
 
             if query.wait.as_deref() == Some("ready") && instance.status == Status::Starting {
@@ -8224,7 +8125,6 @@ mod tests {
 
     // CityHall create-time capability gate (#7): create_session rejects a
     // non-ACP agent up front instead of downgrading to a hidden terminal view.
-    #[cfg(feature = "serve")]
     mod cityhall_capability {
         use super::*;
         use crate::session::test_support::isolate_app_dir;
@@ -8424,7 +8324,6 @@ mod tests {
     // Reverting to the profile-only resolver would miss the override and fall
     // through to the "no prompt yet" path (both are 409, so this asserts the
     // body message, not just the status).
-    #[cfg(feature = "serve")]
     #[tokio::test]
     #[serial_test::serial]
     async fn force_smart_rename_preflight_sees_command_override_but_not_from_a_repo() {
@@ -8485,7 +8384,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "serve")]
     #[tokio::test]
     #[serial_test::serial]
     async fn list_sessions_shares_config_resolution_across_overlays() {
@@ -8524,7 +8422,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "serve")]
     #[tokio::test]
     #[serial_test::serial]
     async fn list_sessions_state_filter() {
@@ -8586,7 +8483,6 @@ mod tests {
         assert_eq!(ids(&explicit_all).len(), 3);
     }
 
-    #[cfg(feature = "serve")]
     #[tokio::test]
     async fn wait_until_left_starting_returns_immediately_if_already_left() {
         let mut inst = Instance::new("already-running", "/tmp/wait-a");
@@ -8608,7 +8504,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "serve")]
     #[tokio::test]
     async fn wait_until_left_starting_resolves_on_broadcast() {
         let mut inst = Instance::new("starting", "/tmp/wait-b");
@@ -8647,7 +8542,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "serve")]
     #[tokio::test]
     async fn wait_until_left_starting_times_out_with_current_status() {
         let mut inst = Instance::new("stuck", "/tmp/wait-c");
@@ -8668,7 +8562,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "serve")]
     #[tokio::test]
     async fn wait_until_left_starting_returns_none_if_instance_vanished() {
         let state = crate::server::test_support::build_test_app_state(vec![]);
@@ -8878,7 +8771,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn acp_can_fork_tracks_acp_capable_and_fork_strategy() {
         // claude is ACP-capable AND declares a real fork strategy, so the web
@@ -10457,14 +10349,12 @@ mod tests {
     /// `purge_session_artifacts` refuses on its first line. The teardown that
     /// follows is what a delete must not start under an in-flight submission;
     /// these tests only need to observe that it waits for one.
-    #[cfg(feature = "serve")]
     fn delete_race_state(id: &str) -> std::sync::Arc<crate::server::AppState> {
         delete_race_state_for(&[id])
     }
 
     /// [`delete_race_state`] for a workspace: every id shares the shape, so a
     /// sibling teardown can be observed the same way the owner's is.
-    #[cfg(feature = "serve")]
     fn delete_race_state_for(ids: &[&str]) -> std::sync::Arc<crate::server::AppState> {
         let instances = ids
             .iter()
@@ -10488,7 +10378,6 @@ mod tests {
     /// Each permanent-delete path is checked the same way: hold the session's
     /// submission guard (standing in for that drain) and assert the delete
     /// parks before any teardown, then completes once the guard drops.
-    #[cfg(feature = "serve")]
     #[tokio::test]
     async fn permanent_deletion_waits_for_an_in_flight_submission() {
         use std::time::Duration;
@@ -10608,7 +10497,6 @@ mod tests {
     /// config, which reads the user's global config, before it reaches the
     /// guard, so the race above cannot cover it without reading user state.
     /// The lock order is asserted in the source instead.
-    #[cfg(feature = "serve")]
     #[test]
     fn the_retention_purge_takes_submission_before_the_instance_lock() {
         let source = std::fs::read_to_string(
@@ -10639,7 +10527,6 @@ mod tests {
     /// Before #3639 the drain held `instance_lock` across delivery and these
     /// four handlers were excluded by it. They take the submission guard now
     /// for the same reason `attach_project` and the tied renames do.
-    #[cfg(feature = "serve")]
     #[tokio::test]
     async fn worker_stopping_handlers_wait_for_an_in_flight_submission() {
         use std::time::Duration;
@@ -10708,7 +10595,6 @@ mod tests {
     /// id it is handed and nothing prunes it, so every externally reachable
     /// mutation that claims it must prove the session exists first. Otherwise
     /// an authenticated client grows daemon memory with random ids.
-    #[cfg(feature = "serve")]
     #[tokio::test]
     async fn session_mutations_allocate_no_prompt_lock_for_an_unknown_id() {
         let state = crate::server::test_support::build_test_app_state(Vec::new());
@@ -12101,22 +11987,14 @@ mod workspace_ordering_tests {
             notify_on_waiting: None,
             notify_on_idle: None,
             notify_on_error: None,
-            #[cfg(feature = "serve")]
             view: crate::session::View::Terminal,
-            #[cfg(feature = "serve")]
             acp_worker_state: crate::acp::supervisor::AcpWorkerState::Absent,
             queued_prompts: Vec::new(),
-            #[cfg(feature = "serve")]
             acp_capable: false,
-            #[cfg(feature = "serve")]
             acp_session_id: None,
-            #[cfg(feature = "serve")]
             acp_agent: None,
-            #[cfg(feature = "serve")]
             acp_can_fork: false,
-            #[cfg(feature = "serve")]
             keeps_context: false,
-            #[cfg(feature = "serve")]
             clear_aliases: Vec::new(),
             claude_fullscreen: false,
             workspace_repos: Vec::new(),

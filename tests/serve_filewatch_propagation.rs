@@ -12,8 +12,6 @@
 //! Storage::update -> notify_local_change -> dispatcher Local arm ->
 //! debounce-collapse with kernel echo -> subscriber receipt.
 
-#![cfg(feature = "serve")]
-
 mod home_isolation;
 
 use std::sync::Arc;

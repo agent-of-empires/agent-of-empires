@@ -11,12 +11,11 @@
 //! fake-ACP `tool_call` shape (toolCallId / kind / status / rawInput) is
 //! identical, so the TUI and the dashboard exercise the same wire data.
 //!
-//! Compiled only with the default `serve` feature (excluded by `--no-default-features`). Run via:
+//! Run via:
 //!
 //! ```sh
 //! cargo test --features e2e-tests --test e2e -- acp_tool_cards
 //! ```
-#![cfg(feature = "serve")]
 
 use std::time::{Duration, Instant};
 

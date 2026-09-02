@@ -8,23 +8,14 @@ use anyhow::Result;
 use clap::{CommandFactory, FromArgMatches, Parser};
 use clap_complete::generate;
 
-/// Did the user invoke `aoe serve`? Feature-gated because `Commands::Serve`
-/// only exists when the `serve` feature is on; in TUI-only builds we
-/// always return false so the tracing-init branch below compiles.
-#[cfg(feature = "serve")]
+/// Did the user invoke `aoe serve`?
 fn is_serve_command(cli: &Cli) -> bool {
     matches!(cli.command, Some(Commands::Serve(_)))
-}
-
-#[cfg(not(feature = "serve"))]
-fn is_serve_command(_cli: &Cli) -> bool {
-    false
 }
 
 /// Bridge the serve `--cityhall` flag into the `AOE_CITYHALL_MODE` env var at
 /// the early, single-threaded point in `main` (before the tokio worker pool),
 /// so downstream readers stay env-driven without an in-runtime `set_var`. #7.
-#[cfg(feature = "serve")]
 fn seed_cityhall_env(cli: &Cli) {
     if let Some(Commands::Serve(args)) = &cli.command {
         if args.cityhall {
@@ -37,9 +28,6 @@ fn seed_cityhall_env(cli: &Cli) {
     }
 }
 
-#[cfg(not(feature = "serve"))]
-fn seed_cityhall_env(_cli: &Cli) {}
-
 /// Did the parent `aoe serve --daemon` spawn this process as the detached
 /// child? Set by `start_daemon()` via the hidden `--daemon-child` flag.
 /// Drives sink resolution: child's stdout/stderr are redirected to the
@@ -47,14 +35,8 @@ fn seed_cityhall_env(_cli: &Cli) {}
 /// would land bytes in the same file via the OS redirect, but mixing two
 /// writers on the same fd hurts ordering, and the configured-sink path
 /// is what the TUI dialog and `aoe logs` tail).
-#[cfg(feature = "serve")]
 fn is_serve_daemon_child(cli: &Cli) -> bool {
     matches!(cli.command, Some(Commands::Serve(ref args)) if args.daemon_child)
-}
-
-#[cfg(not(feature = "serve"))]
-fn is_serve_daemon_child(_cli: &Cli) -> bool {
-    false
 }
 
 /// When the `aoe.web` plugin is disabled, a fresh `aoe serve` start behaves as
@@ -64,7 +46,6 @@ fn is_serve_daemon_child(_cli: &Cli) -> bool {
 /// so a running daemon can always be inspected and brought down. Returns the
 /// clap error to raise, or `None` when the invocation is allowed. Only the
 /// caller calls `.exit()`, so the decision stays unit-testable.
-#[cfg(feature = "serve")]
 fn serve_unavailable_error(cli: &Cli) -> Option<clap::Error> {
     cli::graft::serve_start_blocked(cli, cli::graft::web_disabled()).then(|| {
         Cli::command().error(
@@ -138,7 +119,6 @@ async fn main() -> Result<()> {
     // With the `aoe.web` plugin disabled, a fresh `aoe serve` start is treated
     // as an unrecognized subcommand. Done here, before any logging/app-dir side
     // effects, so a rejected start creates no serve log or ProcessContext.
-    #[cfg(feature = "serve")]
     if let Some(err) = serve_unavailable_error(&cli) {
         err.exit();
     }
@@ -228,9 +208,7 @@ async fn main() -> Result<()> {
                 };
                 // Only the serve daemon multiplexes many sessions, so it is
                 // the one process that tees session-scoped tracing into each
-                // session's acp-workers/<id>.log (#1864). The acp module is
-                // serve-gated, so the tee only exists in serve builds.
-                #[cfg(feature = "serve")]
+                // session's acp-workers/<id>.log (#1864).
                 let session_tee = if matches!(
                     ctx,
                     ProcessContext::ServeForeground | ProcessContext::ServeDaemonChild
@@ -239,8 +217,6 @@ async fn main() -> Result<()> {
                 } else {
                     None
                 };
-                #[cfg(not(feature = "serve"))]
-                let session_tee: Option<logging::TeeLayer> = None;
                 let res = logging::init_subscriber_with_options(
                     resolution.target,
                     filter,
@@ -383,7 +359,6 @@ async fn run(
         }
         Some(Commands::Agents) => return cli::agents::run(),
         Some(Commands::Logs(args)) => return cli::logs::run(args).await,
-        #[cfg(feature = "serve")]
         Some(Commands::LogLevel(args)) => return cli::log_level::run(args).await,
         Some(Commands::Sounds { command }) => return cli::sounds::run(command).await,
         Some(Commands::Theme { command }) => {
@@ -468,13 +443,9 @@ async fn run(
         // `apply` merges settings and writes the project registry, so it has to
         // run after migrations have brought that data to the current shape.
         Some(Commands::Cityhall { command }) => cli::cityhall::run(command),
-        #[cfg(feature = "serve")]
         Some(Commands::Serve(args)) => cli::serve::run(&profile, args).await,
-        #[cfg(feature = "serve")]
         Some(Commands::Url(args)) => cli::url::run(args),
-        #[cfg(feature = "serve")]
         Some(Commands::Acp { command }) => cli::acp::run(command).await,
-        #[cfg(feature = "serve")]
         Some(Commands::AcpRunner(args)) => agent_of_empires::process::runner::run(*args).await,
         None => {
             // Fold the drift notice into the existing startup-warning channel

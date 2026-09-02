@@ -315,8 +315,8 @@ capabilities = ["net"]
     assert!(!plugin.needs_reapproval());
 
     // A builtin is always granted; re-approval is meaningless for it. Only
-    // checkable when a builtin is compiled in (`aoe.web` is serve-gated).
-    #[cfg(feature = "serve")]
+    // checkable when a builtin is compiled in, and `aoe.web` needs `web`.
+    #[cfg(feature = "web")]
     {
         let err = install::reapprove_consent("aoe.web")
             .unwrap_err()

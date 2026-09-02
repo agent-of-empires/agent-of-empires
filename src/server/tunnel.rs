@@ -836,7 +836,17 @@ fn extract_tunnel_url(line: &str) -> Option<String> {
     None
 }
 
+/// Render a QR code to stderr for easy phone scanning. Without the dashboard
+/// bundle there is nothing for a phone to open, so only the URL is printed.
+#[cfg(not(feature = "web"))]
+pub fn print_qr_code(url: &str) {
+    eprintln!();
+    eprintln!("  Open: {}", url);
+    eprintln!();
+}
+
 /// Render a QR code to stderr for easy phone scanning.
+#[cfg(feature = "web")]
 pub fn print_qr_code(url: &str) {
     use qrcode::QrCode;
 

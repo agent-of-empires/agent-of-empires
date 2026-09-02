@@ -6,7 +6,6 @@ mod attached_status_hooks;
 pub(crate) mod clipboard;
 mod components;
 mod creation_poller;
-#[cfg(feature = "serve")]
 mod daemon_status_poller;
 mod deletion_poller;
 pub mod dialogs;
@@ -14,19 +13,15 @@ pub mod diff;
 pub(crate) mod home;
 pub(crate) mod markdown;
 mod metrics_poller;
-#[cfg(feature = "serve")]
 pub(crate) mod open_url;
-#[cfg(feature = "serve")]
 pub(crate) mod plugin_ui;
 mod reconcile_poller;
-#[cfg(feature = "serve")]
 pub(crate) mod remote_home;
 pub(crate) mod responsive;
 mod restart_poller;
 pub mod settings;
 mod status_poller;
 mod stop_poller;
-#[cfg(feature = "serve")]
 pub(crate) mod structured_view;
 pub(crate) mod styles;
 mod trash_poller;
@@ -226,7 +221,6 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
     // sees a session list that doesn't reflect the daemon they pointed
     // us at. Tmux check + migrations are intentionally skipped here:
     // the remote machine owns those, this side is a pure client.
-    #[cfg(feature = "serve")]
     if let Some(endpoint) = crate::acp::client::discovery::discover_env() {
         let _ = startup_warning; // remote mode skips the local startup-warning channel
         let _ = profile;

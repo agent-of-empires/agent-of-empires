@@ -1695,6 +1695,13 @@
       ]
     },
     {
+      "id": "acp.clear-fold-remount",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/components/acp/__tests__/AcpRuntime.clearFold.test.tsx"],
+      "components": ["web/src/components/acp/AcpRuntime.tsx"]
+    },
+    {
       "id": "diff-comments.storage-cleanup",
       "kind": "vitest",
       "risk": "medium",

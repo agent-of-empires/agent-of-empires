@@ -625,11 +625,10 @@ pub(crate) fn title_is_auto_overwritable(inst: &crate::session::instance::Instan
 // still-default-named session: that single edge covers every input path
 // (native attach, web live-view, `aoe send`) and fires only once the pane
 // agent is idle, so the one-shot never races it for the provider API. The work
-// runs in a detached `aoe __smart-rename` child so it never blocks the poller
-// and is identical in the TUI-only and serve builds. Cross-process guards (a
-// per-session advisory lock, MAX_CONCURRENT global slot locks, and the
-// persisted `Instance.smart_rename_attempted` marker) coordinate the TUI, the
-// daemon, and sibling children, which are all separate processes.
+// runs in a detached `aoe __smart-rename` child so it never blocks the poller.
+// Cross-process guards (a per-session advisory lock, MAX_CONCURRENT global slot
+// locks, and the persisted `Instance.smart_rename_attempted` marker) coordinate
+// the TUI, the daemon, and sibling children, which are all separate processes.
 // ---------------------------------------------------------------------------
 
 /// Head/tail byte budgets for the captured first-turn transcript handed to the
@@ -992,20 +991,7 @@ pub async fn run_smart_rename_now(
         .map(|i| i.is_structured());
     drop(instances);
     match structured {
-        // Structured sessions rename through the daemon, whose client lives
-        // behind the `serve` feature. A non-serve (TUI-only) build has no
-        // structured view and no daemon client, so there is nothing to do.
-        Some(true) => {
-            #[cfg(feature = "serve")]
-            {
-                rename_structured_via_daemon(session_id).await
-            }
-            #[cfg(not(feature = "serve"))]
-            {
-                let _ = session_id;
-                Ok(())
-            }
-        }
+        Some(true) => rename_structured_via_daemon(session_id).await,
         Some(false) => run_terminal_rename(profile, session_id, force).await,
         None => Ok(()),
     }
@@ -1015,7 +1001,6 @@ pub async fn run_smart_rename_now(
 /// structured session via `POST /api/sessions/{id}/smart-rename`. The endpoint
 /// already forces past the disabled-setting gate. Best-effort: no daemon, or a
 /// non-2xx response, just leaves the generated name in place.
-#[cfg(feature = "serve")]
 async fn rename_structured_via_daemon(session_id: &str) -> anyhow::Result<()> {
     use crate::acp::client::{discovery, HttpClient};
     let endpoint = match discovery::discover() {
@@ -1173,10 +1158,8 @@ pub async fn run_terminal_rename(
     Ok(())
 }
 
-#[cfg(feature = "serve")]
 pub use serve::{should_trigger_smart_rename, try_smart_rename};
 
-#[cfg(feature = "serve")]
 mod serve {
     use super::*;
     use crate::server::AppState;

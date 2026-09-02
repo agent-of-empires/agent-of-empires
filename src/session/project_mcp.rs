@@ -1,9 +1,8 @@
 //! Project-local `.mcp.json` parsing for the repo-trust gate (#1985).
 //!
-//! This lives outside the serve-gated `acp` module so the always-compiled trust
-//! system (`repo_config`) and the TUI trust dialog can read, fingerprint, and
-//! display a repo's project MCP servers without depending on the ACP schema
-//! types. The supervisor converts these into ACP `McpServer` values for
+//! This lives outside `acp` so the trust system (`repo_config`) and the TUI
+//! trust dialog can read, fingerprint, and display a repo's project MCP
+//! servers without depending on the ACP schema types. The supervisor converts these into ACP `McpServer` values for
 //! forwarding (see `acp::mcp_config::project_servers_to_acp`), parsing the file
 //! exactly once so the fingerprint that gates trust and the servers that are
 //! forwarded can never diverge.

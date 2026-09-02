@@ -88,8 +88,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          # PR body must contain `## Checklist` + "I understand the code
-          # I am submitting" to satisfy pr-template-check.yml.
+          # pr-template-check.yml exempts this PR on the head branch plus
+          # the `<!-- nix-npm-hash: -->` marker and `## Checklist` below.
           {
             echo "<!-- nix-npm-hash: ${NEW_HASH} -->"
             echo
@@ -129,7 +129,9 @@ jobs:
               --label automated | tail -n1)
             PR_NUMBER="${PR_URL##*/}"
           else
-            gh pr edit "$PR_NUMBER" --body-file /tmp/pr-body.md
+            # Re-assert the label; pr-template-check.yml's close-stale job
+            # keys this PR's exemption on it.
+            gh pr edit "$PR_NUMBER" --body-file /tmp/pr-body.md --add-label automated
           fi
 
           # Fails loudly if "Allow auto-merge" is disabled at repo level.
