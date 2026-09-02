@@ -179,9 +179,9 @@ AOE provides two official sandbox images:
 | Image | Description |
 |-------|-------------|
 | `ghcr.io/agent-of-empires/aoe-sandbox:latest` | Base image with Claude Code, OpenCode, Mistral Vibe, Hermes, Codex CLI, Gemini CLI, Cursor CLI, Copilot CLI, Pi, Oh My Pi (OMP), Kiro CLI, Qwen Code, Kimi Code, Prime Agent, git, ripgrep, fzf |
-
-[openzoo](./openzoo.md) is host-only (its wallet lives in `~/.openzoo` on the host) and is not in the image; the new-session dialog disables sandboxing for it.
 | `ghcr.io/agent-of-empires/aoe-dev-sandbox:latest` | Extended image with additional dev tools |
+
+[openzoo](./openzoo.md) is host-only (its wallet lives in `~/.openzoo` on the host) and is not in either image; the new-session dialog disables sandboxing for it.
 
 ### Dev Sandbox Tools
 
