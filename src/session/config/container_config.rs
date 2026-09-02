@@ -979,12 +979,9 @@ pub(crate) fn install_pi_sandbox_extension() -> Result<()> {
         .join("aoe-session-id.js");
     let source = crate::session::instance::PI_SESSION_EXTENSION;
     // The bind is writable from the container, so the current content counts
-    // only when it is a regular file, and the write below follows no link.
-    let path = root.join(&rel);
-    let current = std::fs::symlink_metadata(&path)
-        .is_ok_and(|m| m.is_file())
-        .then(|| std::fs::read_to_string(&path).ok())
-        .flatten();
+    // only when it is a regular file reached without following a link, and the
+    // write below follows none either.
+    let current = crate::session::read_file_no_follow(&root, &rel)?;
     if current.as_deref() != Some(source) {
         crate::session::replace_file_no_follow(&root, &rel, source.as_bytes())?;
     }
