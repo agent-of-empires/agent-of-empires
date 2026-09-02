@@ -85,6 +85,8 @@ jobs:
           OLD_HASH: ${{ steps.hash.outputs.current }}
           NEW_HASH: ${{ steps.hash.outputs.hash }}
           TRIGGER_SHA: ${{ github.sha }}
+          BASE_REPO: ${{ github.repository }}
+          HEAD_BRANCH: chore/nix-npm-hash-update
         run: |
           set -euo pipefail
 
@@ -112,18 +114,26 @@ jobs:
             --description "Automated bot PR" \
             --force >/dev/null 2>&1 || true
 
+          # `gh pr list --head` matches the branch name only, so a fork PR
+          # from an identically named branch can land in this list. The
+          # selector keeps only the base-repo PR and fails closed on an
+          # ambiguous set, before anything below edits or auto-merges a PR.
+          # --limit raises the default page of 30 so a crowd of same-named
+          # fork PRs cannot push ours out of the result window.
           PR_NUMBER=$(gh pr list \
-            --head chore/nix-npm-hash-update \
+            --head "$HEAD_BRANCH" \
             --state open \
-            --json number \
-            --jq '.[0].number // empty')
+            --limit 100 \
+            --json number,headRefName,headRepository,baseRefName \
+            | python3 .github/scripts/select-internal-pr.py \
+                --repo "$BASE_REPO" --head "$HEAD_BRANCH" --base main)
 
           if [ -z "$PR_NUMBER" ]; then
             # Capture URL from gh pr create directly; gh pr list right
             # after creation can miss the new PR due to search-index lag.
             PR_URL=$(gh pr create \
               --base main \
-              --head chore/nix-npm-hash-update \
+              --head "$HEAD_BRANCH" \
               --title "chore: update Nix npmDepsHash for web dependencies" \
               --body-file /tmp/pr-body.md \
               --label automated | tail -n1)

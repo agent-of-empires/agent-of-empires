@@ -161,6 +161,20 @@ jobs:
           persist-credentials: false
       - run: scripts/verify-shared-target.sh --self-test
 
+  pr-lookup-selftest:
+    name: PR Lookup Self-Test
+    runs-on: ubuntu-latest
+    # Guards the selector nix-npm-hash.yml uses to decide which PR it edits,
+    # labels `automated` and queues for auto-merge. No toolchain: feeds
+    # candidate lists (an internal PR, a fork PR on the same branch name,
+    # both, duplicates) through the selector and asserts it picks the
+    # base-repo PR or fails closed. Runs in seconds.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: python3 .github/scripts/select-internal-pr.py --self-test
+
   nix:
     name: Nix Eval
     runs-on: ubuntu-latest
