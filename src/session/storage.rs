@@ -4840,6 +4840,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn profile_move_crash_recovery_target_wins_from_each_crash_point() -> Result<()> {
         // One case per crash point #3459 requires: target write/fsync,
         // source group write/fsync, source session write/fsync. In all
@@ -4906,6 +4907,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn profile_move_crash_before_publication_source_wins() -> Result<()> {
         // Crash right after the journal is written but before any row was
         // touched: the evidence says the target never published, so the

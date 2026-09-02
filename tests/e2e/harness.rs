@@ -348,6 +348,7 @@ update_check_mode = "off"
 [app_state]
 has_seen_welcome = true
 has_responded_to_telemetry = true
+has_acknowledged_agent_hooks = true
 last_seen_version = "{}"
 "#,
             env!("CARGO_PKG_VERSION")
@@ -433,6 +434,8 @@ last_seen_version = "{}"
     /// shim (the daemon -> runner -> node spawn chain does not reliably
     /// propagate process env). Also sets the runner-socket timeout high
     /// so a contended CI box doesn't trip the spawn deadline.
+    /// The generated shim embeds Node's real executable because the isolated
+    /// home cannot initialize user-scoped version-manager shims.
     pub fn install_acp_shim(&mut self, fake_acp_script: &Path) {
         self.install_acp_shim_inner(fake_acp_script, None);
     }
@@ -458,6 +461,20 @@ last_seen_version = "{}"
             "fake ACP agent not found at {}",
             fake_agent.display()
         );
+        let node = Command::new("node")
+            .args(["-p", "process.execPath"])
+            .output()
+            .expect("resolve Node executable");
+        assert!(
+            node.status.success(),
+            "node could not resolve process.execPath: {}",
+            String::from_utf8_lossy(&node.stderr)
+        );
+        let node = String::from_utf8(node.stdout)
+            .expect("Node executable path is UTF-8")
+            .trim()
+            .to_string();
+        assert!(!node.is_empty(), "node returned an empty process.execPath");
         let debug_log = app_dir_in(self.home_dir.path()).join("fake-acp.log");
         // Bake the fork-fail knob into the shim (not the daemon env) so it
         // survives the daemon's env_clear + allowlist when spawning the worker.
@@ -473,11 +490,12 @@ last_seen_version = "{}"
             })
             .unwrap_or_default();
         let script = format!(
-            "#!/bin/sh\nexport FAKE_ACP_SCRIPT=\"{}\"\nexport FAKE_ACP_DEBUG_LOG=\"{}\"\n{}{}exec node \"{}\" \"$@\"\n",
+            "#!/bin/sh\nexport FAKE_ACP_SCRIPT=\"{}\"\nexport FAKE_ACP_DEBUG_LOG=\"{}\"\n{}{}exec \"{}\" \"{}\" \"$@\"\n",
             fake_acp_script.display(),
             debug_log.display(),
             fork_fail_line,
             capture_line,
+            node,
             fake_agent.display(),
         );
         for name in ["claude", "claude-agent-acp", "aoe-agent"] {
