@@ -205,8 +205,8 @@ Add a new session
 * `--extra-args <EXTRA_ARGS>` — Extra arguments to append after the agent binary
 * `--cmd-override <CMD_OVERRIDE>` — Override the agent binary command
 * `--structured-view` — Render this session in the structured view (ACP-based native rendering) instead of the default terminal view. `aoe add` defaults to the terminal (raw tmux/PTY) so the CLI matches the TUI; pass this (or `--agent`) to opt into the structured rendering. Ignored for tools with no ACP adapter
-* `--agent <AGENT>` — Pick a specific ACP agent for the structured view (e.g., aoe-agent, claude-code)
-* `--model <MODEL>` — Override the model used by aoe-agent (e.g., claude-opus-4-7, gpt-5, gemini-2.5-pro). Forwarded to the agent at session start
+* `--agent <AGENT>` — Pick a specific ACP agent for the structured view (e.g., claude-code, codex)
+* `--model <MODEL>` — Override the model used by the ACP agent (e.g., claude-opus-4-7, gpt-5, gemini-2.5-pro). Forwarded to the agent at session start
 * `--scratch` — Create the session in a fresh scratch directory under `<app_dir>/scratch/<id>/` instead of a project path. The directory is removed when the session is deleted (unless `aoe rm` is given `--keep-scratch`). Mutually exclusive with worktree-related flags
 
 
@@ -390,7 +390,7 @@ Manage session lifecycle (start, stop, attach, etc.)
 * `capture` — Capture tmux pane output
 * `current` — Auto-detect current session
 * `add-project` — Attach another repo to an existing session, so an agent that turns out to need a second repo can keep working in the same conversation instead of the session being recreated. Creates a worktree for the repo and restarts the agent so it can see it; the conversation is kept. See #3103
-* `set-session-id` — Set the resume target for a session (pin a conversation or force a one-shot fresh start)
+* `set-session-id` — Set the resume target for a session; agents with resume disabled in AoE store the ID but do not use it
 * `set-base` — Set or clear the per-session diff base branch. The diff view compares the worktree against this ref instead of the auto-detected default. Useful when the PR target differs from the project default (stacked PRs, hotfix off `release/*`, renamed default branch). See #970
 * `snooze` — Snooze a session for a duration (temporary archive, auto wakes)
 * `unsnooze` — Wake a snoozed session immediately
@@ -564,14 +564,14 @@ Attach another repo to an existing session, so an agent that turns out to need a
 
 ## `aoe session set-session-id`
 
-Set the resume target for a session (pin a conversation or force a one-shot fresh start)
+Set the resume target for a session; agents with resume disabled in AoE store the ID but do not use it
 
 **Usage:** `aoe session set-session-id <IDENTIFIER> <SESSION_ID>`
 
 ###### **Arguments:**
 
 * `<IDENTIFIER>` — Session ID or title
-* `<SESSION_ID>` — Resume target: a UUID/sid pins the next launches to that conversation; an empty string forces a one-shot fresh start (after which the system reverts to auto-resume)
+* `<SESSION_ID>` — Resume target: for resume-enabled agents, a UUID/sid pins subsequent launches to that conversation; agents with resume disabled in AoE store but do not use it. An empty string forces a one-shot fresh start
 
 
 

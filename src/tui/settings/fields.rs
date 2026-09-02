@@ -192,6 +192,8 @@ pub enum ListItemValidation {
     DetectAs,
     /// `name=command`, an ACP launch command split into argv (acp).
     AcpCmd,
+    /// `name=dir`, an absolute (or `~/`) config directory for an agent.
+    AgentConfigDir,
     /// Host/sandbox env entry (`KEY=value` etc).
     EnvEntry,
 }
@@ -256,6 +258,7 @@ impl SettingField {
                     "custom_agents" => ListItemValidation::CustomAgent,
                     "agent_detect_as" => ListItemValidation::DetectAs,
                     "agent_acp_cmd" => ListItemValidation::AcpCmd,
+                    "agent_config_dir" => ListItemValidation::AgentConfigDir,
                     _ => ListItemValidation::None,
                 }
             }
@@ -392,6 +395,7 @@ fn is_map_list(section: &str, field: &str) -> bool {
                 | "custom_agents"
                 | "agent_detect_as"
                 | "agent_acp_cmd"
+                | "agent_config_dir"
         )
 }
 
@@ -1238,6 +1242,7 @@ mod tests {
             "session.agent_command_override",
             "session.agent_extra_args",
             "session.agent_acp_cmd",
+            "session.agent_config_dir",
         ] {
             assert!(
                 !ident_present(&repo_rows, denied),

@@ -1309,11 +1309,8 @@ export function reportTelemetrySeen(surface: TelemetrySignal): void {
   }).catch(() => {});
 }
 
-/// Report an acp interaction the daemon cannot observe itself, so its next
-/// opt-in snapshot can fold it in. Today the only kind is a queued prompt: the
-/// prompt queue lives entirely in client state, so the browser is the one
-/// surface that can report it. Best-effort; the daemon only counts when the
-/// user is opted in.
+/// Report a browser ACP interaction for the daemon's next opt-in snapshot.
+/// Best-effort; the daemon only sends counts when the user is opted in.
 export function reportAcpInteraction(kind: "prompt_queued"): void {
   void fetch("/api/telemetry/structured-interaction", {
     method: "POST",
@@ -1508,8 +1505,6 @@ export async function acpDisable(sessionId: string): Promise<ViewSwitchResponse 
   });
 }
 
-// --- Server-owned prompt queue (docs/development/server-side-prompt-queue.md) ---
-//
 // The daemon owns the structured-view prompt queue, so a follow-up queued
 // behind a busy turn survives a client reload / closed PWA and drains
 // server-side. These wrap the /queue endpoints; the queue itself reflects to

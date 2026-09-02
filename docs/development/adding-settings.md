@@ -150,4 +150,4 @@ fallback.
   (`web/src/components/settings/__tests__/customWidgets.test.tsx`).
 - A user-facing dashboard settings flow must update
   `web/tests/coverage-matrix.json` and add or extend the appropriate Vitest /
-  Playwright test (see [Playwright + Vitest testing](playwright.md)).
+  Playwright test. Follow `web/AGENTS.md` for test selection and commands.

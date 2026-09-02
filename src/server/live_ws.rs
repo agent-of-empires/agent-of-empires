@@ -622,8 +622,7 @@ async fn handle_live_ws(
                             let claimed = tokio::task::spawn_blocking(move || {
                                 let session = crate::tmux::Session::from_name(&name);
                                 if session.claim_size_owner(&who, SIZE_OWNER_TTL) {
-                                    session.resize_window(cols, rows);
-                                    true
+                                    session.resize_window_if_owner(&who, cols, rows)
                                 } else {
                                     false
                                 }
@@ -902,8 +901,7 @@ async fn handle_live_ws(
                                 let owned = tokio::task::spawn_blocking(move || {
                                     let session = crate::tmux::Session::from_name(&name);
                                     if session.claim_size_owner(&who, SIZE_OWNER_TTL) {
-                                        session.resize_window(cols, rows);
-                                        true
+                                        session.resize_window_if_owner(&who, cols, rows)
                                     } else {
                                         false
                                     }
@@ -963,9 +961,10 @@ async fn handle_live_ws(
                                     let session = crate::tmux::Session::from_name(&name);
                                     if session.steal_size_owner(&who) {
                                         if cols > 0 && rows > 0 {
-                                            session.resize_window(cols, rows);
+                                            session.resize_window_if_owner(&who, cols, rows)
+                                        } else {
+                                            true
                                         }
-                                        true
                                     } else {
                                         false
                                     }
@@ -1035,7 +1034,9 @@ async fn handle_live_ws(
 fn frame_json(content: &str, cursor: Option<&crate::tmux::PaneCursor>) -> String {
     // The cursor is pane relative while composited content uses the window
     // grid. Emit window-relative coordinates and carry the same origin for
-    // the client's inverse pointer mapping. No pane rectangle means identity.
+    // the client's inverse pointer mapping. Translating before emission also
+    // keeps cursor painting correct in older clients that ignore the origin;
+    // only their pointer mapping degrades. No pane rectangle means identity.
     let pane0 = cursor.and_then(|c| c.composite_pane0);
     let (origin_x, origin_y) = pane0.map_or((0, 0), |p| (p.left, p.top));
     let cursor_value = match cursor {

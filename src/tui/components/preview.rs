@@ -20,14 +20,18 @@ use crate::tui::styles::Theme;
 /// frame. See `PreviewCache::ensure_parsed` for the parse-and-cache
 /// contract.
 pub struct CachedPreview<'a> {
-    /// `None` means the source `content` was empty (no pane bytes
-    /// yet, or just cleared); callers render their own placeholder.
+    /// `None` means the source `content` was empty.
     pub text: Option<&'a Text<'static>>,
+    /// No frame has landed for the displayed session yet, so an empty
+    /// `text` says nothing about its pane: paint nothing rather than the
+    /// "No output available" hint, which would blink while a just-selected
+    /// session fills.
+    pub pending: bool,
 }
 
 impl<'a> CachedPreview<'a> {
-    pub fn from_text(text: Option<&'a Text<'static>>) -> Self {
-        Self { text }
+    pub fn new(text: Option<&'a Text<'static>>, pending: bool) -> Self {
+        Self { text, pending }
     }
 }
 
@@ -35,9 +39,9 @@ impl<'a> CachedPreview<'a> {
 /// optional sandbox line, optional worktree block) for `instance`.
 ///
 /// Exposed at the module level so callers outside `Preview::render_with_cache`
-/// can compute the same split. In particular, the live-send sync resize
-/// in `HomeView::finalize_live_send_resize` needs to size the tmux pane
-/// to the OUTPUT portion, not the full inner. The output portion is
+/// can compute the same split. In particular, render queues the live-send
+/// worker to size the tmux pane to the OUTPUT portion, not the full inner. The
+/// output portion is
 /// `inner.height - agent_info_height(inst) - 1`: subtract the info
 /// header, then subtract one more row for the inner ` Output ` banner
 /// that `render_output_cached` draws on top of the output sub-rect (a
@@ -260,7 +264,7 @@ impl Preview {
                 scroll_offset,
                 Style::default().fg(theme.text),
             );
-        } else {
+        } else if !cached_output.pending {
             let hint = Paragraph::new("No output available")
                 .style(Style::default().fg(theme.dimmed))
                 .alignment(Alignment::Center);
@@ -476,7 +480,7 @@ impl Preview {
                 scroll_offset,
                 Style::default().fg(theme.text),
             );
-        } else {
+        } else if !cached_output.pending {
             let hint = Paragraph::new("No output available")
                 .style(Style::default().fg(theme.dimmed))
                 .alignment(Alignment::Center);
@@ -570,7 +574,7 @@ pub fn format_scroll_indicator(
 /// Parse a captured ANSI string into a ratatui `Text`.
 ///
 /// Visible at the module level so `PreviewCache::ensure_parsed` can
-/// call it from `src/tui/home/mod.rs` to drive the cache.
+/// call it from `src/tui/home/preview.rs` to drive the cache.
 pub fn parse_output_text(content: &str) -> Text<'static> {
     let cleaned = crate::tmux::utils::strip_osc_st(content);
     cleaned.into_text().unwrap_or_else(|_| Text::from(cleaned))
@@ -653,7 +657,7 @@ mod tests {
             if let Some(home_str) = home.to_str() {
                 let path = format!("{}extra/not/home", home_str);
                 let shortened = shorten_path(&path);
-                assert_eq!(shortened, format!("~extra/not/home"));
+                assert_eq!(shortened, "~extra/not/home");
             }
         }
     }
@@ -790,9 +794,8 @@ mod tests {
         );
     }
 
-    // `agent_info_height` drives both the preview layout split in
-    // `render_with_cache` and the live-send sync resize in
-    // `HomeView::finalize_live_send_resize`. A one-row drift here brings
+    // `agent_info_height` drives both the preview layout split and the
+    // live-send worker geometry queued from render. A one-row drift here brings
     // the shifted-preview bug right back, so each branch of the formula
     // gets a dedicated case.
     mod agent_info_height {
@@ -926,5 +929,54 @@ mod tests {
             });
             assert_eq!(terminal_info_height(&inst), 3);
         }
+    }
+
+    /// Rows of a rendered terminal preview, for the hint assertions below.
+    fn terminal_preview_rows(pending: bool) -> Vec<String> {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let theme = crate::tui::styles::load_theme("empire");
+        let instance = Instance::new("pane", "/tmp/pane");
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal
+            .draw(|frame| {
+                Preview::render_terminal_preview(
+                    frame,
+                    frame.area(),
+                    &instance,
+                    true,
+                    CachedPreview::new(None, pending),
+                    0,
+                    &theme,
+                    false,
+                    false,
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn empty_preview_hint_waits_for_the_first_frame() {
+        let hint = |pending| {
+            terminal_preview_rows(pending)
+                .iter()
+                .any(|row| row.contains("No output available"))
+        };
+        assert!(
+            hint(false),
+            "an empty frame for the displayed session paints the hint"
+        );
+        assert!(
+            !hint(true),
+            "no frame yet for the displayed session paints nothing"
+        );
     }
 }

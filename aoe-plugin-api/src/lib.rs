@@ -1,15 +1,7 @@
 //! Plugin manifest types for the Agent of Empires plugin system.
 //!
-//! This crate is the stable surface a plugin author (and the in-tree host)
-//! compiles against: the `aoe-plugin.toml` manifest schema, the capability
-//! taxonomy, and the validation rules that gate a manifest before it loads.
-//! The contribution sections (capabilities, commands, keybinds, settings,
-//! themes, ui, runtime worker) are defined here. Settings and themes are
-//! consumed by the Tier 0 registries (#2094); keybinds/commands resolve and
-//! graft at Tier 0 but execute only with the runtime host (#2095); ui slots
-//! land with #2366; the status section's consumer is the status reference
-//! plugin (#2096). Panes are not a manifest section: they ship as a `ui` slot
-//! kind (#2432). See `docs/development/internals/plugin-system.md`.
+//! Defines `aoe-plugin.toml`, capabilities, session RPC payloads, and manifest
+//! validation without depending on the host crate.
 
 pub mod acp;
 mod capability;
@@ -26,27 +18,6 @@ pub use manifest::{
     ThemeContribution, UiContribution, UiSlot, MAX_SCREENSHOTS,
 };
 
-/// Version of the manifest schema and host API this crate describes.
-///
-/// A manifest declares the `api_version` it was written against; the host
-/// refuses manifests targeting a newer version than it understands. Bumped to
-/// 2 when the contribution sections and capability taxonomy were added; 3 when
-/// the `detail-panel` slot became the dockable `pane` slot (with
-/// `default_location`); 4 when the `status` contribution section and the
-/// `aoe_version` host-compatibility field were added; 5 when the `screenshots`
-/// presentation metadata was added; 6 when a command could declare a
-/// client-executed `action` (`ClientAction`); 7 when `icon` and `icon_asset`
-/// identity metadata were added; 8 when plugins could contribute composer
-/// actions; 9 when the host gained ACP-capability discovery, host-owned
-/// session creation / prompt delivery (with the `session.unattended` grant),
-/// plugin-private storage, and structured settings widgets (`object_list`,
-/// `dynamic_select`); 10 is retired, its two UI slots (`settings-page`,
-/// `tool-card-badge`) having been removed once MCP and skills management
-/// moved into core; 11 when `acp.capabilities.probe` let a
-/// plugin trigger a handshake-only catalog probe and the capability response
-/// grew a `thinking` (thought-level) list; 12 when the pane block vocabulary
-/// gained the `callout`, `bar`, and `columns` kinds, clickable/badged `row`s,
-/// header-summary and scrollable `section`s, `disabled`/`variant` actions, and
-/// the pane-level `footer`; 13 when the global `home-pane` slot and the
-/// `sparkline` block kind were added.
+/// Current manifest schema and host API version. The host rejects newer
+/// manifests. Version history is documented in `docs/plugin-api.md`.
 pub const API_VERSION: u32 = 13;

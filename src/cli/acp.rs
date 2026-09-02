@@ -737,7 +737,7 @@ fn check_node() -> NodeStatus {
     let (version, meets_minimum) = match output {
         Ok(out) if out.status.success() => {
             let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            let meets = parse_node_major(&raw).map(|m| m >= 20);
+            let meets = node::meets_minimum(&raw);
             (Some(raw), meets)
         }
         _ => (None, None),
@@ -748,12 +748,6 @@ fn check_node() -> NodeStatus {
         version,
         meets_minimum,
     }
-}
-
-fn parse_node_major(raw: &str) -> Option<u32> {
-    let trimmed = raw.trim_start_matches('v');
-    let major_str = trimmed.split('.').next()?;
-    major_str.parse::<u32>().ok()
 }
 
 fn find_in_path(binary: &str) -> Option<String> {
@@ -767,8 +761,8 @@ pub(crate) fn command_present(command: &str) -> bool {
     // runtime against the app data dir, so the literal string contains
     // both `${` and `/`. Check the placeholder branch FIRST — otherwise
     // the `/`-branch tries to stat a literal path containing `${...}`
-    // and reports "missing" for every placeholder-based agent
-    // (notably `aoe-agent`, our bundled multi-provider fallback).
+    // and reports "missing" for every placeholder-based agent (notably
+    // `aoe-agent`).
     if command.contains("${") {
         true
     } else if command.contains('/') || command.contains('\\') {
@@ -1253,14 +1247,6 @@ fn event_kind(event: &crate::acp::Event) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_node_major_works() {
-        assert_eq!(parse_node_major("v22.21.0"), Some(22));
-        assert_eq!(parse_node_major("v20.0.0"), Some(20));
-        assert_eq!(parse_node_major("18.17.1"), Some(18));
-        assert_eq!(parse_node_major("not a version"), None);
-    }
 
     #[test]
     fn registry_lifecycle_mirrors_agents_registry() {

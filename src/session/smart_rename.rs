@@ -1543,7 +1543,7 @@ mod serve {
             // differs only by a trailing slash.
             let mut existing = crate::session::Instance::new("Already owned", "/tmp/shared");
             existing.source_profile = "default".to_string();
-            let instances = vec![existing];
+            let instances = [existing];
             let cases = [
                 ("Already owned", "/tmp/shared", true),
                 // "/tmp/shared/" and "/tmp/shared" are equal after trim_end_matches('/').

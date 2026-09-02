@@ -761,6 +761,14 @@ impl App {
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     ) -> Result<()> {
+        // Keep the display snapshots (sessions, pane metadata) fresh off the
+        // paint thread: every _for_display helper and the passive preview
+        // resize executor answers from these snapshots and never forks in render.
+        // The poller's first cycle runs immediately. Do not warm the cache
+        // here: tmux may consume the full command deadline, and startup must
+        // paint its conservative empty snapshot before any such wait.
+        crate::tmux::spawn_snapshot_poller();
+
         // Initial render
         crate::tui::clear_terminal(terminal)?;
         // Sync mouse capture before the first paint so any onboarding
@@ -769,9 +777,6 @@ impl App {
         // Otherwise the user would have to press a key first.
         self.sync_mouse_capture(terminal)?;
         self.draw(terminal)?;
-
-        // Refresh tmux session cache
-        crate::tmux::refresh_session_cache();
 
         // Spawn async update check at startup. The periodic re-check below
         // covers long-running sessions (#1471). `last_update_check` stays
@@ -1857,6 +1862,11 @@ impl App {
                 needs_full_refresh = true;
             }
 
+            if self.home.apply_reconcile_results() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
             if last_session_idle_reap.elapsed() >= SESSION_IDLE_REAP_INTERVAL {
                 last_session_idle_reap = std::time::Instant::now();
                 if self.reap_idle_sessions() {
@@ -2174,7 +2184,7 @@ impl App {
     /// (mirroring the serve deferred-clear).
     fn build_telemetry_snapshot(&self) -> Option<crate::telemetry::UsageSnapshot> {
         // Boundary snapshot: `build_usage_snapshot` takes `&[Instance]`
-        // (shared API with the daemon caller in `src/server/mod.rs`).
+        // (shared API with the daemon caller in `src/server/serve_snapshot.rs`).
         let instances: Vec<crate::session::Instance> = self.home.instances().cloned().collect();
         crate::telemetry::build_usage_snapshot(
             crate::telemetry::Surface::Tui,
@@ -2219,9 +2229,9 @@ impl App {
         let image_update = self
             .image_banner_active()
             .then_some(self.image_update.as_ref());
-        // Reset before the render so a frame that skips the preview path
-        // (dialog open, non-home view) reads as zero capture/parse rather
-        // than leaking the previous frame's durations.
+        // Reset before render so a frame that skips the preview path
+        // (dialog open, non-home view) reads as zero apply/parse rather than
+        // leaking the previous frame durations.
         self.home.preview_timings = Default::default();
         self.home.render(
             frame,
@@ -2232,13 +2242,10 @@ impl App {
             image_update.flatten(),
         );
         // Sampled trace for frame-budget diagnostics. A full-frame trace on
-        // every paint would dominate the log at `default_level = trace`, so
-        // we only emit for (a) frames that break the 16ms / 60fps budget and
-        // (b) live-send frames, where the per-frame `tmux capture-pane` fork
-        // is the latency we're profiling and individual frames usually stay
-        // under 16ms. `capture_us` / `parse_us` break the frame down into the
-        // capture fork vs. the `ansi-to-tui` parse; the remainder (frame_ms
-        // minus those two) is the widget build + ratatui diff.
+        // every paint would dominate the log at default_level = trace, so emit
+        // only for frames over the 16ms / 60fps budget and live-send frames.
+        // preview_apply_us and parse_us split mailbox/cache application from
+        // ANSI parsing; the remainder is widget build plus ratatui diff.
         let elapsed = start.elapsed();
         let in_live = self.home.live_send.is_some();
         if (elapsed.as_millis() > 16 || in_live)
@@ -2249,7 +2256,7 @@ impl App {
                 target: "tui.render",
                 frame_ms = elapsed.as_millis() as u64,
                 frame_us = elapsed.as_micros() as u64,
-                capture_us = timings.capture.as_micros() as u64,
+                preview_apply_us = timings.apply.as_micros() as u64,
                 parse_us = timings.parse.as_micros() as u64,
                 live = in_live,
                 width = frame.area().width,
@@ -3369,7 +3376,7 @@ impl App {
         };
         let now = chrono::Utc::now();
         // Boundary snapshot: `idle_reap_candidates` takes `&[Instance]`
-        // (shared API with the daemon caller in `src/server/mod.rs`).
+        // (shared API with the daemon caller in `src/server/idle_reap.rs`).
         let instances: Vec<crate::session::Instance> = self.home.instances().cloned().collect();
         let candidates = crate::session::idle_reap::idle_reap_candidates(
             &instances,
@@ -3539,14 +3546,10 @@ impl App {
                     self.draw(terminal)?;
                 }
                 let outcome = self.home.prepare_live_send(&id);
-                // Settle the toast to its final state BEFORE the sync resize
-                // and redraw, so HomeView's cached `preview_pane_area`
-                // matches the geometry the user will see for the next
-                // several frames. Otherwise the toast row that was on screen
-                // during `prepare_live_send` would make the preview pane one
-                // row shorter than post-toast, the sync resize would target
-                // the smaller pane, and the first capture would render
-                // shifted up.
+                // Settle the toast before redraw so HomeView computes the
+                // geometry the user will actually see. That draw queues the
+                // resize through LiveSendWorker; the action thread never
+                // performs or waits for a tmux resize.
                 if !warm {
                     self.update_status = match &outcome {
                         // On clean ready, drop the toast entirely. On Err the
@@ -3557,7 +3560,6 @@ impl App {
                 }
                 if outcome.is_ok() {
                     self.draw(terminal)?;
-                    self.home.finalize_live_send_resize();
                 }
             }
             Action::AttachToolSession(id, tool_name) => {

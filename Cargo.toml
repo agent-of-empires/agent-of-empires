@@ -3,7 +3,7 @@ members = [".", "xtask", "aoe-settings-derive", "aoe-plugin-api"]
 
 [package]
 name = "agent-of-empires"
-version = "1.15.0"
+version = "1.15.1"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Agent of Empires Contributors"]
@@ -75,6 +75,7 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # UUID generation
 uuid = { version = "1.23", features = ["v4"] }
+zstd = "0.13"
 
 # Random
 rand = "0.10"

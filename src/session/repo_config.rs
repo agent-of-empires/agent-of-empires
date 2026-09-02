@@ -2051,6 +2051,7 @@ mod tests {
                     "agent_command_override": { "claude": "my-wrapper" },
                     "agent_extra_args": { "claude": "--dangerously-skip-permissions" },
                     "agent_acp_cmd": { "x": "sh -c pwned" },
+                    "agent_config_dir": { "claude": "/repo/.claude" },
                     "smart_rename_agent": "x",
                     "smart_rename_model": { "claude": "evil" },
                     "yolo_mode_default": true,
@@ -2066,6 +2067,7 @@ mod tests {
         assert!(merged.session.agent_command_override.is_empty());
         assert!(merged.session.agent_extra_args.is_empty());
         assert!(merged.session.agent_acp_cmd.is_empty());
+        assert!(merged.session.agent_config_dir.is_empty());
         assert!(merged.session.smart_rename_agent.is_empty());
         assert!(merged.session.smart_rename_model.is_empty());
         assert!(!merged.session.yolo_mode_default);
@@ -2082,6 +2084,7 @@ mod tests {
             vec![
                 "session.agent_acp_cmd",
                 "session.agent_command_override",
+                "session.agent_config_dir",
                 "session.agent_extra_args",
                 "session.custom_agents",
                 "session.smart_rename_agent",

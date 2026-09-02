@@ -131,6 +131,9 @@ fn apply_updates(
         if let Some(baseline) = update.live_status_baseline {
             session.instance.live_status_baseline = Some(baseline);
         }
+        if let Some(detection) = update.detection {
+            session.instance.detection = detection;
+        }
 
         if run_hooks && old != update.status {
             crate::status_hooks::run_for_transition(
@@ -164,7 +167,7 @@ fn snapshot(sessions: &[AttachedStatusHookSession]) -> Vec<StatusUpdate> {
             // `Set(ts)` / `Clear` reflect the real observation.
             //
             // Arm order matches consumer sites (`apply_updates` above,
-            // `apply_status_update` in `src/tui/home/mod.rs`) and the
+            // `apply_status_update` in `src/tui/home/status.rs`) and the
             // enum declaration in `src/tui/status_poller.rs`:
             // `Set` first, `Clear` second, `Keep` last.
             idle_entered_at: match (
@@ -178,6 +181,10 @@ fn snapshot(sessions: &[AttachedStatusHookSession]) -> Vec<StatusUpdate> {
             last_accessed_at: session.instance.last_accessed_at,
             pane_dead: session.instance.pane_dead_observed,
             live_status_baseline: session.instance.live_status_baseline,
+            // The watcher owns detection while the main loop is parked on
+            // the attach, so a proposal raised during it is confirmed after
+            // it only if the copy hands this back (#3642).
+            detection: Some(session.instance.detection),
         })
         .collect()
 }
@@ -214,6 +221,7 @@ mod tests {
                 last_accessed_at: None,
                 pane_dead: false,
                 live_status_baseline: None,
+                detection: None,
             }],
             true,
         );
@@ -233,7 +241,7 @@ mod tests {
         // `apply_updates` (the `match update.idle_entered_at` arms
         // above) is the attached-hooks copy of the same match that
         // `HomeView::apply_status_update` performs in
-        // `src/tui/home/mod.rs`. The `home` copy is covered by
+        // `src/tui/home/status.rs`. The `home` copy is covered by
         // `apply_status_update_clears_idle_entered_at_on_idle_to_running`
         // in `src/tui/home/tests.rs`. This test locks the equivalent
         // shape here so a Set<->Clear swap in either consumer is
@@ -261,6 +269,7 @@ mod tests {
                 last_accessed_at: None,
                 pane_dead: false,
                 live_status_baseline: Some(Status::Idle),
+                detection: None,
             }],
             false,
         );
@@ -280,6 +289,7 @@ mod tests {
                 last_accessed_at: None,
                 pane_dead: false,
                 live_status_baseline: Some(Status::Running),
+                detection: None,
             }],
             false,
         );

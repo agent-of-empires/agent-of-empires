@@ -177,6 +177,11 @@ pub struct SessionService {
     /// resume continuation (#3028).
     #[cfg(feature = "serve")]
     pub acp_event_store: Arc<crate::acp::event_store::EventStore>,
+    /// Live control-state projection, shared with `AppState.acp_control_cache`.
+    /// The queue drain reads turn liveness from it so it agrees with prompt
+    /// dispatch; see [`SessionService::fold_control_state`].
+    #[cfg(feature = "serve")]
+    pub acp_control_cache: Arc<crate::acp::control_cache::ControlStateCache>,
     /// In-flight plugin creates keyed by `(plugin_id, idempotency_key)`.
     /// Sync mutex: critical sections are tiny and never span an `await`.
     // ponytail: one daemon process is the only sessions.json writer, so a
@@ -189,9 +194,13 @@ pub struct SessionService {
     pending_drains: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Per-session persist locks for `mutate_instance_persisted`, held across
     /// snapshot AND disk write so the two cannot be reordered. Distinct from
-    /// `instance_locks`: the drain holds that one across `send_turn` and then
-    /// calls this path, so reusing it would self-deadlock.
+    /// the other two: the drains hold `prompt_locks` across `send_turn` and
+    /// then call this path, so reusing either would self-deadlock.
     persist_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Per-session prompt-submission locks. See
+    /// [`SessionService::prompt_submission`].
+    #[cfg(feature = "serve")]
+    prompt_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// Who is asking the session service to act. Constructed only by the
@@ -252,6 +261,16 @@ impl std::fmt::Display for SendTurnError {
     }
 }
 
+/// The ACP collaborators `SessionService` shares with `AppState`. Grouped so
+/// the constructor keeps one parameter for "the ACP side" rather than one per
+/// handle.
+#[cfg(feature = "serve")]
+pub struct AcpDeps {
+    pub supervisor: Arc<crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>>,
+    pub event_store: Arc<crate::acp::event_store::EventStore>,
+    pub control_cache: Arc<crate::acp::control_cache::ControlStateCache>,
+}
+
 impl SessionService {
     #[cfg(feature = "serve")]
     pub fn new(
@@ -260,10 +279,7 @@ impl SessionService {
         file_watch: Arc<crate::file_watch::FileWatchService>,
         telemetry_session_creates: Arc<std::sync::atomic::AtomicU32>,
         mutation_epoch: Arc<std::sync::atomic::AtomicU64>,
-        acp_supervisor: Arc<
-            crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>,
-        >,
-        acp_event_store: Arc<crate::acp::event_store::EventStore>,
+        acp: AcpDeps,
     ) -> Self {
         Self {
             instances,
@@ -271,11 +287,13 @@ impl SessionService {
             file_watch,
             telemetry_session_creates,
             mutation_epoch,
-            acp_supervisor,
-            acp_event_store,
+            acp_supervisor: acp.supervisor,
+            acp_event_store: acp.event_store,
+            acp_control_cache: acp.control_cache,
             create_in_flight: std::sync::Mutex::new(HashMap::new()),
             pending_drains: std::sync::Mutex::new(std::collections::HashSet::new()),
             persist_locks: RwLock::new(HashMap::new()),
+            prompt_locks: RwLock::new(HashMap::new()),
         }
     }
 
@@ -481,8 +499,10 @@ impl SessionService {
         // Ownership gate, before ANY side effect (no wake, resume, publish,
         // or forward for a denied caller): a plugin may deliver turns only
         // to sessions it created. Ownership is immutable after creation, so
-        // a read snapshot suffices; deliberately no instance_lock here (the
-        // pending-turn drain calls this while holding it).
+        // a read snapshot suffices. Deliberately no instance_lock anywhere in
+        // this function: it waits on worker readiness below, and the resume it
+        // waits for needs that lock to finish (#3172, #3621). Callers own the
+        // per-session ordering through [`Self::prompt_submission`] instead.
         let (acp_mode_id, yolo_mode) = {
             let instances = self.instances.read().await;
             let Some(inst) = instances.iter().find(|i| i.id == id) else {
@@ -597,9 +617,11 @@ impl SessionService {
     ///
     /// Single drain owner: callers (the create fast path and the reconciler
     /// tick) race through the `pending_drains` claim, and the delivery runs
-    /// under the per-instance lock, so the turn cannot be published twice
-    /// concurrently. A delivery failure leaves the field set; the reconciler
-    /// tick retries once the worker is live. Clearing writes memory first,
+    /// under the session's [`Self::prompt_submission`] guard, so the turn
+    /// cannot be published twice concurrently and a direct prompt cannot
+    /// decide its own disposition mid-delivery. A delivery failure leaves the
+    /// field set; the reconciler tick retries once the worker is live.
+    /// Clearing writes memory first,
     /// then disk: a crash (or failed persist) between the forward and the
     /// disk clear re-delivers after restart, which is the documented
     /// at-least-once contract.
@@ -618,8 +640,7 @@ impl SessionService {
             service: Arc::clone(self),
             id: id.to_string(),
         };
-        let inst_lock = self.instance_lock(id).await;
-        let _serialized = inst_lock.lock().await;
+        let _submission = self.prompt_submission(id).await;
         let Some((text, attachment_refs, profile, caller)) = ({
             let instances = self.instances.read().await;
             instances.iter().find(|i| i.id == id).and_then(|i| {
@@ -928,6 +949,12 @@ impl SessionService {
     /// edges kept recency fresh by accident; dropping that stamp is what made
     /// the missing gesture-side write observable in the attention sort and the
     /// TUI activity column.
+    ///
+    /// Deliberately does NOT take [`Self::prompt_submission`]: `acp_prompt`
+    /// calls this through `buffer_and_enqueue` while already holding it, and
+    /// the guard is not reentrant. The `queue_enqueue` handler claims it
+    /// instead, so the row rewrite this does for an existing id still cannot
+    /// land inside a drain's snapshot-to-send window.
     #[cfg(feature = "serve")]
     pub(crate) async fn enqueue_prompt(
         self: &Arc<Self>,
@@ -969,6 +996,12 @@ impl SessionService {
     /// the batch, so it retries on every reconciler tick, nothing behind it
     /// ever drains, and the idle reaper (which skips a session with a queue)
     /// keeps its worker alive forever.
+    ///
+    /// Takes [`Self::prompt_submission`] for the same reason
+    /// `remove_queued_prompt` does: the drain snapshots its batch and only
+    /// then sends, so an unserialized edit landing inside that window is
+    /// written to a row the drain has already copied. It delivers the old
+    /// text and retires the row, and the edit is lost with nothing to retry.
     #[cfg(feature = "serve")]
     pub(crate) async fn edit_queued_prompt(
         self: &Arc<Self>,
@@ -976,6 +1009,9 @@ impl SessionService {
         prompt_id: String,
         text: String,
     ) -> EditQueuedOutcome {
+        let Some(_submission) = self.prompt_submission_for_session(id).await else {
+            return EditQueuedOutcome::NotFound;
+        };
         self.mutate_instance_persisted(id, move |inst| {
             match inst.queued_prompts.iter_mut().find(|q| q.id == prompt_id) {
                 Some(q) if text.trim().is_empty() && q.attachments.is_empty() => {
@@ -995,9 +1031,9 @@ impl SessionService {
     /// Remove a queued prompt by id. Returns `true` if a row was removed. Also
     /// drops any attachment bytes buffered for that prompt so they don't leak.
     ///
-    /// Takes the per-instance lock the drain holds across its whole
-    /// snapshot -> send -> retire, so a removal cannot land in the middle of a
-    /// delivery. Without it the web's "Send now" (which removes the row, then
+    /// Takes the [`Self::prompt_submission`] guard the drain holds across its
+    /// whole snapshot -> send -> retire, so a removal cannot land in the middle
+    /// of a delivery. Without it the web's "Send now" (which removes the row, then
     /// POSTs the same text itself) could tap inside the drain window: the drain
     /// already holds its own copy of the batch, so both would deliver and the
     /// agent would see the prompt twice. Serialized, the removal either beats
@@ -1009,8 +1045,9 @@ impl SessionService {
         id: &str,
         prompt_id: String,
     ) -> bool {
-        let inst_lock = self.instance_lock(id).await;
-        let _serialized = inst_lock.lock().await;
+        let Some(_submission) = self.prompt_submission_for_session(id).await else {
+            return false;
+        };
         let prompt_id_cleanup = prompt_id.clone();
         let removed = self
             .mutate_instance_persisted(id, move |inst| {
@@ -1029,8 +1066,16 @@ impl SessionService {
 
     /// Drop every queued prompt for a session, plus every attachment blob
     /// buffered for those prompts.
+    ///
+    /// Serialized against delivery like the other queue mutations: clearing
+    /// inside the drain's snapshot-to-send window empties the durable rows
+    /// while the batch the drain already copied still goes to the agent, so
+    /// the user watches the queue empty and then sees it sent anyway.
     #[cfg(feature = "serve")]
     pub(crate) async fn clear_queued_prompts(self: &Arc<Self>, id: &str) {
+        let Some(_submission) = self.prompt_submission_for_session(id).await else {
+            return;
+        };
         let cleared_ids = self
             .mutate_instance_persisted(id, move |inst| {
                 let ids: Vec<String> = inst.queued_prompts.iter().map(|q| q.id.clone()).collect();
@@ -1063,17 +1108,82 @@ impl SessionService {
             .unwrap_or_default()
     }
 
+    /// The daemon's live control state for a session, folded once at the
+    /// publish choke point and hydrated from the event log on a cache miss.
+    ///
+    /// This is the daemon's only non-lagging answer to "is a turn in flight":
+    /// `ChannelSink::publish_persisted` folds each event in as it records it,
+    /// whereas `Instance.status` is a mirror the broadcast listener applies
+    /// afterwards, one serial task behind every session's event stream.
+    ///
+    /// The fold is cached because rebuilding it per call measured 68ms at 20k
+    /// events and 342ms at 100k, holding the event store's connection mutex
+    /// for the whole scan, which stalls event recording daemon-wide.
+    #[cfg(feature = "serve")]
+    pub(crate) async fn fold_control_state(&self, id: &str) -> crate::acp::state::AcpState {
+        use crate::acp::state::{AcpSessionId, AcpState, AgentName};
+        let (agent, model) = {
+            let instances = self.instances.read().await;
+            instances
+                .iter()
+                .find(|i| i.id == id)
+                .map(|i| {
+                    (
+                        AgentName(i.agent_name.clone().unwrap_or_else(|| i.tool.clone())),
+                        i.agent_model.clone(),
+                    )
+                })
+                .unwrap_or_else(|| (AgentName(String::new()), None))
+        };
+        let store = Arc::clone(&self.acp_event_store);
+        let cache = Arc::clone(&self.acp_control_cache);
+        let sid = id.to_string();
+        // The hydrate closure runs under the cache's per-session lock and does
+        // a locking SQLite scan, so the whole thing goes off the runtime rather
+        // than just the scan.
+        tokio::task::spawn_blocking(move || {
+            cache.get_or_hydrate(&sid.clone(), || {
+                let mut reduced = AcpState::new(AcpSessionId(sid.clone()), agent, model);
+                let mut last_seq = 0;
+                for (seq, event) in store.replay_from(&sid, 0) {
+                    let _ = reduced.apply_event(event);
+                    last_seq = seq;
+                }
+                (reduced, last_seq)
+            })
+        })
+        .await
+        .unwrap_or_else(|_| {
+            // The blocking pool panicked or shut down. An empty state reads as
+            // "idle", which would let both prompt dispatch and the queue drain
+            // push into whatever turn is running, so hand back one that parks.
+            let mut fallback =
+                AcpState::new(AcpSessionId(id.to_string()), AgentName(String::new()), None);
+            fallback.turn_active = true;
+            fallback
+        })
+    }
+
     /// Drain the leading batch of a session's server-owned queue into the live
     /// worker once the current turn has ended. Mirrors
     /// `drain_pending_initial_turn`'s single-owner `pending_drains` claim +
-    /// per-instance-lock delivery, so a batch is never sent twice concurrently.
+    /// [`Self::prompt_submission`] delivery, so a batch is never sent twice
+    /// concurrently and the idle check below cannot be invalidated by a direct
+    /// prompt deciding its own disposition before this one reaches the agent.
     ///
-    /// Only drains an idle turn: `Status::Idle` means the prior turn emitted its
-    /// terminal `Stopped`, so this starts a fresh turn rather than racing a live
-    /// one. Callers (the reconciler tick) gate on `is_running`, so the worker is
-    /// live and `send_turn` will not spawn, making it safe to hold the instance
-    /// lock across delivery (the #3172 re-entrant-spawn deadlock cannot occur on
-    /// a live worker). The `/clear`-boundary split matches the client
+    /// Only drains an idle turn, and asks the live control fold rather than
+    /// `Instance.status`: dispatch parks a prompt on that fold, so gating the
+    /// delivery on the lagging status mirror lets the drain hand a queued
+    /// prompt to the turn it was parked behind.
+    ///
+    /// The reconciler tick gates on `is_running`, which is also true for a
+    /// resume that has reserved its slot but has no worker yet, so `send_turn`
+    /// here can park on `WORKER_READY_TIMEOUT`. That is why delivery must not
+    /// hold `instance_lock`: the resume being waited for takes it inside
+    /// `build_spawn_request`, and holding it stalled the drain for the whole
+    /// timeout and left the queue for a later retry (#3621).
+    ///
+    /// The `/clear`-boundary split matches the client
     /// (`useAcpSession`): a clear-command row fires as its own turn; a leading
     /// run of non-clear rows combines into one with blank-line separators.
     /// A batch's buffered attachment bytes are reloaded and forwarded with it.
@@ -1092,8 +1202,7 @@ impl SessionService {
             service: Arc::clone(self),
             id: id.to_string(),
         };
-        let inst_lock = self.instance_lock(id).await;
-        let _serialized = inst_lock.lock().await;
+        let _submission = self.prompt_submission(id).await;
 
         let (caller, agent_key, queue) = {
             let instances = self.instances.read().await;
@@ -1122,6 +1231,16 @@ impl SessionService {
             let agent_key = inst.agent_name.clone().unwrap_or_else(|| inst.tool.clone());
             (caller, agent_key, queue)
         };
+
+        // `Status::Idle` above is a mirror the broadcast listener applies one
+        // serial task behind every session's events, so it still reads Idle for
+        // as long as that task is behind. Prompt dispatch reads the live fold
+        // instead, which is why a prompt can be parked as `turn_active` and
+        // then drained into that very turn a moment later. Ask the same
+        // authority dispatch asked before delivering; the next tick retries.
+        if self.fold_control_state(id).await.turn_active {
+            return;
+        }
 
         // Leading batch up to a clear boundary (mirrors the client's split).
         let profile = crate::acp::agent_profiles::resolve(&agent_key);
@@ -1258,6 +1377,137 @@ impl SessionService {
             .entry(id.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    /// The session's single prompt-submission authority: hold this guard
+    /// across the whole decide-then-dispatch step, so the `Sent` / `Steered` /
+    /// `Queued` disposition ([`crate::acp::dispatch::PromptDispatch`]) is
+    /// settled atomically for every surface that can start a turn (both prompt
+    /// endpoints, the plugin host's `sessions.turn.send`, the queue drain, and
+    /// the pending-initial-turn drain). Every barrier that quiesces a worker
+    /// holds it too: stop, trash, archive, snooze, ACP shutdown, agent switch,
+    /// ACP disable, `attach_project`, the tied-worktree renames, and every
+    /// permanent delete. The drain reads status and the
+    /// trashed/archived/snoozed flags once and then reaches `send_turn`, which
+    /// respawns a worker it finds gone, so a quiesce landing inside that window
+    /// is undone and a delete races teardown against a live delivery. The
+    /// supervisor's reapers stay outside this: they drop a handle rather than
+    /// start a turn, so the worst they do to a delivery in flight is fail it,
+    /// and a failed delivery leaves its rows queued for the next tick. See
+    /// #3621 and #3650. Callers that have not yet proved the session exists take
+    /// [`Self::prompt_submission_for_session`] instead.
+    ///
+    /// Two rules make this work, and neither is optional:
+    ///
+    /// 1. **Decide and dispatch under one hold.** Dispatch reads
+    ///    [`Self::fold_control_state`], and the fold flips to `turn_active` at
+    ///    the publish choke point inside `send_turn`. Deciding under this lock
+    ///    means the loser of a race reads the winner's publish and parks,
+    ///    rather than pushing a second `ClientCmd::Prompt` at a busy agent that
+    ///    answers `PromptRejected(agent_busy)` after the queue row is retired.
+    /// 2. **Never `instance_lock`.** `send_turn` waits on worker readiness, and
+    ///    the resume it waits for builds its spawn request under `instance_lock`
+    ///    (`acp_reconciler::build_spawn_request`). A submitter that held that
+    ///    lock would stall the very resume it is waiting for and give up after
+    ///    `WORKER_READY_TIMEOUT`. This lock is deliberately distinct so the two
+    ///    never overlap; where both are genuinely needed, take this one first.
+    ///
+    /// One input escapes the hold: `acp_prompt` samples `woke_idle_dormant`
+    /// from `touch_on_prompt_and_wake_if_sunk` before claiming the guard,
+    /// because that helper takes `instance_lock`. A stale `true` only forces
+    /// `send_turn`'s resume trigger, which answers `AlreadyResuming` or
+    /// `AlreadyRunning` for a worker that is already there, so it costs a
+    /// lookup rather than a wrong disposition.
+    #[cfg(feature = "serve")]
+    pub(crate) async fn prompt_submission(&self, id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let guard = self.prompt_locks.read().await;
+            guard.get(id).cloned()
+        };
+        let lock = match lock {
+            Some(lock) => lock,
+            None => self
+                .prompt_locks
+                .write()
+                .await
+                .entry(id.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone(),
+        };
+        lock.lock_owned().await
+    }
+
+    /// [`Self::prompt_submission`] for a caller that has not yet proved the
+    /// session exists. `None` means "do not act", and no registry entry is
+    /// left behind for an id that was never admitted: the registry
+    /// auto-vivifies per id it is asked for and nothing else prunes it, so an
+    /// authenticated client probing random ids would otherwise grow it for the
+    /// daemon's lifetime (#3651).
+    ///
+    /// The re-check under the guard is what makes a permanent delete a
+    /// barrier (#3650). A delete holds this guard across its irreversible
+    /// teardown and removes the session row before dropping its lock, so both
+    /// a waiter parked on that lock and one that vivified a fresh entry after
+    /// `forget_prompt_lock` observe the removal and decline.
+    #[cfg(feature = "serve")]
+    pub(crate) async fn prompt_submission_for_session(
+        &self,
+        id: &str,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        if !self.session_exists(id).await {
+            return None;
+        }
+        let guard = self.prompt_submission(id).await;
+        if !self.session_exists(id).await {
+            drop(guard);
+            self.forget_prompt_lock(id).await;
+            return None;
+        }
+        Some(guard)
+    }
+
+    /// Claim the session's submission authority and settle the prompt's
+    /// disposition under it, so every turn-starting surface decides and
+    /// dispatches as one step instead of dispatching unconditionally after
+    /// the wait (#3649). `None` for a session that no longer exists.
+    #[cfg(feature = "serve")]
+    pub(crate) async fn begin_prompt_submission(
+        &self,
+        id: &str,
+        idle_dormant: bool,
+    ) -> Option<(
+        tokio::sync::OwnedMutexGuard<()>,
+        crate::acp::dispatch::PromptDispatch,
+    )> {
+        let guard = self.prompt_submission_for_session(id).await?;
+        let liveness = crate::acp::dispatch::WorkerLiveness {
+            running: self.acp_supervisor.is_running(id).await,
+            idle_dormant,
+        };
+        let dispatch = crate::acp::dispatch::decide(&self.fold_control_state(id).await, liveness);
+        Some((guard, dispatch))
+    }
+
+    #[cfg(feature = "serve")]
+    async fn session_exists(&self, id: &str) -> bool {
+        self.instances.read().await.iter().any(|i| i.id == id)
+    }
+
+    /// Drop a deleted session's submission lock, mirroring the `instance_locks`
+    /// removal the same delete paths already do. The registry is keyed by
+    /// session id and nothing prunes it otherwise, so without this a long-lived
+    /// daemon retains one entry per session it has ever seen.
+    #[cfg(feature = "serve")]
+    pub(crate) async fn forget_prompt_lock(&self, id: &str) {
+        self.prompt_locks.write().await.remove(id);
+    }
+
+    /// Registry size for a test asserting `prompt_locks` stays bounded (e.g.
+    /// does not grow for ids that were never admitted past an existence
+    /// check).
+    #[cfg(all(test, feature = "serve"))]
+    pub(crate) async fn prompt_locks_len(&self) -> usize {
+        self.prompt_locks.read().await.len()
     }
 }
 
@@ -1792,6 +2042,255 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["next"]
         );
+    }
+
+    /// The drain must not deliver into a turn prompt dispatch parked the
+    /// prompt behind.
+    ///
+    /// `Instance.status` is applied by `acp_event_listener`, one serial task
+    /// behind every session's event stream, while dispatch reads the fold
+    /// `ChannelSink::publish_persisted` updates as it records. Whenever the
+    /// listener is behind, a session with a live turn still reads `Idle`, and
+    /// the pre-fix drain took that as "the turn ended" and sent the queued
+    /// prompt as a second concurrent turn.
+    ///
+    /// Both rows below are undeliverable husks (empty text, no buffered
+    /// bytes), because retiring a husk is the drain's only externally visible
+    /// effect in a test with no live worker: the idle session's row is retired,
+    /// the mid-turn session's row survives untouched.
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn a_queued_prompt_is_not_drained_into_a_turn_status_has_not_caught_up_with() {
+        use crate::acp::state::Event;
+        use crate::acp::supervisor::BroadcastSink;
+
+        let mut idle = Instance::new("idle", "/tmp/aoe-queue-idle");
+        idle.id = "sess-idle".to_string();
+        idle.view = crate::session::View::Structured;
+        idle.status = crate::session::Status::Idle;
+        let mut mid_turn = Instance::new("mid", "/tmp/aoe-queue-mid-turn");
+        mid_turn.id = "sess-mid-turn".to_string();
+        mid_turn.view = crate::session::View::Structured;
+        // The lagging mirror: a turn is running, but the listener has not
+        // applied its `UserPromptSent` yet, so the row still says Idle.
+        mid_turn.status = crate::session::Status::Idle;
+        let state = crate::server::test_support::build_test_app_state(vec![idle, mid_turn]);
+        let service = state.session_service.clone();
+
+        // Publish through the real choke point: that is what folds the live
+        // projection the drain now reads.
+        let sink = crate::acp::supervisor::ChannelSink {
+            tx: state.acp_events_tx.clone(),
+            event_store: Arc::clone(&state.acp_event_store),
+            control_cache: Arc::clone(&state.acp_control_cache),
+        };
+        assert!(
+            sink.publish_persisted(
+                "sess-mid-turn",
+                1,
+                &Event::UserPromptSent {
+                    text: "go".into(),
+                    attachments: Vec::new(),
+                    prompt_id: None,
+                },
+            ),
+            "publish must reach the event store"
+        );
+
+        for id in ["sess-idle", "sess-mid-turn"] {
+            service
+                .enqueue_prompt(
+                    id,
+                    "husk".into(),
+                    String::new(),
+                    vec![crate::acp::state::PromptAttachmentRef {
+                        id: "att-1".into(),
+                        kind: crate::acp::state::PromptAttachmentKind::Image,
+                        mime_type: "image/png".into(),
+                        name: Some("shot.png".into()),
+                        size: 9,
+                    }],
+                    None,
+                    "t0".into(),
+                )
+                .await
+                .expect("session exists");
+            service.drain_queued_prompts_once(id).await;
+        }
+
+        assert!(
+            service
+                .queued_prompts_snapshot("sess-idle")
+                .await
+                .is_empty(),
+            "no turn in flight: the drain runs and retires the husk"
+        );
+        assert_eq!(
+            service.queued_prompts_snapshot("sess-mid-turn").await.len(),
+            1,
+            "a turn is in flight, so the drain must leave the queue for the next tick"
+        );
+    }
+
+    /// #3621: the queue drain must leave `instance_lock` free while it waits
+    /// for a worker.
+    ///
+    /// The reconciler starts the drain on `is_running`, which is also true for
+    /// a resume that has reserved its slot but has not produced a worker yet.
+    /// The drain then parks in `send_turn`'s readiness wait, and the resume it
+    /// is parked on cannot finish, because `build_spawn_request` needs that
+    /// same lock. Pre-fix the two sat on each other for the whole
+    /// `WORKER_READY_TIMEOUT`, after which the drain gave up and left the batch
+    /// for a later tick.
+    ///
+    /// A held `ResumeReservation` stands in for the spawn in flight, the same
+    /// fixture `acp::wake_prompt_frees_instance_lock_and_publishes_nothing_without_a_worker`
+    /// uses: it makes `wait_for_worker` park exactly as it does mid-respawn,
+    /// with no process, sandbox, or agent involved.
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn the_queue_drain_frees_instance_lock_while_it_waits_for_a_resuming_worker() {
+        use crate::acp::supervisor::{ResumeKind, ResumeReservationOutcome};
+        use std::time::Duration;
+
+        let mut inst = Instance::new("queue-3621", "/tmp/aoe-3621-drain");
+        inst.id = "sess-3621".to_string();
+        inst.view = crate::session::View::Structured;
+        inst.status = crate::session::Status::Idle;
+        let service = crate::server::test_support::build_test_app_state(vec![inst])
+            .session_service
+            .clone();
+
+        // Deliverable text, so the drain reaches `send_turn` rather than
+        // retiring an undeliverable husk on the way.
+        service
+            .enqueue_prompt(
+                "sess-3621",
+                "q1".into(),
+                "follow-up".into(),
+                vec![],
+                None,
+                "t0".into(),
+            )
+            .await
+            .expect("session exists");
+
+        // Hold the reservation for the whole probe so no worker can land.
+        let reservation = match service
+            .acp_supervisor
+            .begin_resume("sess-3621", ResumeKind::Spawn)
+            .await
+            .expect("begin_resume must not error under capacity")
+        {
+            ResumeReservationOutcome::Reserved(r) => r,
+            ResumeReservationOutcome::AlreadyPresent => panic!("expected a fresh reservation"),
+        };
+
+        let drain = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.drain_queued_prompts_once("sess-3621").await }
+        });
+
+        // Let the drain reach its parked readiness wait. It cannot return
+        // until the reservation drops, so anything past delivery is enough.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // The 2s budget is far under the 10s `WORKER_READY_TIMEOUT` the
+        // pre-fix drain holds the lock for, and far over what the fixed one
+        // needs, since it never takes the lock at all.
+        let inst_lock = service.instance_lock("sess-3621").await;
+        let acquired = tokio::time::timeout(Duration::from_secs(2), inst_lock.lock()).await;
+        assert!(
+            acquired.is_ok(),
+            "the drain must leave instance_lock free for the resume's build_spawn_request"
+        );
+        drop(acquired);
+
+        drop(reservation);
+        tokio::time::timeout(Duration::from_secs(30), drain)
+            .await
+            .expect("the drain must finish once the reservation drops")
+            .expect("drain task must not panic");
+
+        assert_eq!(
+            service.queued_prompts_snapshot("sess-3621").await.len(),
+            1,
+            "no worker ever arrived, so the batch stays queued for the next tick"
+        );
+    }
+
+    /// Every queue mutation that can race a delivery waits for it.
+    ///
+    /// The drain snapshots its batch and only then sends, so a mutation
+    /// landing inside that window changes rows the agent is already about to
+    /// receive: an edit is delivered as its old text and then retired, losing
+    /// the new text with nothing to retry, and a clear empties the durable
+    /// queue for a batch that goes out anyway. `remove_queued_prompt` was
+    /// already serialized for this reason; `edit` and `clear` were not.
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn queue_mutations_wait_for_an_in_flight_delivery() {
+        use std::time::Duration;
+
+        let mut inst = Instance::new("queue-mut", "/tmp/aoe-queue-mutations");
+        inst.id = "sess-mut".to_string();
+        inst.view = crate::session::View::Structured;
+        inst.status = crate::session::Status::Idle;
+        let service = crate::server::test_support::build_test_app_state(vec![inst])
+            .session_service
+            .clone();
+        service
+            .enqueue_prompt(
+                "sess-mut",
+                "q1".into(),
+                "original".into(),
+                vec![],
+                None,
+                "t0".into(),
+            )
+            .await
+            .expect("session exists");
+
+        // Stand in for a drain holding the session across snapshot -> send.
+        let delivering = service.prompt_submission("sess-mut").await;
+        let edit = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move {
+                service
+                    .edit_queued_prompt("sess-mut", "q1".into(), "edited".into())
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !edit.is_finished(),
+            "an edit must not rewrite a row a delivery has already snapshotted"
+        );
+        drop(delivering);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(10), edit)
+                .await
+                .expect("the edit lands once the delivery releases the session")
+                .expect("edit task must not panic"),
+            EditQueuedOutcome::Updated
+        ));
+
+        let delivering = service.prompt_submission("sess-mut").await;
+        let clear = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.clear_queued_prompts("sess-mut").await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !clear.is_finished(),
+            "a clear must not empty the queue out from under a delivery"
+        );
+        drop(delivering);
+        tokio::time::timeout(Duration::from_secs(10), clear)
+            .await
+            .expect("the clear lands once the delivery releases the session")
+            .expect("clear task must not panic");
+        assert!(service.queued_prompts_snapshot("sess-mut").await.is_empty());
     }
 
     /// Queueing a follow-up is a user gesture, so it must advance

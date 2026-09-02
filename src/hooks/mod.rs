@@ -27,8 +27,9 @@ pub(crate) use dir_guard::{
     write_session_id_via_guard,
 };
 pub use status_file::{
-    cleanup_hook_status_dir, hook_status_dir, read_hook_session_id, read_hook_status,
-    read_hook_status_age, read_hook_urgent,
+    cleanup_hook_status_dir, hook_status_dir, read_hook_session_id, read_hook_session_id_any_age,
+    read_hook_session_path, read_hook_status, read_hook_status_age, read_hook_urgent,
+    session_id_sidecar_exists,
 };
 pub(crate) use targets::{
     has_aoe_marker, iter_hook_targets, iter_hook_targets_in, HookTarget, HookTargetKind,
@@ -736,8 +737,8 @@ pub(crate) fn snapshot_codex_hooks_state(config_path: &Path) -> Result<Option<to
         return Ok(None);
     }
 
-    with_codex_config_lock(config_path, || {
-        let config = read_codex_config(config_path)?;
+    with_codex_config_lock(config_path, SymlinkPolicy::Follow, || {
+        let config = read_codex_config(config_path, SymlinkPolicy::Follow)?;
         Ok(config
             .get("hooks")
             .and_then(|hooks| hooks.as_table_like())
@@ -754,11 +755,11 @@ pub(crate) fn snapshot_codex_hooks_state(config_path: &Path) -> Result<Option<to
 /// `state` already present at `config_path`; pair only with a fresh
 /// snapshot from the authoritative source.
 pub(crate) fn restore_codex_hooks_state(config_path: &Path, state: toml_edit::Item) -> Result<()> {
-    with_codex_config_lock(config_path, || {
-        let mut config = read_codex_config(config_path)?;
+    with_codex_config_lock(config_path, SymlinkPolicy::Follow, || {
+        let mut config = read_codex_config(config_path, SymlinkPolicy::Follow)?;
         let hooks = ensure_codex_hooks_table(&mut config)?;
         hooks.insert("state", state);
-        write_codex_config(config_path, &config)?;
+        write_codex_config(config_path, &config, SymlinkPolicy::Follow)?;
         Ok(())
     })
 }
@@ -769,8 +770,8 @@ pub(crate) fn install_codex_hooks_with_preserved_state(
     preserved_state: Option<toml_edit::Item>,
     target: HookInstallTarget,
 ) -> Result<()> {
-    with_codex_config_lock(config_path, || {
-        let mut config = read_codex_config(config_path)?;
+    with_codex_config_lock(config_path, SymlinkPolicy::Follow, || {
+        let mut config = read_codex_config(config_path, SymlinkPolicy::Follow)?;
         if codex_hooks_feature_is_disabled(&config, config_path) {
             return Ok(());
         }
@@ -793,16 +794,20 @@ pub(crate) fn install_codex_hooks_with_preserved_state(
             return Ok(());
         }
 
-        write_codex_config(config_path, &config)?;
+        write_codex_config(config_path, &config, SymlinkPolicy::Follow)?;
         tracing::info!(target: "hooks.install",
             "Installed AoE hooks in {}", config_path.display());
         Ok(())
     })
 }
 
-fn with_codex_config_lock<T>(config_path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
-    let lock_base_path = crate::session::resolve_symlink_chain(config_path)?;
-    with_config_lock(&lock_base_path, "toml.lock", f)
+fn with_codex_config_lock<T>(
+    config_path: &Path,
+    policy: SymlinkPolicy,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let lock_base_path = policy.lock_path(config_path)?;
+    with_config_lock_policy(&lock_base_path, "toml.lock", policy, f)
 }
 
 /// Generic advisory-lock helper for hook settings files. Holds an exclusive
@@ -815,17 +820,36 @@ fn with_config_lock<T>(
     lock_extension: &str,
     f: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
+    with_config_lock_policy(path, lock_extension, SymlinkPolicy::Follow, f)
+}
+
+/// [`with_config_lock`] with an explicit symlink policy. Under
+/// [`SymlinkPolicy::Never`] the sidecar is opened `O_NOFOLLOW`, so a link
+/// planted at the lock path by a process in the container fails the open and
+/// the write it guards never runs, rather than the lock landing on a host file
+/// outside the bind.
+fn with_config_lock_policy<T>(
+    path: &Path,
+    lock_extension: &str,
+    policy: SymlinkPolicy,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
     use std::os::unix::fs::OpenOptionsExt;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let lock_path = path.with_extension(lock_extension);
-    let lock_file = std::fs::OpenOptions::new()
+    let mut options = std::fs::OpenOptions::new();
+    options
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .mode(0o600)
+        .mode(0o600);
+    if policy == SymlinkPolicy::Never {
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let lock_file = options
         .open(&lock_path)
         .with_context(|| format!("Failed to open config lock {}", lock_path.display()))?;
 
@@ -844,18 +868,85 @@ fn with_config_lock<T>(
     }
 }
 
-fn write_codex_config(config_path: &Path, config: &toml_edit::DocumentMut) -> Result<()> {
-    crate::session::atomic_write(config_path, config.to_string().as_bytes())
+/// How a config write treats a symlink it finds on the path.
+///
+/// `Follow` is the host default: the file is the user's own config, and a link
+/// into a dotfiles repo has to survive the write (`session::atomic_write`,
+/// #2784, #3186). `Never` is for a directory bind-mounted into a container the
+/// agent can write, where a link on the path is an attempt to redirect the
+/// write onto a host file and is replaced instead of followed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SymlinkPolicy {
+    Follow,
+    Never,
 }
 
-fn read_codex_config(config_path: &Path) -> Result<toml_edit::DocumentMut> {
-    if config_path.exists() {
-        let content = std::fs::read_to_string(config_path)?;
-        content
+impl SymlinkPolicy {
+    /// The content to merge into, or `None` when there is none. Under `Never`
+    /// anything that is not a regular file reads as absent: following a planted
+    /// link would pull an arbitrary host file into a config the container
+    /// reads.
+    fn read(self, path: &Path) -> Result<Option<String>> {
+        match self {
+            Self::Follow => match std::fs::read_to_string(path) {
+                Ok(content) => Ok(Some(content)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+            },
+            Self::Never => Ok(std::fs::symlink_metadata(path)
+                .is_ok_and(|m| m.is_file())
+                .then(|| std::fs::read_to_string(path).ok())
+                .flatten()),
+        }
+    }
+
+    fn write(self, path: &Path, content: &[u8]) -> Result<()> {
+        match self {
+            Self::Follow => {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                crate::session::atomic_write(path, content)
+            }
+            // The bind root is the directory AoE owns; the file sits directly
+            // in it, so the whole path below the root is that one name.
+            Self::Never => {
+                let dir = path
+                    .parent()
+                    .ok_or_else(|| anyhow::anyhow!("{} has no parent", path.display()))?;
+                let name = path
+                    .file_name()
+                    .ok_or_else(|| anyhow::anyhow!("{} has no file name", path.display()))?;
+                crate::session::replace_file_no_follow(dir, Path::new(name), content)
+            }
+        }
+    }
+
+    /// The path to lock on. Resolving the chain keeps two writers to the same
+    /// dotfile target on one lock; under `Never` there is no link to honor, and
+    /// resolving one would move the lock outside the bind.
+    fn lock_path(self, path: &Path) -> Result<PathBuf> {
+        match self {
+            Self::Follow => crate::session::resolve_symlink_chain(path),
+            Self::Never => Ok(path.to_path_buf()),
+        }
+    }
+}
+
+fn write_codex_config(
+    config_path: &Path,
+    config: &toml_edit::DocumentMut,
+    policy: SymlinkPolicy,
+) -> Result<()> {
+    policy.write(config_path, config.to_string().as_bytes())
+}
+
+fn read_codex_config(config_path: &Path, policy: SymlinkPolicy) -> Result<toml_edit::DocumentMut> {
+    match policy.read(config_path)? {
+        Some(content) => content
             .parse::<toml_edit::DocumentMut>()
-            .with_context(|| format!("Failed to parse {}", config_path.display()))
-    } else {
-        Ok(toml_edit::DocumentMut::new())
+            .with_context(|| format!("Failed to parse {}", config_path.display())),
+        None => Ok(toml_edit::DocumentMut::new()),
     }
 }
 
@@ -1086,13 +1177,13 @@ pub fn uninstall_codex_hooks(config_path: &Path) -> Result<bool> {
         return Ok(false);
     }
 
-    let modified = with_codex_config_lock(config_path, || {
-        let mut config = read_codex_config(config_path)?;
+    let modified = with_codex_config_lock(config_path, SymlinkPolicy::Follow, || {
+        let mut config = read_codex_config(config_path, SymlinkPolicy::Follow)?;
         if !remove_codex_aoe_hooks(&mut config)? {
             return Ok(false);
         }
 
-        write_codex_config(config_path, &config)?;
+        write_codex_config(config_path, &config, SymlinkPolicy::Follow)?;
         Ok(true)
     })?;
     if modified {
@@ -1112,9 +1203,11 @@ pub fn uninstall_codex_hooks(config_path: &Path) -> Result<bool> {
 /// treated as empty rather than propagated as an error, mirroring the hook
 /// installers above.
 pub fn disable_gemini_folder_trust(settings_path: &Path) -> Result<()> {
-    with_config_lock(settings_path, "json.lock", || {
-        let mut settings: Value = if settings_path.exists() {
-            let content = std::fs::read_to_string(settings_path)?;
+    // Staged for one container, so the file is always inside a bind the agent
+    // can write; there is no host arm to keep a dotfile link for.
+    let policy = SymlinkPolicy::Never;
+    with_config_lock_policy(settings_path, "json.lock", policy, || {
+        let mut settings: Value = if let Some(content) = policy.read(settings_path)? {
             serde_json::from_str(&content).unwrap_or_else(|e| {
                 tracing::warn!(target: "hooks.install", "Failed to parse {}: {}", settings_path.display(), e);
                 serde_json::json!({})
@@ -1151,11 +1244,8 @@ pub fn disable_gemini_folder_trust(settings_path: &Path) -> Result<()> {
             return Ok(());
         }
 
-        if let Some(parent) = settings_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let formatted = serde_json::to_string_pretty(&settings)?;
-        crate::session::atomic_write(settings_path, formatted.as_bytes())?;
+        policy.write(settings_path, formatted.as_bytes())?;
         tracing::info!(target: "hooks.install",
             "Disabled Gemini folder trust in {}", settings_path.display());
         Ok(())
@@ -1173,9 +1263,13 @@ pub fn disable_gemini_folder_trust(settings_path: &Path) -> Result<()> {
 /// installers so it cannot interleave with a concurrent hook rewrite, and
 /// preserves every other key in the file, including an existing `[projects.*]`
 /// block.
-pub fn trust_codex_project(config_path: &Path, project_path: &str) -> Result<()> {
-    with_codex_config_lock(config_path, || {
-        let mut config = read_codex_config(config_path)?;
+pub fn trust_codex_project(
+    config_path: &Path,
+    project_path: &str,
+    policy: SymlinkPolicy,
+) -> Result<()> {
+    with_codex_config_lock(config_path, policy, || {
+        let mut config = read_codex_config(config_path, policy)?;
         let before = config.to_string();
 
         let root = config.as_table_mut();
@@ -1212,11 +1306,187 @@ pub fn trust_codex_project(config_path: &Path, project_path: &str) -> Result<()>
             return Ok(());
         }
 
-        write_codex_config(config_path, &config)?;
+        write_codex_config(config_path, &config, policy)?;
         tracing::info!(target: "hooks.install",
             "Marked {} trusted in Codex config {}", project_path, config_path.display());
         Ok(())
     })
+}
+
+/// Mark `project_path` as trusted in Claude Code's `.claude.json` by merging
+/// `projects."<project_path>".hasTrustDialogAccepted = true`.
+///
+/// Claude Code keys folder trust on the resolved workspace directory (a trusted
+/// entry also covers its subdirectories), so `project_path` must be the path it
+/// resolves as its workspace (inside a sandbox that is the in-container worktree
+/// path, not the host path). Unlike
+/// `CLAUDE_CODE_SANDBOXED`, a persisted entry also lets the repo's own
+/// `.claude/settings.json` permission rules load; the env var leaves them
+/// ignored. Neither auto-approves `.mcp.json` servers, which keep their own
+/// per-server prompt.
+///
+/// The file doubles as Claude Code's onboarding state, so every other key is
+/// preserved and a malformed file is treated as empty rather than propagated,
+/// mirroring the installers above.
+pub fn trust_claude_project(
+    config_path: &Path,
+    project_path: &str,
+    policy: SymlinkPolicy,
+) -> Result<()> {
+    with_config_lock_policy(&policy.lock_path(config_path)?, "json.lock", policy, || {
+        let mut config: Value = if let Some(content) = policy.read(config_path)? {
+            serde_json::from_str(&content).unwrap_or_else(|e| {
+                tracing::warn!(target: "hooks.install", "Failed to parse {}: {}", config_path.display(), e);
+                serde_json::json!({})
+            })
+        } else {
+            serde_json::json!({})
+        };
+
+        let before = config.clone();
+
+        let root = config
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("Claude config root is not a JSON object"))?;
+        let projects = root
+            .entry("projects")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if !projects.is_object() {
+            *projects = Value::Object(serde_json::Map::new());
+        }
+        let project = projects
+            .as_object_mut()
+            .expect("ensured object above")
+            .entry(project_path)
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if !project.is_object() {
+            *project = Value::Object(serde_json::Map::new());
+        }
+        project
+            .as_object_mut()
+            .expect("ensured object above")
+            .insert("hasTrustDialogAccepted".to_string(), Value::Bool(true));
+
+        if config == before {
+            return Ok(());
+        }
+
+        let formatted = serde_json::to_string_pretty(&config)?;
+        policy.write(config_path, formatted.as_bytes())?;
+        tracing::info!(target: "hooks.install",
+            "Marked {} trusted in Claude config {}", project_path, config_path.display());
+        Ok(())
+    })
+}
+
+/// Mark `project_path` as trusted in Gemini's `trustedFolders.json` by merging
+/// `"<project_path>": "TRUST_FOLDER"`.
+///
+/// The per-path counterpart to [`disable_gemini_folder_trust`], which turns the
+/// feature off wholesale. That is acceptable against a staged sandbox config
+/// that only ever reaches one container, but on the host it would disable
+/// folder trust for the user's Gemini everywhere, so the host path trusts one
+/// directory at a time instead.
+pub fn trust_gemini_project(
+    trusted_folders_path: &Path,
+    project_path: &str,
+    policy: SymlinkPolicy,
+) -> Result<()> {
+    with_config_lock_policy(
+        &policy.lock_path(trusted_folders_path)?,
+        "json.lock",
+        policy,
+        || {
+            let mut folders: Value = if let Some(content) = policy.read(trusted_folders_path)? {
+                serde_json::from_str(&content).unwrap_or_else(|e| {
+                tracing::warn!(target: "hooks.install", "Failed to parse {}: {}", trusted_folders_path.display(), e);
+                serde_json::json!({})
+            })
+            } else {
+                serde_json::json!({})
+            };
+
+            let before = folders.clone();
+
+            let root = folders.as_object_mut().ok_or_else(|| {
+                anyhow::anyhow!("Gemini trustedFolders root is not a JSON object")
+            })?;
+            root.insert(
+                project_path.to_string(),
+                Value::String("TRUST_FOLDER".to_string()),
+            );
+
+            if folders == before {
+                return Ok(());
+            }
+
+            let formatted = serde_json::to_string_pretty(&folders)?;
+            policy.write(trusted_folders_path, formatted.as_bytes())?;
+            tracing::info!(target: "hooks.install",
+            "Marked {} trusted in Gemini trustedFolders {}",
+            project_path, trusted_folders_path.display());
+            Ok(())
+        },
+    )
+}
+
+/// Pre-trust `project_path` in the agent's real host config.
+///
+/// The host counterpart of the sandbox trust registry in `container_config`.
+/// Sandboxed sessions write to a staged config that only ever reaches one
+/// container; here the write lands in the user's own config and outlives the
+/// session, so it is gated on `session.pre_trust_agent_folders` and always
+/// scoped to a single directory. Gemini in particular gets a per-path entry
+/// rather than the global [`disable_gemini_folder_trust`] the sandbox uses.
+///
+/// `config_dir` is the session's `session.agent_config_dir` entry. It wins over
+/// the agent's own config-dir env var, which AoE can only read from the
+/// environment it hands the agent: a wrapper that exports the variable itself
+/// (the usual way to run one CLI against two accounts) sets it after AoE has
+/// already chosen a file, so without the setting the record lands in the
+/// default config the agent never reads.
+///
+/// Agents with no folder-trust prompt are a no-op.
+pub fn trust_host_project(
+    agent_name: &str,
+    home: &Path,
+    host_env: &[String],
+    config_dir: Option<&Path>,
+    project_path: &str,
+) -> Result<()> {
+    let declared = || config_dir.map(Path::to_path_buf);
+    let from_env = |var: &str| resolve_config_dir_override(var, host_env).map(PathBuf::from);
+    match agent_name {
+        // Without a config dir the trust record lives at `~/.claude.json`,
+        // beside `~/.claude/` rather than inside it; an override replaces the
+        // whole directory, so it takes the file with it.
+        "claude" => trust_claude_project(
+            &declared()
+                .or_else(|| from_env("CLAUDE_CONFIG_DIR"))
+                .map(|dir| dir.join(".claude.json"))
+                .unwrap_or_else(|| home.join(".claude.json")),
+            project_path,
+            SymlinkPolicy::Follow,
+        ),
+        "codex" => trust_codex_project(
+            &declared()
+                .or_else(|| from_env("CODEX_HOME"))
+                .unwrap_or_else(|| home.join(".codex"))
+                .join("config.toml"),
+            project_path,
+            SymlinkPolicy::Follow,
+        ),
+        // Gemini's env var names the file rather than the directory holding it.
+        "gemini" => trust_gemini_project(
+            &config_dir
+                .map(|dir| dir.join("trustedFolders.json"))
+                .or_else(|| from_env("GEMINI_CLI_TRUSTED_FOLDERS_PATH"))
+                .unwrap_or_else(|| home.join(".gemini").join("trustedFolders.json")),
+            project_path,
+            SymlinkPolicy::Follow,
+        ),
+        _ => Ok(()),
+    }
 }
 
 /// Remove all AoE hooks from an agent's `settings.json` file.
@@ -3029,7 +3299,12 @@ trust_level = "trusted"
         let tmp = TempDir::new().unwrap();
         let config_path = tmp.path().join(".codex").join("config.toml");
 
-        trust_codex_project(&config_path, "/workspace/my-worktree").unwrap();
+        trust_codex_project(
+            &config_path,
+            "/workspace/my-worktree",
+            SymlinkPolicy::Follow,
+        )
+        .unwrap();
 
         let config_text = std::fs::read_to_string(&config_path).unwrap();
         assert!(
@@ -3057,7 +3332,12 @@ trust_level = "trusted"
         )
         .unwrap();
 
-        trust_codex_project(&config_path, "/workspace/my-worktree").unwrap();
+        trust_codex_project(
+            &config_path,
+            "/workspace/my-worktree",
+            SymlinkPolicy::Follow,
+        )
+        .unwrap();
 
         let config: toml::Value =
             toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
@@ -3077,17 +3357,288 @@ trust_level = "trusted"
         let tmp = TempDir::new().unwrap();
         let config_path = tmp.path().join("config.toml");
 
-        trust_codex_project(&config_path, "/workspace/my-worktree").unwrap();
+        trust_codex_project(
+            &config_path,
+            "/workspace/my-worktree",
+            SymlinkPolicy::Follow,
+        )
+        .unwrap();
         let first = std::fs::read_to_string(&config_path).unwrap();
         let mtime = std::fs::metadata(&config_path).unwrap().modified().unwrap();
 
-        trust_codex_project(&config_path, "/workspace/my-worktree").unwrap();
+        trust_codex_project(
+            &config_path,
+            "/workspace/my-worktree",
+            SymlinkPolicy::Follow,
+        )
+        .unwrap();
         let second = std::fs::read_to_string(&config_path).unwrap();
         assert_eq!(first, second);
         assert_eq!(
             mtime,
             std::fs::metadata(&config_path).unwrap().modified().unwrap()
         );
+    }
+
+    // The file Claude Code keys folder trust in is the same one that carries
+    // its onboarding state, so a trust write must merge rather than replace.
+    /// The two halves of the symlink contract. `Follow` keeps a user's config
+    /// symlinked into a dotfiles repo working (#2784, #3186); `Never` refuses a
+    /// link planted in a bind the container can write, which would otherwise
+    /// redirect the trust write onto a host file of its choosing.
+    #[cfg(unix)]
+    #[test]
+    fn test_trust_claude_project_follows_a_dotfile_link_and_replaces_a_planted_one() {
+        let tmp = TempDir::new().unwrap();
+
+        let dotfiles = tmp.path().join("dotfiles.json");
+        std::fs::write(&dotfiles, "{}").unwrap();
+        let host_config = tmp.path().join("host.claude.json");
+        std::os::unix::fs::symlink(&dotfiles, &host_config).unwrap();
+
+        trust_claude_project(&host_config, "/workspace/wt", SymlinkPolicy::Follow).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&host_config)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "a dotfile link must survive the write"
+        );
+        let followed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&dotfiles).unwrap()).unwrap();
+        assert_eq!(
+            followed["projects"]["/workspace/wt"]["hasTrustDialogAccepted"],
+            Value::Bool(true)
+        );
+
+        let outside = tmp.path().join("host-secret");
+        std::fs::write(&outside, "untouched").unwrap();
+        let bind = tmp.path().join("bind");
+        std::fs::create_dir(&bind).unwrap();
+        let planted = bind.join(".claude.json");
+        std::os::unix::fs::symlink(&outside, &planted).unwrap();
+
+        trust_claude_project(&planted, "/workspace/wt", SymlinkPolicy::Never).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "untouched",
+            "the planted link must not carry the write out of the bind"
+        );
+        assert!(!std::fs::symlink_metadata(&planted)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&planted).unwrap()).unwrap();
+        assert_eq!(
+            written["projects"]["/workspace/wt"]["hasTrustDialogAccepted"],
+            Value::Bool(true),
+            "and the record still lands in the bind"
+        );
+        // The link's target is not merged in either: it never reaches a config
+        // the container can read.
+        assert_eq!(written.as_object().unwrap().len(), 1);
+
+        // The lock sidecar is part of the path the container can plant on, so
+        // a link there fails the write closed rather than locking a host file.
+        let locked = bind.join("locked.claude.json");
+        std::os::unix::fs::symlink(&outside, bind.join("locked.claude.json.lock")).unwrap();
+        assert!(
+            trust_claude_project(&locked, "/workspace/wt", SymlinkPolicy::Never).is_err(),
+            "a planted lock link must fail the write, not follow it"
+        );
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "untouched");
+    }
+
+    #[test]
+    fn test_trust_claude_project_merges_into_existing_config() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join(".claude").join(".claude.json");
+
+        // Table cases share the file: each runs against what the last left.
+        // (existing content, path to trust)
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config_path,
+            r#"{"hasCompletedOnboarding":true,"projects":{"/other":{"hasTrustDialogAccepted":true,"allowedTools":["Bash"]}}}"#,
+        )
+        .unwrap();
+
+        trust_claude_project(
+            &config_path,
+            "/workspace/my-worktree",
+            SymlinkPolicy::Follow,
+        )
+        .unwrap();
+
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(config["hasCompletedOnboarding"].as_bool(), Some(true));
+        assert_eq!(
+            config["projects"]["/workspace/my-worktree"]["hasTrustDialogAccepted"].as_bool(),
+            Some(true)
+        );
+        // A sibling project keeps every key it had, not just the trust flag.
+        assert_eq!(
+            config["projects"]["/other"]["allowedTools"][0].as_str(),
+            Some("Bash")
+        );
+
+        // Idempotent: a second call must not rewrite the file.
+        let first = std::fs::read_to_string(&config_path).unwrap();
+        let mtime = std::fs::metadata(&config_path).unwrap().modified().unwrap();
+        trust_claude_project(
+            &config_path,
+            "/workspace/my-worktree",
+            SymlinkPolicy::Follow,
+        )
+        .unwrap();
+        assert_eq!(first, std::fs::read_to_string(&config_path).unwrap());
+        assert_eq!(
+            mtime,
+            std::fs::metadata(&config_path).unwrap().modified().unwrap()
+        );
+    }
+
+    // A half-written config must not block the launch; the installers above
+    // treat unparseable files as empty and this one has to match.
+    #[test]
+    #[serial_test::serial]
+    fn test_trust_claude_project_replaces_malformed_config() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join(".claude.json");
+        std::fs::write(&config_path, "{not json").unwrap();
+
+        trust_claude_project(
+            &config_path,
+            "/workspace/my-worktree",
+            SymlinkPolicy::Follow,
+        )
+        .unwrap();
+
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(
+            config["projects"]["/workspace/my-worktree"]["hasTrustDialogAccepted"].as_bool(),
+            Some(true)
+        );
+    }
+
+    // The host path trusts one directory instead of turning the whole feature
+    // off the way the sandbox-only `disable_gemini_folder_trust` does.
+    #[test]
+    fn test_trust_gemini_project_writes_per_path_entry() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(".gemini").join("trustedFolders.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"/other":"TRUST_FOLDER"}"#).unwrap();
+
+        trust_gemini_project(&path, "/workspace/my-worktree", SymlinkPolicy::Follow).unwrap();
+
+        let folders: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(folders["/other"].as_str(), Some("TRUST_FOLDER"));
+        assert_eq!(
+            folders["/workspace/my-worktree"].as_str(),
+            Some("TRUST_FOLDER")
+        );
+    }
+
+    // Agents with no folder-trust prompt must not have a config invented for
+    // them, and the claude arm has to honor CLAUDE_CONFIG_DIR.
+    #[test]
+    fn test_trust_host_project_routes_per_agent() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let claude_dir = home.join("custom-claude");
+
+        trust_host_project(
+            "claude",
+            home,
+            &[format!("CLAUDE_CONFIG_DIR={}", claude_dir.display())],
+            None,
+            "/repo",
+        )
+        .unwrap();
+        trust_host_project("gemini", home, &[], None, "/repo").unwrap();
+        trust_host_project("opencode", home, &[], None, "/repo").unwrap();
+
+        assert!(
+            claude_dir.join(".claude.json").exists(),
+            "claude must honor CLAUDE_CONFIG_DIR over ~/.claude"
+        );
+        assert!(!home.join(".claude").exists());
+        assert!(home.join(".gemini").join("trustedFolders.json").exists());
+        assert!(
+            std::fs::read_dir(home).unwrap().count() == 2,
+            "an agent without a folder-trust prompt must write nothing"
+        );
+    }
+
+    // Claude Code reads `~/.claude.json`, a sibling of `~/.claude/` and not a
+    // file inside it, whenever CLAUDE_CONFIG_DIR is unset. Writing the trust
+    // record one directory down leaves it somewhere the agent never looks.
+    #[test]
+    fn test_trust_host_project_claude_defaults_to_home_level_config() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let _guard = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+
+        trust_host_project("claude", home, &[], None, "/repo").unwrap();
+
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(home.join(".claude.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            config["projects"]["/repo"]["hasTrustDialogAccepted"].as_bool(),
+            Some(true)
+        );
+        assert!(!home.join(".claude").join(".claude.json").exists());
+    }
+
+    // `session.agent_config_dir` exists for wrappers that export the config-dir
+    // env var themselves, after AoE has already picked a file, so it has to win
+    // over the env var rather than merely fill in for it.
+    #[test]
+    fn test_trust_host_project_config_dir_wins_over_env_var() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let from_env = home.join("from-env");
+        let declared = home.join("declared");
+
+        for (agent, env_var, rel) in [
+            ("claude", "CLAUDE_CONFIG_DIR", ".claude.json"),
+            ("codex", "CODEX_HOME", "config.toml"),
+            (
+                "gemini",
+                "GEMINI_CLI_TRUSTED_FOLDERS_PATH",
+                "trustedFolders.json",
+            ),
+        ] {
+            let env = vec![format!(
+                "{env_var}={}",
+                // Gemini's variable names the file, not the directory.
+                if agent == "gemini" {
+                    from_env.join(rel)
+                } else {
+                    from_env.clone()
+                }
+                .display()
+            )];
+            trust_host_project(agent, home, &env, Some(&declared), "/repo").unwrap();
+
+            assert!(
+                declared.join(rel).exists(),
+                "{agent}: the declared config dir must take the write"
+            );
+            assert!(
+                !from_env.join(rel).exists(),
+                "{agent}: the env var must not win over the declared config dir"
+            );
+            std::fs::remove_dir_all(&declared).unwrap();
+        }
     }
 
     #[test]
@@ -3837,6 +4388,7 @@ hooks_auto_accept: false
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_install_hermes_hooks_rejects_invalid_allowlist_without_overwrite() {
         let tmp = TempDir::new().unwrap();
         let config_path = tmp.path().join("config.yaml");
@@ -4130,6 +4682,7 @@ hooks_auto_accept: false
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_resolve_kiro_agent_file_ignores_non_json_and_invalid_files() {
         // Unreadable-as-JSON and non-.json files in the dir must not break the
         // scan or produce a false match.

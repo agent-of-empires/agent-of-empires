@@ -15,6 +15,8 @@ export const ACP_CAPABLE_TOOLS: ReadonlySet<string> = new Set([
   "vibe",
   "pi",
   "omp",
+  "kimi",
+  "prime-agent",
 ]);
 
 /** Authoritative acp-capability check. The server now reports

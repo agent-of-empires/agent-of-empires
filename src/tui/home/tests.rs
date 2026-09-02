@@ -6,7 +6,8 @@ use serial_test::serial;
 use tempfile::TempDir;
 use tui_input::Input;
 
-use super::{ConfigRefreshOrigin, ConfigWatchKey, HomeView, PreviewSelection, ViewMode};
+use super::watchers::ConfigWatchKey;
+use super::{ConfigRefreshOrigin, HomeView, PreviewSelection, ViewMode};
 use crate::session::{
     Group, GroupTree, Instance, Item, LifecycleOperation, LifecycleReservation, Status, Storage,
 };
@@ -2901,6 +2902,26 @@ fn switching_view_retargets_capture_worker_pane() {
 
 #[test]
 #[serial]
+fn retarget_same_session_tool_clears_previous_pane_content() {
+    let env = create_test_env_with_sessions(1);
+    let mut view = env.view;
+    view.view_mode = ViewMode::Tool("lazygit".to_string());
+    view.sync_preview_capture_worker(Some("aoe_test_tool_a".to_string()));
+    view.tool_preview_cache.content = "tool A screen".to_string();
+    view.tool_preview_cache.capture_target = Some("aoe_test_tool_a".to_string());
+    view.tool_preview_cache.session_id = view.selected_session.clone();
+
+    view.sync_preview_capture_worker(Some("aoe_test_tool_b".to_string()));
+
+    assert!(
+        view.tool_preview_cache.content.is_empty(),
+        "a cold pane must not render another tool's bytes from the same session",
+    );
+    assert!(view.tool_preview_cache.capture_target.is_none());
+}
+
+#[test]
+#[serial]
 fn test_enter_returns_attach_terminal_in_terminal_view() {
     let env = create_test_env_with_sessions(1);
     let mut view = env.view;
@@ -3441,26 +3462,74 @@ fn test_prompt_archive_selected_group() {
 #[test]
 #[serial]
 fn test_delete_group_with_sessions_updates_groups_field() {
-    use crate::session::Status;
     use crate::tui::dialogs::GroupDeleteOptions;
 
-    let mut env = create_test_env_with_group_sessions();
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+    let other_storage = Storage::new_unwatched("other").unwrap();
 
-    // Select the "work" group
-    for (i, item) in env.view.flat_items.iter().enumerate() {
-        if let Item::Group { path, .. } = item {
+    let project = temp.path().join("work");
+    std::fs::create_dir(&project).unwrap();
+    let mut hidden = Instance::new("hidden-trash-member", &project.to_string_lossy());
+    hidden.group_path = "work/projects".to_string();
+    hidden.trash();
+    hidden.lifecycle_generation = 1;
+    hidden.lifecycle_reservation = Some(LifecycleReservation {
+        op: LifecycleOperation::Launch,
+        generation: 1,
+        at: chrono::Utc::now(),
+    });
+    storage
+        .update(|instances, groups| {
+            instances.push(hidden);
+            groups.extend([
+                Group::new("work", "work"),
+                Group::new("projects", "work/projects"),
+                Group::new("workbench", "workbench"),
+            ]);
+            Ok(())
+        })
+        .unwrap();
+    other_storage
+        .update(|_, groups| {
+            groups.extend([
+                Group::new("work", "work"),
+                Group::new("projects", "work/projects"),
+            ]);
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.flat_items = view.build_flat_items();
+    view.update_selected();
+
+    for (i, item) in view.flat_items.iter().enumerate() {
+        if let Item::Group {
+            path,
+            session_count,
+            ..
+        } = item
+        {
             if path == "work" {
-                env.view.cursor = i;
-                env.view.update_selected();
+                assert_eq!(*session_count, 0, "trashed members stay hidden");
+                view.cursor = i;
+                view.update_selected();
                 break;
             }
         }
     }
+    assert_eq!(view.selected_group.as_deref(), Some("work"));
+    assert_eq!(view.selected_group_profile.as_deref(), Some("test"));
 
-    assert!(env.view.selected_group.is_some());
-    let initial_instance_count = env.view.instances().len();
-
-    // Delete the group with all sessions
     let options = GroupDeleteOptions {
         delete_sessions: true,
         delete_worktrees: false,
@@ -3468,39 +3537,79 @@ fn test_delete_group_with_sessions_updates_groups_field() {
         delete_containers: false,
         force_delete_worktrees: false,
     };
-    env.view.delete_group_with_sessions(&options).unwrap();
+    view.delete_group_with_sessions(&options).unwrap();
+    view.save().unwrap();
+    let during_delete = storage.load().unwrap();
+    assert_eq!(during_delete.len(), 1);
+    assert_ne!(
+        during_delete[0].status,
+        Status::Deleting,
+        "save persisted the transient Deleting status"
+    );
 
-    // Verify the group is removed from group_tree
-    assert!(!env
-        .view
-        .group_trees
-        .get("test")
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !view.apply_deletion_results() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        view.info_dialog.is_some(),
+        "busy purge result was not delivered"
+    );
+
+    let persisted = storage.load().unwrap();
+    assert_eq!(persisted.len(), 1);
+    assert!(persisted[0].group_path.is_empty());
+    assert_ne!(persisted[0].status, Status::Deleting);
+    storage
+        .update(|instances, _| {
+            instances.clear();
+            Ok(())
+        })
+        .unwrap();
+
+    view.reload().unwrap();
+    let tree = view.group_trees.get("test").unwrap();
+    assert!(!tree.group_exists("work"));
+    assert!(!tree.group_exists("work/projects"));
+    assert!(tree.group_exists("workbench"), "near-prefix group removed");
+
+    let (_, groups) = storage.load_with_groups().unwrap();
+    assert!(!groups
+        .iter()
+        .any(|group| group.path == "work" || group.path.starts_with("work/")));
+    assert!(groups.iter().any(|group| group.path == "workbench"));
+    let (_, other_groups) = other_storage.load_with_groups().unwrap();
+    assert!(other_groups.iter().any(|group| group.path == "work"));
+    assert!(other_groups
+        .iter()
+        .any(|group| group.path == "work/projects"));
+    let mut creating = Instance::new("creating-member", "/tmp/creating");
+    creating.source_profile = "test".to_string();
+    creating.group_path = "creating".to_string();
+    creating.status = Status::Creating;
+    let creating_id = creating.id.clone();
+    view.add_instance(creating);
+    view.rebuild_group_trees();
+    view.selected_group = Some("creating".to_string());
+    view.selected_group_profile = Some("test".to_string());
+    view.info_dialog = None;
+
+    view.delete_group_with_sessions(&options).unwrap();
+    assert_eq!(view.selected_group.as_deref(), Some("creating"));
+    assert_eq!(
+        view.info_dialog.as_ref().map(InfoDialog::title),
+        Some("Creation in progress")
+    );
+
+    view.mutate_instance(&creating_id, |instance| {
+        instance.status = Status::Deleting;
+    });
+    view.save().unwrap();
+    assert!(!storage
+        .load()
         .unwrap()
-        .group_exists("work"));
-    assert!(!env
-        .view
-        .group_trees
-        .get("test")
-        .unwrap()
-        .group_exists("work/projects"));
-
-    // Verify self.groups is updated (this is the bug fix)
-    let all_groups = env.view.all_groups();
-    let group_paths: Vec<_> = all_groups.iter().map(|g| g.path.as_str()).collect();
-    assert!(!group_paths.contains(&"work"));
-    assert!(!group_paths.contains(&"work/projects"));
-
-    // Verify sessions are marked as deleting
-    let deleting_count = env
-        .view
-        .instances()
-        .filter(|i| i.status == Status::Deleting)
-        .count();
-    // Should have 3 sessions in the work group marked as deleting
-    assert_eq!(deleting_count, 3);
-
-    // Instance count should remain the same (they're marked as deleting, not removed yet)
-    assert_eq!(env.view.instances().len(), initial_instance_count);
+        .iter()
+        .any(|instance| instance.id == creating_id));
 }
 
 #[test]
@@ -8124,6 +8233,7 @@ fn apply_status_update_propagates_idle_entered_at_into_live_instance() {
         last_accessed_at: None,
         pane_dead: false,
         live_status_baseline: None,
+        detection: None,
     });
 
     let inst = env.view.get_instance(&id).unwrap();
@@ -8176,6 +8286,104 @@ fn apply_status_update_propagates_live_status_baseline_from_poller() {
     );
 }
 
+// #3642: the poller decides on a *clone* too (see `status_poller.rs`), so
+// the detection bookkeeping `update_status_from_manifest` writes reaches the
+// next cycle only through `StatusUpdate`. Dropped, every cycle started with
+// no proposal on record, so a `Running -> Idle` that no rule read off the
+// agent's own chrome proposed itself forever and the row never left Running.
+//
+// Two real cycles over a live pane parked on a screen no Claude rule matches:
+// the first proposes, the second publishes.
+#[test]
+#[serial]
+fn poll_cycles_confirm_an_unwitnessed_idle_through_the_status_update() {
+    use crate::session::Status;
+    use crate::tui::status_poller::{poll_statuses_once, StatusPollState};
+
+    if crate::tmux::tmux_command()
+        .arg("-V")
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        eprintln!("skipping: tmux not available");
+        return;
+    }
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = match env.view.flat_items.first() {
+        Some(Item::Session { id, .. }) => id.clone(),
+        _ => panic!("expected the fixture to seed a single Session item"),
+    };
+
+    let session_name = {
+        let inst = env.view.get_instance(&id).unwrap();
+        assert_eq!(
+            inst.tool, "claude",
+            "fixture invariant: this test needs an agent with a manifest"
+        );
+        crate::tmux::Session::generate_name(&inst.id, &inst.title)
+    };
+    let _kill = crate::tmux::test_helpers::TmuxTestSession::from_name(session_name.clone());
+    let created = crate::tmux::tmux_command()
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            &session_name,
+            "-x",
+            "120",
+            "-y",
+            "40",
+            // `exec` so tmux reports the pane's command as `sleep` rather
+            // than the launching shell, which the stale-shell check would
+            // read as an agent that exited.
+            "printf 'turn over\n'; exec sleep 300",
+        ])
+        .output()
+        .expect("spawn tmux");
+    assert!(
+        created.status.success(),
+        "tmux new-session failed: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+
+    // Mid-turn, as the poller last left it.
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = Status::Running;
+        inst.live_status_baseline = Some(Status::Running);
+    });
+
+    // The launch is asynchronous: poll until the frame is drawn and the
+    // shell has `exec`ed, so the first cycle reads the parked pane rather
+    // than a pane still being set up.
+    let ready = (0..100).any(|_| {
+        if crate::tmux::utils::pane_current_command(&session_name).as_deref() == Some("sleep") {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        false
+    });
+    assert!(ready, "pane never settled on its parked command");
+
+    let mut poll_state = StatusPollState::new();
+    let mut published = Vec::new();
+    for _ in 0..2 {
+        let updates = poll_statuses_once(env.view.pollable_instances(), &mut poll_state);
+        for update in updates {
+            env.view.apply_one_status_update(update);
+        }
+        published.push(env.view.get_instance(&id).unwrap().status);
+    }
+
+    assert_eq!(
+        published,
+        vec![Status::Running, Status::Idle],
+        "an unwitnessed Idle waits one cycle, then publishes on the cycle \
+         that agrees with it (#3642)"
+    );
+}
+
 // #2690: `IdleIntent::Keep` means the producer has no observation for
 // `idle_entered_at`. The consumer must not touch the field, or an
 // unseeded `attached_status_hooks` snapshot on attach exit would clobber
@@ -8210,6 +8418,7 @@ fn apply_status_update_preserves_idle_entered_at_on_keep() {
         last_accessed_at: None,
         pane_dead: false,
         live_status_baseline: None,
+        detection: None,
     });
 
     assert_eq!(
@@ -8246,6 +8455,7 @@ fn apply_status_update_persists_genuine_transition_to_disk() {
         last_accessed_at: Some(now),
         pane_dead: false,
         live_status_baseline: None,
+        detection: None,
     });
 
     let reloaded = Storage::new_unwatched("test").unwrap().load().unwrap();
@@ -8280,6 +8490,7 @@ fn apply_status_update_clears_idle_entered_at_on_idle_to_running() {
         last_accessed_at: None,
         pane_dead: false,
         live_status_baseline: None,
+        detection: None,
     });
     assert_eq!(
         env.view.get_instance(&id).unwrap().idle_entered_at,
@@ -8298,6 +8509,7 @@ fn apply_status_update_clears_idle_entered_at_on_idle_to_running() {
         last_accessed_at: None,
         pane_dead: false,
         live_status_baseline: None,
+        detection: None,
     });
 
     let inst = env.view.get_instance(&id).unwrap();
@@ -8396,6 +8608,7 @@ fn apply_status_update_skips_terminal_states() {
         last_accessed_at: None,
         pane_dead: false,
         live_status_baseline: None,
+        detection: None,
     });
 
     // Status and timestamp should both stay untouched.
@@ -8471,6 +8684,7 @@ fn apply_status_update_runs_status_hook_on_transition() {
         last_accessed_at: None,
         pane_dead: false,
         live_status_baseline: None,
+        detection: None,
     });
 
     let launches = take_recorded_launches();
@@ -8535,6 +8749,7 @@ fn apply_status_update_does_not_run_status_hook_for_same_status() {
         last_accessed_at: None,
         pane_dead: false,
         live_status_baseline: None,
+        detection: None,
     });
 
     assert!(take_recorded_launches().is_empty());
@@ -8568,6 +8783,7 @@ fn apply_status_updates_without_hooks_does_not_run_status_hook() {
             last_accessed_at: None,
             pane_dead: false,
             live_status_baseline: None,
+            detection: None,
         }]);
 
     assert_eq!(env.view.get_instance(&id).unwrap().status, Status::Waiting);
@@ -10891,7 +11107,7 @@ fn restart_selected_session_skips_when_already_in_flight() {
 #[test]
 #[serial]
 fn delete_selected_refused_during_restart() {
-    use crate::tui::dialogs::DeleteOptions;
+    use crate::tui::dialogs::{DeleteOptions, GroupDeleteOptions};
 
     let mut env = create_test_env_with_sessions(1);
     let id = env.view.instance_at(0).id.clone();
@@ -10909,6 +11125,84 @@ fn delete_selected_refused_during_restart() {
         env.view.info_dialog.is_some(),
         "the refused delete must surface a dialog, not silently no-op"
     );
+    {
+        let storage = env.view.storages.get("test").unwrap();
+        storage
+            .update(|instances, groups| {
+                instances
+                    .iter_mut()
+                    .find(|instance| instance.id == id)
+                    .unwrap()
+                    .group_path = "work".to_string();
+                groups.push(Group::new("work", "work"));
+                Ok(())
+            })
+            .unwrap();
+    }
+    env.view.selected_session = None;
+    env.view.selected_group = Some("work".to_string());
+    env.view.selected_group_profile = Some("test".to_string());
+    env.view.info_dialog = None;
+
+    env.view
+        .delete_group_with_sessions(&GroupDeleteOptions {
+            delete_sessions: true,
+            delete_worktrees: false,
+            delete_branches: false,
+            delete_containers: false,
+            force_delete_worktrees: false,
+        })
+        .unwrap();
+
+    assert_eq!(env.view.selected_group.as_deref(), Some("work"));
+    assert_eq!(
+        env.view.info_dialog.as_ref().map(InfoDialog::title),
+        Some("Restart in progress")
+    );
+    let (instances, groups) = Storage::open_unwatched("test")
+        .unwrap()
+        .load_with_groups()
+        .unwrap();
+    assert_eq!(instances[0].group_path, "work");
+    assert!(groups.iter().any(|group| group.path == "work"));
+    env.view.restart_in_flight.remove(&id);
+    {
+        let storage = env.view.storages.get("test").unwrap();
+        storage
+            .update(|instances, _groups| {
+                instances
+                    .iter_mut()
+                    .find(|instance| instance.id == id)
+                    .unwrap()
+                    .status = crate::session::Status::Creating;
+                Ok(())
+            })
+            .unwrap();
+    }
+    env.view.info_dialog = None;
+
+    env.view
+        .delete_group_with_sessions(&GroupDeleteOptions {
+            delete_sessions: true,
+            delete_worktrees: false,
+            delete_branches: false,
+            delete_containers: false,
+            force_delete_worktrees: false,
+        })
+        .unwrap();
+
+    assert_eq!(env.view.selected_group.as_deref(), Some("work"));
+    assert_eq!(
+        env.view.info_dialog.as_ref().map(InfoDialog::title),
+        Some("Creation in progress")
+    );
+    let (instances, groups) = Storage::open_unwatched("test")
+        .unwrap()
+        .load_with_groups()
+        .unwrap();
+    assert_eq!(instances[0].group_path, "work");
+    assert_eq!(instances[0].status, crate::session::Status::Creating);
+    assert!(groups.iter().any(|group| group.path == "work"));
 }
 
 /// Build a HomeView seeded with two distinct projects, each containing
@@ -13145,9 +13439,6 @@ mod scroll_pane_isolation {
         setup_panes(&mut env);
         env.view.cursor = 1;
         env.view.update_selected();
-        env.view.preview_cache.dimensions = (80, 24);
-        env.view.preview_cache.captured_lines = 200;
-        env.view.preview_scroll_offset = 10;
         env.view.live_send = Some(LiveSendState {
             session_id: "fake".to_string(),
             title: "fake".to_string(),
@@ -13159,15 +13450,19 @@ mod scroll_pane_isolation {
             leader: None,
         });
         env.view.live_send_worker = Some(LiveSendWorker::spawn("fake".to_string(), None));
-        // Spawn the capture worker, then inject the cursor (set_target
-        // clears it, so the injection must come after).
         env.view
             .sync_preview_capture_worker(Some("fake".to_string()));
-        env.view
+        env.view.preview_cache.dimensions = (80, 24);
+        env.view.preview_cache.captured_lines = 200;
+        env.view.preview_scroll_offset = 10;
+        env.view.preview_cache.cursor = Some(cursor);
+        env.view.preview_cache.capture_target = Some("fake".to_string());
+        env.view.preview_cache.capture_generation = env
+            .view
             .preview_capture_worker
             .as_ref()
-            .expect("capture worker spawned")
-            .set_cursor_for_test(Some(cursor));
+            .expect("capture worker")
+            .current_generation_for_test();
         env
     }
 
@@ -13181,17 +13476,20 @@ mod scroll_pane_isolation {
         setup_panes(&mut env);
         env.view.cursor = 1;
         env.view.update_selected();
+        env.view
+            .sync_preview_capture_worker(Some("fake".to_string()));
         env.view.preview_cache.dimensions = (80, 24);
         env.view.preview_cache.captured_lines = 200;
         env.view.preview_scroll_offset = 10;
-        env.view
-            .sync_preview_capture_worker(Some("fake".to_string()));
         env.view.preview_capture_target = Some("fake".to_string());
-        env.view
+        env.view.preview_cache.cursor = Some(cursor);
+        env.view.preview_cache.capture_target = Some("fake".to_string());
+        env.view.preview_cache.capture_generation = env
+            .view
             .preview_capture_worker
             .as_ref()
-            .expect("capture worker spawned")
-            .set_cursor_for_test(Some(cursor));
+            .expect("capture worker")
+            .current_generation_for_test();
         env
     }
 
@@ -16140,7 +16438,6 @@ mod preview_drag_select {
         env.view.preview_cache.content = "alpha beta gamma\nsecond line\nthird line\n".to_string();
         env.view.preview_cache.dimensions = (80, 24);
         env.view.preview_cache.captured_lines = 3;
-        env.view.preview_cache.last_refresh = std::time::Instant::now();
         env.view.preview_cache.session_id = Some("fake-id".to_string());
 
         // First render seeds preview_text_view + paints content. We need
@@ -16800,6 +17097,55 @@ mod live_send_mode {
 
     #[test]
     #[serial]
+    fn accepted_capture_keeps_content_and_cursor_in_one_cache_frame() {
+        let mut env = create_test_env_with_sessions(1);
+        let id = env.view.selected_session.clone().expect("selected session");
+        env.view
+            .sync_preview_capture_worker(Some("aoe_test_atomic_cursor".to_string()));
+        let first = crate::tmux::PaneCursor {
+            x: 1,
+            y: 2,
+            visible: true,
+            pane_height: 24,
+            history_size: 0,
+            pane_width: 80,
+            alternate_on: false,
+            mouse_tracking: false,
+            mouse_sgr: false,
+            mouse_all: false,
+            position_reliable: true,
+            composite_pane0: None,
+        };
+        env.view
+            .preview_capture_worker
+            .as_ref()
+            .expect("capture worker")
+            .inject_frame_with_cursor_for_test(40, "stable content", Some(first));
+        env.view.refresh_preview_cache_if_needed(80, 24);
+        assert_eq!(env.view.preview_cache.session_id, Some(id));
+        assert_eq!(env.view.preview_cache.content, "stable content");
+        assert_eq!(env.view.preview_cache.cursor, Some(first));
+
+        let second = crate::tmux::PaneCursor { x: 7, ..first };
+        env.view
+            .preview_capture_worker
+            .as_ref()
+            .expect("capture worker")
+            .inject_frame_with_cursor_for_test(40, "stable content", Some(second));
+        env.view.refresh_preview_cache_if_needed(80, 24);
+        assert_eq!(env.view.preview_cache.cursor, Some(second));
+        env.view
+            .sync_preview_capture_worker(Some("aoe_test_atomic_other".to_string()));
+        assert!(env.view.active_preview_cursor().is_none());
+        env.view
+            .sync_preview_capture_worker(Some("aoe_test_atomic_cursor".to_string()));
+        // Simulate an old cache surviving an A -> B -> A switch. Matching the
+        // target string is insufficient; the accepted generation must match.
+        env.view.preview_cache.cursor = Some(second);
+        assert!(env.view.active_preview_cursor().is_none());
+    }
+    #[test]
+    #[serial]
     fn warm_predicates_stay_cold_without_a_live_pane() {
         // The EnterLiveSend / SendMessage handlers skip the "Reviving
         // session..." toast only when the target pane is provably warm; every
@@ -16888,13 +17234,11 @@ mod live_send_mode {
     #[serial]
     fn refresh_terminal_cache_overwrites_on_empty_capture() {
         // Counterpart to `refresh_preserves_cache_when_live_capture_fails`:
-        // the agent cache and the host-terminal cache now share
-        // `refresh_preview_cache_core`, but only the agent wrapper carries the
-        // live-send kill switch. The terminal path must keep its old semantics
-        // (overwrite to empty so the preview surfaces "session looks gone")
-        // even when the unit fixture's backing tmux session does not exist and
-        // the capture comes back empty. Guards against the kill switch leaking
-        // into the shared core for the non-agent wrappers.
+        // only the agent path carries the live-send kill switch. The terminal
+        // path must overwrite to empty so the preview surfaces "session looks
+        // gone". With the worker as the ONLY capture source, the empty frame
+        // arrives through the mailbox (the worker forwards empties for
+        // terminal panes); paint applies it without any synchronous fork.
         let mut env = create_test_env_with_sessions(1);
         let id = env
             .view
@@ -16910,6 +17254,12 @@ mod live_send_mode {
         env.view.terminal_preview_cache.captured_lines = 1;
         env.view.terminal_preview_cache.dimensions = (10, 10);
         env.view.terminal_preview_cache.session_id = Some(id.clone());
+
+        env.view
+            .sync_preview_capture_worker(Some("aoe_test_missing_terminal".to_string()));
+        if let Some(worker) = env.view.preview_capture_worker.as_ref() {
+            worker.inject_frame_for_test(40, "");
+        }
 
         env.view.refresh_terminal_preview_cache_if_needed(80, 24);
 
@@ -20037,7 +20387,7 @@ mod live_send_boot_size_tests {
     #[serial_test::serial]
     fn boots_agent_at_visible_preview_size() {
         let mut env = create_test_env_empty();
-        // The rect `finalize_live_send_resize` would resize the pane to.
+        // The visible rect the post-toast draw queues to LiveSendWorker.
         env.view.preview_pane_area = Rect::new(35, 1, 123, 38);
 
         assert_eq!(
@@ -21064,4 +21414,748 @@ mod profile_duplicate_reconciliation {
             "the list title must flag ambiguous sessions.\nFull buffer:\n{out}"
         );
     }
+}
+
+/// Regression: the TUI paint path must never fork tmux, no matter how cold
+/// the shared snapshots are. Every tmux question a frame needs is answered
+/// from `SESSION_CACHE` / `PANE_META_CACHE` by a background poller and from
+/// `LiveCaptureWorker` frames; this walks Structured / Terminal / Tool view
+/// modes across an empty cache, a fresh-but-absent snapshot, and an expired
+/// one (the states that used to trigger synchronous refreshes from render)
+/// and counts forks on the paint thread via the probe at
+/// `tmux_command()`. Worker threads are NOT armed, so their legitimate
+/// captures don't count.
+#[test]
+#[serial]
+fn paint_never_forks_tmux_even_with_empty_absent_or_expired_caches() {
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+    let theme = load_theme("empire");
+
+    let session_guard = crate::tmux::SessionCacheGuard::capture();
+    let pane_guard = crate::tmux::PaneMetaCacheGuard::capture();
+
+    let modes = [
+        ViewMode::Structured,
+        ViewMode::Terminal,
+        ViewMode::Tool("lazygit".to_string()),
+    ];
+    for mode in modes {
+        env.view.view_mode = mode.clone();
+        // Cache states: (session snapshot, pane snapshot). "Cold boot" is the
+        // never-refreshed state; "absent" is fresh but without our session;
+        // "expired" is populated but past CACHE_TTL. All three used to make
+        // paint refresh synchronously.
+        let states = [("cold-boot", 0), ("fresh-absent", 1), ("expired", 2)];
+        for (label, state) in states {
+            match state {
+                0 => {
+                    session_guard.force_unreachable();
+                    session_guard.force_stale();
+                    pane_guard.force_failed_refresh();
+                    pane_guard.force_stale();
+                }
+                1 => {
+                    session_guard.force_present(&["aoe_someone_elses_session"]);
+                    pane_guard.force_failed_refresh();
+                }
+                _ => {
+                    session_guard.force_present(&["aoe_someone_elses_session"]);
+                    session_guard.force_stale();
+                    pane_guard.force_failed_refresh();
+                    pane_guard.force_stale();
+                }
+            }
+
+            crate::tmux::fork_probe::take();
+            let _armed = crate::tmux::fork_probe::arm();
+            // Two frames: the first exercises cold paths (worker empty,
+            // debounces arming), the second steady state.
+            for _frame in 0..2 {
+                let backend = TestBackend::new(120, 40);
+                let mut terminal = Terminal::new(backend).unwrap();
+                terminal
+                    .draw(|f| env.view.render(f, f.area(), &theme, None, None, None))
+                    .unwrap();
+            }
+            let forks = crate::tmux::fork_probe::take();
+            assert_eq!(
+                forks, 0,
+                "{mode:?} with {label} caches: paint forked tmux {forks}x; \
+                 display answers must come from poller-refreshed snapshots"
+            );
+        }
+    }
+}
+
+/// Regression: a frozen (scrolled-back) preview must still be able to GROW
+/// its capture. Only worker frames write the cache now, so the reading-depth
+/// budget has to reach the worker while frozen and an adequate frame has to
+/// be applied; otherwise scrollback reads hit a hard wall at the live-edge
+/// window (~CAPTURE_BUFFER rows past the viewport). An inadequate frame is
+/// skipped rather than applied: it would clamp the held offset against too
+/// few lines and snap the view toward the live edge.
+#[test]
+#[serial]
+fn frozen_preview_grows_only_on_coverage_extending_frames() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+    env.view
+        .sync_preview_capture_worker(Some("aoe_test_frozen_read".to_string()));
+    env.view.preview_scroll_offset = 40; // non-zero offset freezes the preview
+
+    // A frame that does not cover viewport + offset is skipped while frozen.
+    if let Some(worker) = env.view.preview_capture_worker.as_ref() {
+        worker.inject_frame_for_test(100, &"line\n".repeat(30));
+    }
+    env.view.refresh_preview_cache_if_needed(80, 24);
+    assert_eq!(
+        env.view.preview_cache.content.lines().count(),
+        0,
+        "an inadequate frame must not shift the held content under the reader"
+    );
+    // The skipped frame must be back in the mailbox: the worker's content
+    // dedup would otherwise never republish it.
+    assert!(
+        env.view
+            .preview_capture_worker
+            .as_ref()
+            .map(|w| w.take_latest().is_some())
+            .unwrap_or(false),
+        "a frame rejected while frozen must be restored for later consumption"
+    );
+
+    // A coverage-extending frame grows the cache even though frozen.
+    if let Some(worker) = env.view.preview_capture_worker.as_ref() {
+        worker.inject_frame_for_test(200, &"line\n".repeat(120));
+    }
+    env.view.refresh_preview_cache_if_needed(80, 24);
+    assert_eq!(
+        env.view.preview_cache.content.lines().count(),
+        120,
+        "the frozen read must be able to grow its capture off-thread"
+    );
+}
+
+/// Regression: a frame captured before the last retarget must never land
+/// under the new view. The consumer-side `frame_is_current` guard is the
+/// last line of defense against the race where the worker publishes an
+/// old-generation frame after `set_target` cleared the mailbox; without
+/// this test, deleting the guard reintroduces the previous pane's bytes
+/// under the new header.
+#[test]
+#[serial]
+fn preview_rejects_frames_from_previous_generation() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+    env.view
+        .sync_preview_capture_worker(Some("aoe_test_new_target".to_string()));
+    if let Some(worker) = env.view.preview_capture_worker.as_ref() {
+        // Idle the real capture thread before injection, so it cannot
+        // overwrite the synthetic stale frame and make the test pass by
+        // accident even if the consumer guard is deleted.
+        worker.set_target(String::new());
+        worker.inject_stale_generation_frame_for_test(40, "previous pane bytes");
+    }
+
+    env.view.refresh_preview_cache_if_needed(80, 24);
+
+    assert_ne!(
+        env.view.preview_cache.content, "previous pane bytes",
+        "a stale-generation frame must be dropped, never applied"
+    );
+}
+
+/// Regression: entering live-send while a blocking capture is in flight must
+/// revalidate the empty-frame policy on the consumer. An empty frame captured
+/// just before the transition cannot blank the agent/tool pane under the
+/// user's cursor (#1501); the same restored frame must clear stale content
+/// after live-send exits.
+#[test]
+#[serial]
+fn preview_revalidates_empty_policy_across_live_transition() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+    let target = "aoe_test_live_transition".to_string();
+    env.view.sync_preview_capture_worker(Some(target.clone()));
+    env.view.preview_cache.content = "last good frame".to_string();
+    env.view.preview_cache.captured_lines = 1;
+    env.view.preview_cache.dimensions = (80, 24);
+    env.view.preview_cache.session_id = Some(id);
+    env.view.preview_cache.capture_target = Some(target);
+    env.view.preview_cache.capture_generation = env
+        .view
+        .preview_capture_worker
+        .as_ref()
+        .expect("worker spawned")
+        .current_generation_for_test();
+    let worker = env
+        .view
+        .preview_capture_worker
+        .as_ref()
+        .expect("worker spawned");
+    worker.inject_frame_for_test(40, "");
+    worker.set_live(true);
+
+    env.view.refresh_preview_cache_if_needed(80, 24);
+    assert_eq!(
+        env.view.preview_cache.content, "last good frame",
+        "live transition must preserve the last-good agent frame"
+    );
+
+    env.view
+        .preview_capture_worker
+        .as_ref()
+        .expect("worker retained")
+        .set_live(false);
+    env.view.refresh_preview_cache_if_needed(80, 24);
+    assert_eq!(
+        env.view.preview_cache.content, "",
+        "the restored empty frame must clear stale content after live exit"
+    );
+}
+/// A passive completion that lands after live ownership must invalidate the
+/// matching agent resize dedup, but never another session or target.
+#[test]
+fn passive_completion_invalidates_only_matching_agent_live_geometry() {
+    use super::live_send::LiveSendTarget;
+    use super::render::passive_resize_invalidates_live_geometry;
+
+    let cases = [
+        (
+            Some(&LiveSendTarget::Agent),
+            Some("selected"),
+            "selected",
+            true,
+        ),
+        (
+            Some(&LiveSendTarget::Agent),
+            Some("selected"),
+            "other",
+            false,
+        ),
+        (
+            Some(&LiveSendTarget::Terminal),
+            Some("selected"),
+            "selected",
+            false,
+        ),
+        (None, Some("selected"), "selected", false),
+    ];
+    for (target, selected, completed, expected) in cases {
+        assert_eq!(
+            passive_resize_invalidates_live_geometry(target, selected, completed),
+            expected,
+        );
+    }
+}
+/// A worker that stops advancing is replaced after the tmux deadline, while a
+/// normal retarget clears heartbeat history. Removing either reset leaves the
+/// old worker or old target's liveness attached to the displayed pane.
+#[test]
+fn stalled_preview_worker_restarts_and_retarget_resets_heartbeat() {
+    let mut env = create_test_env_empty();
+    let first_target = "aoe_test_stalled_worker".to_string();
+    env.view
+        .sync_preview_capture_worker(Some(first_target.clone()));
+
+    let worker = env
+        .view
+        .preview_capture_worker
+        .as_mut()
+        .expect("worker spawned");
+    let old_worker_id = worker.id_for_test();
+    worker.stop_for_test();
+    worker.set_cycles_for_test(17);
+    env.view.preview_worker_pulse = Some((
+        17,
+        std::time::Instant::now()
+            - crate::tmux::TMUX_COMMAND_TIMEOUT
+            - std::time::Duration::from_secs(3),
+    ));
+
+    env.view
+        .sync_preview_capture_worker(Some(first_target.clone()));
+    let replacement = env
+        .view
+        .preview_capture_worker
+        .as_ref()
+        .expect("stalled worker replaced");
+    assert_ne!(
+        replacement.id_for_test(),
+        old_worker_id,
+        "a stalled capture worker must be replaced"
+    );
+    assert_eq!(
+        env.view.preview_capture_target.as_deref(),
+        Some(first_target.as_str()),
+        "replacement must retain the displayed target"
+    );
+
+    env.view.preview_worker_pulse = Some((replacement.cycles(), std::time::Instant::now()));
+    env.view
+        .sync_preview_capture_worker(Some("aoe_test_retarget".to_string()));
+    assert!(
+        env.view.preview_worker_pulse.is_none(),
+        "a retarget must start a fresh heartbeat window"
+    );
+}
+
+/// #3611: trashed-row healing must not run before the first frame. `HomeView::new`
+/// hands it to `ReconcilePoller`, so the repair lands through
+/// `apply_reconcile_results` instead. This row needs only a pointer repair, so
+/// the sweep reaches durable state without git.
+#[test]
+#[serial]
+fn trashed_row_healing_lands_through_the_reconcile_poller() {
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let project = TempDir::new().unwrap();
+    let storage = Storage::new_unwatched("test").unwrap();
+
+    let recorded = project.path().join("feat");
+    let mut instance = Instance::new("trashed", recorded.to_str().unwrap());
+    instance.worktree_info = Some(crate::session::WorktreeInfo {
+        branch: "feat".to_string(),
+        main_repo_path: project.path().to_string_lossy().into_owned(),
+        managed_by_aoe: true,
+        created_at: chrono::Utc::now(),
+        base_branch: None,
+    });
+    instance.trash();
+    let id = instance.id.clone();
+    let holding = crate::session::trash::trash_holding_path(&recorded, &id).unwrap();
+    std::fs::create_dir_all(&holding).unwrap();
+    storage
+        .update(|instances, _groups| {
+            instances.push(instance);
+            Ok(())
+        })
+        .unwrap();
+
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+
+    let mut applied = false;
+    for _ in 0..100 {
+        if view.apply_reconcile_results() {
+            applied = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(applied, "the reconcile poller never reported its sweep");
+    assert_eq!(
+        view.get_instance(&id).unwrap().project_path,
+        holding.to_string_lossy(),
+        "the reload must publish the healed path"
+    );
+}
+
+/// the reconcile sweep's reload must respect the same live-send
+/// gate every other storage reload uses, and the worker's verdict must survive
+/// being skipped rather than being drained and dropped.
+#[test]
+#[serial]
+fn reconcile_reload_waits_for_live_send_to_finish() {
+    use super::live_send::{LiveSendState, LiveSendTarget};
+
+    let mut env = create_test_env_empty();
+    env.view.reconcile_poller =
+        crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(true);
+    env.view.live_send = Some(LiveSendState {
+        session_id: "s".to_string(),
+        title: "s".to_string(),
+        tmux_name: "aoe_test_live".to_string(),
+        target: LiveSendTarget::Agent,
+        exit_chords: Vec::new(),
+        leader: None,
+    });
+
+    assert!(
+        !env.view.apply_reconcile_results(),
+        "a reload must not interrupt a paste in progress"
+    );
+
+    env.view.live_send = None;
+    assert!(
+        env.view.apply_reconcile_results(),
+        "the skipped verdict must still be waiting once live-send ends"
+    );
+}
+
+/// startup auto-recovery launches from `project_path` and records
+/// each attempt in a boot-scoped ledger that is not retried, so it must not run
+/// until the reconcile sweep has had its chance to repoint a row whose worktree
+/// moved outside aoe (#2002). `HomeView::new` therefore arms the gate instead of
+/// starting recovery, and `apply_reconcile_results` releases it exactly once,
+/// whether or not the sweep changed anything.
+#[test]
+#[serial]
+fn startup_recovery_waits_for_the_first_reconcile_sweep() {
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let _storage = Storage::new_unwatched("test").unwrap();
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+
+    assert!(
+        view.startup_recovery_gate.is_some(),
+        "construction must arm the gate rather than recover from unrepaired paths"
+    );
+
+    // An unchanged sweep still releases it: the paths are now known good.
+    view.reconcile_poller =
+        crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(false);
+    assert!(
+        !view.apply_reconcile_results(),
+        "nothing changed, so no reload"
+    );
+    assert!(
+        view.startup_recovery_gate.is_none(),
+        "the sweep landing must release the recovery gate"
+    );
+
+    // Released exactly once, so later ticks cannot re-run recovery.
+    view.reconcile_poller =
+        crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(false);
+    assert!(!view.apply_reconcile_results());
+    assert!(view.startup_recovery_gate.is_none());
+}
+
+/// the gate cannot outlive its deadline.
+/// `Storage::update` blocks on a contended profile flock with no timeout, so a
+/// peer holding that lock leaves the sweep worker neither delivering a result
+/// nor disconnecting. Gating recovery on that forever would trade "recovery
+/// used a stale path" for "recovery never ran", which is the worse failure.
+#[test]
+#[serial]
+fn startup_recovery_gate_expires_when_the_sweep_never_lands() {
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let _storage = Storage::new_unwatched("test").unwrap();
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    // A poller that never reports, standing in for a sweep blocked on a flock.
+    view.reconcile_poller = crate::tui::reconcile_poller::ReconcilePoller::new();
+
+    assert!(!view.apply_reconcile_results());
+    assert!(
+        view.startup_recovery_gate.is_some(),
+        "an un-landed sweep inside the deadline must still hold the gate"
+    );
+
+    view.startup_recovery_gate =
+        Some(std::time::Instant::now() - HomeView::STARTUP_RECOVERY_GATE_TIMEOUT);
+    assert!(!view.apply_reconcile_results());
+    assert!(
+        view.startup_recovery_gate.is_none(),
+        "past the deadline recovery must start without the sweep"
+    );
+}
+
+/// A failed reload must not be retried on every tick. `apply_reconcile_results`
+/// runs ~30 times a second, so an unreadable store would spin on storage and
+/// flood the log where every other reload in that loop is throttled.
+#[test]
+#[serial]
+fn a_failed_reload_backs_off_instead_of_retrying_every_tick() {
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+    let mut seed = Instance::new("row", "/tmp/stale-path");
+    seed.source_profile = "test".to_string();
+    storage
+        .update(|instances, _groups| {
+            instances.push(seed);
+            Ok(())
+        })
+        .unwrap();
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.reconcile_poller =
+        crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(true);
+
+    let groups = crate::session::get_app_dir()
+        .unwrap()
+        .join("profiles")
+        .join("test")
+        .join("groups.json");
+    std::fs::remove_file(&groups).ok();
+    std::fs::create_dir(&groups).unwrap();
+
+    assert!(!view.apply_reconcile_results(), "the first attempt fails");
+    let armed = view
+        .reconcile_reload_retry_at
+        .expect("a failed reload must arm the backoff");
+
+    // Storage is readable again, but the backoff has not elapsed, so the next
+    // tick must not touch it.
+    std::fs::remove_dir(&groups).unwrap();
+    std::fs::write(&groups, "[]").unwrap();
+    assert!(!view.apply_reconcile_results(), "still inside the backoff");
+    assert_eq!(
+        view.reconcile_reload_retry_at,
+        Some(armed),
+        "a skipped attempt must not re-arm the backoff"
+    );
+    assert!(view.pending_reconcile_reload, "the repair is still pending");
+
+    // Once it elapses the retry lands.
+    view.reconcile_reload_retry_at = Some(std::time::Instant::now());
+    assert!(view.apply_reconcile_results(), "the retry must land");
+    assert!(view.reconcile_reload_retry_at.is_none());
+    assert!(!view.pending_reconcile_reload);
+}
+
+/// The deadline is also checked while live-send holds the reload, since starting
+/// recovery spawns workers rather than touching the terminal.
+#[test]
+#[serial]
+fn startup_recovery_gate_expires_during_live_send() {
+    use super::live_send::{LiveSendState, LiveSendTarget};
+
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let _storage = Storage::new_unwatched("test").unwrap();
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.live_send = Some(LiveSendState {
+        session_id: "s".to_string(),
+        title: "s".to_string(),
+        tmux_name: "aoe_test_live".to_string(),
+        target: LiveSendTarget::Agent,
+        exit_chords: Vec::new(),
+        leader: None,
+    });
+    view.startup_recovery_gate =
+        Some(std::time::Instant::now() - HomeView::STARTUP_RECOVERY_GATE_TIMEOUT);
+
+    assert!(!view.apply_reconcile_results());
+    assert!(
+        view.startup_recovery_gate.is_none(),
+        "a long paste must not strand recovery either"
+    );
+}
+
+/// a repair queued in the channel must be applied to `instances`
+/// before the gate opens, deadline or not. Releasing first let startup recovery
+/// clone a `project_path` the sweep had already fixed on disk and spend that
+/// row's one boot-scoped attempt on it, which is what the gate exists to stop.
+#[test]
+#[serial]
+fn a_queued_repair_is_applied_before_the_gate_opens_at_the_deadline() {
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+    let mut seed = Instance::new("row", "/tmp/stale-path");
+    seed.source_profile = "test".to_string();
+    let id = seed.id.clone();
+    storage
+        .update(|instances, _groups| {
+            instances.push(seed);
+            Ok(())
+        })
+        .unwrap();
+
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    assert_eq!(
+        view.get_instance(&id).unwrap().project_path,
+        "/tmp/stale-path"
+    );
+
+    // The sweep repaired durable storage and reported the change.
+    storage
+        .update(|instances, _groups| {
+            instances[0].project_path = "/tmp/repaired-path".to_string();
+            Ok(())
+        })
+        .unwrap();
+    view.reconcile_poller =
+        crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(true);
+    view.startup_recovery_gate =
+        Some(std::time::Instant::now() - HomeView::STARTUP_RECOVERY_GATE_TIMEOUT);
+
+    assert!(
+        view.apply_reconcile_results(),
+        "the queued repair must reload"
+    );
+    assert_eq!(
+        view.get_instance(&id).unwrap().project_path,
+        "/tmp/repaired-path",
+        "recovery must not be released against the stale in-memory path"
+    );
+    assert!(view.startup_recovery_gate.is_none());
+}
+
+/// The live-send case of the same rule: the reload is postponed, so the result
+/// must be preserved and the gate must stay armed even past the deadline.
+#[test]
+#[serial]
+fn a_queued_repair_keeps_the_gate_armed_while_live_send_holds_the_reload() {
+    use super::live_send::{LiveSendState, LiveSendTarget};
+
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+    let mut seed = Instance::new("row", "/tmp/stale-path");
+    seed.source_profile = "test".to_string();
+    let id = seed.id.clone();
+    storage
+        .update(|instances, _groups| {
+            instances.push(seed);
+            Ok(())
+        })
+        .unwrap();
+
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    storage
+        .update(|instances, _groups| {
+            instances[0].project_path = "/tmp/repaired-path".to_string();
+            Ok(())
+        })
+        .unwrap();
+    view.reconcile_poller =
+        crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(true);
+    view.startup_recovery_gate =
+        Some(std::time::Instant::now() - HomeView::STARTUP_RECOVERY_GATE_TIMEOUT);
+    view.live_send = Some(LiveSendState {
+        session_id: "s".to_string(),
+        title: "s".to_string(),
+        tmux_name: "aoe_test_live".to_string(),
+        target: LiveSendTarget::Agent,
+        exit_chords: Vec::new(),
+        leader: None,
+    });
+
+    assert!(
+        !view.apply_reconcile_results(),
+        "the reload waits for live-send"
+    );
+    assert!(
+        view.startup_recovery_gate.is_some(),
+        "an unapplied repair must hold the gate shut past the deadline"
+    );
+
+    // The result is preserved, not dropped, and lands once the paste ends.
+    view.live_send = None;
+    assert!(view.apply_reconcile_results());
+    assert_eq!(
+        view.get_instance(&id).unwrap().project_path,
+        "/tmp/repaired-path"
+    );
+    assert!(view.startup_recovery_gate.is_none());
+}
+
+/// a failed reload must keep the repair pending and the gate shut.
+/// Clearing the flag before the fallible call dropped the repair and released
+/// recovery against stale rows, which is the failure the gate exists to prevent.
+#[test]
+#[serial]
+fn a_failed_reload_keeps_the_repair_pending_and_the_gate_shut() {
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+    let mut seed = Instance::new("row", "/tmp/stale-path");
+    seed.source_profile = "test".to_string();
+    let id = seed.id.clone();
+    storage
+        .update(|instances, _groups| {
+            instances.push(seed);
+            Ok(())
+        })
+        .unwrap();
+
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    storage
+        .update(|instances, _groups| {
+            instances[0].project_path = "/tmp/repaired-path".to_string();
+            Ok(())
+        })
+        .unwrap();
+    view.reconcile_poller =
+        crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(true);
+
+    // A groups.json that is a directory makes `load_with_groups` fail.
+    let groups = crate::session::get_app_dir()
+        .unwrap()
+        .join("profiles")
+        .join("test")
+        .join("groups.json");
+    std::fs::remove_file(&groups).ok();
+    std::fs::create_dir(&groups).unwrap();
+
+    assert!(
+        !view.apply_reconcile_results(),
+        "the reload failed, so no refresh"
+    );
+    assert!(
+        view.startup_recovery_gate.is_some(),
+        "a dropped repair must not open the gate onto stale rows"
+    );
+    assert_eq!(
+        view.get_instance(&id).unwrap().project_path,
+        "/tmp/stale-path",
+        "the in-memory row is still the stale one"
+    );
+
+    // The repair is retried, not lost, once storage is readable again. The
+    // retry is throttled, so let the backoff elapse as a later tick would;
+    // `a_failed_reload_backs_off_instead_of_retrying_every_tick` covers the
+    // throttle itself.
+    std::fs::remove_dir(&groups).unwrap();
+    std::fs::write(&groups, "[]").unwrap();
+    view.reconcile_reload_retry_at = Some(std::time::Instant::now());
+    assert!(
+        view.apply_reconcile_results(),
+        "the retry must land the repair"
+    );
+    assert_eq!(
+        view.get_instance(&id).unwrap().project_path,
+        "/tmp/repaired-path"
+    );
+    assert!(view.startup_recovery_gate.is_none());
 }

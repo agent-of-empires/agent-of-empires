@@ -353,8 +353,12 @@ pub fn deinit_submodules_if_present(worktree_path: &Path) {
     }
 }
 
-/// Read the `gitdir:` target from a linked worktree's `.git` file.
-fn read_linked_worktree_gitdir(worktree_path: &Path) -> Option<PathBuf> {
+/// Resolve a linked worktree's `.git` pointer to its admin dir.
+///
+/// The target is resolved against the worktree, since aoe rewrites every
+/// managed worktree's pointer to a relative path in `create_worktree` and git
+/// itself writes one under `worktree.useRelativePaths`.
+pub(crate) fn read_linked_worktree_gitdir(worktree_path: &Path) -> Option<PathBuf> {
     let contents = std::fs::read_to_string(worktree_path.join(".git")).ok()?;
     let raw = contents
         .lines()

@@ -47,8 +47,8 @@ pub enum SessionCommands {
     /// restarts the agent so it can see it; the conversation is kept. See #3103.
     AddProject(AddProjectArgs),
 
-    /// Set the resume target for a session (pin a conversation or force a
-    /// one-shot fresh start)
+    /// Set the resume target for a session; agents with resume disabled in AoE
+    /// store the ID but do not use it
     SetSessionId(SetSessionIdArgs),
 
     /// Set or clear the per-session diff base branch. The diff view
@@ -278,9 +278,9 @@ struct CaptureOutput {
 pub struct SetSessionIdArgs {
     /// Session ID or title
     identifier: String,
-    /// Resume target: a UUID/sid pins the next launches to that
-    /// conversation; an empty string forces a one-shot fresh start (after
-    /// which the system reverts to auto-resume).
+    /// Resume target: for resume-enabled agents, a UUID/sid pins subsequent
+    /// launches to that conversation; agents with resume disabled in AoE store
+    /// but do not use it. An empty string forces a one-shot fresh start.
     session_id: String,
 }
 
@@ -1657,27 +1657,61 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
         (String::new(), "stopped".to_string())
     } else {
         let raw = tmux_session.capture_pane(args.lines)?;
-        let detection_tool =
-            crate::tmux::status_rules::detection_tool(profile, &inst.tool, &inst.detect_as);
-        let status = if let Some(hook_status) = crate::hooks::read_hook_status(&inst.id) {
-            if detection_tool == "codex" && hook_status == crate::session::Status::Running {
-                let status_raw;
-                let status_content = if args.lines >= 50 {
-                    raw.as_str()
-                } else {
-                    status_raw = tmux_session
-                        .capture_pane(50)
-                        .unwrap_or_else(|_| raw.clone());
-                    status_raw.as_str()
-                };
-                crate::tmux::reconcile_codex_hook_status(hook_status, status_content)
-            } else {
-                hook_status
-            }
+        // The poller's two detection identities, resolved the same way: the
+        // manifest follows the `agent_detect_as` alias, while configured rules
+        // stay keyed to the session's own tool.
+        let hook_alias =
+            crate::tmux::status_rules::effective_detect_as(profile, &inst.tool, &inst.detect_as);
+        let manifest_tool: &str = if hook_alias.is_empty() {
+            &inst.tool
         } else {
-            tmux_session
-                .detect_status(profile, &detection_tool)
-                .unwrap_or_default()
+            &hook_alias
+        };
+        let rules_tool =
+            crate::tmux::status_rules::detection_tool(profile, &inst.tool, &inst.detect_as);
+        let hook = crate::hooks::read_hook_status(&inst.id).map(|status| {
+            crate::tmux::detect::HookObservation {
+                status,
+                age: crate::hooks::read_hook_status_age(&inst.id),
+            }
+        });
+        // The same rule table the poller runs, so `aoe session capture`
+        // reports what the dashboard would. A short `--lines` still detects
+        // against the window the rules expect.
+        let status = if crate::tmux::detect::has_manifest(manifest_tool) {
+            let status_raw;
+            let status_content = if args.lines >= 50 {
+                raw.as_str()
+            } else {
+                status_raw = tmux_session
+                    .capture_pane(50)
+                    .unwrap_or_else(|_| raw.clone());
+                status_raw.as_str()
+            };
+            // The pane title is a rule region like any other (Claude ranks it
+            // above every screen shape), so it has to be read here too; the
+            // poller gets it batched with the rest of the pane metadata.
+            let osc_title = crate::tmux::utils::pane_title(tmux_session.name()).unwrap_or_default();
+            crate::tmux::detect_with_rules(
+                profile,
+                &rules_tool,
+                manifest_tool,
+                &crate::tmux::utils::strip_ansi(status_content),
+                &osc_title,
+                hook,
+            )
+            .and_then(|d| d.status)
+            .unwrap_or_default()
+        } else {
+            // Configured rules outrank the hook file here as they do in the
+            // poller; `detect_status` runs them ahead of the built-in detector.
+            let hook = hook.filter(|_| !crate::tmux::status_rules::has_rules(profile, &rules_tool));
+            match hook {
+                Some(hook) => hook.status,
+                None => tmux_session
+                    .detect_status(profile, &rules_tool)
+                    .unwrap_or_default(),
+            }
         };
         let content = if args.strip_ansi {
             crate::tmux::utils::strip_ansi(&raw)
@@ -1778,6 +1812,19 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         .iter()
         .find(|instance| instance.id == id)
         .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
+    // Heal a `project_path` left stale by an external `git worktree move`
+    // before the duplicate-identity check and the container gate below derive
+    // anything from it. The tied branch of this command moves the worktree, so
+    // it needs the same repair as the standalone workdir edit; this is a fresh
+    // process per invocation, so no startup sweep has run for it (#2002).
+    let mut inst = inst.clone();
+    if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist(
+        &storage,
+        &mut inst,
+        &mut Default::default(),
+    ) {
+        tracing::warn!(target: "cli.session", session = %id, "worktree path reconciliation skipped: {error}");
+    }
     let old_title = inst.title.clone();
     let effective_title = args
         .title
@@ -2148,6 +2195,19 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
         .iter()
         .find(|instance| instance.id == id)
         .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
+    // The recorded path can be stale: someone may have `git worktree move`d the
+    // directory outside aoe. Heal it from git before anything below derives a
+    // target path or a container gate from it, so those decisions are made
+    // against the live parent. Best-effort; a lookup failure just leaves the
+    // stale path, which `edit_worktree_workdir` then rejects as before (#2002).
+    let mut inst = inst.clone();
+    if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist(
+        &storage,
+        &mut inst,
+        &mut Default::default(),
+    ) {
+        tracing::warn!(target: "cli.session", session = %id, "worktree path reconciliation skipped: {error}");
+    }
     let current_path = inst.project_path.clone();
     let Some(worktree_info) = inst.worktree_info.clone() else {
         bail!("Session does not use a worktree");
@@ -2347,7 +2407,10 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
                     agent.resume_strategy,
                     crate::agents::ResumeStrategy::Unsupported
                 ) {
-                    eprintln!("Warning: {} does not support session resume; this ID will be stored but not used.", tool);
+                    eprintln!(
+                        "Warning: session resume is disabled for {} in AoE; this ID will be stored but not used.",
+                        tool
+                    );
                 }
             }
         }
