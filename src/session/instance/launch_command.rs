@@ -507,6 +507,15 @@ impl Instance {
         &mut self,
         agent: Option<&'static crate::agents::AgentDef>,
     ) -> Result<(Option<String>, bool, Option<OmpCapturePlan>)> {
+        let pi_extension = self.pi_extension_launch();
+        self.build_host_command_with_pi_extension(agent, pi_extension)
+    }
+
+    fn build_host_command_with_pi_extension(
+        &mut self,
+        agent: Option<&'static crate::agents::AgentDef>,
+        pi_extension: Option<(String, String)>,
+    ) -> Result<(Option<String>, bool, Option<OmpCapturePlan>)> {
         // Resolve after `on_launch`. The snapshot is checked inside the
         // profile environment assignment scope executed by the login shell;
         // startup-file routing drift therefore disables capture.
@@ -519,7 +528,6 @@ impl Instance {
         // A verified direct Pi command publishes through the same extension
         // whether it came from the built-in command or an exact alias.
         self.pi_extension_launched = false;
-        let pi_extension = self.pi_extension_launch();
         if let Some((_, ref env)) = pi_extension {
             env_prefix.push_str(env);
             self.pi_extension_launched = true;
@@ -680,7 +688,7 @@ mod tests {
     }
     #[test]
     #[serial_test::serial]
-    fn direct_pi_alias_emits_the_extension_it_marks_as_launched() {
+    fn verified_direct_pi_alias_emits_the_extension_it_marks_as_launched() {
         let home = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(home.path());
         let mut inst = Instance::new("pi alias", "/tmp/pi-alias-launch");
@@ -689,7 +697,15 @@ mod tests {
         inst.command = "pi".to_string();
         let agent = inst.resolved_agent();
 
-        let (command, _, _) = inst.build_host_command(agent).unwrap();
+        let (command, _, _) = inst
+            .build_host_command_with_pi_extension(
+                agent,
+                Some((
+                    " -e '/tmp/pi-aoe-session-id.js'".to_string(),
+                    "AOE_PI_SESSION_ID_FILE='/tmp/pi-session-id' ".to_string(),
+                )),
+            )
+            .unwrap();
         let command = command.unwrap();
 
         assert!(command.contains(" -e "), "missing Pi extension: {command}");

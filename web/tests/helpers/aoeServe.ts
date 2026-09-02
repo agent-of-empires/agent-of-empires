@@ -527,7 +527,8 @@ function writeFakeAcpShim(
         : name === "codex-acp" || name === "codex"
           ? [...scriptLines, "export FAKE_ACP_IMPERSONATE=codex"]
           : scriptLines;
-    const script = `#!/bin/bash\n${perName.join("\n")}\nexec node ${JSON.stringify(fakeAgentJs)} "$@"\n`;
+    // The isolated home cannot initialize user-scoped Node version-manager shims.
+    const script = `#!/bin/bash\n${perName.join("\n")}\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(fakeAgentJs)} "$@"\n`;
     const path = join(binDir, name);
     writeFileSync(path, script);
     chmodSync(path, 0o755);
@@ -600,6 +601,10 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
   for (const dir of [xdg, xdgData, tmp, tmuxTmp, shimBin]) {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
+  const appDir = appDirFor(home, xdg, aoeBinary);
+  mkdirSync(appDir, { recursive: true, mode: 0o700 });
+  // General live tests exercise launches, not the one-time TUI approval flow.
+  writeFileSync(join(appDir, "config.toml"), "[app_state]\nhas_acknowledged_agent_hooks = true\n");
   const fakeAcpDebugLog = join(home, "fake-acp.log");
   if (opts.acp) {
     writeFakeAcpShim(shimBin, opts.fakeAcpScript, fakeAcpDebugLog, opts.extraEnv);
