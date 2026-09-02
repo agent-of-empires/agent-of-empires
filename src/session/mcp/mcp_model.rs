@@ -440,16 +440,28 @@ impl NativeRead {
 /// own) never blocks a spawn. Individual malformed server entries are skipped
 /// with a warning and recorded in `skipped`.
 pub fn load_native_mcp_servers_checked(agent_key: &str, home: &Path) -> Result<NativeRead> {
+    load_native_mcp_servers_checked_in(agent_key, home, None)
+}
+
+/// [`load_native_mcp_servers_checked`] with the session's effective config
+/// directory. Claude relocates `.claude.json` to its config dir, so discovery
+/// must read the file the launched process will: the session's declared
+/// `agent_config_dir` first (what the launch exports), then a `CLAUDE_CONFIG_DIR`
+/// already in this process's environment, then home. Only the Claude-family
+/// reader is affected; Gemini and Codex keep their fixed home-relative paths.
+pub fn load_native_mcp_servers_checked_in(
+    agent_key: &str,
+    home: &Path,
+    config_dir: Option<&Path>,
+) -> Result<NativeRead> {
     let Some(config) = native_config_for(agent_key) else {
         return Ok(NativeRead::empty());
     };
     match config {
-        // Claude relocates `.claude.json` to `$CLAUDE_CONFIG_DIR` when that is
-        // set; read the same file the launched process will, not
-        // unconditionally the one in home.
         NativeMcpConfig::StandardJson(rel) => {
-            let base = std::env::var_os("CLAUDE_CONFIG_DIR")
-                .map(std::path::PathBuf::from)
+            let base = config_dir
+                .map(Path::to_path_buf)
+                .or_else(|| std::env::var_os("CLAUDE_CONFIG_DIR").map(std::path::PathBuf::from))
                 .unwrap_or_else(|| home.to_path_buf());
             read_standard_json(&base.join(rel))
         }
@@ -472,15 +484,24 @@ pub fn load_native_mcp_servers(agent_key: &str, home: &Path) -> Result<Vec<Proje
 /// Convenience wrapper that resolves the real home dir. Kept separate from
 /// [`load_native_mcp_servers`] so tests can inject a temp home.
 pub fn load_native_mcp_servers_from_home(agent_key: &str) -> Result<Vec<ProjectMcpServer>> {
-    let home = dirs::home_dir().context("could not resolve home dir for native MCP config")?;
-    load_native_mcp_servers(agent_key, &home)
+    let read = load_native_mcp_servers_checked_from_home(agent_key)?;
+    Ok(read
+        .servers
+        .into_iter()
+        .filter(|server| !read.disabled_names.contains(&server.name))
+        .collect())
 }
 
 /// Like [`load_native_mcp_servers_checked`] but resolves the real home dir. Used
 /// by the management surface, which needs the skipped-entry list to gate drift.
 pub fn load_native_mcp_servers_checked_from_home(agent_key: &str) -> Result<NativeRead> {
     let home = dirs::home_dir().context("could not resolve home dir for native MCP config")?;
-    load_native_mcp_servers_checked(agent_key, &home)
+    // The session's declared config dir is what the launch exports to the
+    // agent, and the daemon's own environment does not carry it.
+    let config_dir = crate::session::Config::load_or_warn()
+        .session
+        .agent_config_dir_for(agent_key, &home);
+    load_native_mcp_servers_checked_in(agent_key, &home, config_dir.as_deref())
 }
 
 /// Convert a map of raw server entries, skipping (with a warning) any entry that
