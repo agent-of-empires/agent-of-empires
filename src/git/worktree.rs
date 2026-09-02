@@ -1483,7 +1483,7 @@ impl GitWorktree {
     /// pointing at the old path, so always go through git here.
     ///
     /// A worktree with submodules cannot go through `git worktree move` at all
-    /// and takes [`Self::relocate_worktree_with_submodules`] instead.
+    /// and takes `relocate_worktree_with_submodules` instead.
     pub fn move_worktree(&self, from: &Path, to: &Path) -> Result<()> {
         if !from.exists() {
             return Err(GitError::WorktreeNotFound(from.to_path_buf()));
