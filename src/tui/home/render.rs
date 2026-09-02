@@ -323,6 +323,27 @@ fn fleet_passive_step(
     }
 }
 
+/// How long a declined passive resize stays parked before the fleet retries
+/// it. Declines come from a live attach or an active size owner; nothing
+/// announces when those go away, so a bounded retry turns "parked until the
+/// next geometry change" into "recovers within half a minute", at one
+/// guarded worker attempt per declined session per interval.
+pub(super) const PASSIVE_DECLINE_RETRY: Duration = Duration::from_secs(30);
+
+/// Whether a pane observation contradicts an applied passive resize: taken
+/// after adoption (the shared list-panes snapshot can lag our own resize,
+/// and acting on an older one would re-SIGWINCH a pane that is already
+/// correct) and showing a window size other than the one we applied. True
+/// means another client resized the window and the synced entry must be
+/// dropped so the reconcile re-asserts the pane.
+fn passive_synced_contradicted(
+    synced: &super::PassiveSynced,
+    observed: (u16, u16),
+    observed_at: Instant,
+) -> bool {
+    observed_at > synced.adopted_at && observed != (synced.cols, synced.window_rows)
+}
+
 /// Clamp the user's preview scroll offset to what the freshly captured pane
 /// can actually render. Prevents the offset from drifting into "phantom"
 /// territory (M3 from the multi-AI review) when tmux history is shorter than
@@ -2280,19 +2301,28 @@ impl HomeView {
     fn adopt_passive_resize_completions(&mut self) {
         for done in crate::tmux::take_passive_resize_dones() {
             self.passive_pane_queued.remove(&done.session_id);
-            if !done.applied {
-                self.passive_pane_declined
-                    .insert(done.session_id, (done.cols, done.rows));
+            let Some(window_rows) = done.applied_window_rows else {
+                self.passive_pane_declined.insert(
+                    done.session_id,
+                    ((done.cols, done.rows), std::time::Instant::now()),
+                );
                 continue;
-            }
+            };
             let invalidates_live = passive_resize_invalidates_live_geometry(
                 self.live_send.as_ref().map(|live| &live.target),
                 self.selected_session.as_deref(),
                 &done.session_id,
             );
             self.passive_pane_declined.remove(&done.session_id);
-            self.passive_pane_synced
-                .insert(done.session_id.clone(), (done.cols, done.rows));
+            self.passive_pane_synced.insert(
+                done.session_id.clone(),
+                super::PassiveSynced {
+                    cols: done.cols,
+                    rows: done.rows,
+                    window_rows,
+                    adopted_at: std::time::Instant::now(),
+                },
+            );
             if self.preview_pane_pending.as_ref() == Some(&(done.session_id, done.cols, done.rows))
             {
                 self.preview_pane_pending = None;
@@ -2320,6 +2350,32 @@ impl HomeView {
     /// fleet analogue of `passive_resize_step`'s one-frame-toast rule), and a
     /// geometry the worker declined is not retried until the wanted fleet
     /// geometry changes again.
+    /// Drop synced entries contradicted by a newer pane snapshot: an
+    /// external `tmux attach` or the web live view resized the window after
+    /// we set it, and treating the entry as in-sync would leave the preview
+    /// clipped with no self-recovery. The reconcile then re-asserts the pane
+    /// like any other diff.
+    fn invalidate_externally_resized_panes(&mut self) {
+        let stale: Vec<String> = self
+            .passive_pane_synced
+            .iter()
+            .filter(|(id, synced)| {
+                let Some(inst) = self.get_instance(id) else {
+                    return false;
+                };
+                let name = crate::tmux::Session::resolve_name_for_display(id, &inst.title);
+                match crate::tmux::observed_window_size_from_cache(&name) {
+                    Some((observed, at)) => passive_synced_contradicted(synced, observed, at),
+                    None => false,
+                }
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in stale {
+            self.passive_pane_synced.remove(&id);
+        }
+    }
+
     pub(super) fn reconcile_passive_fleet(
         &mut self,
         inner: Rect,
@@ -2327,6 +2383,7 @@ impl HomeView {
         exclude: Option<&str>,
     ) {
         self.adopt_passive_resize_completions();
+        self.invalidate_externally_resized_panes();
         if inner.width == 0 || inner.height == 0 {
             return;
         }
@@ -2383,10 +2440,18 @@ impl HomeView {
                 continue;
             }
             let want = (cols, rows);
+            let synced = self.passive_pane_synced.get(&id).map(|s| (s.cols, s.rows));
+            // An expired decline reads as absent so the session is retried
+            // once its blocking attach or size owner may have gone away.
+            let declined = self
+                .passive_pane_declined
+                .get(&id)
+                .filter(|(_, at)| at.elapsed() < PASSIVE_DECLINE_RETRY)
+                .map(|(geometry, _)| *geometry);
             match fleet_passive_step(
                 want,
-                self.passive_pane_synced.get(&id).copied(),
-                self.passive_pane_declined.get(&id).copied(),
+                synced,
+                declined,
                 self.passive_pane_queued.get(&id).copied(),
             ) {
                 FleetPassiveStep::Skip => {}
@@ -2462,7 +2527,7 @@ impl HomeView {
                 let synced = self
                     .passive_pane_synced
                     .get(&want.0)
-                    .map(|&(cols, rows)| (want.0.clone(), cols, rows));
+                    .map(|s| (want.0.clone(), s.cols, s.rows));
                 match passive_resize_step(
                     &want,
                     synced.as_ref(),
@@ -4446,6 +4511,28 @@ mod tests {
                 "synced={synced:?} declined={declined:?} queued={queued:?}"
             );
         }
+    }
+
+    #[test]
+    fn passive_synced_contradiction_requires_a_fresher_mismatch() {
+        let adopted_at = Instant::now();
+        let synced = crate::tui::home::PassiveSynced {
+            cols: 141,
+            rows: 43,
+            window_rows: 44,
+            adopted_at,
+        };
+        let newer = adopted_at + Duration::from_millis(1);
+        let older = adopted_at - Duration::from_millis(1);
+        assert!(passive_synced_contradicted(&synced, (200, 50), newer));
+        assert!(
+            !passive_synced_contradicted(&synced, (141, 44), newer),
+            "an observation matching the applied window size is not a contradiction"
+        );
+        assert!(
+            !passive_synced_contradicted(&synced, (200, 50), older),
+            "a snapshot that may predate our own resize must not invalidate"
+        );
     }
 
     #[test]

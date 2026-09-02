@@ -1328,6 +1328,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             pane_pid: None,
             pane_title: None,
             window_activity,
+            window_size: None,
         }
     }
 

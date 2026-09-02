@@ -1818,15 +1818,19 @@ impl Session {
         quoted
     }
 
+    /// Returns the applied window row count (`rows` plus status-bar chrome)
+    /// on success, so callers can later compare the observed window size
+    /// against what was actually set; `None` when the guard declined or tmux
+    /// errored.
     fn resize_window_if_format_with_deadline(
         &self,
         condition: &str,
         cols: u16,
         rows: u16,
         deadline: &crate::tmux::TmuxCommandDeadline,
-    ) -> bool {
+    ) -> Option<u16> {
         if cols == 0 || rows == 0 {
-            return false;
+            return None;
         }
         let pane_target = format!("{}:^.0", self.name);
         let window_rows = self
@@ -1842,12 +1846,15 @@ impl Session {
         );
         let mut command = crate::tmux::tmux_command();
         command.args(["if-shell", "-t", &self.name, "-F", condition, &resize]);
-        deadline.run(&mut command).is_ok_and(|output| {
-            output.status.success()
-                && String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .any(|line| line.trim() == "aoe-resize-applied")
-        })
+        deadline
+            .run(&mut command)
+            .is_ok_and(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .any(|line| line.trim() == "aoe-resize-applied")
+            })
+            .then_some(window_rows)
     }
 
     fn release_owner_at_with_deadline(
@@ -2003,7 +2010,10 @@ impl Session {
                 owner_id,
                 &heartbeat.to_string(),
             );
-            if self.resize_window_if_format_with_deadline(&condition, cols, rows, deadline) {
+            if self
+                .resize_window_if_format_with_deadline(&condition, cols, rows, deadline)
+                .is_some()
+            {
                 return true;
             }
 
@@ -2039,12 +2049,13 @@ impl Session {
     /// Resize a detached pane only if the inactive owner state observed here
     /// is unchanged when tmux executes resize-window. This fences a live owner
     /// or terminal attach that arrives after the preliminary worker checks.
+    /// Returns the applied window row count on success, `None` when declined.
     pub(crate) fn resize_window_if_detached_without_active_owner_after_exists_with_deadline(
         &self,
         cols: u16,
         rows: u16,
         deadline: &crate::tmux::TmuxCommandDeadline,
-    ) -> bool {
+    ) -> Option<u16> {
         let owner_condition = match self.owner_at_result_with_deadline(
             SIZE_OWNER_OPT,
             SIZE_OWNER_HB_OPT,
@@ -2056,7 +2067,7 @@ impl Session {
             Ok(Some((_, heartbeat)))
                 if now_ms().saturating_sub(heartbeat) <= SIZE_OWNER_TTL.as_millis() as u64 =>
             {
-                return false;
+                return None;
             }
             Ok(Some((owner, heartbeat))) => {
                 let owner = Self::tmux_format_literal(&owner);
@@ -2064,7 +2075,7 @@ impl Session {
                     "#{{&&:#{{==:#{{{SIZE_OWNER_OPT}}},{owner}}},#{{==:#{{{SIZE_OWNER_HB_OPT}}},{heartbeat}}}}}"
                 )
             }
-            Err(_) => return false,
+            Err(_) => return None,
         };
         let condition = format!("#{{&&:#{{==:#{{session_attached}},0}},{owner_condition}}}");
         self.resize_window_if_format_with_deadline(&condition, cols, rows, deadline)
@@ -3156,18 +3167,19 @@ mod tests {
         assert!(session.size_owner().is_none());
 
         let deadline = crate::tmux::TmuxCommandDeadline::new();
-        assert!(
-            session.resize_window_if_detached_without_active_owner_after_exists_with_deadline(
+        assert!(session
+            .resize_window_if_detached_without_active_owner_after_exists_with_deadline(
                 91, 31, &deadline,
             )
-        );
+            .is_some());
         assert_eq!(pane_size(), (91, 31));
         assert!(session.claim_size_owner("active", Duration::from_secs(10)));
         let deadline = crate::tmux::TmuxCommandDeadline::new();
-        assert!(!session
+        assert!(session
             .resize_window_if_detached_without_active_owner_after_exists_with_deadline(
                 92, 32, &deadline,
-            ));
+            )
+            .is_none());
         assert_eq!(pane_size(), (91, 31));
         session.release_size_owner("active");
 

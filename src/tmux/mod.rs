@@ -258,6 +258,12 @@ pub struct PaneMetadata {
     /// tmux's last-output timestamp for the pane's window, used to skip a
     /// capture when nothing has been drawn since the last one.
     pub window_activity: Option<i64>,
+    /// Observed `(window_width, window_height)`. Window, not pane: a resize
+    /// by another client changes the window, while pane splits and status-bar
+    /// chrome only redistribute rows inside an unchanged window, so this is
+    /// the signal the passive-resize reconcile can compare against what it
+    /// applied without false mismatches.
+    pub window_size: Option<(u16, u16)>,
 }
 
 static SESSION_REFRESH_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1079,7 +1085,8 @@ pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
         // fields after it ride [`TAIL_SEP`], because a start command or a
         // title may carry a pipe of its own.
         concat!(
-            "#{session_name}|#{pane_index}|#{pane_dead}|#{pane_current_command}",
+            "#{session_name}|#{pane_index}|#{pane_dead}|#{window_width}|#{window_height}",
+            "|#{pane_current_command}",
             "|#{pane_start_command}|#{pane_pid}\x1f#{window_activity}\x1f#{pane_title}"
         ),
     ]);
@@ -1236,14 +1243,18 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
         let (line, activity, pane_title) = split_pane_metadata_tail(line);
         let window_activity = activity.and_then(|a| a.trim().parse::<i64>().ok());
         let pane_title = pane_title.unwrap_or("");
-        let mut parts = line.splitn(5, FIELD_SEP);
+        let mut parts = line.splitn(7, FIELD_SEP);
         let (
             Some(session_name),
             Some(pane_index),
             Some(pane_dead),
+            Some(window_width),
+            Some(window_height),
             Some(pane_current_command),
             Some(rest),
         ) = (
+            parts.next(),
+            parts.next(),
             parts.next(),
             parts.next(),
             parts.next(),
@@ -1253,6 +1264,10 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
         else {
             continue;
         };
+        let window_size = window_width
+            .parse::<u16>()
+            .ok()
+            .zip(window_height.parse::<u16>().ok());
         // The start command may itself contain the separator, so the pid is
         // split off the tail rather than the command off the head.
         let (pane_start_command, pane_pid) = match rest.rsplit_once(FIELD_SEP) {
@@ -1288,11 +1303,22 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
                     .contains(utils::PANE_ENV_FILE_PREFIX),
                 pane_title: (!pane_title.is_empty()).then(|| pane_title.to_string()),
                 window_activity,
+                window_size,
             },
         );
     }
 
     map
+}
+
+/// Observed window geometry for `session_name` from the shared list-panes
+/// snapshot, with the snapshot's publish time. `None` when the snapshot is
+/// absent, failed, or does not include the session.
+pub(crate) fn observed_window_size_from_cache(session_name: &str) -> Option<((u16, u16), Instant)> {
+    let cache = PANE_META_CACHE.read().ok()?;
+    let time = cache.time?;
+    let size = cache.data.as_ref()?.get(session_name)?.window_size?;
+    Some((size, time))
 }
 
 /// Test-only: inject a synthetic session name into the cache so
@@ -1307,6 +1333,30 @@ pub fn test_inject_session_into_cache(name: &str) {
     if let Ok(mut cache) = SESSION_CACHE.write() {
         let map = cache.data.get_or_insert_with(HashMap::new);
         map.insert(name.to_string(), 0);
+        cache.time = Some(Instant::now());
+    }
+}
+
+/// Test-only: publish a pane snapshot carrying a window size for `name`, so
+/// the render-side observed-size invalidation can be exercised without a
+/// real tmux server.
+#[cfg(test)]
+pub fn test_inject_pane_window_size(name: &str, size: (u16, u16)) {
+    if let Ok(mut cache) = PANE_META_CACHE.write() {
+        let mut map = cache.data.as_deref().cloned().unwrap_or_default();
+        map.insert(
+            name.to_string(),
+            PaneMetadata {
+                pane_dead: false,
+                pane_current_command: None,
+                pane_start_command_is_protected: false,
+                pane_pid: None,
+                pane_title: None,
+                window_activity: None,
+                window_size: Some(size),
+            },
+        );
+        cache.data = Some(std::sync::Arc::new(map));
         cache.time = Some(Instant::now());
     }
 }
@@ -1744,9 +1794,12 @@ pub(crate) struct PassiveResizeDone {
     pub session_id: String,
     pub cols: u16,
     pub rows: u16,
-    /// False when the resize did not happen: the session is missing, a client
-    /// is attached, a size owner is active, or tmux errored.
-    pub applied: bool,
+    /// The window row count actually applied (`rows` plus status-bar chrome)
+    /// so render can later spot an external resize by comparing the observed
+    /// window size against `(cols, this)`. `None` when the resize did not
+    /// happen: the session is missing, a client is attached, a size owner is
+    /// active, or tmux errored.
+    pub applied_window_rows: Option<u16>,
     generation: u64,
 }
 
@@ -1884,17 +1937,20 @@ fn execute_passive_resize(work: &PassiveResizeWork) -> PassiveResizeDone {
     let intent = &work.intent;
     let deadline = TmuxCommandDeadline::new();
     let session = Session::from_name(&intent.session_name);
-    let applied = session.exists_with_deadline(&deadline)
-        && session.resize_window_if_detached_without_active_owner_after_exists_with_deadline(
+    let applied_window_rows = if session.exists_with_deadline(&deadline) {
+        session.resize_window_if_detached_without_active_owner_after_exists_with_deadline(
             intent.cols,
             intent.rows,
             &deadline,
-        );
+        )
+    } else {
+        None
+    };
     PassiveResizeDone {
         session_id: intent.session_id.clone(),
         cols: intent.cols,
         rows: intent.rows,
-        applied,
+        applied_window_rows,
         generation: work.generation,
     }
 }
@@ -2330,7 +2386,7 @@ mod tests {
             session_id: "a".to_string(),
             cols: 120,
             rows: 40,
-            applied: true,
+            applied_window_rows: Some(40),
             generation: 9,
         };
         let mut newer_same_geometry = vec![PassiveResizeTicket {
@@ -2349,7 +2405,7 @@ mod tests {
             session_id: "a".to_string(),
             cols: 120,
             rows: 40,
-            applied: true,
+            applied_window_rows: Some(40),
             generation: 10,
         };
         let current =
@@ -2372,7 +2428,7 @@ mod tests {
                 session_id: "b".to_string(),
                 cols: 90,
                 rows: 30,
-                applied: true,
+                applied_window_rows: Some(30),
                 generation: 12,
             },
         );
@@ -2402,7 +2458,9 @@ mod tests {
         let probe = fork_probe::arm();
 
         assert!(
-            !execute_passive_resize(&intent).applied,
+            execute_passive_resize(&intent)
+                .applied_window_rows
+                .is_none(),
             "a failed or timed-out resize must complete as declined"
         );
         drop(probe);
@@ -2761,6 +2819,7 @@ mod tests {
                             pane_pid: None,
                             pane_title: None,
                             window_activity: None,
+                            window_size: None,
                         },
                     )
                 })
@@ -2831,6 +2890,7 @@ mod tests {
             pane_pid: None,
             pane_title: None,
             window_activity: None,
+            window_size: None,
         }
     }
 
@@ -3042,7 +3102,7 @@ mod tests {
 
     #[test]
     fn test_parse_pane_metadata_basic() {
-        let output = format!("{P}my_proj_abc12345|0|0|claude|claude|4242\n");
+        let output = format!("{P}my_proj_abc12345|0|0|190|52|claude|claude|4242\n");
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
         let meta = map.get(&format!("{P}my_proj_abc12345")).unwrap();
@@ -3050,6 +3110,7 @@ mod tests {
         assert_eq!(meta.pane_current_command.as_deref(), Some("claude"));
         assert!(!meta.pane_start_command_is_protected);
         assert_eq!(meta.pane_pid, Some(4242));
+        assert_eq!(meta.window_size, Some((190, 52)));
     }
 
     #[test]
@@ -3057,8 +3118,9 @@ mod tests {
         // Built from TAIL_SEP itself, so a drift between the constant and the
         // `list-panes` format literal fails here instead of degrading silently
         // (no activity gate, every title rule dark).
-        let output =
-            format!("{P}proj_abc12345|0|0|claude|claude{TAIL_SEP}1770000000{TAIL_SEP}✶ Working\n");
+        let output = format!(
+            "{P}proj_abc12345|0|0|190|52|claude|claude{TAIL_SEP}1770000000{TAIL_SEP}✶ Working\n"
+        );
         let meta = parse_pane_metadata(&output)
             .remove(&format!("{P}proj_abc12345"))
             .unwrap();
@@ -3068,7 +3130,7 @@ mod tests {
         // tmux 3.4 renders the control separators as unescaped octal tokens.
         // A doubled backslash belongs to the title and must not split it.
         let escaped_output = format!(
-            "{P}proj_escaped_abc12345|0|0|claude|claude literal{}{ESCAPED_TAIL_SEP}|4242{ESCAPED_TAIL_SEP}1770000001{ESCAPED_TAIL_SEP}literal{}{ESCAPED_TAIL_SEP}title{}",
+            "{P}proj_escaped_abc12345|0|0|190|52|claude|claude literal{}{ESCAPED_TAIL_SEP}|4242{ESCAPED_TAIL_SEP}1770000001{ESCAPED_TAIL_SEP}literal{}{ESCAPED_TAIL_SEP}title{}",
             char::from(92),
             char::from(92),
             char::from(10)
@@ -3083,21 +3145,23 @@ mod tests {
             Some(format!("literal{}{ESCAPED_TAIL_SEP}title", char::from(92)))
         );
 
-        // An unparsable activity reads as absent, an empty title as `None`,
-        // and a head with no tail at all parses as it did before the fields.
-        let odd = format!("{P}proj_def67890|0|0|claude|claude{TAIL_SEP}{TAIL_SEP}\n");
+        // An unparsable activity or window size reads as absent, an empty
+        // title as `None`, and a head with no tail at all parses as it did
+        // before the fields.
+        let odd = format!("{P}proj_def67890|0|0|||claude|claude{TAIL_SEP}{TAIL_SEP}\n");
         let meta = parse_pane_metadata(&odd)
             .remove(&format!("{P}proj_def67890"))
             .unwrap();
         assert_eq!(meta.window_activity, None);
         assert_eq!(meta.pane_title, None);
+        assert_eq!(meta.window_size, None);
     }
 
     #[test]
     fn test_parse_pane_metadata_protected_wrapper_shell_is_not_stale() {
         let output = format!(
-            "{P}protected_abc12345|0|0|sh|/bin/sh -c 'prepare | . /tmp/aoe-pane-env-123 | exec claude'\n\
-             {P}interactive_def67890|0|0|sh|sh\n"
+            "{P}protected_abc12345|0|0|190|52|sh|/bin/sh -c 'prepare | . /tmp/aoe-pane-env-123 | exec claude'\n\
+             {P}interactive_def67890|0|0|190|52|sh|sh\n"
         );
         let map = parse_pane_metadata(&output);
 
@@ -3120,7 +3184,7 @@ mod tests {
 
     #[test]
     fn test_parse_pane_metadata_dead_pane() {
-        let output = format!("{P}proj_abc12345|0|1|bash|bash\n");
+        let output = format!("{P}proj_abc12345|0|1|190|52|bash|bash\n");
         let map = parse_pane_metadata(&output);
         let meta = map.get(&format!("{P}proj_abc12345")).unwrap();
         assert!(meta.pane_dead);
@@ -3129,7 +3193,7 @@ mod tests {
     #[test]
     fn test_parse_pane_metadata_filters_non_aoe_sessions() {
         let output = format!(
-            "user_session|0|0|bash|bash\n{P}proj_abc12345|0|0|claude|claude\nmy_tmux|0|0|vim|vim\n"
+            "user_session|0|0|190|52|bash|bash\n{P}proj_abc12345|0|0|190|52|claude|claude\nmy_tmux|0|0|190|52|vim|vim\n"
         );
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
@@ -3138,8 +3202,9 @@ mod tests {
 
     #[test]
     fn test_parse_pane_metadata_filters_non_zero_panes() {
-        let output =
-            format!("{P}proj_abc12345|0|0|claude|claude\n{P}proj_abc12345|1|0|bash|bash\n");
+        let output = format!(
+            "{P}proj_abc12345|0|0|190|52|claude|claude\n{P}proj_abc12345|1|0|190|52|bash|bash\n"
+        );
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
         let meta = map.get(&format!("{P}proj_abc12345")).unwrap();
@@ -3149,8 +3214,9 @@ mod tests {
     #[test]
     fn test_parse_pane_metadata_first_window_wins() {
         // Two windows both have pane 0, first window's data should be kept
-        let output =
-            format!("{P}proj_abc12345|0|0|claude|claude\n{P}proj_abc12345|0|1|bash|bash\n");
+        let output = format!(
+            "{P}proj_abc12345|0|0|190|52|claude|claude\n{P}proj_abc12345|0|1|190|52|bash|bash\n"
+        );
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
         let meta = map.get(&format!("{P}proj_abc12345")).unwrap();
@@ -3165,14 +3231,14 @@ mod tests {
 
     #[test]
     fn test_parse_pane_metadata_malformed_lines() {
-        let output = format!("too|few|fields\n{P}proj_abc12345|0|0|claude|claude\n\n");
+        let output = format!("too|few|fields\n{P}proj_abc12345|0|0|190|52|claude|claude\n\n");
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
     }
 
     #[test]
     fn test_parse_pane_metadata_empty_command() {
-        let output = format!("{P}proj_abc12345|0|0||sh\n");
+        let output = format!("{P}proj_abc12345|0|0|190|52||sh\n");
         let map = parse_pane_metadata(&output);
         let meta = map.get(&format!("{P}proj_abc12345")).unwrap();
         assert!(meta.pane_current_command.is_none());
@@ -3181,7 +3247,7 @@ mod tests {
     #[test]
     fn test_parse_pane_metadata_multiple_sessions() {
         let output = format!(
-            "{P}proj_a_abc12345|0|0|claude|claude\n{P}proj_b_def67890|0|0|opencode|opencode\n{P}proj_c_ghi11111|0|1|bash|bash\n"
+            "{P}proj_a_abc12345|0|0|190|52|claude|claude\n{P}proj_b_def67890|0|0|190|52|opencode|opencode\n{P}proj_c_ghi11111|0|1|190|52|bash|bash\n"
         );
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 3);

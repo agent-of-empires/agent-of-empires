@@ -805,6 +805,7 @@ mod tests {
                     pane_pid: None,
                     pane_title: None,
                     window_activity,
+                    window_size: None,
                 },
             )]);
             let mut instances = vec![on_disk.clone()];
