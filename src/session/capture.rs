@@ -326,12 +326,12 @@ fn compose_exclusion_in(
 /// Build the capture exclusion set from live pane ownership, caller-provided
 /// exclusions, and conversation ids parked by peer engine swaps.
 ///
-/// Parked ids are persisted outside a peer's current tool, so the live pane
-/// scan cannot discover them. They remain owned until that peer resumes them.
+/// Parked ids are keyed by the raw outgoing tool, so compare their resolved
+/// built-in identity. An alias and its base agent share one conversation store.
 pub(crate) fn compose_exclusion_with_persisted_peers(
     current_instance_id: &str,
     current_project_path: &str,
-    current_tool: &str,
+    current_capture_agent: &str,
     profile: &str,
     retroactive_capture_excludes: &HashSet<String>,
 ) -> HashSet<String> {
@@ -368,13 +368,20 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
         // intends to resume it on a swap back. It is excluded regardless of the
         // peer's current tool or liveness: its pane is running another engine,
         // so the live tmux ownership scan cannot discover this id.
-        if let Some(parked) = inst
-            .prior_tool_session_ids
-            .get(current_tool)
-            .and_then(|p| p.agent_session_id.as_deref())
-            .filter(|s| !s.is_empty())
-        {
-            set.insert(parked.to_string());
+        for (parked_tool, parked) in &inst.prior_tool_session_ids {
+            let parked_agent =
+                crate::session::instance::resolved_agent_for(&inst.source_profile, parked_tool, "")
+                    .map_or(parked_tool.as_str(), |agent| agent.name);
+            if parked_agent != current_capture_agent {
+                continue;
+            }
+            if let Some(sid) = parked
+                .agent_session_id
+                .as_deref()
+                .filter(|sid| !sid.is_empty())
+            {
+                set.insert(sid.to_string());
+            }
         }
     }
     set
@@ -1581,6 +1588,55 @@ mod tests {
             .to_string();
         std::fs::create_dir_all(temp.path().join("x")).unwrap();
         assert_eq!(canonicalize_or_raw(&spelled), real);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn parked_conversation_exclusion_resolves_alias_keys() {
+        const PROFILE: &str = "capture-parked-alias-test";
+        let app = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(app.path());
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(PROFILE);
+        let mut config = crate::session::Config::default();
+        config
+            .session
+            .agent_detect_as
+            .insert("claude-personal".to_string(), "claude".to_string());
+        crate::tmux::status_rules::install_from_config(PROFILE, &config);
+
+        let project = "/tmp/capture-parked-alias";
+        let parked_sid = "88888888-8888-4888-8888-888888888888";
+        let mut peer = crate::session::Instance::new("peer", project);
+        peer.source_profile = PROFILE.to_string();
+        peer.tool = "codex".to_string();
+        peer.prior_tool_session_ids.insert(
+            "claude-personal".to_string(),
+            crate::session::instance::PriorToolSession {
+                agent_session_id: Some(parked_sid.to_string()),
+                acp_session_id: None,
+            },
+        );
+        let storage = crate::session::Storage::new_unwatched(PROFILE).unwrap();
+        storage
+            .update(|instances, groups| {
+                *instances = vec![peer.clone()];
+                *groups =
+                    crate::session::GroupTree::new_with_groups(instances, &[]).get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+
+        let exclusions = compose_exclusion_with_persisted_peers(
+            "current",
+            project,
+            "claude",
+            PROFILE,
+            &HashSet::new(),
+        );
+        assert!(
+            exclusions.contains(parked_sid),
+            "a conversation parked under an alias belongs to the same built-in store"
+        );
     }
 
     #[test]
