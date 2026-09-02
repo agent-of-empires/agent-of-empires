@@ -822,8 +822,7 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
         // Matched on the built-in each side resolves to, not on the raw
         // tool: a wrapper and the agent it wraps share one store, so a raw
         // compare leaves an inactive base-agent peer's conversation open to
-        // the wrapper's mtime scan (#3638). The parked lookup above stays
-        // keyed on the raw tool, which is how the swap path writes it.
+        // the wrapper's mtime scan (#3638).
         let peer_capture_agent = inst.capture_agent_name().unwrap_or(inst.tool.as_str());
         if !include_inactive_same_tool || peer_capture_agent != current_capture_agent {
             continue;
@@ -2835,11 +2834,15 @@ pub(crate) fn kimi_store_is_shared(
             // sole owner and licenses the MRU retarget this guard exists to
             // refuse (#3516).
             let owns_kimi = inst.capture_agent_name().unwrap_or(inst.tool.as_str()) == "kimi"
-                || inst
-                    .prior_tool_session_ids
-                    .get("kimi")
-                    .and_then(|prior| prior.agent_session_id.as_deref())
-                    .is_some_and(|sid| !sid.is_empty());
+                || inst.prior_tool_session_ids.iter().any(|(tool, prior)| {
+                    crate::session::instance::resolved_agent_for(&inst.source_profile, tool, "")
+                        .map_or(tool.as_str(), |a| a.name)
+                        == "kimi"
+                        && prior
+                            .agent_session_id
+                            .as_deref()
+                            .is_some_and(|sid| !sid.is_empty())
+                });
             if !owns_kimi {
                 continue;
             }

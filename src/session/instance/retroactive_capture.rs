@@ -355,6 +355,46 @@ mod tests {
 
     use super::*;
 
+    /// An alias and its built-in scan one store, so a mixed pair sharing a
+    /// cwd is as unattributable as two of the same name. Keying contention on
+    /// the raw tool left it unmarked and let the first self-heal claim the
+    /// other pane's conversation (#3638).
+    #[test]
+    #[serial_test::serial]
+    fn contended_capture_cwds_spans_an_alias_and_its_base() {
+        const PROFILE: &str = "contended-alias-test";
+        let _registry = crate::session::instance::test_helpers::install_aliases(
+            PROFILE,
+            &[("codex-personal", "codex")],
+        );
+        let cwd = std::env::current_dir().unwrap();
+        let p = cwd.to_str().unwrap();
+        let canon = crate::session::capture::canonicalize_or_raw(p)
+            .to_string_lossy()
+            .into_owned();
+        let mk = |title: &str, tool: &str| {
+            let mut i = Instance::new(title, p);
+            i.source_profile = PROFILE.to_string();
+            i.tool = tool.to_string();
+            i.command = tool.to_string();
+            i
+        };
+        let instances = vec![mk("base", "codex"), mk("wrapper", "codex-personal")];
+
+        let guard = crate::tmux::SessionCacheGuard::capture();
+        guard.force_present(&[]);
+        let name_of = |i: &Instance| crate::tmux::Session::resolve_name(&i.id, &i.title);
+        let live: Vec<String> = instances.iter().map(name_of).collect();
+        let live_refs: Vec<&str> = live.iter().map(String::as_str).collect();
+        guard.force_present(&live_refs);
+
+        let contended = Instance::contended_capture_cwds(&instances);
+        assert!(
+            contended.contains(&("codex".to_string(), canon)),
+            "a codex session and a codex wrapper in one cwd must both abstain"
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn contended_capture_cwds_flags_only_live_colocated_idless_same_tool() {

@@ -654,18 +654,25 @@ impl Instance {
     /// token can be spliced into this launch command.
     ///
     /// [`splice_subcommand_or_append`] puts the token after the first
-    /// whitespace-delimited word, which is the binary only for a line AoE
-    /// built itself or an override that opens with the agent's own binary. A
-    /// wrapper such as `ssh -t host codex` would take `resume <sid>` on `ssh`
-    /// and restart the wrong command, so an unparseable override emits no
-    /// resume at all (#3638).
+    /// whitespace-delimited word, so it reaches the agent only when that word
+    /// is the program the pane runs. A single-word command is that program
+    /// whatever it is named, which is the wrapper shape `custom_agents` and
+    /// `agent_command_override` document (a script that exports something and
+    /// execs the agent with `"$@"`). A multi-word command hides the binary
+    /// behind a launcher, and `ssh -t host codex` would take `resume <sid>` on
+    /// `ssh` and restart the wrong program, so those emit no resume unless the
+    /// first word is the agent's own binary (#3638).
     fn subcommand_splice_is_safe(&self, agent: &crate::agents::AgentDef) -> bool {
         if !self.has_command_override() {
             return true;
         }
-        self.command.split_whitespace().next().is_some_and(|first| {
-            first == agent.binary || first.ends_with(&format!("/{}", agent.binary))
-        })
+        let mut words = self.command.split_whitespace();
+        let Some(first) = words.next() else {
+            return false;
+        };
+        words.next().is_none()
+            || first == agent.binary
+            || first.ends_with(&format!("/{}", agent.binary))
     }
 
     pub(super) fn apply_session_flags(&mut self, cmd: &mut String, context: &str) -> bool {
@@ -691,9 +698,10 @@ impl Instance {
                     if splice_ok {
                         splice_subcommand_or_append(cmd, &fork_part, is_subcommand);
                     } else {
-                        tracing::info!(target: "session.store",
+                        tracing::warn!(target: "session.store",
                             tool = %self.tool,
-                            "fork subcommand needs the binary's position and this command override does not expose it; launching without it"
+                            command = %self.command,
+                            "fork subcommand needs the binary's position and this command hides it behind a launcher; launching without it"
                         );
                     }
                 }
@@ -734,9 +742,10 @@ impl Instance {
                 crate::agents::ResumeStrategy::Subcommand(_)
             ) && !self.subcommand_splice_is_safe(agent)
             {
-                tracing::info!(target: "session.store",
+                tracing::warn!(target: "session.store",
                     tool = %self.tool,
-                    "resume subcommand needs the binary's position and this command override does not expose it; starting fresh"
+                    command = %self.command,
+                    "resume subcommand needs the binary's position and this command hides it behind a launcher; starting fresh"
                 );
                 session_id = None;
             }
@@ -1571,6 +1580,23 @@ mod tests {
         let mut direct_cmd = direct.command.clone();
         assert!(direct.apply_session_flags(&mut direct_cmd, "test"));
         assert_eq!(direct_cmd, format!("codex resume {sid} --model o3"));
+
+        // A bare wrapper binary is the program itself, so the splice reaches
+        // the agent it execs. This is what `agent_command_override` documents
+        // and what a `custom_agents` script is, and dropping it would take
+        // resume away from a plain `codex` session that only renamed its
+        // binary.
+        for command in ["mycodex", "/opt/bin/mycodex", "codex-personal"] {
+            let mut bare = Instance::new("bare", "/tmp/codex-splice");
+            bare.source_profile = PROFILE.to_string();
+            bare.tool = "codex-remote".to_string();
+            bare.command = command.to_string();
+            bare.agent_session_id = Some(sid.to_string());
+            bare.resume_intent = ResumeIntent::Use(sid.to_string());
+            let mut bare_cmd = bare.command.clone();
+            assert!(bare.apply_session_flags(&mut bare_cmd, "test"), "{command}");
+            assert_eq!(bare_cmd, format!("{command} resume {sid}"));
+        }
     }
 
     /// A custom agent that wraps a supported one has no `AgentDef` of its
