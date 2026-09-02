@@ -139,7 +139,7 @@ Notification = "waiting"
 | `custom_agents` | `{}` | User-defined agents: name to command mapping. Custom agent names appear in the TUI agent picker alongside built-in agents. |
 | `agent_detect_as` | `{}` | Maps a custom agent to a built-in agent it inherits. Native resume is enabled only when the command starts with that built-in's exact binary token. Binary paths, same-basename scripts, wrappers, shell operators, remote launchers, and redirections fail closed. |
 | `agent_acp_cmd` | `{}` | ACP launch command for a custom agent, enabling it to run in structured view (for example, `{ "oc-superpowers" = "ocp run sp acp" }`). A custom agent with an entry here is structured view-capable; without one it stays tmux-only. Unlike `custom_agents`, the value is split into argv and run directly, with no shell. |
-| `agent_config_dir` | `{}` | Config directory an agent reads instead of its built-in default, keyed by the session's agent name. Host sessions use the directory directly. Each sandboxed session uses its own `sandbox/<instance-id>` subdirectory, mounted at the resolved built-in config path for hooks, credentials, and native-session capture. Wins over the agent's config-dir environment variable. Global/profile only. |
+| `agent_config_dir` | `{}` | Config directory an agent reads instead of its built-in default, keyed by the session's agent name. Host sessions use the directory directly. Each sandboxed session uses its own `sandbox-v2/<instance-id>` subdirectory, mounted at the resolved built-in config path for hooks, credentials, and native-session capture. Wins over the agent's config-dir environment variable. Global/profile only. |
 | `acp.restrict_agents` | `false` | Restrict structured view sessions to `acp.allowed_agents`. Off leaves every registered agent available. Read from the global config only: a profile override cannot widen it, so a shared or locked-down deployment cannot be loosened by its own users. Changing the web value requires the passphrase step-up. |
 | `acp.allowed_agents` | `[]` | ACP registry keys a structured view session may run while `acp.restrict_agents` is on, e.g. `["claude", "codex"]`. These are registry keys, not binary names, and each alias counts separately (allowing `claude` does not allow `claude-code`). With the restriction on, an empty list denies every agent. Governs the structured view only; a terminal session runs in a pane where any binary can be launched, so it is not constrained here. A policy change applies to new sessions immediately and to an already-running worker when it next respawns or when the daemon restarts, at which point a worker on a now-disallowed agent is terminated rather than reattached. |
 | `acp.acp_defaults` | `{}` | Per-agent defaults for structured view startup (under the `[acp]` section, not `[session]`). `model` is forwarded when the worker starts; `effort` (thinking) and `mode` are applied through the agent's ACP config options (`thought_level`, `mode`) when advertised, and skipped with a warning otherwise. `effort_by_model` (a `{model = effort}` map) overrides `effort` for the resolved model. Editable per agent from the web dashboard (Structured view tab, Structured View Defaults). Example: `[acp.acp_defaults.opencode] model = "openai/gpt-5.5" effort = "high" mode = "plan"`. |
@@ -222,9 +222,9 @@ claude-personal = "~/.claude-personal"
 ```
 
 The value is a host path. Host sessions use the directory itself. Each
-sandboxed session uses a separate `sandbox/<instance-id>` child that AoE
+sandboxed session uses a separate `sandbox-v2/<instance-id>` child that AoE
 creates and mounts at the resolved built-in config path. Do not mount the
-`agent_config_dir` tree or one of its sandbox children through
+`agent_config_dir` tree or one of its `sandbox-v2` children through
 `extra_volumes`: a shared manual mount bypasses per-instance isolation.
 The wrapper must read the resolved built-in config path inside the container.
 
