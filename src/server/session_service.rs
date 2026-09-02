@@ -606,7 +606,12 @@ impl SessionService {
             service: Arc::clone(self),
             id: id.to_string(),
         };
-        let _submission = self.prompt_submission(id).await;
+        // Non-vivifying: the reconciler spawns this from an earlier snapshot,
+        // so a delete can have completed in the gap and the raw guard would
+        // leave a fresh registry entry nothing prunes (#3687).
+        let Some(_submission) = self.prompt_submission_for_session(id).await else {
+            return;
+        };
         let Some((text, attachment_refs, profile, caller)) = ({
             let instances = self.instances.read().await;
             instances.iter().find(|i| i.id == id).and_then(|i| {
@@ -1158,7 +1163,11 @@ impl SessionService {
             service: Arc::clone(self),
             id: id.to_string(),
         };
-        let _submission = self.prompt_submission(id).await;
+        // Non-vivifying, for the same reason as the pending-initial drain
+        // (#3687).
+        let Some(_submission) = self.prompt_submission_for_session(id).await else {
+            return;
+        };
 
         let (caller, agent_key, queue) = {
             let instances = self.instances.read().await;
@@ -2220,6 +2229,88 @@ mod tests {
             .expect("the clear lands once the delivery releases the session")
             .expect("clear task must not panic");
         assert!(service.queued_prompts_snapshot("sess-mut").await.is_empty());
+    }
+
+    /// #3687: a background drain spawned from a pre-deletion snapshot must not
+    /// re-create the deleted session's `prompt_locks` entry.
+    ///
+    /// The registry vivifies an entry per id it is asked for and only a
+    /// permanent delete prunes it, so a drain claiming the raw guard after the
+    /// row is gone leaves one behind for the daemon's lifetime. Both windows
+    /// count: the drain that starts after the delete finished, and the one
+    /// that proves existence first and then vivifies its entry after the
+    /// delete's own `forget_prompt_lock` has already run.
+    #[tokio::test]
+    async fn drains_leave_no_prompt_lock_for_a_deleted_session() {
+        use std::time::Duration;
+
+        fn drainable(id: &str) -> Instance {
+            let mut inst = Instance::new("drain-del", "/tmp/aoe-3687");
+            inst.id = id.to_string();
+            inst.view = crate::session::View::Structured;
+            inst.status = crate::session::Status::Idle;
+            inst.pending_initial_turn = Some("hello".to_string());
+            inst
+        }
+
+        let service = crate::server::test_support::build_test_app_state(vec![
+            drainable("sess-3687-a"),
+            drainable("sess-3687-b"),
+            drainable("sess-3687-live"),
+        ])
+        .session_service
+        .clone();
+
+        // A surviving session's entry makes the assertions a return to a prior
+        // size rather than an emptied map.
+        drop(service.prompt_submission("sess-3687-live").await);
+        let before = service.prompt_locks_len().await;
+        assert_eq!(before, 1);
+
+        // Window one: the delete completed before the reconciler's drain ran.
+        service
+            .instances
+            .write()
+            .await
+            .retain(|i| i.id != "sess-3687-a");
+        service.forget_prompt_lock("sess-3687-a").await;
+        service.drain_pending_initial_turn("sess-3687-a").await;
+        service.drain_queued_prompts_once("sess-3687-a").await;
+        assert_eq!(
+            service.prompt_locks_len().await,
+            before,
+            "a drain for an id that no longer exists must not vivify an entry"
+        );
+
+        // Window two: the drain proved existence and then parked reaching the
+        // registry, so it vivifies its entry after the delete's own
+        // `forget_prompt_lock` (a no-op here: no entry existed yet) and only
+        // the post-acquisition existence check can retire it.
+        let registry = service.prompt_locks.write().await;
+        let drain = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.drain_pending_initial_turn("sess-3687-b").await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !drain.is_finished(),
+            "the drain must still be parked reaching the lock registry"
+        );
+        service
+            .instances
+            .write()
+            .await
+            .retain(|i| i.id != "sess-3687-b");
+        drop(registry);
+        tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .expect("the drain finishes once the registry is free")
+            .expect("drain task must not panic");
+        assert_eq!(
+            service.prompt_locks_len().await,
+            before,
+            "an entry vivified after the delete's removal must be retired by the drain"
+        );
     }
 
     /// Queueing a follow-up is a user gesture, so it must advance
