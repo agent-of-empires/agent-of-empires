@@ -299,16 +299,13 @@ fn passive_resize_step(
     }
 }
 
-/// What the fleet reconcile should do for one non-selected session wanting
-/// `(cols, rows)`. The fleet has its own debounce (the armed fleet geometry
-/// in `reconcile_passive_fleet`), so per session this only dedups: an
-/// already-synced pane is left alone (cancelling any stale queued geometry),
-/// a declined or already-queued geometry is not re-sent, anything else is
-/// handed to the worker.
+/// What the fleet reconcile should do for one session wanting `(cols, rows)`.
+/// The fleet has its own debounce (the armed fleet geometry in
+/// `reconcile_passive_fleet`), so per session this only dedups: an
+/// already-synced, declined, or already-queued geometry is not re-sent,
+/// anything else is handed to the worker.
 #[derive(Debug, PartialEq, Eq)]
 enum FleetPassiveStep {
-    InSync,
-    CancelStale,
     Skip,
     Queue,
 }
@@ -319,13 +316,7 @@ fn fleet_passive_step(
     declined: Option<(u16, u16)>,
     queued: Option<(u16, u16)>,
 ) -> FleetPassiveStep {
-    if synced == Some(want) {
-        if queued.is_some() {
-            FleetPassiveStep::CancelStale
-        } else {
-            FleetPassiveStep::InSync
-        }
-    } else if declined == Some(want) || queued == Some(want) {
+    if synced == Some(want) || declined == Some(want) || queued == Some(want) {
         FleetPassiveStep::Skip
     } else {
         FleetPassiveStep::Queue
@@ -2339,12 +2330,12 @@ impl HomeView {
         if inner.width == 0 || inner.height == 0 {
             return;
         }
-        let live_session = self.live_send.as_ref().map(|live| live.session_id.as_str());
+        // The excluded (selected) and live sessions are skipped at the firing
+        // loop below, NOT while building `wants`: the armed epoch key must be
+        // pure geometry, or moving the selection would re-arm the fleet and
+        // retry every declined session on each cursor stop.
         let mut wants: Vec<(String, u16, u16)> = Vec::new();
         for (id, inst) in &self.instances {
-            if Some(id.as_str()) == exclude || Some(id.as_str()) == live_session {
-                continue;
-            }
             if inst.is_archived() || inst.is_trashed() || inst.is_structured() {
                 continue;
             }
@@ -2385,7 +2376,12 @@ impl HomeView {
             self.preview_wake.notify_one();
             return;
         }
+        let live_session = self.live_send.as_ref().map(|live| live.session_id.clone());
+        let selected = self.selected_session.clone();
         for (id, cols, rows) in wants {
+            if Some(id.as_str()) == exclude || Some(id.as_str()) == live_session.as_deref() {
+                continue;
+            }
             let want = (cols, rows);
             match fleet_passive_step(
                 want,
@@ -2393,11 +2389,7 @@ impl HomeView {
                 self.passive_pane_declined.get(&id).copied(),
                 self.passive_pane_queued.get(&id).copied(),
             ) {
-                FleetPassiveStep::InSync | FleetPassiveStep::Skip => {}
-                FleetPassiveStep::CancelStale => {
-                    crate::tmux::cancel_pending_passive_resize(&id);
-                    self.passive_pane_queued.remove(&id);
-                }
+                FleetPassiveStep::Skip => {}
                 FleetPassiveStep::Queue => {
                     let Some(inst) = self.get_instance(&id) else {
                         continue;
@@ -2410,6 +2402,10 @@ impl HomeView {
                         ),
                         cols,
                         rows,
+                        // The viewed session (selected here in Terminal/Tool
+                        // view; the Structured selection goes through
+                        // `refresh_preview_cache_if_needed`) jumps the queue.
+                        priority: selected.as_deref() == Some(id.as_str()),
                     });
                     self.passive_pane_queued.insert(id, want);
                 }
@@ -2505,6 +2501,9 @@ impl HomeView {
                                 ),
                                 cols: want.1,
                                 rows: want.2,
+                                // The user is viewing this session; its
+                                // resize goes ahead of queued fleet work.
+                                priority: true,
                             });
                             self.passive_pane_queued.insert(want.0, (want.1, want.2));
                         }
@@ -4428,10 +4427,7 @@ mod tests {
             // Fresh session: hand it to the worker.
             (None, None, None, FleetPassiveStep::Queue),
             // Pane already matches: leave it alone.
-            (Some(want), None, None, FleetPassiveStep::InSync),
-            // Matches, but an older different geometry is still queued: the
-            // stale intent must be cancelled before the worker fires it.
-            (Some(want), None, Some(other), FleetPassiveStep::CancelStale),
+            (Some(want), None, None, FleetPassiveStep::Skip),
             // The worker declined this exact geometry (attached, owned, or
             // missing): no retry until the fleet epoch changes.
             (None, Some(want), None, FleetPassiveStep::Skip),

@@ -1724,6 +1724,9 @@ pub(crate) struct PassiveResizeIntent {
     pub session_name: String,
     pub cols: u16,
     pub rows: u16,
+    /// Resize before any queued non-priority work: this is the session the
+    /// user is currently viewing, so its pane must be correct first.
+    pub priority: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1789,7 +1792,15 @@ fn queue_latest_passive_resize(
     }) {
         return;
     }
-    queue.push(work);
+    if work.intent.priority {
+        let at = queue
+            .iter()
+            .position(|prev| !prev.intent.priority)
+            .unwrap_or(queue.len());
+        queue.insert(at, work);
+    } else {
+        queue.push(work);
+    }
 }
 
 /// Queue a passive preview resize for its worker. Non-blocking by contract:
@@ -1893,19 +1904,30 @@ fn publish_latest_passive_resize_done(dones: &mut Vec<PassiveResizeDone>, done: 
     dones.push(done);
 }
 
+/// Pop the head of the queue. One item at a time, not a batch snapshot: a
+/// priority intent (the session the user is viewing) queued mid-drain is
+/// front-inserted and picked on the very next iteration instead of waiting
+/// out a fleet-sized batch.
+fn take_next_passive_resize() -> Option<PassiveResizeWork> {
+    let mut queue = PASSIVE_RESIZE_INTENTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if queue.is_empty() {
+        None
+    } else {
+        Some(queue.remove(0))
+    }
+}
+
 fn execute_passive_resizes() {
     #[cfg(test)]
     PASSIVE_RESIZE_EXECUTION_COUNT.with(|count| count.set(count.get() + 1));
-    let intents = {
-        let mut queue = PASSIVE_RESIZE_INTENTS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let intents = std::mem::take(&mut *queue);
-        let mut in_flight = PASSIVE_RESIZE_IN_FLIGHT
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for work in &intents {
+    while let Some(work) = take_next_passive_resize() {
+        {
             let intent = &work.intent;
+            let mut in_flight = PASSIVE_RESIZE_IN_FLIGHT
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             in_flight.retain(|active| active.session_id != intent.session_id);
             in_flight.push(PassiveResizeTicket {
                 session_id: intent.session_id.clone(),
@@ -1914,10 +1936,6 @@ fn execute_passive_resizes() {
                 generation: work.generation,
             });
         }
-        intents
-    };
-
-    for work in intents {
         let done = execute_passive_resize(&work);
         let mut dones = PASSIVE_RESIZE_DONES
             .lock()
@@ -2250,6 +2268,7 @@ mod tests {
                 session_name: format!("aoe_test_{session_id}"),
                 cols,
                 rows,
+                priority: false,
             },
             generation,
         };
@@ -2267,6 +2286,14 @@ mod tests {
             (queue[1].intent.session_id.as_str(), queue[1].intent.cols),
             ("a", 120)
         );
+
+        // A priority intent (the viewed session) is inserted ahead of queued
+        // non-priority work so the worker resizes it first.
+        let mut viewed = work(4, "sel", 100, 30);
+        viewed.intent.priority = true;
+        queue_latest_passive_resize(&mut queue, &[], viewed);
+        assert_eq!(queue[0].intent.session_id, "sel");
+        assert_eq!(queue.len(), 3);
 
         let in_flight = vec![PassiveResizeTicket {
             session_id: "a".to_string(),
@@ -2367,6 +2394,7 @@ mod tests {
                 session_name: name.clone(),
                 cols: 100,
                 rows: 30,
+                priority: false,
             },
             generation: 1,
         };

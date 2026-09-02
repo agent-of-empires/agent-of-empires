@@ -397,15 +397,16 @@ pub struct HomeView {
     /// wanted geometry changes (a new epoch retries everything once).
     pub(super) passive_pane_declined: std::collections::HashMap<String, (u16, u16)>,
     /// Per-session `(cols, rows)` handed to the passive-resize worker whose
-    /// completion has not been adopted yet. Gates duplicate queueing and lets
-    /// the reconcile cancel a stale queued intent when the wanted geometry
-    /// returns to the synced one before the worker picks it up.
+    /// completion has not been adopted yet. Gates duplicate queueing; the
+    /// selected-session sync also uses it to cancel a stale queued intent
+    /// when its geometry lands back in sync before the worker picks it up.
     pub(super) passive_pane_queued: std::collections::HashMap<String, (u16, u16)>,
     /// The fleet geometry `reconcile_passive_fleet` saw last refresh: one
-    /// `(session_id, cols, rows)` per eligible session. Resizes fire only
-    /// once the same fleet geometry is wanted on two consecutive refreshes,
-    /// extending the one-frame-toast debounce (`passive_resize_step`) to the
-    /// whole fleet.
+    /// `(session_id, cols, rows)` per eligible session, selection-independent
+    /// so cursor movement cannot re-arm the fleet. Resizes fire only once the
+    /// same fleet geometry is wanted on two consecutive refreshes, extending
+    /// the one-frame-toast debounce (`passive_resize_step`) to the whole
+    /// fleet.
     pub(super) passive_fleet_armed: Option<Vec<(String, u16, u16)>>,
     /// `(session_id, cols, rows)` the NON-live preview sync wants but has only
     /// seen for one refresh so far. The sync fires a resize only once the same

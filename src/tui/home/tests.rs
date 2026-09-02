@@ -17290,6 +17290,19 @@ mod live_send_mode {
                 "a new epoch must retry {id} once"
             );
         }
+
+        // Moving the selection is NOT an epoch: the armed key is pure
+        // geometry, so switching the excluded session must not re-arm, and
+        // the previously excluded session fires on the same refresh.
+        let armed_before = env.view.passive_fleet_armed.clone();
+        env.view.selected_session = Some(ids[1].clone());
+        env.view
+            .reconcile_passive_fleet(inner2, false, Some(&ids[1]));
+        assert_eq!(env.view.passive_fleet_armed, armed_before);
+        assert!(
+            env.view.passive_pane_queued.contains_key(&ids[0]),
+            "the newly deselected session must be handed to the worker without re-arming"
+        );
     }
 
     #[test]
