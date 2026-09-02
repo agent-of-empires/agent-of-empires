@@ -17372,6 +17372,68 @@ mod live_send_mode {
 
     #[test]
     #[serial]
+    fn stale_observation_published_after_adoption_does_not_invalidate() {
+        // The cache boundary of the timestamp race: a `list-panes` that read
+        // the pane BEFORE our resize can finish publishing AFTER the resize's
+        // adoption. The snapshot's time is the observation instant (captured
+        // pre-fork), so the pre-resize sizes it carries must read as older
+        // than the adoption and leave the synced entry alone. Re-stamping
+        // `cache.time` at publication would make this observation look
+        // fresher than the adoption and turns this test red (the injector
+        // routes through the real publication path).
+        let _cache_guard = crate::tmux::PaneMetaCacheGuard::capture();
+        let mut env = create_test_env_with_sessions(2);
+        let ids: Vec<String> = env
+            .view
+            .flat_items
+            .iter()
+            .filter_map(|item| match item {
+                crate::session::Item::Session { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        let selected = ids[0].clone();
+        env.view.selected_session = Some(selected.clone());
+        let inner = ratatui::layout::Rect::new(0, 0, 141, 45);
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        let (cols, rows) = env
+            .view
+            .passive_fleet_armed
+            .as_ref()
+            .and_then(|armed| armed.iter().find(|(id, ..)| id == &ids[1]))
+            .map(|&(_, cols, rows)| (cols, rows))
+            .expect("armed epoch covers ids[1]");
+
+        // The listing reads the pane's pre-resize size...
+        let listed_at = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        // ...then our resize applies and is adopted...
+        env.view.passive_pane_synced.insert(
+            ids[1].clone(),
+            crate::tui::home::PassiveSynced {
+                cols,
+                rows,
+                window_rows: rows,
+                adopted_at: std::time::Instant::now(),
+            },
+        );
+        // ...and only then does the stale listing get published.
+        let title = env.view.get_instance(&ids[1]).unwrap().title.clone();
+        let name = crate::tmux::Session::resolve_name_for_display(&ids[1], &title);
+        crate::tmux::test_inject_pane_window_size_at(&name, (cols + 10, rows), listed_at);
+
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        assert!(
+            env.view.passive_pane_synced.contains_key(&ids[1]),
+            "a pre-resize observation must not invalidate the adopted size"
+        );
+        assert!(!env.view.passive_pane_queued.contains_key(&ids[1]));
+    }
+
+    #[test]
+    #[serial]
     fn fleet_reconcile_retries_expired_declines() {
         let mut env = create_test_env_with_sessions(2);
         let ids: Vec<String> = env

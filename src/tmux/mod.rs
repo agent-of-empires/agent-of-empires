@@ -1312,8 +1312,9 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
 }
 
 /// Observed window geometry for `session_name` from the shared list-panes
-/// snapshot, with the snapshot's publish time. `None` when the snapshot is
-/// absent, failed, or does not include the session.
+/// snapshot, with the snapshot's observation time: the instant captured
+/// before the `list-panes` fork, not when the result was published. `None`
+/// when the snapshot is absent, failed, or does not include the session.
 pub(crate) fn observed_window_size_from_cache(session_name: &str) -> Option<((u16, u16), Instant)> {
     let cache = PANE_META_CACHE.read().ok()?;
     let time = cache.time?;
@@ -1339,10 +1340,22 @@ pub fn test_inject_session_into_cache(name: &str) {
 
 /// Test-only: publish a pane snapshot carrying a window size for `name`, so
 /// the render-side observed-size invalidation can be exercised without a
-/// real tmux server.
+/// real tmux server. Observed "now", the common case.
 #[cfg(test)]
 pub fn test_inject_pane_window_size(name: &str, size: (u16, u16)) {
-    if let Ok(mut cache) = PANE_META_CACHE.write() {
+    test_inject_pane_window_size_at(name, size, Instant::now());
+}
+
+/// Test-only: like [`test_inject_pane_window_size`], but with an explicit
+/// observation time. Routes through [`publish_pane_meta_cache`], the real
+/// publication path, so a regression that re-stamped `cache.time` at publish
+/// instead of observation is caught by the tests using this.
+#[cfg(test)]
+pub fn test_inject_pane_window_size_at(name: &str, size: (u16, u16), taken_at: Instant) {
+    let map = {
+        let Ok(cache) = PANE_META_CACHE.read() else {
+            return;
+        };
         let mut map = cache.data.as_deref().cloned().unwrap_or_default();
         map.insert(
             name.to_string(),
@@ -1356,9 +1369,13 @@ pub fn test_inject_pane_window_size(name: &str, size: (u16, u16)) {
                 window_size: Some(size),
             },
         );
-        cache.data = Some(std::sync::Arc::new(map));
-        cache.time = Some(Instant::now());
-    }
+        map
+    };
+    publish_pane_meta_cache(
+        next_refresh_id(&PANE_META_REFRESH_ID),
+        Some(std::sync::Arc::new(map)),
+        taken_at,
+    );
 }
 
 /// Test-only instrumentation at the process's single tmux entry point.
