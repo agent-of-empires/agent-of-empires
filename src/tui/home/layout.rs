@@ -134,12 +134,14 @@ impl HomeView {
         Self::persist_app_state("preview info", |s| s.show_preview_info = Some(show));
     }
 
-    /// Forget the last non-live preview resize so the next render re-asserts the
-    /// preview geometry. Call whenever the agent window's real size changes out
-    /// from under the preview (an attach grows it to the client; entering or
-    /// leaving live mode hands the resize off and back).
-    pub(in crate::tui) fn clear_preview_pane_sync(&mut self) {
-        self.preview_pane_synced = None;
+    /// Forget one session's passive-resize bookkeeping so the next render
+    /// re-asserts its preview geometry. Call whenever that agent window's real
+    /// size changes out from under the preview (an attach grows it to the
+    /// client; entering or leaving live mode hands the resize off and back).
+    pub(in crate::tui) fn clear_preview_pane_sync(&mut self, session_id: &str) {
+        self.passive_pane_synced.remove(session_id);
+        self.passive_pane_declined.remove(session_id);
+        self.passive_pane_queued.remove(session_id);
     }
 
     /// Expand the synthetic Archived section if it is collapsed, persisting

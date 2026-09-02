@@ -17196,19 +17196,100 @@ mod live_send_mode {
             .expect("test env has one session");
         env.view.selected_session = Some(id.clone());
         // Steady state: pane already synced to the toast-free geometry.
-        env.view.preview_pane_synced = Some((id.clone(), 141, 43));
+        env.view.passive_pane_synced.insert(id.clone(), (141, 43));
 
         // Toast frame: one row shorter. Armed only; the synced geometry (and
         // with it the real pane) must stay untouched.
         env.view.refresh_preview_cache_if_needed(141, 42);
         assert_eq!(env.view.preview_pane_pending, Some((id.clone(), 141, 42)));
-        assert_eq!(env.view.preview_pane_synced, Some((id.clone(), 141, 43)));
+        assert_eq!(env.view.passive_pane_synced.get(&id), Some(&(141, 43)));
 
         // Post-toast frame: back in sync; the transient arm is dropped so a
         // later real change still needs two consecutive sightings.
         env.view.refresh_preview_cache_if_needed(141, 43);
         assert_eq!(env.view.preview_pane_pending, None);
-        assert_eq!(env.view.preview_pane_synced, Some((id, 141, 43)));
+        assert_eq!(env.view.passive_pane_synced.get(&id), Some(&(141, 43)));
+    }
+
+    #[test]
+    #[serial]
+    fn fleet_reconcile_presizes_open_sessions_once_per_epoch() {
+        let mut env = create_test_env_with_sessions(3);
+        let ids: Vec<String> = env
+            .view
+            .flat_items
+            .iter()
+            .filter_map(|item| match item {
+                crate::session::Item::Session { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 3);
+        let selected = ids[0].clone();
+        env.view.selected_session = Some(selected.clone());
+        let inner = ratatui::layout::Rect::new(0, 0, 141, 45);
+
+        // First sighting of a fleet geometry arms only; nothing reaches the
+        // worker until the same geometry holds for a second refresh.
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        assert!(env.view.passive_fleet_armed.is_some());
+        assert!(env.view.passive_pane_queued.is_empty());
+
+        // Second sighting queues every open session except the excluded
+        // (selected) one.
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        assert!(!env.view.passive_pane_queued.contains_key(&selected));
+        for id in &ids[1..] {
+            assert!(
+                env.view.passive_pane_queued.contains_key(id),
+                "open session {id} must be handed to the worker"
+            );
+        }
+
+        // The fixture sessions have no tmux panes, so the worker declines
+        // each intent. Once the declines are adopted, the same epoch must not
+        // re-queue them.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            env.view
+                .reconcile_passive_fleet(inner, false, Some(&selected));
+            if ids[1..]
+                .iter()
+                .all(|id| env.view.passive_pane_declined.contains_key(id))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "declined completions never arrived"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        assert!(
+            ids[1..]
+                .iter()
+                .all(|id| !env.view.passive_pane_queued.contains_key(id)),
+            "a declined geometry must not be retried within its epoch"
+        );
+
+        // A different fleet geometry is a new epoch: arming clears the
+        // declines and the follow-up refresh retries each session once.
+        let inner2 = ratatui::layout::Rect::new(0, 0, 120, 38);
+        env.view
+            .reconcile_passive_fleet(inner2, false, Some(&selected));
+        assert!(env.view.passive_pane_declined.is_empty());
+        env.view
+            .reconcile_passive_fleet(inner2, false, Some(&selected));
+        for id in &ids[1..] {
+            assert!(
+                env.view.passive_pane_queued.contains_key(id),
+                "a new epoch must retry {id} once"
+            );
+        }
     }
 
     #[test]

@@ -4385,7 +4385,7 @@ impl HomeView {
     /// * **Mouse tracking on**: forward the wheel as a mouse event, encoding
     ///   following the app (SGR 1006 when `mouse_sgr` is set, else legacy
     ///   X10). The previewed pane is sized to the preview rect in both modes
-    ///   (`preview_pane_synced` / the live-send sync resize), so the mapped
+    ///   (`passive_pane_synced` / the live-send sync resize), so the mapped
     ///   coordinates land inside it.
     /// * **Mouse tracking off**: send `PageUp`/`PageDown`, not arrow keys. A
     ///   full-screen app reads arrows as cursor / input-history navigation,
@@ -6263,7 +6263,7 @@ impl HomeView {
     /// re-asserting `window-size latest` would stomp it (the exact flap
     /// the size-owner lock exists to kill).
     fn teardown_live_send(&mut self) {
-        self.live_send = None;
+        let live_session_id = self.live_send.take().map(|state| state.session_id);
         self.live_send_worker = None;
         // Leave the capture worker running: the same pane is still
         // previewed after exit, just at the idle cadence. The render
@@ -6282,7 +6282,9 @@ impl HomeView {
         // Live mode just owned the pane's size; the non-live preview must
         // re-assert its geometry on the next render now that the header is
         // visible again (and so the agent reflows back to the previewed size).
-        self.preview_pane_synced = None;
+        if let Some(id) = &live_session_id {
+            self.clear_preview_pane_sync(id);
+        }
         // Preview selections also work outside live mode now, but a
         // live-mode highlight pins to the live-resized pane coords,
         // and exiting reflows the preview back to its normal size.

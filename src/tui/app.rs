@@ -3726,7 +3726,7 @@ impl App {
         // preview geometry against the now-grown window instead of leaving the
         // top clipped.
         tmux_session.reset_size_to_latest_client();
-        self.home.clear_preview_pane_sync();
+        self.home.clear_preview_pane_sync(session_id);
         let (attach_result, attached_status_updates) =
             self.with_attached_status_hooks(terminal, || tmux_session.attach())?;
 

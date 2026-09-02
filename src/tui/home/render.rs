@@ -299,6 +299,39 @@ fn passive_resize_step(
     }
 }
 
+/// What the fleet reconcile should do for one non-selected session wanting
+/// `(cols, rows)`. The fleet has its own debounce (the armed fleet geometry
+/// in `reconcile_passive_fleet`), so per session this only dedups: an
+/// already-synced pane is left alone (cancelling any stale queued geometry),
+/// a declined or already-queued geometry is not re-sent, anything else is
+/// handed to the worker.
+#[derive(Debug, PartialEq, Eq)]
+enum FleetPassiveStep {
+    InSync,
+    CancelStale,
+    Skip,
+    Queue,
+}
+
+fn fleet_passive_step(
+    want: (u16, u16),
+    synced: Option<(u16, u16)>,
+    declined: Option<(u16, u16)>,
+    queued: Option<(u16, u16)>,
+) -> FleetPassiveStep {
+    if synced == Some(want) {
+        if queued.is_some() {
+            FleetPassiveStep::CancelStale
+        } else {
+            FleetPassiveStep::InSync
+        }
+    } else if declined == Some(want) || queued == Some(want) {
+        FleetPassiveStep::Skip
+    } else {
+        FleetPassiveStep::Queue
+    }
+}
+
 /// Clamp the user's preview scroll offset to what the freshly captured pane
 /// can actually render. Prevents the offset from drifting into "phantom"
 /// territory (M3 from the multi-AI review) when tmux history is shorter than
@@ -2247,6 +2280,143 @@ impl HomeView {
         preview_frozen(self.preview_scroll_offset, self.preview_selection.is_some())
     }
 
+    /// Adopt passive-resize completions into the per-session bookkeeping.
+    /// Applied geometry becomes the synced dedup (and clears the live-send
+    /// dedup when the resize raced live entry, see
+    /// `passive_resize_invalidates_live_geometry`); declined geometry is
+    /// parked so the fleet reconcile stops retrying it until the wanted
+    /// geometry changes.
+    fn adopt_passive_resize_completions(&mut self) {
+        for done in crate::tmux::take_passive_resize_dones() {
+            self.passive_pane_queued.remove(&done.session_id);
+            if !done.applied {
+                self.passive_pane_declined
+                    .insert(done.session_id, (done.cols, done.rows));
+                continue;
+            }
+            let invalidates_live = passive_resize_invalidates_live_geometry(
+                self.live_send.as_ref().map(|live| &live.target),
+                self.selected_session.as_deref(),
+                &done.session_id,
+            );
+            self.passive_pane_declined.remove(&done.session_id);
+            self.passive_pane_synced
+                .insert(done.session_id.clone(), (done.cols, done.rows));
+            if self.preview_pane_pending.as_ref() == Some(&(done.session_id, done.cols, done.rows))
+            {
+                self.preview_pane_pending = None;
+            }
+            if invalidates_live {
+                self.live_send_last_resize = None;
+                self.live_send_resize_retry_at = None;
+            }
+        }
+    }
+
+    /// Keep every open session's detached agent pane pre-sized to the preview
+    /// output rect it would be shown at, so selecting a row or entering live
+    /// view lands on an already-correct pane instead of waiting out a resize
+    /// round-trip. `exclude` is the session whose per-frame sync in
+    /// `refresh_preview_cache_if_needed` owns its geometry this frame; the
+    /// live-send session is skipped because its worker owns the pane.
+    ///
+    /// The per-session target is fully predictable: `PreviewLayout::compute`
+    /// over the shared preview rect and that instance's own header height,
+    /// the same split the renderer will use when the row is selected. Work
+    /// runs on the passive-resize worker under its atomic detached/no-owner
+    /// guard. Two debounces bound the SIGWINCH cost: resizes fire only when
+    /// the same fleet geometry is wanted on two consecutive refreshes (the
+    /// fleet analogue of `passive_resize_step`'s one-frame-toast rule), and a
+    /// geometry the worker declined is not retried until the wanted fleet
+    /// geometry changes again.
+    pub(super) fn reconcile_passive_fleet(
+        &mut self,
+        inner: Rect,
+        compact: bool,
+        exclude: Option<&str>,
+    ) {
+        self.adopt_passive_resize_completions();
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+        let live_session = self.live_send.as_ref().map(|live| live.session_id.as_str());
+        let mut wants: Vec<(String, u16, u16)> = Vec::new();
+        for (id, inst) in &self.instances {
+            if Some(id.as_str()) == exclude || Some(id.as_str()) == live_session {
+                continue;
+            }
+            if inst.is_archived() || inst.is_trashed() || inst.is_structured() {
+                continue;
+            }
+            if !matches!(
+                inst.status,
+                Status::Running | Status::Waiting | Status::Idle
+            ) {
+                continue;
+            }
+            let output = preview::PreviewLayout::compute(
+                inner,
+                compact,
+                self.show_preview_info,
+                preview::agent_info_height(inst),
+            )
+            .output;
+            if output.width == 0 || output.height == 0 {
+                continue;
+            }
+            wants.push((id.clone(), output.width, output.height));
+        }
+        if self.passive_fleet_armed.as_ref() != Some(&wants) {
+            // First sighting of this fleet geometry: arm it, let declined
+            // sessions retry once under the new epoch, and nudge the event
+            // loop so the confirming refresh isn't left to an idle heartbeat.
+            // Queued entries are dropped too: re-queueing work that is truly
+            // in flight is suppressed by the worker's tickets, while an entry
+            // orphaned by a lost completion (worker panic) would otherwise
+            // block its session at that geometry indefinitely.
+            self.passive_fleet_armed = Some(wants);
+            self.passive_pane_declined.clear();
+            self.passive_pane_queued.clear();
+            // Prune synced entries for sessions that no longer exist so the
+            // map cannot grow without bound as sessions come and go.
+            let instances = &self.instances;
+            self.passive_pane_synced
+                .retain(|id, _| instances.contains_key(id));
+            self.preview_wake.notify_one();
+            return;
+        }
+        for (id, cols, rows) in wants {
+            let want = (cols, rows);
+            match fleet_passive_step(
+                want,
+                self.passive_pane_synced.get(&id).copied(),
+                self.passive_pane_declined.get(&id).copied(),
+                self.passive_pane_queued.get(&id).copied(),
+            ) {
+                FleetPassiveStep::InSync | FleetPassiveStep::Skip => {}
+                FleetPassiveStep::CancelStale => {
+                    crate::tmux::cancel_pending_passive_resize(&id);
+                    self.passive_pane_queued.remove(&id);
+                }
+                FleetPassiveStep::Queue => {
+                    let Some(inst) = self.get_instance(&id) else {
+                        continue;
+                    };
+                    crate::tmux::queue_passive_resize(crate::tmux::PassiveResizeIntent {
+                        session_id: id.clone(),
+                        session_name: crate::tmux::Session::resolve_name_for_display(
+                            &id,
+                            &inst.title,
+                        ),
+                        cols,
+                        rows,
+                    });
+                    self.passive_pane_queued.insert(id, want);
+                }
+            }
+        }
+    }
+
     pub(super) fn refresh_preview_cache_if_needed(&mut self, width: u16, height: u16) {
         // Forward an agent's OSC 52 copy to the host clipboard (#2420). The
         // VT reader extracts it from the raw pane stream (the vt100 grid
@@ -2273,27 +2443,10 @@ impl HomeView {
         // the cache; tui.render preview_apply_us measures that paint-side work,
         // not tmux capture latency.
         let in_live = self.live_send.is_some();
-        // Adopt passive completions before live sizing. A passive resize can
-        // have passed its detached/no-owner checks just before live-send took
-        // ownership, then land after the live worker's first resize. Clear the
-        // live dedup for that active agent so the call below reasserts current
-        // geometry in this same frame.
-        for done in crate::tmux::take_passive_resize_dones() {
-            let invalidates_live = passive_resize_invalidates_live_geometry(
-                self.live_send.as_ref().map(|live| &live.target),
-                self.selected_session.as_deref(),
-                &done.session_id,
-            );
-            self.preview_pane_synced = Some((done.session_id.clone(), done.cols, done.rows));
-            if self.preview_pane_pending.as_ref() == Some(&(done.session_id, done.cols, done.rows))
-            {
-                self.preview_pane_pending = None;
-            }
-            if invalidates_live {
-                self.live_send_last_resize = None;
-                self.live_send_resize_retry_at = None;
-            }
-        }
+        // Passive completions were adopted by `reconcile_passive_fleet`
+        // earlier this frame (it runs before every preview refresh), so the
+        // live-dedup invalidation for a passive resize that raced live entry
+        // is already in place for the live sizing below.
         // While in live-send mode, keep the agent's tmux pane sized to the
         // preview's visible output area so it renders directly into view.
         self.resize_live_pane_if_target(live_send::LiveSendTarget::Agent, width, height);
@@ -2310,13 +2463,18 @@ impl HomeView {
         if !in_live && width > 0 && height > 0 {
             if let Some(id) = self.selected_session.clone() {
                 let want = (id, width, height);
+                let synced = self
+                    .passive_pane_synced
+                    .get(&want.0)
+                    .map(|&(cols, rows)| (want.0.clone(), cols, rows));
                 match passive_resize_step(
                     &want,
-                    self.preview_pane_synced.as_ref(),
+                    synced.as_ref(),
                     self.preview_pane_pending.as_ref(),
                 ) {
                     PassiveResizeStep::InSync => {
                         crate::tmux::cancel_pending_passive_resize(&want.0);
+                        self.passive_pane_queued.remove(&want.0);
                         self.preview_pane_pending = None;
                     }
                     PassiveResizeStep::Arm => {
@@ -2348,6 +2506,7 @@ impl HomeView {
                                 cols: want.1,
                                 rows: want.2,
                             });
+                            self.passive_pane_queued.insert(want.0, (want.1, want.2));
                         }
                     }
                 }
@@ -2727,6 +2886,23 @@ impl HomeView {
                 self.displayed_pane_tmux_name()
             };
         self.sync_preview_capture_worker(desired);
+
+        // Pre-size every other open session's detached pane to the preview
+        // rect it would be shown at (and adopt worker completions), in every
+        // view mode and selection state. The selected session is excluded
+        // exactly when the Structured branch below runs its own per-frame
+        // sync in `refresh_preview_cache_if_needed`.
+        let selected_owns_sync = matches!(self.view_mode, ViewMode::Structured)
+            && !selected_archived
+            && !selected_trashed
+            && !selected_stopped
+            && !selected_structured;
+        let fleet_exclude = if selected_owns_sync {
+            self.selected_session.clone()
+        } else {
+            None
+        };
+        self.reconcile_passive_fleet(inner, compact, fleet_exclude.as_deref());
 
         if selected_archived {
             self.render_archived_preview(frame, inner, theme);
@@ -4242,6 +4418,38 @@ mod tests {
             passive_resize_step(&want, None, Some(&pending)),
             PassiveResizeStep::Arm,
         );
+    }
+
+    #[test]
+    fn fleet_passive_step_dedups_per_session() {
+        let want = (120, 40);
+        let other = (100, 30);
+        let cases = [
+            // Fresh session: hand it to the worker.
+            (None, None, None, FleetPassiveStep::Queue),
+            // Pane already matches: leave it alone.
+            (Some(want), None, None, FleetPassiveStep::InSync),
+            // Matches, but an older different geometry is still queued: the
+            // stale intent must be cancelled before the worker fires it.
+            (Some(want), None, Some(other), FleetPassiveStep::CancelStale),
+            // The worker declined this exact geometry (attached, owned, or
+            // missing): no retry until the fleet epoch changes.
+            (None, Some(want), None, FleetPassiveStep::Skip),
+            // Already handed to the worker: wait for its completion.
+            (None, None, Some(want), FleetPassiveStep::Skip),
+            // A decline for a different geometry does not block the new want.
+            (None, Some(other), None, FleetPassiveStep::Queue),
+            // A queued different geometry is superseded (the queue keeps only
+            // the latest intent per session).
+            (Some(other), None, Some(other), FleetPassiveStep::Queue),
+        ];
+        for (synced, declined, queued, expect) in cases {
+            assert_eq!(
+                fleet_passive_step(want, synced, declined, queued),
+                expect,
+                "synced={synced:?} declined={declined:?} queued={queued:?}"
+            );
+        }
     }
 
     #[test]

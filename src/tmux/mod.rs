@@ -1732,20 +1732,34 @@ struct PassiveResizeWork {
     generation: u64,
 }
 
-/// A passive resize the worker completed. The render thread consumes these to
-/// adopt the (session, cols, rows) dedup exactly as the old in-paint path did
-/// on success.
+/// A passive resize the worker finished. The render thread consumes these to
+/// adopt the per-session (cols, rows) dedup on success, or to park a declined
+/// geometry so background sessions get one attempt per geometry change
+/// instead of a per-frame retry loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PassiveResizeDone {
     pub session_id: String,
     pub cols: u16,
     pub rows: u16,
+    /// False when the resize did not happen: the session is missing, a client
+    /// is attached, a size owner is active, or tmux errored.
+    pub applied: bool,
+    generation: u64,
+}
+
+/// Geometry the worker is executing (or has finished, pending render
+/// adoption). Suppresses identical re-queues until the completion is adopted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PassiveResizeTicket {
+    session_id: String,
+    cols: u16,
+    rows: u16,
     generation: u64,
 }
 
 static PASSIVE_RESIZE_INTENTS: Mutex<Vec<PassiveResizeWork>> = Mutex::new(Vec::new());
 static PASSIVE_RESIZE_DONES: Mutex<Vec<PassiveResizeDone>> = Mutex::new(Vec::new());
-static PASSIVE_RESIZE_IN_FLIGHT: Mutex<Vec<PassiveResizeDone>> = Mutex::new(Vec::new());
+static PASSIVE_RESIZE_IN_FLIGHT: Mutex<Vec<PassiveResizeTicket>> = Mutex::new(Vec::new());
 static PASSIVE_RESIZE_GENERATION: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 static PASSIVE_RESIZE_WORKER_THREAD: OnceLock<std::thread::Thread> = OnceLock::new();
@@ -1761,7 +1775,7 @@ thread_local! {
 /// the number of sessions even if the worker is delayed or restarts.
 fn queue_latest_passive_resize(
     queue: &mut Vec<PassiveResizeWork>,
-    in_flight: &[PassiveResizeDone],
+    in_flight: &[PassiveResizeTicket],
     work: PassiveResizeWork,
 ) {
     // Any newly wanted geometry supersedes the queued one for this session,
@@ -1779,8 +1793,10 @@ fn queue_latest_passive_resize(
 }
 
 /// Queue a passive preview resize for its worker. Non-blocking by contract:
-/// this is called from paint.
+/// this is called from paint. Spawns the worker on first use (a fresh worker
+/// drains the queue before its first park, so no wakeup is lost).
 pub(crate) fn queue_passive_resize(intent: PassiveResizeIntent) {
+    spawn_passive_resize_worker();
     {
         let mut queue = PASSIVE_RESIZE_INTENTS
             .lock()
@@ -1816,7 +1832,7 @@ pub(crate) fn cancel_pending_passive_resize(session_id: &str) {
 /// Drain completions and release matching in-flight geometry only when render
 /// can adopt the dedup. A newer geometry for the same session remains active.
 fn take_current_passive_completions(
-    in_flight: &mut Vec<PassiveResizeDone>,
+    in_flight: &mut Vec<PassiveResizeTicket>,
     dones: Vec<PassiveResizeDone>,
 ) -> Vec<PassiveResizeDone> {
     let current: Vec<_> = dones
@@ -1848,35 +1864,28 @@ pub(crate) fn take_passive_resize_dones() -> Vec<PassiveResizeDone> {
     take_current_passive_completions(&mut in_flight, dones)
 }
 
-fn clear_passive_resize_in_flight(work: &PassiveResizeWork) {
-    let mut in_flight = PASSIVE_RESIZE_IN_FLIGHT
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    in_flight.retain(|active| active.generation != work.generation);
-}
-
 /// Execute one queued passive resize under an atomic final tmux guard. The
 /// worker first rejects a missing session; the Session helper then fences both
-/// a newly attached client and a size-owner takeover at resize execution.
-fn execute_passive_resize(work: &PassiveResizeWork) -> Option<PassiveResizeDone> {
+/// a newly attached client and a size-owner takeover at resize execution. A
+/// resize the guard refuses (or that errors) still completes, as declined, so
+/// render can park the geometry instead of retrying it every frame.
+fn execute_passive_resize(work: &PassiveResizeWork) -> PassiveResizeDone {
     let intent = &work.intent;
     let deadline = TmuxCommandDeadline::new();
     let session = Session::from_name(&intent.session_name);
-    if !session.exists_with_deadline(&deadline) {
-        return None;
-    }
-    session
-        .resize_window_if_detached_without_active_owner_after_exists_with_deadline(
+    let applied = session.exists_with_deadline(&deadline)
+        && session.resize_window_if_detached_without_active_owner_after_exists_with_deadline(
             intent.cols,
             intent.rows,
             &deadline,
-        )
-        .then(|| PassiveResizeDone {
-            session_id: intent.session_id.clone(),
-            cols: intent.cols,
-            rows: intent.rows,
-            generation: work.generation,
-        })
+        );
+    PassiveResizeDone {
+        session_id: intent.session_id.clone(),
+        cols: intent.cols,
+        rows: intent.rows,
+        applied,
+        generation: work.generation,
+    }
 }
 
 fn publish_latest_passive_resize_done(dones: &mut Vec<PassiveResizeDone>, done: PassiveResizeDone) {
@@ -1898,7 +1907,7 @@ fn execute_passive_resizes() {
         for work in &intents {
             let intent = &work.intent;
             in_flight.retain(|active| active.session_id != intent.session_id);
-            in_flight.push(PassiveResizeDone {
+            in_flight.push(PassiveResizeTicket {
                 session_id: intent.session_id.clone(),
                 cols: intent.cols,
                 rows: intent.rows,
@@ -1909,10 +1918,7 @@ fn execute_passive_resizes() {
     };
 
     for work in intents {
-        let Some(done) = execute_passive_resize(&work) else {
-            clear_passive_resize_in_flight(&work);
-            continue;
-        };
+        let done = execute_passive_resize(&work);
         let mut dones = PASSIVE_RESIZE_DONES
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1972,7 +1978,6 @@ fn refresh_display_snapshots() {
 /// Idempotent while the poller is running. The daemon thread dies with the
 /// process.
 pub fn spawn_snapshot_poller() {
-    spawn_passive_resize_worker();
     static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if STARTED.swap(true, std::sync::atomic::Ordering::AcqRel) {
         return;
@@ -2263,7 +2268,7 @@ mod tests {
             ("a", 120)
         );
 
-        let in_flight = vec![PassiveResizeDone {
+        let in_flight = vec![PassiveResizeTicket {
             session_id: "a".to_string(),
             cols: 120,
             rows: 40,
@@ -2298,11 +2303,14 @@ mod tests {
             session_id: "a".to_string(),
             cols: 120,
             rows: 40,
+            applied: true,
             generation: 9,
         };
-        let mut newer_same_geometry = vec![PassiveResizeDone {
+        let mut newer_same_geometry = vec![PassiveResizeTicket {
+            session_id: "a".to_string(),
+            cols: 120,
+            rows: 40,
             generation: 10,
-            ..old_done.clone()
         }];
         let stale = take_current_passive_completions(&mut newer_same_geometry, vec![old_done]);
         assert!(stale.is_empty(), "stale completion must not reach render");
@@ -2310,7 +2318,13 @@ mod tests {
             newer_same_geometry[0].generation, 10,
             "an old identical completion must not clear newer in-flight work"
         );
-        let current_done = newer_same_geometry[0].clone();
+        let current_done = PassiveResizeDone {
+            session_id: "a".to_string(),
+            cols: 120,
+            rows: 40,
+            applied: true,
+            generation: 10,
+        };
         let current =
             take_current_passive_completions(&mut newer_same_geometry, vec![current_done]);
         assert_eq!(current[0].generation, 10);
@@ -2331,6 +2345,7 @@ mod tests {
                 session_id: "b".to_string(),
                 cols: 90,
                 rows: 30,
+                applied: true,
                 generation: 12,
             },
         );
@@ -2340,7 +2355,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn failed_passive_resize_does_not_publish_completion() {
+    fn failed_passive_resize_publishes_declined_completion() {
         const ID: &str = "resize_failure_id";
         const TITLE: &str = "Missing resize target";
         let name = Session::generate_name(ID, TITLE);
@@ -2359,8 +2374,8 @@ mod tests {
         let probe = fork_probe::arm();
 
         assert!(
-            execute_passive_resize(&intent).is_none(),
-            "a failed or timed-out resize must not publish a completion"
+            !execute_passive_resize(&intent).applied,
+            "a failed or timed-out resize must complete as declined"
         );
         drop(probe);
         assert_eq!(

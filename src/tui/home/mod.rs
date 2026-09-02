@@ -380,13 +380,33 @@ pub struct HomeView {
     /// (`leader b`). Persisted to `app_state.home_sidebar_collapsed` so the
     /// choice survives restarts.
     pub(super) sidebar_collapsed: bool,
-    /// `(session_id, cols, rows)` of the last NON-live preview resize we sent
-    /// to the selected agent's pane, so the 250ms preview poll doesn't
-    /// SIGWINCH-storm it every tick. Invalidated (set to None) on attach and on
-    /// live-send enter/exit, where the window's real size changes out from
-    /// under us and the next render must re-assert the preview geometry. See
-    /// `refresh_preview_cache_if_needed`.
-    pub(super) preview_pane_synced: Option<(String, u16, u16)>,
+    /// Per-session `(cols, rows)` of the last NON-live passive resize the
+    /// worker applied, so neither the selected-session sync nor the fleet
+    /// reconcile SIGWINCH-storms a pane that already matches. A session's
+    /// entry is dropped on attach and on live-send enter/exit, where its
+    /// window's real size changes out from under us and the next render must
+    /// re-assert the preview geometry. See `refresh_preview_cache_if_needed`
+    /// and `reconcile_passive_fleet`.
+    pub(super) passive_pane_synced: std::collections::HashMap<String, (u16, u16)>,
+    /// Per-session `(cols, rows)` the worker declined to apply (session
+    /// missing, client attached, or size owner active). The fleet reconcile
+    /// skips a session while it still wants its declined geometry, so
+    /// background sessions get one attempt per geometry change instead of a
+    /// per-frame retry loop; the selected session ignores this and keeps its
+    /// historical retry-until-applied behavior. Cleared whenever the fleet's
+    /// wanted geometry changes (a new epoch retries everything once).
+    pub(super) passive_pane_declined: std::collections::HashMap<String, (u16, u16)>,
+    /// Per-session `(cols, rows)` handed to the passive-resize worker whose
+    /// completion has not been adopted yet. Gates duplicate queueing and lets
+    /// the reconcile cancel a stale queued intent when the wanted geometry
+    /// returns to the synced one before the worker picks it up.
+    pub(super) passive_pane_queued: std::collections::HashMap<String, (u16, u16)>,
+    /// The fleet geometry `reconcile_passive_fleet` saw last refresh: one
+    /// `(session_id, cols, rows)` per eligible session. Resizes fire only
+    /// once the same fleet geometry is wanted on two consecutive refreshes,
+    /// extending the one-frame-toast debounce (`passive_resize_step`) to the
+    /// whole fleet.
+    pub(super) passive_fleet_armed: Option<Vec<(String, u16, u16)>>,
     /// `(session_id, cols, rows)` the NON-live preview sync wants but has only
     /// seen for one refresh so far. The sync fires a resize only once the same
     /// geometry is wanted on two consecutive refreshes: the `EnterLiveSend` /
