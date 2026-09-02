@@ -145,24 +145,19 @@ mod tests {
         }
     }
 
+    // The JSON-number path is covered end to end by
+    // `map_tool_call_update_emits_wakeup_when_title_and_raw_input_land_in_update`;
+    // only the numeric-string fallback is unique to this layer.
     #[test]
-    fn wakeup_from_raw_schedules_valid_delay() {
+    fn wakeup_from_raw_schedules_delay_given_as_string() {
         let before = chrono::Utc::now();
-        let raw = serde_json::json!({ "delaySeconds": 600, "reason": "watching CI" });
-        match wakeup_event_from_raw(&raw) {
-            Some(Event::WakeupScheduled { at, reason }) => {
-                assert_eq!(reason.as_deref(), Some("watching CI"));
-                assert!((at - before).num_seconds() >= 600);
-                assert!((at - before).num_seconds() < 660);
+        match wakeup_event_from_raw(&serde_json::json!({ "delaySeconds": "600" })) {
+            Some(Event::WakeupScheduled { at, .. }) => {
+                let delta = (at - before).num_seconds();
+                assert!((600..660).contains(&delta), "expected ~600s, got {delta}s");
             }
             other => panic!("expected WakeupScheduled, got {other:?}"),
         }
-        // A numeric string is accepted the same way.
-        let raw = serde_json::json!({ "delaySeconds": "600" });
-        assert!(matches!(
-            wakeup_event_from_raw(&raw),
-            Some(Event::WakeupScheduled { .. })
-        ));
     }
 
     #[test]
