@@ -1715,9 +1715,16 @@ fn pane_dead_from_cache(name: &str) -> Option<bool> {
 /// Repopulate [`PANE_META_CACHE`]. The timestamp is stamped even when the
 /// query fails, so a tmux outage costs one fork per poller cycle
 /// ([`CACHE_TTL`] / 2) instead of one per row per frame.
+///
+/// `taken_at` must be captured BEFORE the `list-panes` fork: consumers
+/// compare it against their own write times (`passive_synced_contradicted`),
+/// and a publish-time stamp would let a listing that read pre-resize sizes,
+/// then stalled past the resize's adoption, masquerade as a fresher
+/// observation.
 fn publish_pane_meta_cache(
     refresh_id: u64,
     data: Option<std::sync::Arc<HashMap<String, PaneMetadata>>>,
+    taken_at: Instant,
 ) -> bool {
     let Ok(mut cache) = PANE_META_CACHE.write() else {
         return false;
@@ -1726,7 +1733,7 @@ fn publish_pane_meta_cache(
         return false;
     }
     cache.data = data;
-    cache.time = Some(Instant::now());
+    cache.time = Some(taken_at);
     cache.refresh_id = refresh_id;
     true
 }
@@ -1734,8 +1741,9 @@ fn publish_pane_meta_cache(
 pub(crate) fn refresh_pane_meta_cache(
 ) -> anyhow::Result<std::sync::Arc<HashMap<String, PaneMetadata>>> {
     let refresh_id = next_refresh_id(&PANE_META_REFRESH_ID);
+    let taken_at = Instant::now();
     let result = batch_pane_metadata().map(std::sync::Arc::new);
-    if publish_pane_meta_cache(refresh_id, result.as_ref().ok().cloned()) {
+    if publish_pane_meta_cache(refresh_id, result.as_ref().ok().cloned(), taken_at) {
         return result;
     }
     PANE_META_CACHE
@@ -2525,6 +2533,7 @@ mod tests {
                 "new-pane".to_string(),
                 dead_pane_meta(true),
             )]))),
+            Instant::now(),
         ));
         assert!(!publish_pane_meta_cache(
             pane_older,
@@ -2532,6 +2541,7 @@ mod tests {
                 "old-pane".to_string(),
                 dead_pane_meta(true),
             )]))),
+            Instant::now(),
         ));
         assert_eq!(pane_dead_from_cache("new-pane"), Some(true));
         assert_eq!(pane_dead_from_cache("old-pane"), Some(false));

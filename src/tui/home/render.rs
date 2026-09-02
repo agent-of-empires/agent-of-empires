@@ -2376,6 +2376,14 @@ impl HomeView {
     /// fleet analogue of `passive_resize_step`'s one-frame-toast rule), and a
     /// geometry the worker declined is not retried until the wanted fleet
     /// geometry changes or [`PASSIVE_DECLINE_RETRY`] elapses.
+    ///
+    /// Single-TUI only: with more than one aoe TUI alive, each would treat
+    /// the other's fleet resizes as external (the observed-size invalidation
+    /// below) and re-assert its own geometry, oscillating every open pane at
+    /// snapshot cadence. The presence count already surfaced as the
+    /// "N watching" indicator gates both the fleet pass and the invalidation;
+    /// the selected-session sync stays on, matching the pre-fleet behavior
+    /// those TUIs had.
     pub(super) fn reconcile_passive_fleet(
         &mut self,
         inner: Rect,
@@ -2383,6 +2391,9 @@ impl HomeView {
         exclude: Option<&str>,
     ) {
         self.adopt_passive_resize_completions();
+        if self.active_tui_count > 1 {
+            return;
+        }
         self.invalidate_externally_resized_panes();
         if inner.width == 0 || inner.height == 0 {
             return;
@@ -2414,6 +2425,12 @@ impl HomeView {
             }
             wants.push((id.clone(), output.width, output.height));
         }
+        // Order-independent epoch key: `self.instances` is rebuilt from the
+        // `storages` HashMap on reload, so an order-only shuffle of an
+        // identical fleet must not read as a new geometry (which would clear
+        // the declines early). Sorting also makes the firing order below
+        // deterministic.
+        wants.sort_unstable();
         if self.passive_fleet_armed.as_ref() != Some(&wants) {
             // First sighting of this fleet geometry: arm it, let declined
             // sessions retry once under the new epoch, and nudge the event

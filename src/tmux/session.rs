@@ -1840,7 +1840,14 @@ impl Session {
         // if-shell -F evaluates the owner/attachment guard and inserts this
         // branch in the same tmux command queue. No other client can replace
         // the guarded state between the check and resize-window.
-        let target = Self::tmux_command_string_literal(&self.name);
+        //
+        // Target the FIRST window (`:^`) explicitly: a bare session target
+        // resolves to the session's current window, so on a session where the
+        // user created more windows the resize would land on the wrong one
+        // while the chrome probe above and the preview capture both use the
+        // first. The observed-size reconcile also reads the first window, so
+        // resizing any other would loop forever chasing a mismatch.
+        let target = Self::tmux_command_string_literal(&format!("{}:^", self.name));
         let resize = format!(
             "resize-window -t {target} -x {cols} -y {window_rows} ; display-message -p aoe-resize-applied"
         );
@@ -3182,6 +3189,33 @@ mod tests {
             .is_none());
         assert_eq!(pane_size(), (91, 31));
         session.release_size_owner("active");
+
+        // The resize must land on the FIRST window even when the session's
+        // current window is a later one: preview capture, the chrome probe,
+        // and the observed-size reconcile all read `:^`, so a bare-session
+        // target (which tmux resolves to the current window) would resize the
+        // wrong window and the reconcile would loop chasing a mismatch.
+        let out = crate::tmux::tmux_command()
+            .args(["new-window", "-t", guard.name(), "sleep 30"])
+            .output()
+            .expect("tmux new-window");
+        assert!(out.status.success());
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        assert!(session
+            .resize_window_if_detached_without_active_owner_after_exists_with_deadline(
+                93, 33, &deadline,
+            )
+            .is_some());
+        assert_eq!(
+            pane_size(),
+            (93, 33),
+            "the first window must be the resize target"
+        );
+        let out = crate::tmux::tmux_command()
+            .args(["kill-window", "-t", &format!("{}:$", guard.name())])
+            .output()
+            .expect("tmux kill-window");
+        assert!(out.status.success());
 
         // A partial owner write is unknown to passive readers, but a later
         // claimant must repair it rather than leaving the lock wedged forever.

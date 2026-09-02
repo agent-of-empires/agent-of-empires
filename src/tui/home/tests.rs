@@ -17423,6 +17423,46 @@ mod live_send_mode {
 
     #[test]
     #[serial]
+    fn fleet_reconcile_is_single_tui_only() {
+        // With two aoe TUIs alive, each would treat the other's fleet
+        // resizes as external (observed-size invalidation) and re-assert its
+        // own geometry, oscillating every open pane. The presence count gates
+        // the whole fleet pass; only the selected-session sync stays on.
+        let mut env = create_test_env_with_sessions(2);
+        let ids: Vec<String> = env
+            .view
+            .flat_items
+            .iter()
+            .filter_map(|item| match item {
+                crate::session::Item::Session { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        let selected = ids[0].clone();
+        env.view.selected_session = Some(selected.clone());
+        let inner = ratatui::layout::Rect::new(0, 0, 141, 45);
+
+        env.view.active_tui_count = 2;
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        assert!(env.view.passive_fleet_armed.is_none());
+        assert!(env.view.passive_pane_queued.is_empty());
+
+        // Back down to one TUI: the fleet resumes on the usual two-sighting
+        // debounce.
+        env.view.active_tui_count = 1;
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        assert!(env.view.passive_fleet_armed.is_some());
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        assert!(env.view.passive_pane_queued.contains_key(&ids[1]));
+    }
+
+    #[test]
+    #[serial]
     fn refresh_terminal_cache_overwrites_on_empty_capture() {
         // Counterpart to `refresh_preserves_cache_when_live_capture_fails`:
         // only the agent path carries the live-send kill switch. The terminal
