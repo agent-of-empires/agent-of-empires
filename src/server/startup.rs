@@ -905,7 +905,6 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             state.shutdown.clone(),
             rot_base_url,
             local_port,
-            token_grace,
         ));
     } else if test_token_lifetime_override().is_some() && auth_token.is_some() {
         // Debug-build test path: live Playwright specs set
@@ -1039,19 +1038,19 @@ pub(super) fn maybe_open_browser(url: &str) {
 /// subscriptions bound only to its hash.
 ///
 /// Runs here rather than in `TokenManager::spawn_rotation_task` so rotation can
-/// also refresh `serve.url` and prune the push store. `grace` must be the same
-/// duration the manager validates against; otherwise the previous token's state
-/// and its subscriptions outlive the window it is accepted in.
+/// also refresh `serve.url` and prune the push store. Both deadlines come from
+/// the manager, so the previous token's state and its subscriptions cannot
+/// outlive the window `validate` accepts it in.
 async fn remote_rotation_loop(
     token_manager: Arc<TokenManager>,
     push: Option<Arc<PushState>>,
     shutdown: CancellationToken,
     base_url: Option<String>,
     local_port: u16,
-    grace: Duration,
 ) {
     loop {
         let lifetime = token_manager.lifetime_secs().await;
+        let grace = token_manager.grace().await;
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(lifetime)) => {}
             _ = shutdown.cancelled() => break,
@@ -1115,7 +1114,9 @@ async fn remote_rotation_loop(
             if valid_hashes.is_empty() {
                 valid_hashes.push([0u8; 32]);
             }
-            let _ = push.store.retain_owners(&valid_hashes).await;
+            if let Err(e) = push.store.retain_owners(&valid_hashes).await {
+                tracing::warn!(target: "http.middleware", error = %e, "push: retain_owners failed");
+            }
         }
     }
 }
@@ -1196,7 +1197,6 @@ mod tests {
             shutdown.clone(),
             None,
             8080,
-            grace,
         ));
 
         // Mid-grace: the rotated-out token is still accepted, and its
