@@ -1430,10 +1430,8 @@ impl SessionService {
         let guard = self.prompt_submission(id).await;
         if let Err(e) = self.admits_turn(caller, id).await {
             drop(guard);
-            // Only for a vanished session: the registry entry is the live
-            // session's mutual exclusion, and dropping it while another
-            // caller holds the guard would hand the next waiter a different
-            // mutex.
+            // Only for a vanished session: forgetting a live one's entry
+            // would hand the next waiter a different mutex.
             if matches!(e, TurnAdmissionError::SessionNotFound) {
                 self.forget_prompt_lock(id).await;
             }
