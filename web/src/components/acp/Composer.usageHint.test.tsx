@@ -87,7 +87,7 @@ describe("composer usage indicator tooltip", () => {
     fireEvent.mouseEnter(indicator.parentElement!);
 
     const tip = screen.getByRole("tooltip").textContent ?? "";
-    expect(tip).toContain("120,000 of 200,000 tokens used (60%)");
+    expect(tip).toContain(`${(120_000).toLocaleString()} of ${(200_000).toLocaleString()} tokens used (60%)`);
     expect(tip).toContain("cumulative session spend since the last /clear or /compact");
   });
 
@@ -97,7 +97,7 @@ describe("composer usage indicator tooltip", () => {
     fireEvent.mouseEnter(indicator.parentElement!);
 
     const tip = screen.getByRole("tooltip").textContent ?? "";
-    expect(tip).toContain("50,000 of 200,000 tokens used (25%)");
+    expect(tip).toContain(`${(50_000).toLocaleString()} of ${(200_000).toLocaleString()} tokens used (25%)`);
     expect(tip).not.toContain("cumulative session spend");
   });
 });
