@@ -5,6 +5,7 @@ use crate::file_watch::FileWatchService;
 use crate::server::push::{PushState, STATUS_CHANNEL_CAPACITY};
 use crate::server::rate_limit::RateLimiter;
 use anyhow::Context;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,6 +55,41 @@ pub(super) fn remote_serve_url_contents(
     let remote_url = with_token(remote_base_url);
     let loopback_url = with_token(&format!("http://127.0.0.1:{local_port}"));
     format!("{remote_url}\nlocalhost\t{loopback_url}\n")
+}
+
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// Post-signal shutdown: cancel the shared token, arm the force-exit
+/// deadline, then reap plugin workers.
+///
+/// The deadline is armed before `reap` is awaited so a plugin worker that
+/// never terminates cannot keep the daemon alive indefinitely.
+///
+/// A forced exit skips the post-`axum::serve` cleanup (acp detach, tunnel
+/// SIGTERM of cloudflared, removal of serve.passphrase). The PID file is
+/// swept by `daemon_pid`'s stale-PID check on the next start, but a leftover
+/// cloudflared subprocess and residual passphrase file may survive it. The
+/// common path returns from `axum::serve` normally and runs the full cleanup.
+async fn run_shutdown_sequence<R, F>(
+    shutdown: &CancellationToken,
+    grace: Duration,
+    reap: R,
+    force_exit: F,
+) where
+    R: Future<Output = ()>,
+    F: FnOnce() + Send + 'static,
+{
+    shutdown.cancel();
+    tokio::spawn(async move {
+        tokio::time::sleep(grace).await;
+        tracing::warn!(
+            target: "shutdown",
+            grace_secs = grace.as_secs(),
+            "graceful shutdown exceeded grace window, forcing exit"
+        );
+        force_exit();
+    });
+    reap.await;
 }
 
 /// Raise the soft `RLIMIT_NOFILE` so the server can sustain many WS
@@ -924,9 +960,10 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     //      terminal) wake from their `select!` and close cleanly,
     //      letting `axum::serve` return promptly instead of blocking
     //      on the open WebSockets the browser hasn't disconnected.
-    //   2. Spawns a 5s deadline as the safety net: if any handler
-    //      somehow ignores the cancel, the process force-exits so
-    //      `Ctrl-C` and `aoe serve --stop` never hang. See #1198.
+    //   2. Arms a 5s force-exit deadline, then reaps plugin workers:
+    //      if any handler or worker ignores the cancel, the process
+    //      force-exits so `Ctrl-C` and `aoe serve --stop` never hang.
+    //      See #1198.
     //
     // Note: this future is awaited by `with_graceful_shutdown`, which
     // signals axum to stop accepting new connections once the future
@@ -935,7 +972,6 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // of just the post-signal drain, which is wrong (the server would
     // exit after 5s of normal uptime). The deadline lives inside the
     // signal handler so the clock only starts after the signal fires.
-    const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
     let shutdown_state = state.clone();
     let shutdown_signal = async move {
         #[cfg(unix)]
@@ -960,28 +996,18 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             let _ = tokio::signal::ctrl_c().await;
             tracing::info!(target: "serve.shutdown", "received ctrl-c, shutting down");
         }
-        shutdown_state.shutdown.cancel();
-        // Reap plugin workers before the force-exit deadline so no worker tree
-        // is left behind when the daemon stops.
-        if let Some(host) = shutdown_state.plugin_host.clone() {
-            host.shutdown().await;
-        }
-        tokio::spawn(async {
-            tokio::time::sleep(SHUTDOWN_GRACE).await;
-            tracing::warn!(
-                target: "shutdown",
-                grace_secs = SHUTDOWN_GRACE.as_secs(),
-                "graceful shutdown exceeded grace window, forcing exit"
-            );
-            // Force-exit skips the post-`axum::serve` cleanup block below
-            // (acp detach, tunnel SIGTERM of cloudflared, removal of
-            // serve.passphrase). The PID file is swept by `daemon_pid`'s
-            // stale-PID check on the next start, but a leftover cloudflared
-            // subprocess and residual passphrase file may survive a forced
-            // exit. The common path (handlers honor cancel) returns from
-            // `axum::serve` normally and runs the full cleanup.
-            std::process::exit(0);
-        });
+        let plugin_host = shutdown_state.plugin_host.clone();
+        run_shutdown_sequence(
+            &shutdown_state.shutdown,
+            SHUTDOWN_GRACE,
+            async move {
+                if let Some(host) = plugin_host {
+                    host.shutdown().await;
+                }
+            },
+            || std::process::exit(0),
+        )
+        .await;
     };
 
     axum::serve(
@@ -1215,5 +1241,43 @@ mod tests {
         assert!(push.store.snapshot().await.is_empty());
 
         shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn shutdown_sequence_force_exits_when_plugin_reap_never_finishes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const GRACE: Duration = Duration::from_millis(50);
+
+        // A reap that completes lets the sequence return without forcing an exit.
+        let quick_shutdown = CancellationToken::new();
+        let quick_forced = Arc::new(AtomicBool::new(false));
+        let flag = quick_forced.clone();
+        run_shutdown_sequence(&quick_shutdown, GRACE, std::future::ready(()), move || {
+            flag.store(true, Ordering::SeqCst)
+        })
+        .await;
+        assert!(quick_shutdown.is_cancelled());
+        assert!(!quick_forced.load(Ordering::SeqCst));
+
+        // A reap that never finishes must still arm the deadline and force the exit.
+        let shutdown = CancellationToken::new();
+        let forced = Arc::new(AtomicBool::new(false));
+        let flag = forced.clone();
+        let sequence = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move {
+                run_shutdown_sequence(&shutdown, GRACE, std::future::pending::<()>(), move || {
+                    flag.store(true, Ordering::SeqCst)
+                })
+                .await;
+            }
+        });
+
+        shutdown.cancelled().await;
+        tokio::time::sleep(GRACE * 4).await;
+        assert!(forced.load(Ordering::SeqCst));
+        assert!(!sequence.is_finished());
+        sequence.abort();
     }
 }
