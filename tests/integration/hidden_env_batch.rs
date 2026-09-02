@@ -6,18 +6,26 @@
 
 use agent_of_empires::tmux::test_support as env;
 use serial_test::serial;
-use std::process::Command;
+use std::{process::Command, time::Duration};
 
 struct Cleanup(Vec<String>);
 
 impl Drop for Cleanup {
     fn drop(&mut self) {
+        let socket = crate::common::tmux_socket();
         for name in &self.0 {
             let _ = Command::new("tmux")
                 .arg("-S")
-                .arg(crate::common::tmux_socket())
+                .arg(&socket)
                 .args(["kill-session", "-t", name])
                 .output();
+        }
+        // tmux returns before removing its socket after the final session.
+        for _ in 0..50 {
+            if !socket.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 }
