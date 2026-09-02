@@ -423,26 +423,65 @@ pub(crate) fn claude_poll_fn(
 /// is still being appended. The host scan reads through links for the same
 /// reason (#3454), and the two have to agree for
 /// `claude_host_transcript_confirmed_absent` to mean anything.
+///
+/// `docker exec` inherits the container's environment, not the pane's, so
+/// `$CLAUDE_CONFIG_DIR` here is the value AoE injected at `docker run`. A
+/// wrapper that exports its own before `exec claude` writes where this never
+/// looked, and the session captures nothing (#3638). A declared
+/// `agent_config_dir` cannot stand in for it: the user mounts that directory
+/// themselves and AoE never sees its container path. So each distinct
+/// `CLAUDE_CONFIG_DIR` a live process declares is tried first, the first
+/// directory holding fresh transcripts winning, and the injected value is the
+/// fallback. The `/proc` walk costs a pipeline per process, which is bounded
+/// by a session container holding one agent and its children.
 fn claude_container_list_snippet(dir_name: &str) -> String {
     format!(
         r#"
-CLAUDE_HOME="${{CLAUDE_CONFIG_DIR:-$HOME/.claude}}"
-DIR="$CLAUDE_HOME/projects/{dir_name}"
-[ -d "$DIR" ] || exit 0
-for f in $(ls -tL "$DIR"/*.jsonl 2>/dev/null); do
-  [ -f "$f" ] || continue
-  [ -n "$(find -L "$f" -mmin -5 2>/dev/null)" ] || continue
-  basename "$f" .jsonl
+# A process can exit between the glob and the read; its redirect error is
+# noise, and nothing here reports through stderr.
+exec 2>/dev/null
+list_fresh() {{
+  DIR="$1/projects/{dir_name}"
+  [ -d "$DIR" ] || return 1
+  missed=1
+  # Split the listing on newlines alone. The dir now comes from whatever a
+  # container process declares, so it can hold a space, and the default IFS
+  # would shred the path into arguments no `[ -f ]` matches.
+  OIFS=$IFS
+  IFS='
+'
+  for f in $(ls -tL "$DIR"/*.jsonl 2>/dev/null); do
+    [ -f "$f" ] || continue
+    [ -n "$(find -L "$f" -mmin -5 2>/dev/null)" ] || continue
+    basename "$f" .jsonl
+    missed=0
+  done
+  IFS=$OIFS
+  return $missed
+}}
+FALLBACK="${{CLAUDE_CONFIG_DIR:-$HOME/.claude}}"
+SEEN=""
+for e in /proc/[0-9]*/environ; do
+  [ -r "$e" ] || continue
+  d=$(tr '\0' '\n' < "$e" | sed -n 's/^CLAUDE_CONFIG_DIR=//p' | head -n 1)
+  [ -n "$d" ] || continue
+  [ "$d" = "$FALLBACK" ] && continue
+  case "$SEEN" in *"|$d|"*) continue ;; esac
+  SEEN="$SEEN|$d|"
+  list_fresh "$d" && exit 0
 done
+list_fresh "$FALLBACK"
+exit 0
 "#
     )
 }
 
 /// Capture Claude Code session ID inside a Docker container.
 ///
-/// Lists every fresh (≤ 5 min mtime) UUID-named jsonl in
-/// `$CLAUDE_CONFIG_DIR/projects/<encoded-cwd>/` newest-first via
-/// `docker exec`, wrapped in [`run_with_timeout`] (5 s) so a hung exec
+/// Lists every fresh (≤ 5 min mtime) UUID-named jsonl in the Claude config
+/// dir's `projects/<encoded-cwd>/` newest-first via `docker exec` (see
+/// [`claude_container_list_snippet`] for which dir that is), wrapped in
+/// [`run_with_timeout`] (5 s) so a hung exec
 /// cannot block the poller thread, then delegates per-pane attribution to
 /// [`select_claude_session_in_container`].
 pub(crate) fn capture_claude_session_id_in_container(
@@ -697,10 +736,12 @@ fn compose_exclusion_in(
 }
 
 /// Extend [`compose_exclusion`] with conversations same-project peers parked
-/// for `current_tool` during an engine swap. When
+/// for `current_capture_agent` during an engine swap. When
 /// `include_inactive_same_tool` is true, also include the sids of stopped,
-/// archived, or pane-less peers using `current_tool`. Persisted peers are read
-/// from `sessions.json` via `Storage` for the caller's effective profile.
+/// archived, or pane-less peers whose own built-in agent resolves to
+/// `current_capture_agent`, so a wrapper and the agent it wraps count as one
+/// store. Persisted peers are read from `sessions.json` via `Storage` for the
+/// caller's effective profile.
 ///
 /// Used by `Instance::try_retroactive_capture` and snapshotted when its poller
 /// starts. Parked conversations are no longer published in the peer's tmux
@@ -723,7 +764,7 @@ fn compose_exclusion_in(
 pub(crate) fn compose_exclusion_with_persisted_peers(
     current_instance_id: &str,
     current_project_path: &str,
-    current_tool: &str,
+    current_capture_agent: &str,
     include_inactive_same_tool: bool,
     profile: &str,
     retroactive_capture_excludes: &HashSet<String>,
@@ -761,15 +802,29 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
         // intends to resume it on a swap back. It is excluded regardless of the
         // peer's current tool or liveness: its pane is running another engine,
         // so the live tmux ownership scan cannot discover this id.
-        if let Some(parked) = inst
-            .prior_tool_session_ids
-            .get(current_tool)
-            .and_then(|p| p.agent_session_id.as_deref())
-            .filter(|s| !s.is_empty())
-        {
-            set.insert(parked.to_string());
+        //
+        // `swap_tool` keys this map on the raw outgoing tool, so an exact
+        // lookup makes a conversation parked under `claude-personal` invisible
+        // to `claude` and to every other alias of it, and the MRU scan then
+        // adopts what the peer means to resume. Match on the built-in each key
+        // resolves to instead, which only ever widens the set (#3638).
+        for (parked_tool, parked) in &inst.prior_tool_session_ids {
+            let parked_agent =
+                crate::session::instance::resolved_agent_for(&inst.source_profile, parked_tool, "")
+                    .map_or(parked_tool.as_str(), |a| a.name);
+            if parked_agent != current_capture_agent {
+                continue;
+            }
+            if let Some(sid) = parked.agent_session_id.as_deref().filter(|s| !s.is_empty()) {
+                set.insert(sid.to_string());
+            }
         }
-        if !include_inactive_same_tool || inst.tool != current_tool {
+        // Matched on the built-in each side resolves to, not on the raw
+        // tool: a wrapper and the agent it wraps share one store, so a raw
+        // compare leaves an inactive base-agent peer's conversation open to
+        // the wrapper's mtime scan (#3638).
+        let peer_capture_agent = inst.capture_agent_name().unwrap_or(inst.tool.as_str());
+        if !include_inactive_same_tool || peer_capture_agent != current_capture_agent {
             continue;
         }
         let should_exclude = matches!(inst.status, crate::session::Status::Stopped)
@@ -2773,12 +2828,21 @@ pub(crate) fn kimi_store_is_shared(
             if inst.id == current_instance_id || inst.is_sandboxed() {
                 continue;
             }
-            let owns_kimi = inst.tool == "kimi"
-                || inst
-                    .prior_tool_session_ids
-                    .get("kimi")
-                    .and_then(|prior| prior.agent_session_id.as_deref())
-                    .is_some_and(|sid| !sid.is_empty());
+            // Matched on the built-in the peer resolves to, like the peer
+            // filter in `compose_exclusion_with_persisted_peers`: a wrapper
+            // captures into the same store, so reading `tool` raw reports a
+            // sole owner and licenses the MRU retarget this guard exists to
+            // refuse (#3516).
+            let owns_kimi = inst.capture_agent_name().unwrap_or(inst.tool.as_str()) == "kimi"
+                || inst.prior_tool_session_ids.iter().any(|(tool, prior)| {
+                    crate::session::instance::resolved_agent_for(&inst.source_profile, tool, "")
+                        .map_or(tool.as_str(), |a| a.name)
+                        == "kimi"
+                        && prior
+                            .agent_session_id
+                            .as_deref()
+                            .is_some_and(|sid| !sid.is_empty())
+                });
             if !owns_kimi {
                 continue;
             }
@@ -3722,6 +3786,92 @@ mod tests {
             None,
         );
         assert!(result.is_err());
+    }
+
+    /// A wrapper binary exports its own `CLAUDE_CONFIG_DIR` inside the pane,
+    /// after AoE has already decided what to inject at `docker run`, so the
+    /// scan used to read a directory the agent never writes and the session
+    /// never captured an id (#3638). The live process environment is the only
+    /// side of that boundary that answers.
+    ///
+    /// Linux-only: the discovery reads `/proc`, which is what the container
+    /// always is. Skipped elsewhere rather than asserted away.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn container_snippet_prefers_a_running_process_config_dir() {
+        let project_path = "/tmp/aoe-wrapper-scan";
+        let injected = tempfile::tempdir().unwrap();
+        let wrapper_root = tempfile::tempdir().unwrap();
+        // A space in the declared dir is the realistic shape ("Claude
+        // Personal"), and the listing has to survive word splitting to find
+        // anything under it.
+        let wrapper = wrapper_root.path().join("Claude Personal");
+        let wrapper_sid = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+        let injected_sid = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+        for (home, sid) in [
+            (injected.path().to_path_buf(), injected_sid),
+            (wrapper.clone(), wrapper_sid),
+        ] {
+            let dir = home
+                .join("projects")
+                .join(encode_claude_project_path(project_path));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(format!("{sid}.jsonl")), "{}\n").unwrap();
+        }
+        let snippet = claude_container_list_snippet(&encode_claude_project_path(project_path));
+
+        // Nothing running declares another directory: the injected value.
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&snippet)
+            .env("CLAUDE_CONFIG_DIR", injected.path())
+            .output()
+            .expect("snippet invocation failed");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.lines().any(|l| l.trim() == injected_sid),
+            "expected the injected dir's transcript, got {stdout:?}"
+        );
+
+        // A live process declaring its own outranks it.
+        let mut pane = std::process::Command::new("sleep")
+            .arg("30")
+            .env("CLAUDE_CONFIG_DIR", &wrapper)
+            .spawn()
+            .expect("spawn stand-in for the wrapped agent");
+        // `spawn` returning does not guarantee the child has reached `execve`,
+        // and until it does its `environ` is still this process's. Wait for the
+        // value the scan is meant to find rather than race it.
+        let environ = format!("/proc/{}/environ", pane.id());
+        let declared = format!("CLAUDE_CONFIG_DIR={}", wrapper.display());
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !std::fs::read(&environ)
+            .map(|raw| {
+                raw.split(|b| *b == 0)
+                    .any(|entry| entry == declared.as_bytes())
+            })
+            .unwrap_or(false)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stand-in never published its own CLAUDE_CONFIG_DIR"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&snippet)
+            .env("CLAUDE_CONFIG_DIR", injected.path())
+            .output()
+            .expect("snippet invocation failed");
+        let _ = pane.kill();
+        let _ = pane.wait();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            stdout.lines().map(str::trim).collect::<Vec<_>>(),
+            vec![wrapper_sid],
+            "the wrapper's own directory must win outright"
+        );
     }
 
     /// Runs the production snippet under `sh` against a real directory, so the

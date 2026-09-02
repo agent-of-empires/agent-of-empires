@@ -78,7 +78,7 @@ impl Instance {
     /// and `Cleared` override); excluded sids skipped (cascade re-poison
     /// guard).
     pub(super) fn reconcile_sidecar_into_disk(&mut self) {
-        if self.tool != "claude" {
+        if self.capture_agent_name() != Some("claude") {
             return;
         }
         if !matches!(self.resume_intent, ResumeIntent::Default) {

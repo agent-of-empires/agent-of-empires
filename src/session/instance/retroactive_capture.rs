@@ -8,12 +8,16 @@ impl Instance {
     /// while running another tool, and inactive peers that still own records
     /// in a shared host store.
     pub(super) fn retroactive_capture_exclusion_set(&self) -> HashSet<String> {
+        // Peers, parked conversations and store sharing all follow the
+        // built-in this session resolves to, never its own name: an alias and
+        // its base agent write one store.
+        let capture_agent = self.capture_agent_name().unwrap_or(&self.tool);
         crate::session::capture::compose_exclusion_with_persisted_peers(
             &self.id,
             &self.project_path,
-            &self.tool,
-            self.tool == "claude"
-                || (matches!(self.tool.as_str(), "codex" | "kimi") && !self.is_sandboxed()),
+            capture_agent,
+            capture_agent == "claude"
+                || (matches!(capture_agent, "codex" | "kimi") && !self.is_sandboxed()),
             &self.effective_profile(),
             &self.retroactive_capture_excludes,
         )
@@ -33,8 +37,8 @@ impl Instance {
     }
 
     pub(crate) fn try_retroactive_capture(&self) -> Option<String> {
-        let result: Option<String> = match self.tool.as_str() {
-            "claude" => {
+        let result: Option<String> = match self.capture_agent_name() {
+            Some("claude") => {
                 // Claude additionally extends the common live and parked-id
                 // exclusion with stopped, archived, or pane-less peer sids so
                 // the mtime fallback skips peers whose jsonl outlived their
@@ -59,7 +63,7 @@ impl Instance {
                     .ok()
                 }
             }
-            "opencode" => {
+            Some("opencode") => {
                 let exclusion = self.retroactive_capture_exclusion_set();
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
@@ -74,7 +78,7 @@ impl Instance {
                     try_capture_opencode_session_id(&self.project_path, &exclusion, None).ok()
                 }
             }
-            "vibe" => {
+            Some("vibe") => {
                 let exclusion = self.retroactive_capture_exclusion_set();
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
@@ -88,13 +92,13 @@ impl Instance {
                     capture_vibe_session_id(&self.project_path, &exclusion).ok()
                 }
             }
-            "pi" => {
+            Some("pi") => {
                 // Never: identity comes from the pin or the floored poller,
                 // and this path has no floor at all. Sandboxed panes share one
                 // `~/.pi/sandbox`, so they are no more attributable.
                 None
             }
-            "omp" => {
+            Some("omp") => {
                 let options = self.omp_capture_options()?;
                 let exclusion = self.retroactive_capture_exclusion_set();
                 let tmux_session_name = self
@@ -115,7 +119,7 @@ impl Instance {
                     capture_omp_session_id(&metadata, &exclusion, &tmux_session_name).ok()
                 }
             }
-            "codex" => {
+            Some("codex") => {
                 if self.is_sandboxed() {
                     // Sandboxed Codex sessions have instance-private homes, so
                     // their transcript stores cannot contain a sibling's
@@ -137,7 +141,7 @@ impl Instance {
                     capture_codex_session_id(&self.project_path, &exclusion).ok()
                 }
             }
-            "gemini" => {
+            Some("gemini") => {
                 let exclusion = self.retroactive_capture_exclusion_set();
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
@@ -151,7 +155,7 @@ impl Instance {
                     capture_gemini_session_id(&self.project_path, &exclusion).ok()
                 }
             }
-            "hermes" => {
+            Some("hermes") => {
                 let exclusion = self.retroactive_capture_exclusion_set();
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
@@ -165,7 +169,7 @@ impl Instance {
                     capture_hermes_session_id(&self.project_path, &exclusion).ok()
                 }
             }
-            "copilot" => {
+            Some("copilot") => {
                 // Copilot stores sessions in a SQLite db. Host capture reads it
                 // directly; sandbox resume is a follow-up (the container's db is
                 // not read over `docker exec`), so a sandboxed Copilot session
@@ -177,7 +181,7 @@ impl Instance {
                     capture_copilot_session_id(&self.project_path, &exclusion).ok()
                 }
             }
-            "kimi" => {
+            Some("kimi") => {
                 // Kimi records sessions in `session_index.jsonl` under the
                 // resolved `KIMI_CODE_HOME`, keyed by workDir. Host capture
                 // reads it through the launched pane's environment; sandbox
@@ -209,7 +213,7 @@ impl Instance {
                     .ok()
                 }
             }
-            "prime-agent" => {
+            Some("prime-agent") => {
                 // Prime Agent writes one JSONL per session under
                 // `~/.prime/agent/sessions`, header line keyed by cwd. Host
                 // capture reads it directly; sandbox resume is a follow-up
@@ -279,7 +283,10 @@ impl Instance {
     /// count as one, matching the directory match in `filter_agent_sessions`.
     pub(super) fn contended_capture_key(&self) -> (String, String) {
         (
-            self.tool.clone(),
+            // Resolved: an alias and its built-in scan one store, so keying
+            // this raw leaves a mixed pair unmarked and lets the first
+            // self-heal claim the other pane's conversation.
+            self.capture_agent_name().unwrap_or(&self.tool).to_string(),
             crate::session::capture::canonicalize_or_raw(&self.project_path)
                 .to_string_lossy()
                 .into_owned(),
@@ -347,6 +354,46 @@ mod tests {
     }
 
     use super::*;
+
+    /// An alias and its built-in scan one store, so a mixed pair sharing a
+    /// cwd is as unattributable as two of the same name. Keying contention on
+    /// the raw tool left it unmarked and let the first self-heal claim the
+    /// other pane's conversation (#3638).
+    #[test]
+    #[serial_test::serial]
+    fn contended_capture_cwds_spans_an_alias_and_its_base() {
+        const PROFILE: &str = "contended-alias-test";
+        let _registry = crate::session::instance::test_helpers::install_aliases(
+            PROFILE,
+            &[("codex-personal", "codex")],
+        );
+        let cwd = std::env::current_dir().unwrap();
+        let p = cwd.to_str().unwrap();
+        let canon = crate::session::capture::canonicalize_or_raw(p)
+            .to_string_lossy()
+            .into_owned();
+        let mk = |title: &str, tool: &str| {
+            let mut i = Instance::new(title, p);
+            i.source_profile = PROFILE.to_string();
+            i.tool = tool.to_string();
+            i.command = tool.to_string();
+            i
+        };
+        let instances = vec![mk("base", "codex"), mk("wrapper", "codex-personal")];
+
+        let guard = crate::tmux::SessionCacheGuard::capture();
+        guard.force_present(&[]);
+        let name_of = |i: &Instance| crate::tmux::Session::resolve_name(&i.id, &i.title);
+        let live: Vec<String> = instances.iter().map(name_of).collect();
+        let live_refs: Vec<&str> = live.iter().map(String::as_str).collect();
+        guard.force_present(&live_refs);
+
+        let contended = Instance::contended_capture_cwds(&instances);
+        assert!(
+            contended.contains(&("codex".to_string(), canon)),
+            "a codex session and a codex wrapper in one cwd must both abstain"
+        );
+    }
 
     #[test]
     #[serial_test::serial]
