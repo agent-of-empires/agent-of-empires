@@ -201,7 +201,7 @@ impl Instance {
             "agent launch command prepared"
         );
 
-        if self.tool == "claude" {
+        if crate::agents::runs_claude_code(&self.tool) {
             let _ = crate::hooks::unlink_session_id_via_guard(&self.id);
         }
 

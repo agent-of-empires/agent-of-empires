@@ -507,7 +507,7 @@ impl SessionResponse {
             .iter()
             .map(|s| s.to_string())
             .collect(),
-            claude_fullscreen: claude_fullscreen && inst.tool == "claude",
+            claude_fullscreen: claude_fullscreen && crate::agents::runs_claude_code(&inst.tool),
             // A session converted by `attach_project` (#3103) has a real
             // `workspace_info`, so this lists both repos with no special case:
             // the structured view's repo-relative path rendering, the diff-repo

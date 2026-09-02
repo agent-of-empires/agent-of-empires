@@ -1459,8 +1459,9 @@ pub fn trust_host_project(
     match agent_name {
         // Without a config dir the trust record lives at `~/.claude.json`,
         // beside `~/.claude/` rather than inside it; an override replaces the
-        // whole directory, so it takes the file with it.
-        "claude" => trust_claude_project(
+        // whole directory, so it takes the file with it. openzoo execs the
+        // same claude binary, which reads the same record.
+        "claude" | "openzoo" => trust_claude_project(
             &declared()
                 .or_else(|| from_env("CLAUDE_CONFIG_DIR"))
                 .map(|dir| dir.join(".claude.json"))

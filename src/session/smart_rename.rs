@@ -796,9 +796,10 @@ fn capture_terminal_context(tmux: &crate::tmux::Session, tool: &str) -> Option<S
 /// substantive, so it can never make the capture worse. The `INSTRUCTION` prose
 /// is the backstop for banners this misses or for other agents.
 fn strip_agent_banner(text: &str, tool: &str) -> String {
-    // Only Claude Code has a verified banner shape to key on. Other agents rely
-    // on the instruction prose; add a case here per agent as needed.
-    if !tool.eq_ignore_ascii_case("claude") {
+    // Only Claude Code (and wrappers that exec it, see `runs_claude_code`) has
+    // a verified banner shape to key on. Other agents rely on the instruction
+    // prose; add a case here per agent as needed.
+    if !crate::agents::runs_claude_code(&tool.to_ascii_lowercase()) {
         return text.to_string();
     }
     // Gate loosely: the startup box names the tool ("Claude Code v2.1.216" in

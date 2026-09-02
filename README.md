@@ -118,7 +118,7 @@ Nothing. Sessions are tmux sessions running in the background. Open and close `a
 
 ### Which AI tools are supported?
 
-Run `aoe agents` for the current list and availability on your machine.
+Run `aoe agents` for the current list and availability on your machine. If you want Claude Code without an API key or account, the [openzoo](https://www.agent-of-empires.com/guides/openzoo/) agent runs the same CLI paid per call over x402.
 
 ### Can I use AoE over SSH?
 

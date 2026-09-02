@@ -1,6 +1,6 @@
 # Session Resume (Claude)
 
-Claude Code sessions launched through AoE resume their prior conversation automatically after a reboot, an `aoe` upgrade, or a `kill-server`. No need to hunt through `/resume` to find the right session.
+Claude Code sessions launched through AoE resume their prior conversation automatically after a reboot, an `aoe` upgrade, or a `kill-server`. No need to hunt through `/resume` to find the right session. This covers the `claude` agent and [openzoo](./openzoo.md), which runs the same Claude Code CLI.
 
 This is automatic and on by default. Runtime conversation changes (via `/clear`, `--fork-session`, `--continue`, or starting fresh in the pane) are picked up too, in both host and sandboxed (Docker) modes.
 

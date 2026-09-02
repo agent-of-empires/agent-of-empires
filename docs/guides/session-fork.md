@@ -47,7 +47,7 @@ Forking only reads the parent's conversation. The parent session and its transcr
 
 Forking needs an agent that can branch a conversation:
 
-- **Terminal sessions**: claude, codex, and opencode.
+- **Terminal sessions**: claude, [openzoo](./openzoo.md) (the same Claude Code CLI), codex, and opencode.
 - **Structured (ACP) sessions**: the Claude adapter (`claude-agent-acp`).
 
 Resume-only agents (such as gemini, vibe, and copilot) and agents without resume enabled in AoE (such as cursor, droid, kiro, and qwen) cannot fork. For those, the Fork option is hidden or refused.

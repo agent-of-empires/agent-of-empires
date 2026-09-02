@@ -667,5 +667,11 @@ mod tests {
             status_hook_env_prefix("work", "abc123", crate::agents::get_agent("kimi")),
             "AOE_PROFILE='work' AOE_INSTANCE_ID='abc123' "
         );
+        // openzoo shares claude's hook_config, so its spawned claude gets the
+        // instance id its status/session-id hooks need.
+        assert_eq!(
+            status_hook_env_prefix("work", "abc123", crate::agents::get_agent("openzoo")),
+            "AOE_PROFILE='work' AOE_INSTANCE_ID='abc123' "
+        );
     }
 }

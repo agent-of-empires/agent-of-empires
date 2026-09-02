@@ -1368,6 +1368,66 @@ pub const AGENTS: &[AgentDef] = &[
         permission_response: None,
         lifecycle: AgentLifecycle::Active,
     },
+    AgentDef {
+        // openzoo (npm `openzoo`, https://github.com/staccDOTsol/openzoo) is a
+        // local x402 pay-per-call proxy. `openzoo claude [args...]` launches
+        // the REAL Claude Code CLI with ANTHROPIC_BASE_URL pointed at the
+        // proxy (http://localhost:8402/v1) and forwards every argument
+        // untouched to `claude`, so the pane IS Claude Code: same status
+        // shapes, same ~/.claude/settings.json hooks, same
+        // --resume/--session-id/--fork-session, same `-p` one-shot, same
+        // permission-prompt keys. What earns it its own entry is that no API
+        // key, account, or signup is needed: every turn is paid on chain from
+        // a local burner wallet. Sites that key Claude's session plumbing on
+        // the tool name go through `runs_claude_code` so this entry inherits
+        // them.
+        //
+        // Appended at the END of AGENTS on purpose: settings_index_from_name
+        // persists 1-based array positions, so inserting next to claude would
+        // silently remap every user's saved default agent.
+        name: "openzoo",
+        oneshot_flag: Some("-p"),
+        binary: "openzoo",
+        // Claude Code's flags belong to the `claude` subcommand; the bare
+        // `openzoo` binary is the proxy's own CLI.
+        launch_subcommand: Some("claude"),
+        aliases: &[],
+        detection: DetectionMethod::Which("openzoo"),
+        yolo: Some(YoloMode::CliFlag("--dangerously-skip-permissions")),
+        instruction_flag: Some("--append-system-prompt {}"),
+        set_default_command: false,
+        detect_status: status_detection::detect_claude_status,
+        // host_only: the burner wallet lives in ~/.openzoo on the host and the
+        // sandbox image does not ship openzoo, so there is no container env,
+        // no config mount, and no Dockerfile install.
+        container_env: &[],
+        // The spawned claude reads the same settings file, so the generic
+        // Claude hook install (status + session-id capture) covers it.
+        hook_config: Some(AgentHookConfig {
+            settings_rel_path: ".claude/settings.json",
+            config_dir_env_var: Some("CLAUDE_CONFIG_DIR"),
+            events: CLAUDE_HOOK_EVENTS,
+            format: HookFormat::JsonSettings,
+        }),
+        sidecar_hooks: None,
+        resume_strategy: ResumeStrategy::FlagPair {
+            existing: "--resume",
+            new_session: "--session-id",
+        },
+        fork_strategy: ForkStrategy::ClaudeFork,
+        host_only: true,
+        // Same paste-burst suppression as claude (see its entry): the Enter
+        // must land after Claude Code's 100ms paste-completion window.
+        send_keys_enter_delay_ms: 150,
+        ready_marker: None,
+        install_hint: "npm install -g openzoo",
+        permission_response: Some(PermissionResponse {
+            allow: &[KeyToken::Literal("1")],
+            allow_always: Some(&[KeyToken::Literal("2")]),
+            deny: &[KeyToken::Literal("3")],
+        }),
+        lifecycle: AgentLifecycle::Active,
+    },
 ];
 
 /// Look up an agent by canonical name.
@@ -1427,7 +1487,7 @@ impl AgentDef {
     /// ignored rather than mis-injected (fail-closed).
     pub fn oneshot_model_flag(&self) -> Option<&'static str> {
         match self.name {
-            "claude" | "copilot" | "omp" | "prime-agent" => Some("--model"),
+            "claude" | "openzoo" | "copilot" | "omp" | "prime-agent" => Some("--model"),
             "codex" | "gemini" | "opencode" | "kimi" => Some("-m"),
             _ => None,
         }
@@ -1821,6 +1881,19 @@ pub fn install_hint(name: &str) -> Option<&'static str> {
     get_agent(name).map(|a| a.install_hint)
 }
 
+/// True for agents whose pane is the real Claude Code CLI: `claude` itself and
+/// wrappers such as `openzoo` (`openzoo claude ...` execs `claude` with a
+/// different API base URL). They share Claude's transcript store
+/// (`~/.claude/projects/*.jsonl`), its hook session-id sidecar, its
+/// `--resume`/`--session-id`/`--fork-session` flags, its boolean `-p` one-shot
+/// and its startup banner, so every site that keys that plumbing on the tool
+/// name goes through here rather than `tool == "claude"`. Deliberately not
+/// used where the behaviour belongs to the `claude` registry entry itself
+/// (ACP adapter lookup, sandbox config mounts, the web session import).
+pub fn runs_claude_code(tool: &str) -> bool {
+    matches!(tool, "claude" | "openzoo")
+}
+
 /// Convert a tool name to a 1-based settings index (0 = Auto).
 pub fn settings_index_from_name(name: Option<&str>) -> usize {
     match name {
@@ -1948,7 +2021,7 @@ mod tests {
         // flag to emit it.
         for agent in AGENTS {
             let expected = match agent.name {
-                "claude" | "copilot" | "omp" | "prime-agent" => Some("--model"),
+                "claude" | "openzoo" | "copilot" | "omp" | "prime-agent" => Some("--model"),
                 "codex" | "gemini" | "opencode" | "kimi" => Some("-m"),
                 _ => None,
             };
@@ -2019,10 +2092,11 @@ mod tests {
                 );
             }
             // Semi-independent oracle (not a copy of the impl's name list):
-            // `-p` is value-binding except for claude, omp, and prime-agent,
-            // where it is the boolean `--print` flag.
+            // `-p` is value-binding except for claude (and openzoo, which
+            // execs claude), omp, and prime-agent, where it is the boolean
+            // `--print` flag.
             if agent.oneshot_flag == Some("-p")
-                && !matches!(agent.name, "claude" | "omp" | "prime-agent")
+                && !matches!(agent.name, "claude" | "openzoo" | "omp" | "prime-agent")
             {
                 assert!(
                     agent.oneshot_flag_binds_prompt(),
@@ -2081,6 +2155,7 @@ mod tests {
         assert_eq!(get_agent("kimi").unwrap().binary, "kimi");
         assert_eq!(get_agent("omp").unwrap().binary, "omp");
         assert_eq!(get_agent("prime-agent").unwrap().binary, "prime-agent");
+        assert_eq!(get_agent("openzoo").unwrap().binary, "openzoo");
     }
 
     #[test]
@@ -2369,7 +2444,8 @@ mod tests {
                 "antigravity",
                 "kimi",
                 "omp",
-                "prime-agent"
+                "prime-agent",
+                "openzoo"
             ]
         );
     }
@@ -2407,6 +2483,14 @@ mod tests {
             resolve_tool_name("prime-agent --mode acp"),
             Some("prime-agent")
         );
+        assert_eq!(resolve_tool_name("openzoo"), Some("openzoo"));
+        // Longest token wins: the default launch command `openzoo claude`
+        // contains claude's name, but "openzoo" is the longer match.
+        assert_eq!(resolve_tool_name("openzoo claude"), Some("openzoo"));
+        assert_eq!(
+            resolve_tool_name("openzoo claude --dangerously-skip-permissions"),
+            Some("openzoo")
+        );
         assert_eq!(resolve_tool_name("unknown-tool"), None);
     }
 
@@ -2427,6 +2511,7 @@ mod tests {
         assert_eq!(settings_index_from_name(Some("kimi")), 15);
         assert_eq!(settings_index_from_name(Some("omp")), 16);
         assert_eq!(settings_index_from_name(Some("prime-agent")), 17);
+        assert_eq!(settings_index_from_name(Some("openzoo")), 18);
 
         assert_eq!(name_from_settings_index(0), None);
         assert_eq!(name_from_settings_index(1), Some("claude"));
@@ -2443,6 +2528,7 @@ mod tests {
         assert_eq!(name_from_settings_index(15), Some("kimi"));
         assert_eq!(name_from_settings_index(16), Some("omp"));
         assert_eq!(name_from_settings_index(17), Some("prime-agent"));
+        assert_eq!(name_from_settings_index(18), Some("openzoo"));
         assert_eq!(name_from_settings_index(99), None);
     }
 
@@ -2476,14 +2562,50 @@ mod tests {
     }
 
     #[test]
-    fn test_only_kiro_uses_launch_subcommand() {
-        // Lock the surface: today only kiro needs a launch subcommand. A new
-        // agent that needs one must update this test deliberately.
+    fn test_openzoo_launches_via_claude_subcommand() {
+        // openzoo wraps Claude Code behind its `claude` subcommand, which is
+        // where claude's own flags (--dangerously-skip-permissions, --resume,
+        // -p) parse; the bare binary is the proxy's CLI.
+        let openzoo = get_agent("openzoo").unwrap();
+        assert_eq!(openzoo.launch_subcommand, Some("claude"));
+        assert_eq!(openzoo.launch_base_command(), "openzoo claude");
+    }
+
+    #[test]
+    fn test_runs_claude_code() {
+        assert!(runs_claude_code("claude"));
+        assert!(runs_claude_code("openzoo"));
+        assert!(!runs_claude_code("codex"));
+        assert!(!runs_claude_code("claude-code"));
+        assert!(!runs_claude_code(""));
+        // Drift guard: the set is exactly the registry agents that carry
+        // Claude's shape (ClaudeFork + hooks in Claude's own settings file).
+        // A new Claude wrapper must join both, and nothing else may.
         for agent in AGENTS {
-            let expected = if agent.name == "kiro" {
-                Some("chat")
-            } else {
-                None
+            let claude_shaped = matches!(agent.fork_strategy, ForkStrategy::ClaudeFork)
+                && agent
+                    .hook_config
+                    .as_ref()
+                    .is_some_and(|h| h.settings_rel_path == ".claude/settings.json");
+            assert_eq!(
+                runs_claude_code(agent.name),
+                claude_shaped,
+                "agent '{}' drifted from runs_claude_code",
+                agent.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_launch_subcommand_registry() {
+        // Lock the surface: today only kiro (`kiro-cli chat`) and openzoo
+        // (`openzoo claude`) need a launch subcommand. A new agent that needs
+        // one must update this test deliberately.
+        for agent in AGENTS {
+            let expected = match agent.name {
+                "kiro" => Some("chat"),
+                "openzoo" => Some("claude"),
+                _ => None,
             };
             assert_eq!(
                 agent.launch_subcommand, expected,
@@ -2617,6 +2739,8 @@ mod tests {
         // `[Pasted text]` sits unsubmitted). The Enter must arrive after that
         // 100ms window expires, so claude needs a delay > 100ms.
         assert!(send_keys_enter_delay("claude") > 100);
+        // openzoo's pane is the same Claude Code binary, so the same window.
+        assert!(send_keys_enter_delay("openzoo") > 100);
         // Other agents have no paste-burst suppression and should not delay
         assert_eq!(send_keys_enter_delay("opencode"), 0);
         assert_eq!(send_keys_enter_delay("hermes"), 0);
@@ -2644,6 +2768,7 @@ mod tests {
             Some("npm install -g @anthropic-ai/claude-code")
         );
         assert_eq!(install_hint("codex"), Some("npm install -g @openai/codex"));
+        assert_eq!(install_hint("openzoo"), Some("npm install -g openzoo"));
         // Pi is distributed via npm, not pip (issue #818).
         assert_eq!(
             install_hint("pi"),
@@ -2698,6 +2823,7 @@ mod tests {
             ("gemini", HookFormat::JsonSettings),
             ("cursor", HookFormat::JsonSettings),
             ("qwen", HookFormat::JsonSettings),
+            ("openzoo", HookFormat::JsonSettings),
         ];
         for (name, fmt) in expected {
             let agent = get_agent(name).unwrap_or_else(|| panic!("missing agent {name}"));
@@ -2755,11 +2881,16 @@ mod tests {
 
     #[test]
     fn test_fork_strategy_is_set_for_fork_capable_agents() {
-        // Only claude, codex, and opencode can fork; every other agent is
-        // Unsupported. Iterating the full AGENTS slice makes a new agent with a
-        // stray fork_strategy fail loudly here.
+        // Only claude (and openzoo, which execs claude), codex, and opencode
+        // can fork; every other agent is Unsupported. Iterating the full
+        // AGENTS slice makes a new agent with a stray fork_strategy fail
+        // loudly here.
         assert!(matches!(
             get_agent("claude").unwrap().fork_strategy,
+            ForkStrategy::ClaudeFork
+        ));
+        assert!(matches!(
+            get_agent("openzoo").unwrap().fork_strategy,
             ForkStrategy::ClaudeFork
         ));
         assert!(matches!(
@@ -2778,7 +2909,7 @@ mod tests {
             ForkStrategy::Unsupported
         ));
         for agent in AGENTS {
-            let fork_capable = matches!(agent.name, "claude" | "codex" | "opencode");
+            let fork_capable = matches!(agent.name, "claude" | "openzoo" | "codex" | "opencode");
             assert_eq!(
                 matches!(agent.fork_strategy, ForkStrategy::Unsupported),
                 !fork_capable,

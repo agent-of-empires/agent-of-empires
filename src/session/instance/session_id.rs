@@ -102,7 +102,7 @@ impl Instance {
             // the conversation under the same id (see
             // `resume_flag_arm_is_existing`). Host-only: a sandboxed transcript
             // lives inside the container, which may not be up at acquire time.
-            if self.tool == "claude"
+            if crate::agents::runs_claude_code(&self.tool)
                 && !self.is_sandboxed()
                 && crate::session::capture::claude_host_transcript_confirmed_absent(
                     &self.project_path,
@@ -156,7 +156,7 @@ impl Instance {
         mint_fresh_id: &dyn Fn(&str) -> Option<String>,
     ) -> Option<String> {
         match self.tool.as_str() {
-            "claude" => Some(generate_session_uuid()),
+            tool if crate::agents::runs_claude_code(tool) => Some(generate_session_uuid()),
             "opencode" | "pi" => mint_fresh_id(&self.project_path),
             _ => None,
         }
@@ -352,7 +352,7 @@ impl Instance {
             }
             return override_if_distinct(self.agent_session_id.as_deref(), authoritative);
         }
-        if self.tool == "claude" {
+        if crate::agents::runs_claude_code(&self.tool) {
             if let Some(authoritative) = crate::hooks::read_hook_session_id(&self.id) {
                 if self.retroactive_capture_excludes.contains(&authoritative) {
                     return None;

@@ -400,7 +400,7 @@ enum NativeMcpConfig {
 /// an agent AoE has no native reader for (those contribute no native servers).
 fn native_config_for(agent_key: &str) -> Option<NativeMcpConfig> {
     match agent_key {
-        "claude" | "claude-code" => Some(NativeMcpConfig::StandardJson(".claude.json")),
+        "claude" | "claude-code" | "openzoo" => Some(NativeMcpConfig::StandardJson(".claude.json")),
         "gemini" => Some(NativeMcpConfig::GeminiJson(".gemini/settings.json")),
         "codex" => Some(NativeMcpConfig::CodexToml(".codex/config.toml")),
         _ => None,

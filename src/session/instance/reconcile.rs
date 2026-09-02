@@ -74,11 +74,11 @@ impl Instance {
     /// the daemon crashes before the next poll tick persists it: without
     /// this step, the next launch's wipe destroys the fresh sid.
     ///
-    /// Claude-only (sole sidecar tool); `Default` intent only (`Use(X)`
-    /// and `Cleared` override); excluded sids skipped (cascade re-poison
-    /// guard).
+    /// Claude Code panes only (the sole sidecar tool; see
+    /// `runs_claude_code`); `Default` intent only (`Use(X)` and `Cleared`
+    /// override); excluded sids skipped (cascade re-poison guard).
     pub(super) fn reconcile_sidecar_into_disk(&mut self) {
-        if self.tool != "claude" {
+        if !crate::agents::runs_claude_code(&self.tool) {
             return;
         }
         if !matches!(self.resume_intent, ResumeIntent::Default) {

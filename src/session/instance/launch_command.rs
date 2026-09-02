@@ -1150,6 +1150,53 @@ mod tests {
     }
 
     #[test]
+    fn test_build_host_command_openzoo_uses_claude_subcommand() {
+        // openzoo must launch via `openzoo claude` so the wrapped Claude Code
+        // CLI receives claude-scoped flags; bare `openzoo` is the proxy CLI.
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.tool = "openzoo".to_string();
+        let (cmd, _, _) = inst
+            .build_host_command(crate::agents::get_agent("openzoo"))
+            .unwrap();
+        assert!(cmd.unwrap().contains("openzoo claude"));
+    }
+
+    #[test]
+    fn test_build_host_command_openzoo_yolo_and_resume_after_claude() {
+        // Both the YOLO flag and the session-id/resume pair must follow the
+        // `claude` subcommand, not precede it, so claude (not openzoo) parses
+        // them.
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.tool = "openzoo".to_string();
+        inst.yolo_mode = true;
+        inst.agent_session_id = Some("11111111-2222-4333-8444-555555555555".to_string());
+        let (cmd, _, _) = inst
+            .build_host_command(crate::agents::get_agent("openzoo"))
+            .unwrap();
+        let cmd_str = cmd.unwrap();
+        let sub_pos = cmd_str
+            .find("openzoo claude")
+            .expect("claude subcommand present");
+        let yolo_pos = cmd_str
+            .find("--dangerously-skip-permissions")
+            .expect("yolo flag present");
+        let resume_pos = cmd_str
+            .find("--resume 11111111-2222-4333-8444-555555555555")
+            .or_else(|| cmd_str.find("--session-id 11111111-2222-4333-8444-555555555555"))
+            .expect("resume or session-id flag present");
+        assert!(
+            yolo_pos > sub_pos,
+            "--dangerously-skip-permissions must come after `openzoo claude` \
+             (subcommand at {sub_pos}, flag at {yolo_pos})"
+        );
+        assert!(
+            resume_pos > sub_pos,
+            "session flags must come after `openzoo claude` \
+             (subcommand at {sub_pos}, flag at {resume_pos})"
+        );
+    }
+
+    #[test]
     fn test_build_host_command_custom_override_skips_subcommand() {
         // A user command override is passed through verbatim; AoE must not
         // inject a launch subcommand into it (the user is in full control).

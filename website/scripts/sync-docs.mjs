@@ -132,6 +132,13 @@ const PAGES = [
       "Fork a session to start a second agent from its context, then diverge onto a different task, leaving the original untouched.",
   },
   {
+    source: "docs/guides/openzoo.md",
+    dest: "guides/openzoo.md",
+    title: "openzoo (Claude Code, paid per call)",
+    description:
+      "Run Claude Code through the openzoo x402 proxy: no API key or account, every turn paid on chain from a local wallet.",
+  },
+  {
     source: "docs/guides/multi-repo-workspaces.md",
     dest: "guides/multi-repo-workspaces.md",
     title: "Multi-Repo Workspaces",
@@ -372,6 +379,7 @@ const URL_MAP = {
   "docs/guides/agent-override.md": "/guides/agent-override/",
   "docs/guides/session-resume.md": "/guides/session-resume/",
   "docs/guides/session-fork.md": "/guides/session-fork/",
+  "docs/guides/openzoo.md": "/guides/openzoo/",
   "docs/guides/multi-repo-workspaces.md": "/guides/multi-repo-workspaces/",
   "docs/guides/scratch-sessions.md": "/guides/scratch-sessions/",
   "docs/guides/live-mode.md": "/guides/live-mode/",

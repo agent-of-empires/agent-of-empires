@@ -95,7 +95,7 @@ impl Instance {
         }
 
         let poll_fn: Box<dyn Fn() -> Option<String> + Send + 'static> = match tool {
-            "claude" => {
+            _ if crate::agents::runs_claude_code(tool) => {
                 if self.is_sandboxed() {
                     let container_name = match self.sandbox_info.as_ref() {
                         Some(s) => s.container_name.clone(),

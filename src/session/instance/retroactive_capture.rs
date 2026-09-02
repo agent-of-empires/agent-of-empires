@@ -12,7 +12,7 @@ impl Instance {
             &self.id,
             &self.project_path,
             &self.tool,
-            self.tool == "claude"
+            crate::agents::runs_claude_code(&self.tool)
                 || (matches!(self.tool.as_str(), "codex" | "kimi") && !self.is_sandboxed()),
             &self.effective_profile(),
             &self.retroactive_capture_excludes,
@@ -34,7 +34,7 @@ impl Instance {
 
     pub(crate) fn try_retroactive_capture(&self) -> Option<String> {
         let result: Option<String> = match self.tool.as_str() {
-            "claude" => {
+            tool if crate::agents::runs_claude_code(tool) => {
                 // Claude additionally extends the common live and parked-id
                 // exclusion with stopped, archived, or pane-less peer sids so
                 // the mtime fallback skips peers whose jsonl outlived their
