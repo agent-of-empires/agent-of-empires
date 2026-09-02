@@ -1,22 +1,10 @@
-//! Shared `HOME`/`XDG_CONFIG_HOME` test-isolation support for the
-//! standalone integration-test binaries under `tests/` that don't also
-//! need `tests/common`'s port helpers.
+//! RAII `HOME`/`XDG_CONFIG_HOME` test isolation with restore-on-drop.
 //!
-//! This is a separate module (not folded into `tests/common/mod.rs`)
-//! because binaries that include a module get `dead_code` warnings for
-//! any of its public items they don't call — `pick_free_port`/
-//! `wait_for_port` in `tests/common/mod.rs` are unused by the isolation-only
-//! consumers below, so this splits the two concerns into separate shared
-//! modules. It is also a separate copy from `src/session/test_support.rs`
-//! (the in-crate copy, used by unit tests compiled into the library) and
-//! from `tests/e2e/harness.rs` (used by the `tests/e2e` binary) — each
-//! standalone `tests/*.rs` file Cargo auto-discovers is compiled as its
-//! own separate crate, and `tests/e2e` is yet another separate crate, so
-//! none of the three can share code directly across those boundaries.
-//!
-//! Naming this file `mod.rs` (rather than a sibling `tests/home_isolation.rs`)
-//! opts it out of Cargo's test-binary auto-discovery, so it stays a
-//! shared module rather than becoming its own (empty) test binary.
+//! Distinct from `crate::common::setup_temp_home`, which overrides the
+//! env vars without restoring the previous values. It is also a separate
+//! copy from `src/session/test_support.rs` (used by unit tests compiled
+//! into the library) and `tests/e2e/harness.rs` (used by the `tests/e2e`
+//! binary); those are different crates and cannot share this code.
 
 use std::path::Path;
 

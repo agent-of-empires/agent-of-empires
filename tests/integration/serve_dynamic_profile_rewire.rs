@@ -13,9 +13,6 @@
 //!   trigger `add_profile_disk_watch` / `remove_profile_disk_watch` / `rename_profile_disk_watch` in production, so this layer guards
 //!   the daemon-boot path.
 
-mod common;
-mod home_isolation;
-
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::Arc;
@@ -28,8 +25,8 @@ use agent_of_empires::server::test_support::{
 use serial_test::serial;
 use tempfile::TempDir;
 
-use common::{pick_free_port, wait_for_port};
-use home_isolation::isolate_home;
+use crate::common::{pick_free_port, wait_for_port};
+use crate::home_isolation::isolate_home;
 
 #[tokio::test]
 #[serial]

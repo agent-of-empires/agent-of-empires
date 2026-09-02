@@ -12,14 +12,12 @@
 //! Storage::update -> notify_local_change -> dispatcher Local arm ->
 //! debounce-collapse with kernel echo -> subscriber receipt.
 
-mod home_isolation;
-
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::home_isolation::isolate_home;
 use agent_of_empires::file_watch::{EventSource, FileMatcher, FileWatchService, WatchSpec};
 use agent_of_empires::session::{Instance, Storage};
-use home_isolation::isolate_home;
 use serial_test::serial;
 use tempfile::TempDir;
 use tokio::time::timeout;

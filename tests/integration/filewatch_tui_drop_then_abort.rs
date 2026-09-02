@@ -13,16 +13,14 @@
 //! `None` because the subscription's `DeliverySink` was deregistered).
 //! No `try_send` runs after the drop point.
 
-mod home_isolation;
-
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::home_isolation::isolate_home;
 use agent_of_empires::file_watch::{FileMatcher, FileWatchService, WatchSpec};
 use agent_of_empires::session::{Instance, Storage};
-use home_isolation::isolate_home;
 use serial_test::serial;
 use tempfile::TempDir;
 

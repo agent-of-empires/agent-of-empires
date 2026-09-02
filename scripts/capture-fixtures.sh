@@ -46,7 +46,7 @@ usage() {
     echo "  2. Get the tool into the desired state (running, waiting, etc.)"
     echo "  3. Run this script with the appropriate arguments"
     echo "  4. Verify the captured output looks correct"
-    echo "  5. Run 'cargo test --test status_detection' to verify detection works"
+    echo "  5. Run 'cargo test --test integration status_detection' to verify detection works"
     exit 1
 }
 
@@ -171,7 +171,7 @@ echo ""
 echo "Next steps:"
 echo "  1. Review the captured content: cat $OUTPUT_FILE"
 echo "  2. Update the 'Key indicators' comment if needed"
-echo "  3. Run tests: cargo test --test status_detection"
+echo "  3. Run tests: cargo test --test integration status_detection"
 echo ""
 echo "If tests fail, you may need to update the detection logic in:"
 echo "  src/tmux/session.rs (detect_claude_status or detect_opencode_status)"

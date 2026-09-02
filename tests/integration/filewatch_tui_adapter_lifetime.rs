@@ -10,16 +10,14 @@
 //! "forwarder task accidentally dropped on construct," which would close
 //! the channel and leave the dirty flag forever stuck.
 
-mod home_isolation;
-
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::home_isolation::isolate_home;
 use agent_of_empires::file_watch::{FileMatcher, FileWatchService, WatchSpec};
 use agent_of_empires::session::{Instance, Storage};
-use home_isolation::isolate_home;
 use serial_test::serial;
 use tempfile::TempDir;
 

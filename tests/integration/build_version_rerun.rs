@@ -10,7 +10,7 @@
 //! two halves of the trigger contract: a revision change must disturb a
 //! watched file, and a plain `git status` (which rewrites `index`) must not.
 
-#[path = "../build_git_watch.rs"]
+#[path = "../../build_git_watch.rs"]
 mod build_git_watch;
 
 use std::path::{Path, PathBuf};
