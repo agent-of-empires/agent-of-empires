@@ -1,8 +1,7 @@
-//! Remote home screen for cross-machine session visibility and structured attach.
+//! Remote home screen for cross-machine structured-session attach.
 //!
-//! The daemon projects every canonical session plus connection-scoped attach
-//! and context-resume information. Terminal rows stay visible but cannot be
-//! opened by this ACP-only client.
+//! The daemon supplies request-scoped attach availability while each session
+//! row carries its request-invariant context-resume state.
 mod render;
 
 use std::collections::BTreeMap;
@@ -11,7 +10,9 @@ use std::io::Stdout;
 use crate::acp::client::discovery::DaemonEndpoint;
 use crate::acp::client::{ClientCapability, HttpClient};
 use crate::plugin::ui_state::UiSnapshot;
-use crate::server::api::sessions::{AttachAvailability, AttachTransport, SessionInteraction};
+use crate::server::api::sessions::{
+    AttachAvailability, AttachTransport, ContextResumeAvailability,
+};
 use crate::session::config::{resolve_theme_name, resolve_theme_palette_mode};
 use crate::tui::styles::Theme;
 use anyhow::Result;
@@ -26,6 +27,9 @@ struct RemoteSessionWire {
     title: String,
     project_path: String,
     status: String,
+    #[serde(default)]
+    view: crate::session::View,
+    context_resume: ContextResumeAvailability,
 }
 #[derive(Debug, Clone)]
 pub struct RemoteSession {
@@ -33,13 +37,14 @@ pub struct RemoteSession {
     pub title: String,
     pub project_path: String,
     pub status: String,
-    pub interaction: SessionInteraction,
+    pub context_resume: ContextResumeAvailability,
+    pub attach: AttachAvailability,
 }
 
 impl RemoteSession {
     fn can_open(&self) -> bool {
         matches!(
-            self.interaction.attach,
+            self.attach,
             AttachAvailability::Available {
                 transport: AttachTransport::AcpWebsocketV1
             }
@@ -201,9 +206,9 @@ async fn run(
 }
 
 fn sessions_from_snapshot(
-    (wire_sessions, mut interactions): (
+    (wire_sessions, mut session_attach): (
         Vec<RemoteSessionWire>,
-        BTreeMap<String, SessionInteraction>,
+        BTreeMap<String, AttachAvailability>,
     ),
 ) -> Result<Vec<RemoteSession>, String> {
     let mut seen = std::collections::HashSet::new();
@@ -212,17 +217,22 @@ fn sessions_from_snapshot(
         if !seen.insert(session.id.clone()) {
             return Err(format!("duplicate session id: {}", session.id));
         }
-        let interaction = interactions
+        if session.view != crate::session::View::Structured {
+            continue;
+        }
+        let attach = session_attach
             .remove(&session.id)
-            .ok_or_else(|| format!("missing interaction for session {}", session.id))?;
+            .ok_or_else(|| format!("missing attach availability for session {}", session.id))?;
         sessions.push(RemoteSession {
             id: session.id,
             title: session.title,
             project_path: session.project_path,
             status: session.status,
-            interaction,
+            context_resume: session.context_resume,
+            attach,
         });
     }
+    sessions.sort_by(|a, b| a.title.cmp(&b.title));
     Ok(sessions)
 }
 
@@ -248,7 +258,7 @@ async fn refresh(state: &mut RemoteHomeState) {
     state.last_error = None;
     let sessions = state
         .client
-        .list_sessions_with_interactions::<RemoteSessionWire, SessionInteraction>(&[
+        .list_sessions_with_attach::<RemoteSessionWire, AttachAvailability>(&[
             ClientCapability::AcpWebsocketV1,
         ])
         .await
@@ -270,26 +280,31 @@ mod tests {
     use super::*;
     use crate::acp::client::discovery::Source;
 
+    fn available_attach() -> AttachAvailability {
+        AttachAvailability::Available {
+            transport: AttachTransport::AcpWebsocketV1,
+        }
+    }
+
     fn session(id: &str) -> RemoteSession {
         RemoteSession {
             id: id.to_string(),
             title: id.to_string(),
             project_path: format!("/tmp/{id}"),
             status: "Stopped".to_string(),
-            interaction: SessionInteraction {
-                context_resume: crate::server::api::sessions::ContextResumeAvailability::Available,
-                attach: AttachAvailability::Available {
-                    transport: AttachTransport::AcpWebsocketV1,
-                },
-            },
+            context_resume: ContextResumeAvailability::Available,
+            attach: available_attach(),
         }
     }
-    fn wire(id: &str) -> RemoteSessionWire {
+
+    fn wire(id: &str, view: crate::session::View) -> RemoteSessionWire {
         RemoteSessionWire {
             id: id.to_string(),
             title: id.to_string(),
             project_path: format!("/tmp/{id}"),
             status: "Stopped".to_string(),
+            view,
+            context_resume: ContextResumeAvailability::Available,
         }
     }
 
@@ -301,10 +316,15 @@ mod tests {
         ))
         .unwrap()
     }
+
     #[test]
-    fn snapshot_requires_interaction_for_every_session() {
-        let error = sessions_from_snapshot((vec![wire("missing")], BTreeMap::new())).unwrap_err();
-        assert_eq!(error, "missing interaction for session missing");
+    fn snapshot_requires_attach_for_every_structured_session() {
+        let error = sessions_from_snapshot((
+            vec![wire("missing", crate::session::View::Structured)],
+            BTreeMap::new(),
+        ))
+        .unwrap_err();
+        assert_eq!(error, "missing attach availability for session missing");
     }
 
     #[test]
@@ -314,22 +334,32 @@ mod tests {
         state.cursor = 4;
         state.status_text = Some("stale status".to_string());
 
-        apply_session_result(&mut state, Err("missing interaction".to_string()));
+        apply_session_result(&mut state, Err("missing attach availability".to_string()));
 
         assert!(state.sessions.is_empty());
         assert_eq!(state.cursor, 0);
-        assert_eq!(state.last_error.as_deref(), Some("missing interaction"));
+        assert_eq!(
+            state.last_error.as_deref(),
+            Some("missing attach availability")
+        );
         assert!(state.status_text.is_none());
     }
 
     #[test]
-    fn successful_snapshot_preserves_server_order_and_ignores_extra_keys() {
-        let mut interactions = BTreeMap::new();
-        interactions.insert("second".to_string(), session("second").interaction);
-        interactions.insert("first".to_string(), session("first").interaction);
-        interactions.insert("extra".to_string(), session("extra").interaction);
-        let sessions =
-            sessions_from_snapshot((vec![wire("second"), wire("first")], interactions)).unwrap();
+    fn successful_snapshot_restores_sorted_structured_scope() {
+        let mut attach = BTreeMap::new();
+        attach.insert("second".to_string(), available_attach());
+        attach.insert("first".to_string(), available_attach());
+        attach.insert("extra".to_string(), available_attach());
+        let sessions = sessions_from_snapshot((
+            vec![
+                wire("second", crate::session::View::Structured),
+                wire("terminal", crate::session::View::Terminal),
+                wire("first", crate::session::View::Structured),
+            ],
+            attach,
+        ))
+        .unwrap();
 
         let mut state = state();
         apply_session_result(&mut state, Ok(sessions));
@@ -339,7 +369,7 @@ mod tests {
                 .iter()
                 .map(|session| session.id.as_str())
                 .collect::<Vec<_>>(),
-            ["second", "first"]
+            ["first", "second"]
         );
     }
 }

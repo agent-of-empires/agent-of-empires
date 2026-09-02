@@ -49,9 +49,9 @@ struct SessionsEnvelope<T> {
     sessions: Vec<T>,
 }
 #[derive(serde::Deserialize)]
-struct SessionsContextEnvelope<T, I> {
+struct SessionsAttachEnvelope<T, A> {
     sessions: Vec<T>,
-    session_interactions: BTreeMap<String, I>,
+    session_attach: BTreeMap<String, A>,
 }
 
 /// Transport features this HTTP client can consume for a sessions request.
@@ -609,14 +609,14 @@ impl HttpClient {
         let res = check_status(res, "<sessions>").await?;
         Ok(res.json::<SessionsEnvelope<T>>().await?.sessions)
     }
-    /// `GET /api/sessions` with request-scoped client transport negotiation.
-    pub async fn list_sessions_with_interactions<T, I>(
+    /// `GET /api/sessions` with request-scoped attach negotiation.
+    pub async fn list_sessions_with_attach<T, A>(
         &self,
         capabilities: &[ClientCapability],
-    ) -> Result<(Vec<T>, BTreeMap<String, I>), HttpError>
+    ) -> Result<(Vec<T>, BTreeMap<String, A>), HttpError>
     where
         T: serde::de::DeserializeOwned,
-        I: serde::de::DeserializeOwned,
+        A: serde::de::DeserializeOwned,
     {
         let url = format!("{}/api/sessions", self.endpoint.base_url);
         let mut request = self.http.get(&url);
@@ -630,8 +630,8 @@ impl HttpClient {
         }
         let res = self.auth(request).send().await?;
         let res = check_status(res, "<sessions>").await?;
-        let envelope = res.json::<SessionsContextEnvelope<T, I>>().await?;
-        Ok((envelope.sessions, envelope.session_interactions))
+        let envelope = res.json::<SessionsAttachEnvelope<T, A>>().await?;
+        Ok((envelope.sessions, envelope.session_attach))
     }
 
     /// Session title, resolved ACP agent, and path roots used by the native

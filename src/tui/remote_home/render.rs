@@ -214,10 +214,7 @@ Press r to refresh, q to quit.",
                 ),
                 Span::styled(format!("{:<10}  ", s.status), readable(status_style)),
                 Span::styled(
-                    format!(
-                        "{:<11}  ",
-                        context_resume_summary(s.interaction.context_resume)
-                    ),
+                    format!("{:<11}  ", context_resume_summary(s.context_resume)),
                     readable(status_style),
                 ),
                 Span::styled(format!("{attach:<9}  "), readable(status_style)),
@@ -286,8 +283,8 @@ fn render_footer(frame: &mut Frame, area: Rect, theme: &Theme, state: &RemoteHom
         spans.push(Span::styled(
             format!(
                 " · context resume: {} · attach: {} ",
-                context_resume_detail(session.interaction.context_resume),
-                attach_detail(session.interaction.attach),
+                context_resume_detail(session.context_resume),
+                attach_detail(session.attach),
             ),
             Style::default().fg(theme.dimmed),
         ));
@@ -311,7 +308,7 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use crate::acp::client::discovery::{DaemonEndpoint, Source};
-    use crate::server::api::sessions::{AttachUnavailableReason, SessionInteraction};
+    use crate::server::api::sessions::AttachUnavailableReason;
     use crate::tui::remote_home::RemoteSession;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -331,11 +328,9 @@ mod tests {
                 title: format!("session {id}"),
                 project_path: format!("/tmp/{id}"),
                 status: "idle".to_string(),
-                interaction: SessionInteraction {
-                    context_resume: ContextResumeAvailability::Available,
-                    attach: AttachAvailability::Available {
-                        transport: AttachTransport::AcpWebsocketV1,
-                    },
+                context_resume: ContextResumeAvailability::Available,
+                attach: AttachAvailability::Available {
+                    transport: AttachTransport::AcpWebsocketV1,
                 },
             })
             .collect();
@@ -526,10 +521,10 @@ mod tests {
     #[test]
     fn unavailable_attach_is_visible_and_disables_enter() {
         let mut state = state_with(&["s1"], json!([]));
-        state.sessions[0].interaction.attach = AttachAvailability::Unavailable {
+        state.sessions[0].attach = AttachAvailability::Unavailable {
             reason: AttachUnavailableReason::ClientMissingTransport,
         };
-        state.sessions[0].interaction.context_resume = ContextResumeAvailability::Unavailable {
+        state.sessions[0].context_resume = ContextResumeAvailability::Unavailable {
             reason: ContextResumeUnavailableReason::SandboxUnsupported,
         };
 

@@ -1629,7 +1629,11 @@ fn session_existence_from_cache(name: &str) -> Option<SessionExistence> {
         None => SessionExistence::Unknown,
     })
 }
-
+/// Read the current session cache without refreshing it. A stale or poisoned
+/// snapshot remains unknown so async request handlers never spawn tmux.
+pub(crate) fn cached_session_existence(name: &str) -> SessionExistence {
+    session_existence_from_cache(name).unwrap_or(SessionExistence::Unknown)
+}
 /// Probe whether an aoe tmux session exists, distinguishing "confirmed
 /// absent" from "couldn't tell because the tmux server was unreachable".
 ///
@@ -2717,6 +2721,16 @@ mod tests {
         assert_eq!(probe_session_existence(&name), SessionExistence::Unknown);
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn cached_session_existence_keeps_stale_snapshot_unknown() {
+        let guard = SessionCacheGuard::capture();
+        let name = format!("{P}cached_stale_abc12345");
+        guard.force_present(&[&name]);
+        guard.force_stale();
+
+        assert_eq!(cached_session_existence(&name), SessionExistence::Unknown);
+    }
     #[test]
     #[serial_test::serial]
     fn rekey_classification_treats_confirmed_no_server_as_absent() {

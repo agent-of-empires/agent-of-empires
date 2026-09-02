@@ -644,6 +644,8 @@ impl Instance {
         ) {
             return Some(ResumeStaticUnavailable::AgentUnsupported);
         }
+        // These agents keep session stores inside the container, where a host
+        // resume target cannot exist.
         if self.is_sandboxed() && matches!(self.tool.as_str(), "copilot" | "kimi" | "prime-agent") {
             return Some(ResumeStaticUnavailable::SandboxUnsupported);
         }
@@ -657,10 +659,10 @@ impl Instance {
         )
     }
 
-    pub(crate) fn terminal_context_resume(&self) -> TerminalContextResume {
+    pub(crate) fn terminal_context_resume_cached(&self) -> TerminalContextResume {
         self.terminal_context_resume_with_runtime_source(|| {
             self.tmux_session()
-                .map(|session| crate::tmux::probe_session_existence(session.name()))
+                .map(|session| crate::tmux::cached_session_existence(session.name()))
                 .unwrap_or(crate::tmux::SessionExistence::Unknown)
         })
     }
@@ -3310,27 +3312,27 @@ mod tests {
         );
         inst.agent_session_id = Some(sid.clone());
         assert_eq!(
-            inst.terminal_context_resume(),
+            inst.terminal_context_resume_cached(),
             TerminalContextResume::RuntimeCheckRequired
         );
         inst.resume_intent = ResumeIntent::Use(sid.clone());
         assert_eq!(
-            inst.terminal_context_resume(),
+            inst.terminal_context_resume_cached(),
             TerminalContextResume::Available
         );
         inst.resume_probe_failed_sid = Some(sid.clone());
         assert_eq!(
-            inst.terminal_context_resume(),
+            inst.terminal_context_resume_cached(),
             TerminalContextResume::Available
         );
         inst.resume_intent = ResumeIntent::Default;
         assert_eq!(
-            inst.terminal_context_resume(),
+            inst.terminal_context_resume_cached(),
             TerminalContextResume::PreviousFailure
         );
         inst.resume_intent = ResumeIntent::Use("bad target".to_string());
         assert_eq!(
-            inst.terminal_context_resume(),
+            inst.terminal_context_resume_cached(),
             TerminalContextResume::InvalidTarget
         );
         let mut command = "claude".to_string();
@@ -3338,18 +3340,18 @@ mod tests {
         assert_eq!(command, "claude");
         inst.resume_intent = ResumeIntent::Cleared;
         assert_eq!(
-            inst.terminal_context_resume(),
+            inst.terminal_context_resume_cached(),
             TerminalContextResume::ForcedFresh
         );
         inst.resume_intent = ResumeIntent::Fork { from: sid.clone() };
         assert_eq!(
-            inst.terminal_context_resume(),
+            inst.terminal_context_resume_cached(),
             TerminalContextResume::ForkPending
         );
 
         inst.tool = "cursor".to_string();
         assert_eq!(
-            inst.terminal_context_resume(),
+            inst.terminal_context_resume_cached(),
             TerminalContextResume::AgentUnsupported
         );
 
@@ -3369,7 +3371,7 @@ mod tests {
             for target in [None, Some(sid.clone())] {
                 inst.agent_session_id = target;
                 assert_eq!(
-                    inst.terminal_context_resume(),
+                    inst.terminal_context_resume_cached(),
                     TerminalContextResume::SandboxUnsupported,
                     "{tool} must start fresh in a sandbox"
                 );

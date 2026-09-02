@@ -31,64 +31,13 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T | null> 
 
 // --- Sessions ---
 
-export type ContextResumeAvailability =
-  | { state: "available" }
-  | { state: "indeterminate"; reason: "runtime_check_required" | "agent_handshake_required" }
-  | {
-      state: "unavailable";
-      reason:
-        | "agent_unsupported"
-        | "sandbox_unsupported"
-        | "forced_fresh"
-        | "invalid_target"
-        | "fork_pending"
-        | "previous_failure"
-        | "no_target";
-    };
-
-export type AttachAvailability =
-  | { state: "available"; transport: "acp_websocket_v1" | "terminal_websocket_v1" }
-  | { state: "unavailable"; reason: "client_missing_transport" };
-
-export interface SessionInteraction {
-  context_resume: ContextResumeAvailability;
-  attach: AttachAvailability;
-}
-
 export interface SessionsEnvelope {
   sessions: SessionResponse[];
   workspace_ordering: string[];
-  session_interactions: Record<string, SessionInteraction>;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isContextResumeAvailability(value: unknown): value is ContextResumeAvailability {
-  if (!isRecord(value) || typeof value.state !== "string") return false;
-  if (value.state === "available") return true;
-  if (value.state === "indeterminate") {
-    return value.reason === "runtime_check_required" || value.reason === "agent_handshake_required";
-  }
-  if (value.state !== "unavailable") return false;
-  return [
-    "agent_unsupported",
-    "sandbox_unsupported",
-    "forced_fresh",
-    "invalid_target",
-    "fork_pending",
-    "previous_failure",
-    "no_target",
-  ].includes(value.reason as string);
-}
-
-function isAttachAvailability(value: unknown): value is AttachAvailability {
-  if (!isRecord(value) || typeof value.state !== "string") return false;
-  if (value.state === "available") {
-    return value.transport === "acp_websocket_v1" || value.transport === "terminal_websocket_v1";
-  }
-  return value.state === "unavailable" && value.reason === "client_missing_transport";
 }
 
 function decodeSessionsEnvelope(value: unknown): SessionsEnvelope | null {
@@ -96,8 +45,7 @@ function decodeSessionsEnvelope(value: unknown): SessionsEnvelope | null {
     !isRecord(value) ||
     !Array.isArray(value.sessions) ||
     !Array.isArray(value.workspace_ordering) ||
-    !value.workspace_ordering.every((id) => typeof id === "string") ||
-    !isRecord(value.session_interactions)
+    !value.workspace_ordering.every((id) => typeof id === "string")
   ) {
     return null;
   }
@@ -106,25 +54,11 @@ function decodeSessionsEnvelope(value: unknown): SessionsEnvelope | null {
     if (!isRecord(session) || typeof session.id !== "string" || ids.has(session.id)) return null;
     ids.add(session.id);
   }
-  for (const [id, interaction] of Object.entries(value.session_interactions)) {
-    if (
-      !isRecord(interaction) ||
-      !isContextResumeAvailability(interaction.context_resume) ||
-      !isAttachAvailability(interaction.attach)
-    ) {
-      return null;
-    }
-    if (ids.has(id)) ids.delete(id);
-  }
-  if (ids.size !== 0) return null;
   return value as unknown as SessionsEnvelope;
 }
 
 export async function fetchSessions(): Promise<SessionsEnvelope | null> {
-  const value = await fetchJson<unknown>("/api/sessions", {
-    headers: { "X-Aoe-Client-Capabilities": "acp_ws_v1,terminal_ws_v1" },
-  });
-  return decodeSessionsEnvelope(value);
+  return decodeSessionsEnvelope(await fetchJson<unknown>("/api/sessions"));
 }
 
 export interface ConversationSearchHit {

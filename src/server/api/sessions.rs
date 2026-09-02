@@ -181,6 +181,7 @@ pub struct SessionResponse {
     /// pick the structured panels vs the terminal view.
     #[serde(default, skip_serializing_if = "crate::session::View::is_terminal")]
     pub view: crate::session::View,
+    pub context_resume: ContextResumeAvailability,
     /// Live structured view worker lifecycle. `absent` for tmux sessions or
     /// structured view sessions whose worker has not been spawned/attached
     /// yet; `resuming` while the reconciler is mid-spawn or mid-attach;
@@ -431,6 +432,7 @@ impl SessionResponse {
             notify_on_idle: inst.notify_on_idle,
             notify_on_error: inst.notify_on_error,
             view: inst.view,
+            context_resume: context_resume_for(inst),
             queued_prompts: {
                 let mut q = inst.queued_prompts.clone();
                 q.sort_by_key(|e| e.seq);
@@ -599,21 +601,11 @@ pub enum AttachAvailability {
     Unavailable { reason: AttachUnavailableReason },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionInteraction {
-    pub context_resume: ContextResumeAvailability,
-    pub attach: AttachAvailability,
-}
-// Envelope for `GET /api/sessions`. Wraps the sessions list with the
-// user's persisted workspace ordering so the client can render the
-// sidebar in the requested order on the first paint, with no extra
-// round-trip. The order is a list of workspace ids; ids not present
-// fall back to the client's default newest-first ordering. See #1169.
 #[derive(serde::Serialize)]
 pub struct SessionsEnvelope {
     pub sessions: Vec<SessionResponse>,
     pub workspace_ordering: Vec<String>,
-    pub session_interactions: BTreeMap<String, SessionInteraction>,
+    pub session_attach: BTreeMap<String, AttachAvailability>,
 }
 
 /// Process-wide built-in ACP registry, built once. Used to compute
@@ -775,7 +767,7 @@ fn context_resume_for(inst: &Instance) -> ContextResumeAvailability {
         };
     }
 
-    match inst.terminal_context_resume() {
+    match inst.terminal_context_resume_cached() {
         TerminalContextResume::Available => ContextResumeAvailability::Available,
         TerminalContextResume::RuntimeCheckRequired => ContextResumeAvailability::Indeterminate {
             reason: ContextResumeIndeterminateReason::RuntimeCheckRequired,
@@ -804,11 +796,8 @@ fn context_resume_for(inst: &Instance) -> ContextResumeAvailability {
     }
 }
 
-fn interaction_for(
-    inst: &Instance,
-    capabilities: RequestedClientCapabilities,
-) -> SessionInteraction {
-    let attach = match inst.view {
+fn attach_for(inst: &Instance, capabilities: RequestedClientCapabilities) -> AttachAvailability {
+    match inst.view {
         crate::session::View::Structured if capabilities.acp_websocket_v1 => {
             AttachAvailability::Available {
                 transport: AttachTransport::AcpWebsocketV1,
@@ -822,10 +811,6 @@ fn interaction_for(
         _ => AttachAvailability::Unavailable {
             reason: AttachUnavailableReason::ClientMissingTransport,
         },
-    };
-    SessionInteraction {
-        context_resume: context_resume_for(inst),
-        attach,
     }
 }
 
@@ -866,9 +851,9 @@ pub async fn list_sessions(
         .filter(|inst| !state.cityhall_mode || inst.is_structured())
         .filter(|inst| crate::session::SessionScope::matches(query.state, inst))
         .collect();
-    let session_interactions: BTreeMap<String, SessionInteraction> = scoped_instances
+    let session_attach: BTreeMap<String, AttachAvailability> = scoped_instances
         .iter()
-        .map(|inst| (inst.id.clone(), interaction_for(inst, capabilities)))
+        .map(|inst| (inst.id.clone(), attach_for(inst, capabilities)))
         .collect();
     let mut sessions: Vec<SessionResponse> = scoped_instances
         .iter()
@@ -1107,7 +1092,7 @@ pub async fn list_sessions(
         Json(SessionsEnvelope {
             sessions,
             workspace_ordering,
-            session_interactions,
+            session_attach,
         })
         .into_response(),
     )
@@ -8035,39 +8020,37 @@ mod tests {
     }
 
     #[test]
-    fn interaction_projection_separates_context_resume_from_attach() {
+    fn projections_separate_context_resume_from_attach() {
         let mut structured = Instance::new("structured", "/tmp/structured");
         structured.view = crate::session::View::Structured;
-        let no_transport = interaction_for(&structured, RequestedClientCapabilities::default());
         assert_eq!(
-            no_transport.context_resume,
+            context_resume_for(&structured),
             ContextResumeAvailability::Unavailable {
                 reason: ContextResumeUnavailableReason::NoTarget,
             }
         );
         assert_eq!(
-            no_transport.attach,
+            attach_for(&structured, RequestedClientCapabilities::default()),
             AttachAvailability::Unavailable {
                 reason: AttachUnavailableReason::ClientMissingTransport,
             }
         );
 
         structured.acp_session_id = Some("opaque-server-target".to_string());
-        let acp = interaction_for(
-            &structured,
-            RequestedClientCapabilities {
-                acp_websocket_v1: true,
-                terminal_websocket_v1: false,
-            },
-        );
         assert_eq!(
-            acp.context_resume,
+            context_resume_for(&structured),
             ContextResumeAvailability::Indeterminate {
                 reason: ContextResumeIndeterminateReason::AgentHandshakeRequired,
             }
         );
         assert_eq!(
-            acp.attach,
+            attach_for(
+                &structured,
+                RequestedClientCapabilities {
+                    acp_websocket_v1: true,
+                    terminal_websocket_v1: false,
+                },
+            ),
             AttachAvailability::Available {
                 transport: AttachTransport::AcpWebsocketV1,
             }
@@ -8083,34 +8066,26 @@ mod tests {
 
         let mut terminal = Instance::new("terminal", "/tmp/terminal");
         terminal.tool = "claude".to_string();
-        let projected = interaction_for(
-            &terminal,
-            RequestedClientCapabilities {
-                acp_websocket_v1: false,
-                terminal_websocket_v1: true,
-            },
-        );
+        terminal.agent_session_id = Some("terminal-context".to_string());
         assert_eq!(
-            projected.context_resume,
+            context_resume_for(&terminal),
             ContextResumeAvailability::Indeterminate {
                 reason: ContextResumeIndeterminateReason::RuntimeCheckRequired,
             }
         );
         assert_eq!(
-            projected.attach,
+            attach_for(
+                &terminal,
+                RequestedClientCapabilities {
+                    acp_websocket_v1: false,
+                    terminal_websocket_v1: true,
+                },
+            ),
             AttachAvailability::Available {
                 transport: AttachTransport::TerminalWebsocketV1,
             }
         );
     }
-
-    /// `remove_instance` is the only way a row leaves `state.instances` on the
-    /// delete path, so the epoch bump has to be tied to an actual removal
-    /// rather than to reaching the call. Bumping unconditionally would spend
-    /// an epoch on the final commit block after the structured purge's early
-    /// removal already took the row, dropping a reload that was perfectly
-    /// valid; not bumping at all leaves the window a stale reload uses to put
-    /// a deleted row back.
     #[test]
     fn remove_instance_bumps_the_epoch_only_when_it_removes_a_row() {
         let epoch = std::sync::atomic::AtomicU64::new(0);
@@ -12342,6 +12317,9 @@ mod workspace_ordering_tests {
             notify_on_idle: None,
             notify_on_error: None,
             view: crate::session::View::Terminal,
+            context_resume: ContextResumeAvailability::Unavailable {
+                reason: ContextResumeUnavailableReason::NoTarget,
+            },
             acp_worker_state: crate::acp::supervisor::AcpWorkerState::Absent,
             queued_prompts: Vec::new(),
             acp_capable: false,

@@ -107,95 +107,25 @@ function bodyOf(init: RequestInit | undefined): unknown {
 // Sessions
 
 describe("fetchSessions", () => {
-  const available = {
-    context_resume: { state: "available" },
-    attach: { state: "available", transport: "acp_websocket_v1" },
-  };
-
-  it("negotiates transports and returns a validated envelope", async () => {
+  it("returns the base envelope without negotiating unused interaction metadata", async () => {
     const env = {
       sessions: [{ id: "s1" }],
       workspace_ordering: ["s1"],
-      session_interactions: { s1: available, extra: available },
+      session_attach: { s1: { state: "available", transport: "future_ws" } },
     };
     fetchSpy.mockResolvedValueOnce(jsonResponse(env));
+
     expect(await fetchSessions()).toEqual(env);
-    const [url, init] = lastCall();
-    expect(url).toBe("/api/sessions");
-    expect(init?.headers).toEqual({ "X-Aoe-Client-Capabilities": "acp_ws_v1,terminal_ws_v1" });
+    expect(lastCall()).toEqual(["/api/sessions", undefined]);
   });
 
   it.each([
-    {
-      name: "runtime-gated resume with terminal attach",
-      interaction: {
-        context_resume: { state: "indeterminate", reason: "runtime_check_required" },
-        attach: { state: "available", transport: "terminal_websocket_v1" },
-      },
-    },
-    {
-      name: "handshake-gated resume without an attach transport",
-      interaction: {
-        context_resume: { state: "indeterminate", reason: "agent_handshake_required" },
-        attach: { state: "unavailable", reason: "client_missing_transport" },
-      },
-    },
-    {
-      name: "unavailable resume with ACP attach",
-      interaction: {
-        context_resume: { state: "unavailable", reason: "no_target" },
-        attach: available.attach,
-      },
-    },
-  ])("accepts $name", async ({ interaction }) => {
-    const env = {
-      sessions: [{ id: "s1" }],
-      workspace_ordering: ["s1"],
-      session_interactions: { s1: interaction },
-    };
-    fetchSpy.mockResolvedValueOnce(jsonResponse(env));
-    expect(await fetchSessions()).toEqual(env);
-  });
-
-  it.each([
-    { sessions: [{ id: "s1" }], workspace_ordering: [], session_interactions: {} },
-    {
-      sessions: [{ id: "s1" }],
-      workspace_ordering: [],
-      session_interactions: { s1: { context_resume: null, attach: available.attach } },
-    },
-    {
-      sessions: [{ id: "s1" }],
-      workspace_ordering: [],
-      session_interactions: {
-        s1: { context_resume: { state: "new_state" }, attach: available.attach },
-      },
-    },
-    {
-      sessions: [{ id: "s1" }],
-      workspace_ordering: [],
-      session_interactions: { s1: { context_resume: available.context_resume, attach: null } },
-    },
-    {
-      sessions: [{ id: "s1" }, { id: "s1" }],
-      workspace_ordering: [],
-      session_interactions: { s1: available },
-    },
-    {
-      sessions: [{ id: "s1" }],
-      workspace_ordering: [],
-      session_interactions: {
-        s1: { context_resume: { state: "unavailable", reason: "new_reason" }, attach: available.attach },
-      },
-    },
-    {
-      sessions: [{ id: "s1" }],
-      workspace_ordering: [],
-      session_interactions: {
-        s1: { context_resume: available.context_resume, attach: { state: "available", transport: "new_ws" } },
-      },
-    },
-  ])("rejects malformed interaction contracts", async (body) => {
+    null,
+    { sessions: null, workspace_ordering: [] },
+    { sessions: [], workspace_ordering: [1] },
+    { sessions: [{}], workspace_ordering: [] },
+    { sessions: [{ id: "s1" }, { id: "s1" }], workspace_ordering: [] },
+  ])("rejects malformed base envelopes %#", async (body) => {
     fetchSpy.mockResolvedValueOnce(jsonResponse(body));
     expect(await fetchSessions()).toBeNull();
   });
