@@ -1360,9 +1360,9 @@ pub async fn acp_prompt(
     // back `agent_busy` after its queue row was already retired (#3621).
     // `woke_idle_dormant` is passed rather than re-read: the wake above
     // already cleared the marker, so the instance now says "awake".
-    let Some((_submission, dispatch)) = state
+    let Ok((_submission, dispatch)) = state
         .session_service
-        .begin_prompt_submission(&id, woke_idle_dormant)
+        .begin_prompt_submission(&SessionCaller::User, &id, woke_idle_dormant)
         .await
     else {
         return (StatusCode::NOT_FOUND, "session not found").into_response();
@@ -1518,9 +1518,9 @@ pub async fn acp_prompt_diff_comments(
     // This opens a turn (`UserDiffCommentsPrompt` folds to `turn_active`) just
     // as an ordinary prompt does, so it takes the same submission authority
     // and settles the same disposition under it (#3621, #3649).
-    let Some((_submission, dispatch)) = state
+    let Ok((_submission, dispatch)) = state
         .session_service
-        .begin_prompt_submission(&id, woke_idle_dormant)
+        .begin_prompt_submission(&SessionCaller::User, &id, woke_idle_dormant)
         .await
     else {
         return (StatusCode::NOT_FOUND, "session not found").into_response();
