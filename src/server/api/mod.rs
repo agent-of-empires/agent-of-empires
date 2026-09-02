@@ -10,11 +10,8 @@
 
 pub(super) use super::AppState;
 
-#[cfg(feature = "serve")]
 mod acp;
-#[cfg(feature = "serve")]
 mod client_log;
-#[cfg(feature = "serve")]
 mod file_provenance;
 mod git;
 mod log_level;
@@ -22,16 +19,13 @@ mod mcp;
 pub(crate) mod plugin_settings;
 pub mod plugins;
 mod projects;
-#[cfg(feature = "serve")]
 mod queue;
 pub(crate) mod sessions;
 mod skills;
 pub(crate) mod system;
 mod telemetry;
 
-#[cfg(feature = "serve")]
 pub(crate) use acp::structured_spawn_error_message;
-#[cfg(feature = "serve")]
 pub use acp::{
     acp_attachment, acp_cancel, acp_context_primer, acp_disable, acp_enable, acp_files,
     acp_force_end_turn, acp_prompt, acp_prompt_diff_comments, acp_replay, acp_set_config_option,
@@ -40,10 +34,8 @@ pub use acp::{
     switch_acp_agent,
 };
 
-#[cfg(feature = "serve")]
 pub use queue::{queue_clear, queue_edit, queue_enqueue, queue_list, queue_remove};
 
-#[cfg(feature = "serve")]
 pub use client_log::post_client_log;
 pub use git::{clone_repo, is_git_repo, list_branches};
 pub use log_level::{get_log_level, patch_log_level};
@@ -73,10 +65,8 @@ pub use skills::{
 // Shared by the status poll loop's auto-unread persistence; not a route handler.
 pub(crate) use sessions::persist_session_update;
 // Trash retention sweep, driven by the daemon's hourly loop; not a route handler.
-#[cfg(feature = "serve")]
 pub(crate) use sessions::purge_expired_trash;
 // Startup backfill that relocates trashed worktrees; not a route handler.
-#[cfg(feature = "serve")]
 pub(crate) use sessions::{reconcile_trashed_worktrees, reconcile_worktree_paths};
 pub use system::{
     browse_filesystem, create_profile, default_profile, delete_profile, dismiss_update,

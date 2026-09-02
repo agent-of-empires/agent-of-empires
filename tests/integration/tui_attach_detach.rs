@@ -117,42 +117,44 @@ fn test_session_name_format() {
     assert!(!session_name.contains('.'));
 }
 
-/// The TUI live-send resize path must size the pane through
-/// `Session::resize_window` (which adds the status-bar chrome back so the pane
-/// lands at exactly the requested rows, #2766), not a raw `resize-window` that
-/// ignores chrome. A raw resize leaves the live pane a row short of the preview
-/// output area whenever a client reserves the status row, desyncing the live
-/// preview by a row (#2742). Behavioral coverage is unreliable here because
-/// `resize-window` is a no-op / reports chrome 0 on a detached, client-less
-/// tmux on some builds (see the dropped convergence test in #2766); the
-/// chrome math itself is unit-tested by `chrome_rows_*`. This guards the
-/// wiring so it can't silently regress to the raw path.
+/// The TUI live-send resize path must queue geometry through `LiveSendWorker`.
+/// The worker dispatches through `Session::resize_window_if_owner`, preserving
+/// chrome-aware sizing while fencing ownership in tmux's command queue (#2766).
+/// A synchronous prep resize races the worker's ownership claim; a raw
+/// `resize-window` also ignores chrome and leaves the pane a row short (#2742).
+/// The chrome math and worker behavior have direct tests; this guards the
+/// cross-module wiring.
 #[test]
 fn test_live_send_resize_uses_chrome_aware_resize_window() {
-    // Worker dispatch (the `TmuxAction::Resize` arm).
     let dispatch =
         std::fs::read_to_string("src/tui/home/live_send.rs").expect("Failed to read live_send.rs");
     let body = app_method_body(&dispatch, "dispatch_via_fork");
     assert!(
-        body.contains("resize_window("),
-        "dispatch_via_fork must resize through Session::resize_window (chrome-aware, #2766)"
+        body.contains("resize_window_if_owner("),
+        "dispatch_via_fork must use the guarded chrome-aware resize path (#2766)"
     );
     assert!(
         !body.contains("\"resize-window\""),
-        "dispatch_via_fork must not run a raw `resize-window`, which ignores status-bar chrome (#2742)"
+        "dispatch_via_fork must not run a raw resize-window (#2742)"
     );
 
-    // Live-send entry sync (`finalize_live_send_resize`).
-    let home = std::fs::read_to_string("src/tui/home/live_send_prep.rs")
-        .expect("Failed to read home/live_send_prep.rs");
-    let finalize = app_method_body(&home, "finalize_live_send_resize");
+    let render =
+        std::fs::read_to_string("src/tui/home/render.rs").expect("Failed to read render.rs");
+    let reconcile = app_method_body(&render, "resize_live_pane_if_target");
     assert!(
-        finalize.contains("resize_window("),
-        "finalize_live_send_resize must resize through Session::resize_window (chrome-aware, #2766)"
+        reconcile.contains("worker.resize(width, height)"),
+        "render must queue settled geometry through LiveSendWorker"
     );
     assert!(
-        !finalize.contains("\"resize-window\""),
-        "finalize_live_send_resize must not run a raw `resize-window` (#2742)"
+        !reconcile.contains("resize_window("),
+        "render must not synchronously resize on the paint path"
+    );
+
+    let prep = std::fs::read_to_string("src/tui/home/live_send_prep.rs")
+        .expect("Failed to read home/live_send_prep.rs");
+    assert!(
+        !prep.contains("resize_window("),
+        "live-send preparation must leave post-draw resize ownership to the worker"
     );
 }
 

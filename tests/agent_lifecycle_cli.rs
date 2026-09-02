@@ -5,7 +5,7 @@
 //! isolated HOME:
 //!
 //! - `aoe agents` lists the deprecation notice under gemini;
-//! - `aoe acp doctor` (serve build) emits the notice line in text mode;
+//! - `aoe acp doctor` emits the notice line in text mode;
 //! - `aoe add` emits exactly one non-blocking warning after every built-in
 //!   resolution path, including default tools and command overrides.
 //!
@@ -129,7 +129,6 @@ fn aoe_agents_lists_deprecated_notice() {
     assert_eq!(stdout.matches("deprecated since").count(), 1, "{stdout}");
 }
 
-#[cfg(feature = "serve")]
 #[test]
 fn acp_doctor_text_emits_amber_lifecycle_notice() {
     let (_tmp, home, xdg) = isolated_dirs();

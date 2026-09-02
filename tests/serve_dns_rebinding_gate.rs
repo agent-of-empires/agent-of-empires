@@ -8,8 +8,6 @@
 //! unauthenticated, non-loopback request). Mirrors the harness style of
 //! `serve_disk_reload_helper_equivalence.rs` via `build_test_app_state*`.
 
-#![cfg(feature = "serve")]
-
 use agent_of_empires::server::test_support::{
     build_router_for_test, build_test_app_state_with_policy,
 };

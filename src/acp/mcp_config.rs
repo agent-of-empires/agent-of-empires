@@ -2,8 +2,8 @@
 //!
 //! Parsing, layering, provenance, and the precedence merge all live in the
 //! always-compiled `session::mcp_model` resolver, which the unified management
-//! surface (#1996), the CLI, and the TUI also read. This serve-gated module is
-//! the thin edge that converts the resolver's winning set into ACP `McpServer`
+//! surface (#1996), the CLI, and the TUI also read. This module is the thin
+//! edge that converts the resolver's winning set into ACP `McpServer`
 //! wire values and drops any transport the agent did not advertise. Sharing one
 //! resolver across forwarding and display guarantees what the user sees equals
 //! what the agent receives.

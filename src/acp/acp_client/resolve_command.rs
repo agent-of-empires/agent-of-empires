@@ -108,7 +108,6 @@ pub(super) fn bundled_resolution(
 /// True when `path` reports a version below the adapter's startup floor.
 /// Conservative: any probe failure or unparseable output returns false, so
 /// an unknown version keeps the user's own copy rather than overriding it.
-#[cfg(feature = "serve")]
 pub(super) fn path_copy_below_floor(command: &str, path: &std::path::Path) -> bool {
     let Some(gate) = crate::acp::agent_compat::version_gate_for(
         crate::acp::agent_compat::ExpectedAgent::from_command(command),
@@ -132,7 +131,6 @@ pub(super) fn path_copy_below_floor(command: &str, path: &std::path::Path) -> bo
 /// otherwise block session spawn forever. It mirrors `version_probe`'s 2s
 /// budget; any failure or timeout yields `None` so the caller keeps the
 /// user's own copy.
-#[cfg(feature = "serve")]
 pub(super) fn probe_version_bounded(path: &std::path::Path) -> Option<String> {
     const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
@@ -172,11 +170,6 @@ pub(super) fn probe_version_bounded(path: &std::path::Path) -> Option<String> {
             Err(_) => return None,
         }
     }
-}
-
-#[cfg(not(feature = "serve"))]
-pub(super) fn path_copy_below_floor(_command: &str, _path: &std::path::Path) -> bool {
-    false
 }
 
 pub(super) fn find_in_path_env(binary: &str) -> Option<std::path::PathBuf> {
@@ -285,7 +278,7 @@ mod tests {
     /// A hanging adapter must not block session spawn: the probe has to give
     /// up on its deadline and report nothing, so the caller keeps the user's
     /// copy rather than waiting forever.
-    #[cfg(all(unix, feature = "serve"))]
+    #[cfg(unix)]
     #[test]
     fn probe_version_bounded_gives_up_on_a_hanging_binary() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -303,7 +296,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(unix, feature = "serve"))]
+    #[cfg(unix)]
     #[test]
     fn probe_version_bounded_reads_version_output() {
         let dir = tempfile::TempDir::new().unwrap();

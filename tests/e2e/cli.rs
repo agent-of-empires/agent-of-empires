@@ -2273,7 +2273,6 @@ fn test_cli_session_show_json_reports_archived_and_precedence() {
 /// present but below-floor reads `[!! ]` with remediation instead of
 /// `[OK]`. Deleting the probe call from the listing loop fails here even
 /// though every unit-level decision test stays green.
-#[cfg(feature = "serve")]
 #[test]
 #[parallel]
 fn test_cli_acp_doctor_flags_below_floor_adapter() {
@@ -2303,7 +2302,6 @@ fn test_cli_acp_doctor_flags_below_floor_adapter() {
 
 /// Seed the pinned-bundle location `bundled_adapter_bin` resolves, with
 /// a fixture reporting `version`.
-#[cfg(feature = "serve")]
 fn seed_bundled_fixture(h: &TuiTestHarness, version: &str) {
     let bin = h.home_path().join(
         ".config/agent-of-empires-dev/acp-worker/adapters/claude-agent-acp/node_modules/.bin",
@@ -2323,7 +2321,6 @@ fn seed_bundled_fixture(h: &TuiTestHarness, version: &str) {
 /// because spawn switches to the bundle below-floor. This is the only
 /// end-to-end view of `bundled_copy_installed` +
 /// `bundled_copy_meets_floor`: unit tests inject that flag directly.
-#[cfg(feature = "serve")]
 #[test]
 #[parallel]
 fn test_cli_acp_doctor_compliant_bundle_silences_stale_path() {
@@ -2350,7 +2347,6 @@ fn test_cli_acp_doctor_compliant_bundle_silences_stale_path() {
 /// The mirror case: an installed but STALE pinned copy (below today's
 /// floor) must not silence the listing, since spawn picks it over the
 /// stale PATH copy and validate() rejects its handshake.
-#[cfg(feature = "serve")]
 #[test]
 #[parallel]
 fn test_cli_acp_doctor_stale_bundle_keeps_flagging() {
@@ -2378,7 +2374,6 @@ fn test_cli_acp_doctor_stale_bundle_keeps_flagging() {
 /// probe, so the pinned copy itself decides the verdict: compliant
 /// reads `[OK]`, stale reads `[!! ]` naming the bundled version. This
 /// is the stranded-pin cell after a floor bump.
-#[cfg(feature = "serve")]
 #[test]
 #[parallel]
 fn test_cli_acp_doctor_bundle_only_judged_by_pinned_copy() {

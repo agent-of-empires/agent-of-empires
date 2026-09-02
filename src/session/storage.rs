@@ -5122,15 +5122,14 @@ mod tests {
         for case in ["duplicate-ids", "aliased-endpoints"] {
             let (_temp, _guard, source, target, before, _after) = setup_recovery_env(case)?;
             let mut entry = fresh_journal_entry(&source, &target, &before.id);
-            let stores: Vec<(&str, &Storage)>;
-            if case == "duplicate-ids" {
+            let stores: Vec<(&str, &Storage)> = if case == "duplicate-ids" {
                 entry.ids.push(before.id.clone());
-                stores = vec![(source.profile(), &source), (target.profile(), &target)];
+                vec![(source.profile(), &source), (target.profile(), &target)]
             } else {
                 entry.target_profile = source.profile().to_string();
                 entry.target_sessions_path = source.sessions_path().to_path_buf();
-                stores = vec![(source.profile(), &source)];
-            }
+                vec![(source.profile(), &source)]
+            };
             let journal_path = super::super::move_journal::record(&entry, source.sessions_path())?;
 
             let outcome = if case == "duplicate-ids" {

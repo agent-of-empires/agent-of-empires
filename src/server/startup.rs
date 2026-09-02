@@ -266,9 +266,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         None
     };
 
-    #[cfg(feature = "serve")]
     let acp_events_tx = broadcast::channel(ACP_CHANNEL_CAPACITY).0;
-    #[cfg(feature = "serve")]
     let acp_event_store = {
         let app_dir = crate::session::get_app_dir().context("acp event store: resolve app dir")?;
         let db_path = app_dir.join("acp_events.db");
@@ -277,9 +275,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
                 .context("acp event store: open")?,
         )
     };
-    #[cfg(feature = "serve")]
     let acp_control_cache = Arc::new(crate::acp::control_cache::ControlStateCache::new());
-    #[cfg(feature = "serve")]
     let acp_supervisor = {
         // Approval pushes are dispatched from `acp_event_listener`,
         // which subscribes to the broadcast that ChannelSink::publish
@@ -312,7 +308,6 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     let idempotency_locks = Arc::new(RwLock::new(std::collections::HashMap::new()));
     let telemetry_session_creates = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let mutation_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    #[cfg(feature = "serve")]
     let session_service = Arc::new(session_service::SessionService::new(
         Arc::clone(&instances),
         Arc::clone(&instance_locks),
@@ -325,19 +320,10 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             control_cache: acp_control_cache.clone(),
         },
     ));
-    #[cfg(not(feature = "serve"))]
-    let session_service = Arc::new(session_service::SessionService::new(
-        Arc::clone(&instances),
-        Arc::clone(&instance_locks),
-        Arc::clone(&file_watch),
-        Arc::clone(&telemetry_session_creates),
-        Arc::clone(&mutation_epoch),
-    ));
 
     // the daemon serves fine without plugin workers.
     // The host API includes mutating session.meta.set/cas, so a read-only
     // daemon must not run plugin workers at all: gate the host on !read_only.
-    #[cfg(feature = "serve")]
     let plugin_host = if read_only {
         tracing::info!(target: "plugin.host", "plugin host disabled in read-only serve mode");
         None
@@ -531,11 +517,17 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             vec![(IpKind::Loopback, make_url(host))]
         };
 
-        println!("aoe web dashboard running at:");
+        // A build without the dashboard bundle still serves the API, so the
+        // banner must not promise a page that is not there.
+        if cfg!(feature = "web") {
+            println!("aoe web dashboard running at:");
+        } else {
+            println!("aoe daemon running at (API only, no dashboard bundle):");
+        }
         for (_, u) in &labeled_urls {
             println!("  {}", u);
         }
-        if auth_token.is_some() {
+        if auth_token.is_some() && cfg!(feature = "web") {
             println!();
             println!(
                 "Open any URL above in a browser. Share it to access from other devices on your network."
@@ -543,8 +535,14 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         }
 
         if open_browser && !is_daemon {
-            if let Some((_, primary)) = labeled_urls.first() {
-                maybe_open_browser(primary);
+            if cfg!(feature = "web") {
+                if let Some((_, primary)) = labeled_urls.first() {
+                    maybe_open_browser(primary);
+                }
+            } else {
+                // Opening a browser on an API-only daemon lands on a 404. Say
+                // so rather than dropping the flag on the floor.
+                eprintln!("--open ignored: this build has no dashboard bundle");
             }
         }
 
@@ -640,15 +638,10 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         remote_owner_cache: RwLock::new(std::collections::HashMap::new()),
         changed_files_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
         status_tx: broadcast::channel(STATUS_CHANNEL_CAPACITY).0,
-        #[cfg(feature = "serve")]
         acp_events_tx: acp_events_tx.clone(),
-        #[cfg(feature = "serve")]
         acp_event_store: acp_event_store.clone(),
-        #[cfg(feature = "serve")]
         acp_control_cache: acp_control_cache.clone(),
-        #[cfg(feature = "serve")]
         acp_supervisor: acp_supervisor.clone(),
-        #[cfg(feature = "serve")]
         plugin_host: plugin_host.clone(),
         plugin_jobs: Arc::new(api::plugins::PluginJobRegistry::new()),
         push: push_state,
@@ -879,7 +872,6 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // Launch plugin workers for every active plugin that declares a runtime.
     // Non-blocking: each worker runs in its own supervised task. A daemon with
     // no community plugin workers (the common case) does nothing here.
-    #[cfg(feature = "serve")]
     if let Some(host) = state.plugin_host.clone() {
         host.start(&crate::plugin::registry()).await;
     }
@@ -1050,7 +1042,6 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         shutdown_state.shutdown.cancel();
         // Reap plugin workers before the force-exit deadline so no worker tree
         // is left behind when the daemon stops.
-        #[cfg(feature = "serve")]
         if let Some(host) = shutdown_state.plugin_host.clone() {
             host.shutdown().await;
         }

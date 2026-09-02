@@ -11,7 +11,6 @@
 //! convert it to a GIF via `agg`. Recordings are saved to
 //! `target/e2e-recordings/`. Both `asciinema` and `agg` must be on `$PATH`.
 
-#[cfg(feature = "serve")]
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -122,19 +121,27 @@ macro_rules! require_tmux {
 }
 pub(crate) use require_tmux;
 
-#[cfg(feature = "serve")]
-pub fn node_available() -> bool {
-    Command::new("node")
-        .arg("--version")
+/// Resolve Node before the daemon drops host launcher state. PATH shims such as
+/// Volta can recurse when invoked inside the worker's filtered environment.
+fn node_executable() -> Option<PathBuf> {
+    let output = Command::new("node")
+        .args(["-p", "process.execPath"])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
+    path.is_file().then_some(path)
+}
+
+pub fn node_available() -> bool {
+    node_executable().is_some()
 }
 
 /// Skip the calling test if Node.js is not installed. Acp e2e tests
 /// drive the shared `web/tests/helpers/fakeAcpAgent.mjs` fake agent, which
 /// is a Node script; without Node the worker can't speak ACP.
-#[cfg(feature = "serve")]
 macro_rules! require_node {
     () => {
         if !$crate::harness::node_available() {
@@ -143,7 +150,6 @@ macro_rules! require_node {
         }
     };
 }
-#[cfg(feature = "serve")]
 pub(crate) use require_node;
 
 // ---------------------------------------------------------------------------
@@ -161,7 +167,6 @@ pub(crate) use require_node;
 /// whichever daemon lost. Remembering what we have already issued closes the
 /// in-process half of the race; the ephemeral bind still covers ports taken by
 /// unrelated processes.
-#[cfg(feature = "serve")]
 pub fn pick_free_port() -> u16 {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
@@ -185,7 +190,6 @@ pub fn pick_free_port() -> u16 {
 /// `aoe serve --daemon` returns as soon as it has spawned the child, so a
 /// successful exit doesn't prove the child bound the port; this is the
 /// real signal that the daemon is up.
-#[cfg(feature = "serve")]
 pub fn wait_for_port(port: u16, timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
@@ -465,6 +469,7 @@ last_seen_version = "{}"
             fake_agent.display()
         );
         let debug_log = app_dir_in(self.home_dir.path()).join("fake-acp.log");
+        let node = node_executable().expect("resolve Node.js executable");
         // Bake the fork-fail knob into the shim (not the daemon env) so it
         // survives the daemon's env_clear + allowlist when spawning the worker.
         let fork_fail_line = if self.acp_fork_fail {
@@ -479,11 +484,12 @@ last_seen_version = "{}"
             })
             .unwrap_or_default();
         let script = format!(
-            "#!/bin/sh\nexport FAKE_ACP_SCRIPT=\"{}\"\nexport FAKE_ACP_DEBUG_LOG=\"{}\"\n{}{}exec node \"{}\" \"$@\"\n",
+            "#!/bin/sh\nexport FAKE_ACP_SCRIPT=\"{}\"\nexport FAKE_ACP_DEBUG_LOG=\"{}\"\n{}{}exec \"{}\" \"{}\" \"$@\"\n",
             fake_acp_script.display(),
             debug_log.display(),
             fork_fail_line,
             capture_line,
+            node.display(),
             fake_agent.display(),
         );
         for name in ["claude", "claude-agent-acp", "aoe-agent"] {

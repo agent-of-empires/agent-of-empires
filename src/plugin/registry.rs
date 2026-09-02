@@ -57,13 +57,13 @@ pub struct BuiltinPlugin {
 }
 
 /// First-party plugins bundled with the binary. Deliberately minimal while the
-/// system is proven out: just the `aoe.web` dashboard marker (under `serve`).
+/// system is proven out: just the `aoe.web` dashboard marker (under `web`).
 /// More land as each piece is verified.
 pub static BUILTINS: &[BuiltinPlugin] = &[
-    // The web dashboard's management marker is present whenever the dashboard
-    // is compiled in (`feature = "serve"`), so serve and release builds always
-    // surface aoe.web; a TUI-only build has an empty builtin set.
-    #[cfg(feature = "serve")]
+    // The dashboard's management marker is present whenever the bundle is
+    // compiled in, so release builds always surface aoe.web; a build without
+    // `web` has an empty builtin set.
+    #[cfg(feature = "web")]
     BuiltinPlugin {
         manifest_toml: include_str!("../../plugins/aoe-web/aoe-plugin.toml"),
     },

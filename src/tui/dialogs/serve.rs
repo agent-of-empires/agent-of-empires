@@ -5,18 +5,12 @@
 //! `$APP_DIR/serve.{pid,url,log,mode}` files, and runs `aoe serve --stop`
 //! to tear down. The daemon survives across TUI quits, just like tmux
 //! sessions or the CLI-invoked daemon path.
-//!
-//! Only compiled with the `serve` feature, since the tunnel integration
-//! (and the qrcode crate it needs) lives there.
-#![cfg(feature = "serve")]
 
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent};
-use qrcode::render::unicode::Dense1x2;
-use qrcode::QrCode;
 use rand::prelude::IndexedRandom;
 use rand::RngExt;
 use ratatui::prelude::*;
@@ -1979,6 +1973,36 @@ fn looks_like_iso_year(s: &str) -> bool {
     matches!(iter.next(), Some('-'))
 }
 
+/// The scannable block for `url`, as terminal rows. Empty without the
+/// dashboard bundle: a phone that scanned it would reach no page.
+#[cfg(feature = "web")]
+fn render_qr(url: &str) -> String {
+    use qrcode::render::unicode::Dense1x2;
+    use qrcode::QrCode;
+
+    match QrCode::new(url.as_bytes()) {
+        Ok(code) => code
+            .render::<Dense1x2>()
+            .quiet_zone(true)
+            .dark_color(Dense1x2::Dark)
+            .light_color(Dense1x2::Light)
+            .build(),
+        Err(_) => String::from("(QR unavailable; use the URL below)"),
+    }
+}
+
+#[cfg(not(feature = "web"))]
+fn render_qr(_url: &str) -> String {
+    String::new()
+}
+
+/// Shown in place of the QR when the dashboard bundle is not embedded.
+const API_ONLY_NOTICE: &str =
+    "No dashboard bundle in this build: the URL serves the REST API only, and a browser gets a 404.";
+
+/// Rows [`API_ONLY_NOTICE`] needs once wrapped at a usable terminal width.
+const API_ONLY_ROWS: u16 = 2;
+
 #[allow(clippy::too_many_arguments)]
 fn render_active(
     frame: &mut Frame,
@@ -1999,16 +2023,7 @@ fn render_active(
     let url = &active_url.url;
     let kind_label = active_url.label.as_deref();
 
-    let qr_text = match QrCode::new(url.as_bytes()) {
-        Ok(code) => code
-            .render::<Dense1x2>()
-            .quiet_zone(true)
-            .dark_color(Dense1x2::Dark)
-            .light_color(Dense1x2::Light)
-            .build(),
-        Err(_) => String::from("(QR unavailable; use the URL below)"),
-    };
-
+    let qr_text = render_qr(url);
     let qr_lines: Vec<&str> = qr_text.lines().collect();
     let qr_height = qr_lines.len() as u16;
 
@@ -2046,11 +2061,15 @@ fn render_active(
         ServeMode::Local => "local",
         ServeMode::Tunnel => "tunnel",
     };
+    // Without the bundle this screen hands out an API endpoint, not a
+    // dashboard, so the title says which one the user is looking at.
+    let title = if cfg!(feature = "web") {
+        format!(" Remote Access ({mode_label})")
+    } else {
+        format!(" Remote API Access ({mode_label})")
+    };
     let mut header_spans = vec![
-        Span::styled(
-            format!(" Remote Access ({mode_label})"),
-            Style::default().fg(title_color).bold(),
-        ),
+        Span::styled(title, Style::default().fg(title_color).bold()),
         Span::styled(
             format!("  open {}", format_elapsed(elapsed)),
             Style::default().fg(theme.dimmed),
@@ -2072,9 +2091,16 @@ fn render_active(
     let show_passphrase = matches!(mode, ServeMode::Tunnel);
     let show_kind_label = kind_label.is_some();
     let show_split_token = !url_fits_one_line && split_token.is_some();
+    // No bundle means no QR (nothing would answer a scan) and a 404 for any
+    // browser that follows the URL, so the screen says what it is good for
+    // instead of presenting a bare address.
+    let show_api_only = !cfg!(feature = "web");
 
     // Calculate total content height for vertical centering.
     let mut inner_height: u16 = qr_height + 1 /* spacer */ + 1 /* url */;
+    if show_api_only {
+        inner_height += API_ONLY_ROWS;
+    }
     if show_kind_label {
         inner_height += 1;
     }
@@ -2089,6 +2115,9 @@ fn render_active(
 
     let mut constraints = vec![Constraint::Length(v_pad)]; // top padding
     constraints.push(Constraint::Length(qr_height));
+    if show_api_only {
+        constraints.push(Constraint::Length(API_ONLY_ROWS));
+    }
     constraints.push(Constraint::Length(1)); // spacer after QR
     if show_kind_label {
         constraints.push(Constraint::Length(1));
@@ -2121,6 +2150,17 @@ fn render_active(
         chunks[idx],
     );
     idx += 1;
+
+    if show_api_only {
+        frame.render_widget(
+            Paragraph::new(API_ONLY_NOTICE)
+                .style(Style::default().fg(theme.dimmed))
+                .wrap(Wrap { trim: true })
+                .alignment(Alignment::Center),
+            chunks[idx],
+        );
+        idx += 1;
+    }
 
     // Spacer after QR
     idx += 1;
@@ -2556,6 +2596,84 @@ const PASSPHRASE_WORDS: &[&str] = &[
     "motor", "mount", "mouse", "move", "movie", "much", "muffin", "mulch",
     "mule", "muse", "music", "mute", "myth",
 ];
+
+#[cfg(test)]
+mod qr_seam {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// Unicode half-blocks the QR renderer draws with. Their presence is the
+    /// only way to tell a rendered code from an empty panel.
+    const QR_GLYPHS: [char; 3] = ['\u{2588}', '\u{2580}', '\u{2584}'];
+
+    fn active_screen() -> String {
+        let urls = vec![ServeUrl {
+            label: Some("lan".to_string()),
+            url: "http://192.168.1.42:8080/?t=abc123def456".to_string(),
+        }];
+        let mut term = Terminal::new(TestBackend::new(72, 26)).expect("terminal");
+        term.draw(|f| {
+            render_active(
+                f,
+                f.area(),
+                &Theme::default(),
+                ServeMode::Local,
+                &urls,
+                0,
+                None,
+                std::time::Duration::from_secs(42),
+                None,
+            )
+        })
+        .expect("draw");
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The URL is what a user needs off this screen, so it must survive the
+    /// QR being compiled out. Without the dashboard bundle the code is not
+    /// drawn (nothing would answer a scan of it), and the layout must absorb
+    /// the missing rows rather than leaving a gap or panicking on a
+    /// zero-height chunk.
+    #[test]
+    fn active_screen_keeps_the_url_and_drops_the_code_without_web() {
+        let screen = active_screen();
+        assert!(
+            screen.contains("http://192.168.1.42:8080/?t=abc123def456"),
+            "URL must render in both feature corners:\n{screen}"
+        );
+        let drawn = screen.chars().any(|c| QR_GLYPHS.contains(&c));
+        assert_eq!(
+            drawn,
+            cfg!(feature = "web"),
+            "QR code should be drawn only with the dashboard bundle:\n{screen}"
+        );
+    }
+
+    /// A QR-less screen offering a bare URL reads as a dashboard link, and a
+    /// browser following it gets a bodiless 404. Both the title and the panel
+    /// have to say the endpoint is API-only, and neither may say it in a build
+    /// that does embed the bundle.
+    #[test]
+    fn active_screen_says_api_only_without_web() {
+        let screen = active_screen();
+        for needle in ["Remote API Access", "No dashboard bundle in this build:"] {
+            assert_eq!(
+                screen.contains(needle),
+                !cfg!(feature = "web"),
+                "{needle:?} belongs on the screen only without the dashboard bundle:\n{screen}"
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

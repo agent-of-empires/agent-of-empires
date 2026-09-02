@@ -1,6 +1,6 @@
 //! End-to-end coverage for how a Kiro session is launched.
 //!
-//! Kiro's interactive flags (`--trust-all-tools`, `--agent`, `--resume-id`)
+//! Kiro's interactive flags (`--trust-all-tools`, `--agent`)
 //! live on the `kiro-cli chat` subcommand, not the top-level binary. AoE used
 //! to launch bare `kiro-cli` plus the yolo flag, so YOLO mode produced
 //! `kiro-cli --trust-all-tools`, which the real CLI rejects with

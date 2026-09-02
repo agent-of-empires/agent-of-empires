@@ -111,7 +111,7 @@ impl Instance {
         tracing::info!(target: "session.status_change",
             "{} [{}] {:?} -> {:?} (hook={:?} hook_age_ms={:?} rule={})",
             self.id, detection_tool, prev, self.status, hook, hook_age_ms,
-            self.detection_rule.unwrap_or("none")
+            self.detection.rule.unwrap_or("none")
         );
     }
 
@@ -462,16 +462,16 @@ impl Instance {
             .unwrap_or_default();
         let screen_unchanged = skip_capture(
             activity,
-            self.detection_activity,
-            self.detection_captured_at,
+            self.detection.activity,
+            self.detection.captured_at,
             hook.is_some(),
-            self.pending_detection.is_some(),
+            self.detection.pending.is_some(),
         );
 
         if screen_unchanged {
             // Nothing to re-decide, and nothing to re-derive from: the checks
             // below read the capture we deliberately did not take.
-            self.detection_rule = Some("screen_unchanged");
+            self.detection.rule = Some("screen_unchanged");
             return;
         }
 
@@ -495,9 +495,9 @@ impl Instance {
         let Some(candidate) = detection.status else {
             // The screen is an agent-owned viewer; the last known status
             // stands rather than being overwritten by what a pager shows.
-            self.detection_activity = activity;
-            self.detection_captured_at = Some(captured_at);
-            self.detection_rule = Some(detection.rule);
+            self.detection.activity = activity;
+            self.detection.captured_at = Some(captured_at);
+            self.detection.rule = Some(detection.rule);
             return;
         };
 
@@ -526,9 +526,9 @@ impl Instance {
                 self.last_error = None;
             }
         }
-        self.detection_activity = activity;
-        self.detection_captured_at = Some(captured_at);
-        self.detection_rule = Some(detection.rule);
+        self.detection.activity = activity;
+        self.detection.captured_at = Some(captured_at);
+        self.detection.rule = Some(detection.rule);
         tracing::trace!(target: "session.store",
             "status '{}': manifest rule={} candidate={:?} visible={} -> {:?}",
             self.title, detection.rule, candidate, detection.visible, self.status);
@@ -549,16 +549,16 @@ impl Instance {
         let needs_confirmation =
             self.status == Status::Running && candidate == Status::Idle && !visible;
         if !needs_confirmation {
-            self.pending_detection = None;
+            self.detection.pending = None;
             return Some(candidate);
         }
-        match self.pending_detection {
+        match self.detection.pending {
             Some(pending) if pending == candidate => {
-                self.pending_detection = None;
+                self.detection.pending = None;
                 Some(candidate)
             }
             _ => {
-                self.pending_detection = Some(candidate);
+                self.detection.pending = Some(candidate);
                 None
             }
         }
@@ -566,13 +566,6 @@ impl Instance {
 
     pub fn update_status(&mut self) {
         self.update_status_with_metadata(None, None);
-    }
-
-    /// Capture the session's window for the preview, with any panes the user
-    /// split off composited in. `capture-pane` has no size parameters: the
-    /// window is captured at its own dimensions.
-    pub fn capture_output_composited(&self, lines: usize) -> Result<String> {
-        self.tmux_session()?.capture_window_composited(lines)
     }
 }
 
@@ -668,7 +661,7 @@ mod tests {
             inst.confirm_detection(Status::Waiting, false),
             Some(Status::Waiting)
         );
-        assert!(inst.pending_detection.is_none());
+        assert!(inst.detection.pending.is_none());
     }
 
     #[test]
@@ -1255,6 +1248,12 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
                 "-y",
                 "40",
                 &launch,
+                ";",
+                "set-option",
+                "-t",
+                &session_name,
+                "pane-base-index",
+                "0",
             ])
             .output()
             .expect("spawn tmux");
@@ -1554,9 +1553,10 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         poll(&mut inst, Some(0));
         assert_eq!(inst.status, Status::Running, "running frame must be seen");
         let shared = inst
-            .detection_captured_at
+            .detection
+            .captured_at
             .expect("capture stamps its second");
-        inst.detection_activity = Some(shared);
+        inst.detection.activity = Some(shared);
 
         std::fs::File::create(&marker).expect("touch marker");
         assert!(wait_for_pane("turn over"), "idle frame never painted");
@@ -1568,7 +1568,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             "an unwitnessed Idle waits one poll before it publishes"
         );
         assert_eq!(
-            inst.pending_detection,
+            inst.detection.pending,
             Some(Status::Idle),
             "the final frame must be captured, not skipped as unchanged (#3624)"
         );

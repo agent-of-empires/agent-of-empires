@@ -5,10 +5,10 @@ Install Rust and tmux. Node.js and npm are required only for the web dashboard.
 ## Build and test
 
 ```sh
-cargo build                         # debug TUI build
+cargo build                         # debug build: TUI + daemon, no Node
 cargo build --release               # shipping build with LTO
 cargo build --profile dev-release   # optimized build without LTO
-cargo build --features serve        # include the web dashboard
+cargo build --features web          # include the web dashboard
 cargo test
 cargo fmt
 cargo clippy
@@ -28,7 +28,7 @@ AOE_TERMINAL_TRACE=1 cargo run
 aoe logs
 ```
 
-For the dashboard, `cargo xtask dev` runs a serve-enabled debug backend on 8081
+For the dashboard, `cargo xtask dev` runs a dashboard-enabled debug backend on 8081
 and Vite with HMR on 5173. Add `--watch` to rebuild and restart the backend when
 Rust inputs change. A failed rebuild leaves the previous backend running.
 

@@ -12,7 +12,7 @@
 //   node web/scripts/record-tui-demo.mjs [--port 7683] [--out path.gif]
 //
 // Recipe (the script does not stand up the backend):
-//   1. Build:  cargo build --release --features serve   (or without --features serve)
+//   1. Build:  cargo build --release --features web   (or without --features web)
 //   2. Isolated profile with Claude creds + a git repo (see record-web-demo.mjs).
 //   3. Set live mode as the attach default for the profile's config.toml:
 //        [session]

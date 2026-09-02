@@ -26,27 +26,22 @@ mod session_id_acquisition;
 mod session_lifecycle;
 mod status_detection;
 mod storage_concurrency;
-#[cfg(feature = "serve")]
 mod terminal_smart_rename;
 mod tmux_reachability;
 mod tui_attach_detach;
 mod update_command;
 mod worktree_integration;
 
-#[cfg(feature = "serve")]
 mod acp_mcp;
 
-#[cfg(feature = "serve")]
 mod acp_smoke;
 
-#[cfg(feature = "serve")]
 mod acp_session_delete;
 
-#[cfg(feature = "serve")]
 mod acp_effort_respawn;
 
-#[cfg(all(feature = "serve", debug_assertions))]
+#[cfg(debug_assertions)]
 mod acp_midturn_resume;
 
-#[cfg(all(feature = "serve", debug_assertions))]
+#[cfg(debug_assertions)]
 mod acp_silent_orphan;

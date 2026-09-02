@@ -14,7 +14,7 @@
 //! Skipped automatically if `node` is not on PATH.
 //!
 //! Note: the parent `main.rs` only compiles this module under
-//! `cfg(all(feature = "serve", debug_assertions))`. Debug-only because
+//! `cfg(debug_assertions)`. Debug-only because
 //! the watchdog grace is tunable via `AOE_RESUME_IDLE_GRACE_MS` only
 //! under `cfg(debug_assertions)` (see `resume_idle_grace()` in
 //! `src/acp/acp_client/connection.rs`); release builds would wait the full

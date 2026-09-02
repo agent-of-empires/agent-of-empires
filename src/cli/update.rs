@@ -3,7 +3,6 @@
 use anyhow::{bail, Context, Result};
 use clap::Args;
 use std::io::{self, IsTerminal, Write};
-#[cfg(feature = "serve")]
 use std::path::Path;
 
 use crate::update::check_for_update;
@@ -110,20 +109,13 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
             "✓ Updated to v{}. Restart `aoe` to use the new version.",
             info.latest_version
         );
-        #[cfg(feature = "serve")]
         handle_daemon_restart_after_update(binary_path, args.yes)?;
-        #[cfg(not(feature = "serve"))]
-        {
-            let _ = binary_path;
-            println!("{}", daemon_restart_hint());
-        }
         println!("{}", completion_refresh_hint());
     } else if matches!(&method, InstallMethod::Homebrew) {
         println!("✓ brew upgrade complete.");
         // Homebrew swaps a Cellar/bin binary whose path we cannot reliably
         // resolve from this process, so we never auto-restart; point the
         // user at the manual step when a daemon is up.
-        #[cfg(feature = "serve")]
         if !matches!(
             crate::cli::serve::daemon_status(),
             crate::cli::serve::DaemonStatus::Absent
@@ -135,7 +127,6 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
 }
 
 /// What to do with a running daemon after a successful in-place update.
-#[cfg(feature = "serve")]
 #[derive(Debug, PartialEq, Eq)]
 enum RestartDecision {
     /// No daemon process or persisted PID state was found.
@@ -153,7 +144,6 @@ enum RestartDecision {
     Auto,
 }
 
-#[cfg(feature = "serve")]
 #[derive(Clone, Copy, Debug)]
 enum UpdateDaemonState {
     Absent,
@@ -167,7 +157,6 @@ enum UpdateDaemonState {
 /// `serve.launch` record that authorizes this PID; every other state prints a
 /// hint naming the owner that has to do the restart. Pure so the matrix is
 /// unit testable.
-#[cfg(feature = "serve")]
 fn restart_decision(daemon: UpdateDaemonState, is_tty: bool, yes: bool) -> RestartDecision {
     match daemon {
         UpdateDaemonState::Absent => RestartDecision::NotApplicable,
@@ -184,7 +173,6 @@ fn restart_decision(daemon: UpdateDaemonState, is_tty: bool, yes: bool) -> Resta
 /// freshly installed binary as `aoe serve --restart` so the new code, not
 /// this old in-memory image (whose `current_exe()` may now point at the
 /// replaced/unlinked inode), spawns the replacement daemon.
-#[cfg(feature = "serve")]
 fn handle_daemon_restart_after_update(binary_path: &Path, yes: bool) -> Result<()> {
     use crate::cli::serve;
     let daemon = match serve::daemon_status() {
@@ -220,7 +208,6 @@ fn handle_daemon_restart_after_update(binary_path: &Path, yes: bool) -> Result<(
 /// Hint for a running daemon that aoe did not start itself (foreground,
 /// or under systemd/launchd): `aoe serve --restart` would refuse it, so
 /// point the user at the supervisor that owns the process instead.
-#[cfg(feature = "serve")]
 fn external_restart_hint() -> &'static str {
     "  WARNING: an `aoe serve` daemon is running but was not started by\n  \
      `aoe serve --daemon`; restart it through whatever launched it (your\n  \
@@ -233,7 +220,6 @@ fn external_restart_hint() -> &'static str {
 /// by another user, so the hint names ownership rather than `aoe serve
 /// --restart`: that command runs the same verification and refuses an
 /// unverified daemon, which would leave the user chasing a contradiction.
-#[cfg(feature = "serve")]
 fn unverified_restart_hint() -> &'static str {
     "  WARNING: aoe found daemon state but could not verify the running process.\n  \
      Existing `aoe serve` processes keep running the old build until restarted.\n  \
@@ -242,7 +228,6 @@ fn unverified_restart_hint() -> &'static str {
      verify: restart it as its owner, or through its terminal or service manager."
 }
 
-#[cfg(feature = "serve")]
 fn manual_update_restart_hint() -> &'static str {
     "  WARNING: existing `aoe serve` processes keep running the old build until\n  \
      restarted. If started with `aoe serve --daemon`, run `aoe serve --restart`;\n  \
@@ -252,7 +237,6 @@ fn manual_update_restart_hint() -> &'static str {
 /// Spawn the freshly installed binary as `aoe serve --restart`. Best
 /// effort: on any failure we fall back to the manual hint rather than
 /// failing the whole update, which already succeeded.
-#[cfg(feature = "serve")]
 fn restart_via_new_binary(binary_path: &Path) {
     println!("Restarting daemon…");
     match std::process::Command::new(binary_path)
@@ -321,31 +305,27 @@ mod tests {
 
         // Every hint has to name a recovery path the reader can actually take,
         // since each one is printed in place of the restart aoe declined to do.
-        #[cfg(feature = "serve")]
-        {
-            // The unverified case is usually another user's daemon, so the hint
-            // must name ownership instead of promising a restart that refuses.
-            let fallback = super::unverified_restart_hint();
-            assert!(fallback.contains("belongs to another user"));
-            assert!(fallback.contains("terminal or service manager"));
+        // The unverified case is usually another user's daemon, so the hint
+        // must name ownership instead of promising a restart that refuses.
+        let fallback = super::unverified_restart_hint();
+        assert!(fallback.contains("belongs to another user"));
+        assert!(fallback.contains("terminal or service manager"));
 
-            // An externally launched daemon must be sent to its launcher, not
-            // to `aoe serve --restart`, which refuses a daemon it did not start.
-            let external = super::external_restart_hint();
-            assert!(external.contains("WARNING:"));
-            assert!(!external.contains("aoe serve --restart"));
-            assert!(external.contains("service manager"));
+        // An externally launched daemon must be sent to its launcher, not
+        // to `aoe serve --restart`, which refuses a daemon it did not start.
+        let external = super::external_restart_hint();
+        assert!(external.contains("WARNING:"));
+        assert!(!external.contains("aoe serve --restart"));
+        assert!(external.contains("service manager"));
 
-            // The manual-install path cannot know how the daemon was launched,
-            // so it has to cover both recoveries.
-            let manual = super::manual_update_restart_hint();
-            assert!(manual.contains("WARNING:"));
-            assert!(manual.contains("aoe serve --restart"));
-            assert!(manual.contains("terminal or service manager"));
-        }
+        // The manual-install path cannot know how the daemon was launched,
+        // so it has to cover both recoveries.
+        let manual = super::manual_update_restart_hint();
+        assert!(manual.contains("WARNING:"));
+        assert!(manual.contains("aoe serve --restart"));
+        assert!(manual.contains("terminal or service manager"));
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn restart_decision_matrix() {
         use super::{restart_decision, RestartDecision, UpdateDaemonState};

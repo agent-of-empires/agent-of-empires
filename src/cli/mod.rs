@@ -1,6 +1,5 @@
 //! CLI command implementations
 
-#[cfg(feature = "serve")]
 pub mod acp;
 pub mod add;
 pub mod agents;
@@ -12,7 +11,6 @@ pub mod group;
 pub mod init;
 pub mod killall;
 pub mod list;
-#[cfg(feature = "serve")]
 pub mod log_level;
 pub mod logs;
 pub mod mcp;
@@ -23,7 +21,6 @@ pub mod project;
 pub mod ps;
 pub mod remove;
 pub mod send;
-#[cfg(feature = "serve")]
 pub mod serve;
 pub mod session;
 pub mod settings;
@@ -35,7 +32,6 @@ pub mod theme;
 pub mod tmux;
 pub mod uninstall;
 pub mod update;
-#[cfg(feature = "serve")]
 pub mod url;
 pub mod worktree;
 
@@ -117,12 +113,9 @@ pub fn resolve_session<'a>(identifier: &str, instances: &'a [Instance]) -> Resul
 /// not exist; a failure to open or write it returns `Err` so callers keep the
 /// session row rather than orphan its transcript. See #2489, #2524.
 ///
-/// The delete is idempotent and feature-independent: `rusqlite` is a
-/// non-optional dependency, so a default (non-`serve`) build can reach the
-/// store too. It deliberately does NOT gate on `Instance::is_structured()`,
-/// which always returns `false` in a non-`serve` build (the `view` field is
-/// serve-gated), so the old guard left the non-serve bail unreachable and
-/// orphaned transcripts. Deleting zero rows for a terminal session is harmless.
+/// The delete is idempotent and deliberately does NOT gate on
+/// `Instance::is_structured()`: deleting zero rows for a terminal session is
+/// harmless, and the old guard orphaned transcripts (#2524).
 pub(crate) fn purge_acp_transcript(inst: &Instance) -> Result<()> {
     let app_dir = crate::session::get_app_dir()
         .map_err(|e| anyhow::anyhow!("acp transcript purge: resolve app dir: {e}"))?;
@@ -136,8 +129,7 @@ pub(crate) fn purge_acp_transcript(inst: &Instance) -> Result<()> {
 /// Delete a session's rows from the ACP event store at `db_path`, removing both
 /// the event rows and their attachment blobs (mirrors
 /// `crate::events::delete_topic`'s cascade so no orphaned bytes are left).
-/// A missing table means the store predates it: nothing to purge. Kept
-/// feature-independent so non-`serve` CLI builds can clean transcripts too.
+/// A missing table means the store predates it: nothing to purge.
 fn purge_acp_transcript_rows(db_path: &std::path::Path, session_id: &str) -> Result<()> {
     let mut conn = rusqlite::Connection::open(db_path)
         .map_err(|e| anyhow::anyhow!("acp transcript purge: open event store: {e}"))?;
@@ -151,11 +143,12 @@ fn purge_acp_transcript_rows(db_path: &std::path::Path, session_id: &str) -> Res
     let tx = conn
         .transaction()
         .map_err(|e| anyhow::anyhow!("acp transcript purge: begin transaction: {e}"))?;
-    // The source of truth for these names is `crate::events::Schema` (prefix
-    // "acp"), which is serve-gated and so cannot be referenced from here. They
-    // are fixed literals, not user input, and `session_id` is bound, so the
-    // `format!` only interpolates a constant.
-    for table in ["acp_events", "acp_attachments"] {
+    // Table names come from the same `crate::events::Schema` the store is
+    // opened with, so they cannot drift; `session_id` is bound, so the
+    // `format!` only interpolates a validated constant.
+    let schema = crate::events::Schema::new("acp")
+        .map_err(|e| anyhow::anyhow!("acp transcript purge: schema: {e}"))?;
+    for table in [schema.events_table(), schema.attachments_table()] {
         match tx.execute(
             &format!("DELETE FROM {table} WHERE session_id = ?1"),
             rusqlite::params![session_id],
@@ -313,9 +306,9 @@ mod tests {
         assert!(!purge_restored_row_must_be_kept(false, true));
     }
 
-    // #2524: the non-serve purge path used to be unreachable, orphaning
-    // transcripts. The feature-independent row delete must drop both the
-    // event rows and their attachment blobs for the target session only.
+    // #2524: the purge path used to be unreachable, orphaning transcripts.
+    // The row delete must drop both the event rows and their attachment blobs
+    // for the target session only.
     #[test]
     fn purge_acp_transcript_rows_deletes_only_target_session() {
         let dir = tempfile::tempdir().unwrap();

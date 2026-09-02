@@ -251,7 +251,6 @@ impl HomeView {
             plugin_manager_dialog: None,
             skills_manager_dialog: None,
             command_palette: None,
-            #[cfg(feature = "serve")]
             serve_view: None,
             update_confirm_dialog: None,
             telemetry_consent_dialog: None,
@@ -273,6 +272,7 @@ impl HomeView {
             preview_worker_pulse: None,
             preview_wake: std::sync::Arc::new(tokio::sync::Notify::new()),
             live_send_last_resize: None,
+            live_send_resize_retry_at: None,
             live_send_pending_leader: false,
             live_send_ctrl_c_flash_until: None,
             sidebar_collapsed: user_config
@@ -292,11 +292,8 @@ impl HomeView {
             pending_stop_tool: None,
             pending_image_pull: None,
             pending_switch_view_session: None,
-            #[cfg(feature = "serve")]
             pending_daemon_start_session: None,
-            #[cfg(feature = "serve")]
             structured_preview: None,
-            #[cfg(feature = "serve")]
             structured_preview_pending: false,
             pending_force_remove_session: None,
             pending_trash_session: None,
@@ -323,9 +320,7 @@ impl HomeView {
             system_health_discovered: user_config
                 .as_ref()
                 .is_some_and(|config| config.app_state.used_system_health),
-            #[cfg(feature = "serve")]
             daemon_status_poller: crate::tui::daemon_status_poller::DaemonStatusPoller::new(),
-            #[cfg(feature = "serve")]
             pending_daemon_status_refresh: false,
             deletion_poller: DeletionPoller::new(),
             stop_poller: StopPoller::new(),
