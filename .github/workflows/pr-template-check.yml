@@ -2,7 +2,7 @@ name: PR Template Check
 
 on:
   # Use pull_request_target to have write access for PRs from forks
-  # This is safe because we only read the PR body from the event payload
+  # This is safe because we only read PR metadata from the event payload
   # and don't checkout or execute any code from the fork
   pull_request_target:
     types: [opened, edited]
@@ -16,8 +16,7 @@ jobs:
     # triggered the event; on an `edited` event fired by a maintainer or
     # another bot the actor is the editor, so a github.actor guard would let
     # the check run against Dependabot's templateless body. Matches the
-    # close-stale job and the nix-npm-hash escape hatch, which both key on
-    # pull_request.user.login.
+    # close-stale job, which keys on the same field.
     if: github.event_name == 'pull_request_target' && github.event.pull_request.user.login != 'dependabot[bot]'
     runs-on: ubuntu-latest
     permissions:
@@ -54,18 +53,18 @@ jobs:
             // branch in the base repo needs push access, so a fork cannot
             // opt out of enforcement by pasting a marker into its body.
             const head = context.payload.pull_request.head;
-            const isInternalBranch =
+            const isInternalRepo =
               head?.repo?.full_name === `${context.repo.owner}/${context.repo.repo}`;
             const headRef = head?.ref || '';
 
             const isNixNpmHashBotPr =
-              isInternalBranch &&
+              isInternalRepo &&
               headRef === 'chore/nix-npm-hash-update' &&
               body.includes('<!-- nix-npm-hash:') &&
               body.includes('## Checklist');
 
             const isReleaseStagingBotPr =
-              isInternalBranch &&
+              isInternalRepo &&
               headRef.startsWith('release-staging/v') &&
               body.includes('<!-- release-version:');
 
