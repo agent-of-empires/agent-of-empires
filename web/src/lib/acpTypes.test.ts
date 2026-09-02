@@ -67,11 +67,13 @@ describe("applyEvent / UserPromptSent (control state)", () => {
       ...emptyAcpState(),
       startupError: "old error",
       lastError: "old action error",
+      rateLimitRetriesExhausted: true,
       turnActive: false,
     };
     const next = applyEvent(stale, frame(1, "new prompt"));
     expect(next.startupError).toBeNull();
     expect(next.lastError).toBeNull();
+    expect(next.rateLimitRetriesExhausted).toBe(false);
     expect(next.turnActive).toBe(true);
   });
 
@@ -410,6 +412,32 @@ describe("applyEvent / Stopped user_stopped", () => {
       event: { AcpSessionAssigned: { acp_session_id: "abc-123" } },
     });
     expect(state.workerStopped).toBe(false);
+  });
+});
+
+describe("applyEvent / Stopped rate_limit_exhausted_retries", () => {
+  it("sets the exhausted retry notice", () => {
+    const next = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { Stopped: { reason: "rate_limit_exhausted_retries" } },
+    });
+    expect(next.rateLimitRetriesExhausted).toBe(true);
+  });
+});
+
+describe("applyEvent / RateLimitAutoResumed", () => {
+  it("clears the exhausted retry notice", () => {
+    const seeded: AcpState = {
+      ...emptyAcpState(),
+      rateLimitRetriesExhausted: true,
+    };
+    const next = applyEvent(seeded, {
+      session_id: "s-1",
+      seq: 1,
+      event: { RateLimitAutoResumed: { resets_at: "2026-09-02T00:00:00Z" } },
+    });
+    expect(next.rateLimitRetriesExhausted).toBe(false);
   });
 });
 
