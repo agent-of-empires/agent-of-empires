@@ -509,9 +509,13 @@ pub fn load_native_mcp_servers_checked_from_home(
 /// (`container_config`, `hooks::trust_host_project`), and the daemon's own
 /// environment does not carry what a session exports. Read from the
 /// profile-merged config, since the setting is how one profile points at a
-/// second account. `native_config_for` treats `claude` and `claude-code` as one
-/// agent while `agent_config_dir` is an exact-key map, so either spelling
-/// satisfies a lookup by the other.
+/// second account.
+///
+/// The lookup key is the exact session tool, with no `claude` / `claude-code`
+/// aliasing. The launch keys on the exact tool everywhere, so honoring the
+/// other spelling here would point discovery at a directory the agent does not
+/// read, and these definitions carry credentials. `acp::agent_policy` holds the
+/// same line for the same reason.
 ///
 /// Falling back to `CLAUDE_CONFIG_DIR` in AoE's own environment covers the
 /// wrapper case: a shell that exports the variable exports it to the agent's
@@ -525,13 +529,8 @@ fn native_config_dir_for(
     let cfg = super::profile_config::resolve_config_or_warn(&super::config::effective_profile(
         profile.unwrap_or_default(),
     ));
-    let declared = |key: &str| cfg.session.agent_config_dir_for(key, home);
-    declared(agent_key)
-        .or_else(|| match agent_key {
-            "claude" => declared("claude-code"),
-            "claude-code" => declared("claude"),
-            _ => None,
-        })
+    cfg.session
+        .agent_config_dir_for(agent_key, home)
         .or_else(|| match native_config_for(agent_key) {
             Some(NativeMcpConfig::StandardJson(_)) => std::env::var_os("CLAUDE_CONFIG_DIR")
                 .map(std::path::PathBuf::from)
