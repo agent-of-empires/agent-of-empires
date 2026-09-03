@@ -216,7 +216,7 @@ pub fn resolve_effective(
     profile: Option<&str>,
     cwd: &Path,
 ) -> Vec<ResolvedMcpServer> {
-    let native = load_native_mcp_servers_from_home(agent_key).unwrap_or_else(|e| {
+    let native = load_native_mcp_servers_from_home(agent_key, profile).unwrap_or_else(|e| {
         warn!(
             target: "acp.mcp",
             agent = %agent_key,
@@ -330,7 +330,7 @@ pub struct McpSurfaceView {
 pub fn resolve_surface(agent: &str, profile: Option<&str>, cwd: &Path) -> McpSurfaceView {
     let effective = resolve_effective(agent, profile, cwd);
 
-    let reconcile = match load_native_mcp_servers_checked_from_home(agent) {
+    let reconcile = match load_native_mcp_servers_checked_from_home(agent, profile) {
         Ok(read) => super::mcp_state::reconcile_agent(agent, &read).unwrap_or_else(|e| {
             warn!(target: "acp.mcp", agent = %agent, error = %e, "failed to reconcile MCP drift store");
             Default::default()
@@ -443,12 +443,12 @@ pub fn load_native_mcp_servers_checked(agent_key: &str, home: &Path) -> Result<N
     load_native_mcp_servers_checked_in(agent_key, home, None)
 }
 
-/// [`load_native_mcp_servers_checked`] with the session's effective config
-/// directory. Claude relocates `.claude.json` to its config dir, so discovery
-/// must read the file the launched process will: the session's declared
-/// `agent_config_dir` first (what the launch exports), then a `CLAUDE_CONFIG_DIR`
-/// already in this process's environment, then home. Only the Claude-family
-/// reader is affected; Gemini and Codex keep their fixed home-relative paths.
+/// [`load_native_mcp_servers_checked`] against a config directory the agent
+/// reads instead of its home default. Claude relocates `.claude.json` there, so
+/// discovery must open the file the launched process will. `config_dir` is the
+/// caller's already-resolved answer; this function reads no environment of its
+/// own, so an injected `home` stays authoritative. Only the Claude-family
+/// reader honors it; Gemini and Codex keep their fixed home-relative paths.
 pub fn load_native_mcp_servers_checked_in(
     agent_key: &str,
     home: &Path,
@@ -459,11 +459,7 @@ pub fn load_native_mcp_servers_checked_in(
     };
     match config {
         NativeMcpConfig::StandardJson(rel) => {
-            let base = config_dir
-                .map(Path::to_path_buf)
-                .or_else(|| std::env::var_os("CLAUDE_CONFIG_DIR").map(std::path::PathBuf::from))
-                .unwrap_or_else(|| home.to_path_buf());
-            read_standard_json(&base.join(rel))
+            read_standard_json(&config_dir.unwrap_or(home).join(rel))
         }
         NativeMcpConfig::GeminiJson(rel) => read_gemini_json(&home.join(rel)),
         NativeMcpConfig::CodexToml(rel) => read_codex_toml(&home.join(rel)),
@@ -483,8 +479,11 @@ pub fn load_native_mcp_servers(agent_key: &str, home: &Path) -> Result<Vec<Proje
 
 /// Convenience wrapper that resolves the real home dir. Kept separate from
 /// [`load_native_mcp_servers`] so tests can inject a temp home.
-pub fn load_native_mcp_servers_from_home(agent_key: &str) -> Result<Vec<ProjectMcpServer>> {
-    let read = load_native_mcp_servers_checked_from_home(agent_key)?;
+pub fn load_native_mcp_servers_from_home(
+    agent_key: &str,
+    profile: Option<&str>,
+) -> Result<Vec<ProjectMcpServer>> {
+    let read = load_native_mcp_servers_checked_from_home(agent_key, profile)?;
     Ok(read
         .servers
         .into_iter()
@@ -494,23 +493,51 @@ pub fn load_native_mcp_servers_from_home(agent_key: &str) -> Result<Vec<ProjectM
 
 /// Like [`load_native_mcp_servers_checked`] but resolves the real home dir. Used
 /// by the management surface, which needs the skipped-entry list to gate drift.
-pub fn load_native_mcp_servers_checked_from_home(agent_key: &str) -> Result<NativeRead> {
+pub fn load_native_mcp_servers_checked_from_home(
+    agent_key: &str,
+    profile: Option<&str>,
+) -> Result<NativeRead> {
     let home = dirs::home_dir().context("could not resolve home dir for native MCP config")?;
-    // The session's declared config dir is what the launch exports to the
-    // agent, and the daemon's own environment does not carry it. The reader
-    // treats `claude` and `claude-code` as one agent (`native_config_for`),
-    // but `agent_config_dir` is an exact-key map, so a directory declared
-    // under either spelling must satisfy a lookup by the other.
-    let cfg = crate::session::Config::load_or_warn();
-    let config_dir =
-        cfg.session
-            .agent_config_dir_for(agent_key, &home)
-            .or_else(|| match agent_key {
-                "claude" => cfg.session.agent_config_dir_for("claude-code", &home),
-                "claude-code" => cfg.session.agent_config_dir_for("claude", &home),
-                _ => None,
-            });
+    let config_dir = native_config_dir_for(agent_key, profile, &home);
     load_native_mcp_servers_checked_in(agent_key, &home, config_dir.as_deref())
+}
+
+/// The directory the launched agent will read its native config from, or `None`
+/// for the home default.
+///
+/// `session.agent_config_dir` wins: it is the value the launch itself acts on
+/// (`container_config`, `hooks::trust_host_project`), and the daemon's own
+/// environment does not carry what a session exports. Read from the
+/// profile-merged config, since the setting is how one profile points at a
+/// second account. `native_config_for` treats `claude` and `claude-code` as one
+/// agent while `agent_config_dir` is an exact-key map, so either spelling
+/// satisfies a lookup by the other.
+///
+/// Falling back to `CLAUDE_CONFIG_DIR` in AoE's own environment covers the
+/// wrapper case: a shell that exports the variable exports it to the agent's
+/// login shell too. It is a guess, not a fact about the session, so it ranks
+/// below the declared directory.
+fn native_config_dir_for(
+    agent_key: &str,
+    profile: Option<&str>,
+    home: &Path,
+) -> Option<std::path::PathBuf> {
+    let cfg = super::profile_config::resolve_config_or_warn(&super::config::effective_profile(
+        profile.unwrap_or_default(),
+    ));
+    let declared = |key: &str| cfg.session.agent_config_dir_for(key, home);
+    declared(agent_key)
+        .or_else(|| match agent_key {
+            "claude" => declared("claude-code"),
+            "claude-code" => declared("claude"),
+            _ => None,
+        })
+        .or_else(|| match native_config_for(agent_key) {
+            Some(NativeMcpConfig::StandardJson(_)) => std::env::var_os("CLAUDE_CONFIG_DIR")
+                .map(std::path::PathBuf::from)
+                .filter(|dir| !dir.as_os_str().is_empty()),
+            _ => None,
+        })
 }
 
 /// Convert a map of raw server entries, skipping (with a warning) any entry that
@@ -955,20 +982,25 @@ mod tests {
         assert!(json.contains("TOKEN") && json.contains("Authorization"));
     }
 
-    fn set_tmp_home() -> tempfile::TempDir {
+    /// A temp HOME for a test that goes through the real-home entry points.
+    /// `CLAUDE_CONFIG_DIR` is cleared alongside it: native discovery falls back
+    /// to it, so a developer running under a wrapper that exports it would
+    /// otherwise read their own config instead of this one.
+    fn set_tmp_home() -> (tempfile::TempDir, crate::session::test_support::EnvGuard) {
         let dir = tempfile::tempdir().unwrap();
+        let guard = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
         // SAFETY: serialized by `#[serial]`; matches the existing pattern.
         unsafe {
             std::env::set_var("HOME", dir.path());
             std::env::set_var("XDG_CONFIG_HOME", dir.path().join(".config"));
         }
-        dir
+        (dir, guard)
     }
 
     #[test]
     #[serial_test::serial]
     fn surface_shows_effective_then_keep_on_removal_then_promote() {
-        let home = set_tmp_home();
+        let (home, _env) = set_tmp_home();
         let cwd = home.path().join("repo");
         std::fs::create_dir_all(&cwd).unwrap();
 
@@ -1016,7 +1048,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn surface_drop_removed_discards_without_promoting() {
-        let home = set_tmp_home();
+        let (home, _env) = set_tmp_home();
         let cwd = home.path().join("repo");
         std::fs::create_dir_all(&cwd).unwrap();
         std::fs::write(
@@ -1096,6 +1128,49 @@ mod tests {
                 .unwrap()
                 .is_empty());
         }
+    }
+
+    /// The config-dir override redirects only the Claude-family reader, and an
+    /// injected home stays authoritative against a `CLAUDE_CONFIG_DIR` in the
+    /// ambient environment: discovery resolves the directory at the real-home
+    /// entry point, never inside the injected-home one.
+    #[test]
+    fn native_claude_reads_config_dir_over_injected_home() {
+        let home = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let stray = tempfile::tempdir().unwrap();
+        write(
+            home.path(),
+            ".claude.json",
+            r#"{ "mcpServers": { "from-home": { "command": "h" } } }"#,
+        );
+        write(
+            config_dir.path(),
+            ".claude.json",
+            r#"{ "mcpServers": { "from-config-dir": { "command": "c" } } }"#,
+        );
+        write(
+            stray.path(),
+            ".claude.json",
+            r#"{ "mcpServers": { "from-env": { "command": "e" } } }"#,
+        );
+
+        let _guard = crate::session::test_support::EnvGuard::set(&[(
+            "CLAUDE_CONFIG_DIR",
+            stray.path().to_path_buf(),
+        )]);
+        assert_eq!(
+            names(
+                &load_native_mcp_servers_checked_in("claude", home.path(), Some(config_dir.path()))
+                    .unwrap()
+                    .servers
+            ),
+            vec!["from-config-dir"]
+        );
+        assert_eq!(
+            names(&load_native_mcp_servers("claude", home.path()).unwrap()),
+            vec!["from-home"]
+        );
     }
 
     #[test]
@@ -1280,7 +1355,7 @@ command = "good"
     #[test]
     #[serial_test::serial]
     fn codex_enabled_toggle_preserves_drift_and_restores_effective_server() {
-        let home = set_tmp_home();
+        let (home, _env) = set_tmp_home();
         let cwd = home.path().join("repo");
         std::fs::create_dir_all(&cwd).unwrap();
 
