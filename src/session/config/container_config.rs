@@ -979,12 +979,9 @@ pub(crate) fn install_pi_sandbox_extension() -> Result<()> {
         .join("aoe-session-id.js");
     let source = crate::session::instance::PI_SESSION_EXTENSION;
     // The bind is writable from the container, so the current content counts
-    // only when it is a regular file, and the write below follows no link.
-    let path = root.join(&rel);
-    let current = std::fs::symlink_metadata(&path)
-        .is_ok_and(|m| m.is_file())
-        .then(|| std::fs::read_to_string(&path).ok())
-        .flatten();
+    // only when it is a regular file reached without following a link, and the
+    // write below follows none either.
+    let current = crate::session::read_file_no_follow(&root, &rel)?;
     if current.as_deref() != Some(source) {
         crate::session::replace_file_no_follow(&root, &rel, source.as_bytes())?;
     }
@@ -2313,6 +2310,47 @@ mod tests {
     use crate::hooks::test_support::BaseGuard;
     use std::fs;
     use tempfile::TempDir;
+
+    /// The extension read must go through the anchored walk, not a stat of the
+    /// pathname followed by a second open of it. With `agent/extensions`
+    /// swapped for a link to a directory that already holds the current
+    /// extension, the check-then-open shape stats the host copy through the
+    /// link, finds it equal, and reports success without ever looking inside
+    /// the bind; the walk refuses the linked component instead, and the write
+    /// behind it fails closed.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn install_pi_sandbox_extension_refuses_a_linked_parent() {
+        let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+
+        let root = pi_sandbox_dir().expect("a Pi sandbox dir");
+        let outside = temp_home.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(
+            outside.join("aoe-session-id.js"),
+            crate::session::instance::PI_SESSION_EXTENSION,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("agent")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("agent").join("extensions")).unwrap();
+
+        assert!(
+            install_pi_sandbox_extension().is_err(),
+            "a linked parent must fail the install, not read the host copy through it"
+        );
+        let outside_entries: Vec<_> = std::fs::read_dir(&outside)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            outside_entries.len(),
+            1,
+            "nothing may be written through the link: {outside_entries:?}"
+        );
+    }
 
     #[test]
     fn sanitize_network_defaults_to_none() {

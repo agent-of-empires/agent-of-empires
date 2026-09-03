@@ -885,7 +885,8 @@ impl SymlinkPolicy {
     /// The content to merge into, or `None` when there is none. Under `Never`
     /// anything that is not a regular file reads as absent: following a planted
     /// link would pull an arbitrary host file into a config the container
-    /// reads.
+    /// reads. The type check and the read share one `O_NOFOLLOW` descriptor,
+    /// so a link swapped in after the check cannot be the thing read.
     fn read(self, path: &Path) -> Result<Option<String>> {
         match self {
             Self::Follow => match std::fs::read_to_string(path) {
@@ -893,11 +894,23 @@ impl SymlinkPolicy {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
             },
-            Self::Never => Ok(std::fs::symlink_metadata(path)
-                .is_ok_and(|m| m.is_file())
-                .then(|| std::fs::read_to_string(path).ok())
-                .flatten()),
+            Self::Never => {
+                let (dir, name) = Self::split_in_bind(path)?;
+                crate::session::read_file_no_follow(dir, Path::new(name))
+            }
         }
+    }
+
+    /// The bind root is the directory AoE owns; the file sits directly in it,
+    /// so the whole path below the root is that one name.
+    fn split_in_bind(path: &Path) -> Result<(&Path, &std::ffi::OsStr)> {
+        let dir = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("{} has no parent", path.display()))?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("{} has no file name", path.display()))?;
+        Ok((dir, name))
     }
 
     fn write(self, path: &Path, content: &[u8]) -> Result<()> {
@@ -908,15 +921,8 @@ impl SymlinkPolicy {
                 }
                 crate::session::atomic_write(path, content)
             }
-            // The bind root is the directory AoE owns; the file sits directly
-            // in it, so the whole path below the root is that one name.
             Self::Never => {
-                let dir = path
-                    .parent()
-                    .ok_or_else(|| anyhow::anyhow!("{} has no parent", path.display()))?;
-                let name = path
-                    .file_name()
-                    .ok_or_else(|| anyhow::anyhow!("{} has no file name", path.display()))?;
+                let (dir, name) = Self::split_in_bind(path)?;
                 crate::session::replace_file_no_follow(dir, Path::new(name), content)
             }
         }
@@ -3412,8 +3418,11 @@ trust_level = "trusted"
             Value::Bool(true)
         );
 
+        // Valid JSON, so the only thing keeping it out of the merged config is
+        // the read refusing to follow the link.
         let outside = tmp.path().join("host-secret");
-        std::fs::write(&outside, "untouched").unwrap();
+        let host_json = r#"{"projects":{"/host/secret":{"hasTrustDialogAccepted":true}}}"#;
+        std::fs::write(&outside, host_json).unwrap();
         let bind = tmp.path().join("bind");
         std::fs::create_dir(&bind).unwrap();
         let planted = bind.join(".claude.json");
@@ -3423,7 +3432,7 @@ trust_level = "trusted"
 
         assert_eq!(
             std::fs::read_to_string(&outside).unwrap(),
-            "untouched",
+            host_json,
             "the planted link must not carry the write out of the bind"
         );
         assert!(!std::fs::symlink_metadata(&planted)
@@ -3440,6 +3449,10 @@ trust_level = "trusted"
         // The link's target is not merged in either: it never reaches a config
         // the container can read.
         assert_eq!(written.as_object().unwrap().len(), 1);
+        assert!(
+            written["projects"].get("/host/secret").is_none(),
+            "the host file behind the link must not be republished into the bind"
+        );
 
         // The lock sidecar is part of the path the container can plant on, so
         // a link there fails the write closed rather than locking a host file.
@@ -3449,7 +3462,7 @@ trust_level = "trusted"
             trust_claude_project(&locked, "/workspace/wt", SymlinkPolicy::Never).is_err(),
             "a planted lock link must fail the write, not follow it"
         );
-        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "untouched");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), host_json);
     }
 
     #[test]
