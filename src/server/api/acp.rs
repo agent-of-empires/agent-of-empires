@@ -1346,6 +1346,23 @@ pub async fn acp_prompt(
         Err(rej) => return rej.into_response(),
     };
     let woke_idle_dormant = touch_on_prompt_and_wake_if_sunk(&state, &id).await;
+    let exhausted_rate_limit_park = {
+        let store = Arc::clone(&state.acp_event_store);
+        let id_for_probe = id.clone();
+        tokio::task::spawn_blocking(move || {
+            matches!(
+                store.latest_status_event(&id_for_probe),
+                Some(Event::Stopped { reason })
+                    if reason
+                        == crate::server::acp_reconciler::RATE_LIMIT_EXHAUSTED_RETRIES_REASON
+            )
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(target: "http.api.acp", session = %id, "rate-limit exhausted-park probe failed: {e}");
+            false
+        })
+    };
     {
         let instances = state.instances.read().await;
         if !instances.iter().any(|i| i.id == id) {
@@ -1371,10 +1388,24 @@ pub async fn acp_prompt(
     // already cleared the marker, so the instance now says "awake".
     let Ok((_submission, dispatch)) = state
         .session_service
-        .begin_prompt_submission(&SessionCaller::User, &id, woke_idle_dormant)
+        .begin_prompt_submission(
+            &SessionCaller::User,
+            &id,
+            woke_idle_dormant || exhausted_rate_limit_park,
+        )
         .await
     else {
         return (StatusCode::NOT_FOUND, "session not found").into_response();
+    };
+    // An exhausted rate-limit park has no worker, but this user gesture is its
+    // recovery path. Route it through `send_turn`, which reserves the normal
+    // background resume before publishing the prompt, instead of stranding it
+    // in a queue that only a live or idle-dormant worker can drain.
+    let dispatch = match dispatch {
+        crate::acp::dispatch::PromptDispatch::Queued {
+            reason: crate::acp::dispatch::QueueReason::WorkerDown,
+        } if exhausted_rate_limit_park => crate::acp::dispatch::PromptDispatch::Sent,
+        dispatch => dispatch,
     };
     // A fresh user prompt supersedes any queued rate-limit resume
     // continuation, so drop it before sending: otherwise the reconciler could
@@ -1431,7 +1462,7 @@ pub async fn acp_prompt(
             &id,
             &req.text,
             &attachments,
-            woke_idle_dormant,
+            woke_idle_dormant || exhausted_rate_limit_park,
             req.prompt_id.clone(),
         )
         .await;
@@ -3468,6 +3499,79 @@ mod tests {
                 .iter()
                 .any(|(_, e)| matches!(e, Event::UserPromptSent { .. })),
             "a prompt no worker ever received must not reach the event store"
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_rate_limit_prompt_waits_for_resume_instead_of_queueing() {
+        use crate::acp::supervisor::{ResumeKind, ResumeReservationOutcome};
+        use std::time::Duration;
+
+        let mut inst = crate::session::Instance::new("exhausted-3688", "/tmp/aoe-3688-project");
+        inst.id = "sess-3688".to_string();
+        inst.view = crate::session::View::Structured;
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        assert!(state.acp_supervisor.publish_stopped_if_seq(
+            &id,
+            crate::server::acp_reconciler::RATE_LIMIT_EXHAUSTED_RETRIES_REASON,
+            0,
+        ));
+
+        let reservation = match state
+            .acp_supervisor
+            .begin_resume(&id, ResumeKind::Spawn)
+            .await
+            .expect("begin_resume must not error under capacity")
+        {
+            ResumeReservationOutcome::Reserved(r) => r,
+            ResumeReservationOutcome::AlreadyPresent => panic!("expected a fresh reservation"),
+        };
+        let handler = tokio::spawn({
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            async move {
+                acp_prompt(
+                    State(state),
+                    Path(id),
+                    Ok(Json(PromptRequest {
+                        text: "start a fresh retry budget".to_string(),
+                        attachments: Vec::new(),
+                        prompt_id: None,
+                    })),
+                )
+                .await
+                .into_response()
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !handler.is_finished(),
+            "an exhausted-park prompt must wait for send_turn's resume instead of queueing"
+        );
+        assert!(
+            state
+                .session_service
+                .queued_prompts_snapshot(&id)
+                .await
+                .is_empty(),
+            "fresh recovery prompt must not be stranded in the server queue"
+        );
+
+        drop(reservation);
+        let response = tokio::time::timeout(Duration::from_secs(30), handler)
+            .await
+            .expect("handler must finish once the reservation drops")
+            .expect("handler task must not panic");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            !state
+                .acp_event_store
+                .replay_from(&id, 0)
+                .iter()
+                .any(|(_, e)| matches!(e, Event::UserPromptSent { .. })),
+            "a prompt with no worker must remain unpublished for retry"
         );
     }
 

@@ -1339,22 +1339,27 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
             }
         };
         if streak >= RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES {
-            state.session_service.clear_pending_initial_turn(&id).await;
-            // Seq-guarded like terminal repair (#3190): a prompt or worker
-            // event published between the probe and here must not be
-            // terminated by this park.
-            state.acp_supervisor.publish_stopped_if_seq(
+            // Manual `/acp/spawn` holds this lock through its continuation
+            // enqueue and breadcrumb. Keeping the CAS plus clear in the same
+            // critical section means a manual resume either advances the seq
+            // first (so this park refuses) or enqueues after this old
+            // continuation was cleared.
+            let instance_lock = state.instance_lock(&id).await;
+            let _guard = instance_lock.lock().await;
+            if state.acp_supervisor.publish_stopped_if_seq(
                 &id,
                 RATE_LIMIT_EXHAUSTED_RETRIES_REASON,
                 latest_seq,
-            );
-            tracing::warn!(
-                target: "acp.supervisor",
-                session = %id,
-                redeliveries = streak,
-                max = RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES,
-                "rate-limit auto-resume: redelivery cap reached; parking session with a terminal stop"
-            );
+            ) {
+                state.session_service.clear_pending_initial_turn(&id).await;
+                tracing::warn!(
+                    target: "acp.supervisor",
+                    session = %id,
+                    redeliveries = streak,
+                    max = RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES,
+                    "rate-limit auto-resume: redelivery cap reached; parking session with a terminal stop"
+                );
+            }
             continue;
         }
         // Eligible: queue the interrupted prompt (if any) so the respawned
