@@ -4536,6 +4536,10 @@ cursor-acp-bridge = "agent acp"
     #[serial_test::serial]
     async fn resolve_mcp_layers_merges_native_global_and_profile() {
         let tmp = tempfile::TempDir::new().unwrap();
+        // Native discovery falls back to `CLAUDE_CONFIG_DIR`, so a developer
+        // running under a wrapper that exports it would read their own config
+        // instead of the temp HOME below.
+        let _env = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
         // SAFETY: serialised by `#[serial]`; subsequent serial tests reassign
         // these env vars, which is the existing pattern in this module.
         unsafe {

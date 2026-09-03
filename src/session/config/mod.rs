@@ -1143,7 +1143,8 @@ pub struct SessionConfig {
     /// default. Host sessions use the directory directly. Sandboxed sessions
     /// use its `sandbox` subdirectory, which AoE mounts at the resolved
     /// built-in config path and uses for hooks, credentials, and native-session
-    /// capture.
+    /// capture. Native MCP discovery reads it too, so AoE reconciles the
+    /// servers the agent loads.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[setting(
         label = "Agent Config Dir",
