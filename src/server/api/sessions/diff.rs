@@ -374,25 +374,36 @@ pub async fn session_diff_file(
     // session's primary repo). When the named repo doesn't exist, the
     // request is rejected so a stale link doesn't quietly diff the
     // wrong repo. See #1047.
-    let selected_repo =
-        match query.repo.as_deref() {
-            Some(name) => match ctx.repos.iter().find(|r| r.name.as_deref() == Some(name)) {
-                Some(r) => r.clone(),
-                None => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({
-                            "error": "bad_request",
-                            "message": "unknown workspace repo"
-                        })),
-                    )
-                        .into_response();
-                }
-            },
-            None => ctx.repos.first().cloned().expect(
-                "resolve_diff_repos always returns at least one entry (single-repo fallback)",
-            ),
-        };
+    let selected_repo = match query.repo.as_deref() {
+        Some(name) => match ctx.repos.iter().find(|r| r.name.as_deref() == Some(name)) {
+            Some(r) => r.clone(),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "bad_request",
+                        "message": "unknown workspace repo"
+                    })),
+                )
+                    .into_response();
+            }
+        },
+        // A workspace row can persist with `repos: []`; without this arm
+        // the omitted-`repo` default would panic on the empty list.
+        None => match ctx.repos.first() {
+            Some(r) => r.clone(),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "bad_request",
+                        "message": "workspace has no repos"
+                    })),
+                )
+                    .into_response();
+            }
+        },
+    };
     let project_path = selected_repo.path;
     let selected_repo_name = selected_repo.name;
     let base_override = selected_repo.base_override;
