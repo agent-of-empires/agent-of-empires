@@ -502,14 +502,14 @@ pub fn load_native_mcp_servers_checked_from_home(agent_key: &str) -> Result<Nati
     // but `agent_config_dir` is an exact-key map, so a directory declared
     // under either spelling must satisfy a lookup by the other.
     let cfg = crate::session::Config::load_or_warn();
-    let config_dir = cfg
-        .session
-        .agent_config_dir_for(agent_key, &home)
-        .or_else(|| match agent_key {
-            "claude" => cfg.session.agent_config_dir_for("claude-code", &home),
-            "claude-code" => cfg.session.agent_config_dir_for("claude", &home),
-            _ => None,
-        });
+    let config_dir =
+        cfg.session
+            .agent_config_dir_for(agent_key, &home)
+            .or_else(|| match agent_key {
+                "claude" => cfg.session.agent_config_dir_for("claude-code", &home),
+                "claude-code" => cfg.session.agent_config_dir_for("claude", &home),
+                _ => None,
+            });
     load_native_mcp_servers_checked_in(agent_key, &home, config_dir.as_deref())
 }
 
