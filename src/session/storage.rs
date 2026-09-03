@@ -269,7 +269,6 @@ pub(crate) fn replace_file_no_follow(root: &Path, rel: &Path, content: &[u8]) ->
 /// Split `rel` into the directories to walk and the final name, rejecting
 /// anything but plain relative components so no `..` or absolute segment can
 /// leave the anchor. `what` names the caller for the error.
-#[cfg(unix)]
 fn split_no_follow_rel<'a>(
     rel: &'a Path,
     what: &str,
@@ -301,16 +300,16 @@ fn split_no_follow_rel<'a>(
 /// leaves a window a process sharing the bind wins by swapping the file for a
 /// symlink, which pulls a host file into the config AoE merges and republishes
 /// into the container. Here every component is opened `O_NOFOLLOW` from the
-/// previous descriptor, and the regular-file check and the bytes both come
-/// from that one descriptor, so there is no pathname to re-resolve.
+/// previous descriptor, and the decisive regular-file check and the bytes both
+/// come from that one descriptor, so there is no pathname to re-resolve.
 ///
 /// `None` when the entry is missing, is not a regular file (a planted link
 /// included), or cannot be read: callers merge into what they read, so absent
 /// is the fail-closed answer.
 #[cfg(unix)]
 pub(crate) fn read_file_no_follow(root: &Path, rel: &Path) -> Result<Option<String>> {
-    use nix::fcntl::{open, openat, OFlag};
-    use nix::sys::stat::Mode;
+    use nix::fcntl::{open, openat, AtFlags, OFlag};
+    use nix::sys::stat::{fstat, fstatat, Mode};
     use std::io::Read;
 
     let (dirs, file_name) = split_no_follow_rel(rel, "read_file_no_follow")?;
@@ -326,14 +325,31 @@ pub(crate) fn read_file_no_follow(root: &Path, rel: &Path) -> Result<Option<Stri
         dir = next;
     }
 
-    // `O_NONBLOCK` so a fifo or device planted at the name cannot park the
-    // open until a peer shows up; the fstat below rejects it either way.
+    let regular = |mode| mode & libc::S_IFMT == libc::S_IFREG;
+
+    // Stat the name on the descriptor first. Opening is not free of side
+    // effects on every file type a container can plant: a character device
+    // arms on open, and `O_NONBLOCK` only covers a fifo parking the open until
+    // a peer shows up. This stat is not what makes the read safe, so do not
+    // read it as the check-then-open shape this function exists to replace:
+    // the open still decides, and the identity check below pins the descriptor
+    // to the entry stat'd here, so a swap in between yields nothing.
+    let Ok(before) = fstatat(&dir, file_name, AtFlags::AT_SYMLINK_NOFOLLOW) else {
+        return Ok(None);
+    };
+    if !regular(before.st_mode) {
+        return Ok(None);
+    }
+
     let flags = OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK;
     let Ok(fd) = openat(&dir, file_name, flags, Mode::empty()) else {
         return Ok(None);
     };
     let mut file = fs::File::from(fd);
-    if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+    let Ok(after) = fstat(&file) else {
+        return Ok(None);
+    };
+    if !regular(after.st_mode) || after.st_dev != before.st_dev || after.st_ino != before.st_ino {
         return Ok(None);
     }
     let mut content = String::new();
@@ -346,9 +362,11 @@ pub(crate) fn read_file_no_follow(root: &Path, rel: &Path) -> Result<Option<Stri
 static NO_FOLLOW_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Windows keeps the check-then-open the unix arm closes; the sandbox this
-/// guards against is Linux and macOS only. Kept so the module compiles.
+/// guards against is Linux and macOS only. Kept so the module compiles. `rel`
+/// is still validated, so the two arms agree on what a caller may ask for.
 #[cfg(not(unix))]
 pub(crate) fn read_file_no_follow(root: &Path, rel: &Path) -> Result<Option<String>> {
+    split_no_follow_rel(rel, "read_file_no_follow")?;
     let path = root.join(rel);
     Ok(fs::symlink_metadata(&path)
         .is_ok_and(|metadata| metadata.is_file())
