@@ -703,10 +703,15 @@ pub struct VolumeIgnoresPreviewResponse {
 /// Dry-run how glob `volume_ignores` entries would expand for a session rooted at
 /// `path`, without creating anything. The wizard calls this before a sandbox
 /// create to decide whether to show the snapshot-expansion confirm modal (#2045).
-/// Read-only: no `read_only` guard needed.
+/// Read-only: no `read_only` guard needed. Closed in CityHall mode: it
+/// resolves repo config for a caller-supplied host path.
 pub async fn preview_volume_ignores_globs(
+    State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<VolumeIgnoresPreviewQuery>,
 ) -> impl IntoResponse {
+    if let Some(resp) = crate::server::api::cityhall_block(&state) {
+        return resp;
+    }
     let result = tokio::task::spawn_blocking(move || {
         let profile = query.profile.unwrap_or_default();
         let config = crate::session::config::repo_config::resolve_config_with_repo(

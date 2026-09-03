@@ -385,6 +385,12 @@ pub async fn paste_image(
     if state.read_only {
         return crate::server::api::read_only_response();
     }
+    // Allowed for the CityHall composer, but only against a structured
+    // session: a plain/terminal target would let a locked-down client write
+    // into another session's worktree.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     let Json(req) = match req {
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
