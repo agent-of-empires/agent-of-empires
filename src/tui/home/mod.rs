@@ -220,7 +220,7 @@ pub struct HomeView {
     /// key)`: the key disambiguates same-named owners on different hosts
     /// (GitHub "acme" vs GitLab "acme"), the owner alone is the header's
     /// display text. Mirrors the server's `AppState.remote_owner_cache`
-    /// (`src/server/api/sessions.rs`), but process-local to this TUI
+    /// (`src/server/api/sessions/list.rs`), but process-local to this TUI
     /// instance. `RefCell` gives interior mutability so `org_group_key` can
     /// stay `&self`, matching every other `*_group_name` call site.
     /// Cleared on every `reload_storage_only` so a `git remote

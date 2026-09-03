@@ -169,9 +169,11 @@ impl Instance {
     /// opt-in host-only operation and requires a direct OpenCode launch.
     fn opencode_preassign_enabled(&self) -> bool {
         if self.is_sandboxed()
-            || !crate::session::profile_config::resolve_config_or_warn(&self.effective_profile())
-                .session
-                .opencode_preassign_session_id
+            || !crate::session::config::profile_config::resolve_config_or_warn(
+                &self.effective_profile(),
+            )
+            .session
+            .opencode_preassign_session_id
         {
             return false;
         }
@@ -329,7 +331,8 @@ impl Instance {
         }
         if self.is_sandboxed() {
             let bind_dir = self.pi_config_bind_dir()?;
-            if crate::session::container_config::install_pi_sandbox_extension_at(&bind_dir).is_err()
+            if crate::session::config::container_config::install_pi_sandbox_extension_at(&bind_dir)
+                .is_err()
             {
                 return None;
             }
@@ -353,7 +356,7 @@ impl Instance {
                 String::new(),
                 format!(
                     "AOE_PI_SESSION_ID_FILE={}/{}/session_id ",
-                    crate::session::container_config::PI_SIDECAR_DIR_IN_CONTAINER,
+                    crate::session::config::container_config::PI_SIDECAR_DIR_IN_CONTAINER,
                     self.id
                 ),
             ));

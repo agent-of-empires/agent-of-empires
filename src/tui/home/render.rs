@@ -4393,7 +4393,7 @@ mod tests {
     // by `preview::PreviewLayout`; its tests live alongside it in
     // `components/preview.rs`. The render-side regression is covered end to end
     // by `preview_visible_rows_equal_output_area_with_info_shown` in
-    // `home/tests.rs`, which renders a real frame and asserts
+    // `home/tests/keys_and_nav.rs`, which renders a real frame and asserts
     // `preview_visible_rows == preview_pane_area.height`.
 
     /// A preview worker gets the full shared tmux deadline plus grace before

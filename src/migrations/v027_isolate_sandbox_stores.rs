@@ -70,7 +70,9 @@ fn transition_may_be_pending(app_dir: &Path) -> Result<bool> {
                     .get("sandbox_store_generation")
                     .and_then(Value::as_u64)
                     .unwrap_or(0)
-                    < u64::from(crate::session::container_config::CURRENT_SANDBOX_STORE_GENERATION)
+                    < u64::from(
+                        crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION,
+                    )
                     || transition_paths(row).ok().flatten().is_some())
         }) {
             return Ok(true);
@@ -119,7 +121,7 @@ fn run_in(app_dir: &Path, home: &Path, is_running: &RunningProbe<'_>) -> Result<
         let Some(rows) = registry.value.as_array() else {
             continue;
         };
-        let config = crate::session::profile_config::resolve_config_or_warn(&profile);
+        let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
         for row in rows {
             if !row
                 .pointer("/sandbox_info/enabled")
@@ -148,12 +150,14 @@ fn run_in(app_dir: &Path, home: &Path, is_running: &RunningProbe<'_>) -> Result<
                 continue;
             };
             let declared = config.session.agent_config_dir_for(tool, home);
-            for (source, _) in crate::session::container_config::sandbox_store_migration_paths(
-                agent.name,
-                home,
-                declared.as_deref(),
-                id,
-            )? {
+            for (source, _) in
+                crate::session::config::container_config::sandbox_store_migration_paths(
+                    agent.name,
+                    home,
+                    declared.as_deref(),
+                    id,
+                )?
+            {
                 let root = fs::canonicalize(&source).unwrap_or(source);
                 row_ids_by_root
                     .entry(root)
@@ -186,7 +190,9 @@ fn run_in(app_dir: &Path, home: &Path, is_running: &RunningProbe<'_>) -> Result<
             };
             crate::session::validate_instance_id(&id)?;
             if generation
-                >= u64::from(crate::session::container_config::CURRENT_SANDBOX_STORE_GENERATION)
+                >= u64::from(
+                    crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION,
+                )
             {
                 if clear_transition_metadata(row) {
                     needs_registry_write = true;
@@ -197,7 +203,7 @@ fn run_in(app_dir: &Path, home: &Path, is_running: &RunningProbe<'_>) -> Result<
                 defer_source_retirement = true;
                 continue;
             };
-            let config = crate::session::profile_config::resolve_config_or_warn(&profile);
+            let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
             let detect_as = row
                 .get("detect_as")
                 .and_then(Value::as_str)
@@ -210,12 +216,13 @@ fn run_in(app_dir: &Path, home: &Path, is_running: &RunningProbe<'_>) -> Result<
                 continue;
             };
             let declared = config.session.agent_config_dir_for(tool, home);
-            let mut fresh_plans = crate::session::container_config::sandbox_store_migration_paths(
-                agent.name,
-                home,
-                declared.as_deref(),
-                &id,
-            )?;
+            let mut fresh_plans =
+                crate::session::config::container_config::sandbox_store_migration_paths(
+                    agent.name,
+                    home,
+                    declared.as_deref(),
+                    &id,
+                )?;
             let stored_plans = transition_paths(row)
                 .with_context(|| format!("validating v027 transition plan for {id}"))?;
             let stored_private = stored_plans.as_ref().is_some_and(|plans| {
@@ -526,7 +533,7 @@ fn run_in(app_dir: &Path, home: &Path, is_running: &RunningProbe<'_>) -> Result<
         {
             set_generation(
                 value,
-                crate::session::container_config::CURRENT_SANDBOX_STORE_GENERATION,
+                crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION,
             );
         }
     }
@@ -535,7 +542,7 @@ fn run_in(app_dir: &Path, home: &Path, is_running: &RunningProbe<'_>) -> Result<
             for row in rows {
                 if row.get("sandbox_store_generation").and_then(Value::as_u64)
                     == Some(u64::from(
-                        crate::session::container_config::CURRENT_SANDBOX_STORE_GENERATION,
+                        crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION,
                     ))
                 {
                     clear_transition_metadata(row);
@@ -638,7 +645,7 @@ fn clear_transition_metadata(row: &mut Value) -> bool {
 }
 
 fn mark_current(row: &mut Value, generation: u64, dirty: &mut bool) {
-    let current = crate::session::container_config::CURRENT_SANDBOX_STORE_GENERATION;
+    let current = crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION;
     if generation != u64::from(current) {
         set_generation(row, current);
         *dirty = true;

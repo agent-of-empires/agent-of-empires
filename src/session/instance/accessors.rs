@@ -49,7 +49,7 @@ impl Instance {
             workspace_info: None,
             sandbox_info: None,
             sandbox_store_generation:
-                crate::session::container_config::CURRENT_SANDBOX_STORE_GENERATION,
+                crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION,
             sandbox_store_transition_paths: Vec::new(),
             terminal_info: None,
             agent_session_id: None,
@@ -371,21 +371,22 @@ impl Instance {
             return None;
         }
         let home = dirs::home_dir()?;
-        let config =
-            crate::session::profile_config::resolve_config_or_warn(&self.effective_profile());
+        let config = crate::session::config::profile_config::resolve_config_or_warn(
+            &self.effective_profile(),
+        );
         let declared = config.session.agent_config_dir_for(&self.tool, &home);
         let agent = self.resolved_agent()?;
         if self.sandbox_store_generation
-            < crate::session::container_config::CURRENT_SANDBOX_STORE_GENERATION
+            < crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION
         {
-            return crate::session::container_config::legacy_sandbox_store_dir(
+            return crate::session::config::container_config::legacy_sandbox_store_dir(
                 agent.name,
                 &home,
                 declared.as_deref(),
                 (self.sandbox_store_generation == 0).then_some(self.id.as_str()),
             );
         }
-        crate::session::container_config::sandbox_store_dir(
+        crate::session::config::container_config::sandbox_store_dir(
             agent.name,
             &home,
             declared.as_deref(),

@@ -641,7 +641,7 @@ mod tests {
         );
 
         peer.sandbox_store_generation =
-            crate::session::container_config::CURRENT_SANDBOX_STORE_GENERATION;
+            crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION;
         let peer_store = peer.sandbox_capture_store_dir().unwrap();
         assert_ne!(peer_store, shared_store);
         std::fs::create_dir_all(&peer_store).unwrap();

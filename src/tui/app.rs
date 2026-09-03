@@ -1450,8 +1450,14 @@ impl App {
                                     self.home.handle_diff_click(mouse.column, mouse.row);
                                     self.draw(terminal)?;
                                     None
+                                } else if self.home.clear_preview_selection() {
+                                    // A click on no surface at all still
+                                    // dismisses a finalized highlight, and
+                                    // nothing below repaints for a bare
+                                    // Down(Left), so draw the clear here.
+                                    self.draw(terminal)?;
+                                    None
                                 } else {
-                                    let _ = self.home.clear_preview_selection();
                                     None
                                 }
                             } else {
@@ -3320,7 +3326,7 @@ impl App {
             now,
             &attached,
             |profile| {
-                crate::session::profile_config::resolve_config_or_warn(profile)
+                crate::session::config::profile_config::resolve_config_or_warn(profile)
                     .session
                     .auto_stop_idle_secs
             },

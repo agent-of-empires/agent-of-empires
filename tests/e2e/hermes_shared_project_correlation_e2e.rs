@@ -2,7 +2,7 @@
 //!
 //! Two real-looking active conversations are seeded in the shared Hermes
 //! database. Host launches must ignore both and leave agent_session_id empty;
-//! managed sandbox stores are covered by unit tests in src/session/capture.rs.
+//! managed sandbox stores are covered by unit tests in src/session/capture/mod.rs.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};

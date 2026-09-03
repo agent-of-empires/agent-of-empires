@@ -27,7 +27,8 @@ impl HooksInstallDialog {
     }
 
     pub fn new_for_profile(tool_name: &str, profile: Option<&str>) -> Self {
-        let profile_config = profile.map(crate::session::profile_config::resolve_config_or_warn);
+        let profile_config =
+            profile.map(crate::session::config::profile_config::resolve_config_or_warn);
         let agent_name = crate::agents::get_agent(tool_name)
             .or_else(|| {
                 profile_config
@@ -48,7 +49,8 @@ impl HooksInstallDialog {
         let mut hook_commands = Vec::new();
         let mut needs_codex_trust_note = false;
 
-        let profile_config = profile.map(crate::session::profile_config::resolve_config_or_warn);
+        let profile_config =
+            profile.map(crate::session::config::profile_config::resolve_config_or_warn);
         if let Some(agent) = crate::agents::get_agent(agent_name) {
             if let Some(hook_cfg) = &agent.hook_config {
                 let host_env = profile_config

@@ -427,7 +427,7 @@ impl HomeView {
                 // and silently disables restamping on real transitions.
                 // Locked by
                 // [`apply_status_update_propagates_live_status_baseline_from_poller`]
-                // in `src/tui/home/tests.rs`. See #2690.
+                // in `src/tui/home/tests/status_rows_menu.rs`. See #2690.
                 if let Some(baseline) = new_live_status_baseline {
                     inst.live_status_baseline = Some(baseline);
                 }

@@ -300,11 +300,10 @@ export function resolveAoeBinary(): string {
   const fromEnv = process.env.AOE_E2E_BINARY;
   if (fromEnv && existsSync(fromEnv)) return fromEnv;
   const repoRoot = resolve(__dirname, "..", "..", "..");
-  // Prefer release if both exist (CI builds release by default), fall
-  // back to debug for local `cargo build` flows.
-  const release = join(repoRoot, "target", "release", "aoe");
-  if (existsSync(release)) return release;
-  return join(repoRoot, "target", "debug", "aoe");
+  // Live tests require debug-only timing overrides. CI also supplies a debug binary.
+  const debug = join(repoRoot, "target", "debug", "aoe");
+  if (existsSync(debug)) return debug;
+  return join(repoRoot, "target", "release", "aoe");
 }
 
 /**
@@ -313,7 +312,7 @@ export function resolveAoeBinary(): string {
  * `cfg!(debug_assertions)`; we can't query it from JS, so we derive it
  * from the build directory in the path. CI passes the binary via
  * `AOE_E2E_BINARY` so this works in CI; locally it falls through to the
- * release/debug heuristic in `resolveAoeBinary`.
+ * debug/release fallback in `resolveAoeBinary`.
  */
 export function tmuxPrefixFor(binaryPath: string): "aoe_" | "aoe_dev_" {
   return binaryPath.includes("/target/debug/") ? "aoe_dev_" : "aoe_";

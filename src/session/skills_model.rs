@@ -4,10 +4,10 @@
 //! frontmatter (`name`, `description`, plus optional metadata) between `---`
 //! fences, then a markdown body, living in a per-skill directory. AoE has never
 //! had a Rust model for these; they were only bulk-copied into sandboxes
-//! (`src/session/container_config.rs`). This module is the single resolver used
+//! (`src/session/config/container_config.rs`). This module is the single resolver used
 //! by the server, CLI, and plugin host.
 //!
-//! Two provenance layers, mirroring [`super::mcp_model::McpProvenance`]:
+//! Two provenance layers, mirroring [`super::mcp::mcp_model::McpProvenance`]:
 //! host-discovered skills in each agent's own skills dir (`~/.claude/skills`,
 //! `~/.kimi-code/skills`) are READ-ONLY; the AoE-managed store at
 //! `<app_dir>/skills` is the only WRITABLE layer. Editing a host-discovered

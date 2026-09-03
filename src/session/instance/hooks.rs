@@ -102,9 +102,9 @@ impl Instance {
             if let (Some(hook_cmds), Some(sandbox)) =
                 (on_launch_hooks.as_ref(), self.sandbox_info.as_ref())
             {
-                let hook_env = crate::session::repo_config::lifecycle_env_vars(self);
+                let hook_env = crate::session::config::repo_config::lifecycle_env_vars(self);
                 let workdir = self.container_workdir();
-                if let Err(error) = crate::session::repo_config::execute_hooks_in_container(
+                if let Err(error) = crate::session::config::repo_config::execute_hooks_in_container(
                     hook_cmds,
                     &sandbox.container_name,
                     &workdir,
@@ -112,7 +112,7 @@ impl Instance {
                 ) {
                     if error.chain().any(|cause| {
                         cause
-                            .downcast_ref::<crate::session::repo_config::HookTimeout>()
+                            .downcast_ref::<crate::session::config::repo_config::HookTimeout>()
                             .is_some()
                     }) {
                         return Err(error);
@@ -125,15 +125,15 @@ impl Instance {
                 }
             }
         } else if let Some(hook_cmds) = on_launch_hooks.as_ref() {
-            let hook_env = crate::session::repo_config::lifecycle_env_vars(self);
-            if let Err(error) = crate::session::repo_config::execute_hooks(
+            let hook_env = crate::session::config::repo_config::lifecycle_env_vars(self);
+            if let Err(error) = crate::session::config::repo_config::execute_hooks(
                 hook_cmds,
                 Path::new(&self.project_path),
                 &hook_env,
             ) {
                 if error.chain().any(|cause| {
                     cause
-                        .downcast_ref::<crate::session::repo_config::HookTimeout>()
+                        .downcast_ref::<crate::session::config::repo_config::HookTimeout>()
                         .is_some()
                 }) {
                     return Err(error);
@@ -159,14 +159,14 @@ impl Instance {
 
         // Start with global+profile hooks as the base
         let mut resolved_on_launch =
-            crate::session::profile_config::resolve_config_or_warn(profile)
+            crate::session::config::profile_config::resolve_config_or_warn(profile)
                 .hooks
                 .on_launch;
 
         // Check if repo has trusted hooks that override. Only the hooks surface
         // matters here; untrusted project MCP must not suppress trusted hooks.
         if let Ok(trust) =
-            crate::session::repo_config::check_repo_trust(Path::new(&self.project_path))
+            crate::session::config::repo_config::check_repo_trust(Path::new(&self.project_path))
         {
             if let Some(hooks) = trust.hooks.trusted() {
                 if !hooks.on_launch.is_empty() {
@@ -227,7 +227,7 @@ impl Instance {
             return Ok(());
         }
         let profile = self.effective_profile();
-        let config = crate::session::profile_config::resolve_config_or_warn(&profile);
+        let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
         let hook_install_required =
             crate::agents::hook_install_required(agent, config.session.agent_status_hooks);
         if !hook_install_required {
@@ -323,7 +323,7 @@ impl Instance {
     fn install_agent_status_hooks(&mut self, agent: Option<&'static crate::agents::AgentDef>) {
         self.identity_publisher_launched = false;
         let profile = self.effective_profile();
-        let config = crate::session::profile_config::resolve_config_or_warn(&profile);
+        let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
         let status_hooks_enabled = config.session.agent_status_hooks;
         if !self.is_sandboxed()
             && agent.is_some_and(|agent| {
@@ -427,7 +427,7 @@ impl Instance {
             return;
         }
         let profile = self.effective_profile();
-        let config = crate::session::profile_config::resolve_config_or_warn(&profile);
+        let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
         if !config.session.pre_trust_agent_folders {
             return;
         }
@@ -646,7 +646,7 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
         )];
-        let config = crate::session::profile_config::resolve_config_or_warn("");
+        let config = crate::session::config::profile_config::resolve_config_or_warn("");
         let sidecar = crate::agents::get_agent("cursor")
             .unwrap()
             .sidecar_hooks

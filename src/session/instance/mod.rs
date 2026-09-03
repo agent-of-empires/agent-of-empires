@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::containers::{self, DockerContainer};
-use crate::session::container_config;
+use crate::session::config::container_config;
 use crate::session::environment::{
     build_docker_env_args_with_managed_codex_home, resolved_sandbox_environment, shell_escape,
 };

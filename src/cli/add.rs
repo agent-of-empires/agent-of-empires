@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use crate::containers;
 use crate::session::builder;
-use crate::session::repo_config;
+use crate::session::config::repo_config;
 use crate::session::{
     acquire_session_identity_lock, civilizations, duplicate_session_error, is_duplicate_session,
     GroupTree, Instance, SandboxInfo, Storage,
@@ -238,7 +238,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     // happened to run `aoe add --scratch` in, which breaks the
     // project-less contract. Fall back to the profile-only resolver.
     let config = if args.scratch {
-        crate::session::profile_config::resolve_config_or_warn(profile)
+        crate::session::config::profile_config::resolve_config_or_warn(profile)
     } else {
         repo_config::resolve_config_with_repo_or_warn(profile, &path)
     };
@@ -746,7 +746,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     // otherwise every tool would look ACP-capable via that default and
     // `--structured-view` could never be rejected for a non-ACP tool (it
     // would silently substitute the default). Mirrors the server create
-    // path in `src/server/api/sessions.rs`.
+    // path in `src/server/api/sessions/create.rs`.
     let capability_key = instance
         .agent_name
         .as_deref()

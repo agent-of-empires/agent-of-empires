@@ -14,9 +14,9 @@ use tui_input::Input;
 
 use super::DialogResult;
 use crate::containers;
+use crate::session::config::profile_config::resolve_config_or_warn;
+use crate::session::config::repo_config::HookProgress;
 use crate::session::config::{load_config, update_app_state, DefaultTerminalMode, SandboxConfig};
-use crate::session::profile_config::resolve_config_or_warn;
-use crate::session::repo_config::HookProgress;
 #[cfg(test)]
 use crate::session::Config;
 use crate::tmux::AvailableTools;
@@ -444,7 +444,7 @@ impl NewSessionDialog {
         let docker_available = containers::get_container_runtime().is_available();
 
         // Load resolved config (global + profile + repo overrides from cwd)
-        let config = crate::session::repo_config::resolve_config_with_repo_or_warn(
+        let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
             profile,
             std::path::Path::new(&current_dir),
         );
@@ -733,7 +733,7 @@ impl NewSessionDialog {
         if path.is_empty() {
             resolve_config_or_warn(profile)
         } else {
-            crate::session::repo_config::resolve_config_with_repo_or_warn(
+            crate::session::config::repo_config::resolve_config_with_repo_or_warn(
                 profile,
                 std::path::Path::new(path),
             )

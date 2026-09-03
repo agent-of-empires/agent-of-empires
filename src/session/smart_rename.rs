@@ -239,11 +239,11 @@ pub fn render_first_turn(user_prompt: &str, agent_prose: &str) -> String {
 }
 
 /// Project a resolved [`SessionConfig`] into the three fields the smart-rename
-/// indicator (`list_sessions` in `src/server/api/sessions.rs`) and the runtime
+/// indicator (`list_sessions` in `src/server/api/sessions/list.rs`) and the runtime
 /// gate ([`try_smart_rename`]) both consume. Shared projection so the two
 /// call sites cannot drift on which fields count: each site fetches the
 /// resolved config via
-/// [`crate::session::repo_config::resolve_config_with_repo_or_warn`] and
+/// [`crate::session::config::repo_config::resolve_config_with_repo_or_warn`] and
 /// passes `.session` through this function. Returns borrowed refs so the
 /// sidebar's per-row call does not allocate. See #2603.
 pub fn resolve_smart_rename_config(session: &SessionConfig) -> SmartRenameConfig<'_> {
@@ -658,7 +658,7 @@ pub fn maybe_spawn_terminal_smart_rename(inst: &crate::session::instance::Instan
     // child's resolve_oneshot_target, so it can retry when the container comes
     // back. The child re-checks against fresh storage anyway, so this is a
     // fork-avoidance filter, not the authority.
-    let resolved = crate::session::repo_config::resolve_config_with_repo_or_warn(
+    let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
         &inst.source_profile,
         Path::new(&inst.project_path),
     );
@@ -1072,7 +1072,7 @@ pub async fn run_terminal_rename(
         return Ok(());
     }
 
-    let resolved = crate::session::repo_config::resolve_config_with_repo_or_warn(
+    let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
         profile,
         Path::new(&project_path),
     );
@@ -1284,7 +1284,7 @@ mod serve {
             return;
         };
 
-        let resolved = crate::session::repo_config::resolve_config_with_repo_or_warn(
+        let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
             &profile,
             Path::new(&project_path),
         );
@@ -2532,7 +2532,7 @@ Rewrote the getting-started section and fixed two broken links.";
     }
 
     // Regression for #2351: pins the shared helper that both `try_smart_rename`
-    // and the sidebar indicator overlay in `src/server/api/sessions.rs` route
+    // and the sidebar indicator overlay in `src/server/api/sessions/list.rs` route
     // through. The helper is verified in isolation here; call-site coverage is
     // design-level (reverting either site to bypass the helper is visible in
     // review because both explicitly name `resolve_smart_rename_config`).
@@ -2545,7 +2545,7 @@ Rewrote the getting-started section and fixed two broken links.";
     fn resolve_smart_rename_config_reads_repo_aware_config_but_not_repo_commands() {
         let home = tempfile::tempdir().expect("tempdir HOME");
         // SAFETY: serialized by `#[serial]`; matches `set_tmp_home` in
-        // `src/session/mcp_state.rs`.
+        // `src/session/mcp/mcp_state.rs`.
         unsafe {
             std::env::set_var("HOME", home.path());
             std::env::set_var("XDG_CONFIG_HOME", home.path().join(".config"));
@@ -2587,8 +2587,10 @@ claude = "repo-wrapper"
         )
         .unwrap();
 
-        let resolved =
-            crate::session::repo_config::resolve_config_with_repo_or_warn("default", repo.path());
+        let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+            "default",
+            repo.path(),
+        );
         // Pins that the repo file was actually discovered: an allowed field
         // from it lands, so the assertions below are about the boundary and
         // not about a fixture that silently never loaded.

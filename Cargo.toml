@@ -227,6 +227,10 @@ serve = ["web"]
 
 [dev-dependencies]
 serial_test = "4.0"
+# Test-only tokio clock control (`start_paused`), so the token-rotation
+# loop's grace deadline can be asserted without sleeping through it.
+# `cargo build` and released binaries never enable `test-util`.
+tokio = { version = "1.52", features = ["test-util"] }
 # Test-only tracing capture (#2756, I4): asserts the equal-timestamp guard's
 # drop branch logged. Its target `session.store` is rejected by the default
 # `agent_of_empires=trace` env filter, so `no-env-filter` is required; the
@@ -251,6 +255,19 @@ tower = { version = "0.5", features = ["util"] }
 # `cargo test --no-default-features`, making that CI job meaningless.
 agent-of-empires = { path = ".", default-features = false, features = ["test-support"] }
 
+[profile.dev]
+# Full DWARF is cargo's `dev` default and it dominates `target/`: this table and
+# the one below take a `cargo build --lib --bins` here from 5.6 GB to 3.8 GB.
+# Line tables keep the file and line number in panics and backtraces; the cost
+# is local-variable inspection under a debugger. docs/development.md documents
+# the tradeoff and how to opt back into full debug info.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+# Dependencies only; the `"*"` glob never matches a workspace member. Nobody
+# reads DWARF for tokio internals, so it is pure weight in every target dir.
+debug = false
+
 [profile.release]
 lto = true
 codegen-units = 1
@@ -270,7 +287,8 @@ debug-assertions = false
 # Explicit target so the `e2e-tests` feature gate applies. Without this entry
 # Cargo auto-discovers tests/e2e/main.rs unconditionally; the gate lets CI split
 # the suite into "everything except e2e" and "e2e only" shards. The other
-# standalone test binaries stay auto-discovered.
+# test targets (the consolidated `integration` harness and the standalone
+# `branch_exists_spawn_failure`) stay auto-discovered.
 name = "e2e"
 path = "tests/e2e/main.rs"
 required-features = ["e2e-tests"]

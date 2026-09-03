@@ -17,6 +17,11 @@ cargo clippy
 The binary is `target/{profile}/aoe`. Web commands and test selection are in
 `web/AGENTS.md`.
 
+Debug builds carry line tables only, and dependencies carry no debug info, to
+keep `target/` small across worktrees. Panics and backtraces still name the file
+and line in this crate; a debugger has no local-variable values. Rebuild with
+`RUSTFLAGS="-Cdebuginfo=2"` for a full debugging session.
+
 ## Run and inspect logs
 
 ```sh

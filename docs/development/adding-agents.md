@@ -9,7 +9,7 @@
 | `src/tmux/status_detection.rs` | Detection entry point (manifest call or stub) |
 | `src/hooks/mod.rs` | Hook installer (if the agent supports hooks) |
 | `src/session/instance/hooks.rs` | Wire hook installation + `AOE_INSTANCE_ID` env prefix |
-| `src/session/container_config.rs` | Config mount for Docker sandbox |
+| `src/session/config/container_config.rs` | Config mount for Docker sandbox |
 | `src/acp/agent_registry.rs` | Structured view ACP adapter entry (only if the agent ships an ACP server) |
 | `src/acp/agent_profiles.rs` + `web/src/lib/agentProfiles.ts` | Structured view profile (clear aliases, meta namespace, capability gates, tool aliases) |
 | `src/acp/install_hints.rs` | Install hint surfaced by `aoe acp doctor` and handshake failures |
@@ -41,7 +41,7 @@ Levels 3 and 4 are independent. `session_support` declares verified native resum
 
 **4. Hooks (if applicable):** for non-Claude formats add a custom installer in `src/hooks/mod.rs` (see `install_hermes_hooks_with_events`, `install_kiro_hooks_with_events`). Wire it into `SidecarHooks::install`, and make sure `status_hook_env_prefix()` includes the agent so `AOE_INSTANCE_ID` and `AOE_PROFILE` reach the hook (without the instance id hooks write nothing). Hook statuses use `HookStatus` (`Running`, `Waiting`, `Idle`, `Error`), not raw strings, and sidecar event defaults live on the agent so profile `agents.<name>.status_map` entries feed host and sandbox installs through the same resolver. Keep installers as pure file IO; any subprocess work (e.g. setting a default agent) goes in a separate function so `cargo test` doesn't mutate the dev's real environment.
 
-**5. Container mount (`src/session/container_config.rs`):** add an `AgentConfigMount` (`tool_name`, `host_rel`, `container_suffix`, `skip_entries`). The resolved config store must be mounted at the path the containerized binary actually reads. Install hooks and session-id sidecars into that mounted store. Add a sandbox capture context only after this path is proven; otherwise declare it `Unsupported`.
+**5. Container mount (`src/session/config/container_config.rs`):** add an `AgentConfigMount` (`tool_name`, `host_rel`, `container_suffix`, `skip_entries`). The resolved config store must be mounted at the path the containerized binary actually reads. Install hooks and session-id sidecars into that mounted store. Add a sandbox capture context only after this path is proven; otherwise declare it `Unsupported`.
 
 **6. Dockerfile (`docker/Dockerfile`):** install the agent and add its config dir to the `mkdir -p` block.
 

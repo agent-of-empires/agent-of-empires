@@ -536,7 +536,7 @@ fn stamp_recovery_error(inst: &mut Instance, e: &anyhow::Error) {
 fn format_recovery_last_error(e: &anyhow::Error) -> String {
     if let Some(t) = e
         .chain()
-        .find_map(|c| c.downcast_ref::<super::repo_config::HookTimeout>())
+        .find_map(|c| c.downcast_ref::<super::config::repo_config::HookTimeout>())
     {
         format!(
             "on_launch hook timed out after {}s: {}",
@@ -959,7 +959,9 @@ mod tests {
 
         let mut visible = false;
         for _ in 0..100 {
-            if crate::process::processes_matching(&[marker.clone()], &[None], &[None])[0] {
+            if crate::process::processes_matching(std::slice::from_ref(&marker), &[None], &[None])
+                [0]
+            {
                 visible = true;
                 break;
             }
@@ -1116,7 +1118,7 @@ mod tests {
     /// today. AC #3 of #1889 specifies the exact `last_error` text.
     #[test]
     fn format_recovery_last_error_renders_hook_timeout_with_on_launch_prefix() {
-        let err = anyhow::Error::new(super::super::repo_config::HookTimeout {
+        let err = anyhow::Error::new(super::super::config::repo_config::HookTimeout {
             cmd: "sleep 60".to_string(),
             timeout_secs: 30,
         });
@@ -1130,7 +1132,7 @@ mod tests {
     fn stamp_recovery_error_sets_error_status_and_operator_fields() {
         let mut inst = Instance::new("timeout", "/tmp/test");
         let before = std::time::Instant::now();
-        let err = anyhow::Error::new(super::super::repo_config::HookTimeout {
+        let err = anyhow::Error::new(super::super::config::repo_config::HookTimeout {
             cmd: "sleep 60".to_string(),
             timeout_secs: 30,
         });
@@ -1166,7 +1168,7 @@ mod tests {
     /// the timeout-shaped message.
     #[test]
     fn format_recovery_last_error_walks_chain_through_context() {
-        let err = anyhow::Error::new(super::super::repo_config::HookTimeout {
+        let err = anyhow::Error::new(super::super::config::repo_config::HookTimeout {
             cmd: "echo hi && sleep 60".to_string(),
             timeout_secs: 12,
         })
