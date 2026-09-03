@@ -319,8 +319,9 @@ impl HomeView {
         self.live_send_last_resize = None;
         self.live_send_resize_retry_at = None;
         // Live mode takes over the pane's size from here; drop the non-live
-        // preview dedup so exiting re-asserts the preview geometry cleanly.
-        self.preview_pane_synced = None;
+        // resize bookkeeping so exiting re-asserts the preview geometry
+        // cleanly.
+        self.clear_preview_pane_sync(session_id);
         self.stamp_last_accessed(session_id);
         Ok(())
     }

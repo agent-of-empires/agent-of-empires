@@ -131,6 +131,19 @@ pub(super) struct CreatingHookProgress {
     pub(super) current_hook: Option<String>,
 }
 
+/// One applied passive resize: the preview geometry the dedup keys on, the
+/// window geometry tmux actually applied (preview rows plus status-bar
+/// chrome), and when render adopted it. Only a pane snapshot taken after
+/// adoption can invalidate the entry, because the shared snapshot can lag
+/// our own resize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PassiveSynced {
+    pub(super) cols: u16,
+    pub(super) rows: u16,
+    pub(super) window_rows: u16,
+    pub(super) adopted_at: std::time::Instant,
+}
+
 /// Result delivered by a startup-recovery worker back to the TUI tick.
 struct RecoveryUpdate {
     instance_id: String,
@@ -380,13 +393,38 @@ pub struct HomeView {
     /// (`leader b`). Persisted to `app_state.home_sidebar_collapsed` so the
     /// choice survives restarts.
     pub(super) sidebar_collapsed: bool,
-    /// `(session_id, cols, rows)` of the last NON-live preview resize we sent
-    /// to the selected agent's pane, so the 250ms preview poll doesn't
-    /// SIGWINCH-storm it every tick. Invalidated (set to None) on attach and on
-    /// live-send enter/exit, where the window's real size changes out from
-    /// under us and the next render must re-assert the preview geometry. See
-    /// `refresh_preview_cache_if_needed`.
-    pub(super) preview_pane_synced: Option<(String, u16, u16)>,
+    /// Per-session record of the last NON-live passive resize the worker
+    /// applied, so neither the selected-session sync nor the fleet reconcile
+    /// SIGWINCH-storms a pane that already matches. A session's entry is
+    /// dropped on attach and on live-send enter/exit, where its window's real
+    /// size changes out from under us, and when a newer pane snapshot shows a
+    /// window size other than the one we applied (an external `tmux attach`
+    /// or the web live view resized it behind our back). See
+    /// `refresh_preview_cache_if_needed` and `reconcile_passive_fleet`.
+    pub(super) passive_pane_synced: std::collections::HashMap<String, PassiveSynced>,
+    /// Per-session `(cols, rows)` the worker declined to apply (session
+    /// missing, client attached, or size owner active), with when. The fleet
+    /// reconcile skips a session while it still wants its declined geometry,
+    /// so background sessions get one attempt per geometry change instead of
+    /// a per-frame retry loop; the selected session ignores this and keeps
+    /// its historical retry-until-applied behavior. Cleared whenever the
+    /// fleet's wanted geometry changes, and an entry older than
+    /// `PASSIVE_DECLINE_RETRY` reads as absent so a session recovers once its
+    /// blocking attach or size owner goes away.
+    pub(super) passive_pane_declined:
+        std::collections::HashMap<String, ((u16, u16), std::time::Instant)>,
+    /// Per-session `(cols, rows)` handed to the passive-resize worker whose
+    /// completion has not been adopted yet. Gates duplicate queueing; the
+    /// selected-session sync also uses it to cancel a stale queued intent
+    /// when its geometry lands back in sync before the worker picks it up.
+    pub(super) passive_pane_queued: std::collections::HashMap<String, (u16, u16)>,
+    /// The fleet geometry `reconcile_passive_fleet` saw last refresh: one
+    /// `(session_id, cols, rows)` per eligible session, selection-independent
+    /// so cursor movement cannot re-arm the fleet. Resizes fire only once the
+    /// same fleet geometry is wanted on two consecutive refreshes, extending
+    /// the one-frame-toast debounce (`passive_resize_step`) to the whole
+    /// fleet.
+    pub(super) passive_fleet_armed: Option<Vec<(String, u16, u16)>>,
     /// `(session_id, cols, rows)` the NON-live preview sync wants but has only
     /// seen for one refresh so far. The sync fires a resize only once the same
     /// geometry is wanted on two consecutive refreshes: the `EnterLiveSend` /

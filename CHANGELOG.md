@@ -4,6 +4,23 @@ All notable changes to Agent of Empires will be documented in this file.
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [1.15.3](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.15.3) - 2026-09-02
+
+
+
+### Bug Fixes
+
+- **ci:** Key the PR-template escape hatches on the head branch in [#3700](https://github.com/agent-of-empires/agent-of-empires/pull/3700) by [@njbrake](https://github.com/njbrake) ([`fc792b2`](https://github.com/agent-of-empires/agent-of-empires/commit/fc792b2c857910d525688f4885ec966a9908c3cf))
+- **ci:** Constrain the Nix hash PR lookup to the base repository in [#3706](https://github.com/agent-of-empires/agent-of-empires/pull/3706) by [@njbrake](https://github.com/njbrake) ([`03c4fba`](https://github.com/agent-of-empires/agent-of-empires/commit/03c4fba9cd804ddb027f7e1af578b13798d48436))
+- **status:** Decide an unwitnessed idle from a single observation in [#3717](https://github.com/agent-of-empires/agent-of-empires/pull/3717) by [@njbrake](https://github.com/njbrake) ([`6038459`](https://github.com/agent-of-empires/agent-of-empires/commit/6038459d8ddd60e3efc4927dee6579b84603d5e1))
+
+
+### Features
+
+- **tui:** Pre-size every open session's pane to its preview rect in [#3709](https://github.com/agent-of-empires/agent-of-empires/pull/3709) by [@njbrake](https://github.com/njbrake) ([`b00049e`](https://github.com/agent-of-empires/agent-of-empires/commit/b00049e22daaf2e921bf94a92be6d77e3ce34360))
+
+
+**Full Changelog**: https://github.com/agent-of-empires/agent-of-empires/compare/v1.15.2...v1.15.3
 ## [1.15.2](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.15.2) - 2026-09-02
 
 

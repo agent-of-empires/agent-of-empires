@@ -15898,6 +15898,58 @@ mod preview_drag_select {
 
     #[test]
     #[serial]
+    fn drag_start_below_painted_content_is_noop() {
+        // Pane rows past the last painted line show no text, and
+        // `screen_to_content` would clamp them onto the last line, so a
+        // press there must not anchor a selection.
+        let mut env = create_test_env_empty();
+        let pane = Rect::new(40, 0, 60, 20);
+        // (first_line, total_lines, row, starts a selection)
+        let cases = [
+            (0, 3, 2, true),
+            (0, 3, 3, false),
+            (0, 3, 10, false),
+            // Scrolled into history: the window is full, so every pane
+            // row is painted and the gate rejects nothing.
+            (85, 105, 0, true),
+            (85, 105, 19, true),
+            // A partly-painted window is geometry `compute_scroll` and
+            // `TranscriptGeometry` both clamp away; the gate stays right
+            // without leaning on that.
+            (100, 105, 4, true),
+            (100, 105, 5, false),
+        ];
+        for (first_line, total_lines, row, accepted) in cases {
+            env.view.preview_selection = None;
+            env.view.drag_state = None;
+            stage_pane(&mut env, pane, first_line, total_lines);
+            let label = format!("first_line={first_line} total={total_lines} row={row}");
+            assert_eq!(env.view.handle_drag_start(50, row), accepted, "{label}");
+            assert_eq!(env.view.preview_selection.is_some(), accepted, "{label}");
+            assert_eq!(
+                matches!(env.view.drag_state, Some(DragKind::PreviewSelect)),
+                accepted,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn drag_move_below_painted_content_clamps_to_last_line() {
+        // Only the start is gated: a drag already in flight that leaves
+        // the painted rows keeps extending to the last content line.
+        let mut env = create_test_env_empty();
+        stage_pane(&mut env, Rect::new(40, 0, 60, 20), 0, 3);
+        assert!(env.view.handle_drag_start(40, 0));
+        assert!(env.view.handle_drag_move(45, 15));
+        let sel = env.view.preview_selection.expect("selection installed");
+        assert_eq!(to_abs(3, sel.anchor), (0, 0));
+        assert_eq!(to_abs(3, sel.extent), (5, 2));
+    }
+
+    #[test]
+    #[serial]
     fn drag_start_inside_live_mode_installs_selection() {
         let mut env = create_test_env_empty();
         stage_pane(&mut env, Rect::new(40, 0, 60, 20), 0, 100);
@@ -17196,19 +17248,331 @@ mod live_send_mode {
             .expect("test env has one session");
         env.view.selected_session = Some(id.clone());
         // Steady state: pane already synced to the toast-free geometry.
-        env.view.preview_pane_synced = Some((id.clone(), 141, 43));
+        let synced = crate::tui::home::PassiveSynced {
+            cols: 141,
+            rows: 43,
+            window_rows: 43,
+            adopted_at: std::time::Instant::now(),
+        };
+        env.view.passive_pane_synced.insert(id.clone(), synced);
 
         // Toast frame: one row shorter. Armed only; the synced geometry (and
         // with it the real pane) must stay untouched.
         env.view.refresh_preview_cache_if_needed(141, 42);
         assert_eq!(env.view.preview_pane_pending, Some((id.clone(), 141, 42)));
-        assert_eq!(env.view.preview_pane_synced, Some((id.clone(), 141, 43)));
+        assert_eq!(env.view.passive_pane_synced.get(&id), Some(&synced));
 
         // Post-toast frame: back in sync; the transient arm is dropped so a
         // later real change still needs two consecutive sightings.
         env.view.refresh_preview_cache_if_needed(141, 43);
         assert_eq!(env.view.preview_pane_pending, None);
-        assert_eq!(env.view.preview_pane_synced, Some((id, 141, 43)));
+        assert_eq!(env.view.passive_pane_synced.get(&id), Some(&synced));
+    }
+
+    #[test]
+    #[serial]
+    fn fleet_reconcile_presizes_open_sessions_once_per_epoch() {
+        let mut env = create_test_env_with_sessions(3);
+        let ids: Vec<String> = env
+            .view
+            .flat_items
+            .iter()
+            .filter_map(|item| match item {
+                crate::session::Item::Session { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 3);
+        let selected = ids[0].clone();
+        env.view.selected_session = Some(selected.clone());
+        let inner = ratatui::layout::Rect::new(0, 0, 141, 45);
+
+        // First sighting of a fleet geometry arms only; nothing reaches the
+        // worker until the same geometry holds for a second refresh.
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        assert!(env.view.passive_fleet_armed.is_some());
+        assert!(env.view.passive_pane_queued.is_empty());
+
+        // Second sighting queues every open session except the excluded
+        // (selected) one.
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        assert!(!env.view.passive_pane_queued.contains_key(&selected));
+        for id in &ids[1..] {
+            assert!(
+                env.view.passive_pane_queued.contains_key(id),
+                "open session {id} must be handed to the worker"
+            );
+        }
+
+        // The fixture sessions have no tmux panes, so the worker declines
+        // each intent. Once the declines are adopted, the same epoch must not
+        // re-queue them.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            env.view
+                .reconcile_passive_fleet(inner, false, Some(&selected));
+            if ids[1..]
+                .iter()
+                .all(|id| env.view.passive_pane_declined.contains_key(id))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "declined completions never arrived"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        assert!(
+            ids[1..]
+                .iter()
+                .all(|id| !env.view.passive_pane_queued.contains_key(id)),
+            "a declined geometry must not be retried within its epoch"
+        );
+
+        // A different fleet geometry is a new epoch: arming clears the
+        // declines and the follow-up refresh retries each session once.
+        let inner2 = ratatui::layout::Rect::new(0, 0, 120, 38);
+        env.view
+            .reconcile_passive_fleet(inner2, false, Some(&selected));
+        assert!(env.view.passive_pane_declined.is_empty());
+        env.view
+            .reconcile_passive_fleet(inner2, false, Some(&selected));
+        for id in &ids[1..] {
+            assert!(
+                env.view.passive_pane_queued.contains_key(id),
+                "a new epoch must retry {id} once"
+            );
+        }
+
+        // Moving the selection is NOT an epoch: the armed key is pure
+        // geometry, so switching the excluded session must not re-arm, and
+        // the previously excluded session fires on the same refresh.
+        let armed_before = env.view.passive_fleet_armed.clone();
+        env.view.selected_session = Some(ids[1].clone());
+        env.view
+            .reconcile_passive_fleet(inner2, false, Some(&ids[1]));
+        assert_eq!(env.view.passive_fleet_armed, armed_before);
+        assert!(
+            env.view.passive_pane_queued.contains_key(&ids[0]),
+            "the newly deselected session must be handed to the worker without re-arming"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn fleet_reconcile_reasserts_after_external_resize() {
+        let _cache_guard = crate::tmux::PaneMetaCacheGuard::capture();
+        let mut env = create_test_env_with_sessions(2);
+        let ids: Vec<String> = env
+            .view
+            .flat_items
+            .iter()
+            .filter_map(|item| match item {
+                crate::session::Item::Session { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        let selected = ids[0].clone();
+        env.view.selected_session = Some(selected.clone());
+        let inner = ratatui::layout::Rect::new(0, 0, 141, 45);
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+
+        // Pretend ids[1]'s resize was applied at its wanted geometry (read
+        // back from the armed epoch so the fixture can't drift from the real
+        // layout math).
+        let (cols, rows) = env
+            .view
+            .passive_fleet_armed
+            .as_ref()
+            .and_then(|armed| armed.iter().find(|(id, ..)| id == &ids[1]))
+            .map(|&(_, cols, rows)| (cols, rows))
+            .expect("armed epoch covers ids[1]");
+        env.view.passive_pane_synced.insert(
+            ids[1].clone(),
+            crate::tui::home::PassiveSynced {
+                cols,
+                rows,
+                window_rows: rows,
+                adopted_at: std::time::Instant::now(),
+            },
+        );
+        let title = env.view.get_instance(&ids[1]).unwrap().title.clone();
+        let name = crate::tmux::Session::resolve_name_for_display(&ids[1], &title);
+
+        // A fresher observation MATCHING the applied size is not a
+        // contradiction: the session stays in sync, nothing queued.
+        crate::tmux::test_inject_pane_window_size(&name, (cols, rows));
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        assert!(env.view.passive_pane_synced.contains_key(&ids[1]));
+        assert!(!env.view.passive_pane_queued.contains_key(&ids[1]));
+
+        // Another client resizes the window (external attach, web live
+        // view): the contradicted entry is dropped and the pane re-asserted.
+        crate::tmux::test_inject_pane_window_size(&name, (cols + 10, rows));
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        assert!(!env.view.passive_pane_synced.contains_key(&ids[1]));
+        assert!(env.view.passive_pane_queued.contains_key(&ids[1]));
+    }
+
+    #[test]
+    #[serial]
+    fn stale_observation_published_after_adoption_does_not_invalidate() {
+        // The cache boundary of the timestamp race: a `list-panes` that read
+        // the pane BEFORE our resize can finish publishing AFTER the resize's
+        // adoption. The snapshot's time is the observation instant (captured
+        // pre-fork), so the pre-resize sizes it carries must read as older
+        // than the adoption and leave the synced entry alone. Re-stamping
+        // `cache.time` at publication would make this observation look
+        // fresher than the adoption and turns this test red (the injector
+        // routes through the real publication path).
+        let _cache_guard = crate::tmux::PaneMetaCacheGuard::capture();
+        let mut env = create_test_env_with_sessions(2);
+        let ids: Vec<String> = env
+            .view
+            .flat_items
+            .iter()
+            .filter_map(|item| match item {
+                crate::session::Item::Session { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        let selected = ids[0].clone();
+        env.view.selected_session = Some(selected.clone());
+        let inner = ratatui::layout::Rect::new(0, 0, 141, 45);
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        let (cols, rows) = env
+            .view
+            .passive_fleet_armed
+            .as_ref()
+            .and_then(|armed| armed.iter().find(|(id, ..)| id == &ids[1]))
+            .map(|&(_, cols, rows)| (cols, rows))
+            .expect("armed epoch covers ids[1]");
+
+        // The listing reads the pane's pre-resize size...
+        let listed_at = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        // ...then our resize applies and is adopted...
+        env.view.passive_pane_synced.insert(
+            ids[1].clone(),
+            crate::tui::home::PassiveSynced {
+                cols,
+                rows,
+                window_rows: rows,
+                adopted_at: std::time::Instant::now(),
+            },
+        );
+        // ...and only then does the stale listing get published.
+        let title = env.view.get_instance(&ids[1]).unwrap().title.clone();
+        let name = crate::tmux::Session::resolve_name_for_display(&ids[1], &title);
+        crate::tmux::test_inject_pane_window_size_at(&name, (cols + 10, rows), listed_at);
+
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        assert!(
+            env.view.passive_pane_synced.contains_key(&ids[1]),
+            "a pre-resize observation must not invalidate the adopted size"
+        );
+        assert!(!env.view.passive_pane_queued.contains_key(&ids[1]));
+    }
+
+    #[test]
+    #[serial]
+    fn fleet_reconcile_retries_expired_declines() {
+        let mut env = create_test_env_with_sessions(2);
+        let ids: Vec<String> = env
+            .view
+            .flat_items
+            .iter()
+            .filter_map(|item| match item {
+                crate::session::Item::Session { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        let selected = ids[0].clone();
+        env.view.selected_session = Some(selected.clone());
+        let inner = ratatui::layout::Rect::new(0, 0, 141, 45);
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        let want = env
+            .view
+            .passive_fleet_armed
+            .as_ref()
+            .and_then(|armed| armed.iter().find(|(id, ..)| id == &ids[1]))
+            .map(|&(_, cols, rows)| (cols, rows))
+            .expect("armed epoch covers ids[1]");
+
+        // A decline older than the retry window reads as absent, so the
+        // session recovers once its blocking attach or size owner may have
+        // gone away, instead of staying parked until a geometry change.
+        let expired = std::time::Instant::now()
+            .checked_sub(
+                crate::tui::home::render::PASSIVE_DECLINE_RETRY + std::time::Duration::from_secs(1),
+            )
+            .expect("test clock predates the retry window");
+        env.view
+            .passive_pane_declined
+            .insert(ids[1].clone(), (want, expired));
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        assert!(env.view.passive_pane_queued.contains_key(&ids[1]));
+
+        // A fresh decline parks it again.
+        env.view.passive_pane_queued.clear();
+        env.view
+            .passive_pane_declined
+            .insert(ids[1].clone(), (want, std::time::Instant::now()));
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        assert!(!env.view.passive_pane_queued.contains_key(&ids[1]));
+    }
+
+    #[test]
+    #[serial]
+    fn fleet_reconcile_is_single_tui_only() {
+        // With two aoe TUIs alive, each would treat the other's fleet
+        // resizes as external (observed-size invalidation) and re-assert its
+        // own geometry, oscillating every open pane. The presence count gates
+        // the whole fleet pass; only the selected-session sync stays on.
+        let mut env = create_test_env_with_sessions(2);
+        let ids: Vec<String> = env
+            .view
+            .flat_items
+            .iter()
+            .filter_map(|item| match item {
+                crate::session::Item::Session { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        let selected = ids[0].clone();
+        env.view.selected_session = Some(selected.clone());
+        let inner = ratatui::layout::Rect::new(0, 0, 141, 45);
+
+        env.view.active_tui_count = 2;
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        assert!(env.view.passive_fleet_armed.is_none());
+        assert!(env.view.passive_pane_queued.is_empty());
+
+        // Back down to one TUI: the fleet resumes on the usual two-sighting
+        // debounce.
+        env.view.active_tui_count = 1;
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        assert!(env.view.passive_fleet_armed.is_some());
+        env.view
+            .reconcile_passive_fleet(inner, false, Some(&selected));
+        assert!(env.view.passive_pane_queued.contains_key(&ids[1]));
     }
 
     #[test]

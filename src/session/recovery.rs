@@ -129,7 +129,10 @@ pub fn is_recovery_candidate(inst: &Instance) -> bool {
         && !inst.is_trashed()
         && inst.status != super::Status::Stopped
         && inst.agent_session_id != inst.resume_probe_failed_sid
-        && should_attempt_resume(inst.agent_session_id.as_deref(), &inst.tool)
+        && should_attempt_resume(
+            inst.agent_session_id.as_deref(),
+            inst.capture_agent_name().unwrap_or(&inst.tool),
+        )
 }
 
 /// Minimum `agent_session_id` length before it is trusted as a process-argv
@@ -141,7 +144,10 @@ const ORPHAN_SCAN_MIN_SID_LEN: usize = 8;
 
 /// True when aoe injects `AOE_INSTANCE_ID` into this agent's environment. Gated
 /// on the same hook presence as `status_hook_env_prefix`, so it tracks exactly
-/// the agents whose live process carries the anchored env marker.
+/// the agents whose live process carries the anchored env marker. Callers pass
+/// the resolved built-in for the same reason that prefix does: a wrapper's own
+/// name resolves to no agent, so reading it raw denies a marker the launch line
+/// did put there.
 fn agent_injects_instance_id_env(tool: &str) -> bool {
     crate::agents::get_agent(tool)
         .is_some_and(|a| a.hook_config.is_some() || a.sidecar_hooks.is_some())
@@ -162,7 +168,8 @@ pub fn orphan_needles(inst: &Instance) -> (String, Option<String>) {
     } else {
         format!("{}={}", crate::tmux::env::AOE_INSTANCE_ID_KEY, inst.id)
     };
-    let cmdline = if agent_injects_instance_id_env(&inst.tool) {
+    let cmdline = if agent_injects_instance_id_env(inst.capture_agent_name().unwrap_or(&inst.tool))
+    {
         None
     } else {
         inst.agent_session_id
@@ -755,6 +762,38 @@ mod tests {
             !recently.read().unwrap().contains_key("x"),
             "the worker's unmark must win over the refresher's last mark; \
              no mark-after-unmark resurrection",
+        );
+    }
+
+    /// A wrapper declared through `agent_detect_as` now carries a real
+    /// conversation id, so both recovery predicates have to resolve it: the
+    /// resume gate keeps a crashed wrapper pane recoverable, and the orphan
+    /// scan must not fall back to the sid needle for an agent whose launch
+    /// line already carries `AOE_INSTANCE_ID` (#3006).
+    #[test]
+    fn wrapper_recovery_resolves_its_detect_as_base() {
+        const PROFILE: &str = "wrapper-recovery-test";
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(PROFILE);
+        let mut config = crate::session::Config::default();
+        config
+            .session
+            .agent_detect_as
+            .insert("claude-personal".to_string(), "claude".to_string());
+        crate::tmux::status_rules::install_from_config(PROFILE, &config);
+
+        let mut inst = Instance::new("wrapper", "/tmp/test");
+        inst.source_profile = PROFILE.to_string();
+        inst.tool = "claude-personal".to_string();
+        inst.agent_session_id = Some("44444444-4444-4444-8444-444444444444".into());
+
+        assert!(
+            is_recovery_candidate(&inst),
+            "a wrapper holding a claude conversation must stay recoverable"
+        );
+        assert_eq!(
+            orphan_needles(&inst).1,
+            None,
+            "a wrapper injects AOE_INSTANCE_ID, so the sid must not double as a needle"
         );
     }
 

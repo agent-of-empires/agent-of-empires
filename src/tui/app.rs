@@ -1450,8 +1450,14 @@ impl App {
                                     self.home.handle_diff_click(mouse.column, mouse.row);
                                     self.draw(terminal)?;
                                     None
+                                } else if self.home.clear_preview_selection() {
+                                    // A click on no surface at all still
+                                    // dismisses a finalized highlight, and
+                                    // nothing below repaints for a bare
+                                    // Down(Left), so draw the clear here.
+                                    self.draw(terminal)?;
+                                    None
                                 } else {
-                                    let _ = self.home.clear_preview_selection();
                                     None
                                 }
                             } else {
@@ -3726,7 +3732,7 @@ impl App {
         // preview geometry against the now-grown window instead of leaving the
         // top clipped.
         tmux_session.reset_size_to_latest_client();
-        self.home.clear_preview_pane_sync();
+        self.home.clear_preview_pane_sync(session_id);
         let (attach_result, attached_status_updates) =
             self.with_attached_status_hooks(terminal, || tmux_session.attach())?;
 

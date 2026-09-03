@@ -391,11 +391,9 @@ pub async fn list_sessions(
         })
         .collect();
 
-    // Shared per-request cache of the resolved `SessionConfig` keyed by
-    // (profile, project_path). Both the ACP-capability overlay (serve-only)
-    // and the smart-rename indicator overlay below fetch through this one
-    // cache, halving the disk reads the 3s sidebar poll does when the same
-    // pair appears in more than one row. See #2603.
+    // Share resolved config between the ACP-capability and smart-rename
+    // overlays, halving disk reads when a profile/project pair repeats in the
+    // 3s sidebar poll. See #2603.
     let mut session_cfg_cache: HashMap<(String, String), SessionConfig> = HashMap::new();
 
     // Overlay custom-agent ACP capability (built-ins were resolved in the

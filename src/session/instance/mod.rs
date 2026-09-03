@@ -72,6 +72,7 @@ mod test_helpers;
 mod tmux_session;
 mod types;
 
+pub(crate) use accessors::resolved_agent_for;
 pub use flags::{is_valid_session_color, SessionBucket, SESSION_COLORS};
 pub(crate) use lifecycle::NEWER_GENERATION_BUSY_REASON;
 pub use lifecycle::{LifecycleOperation, LifecycleReservation, LifecycleReservationError};

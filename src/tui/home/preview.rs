@@ -21,12 +21,19 @@ pub(in crate::tui) struct PreviewTextView {
 
 impl PreviewTextView {
     /// True when `(col, row)` lands on a row/col that maps to real
-    /// content. Used to gate drag-select start.
+    /// content. Used to gate drag-select start. Rows in the pane below
+    /// the last painted line are rejected: `screen_to_content` clamps
+    /// them onto the last line, so accepting one would anchor a
+    /// selection on text the user never clicked.
     pub(in crate::tui) fn contains(self, col: u16, row: u16) -> bool {
-        self.total_lines > 0
-            && self
-                .pane
-                .contains(ratatui::layout::Position::from((col, row)))
+        if !self
+            .pane
+            .contains(ratatui::layout::Position::from((col, row)))
+        {
+            return false;
+        }
+        let painted_rows = self.total_lines.saturating_sub(self.first_line);
+        usize::from(row - self.pane.y) < painted_rows
     }
 
     /// Absolute parsed-text index of the line painted on screen row

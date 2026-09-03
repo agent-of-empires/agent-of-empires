@@ -60,13 +60,62 @@ impl Instance {
     /// field itself; this method's job is the guard shape (baseline vs. newly
     /// detected). Every call re-seeds the baseline at exit, so the next call
     /// compares against a value this method itself wrote.
+    ///
+    /// A `Running -> Idle` no rule read off live chrome is held for the next
+    /// call to agree with it. A caller that will not call again wants
+    /// [`Self::update_status_once`].
     pub fn update_status_with_metadata(
         &mut self,
         metadata: Option<&tmux::PaneMetadata>,
         resolved_name: Option<&str>,
     ) {
+        self.poll_status(metadata, resolved_name, false);
+    }
+
+    /// Update status for a caller that observes this session exactly once.
+    ///
+    /// `confirm_detection` (private, so a code span rather than an intra-doc
+    /// link) holds a `Running -> Idle` no rule read off the agent's own chrome
+    /// until a second poll agrees with it. A caller that observes once and
+    /// exits never makes that second observation, so the hold publishes
+    /// nothing and the row's last persisted status stands. With no TUI or
+    /// daemon polling to converge that row, `aoe send` followed by `aoe ps`
+    /// read `Running` for the life of the session (#3712). One observation is
+    /// all this caller gets, so its proposal decides.
+    pub fn update_status_once(
+        &mut self,
+        metadata: Option<&tmux::PaneMetadata>,
+        resolved_name: Option<&str>,
+    ) {
+        self.poll_status(metadata, resolved_name, true);
+    }
+
+    /// The body both entry points share. `single_poll` says no further
+    /// observation is coming, which is what decides a held proposal.
+    fn poll_status(
+        &mut self,
+        metadata: Option<&tmux::PaneMetadata>,
+        resolved_name: Option<&str>,
+        single_poll: bool,
+    ) {
+        if single_poll {
+            // This observation decides, so only this observation may propose:
+            // a proposal carried in from an earlier poll was made against a
+            // screen this call never read, and the publish below would take it
+            // even on a path that returned before reaching the pane.
+            self.detection.pending = None;
+        }
         let baseline = self.live_status_baseline;
         self.update_status_with_metadata_inner(metadata, resolved_name);
+        if single_poll {
+            if let Some(pending) = self.detection.pending.take() {
+                // Only a plain Idle is ever held, so there is no error
+                // explanation to keep or derive; the confirmed arm of
+                // `update_status_from_manifest` clears it for the same reason.
+                self.status = pending;
+                self.last_error = None;
+            }
+        }
         if let Some(prev) = baseline {
             if prev != self.status {
                 self.log_status_transition(prev);
@@ -562,10 +611,6 @@ impl Instance {
                 None
             }
         }
-    }
-
-    pub fn update_status(&mut self) {
-        self.update_status_with_metadata(None, None);
     }
 }
 
@@ -1305,7 +1350,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         // then pin it). Refresh from live tmux now that the pane is painted so
         // the single authoritative read sees a true existence result.
         crate::tmux::refresh_session_cache();
-        inst.update_status();
+        inst.update_status_with_metadata(None, None);
 
         std::fs::remove_file(&pane_file).ok();
         crate::hooks::cleanup_hook_status_dir(&inst.id);
@@ -1328,6 +1373,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             pane_pid: None,
             pane_title: None,
             window_activity,
+            window_size: None,
         }
     }
 
@@ -1581,5 +1627,102 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             Status::Idle,
             "the confirming poll must publish the idle the final frame showed"
         );
+    }
+
+    /// #3712: `aoe ps`, `aoe status` and the worktree-edit guards observe a
+    /// session once and exit, so the confirming poll an unwitnessed
+    /// `Running -> Idle` waits for never arrives. The hold published nothing
+    /// and the row's last persisted status stood, so every parked session
+    /// read `Running` for the life of the session.
+    ///
+    /// One pane, two readers: the repeating poller holds its proposal for the
+    /// poll it will make, and the single-observation reader publishes the same
+    /// proposal now.
+    #[test]
+    #[serial_test::serial]
+    fn a_single_observation_publishes_an_unwitnessed_idle() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not available");
+            return;
+        }
+
+        let mut polled = Instance::new("aoe_test_3712_polled", "/tmp");
+        // Guard, not a constant assertion: the manifest path is only reached
+        // for a tool that has one.
+        assert_eq!(polled.tool, "claude");
+
+        // A parked Claude prompt carrying half-typed text. `ready_prompt`
+        // wants an empty box and `completed_turn` wants a completion line in
+        // the status slot, so the idle here is the one `live_prompt_box`
+        // guesses at rather than reads off live chrome: unwitnessed, and so
+        // held.
+        let pane = "earlier output\n\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\u{276f} half typed prompt\n\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n  \u{23f5}\u{23f5} auto mode on (shift+tab to cycle)\n";
+        let pane_file = std::env::temp_dir().join(format!("aoe_test_3712_{}.txt", polled.id));
+        std::fs::write(&pane_file, pane).expect("write pane fixture");
+
+        let session_name = tmux::Session::generate_name(&polled.id, &polled.title);
+        let _guard = KillTmuxOnDrop(session_name.clone());
+        let quoted = format!("'{}'", pane_file.to_string_lossy().replace('\'', r#"'\''"#));
+        let created = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &session_name,
+                "-x",
+                "120",
+                "-y",
+                "40",
+                &format!("cat {quoted}; sleep 300"),
+            ])
+            .output()
+            .expect("spawn tmux");
+        assert!(
+            created.status.success(),
+            "tmux new-session failed: {}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+
+        let mut painted = false;
+        for _ in 0..100 {
+            let cap = crate::tmux::tmux_command()
+                .args(["capture-pane", "-p", "-t", &session_name])
+                .output();
+            if let Ok(out) = cap {
+                if String::from_utf8_lossy(&out.stdout).contains("half typed prompt") {
+                    painted = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        std::fs::remove_file(&pane_file).ok();
+        assert!(painted, "parked prompt never painted into the tmux pane");
+
+        let cache = crate::tmux::SessionCacheGuard::capture();
+        cache.force_present(&[session_name.as_str()]);
+        let metadata = agent_pane_metadata("claude", None);
+
+        // Both rows come off disk on `Running`, which is what the CLI reads.
+        polled.status = Status::Running;
+        polled.update_status_with_metadata(Some(&metadata), Some(&session_name));
+        assert_eq!(
+            polled.status,
+            Status::Running,
+            "a repeating poller holds an unwitnessed Idle for the poll that agrees"
+        );
+        assert_eq!(polled.detection.pending, Some(Status::Idle));
+
+        // A one-shot reader starts from a bare disk load: no proposal on
+        // record, and none it can ever meet.
+        let mut once = Instance::new("aoe_test_3712_once", "/tmp");
+        once.status = Status::Running;
+        once.update_status_once(Some(&metadata), Some(&session_name));
+        assert_eq!(
+            once.status,
+            Status::Idle,
+            "one observation is all this caller gets, so its proposal decides (#3712)"
+        );
+        assert_eq!(once.detection.pending, None);
     }
 }

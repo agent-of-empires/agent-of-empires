@@ -183,8 +183,15 @@ impl Instance {
     /// agent does have bails on `[ -n "$AOE_INSTANCE_ID" ]` and the session
     /// reports Idle forever with nothing logged.
     pub(super) fn resolved_agent(&self) -> Option<&'static crate::agents::AgentDef> {
-        crate::agents::get_agent(&self.tool)
-            .or_else(|| crate::agents::get_agent(&self.effective_detect_as()))
+        resolved_agent_for(&self.source_profile, &self.tool, &self.detect_as)
+    }
+
+    /// The built-in agent name whose capture and resume behavior applies to
+    /// this session. Both paths fail closed on an unknown tool, so keying them
+    /// off `tool` raw leaves a custom wrapper with no poller, no pre-minted id
+    /// and no resume flag, silently and forever (#3638).
+    pub(crate) fn capture_agent_name(&self) -> Option<&'static str> {
+        self.resolved_agent().map(|a| a.name)
     }
 
     pub fn is_sub_session(&self) -> bool {
@@ -237,6 +244,22 @@ impl Instance {
         self.import_pending = None;
         self.view = View::Terminal;
     }
+}
+
+/// [`Instance::resolved_agent`] for a bare `(profile, tool)` pair, so state
+/// keyed by tool name outside an `Instance` (parked conversations, peer rows)
+/// resolves its built-in the same way the row itself would. Pass an empty
+/// `detect_as` when no stored alias exists; the live registry answers then.
+pub(crate) fn resolved_agent_for(
+    profile: &str,
+    tool: &str,
+    detect_as: &str,
+) -> Option<&'static crate::agents::AgentDef> {
+    crate::agents::get_agent(tool).or_else(|| {
+        crate::agents::get_agent(&tmux::status_rules::effective_detect_as(
+            profile, tool, detect_as,
+        ))
+    })
 }
 
 #[cfg(test)]
