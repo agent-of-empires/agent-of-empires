@@ -150,6 +150,14 @@ async fn sensitive_routes_are_blocked() {
         (Method::POST, "/api/sessions/foreign/start", ""),
         (Method::POST, "/api/sessions/foreign/stop", ""),
         (Method::DELETE, "/api/sessions/foreign", "{}"),
+        // Content search and the sandbox glob preview: reads that expose
+        // conversation content and resolve caller-supplied host paths.
+        (Method::GET, "/api/sessions/search?q=x", ""),
+        (
+            Method::GET,
+            "/api/sandbox/volume-ignores-preview?path=/tmp",
+            "",
+        ),
         // G3: workspace-ordering is a PUT carrying only a read_only guard and no
         // per-handler CityHall check. The default-deny middleware must still
         // refuse it, proving the boundary is method- and prefix-uniform.
@@ -245,4 +253,26 @@ async fn allowlisted_route_stays_reachable() {
         "an allowlisted route must not be refused by the CityHall gate (got: {})",
         String::from_utf8_lossy(&bytes)
     );
+}
+
+// paste_image stays allowlisted for the CityHall composer, but only against a
+// structured target: a plain/terminal session's worktree is foreign state a
+// locked-down client must not write into.
+#[tokio::test]
+async fn paste_image_against_plain_session_is_blocked() {
+    let state = build_test_app_state_cityhall(vec![plain_session("foreign")]);
+    let app = build_router_for_test(state);
+    let resp = app
+        .oneshot(request(
+            Method::POST,
+            "/api/sessions/foreign/paste-image",
+            Body::from(r#"{"mime_type":"image/png","data":"aGk="}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&bytes).contains("cityhall_mode"));
 }

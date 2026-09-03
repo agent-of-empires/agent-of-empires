@@ -2891,8 +2891,10 @@ fn create_session_validates_tool_before_builder_or_persistence() {
     .unwrap();
     let create_start = source.find("pub async fn create_session").unwrap();
     let create_source = &source[create_start..];
+    // Anchor on the call, not the bare name: a comment above mentions the
+    // fn earlier in the handler and would satisfy a name-only find.
     let validation = create_source
-        .find("validate_session_tool_identity")
+        .find("if !validate_session_tool_identity(")
         .unwrap();
     let unwrap_or_else = create_source.find("body.profile.unwrap_or_else").unwrap();
     let spawn_blocking = create_source.find("tokio::task::spawn_blocking").unwrap();
@@ -2930,6 +2932,59 @@ fn ensure_session_refreshes_instance_after_instance_lock() {
 
     assert!(lock < read);
     assert!(read < sync_base);
+}
+
+/// The three terminal handlers must take the per-session lock before
+/// snapshotting the instance, like `ensure_session`; a read-then-lock order
+/// lets a concurrent mutation land between the two and hands `spawn_blocking`
+/// a stale clone.
+#[test]
+fn terminal_handlers_take_instance_lock_before_snapshot() {
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server/api/sessions/ensure.rs"),
+    )
+    .unwrap();
+    for handler in [
+        "pub async fn ensure_terminal",
+        "pub async fn ensure_container_terminal",
+        "pub async fn kill_terminal",
+    ] {
+        let start = source.find(handler).unwrap();
+        let body = &source[start..];
+        let lock = body.find("state.instance_lock(&id).await").unwrap();
+        let read = body.find("state.instances.read().await").unwrap();
+        assert!(lock < read, "{handler} must lock before its snapshot read");
+    }
+}
+
+/// A workspace row can persist with `repos: []`; a file-diff request that
+/// omits `?repo=` must get a 400 for it, not a panic on the empty repo list.
+#[tokio::test]
+async fn diff_file_rejects_workspace_with_no_repos() {
+    use axum::extract::Query;
+
+    let mut inst = Instance::new("empty-ws", "/tmp/aoe-empty-ws");
+    inst.id = "empty-ws".to_string();
+    inst.workspace_info = Some(crate::session::WorkspaceInfo {
+        branch: "main".to_string(),
+        workspace_dir: "/tmp/aoe-empty-ws".to_string(),
+        repos: Vec::new(),
+        created_at: chrono::Utc::now(),
+        cleanup_on_delete: true,
+    });
+    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+    let resp = session_diff_file(
+        State(state),
+        Path("empty-ws".to_string()),
+        Query(FileDiffQuery {
+            path: "Cargo.toml".to_string(),
+            repo: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[test]
