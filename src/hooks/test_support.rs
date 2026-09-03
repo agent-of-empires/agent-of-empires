@@ -1,7 +1,7 @@
 //! Shared test helpers for hook-base scaffolding.
 //!
 //! Used by `dir_guard`, `status_file`, `cli::extract_session_id`, and
-//! `session::container_config` tests so the override-and-reset dance lives
+//! `session::config::container_config` tests so the override-and-reset dance lives
 //! in one place. Tests using these helpers MUST also gate via
 //! `serial_test::serial(hook_base)` so the thread-local override stays
 //! consistent across parallel runs.

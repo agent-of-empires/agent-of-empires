@@ -4,7 +4,7 @@
 // locale, and proxy settings. Anything inherited that names a config, data,
 // or credential location escapes the temporary HOME, because the daemon
 // resolves agent state from its own environment (`resolve_agent_home` in
-// `src/session/capture.rs`, the opencode readers, the XDG bases). A developer
+// `src/session/capture/mod.rs`, the opencode readers, the XDG bases). A developer
 // or CI shell exporting one of them points a live spec at real agent state.
 //
 // Listing every such name does not hold on its own: `src/` reads more than a

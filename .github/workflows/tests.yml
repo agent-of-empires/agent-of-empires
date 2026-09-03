@@ -93,11 +93,11 @@ jobs:
         if: matrix.leg == 'web-e2e'
         run: |
           cargo test --features web,e2e-tests \
-            --test daemon_core_web_optional --test plugin_install
+            --test integration -- daemon_core_web_optional plugin_install
           cargo test --features web,e2e-tests --lib -- \
             server::assets:: tui::dialogs::serve::qr_seam
       # core-rest: the full default-feature suite minus e2e (lib + bins +
-      # integration + the standalone test bins). The daemon is core, so this
+      # the consolidated integration binary). The daemon is core, so this
       # leg covers it end to end with no dashboard bundle and no npm in the
       # build. Without `e2e-tests` the e2e target is gated off, so it is
       # skipped here while every non-e2e test binary stays auto-discovered.

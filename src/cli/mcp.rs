@@ -10,7 +10,7 @@
 use anyhow::Result;
 use clap::Subcommand;
 
-use crate::session::mcp_model::{resolve_surface, McpSurfaceView};
+use crate::session::mcp::mcp_model::{resolve_surface, McpSurfaceView};
 
 #[derive(Subcommand, Debug)]
 pub enum McpCommands {
@@ -39,7 +39,7 @@ pub async fn run(profile: &str, command: McpCommands) -> Result<()> {
 
 fn list(profile: &str, args: McpListArgs) -> Result<()> {
     let agent = args.agent.unwrap_or_else(|| {
-        crate::session::profile_config::resolve_config_or_warn(profile)
+        crate::session::config::profile_config::resolve_config_or_warn(profile)
             .session
             .default_tool
             .unwrap_or_else(|| "claude".to_string())
@@ -121,7 +121,7 @@ fn print_table(agent: &str, view: &McpSurfaceView) {
     }
 }
 
-fn transport_detail(r: &crate::session::mcp_model::RedactedMcpServer) -> String {
+fn transport_detail(r: &crate::session::mcp::mcp_model::RedactedMcpServer) -> String {
     let mut s = match (&r.command, &r.url) {
         (Some(command), _) => {
             let mut d = format!("{} ({})", command, r.transport);

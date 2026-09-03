@@ -2207,7 +2207,7 @@ impl HomeView {
 
             self.set_instance_status(&id, Status::Deleting);
 
-            let config = crate::session::repo_config::resolve_config_with_repo_or_warn(
+            let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
                 &inst.source_profile,
                 std::path::Path::new(&inst.project_path),
             );

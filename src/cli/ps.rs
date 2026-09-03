@@ -584,7 +584,9 @@ fn collect_tmux_states(instances: &mut [Instance]) -> Vec<TmuxState> {
         let mut resolved: HashSet<&str> = HashSet::new();
         for inst in instances.iter() {
             if resolved.insert(inst.source_profile.as_str()) {
-                crate::session::profile_config::resolve_config_or_warn(&inst.source_profile);
+                crate::session::config::profile_config::resolve_config_or_warn(
+                    &inst.source_profile,
+                );
             }
         }
     }

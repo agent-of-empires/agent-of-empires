@@ -16,7 +16,7 @@ impl HomeView {
     /// Tick dialog animations/timers and drain hook progress.
     /// Returns true when a redraw is needed.
     pub fn tick_dialog(&mut self) -> bool {
-        use crate::session::repo_config::HookProgress;
+        use crate::session::config::repo_config::HookProgress;
 
         let mut changed = false;
 

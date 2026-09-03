@@ -499,7 +499,7 @@ pub async fn reconcile_acp_workers(
     // Resume concurrency cap. Bounded by total worker capacity so it can
     // never exceed `max_concurrent_workers`. Floor at 1 so a misconfigured
     // zero doesn't deadlock the reconciler.
-    let cfg = crate::session::profile_config::resolve_config_or_warn(&state.profile);
+    let cfg = crate::session::config::profile_config::resolve_config_or_warn(&state.profile);
     let resume_limit = MAX_CONCURRENT_RESUMES
         .min(cfg.acp.max_concurrent_workers)
         .max(1);
@@ -858,7 +858,7 @@ async fn reap_idle_workers(state: &Arc<AppState>) {
             distinct_profiles
                 .into_iter()
                 .map(|p| {
-                    let secs = crate::session::profile_config::resolve_config_or_warn(&p)
+                    let secs = crate::session::config::profile_config::resolve_config_or_warn(&p)
                         .acp
                         .auto_stop_idle_secs;
                     (p, secs)
@@ -1213,7 +1213,8 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
             distinct_profiles
                 .into_iter()
                 .map(|p| {
-                    let acp = crate::session::profile_config::resolve_config_or_warn(&p).acp;
+                    let acp =
+                        crate::session::config::profile_config::resolve_config_or_warn(&p).acp;
                     (p, acp.rate_limit_auto_resume)
                 })
                 .collect()

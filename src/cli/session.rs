@@ -653,7 +653,7 @@ async fn empty_trash(profile: &str) -> Result<()> {
     let mut being_restored_elsewhere = 0usize;
     let mut being_purged_elsewhere = 0usize;
     for inst in &trashed {
-        let config = crate::session::repo_config::resolve_config_with_repo_or_warn(
+        let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
             profile,
             std::path::Path::new(&inst.project_path),
         );
@@ -762,7 +762,7 @@ async fn empty_trash(profile: &str) -> Result<()> {
 }
 
 async fn snooze_session(profile: &str, args: SnoozeArgs) -> Result<()> {
-    let config = crate::session::profile_config::resolve_config(profile)?;
+    let config = crate::session::config::profile_config::resolve_config(profile)?;
 
     // `--minutes` overrides the profile default; otherwise use the
     // configured `snooze_duration_minutes`. Validate either way so the
@@ -1551,7 +1551,7 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
     // Resolving the profile config installs the declarative status-rule
     // registry for this profile; the status detection below never loads config
     // itself, so a rules-having custom agent would otherwise report Idle.
-    crate::session::profile_config::resolve_config_or_warn(profile);
+    crate::session::config::profile_config::resolve_config_or_warn(profile);
 
     // Refresh status from tmux so the output reflects current state
     // rather than the stale persisted value.
@@ -1615,7 +1615,7 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
     // Resolving the profile config installs the declarative status-rule
     // registry for this profile; the status detection below never loads config
     // itself, so a rules-having custom agent would otherwise report Idle.
-    crate::session::profile_config::resolve_config_or_warn(profile);
+    crate::session::config::profile_config::resolve_config_or_warn(profile);
 
     let tmux_session = crate::tmux::Session::new(&inst.id, &inst.title)?;
 
@@ -1804,7 +1804,7 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
     // Tied mode (#1927): renaming an aoe-managed worktree session also moves
     // its directory leaf to match the title (and optionally the branch), so
     // the two cannot drift. Decided per-session from the resolved setting.
-    let config = crate::session::profile_config::resolve_config_or_warn(profile);
+    let config = crate::session::config::profile_config::resolve_config_or_warn(profile);
     let tied = inst.tie_workdir_applies(config.session.tie_workdir_to_name);
     let tied_edit = tied && (args.title.is_some() || args.rename_branch);
     let duplicate_path = if tied_edit {
@@ -2186,7 +2186,7 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
     // When tied (#1927) the directory follows the title, so reject the
     // standalone edit and point at the unified rename instead.
     if inst.tie_workdir_applies(
-        crate::session::profile_config::resolve_config_or_warn(profile)
+        crate::session::config::profile_config::resolve_config_or_warn(profile)
             .session
             .tie_workdir_to_name,
     ) {

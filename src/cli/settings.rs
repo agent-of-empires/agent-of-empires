@@ -3,7 +3,7 @@
 use anyhow::{bail, Result};
 use clap::Subcommand;
 
-use crate::session::settings_schema::{resolve, SettingSource};
+use crate::session::config::settings_schema::{resolve, SettingSource};
 
 #[derive(Subcommand)]
 pub enum SettingsCommands {

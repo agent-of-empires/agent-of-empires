@@ -8,7 +8,7 @@ use chrono::Utc;
 use crate::containers::DockerContainer;
 use crate::git::cleanup::remove_managed_worktree;
 use crate::git::GitWorktree;
-use crate::session::repo_config;
+use crate::session::config::repo_config;
 use crate::session::storage::StorageFlock;
 use crate::session::{Instance, LifecycleOperation, Storage};
 
@@ -1224,9 +1224,10 @@ fn run_on_destroy_hooks(instance: &Instance, detach: bool) {
     let project_path = Path::new(&instance.project_path);
 
     // Start with global+profile on_destroy hooks (implicitly trusted).
-    let mut resolved_on_destroy = crate::session::profile_config::resolve_config_or_warn(&profile)
-        .hooks
-        .on_destroy;
+    let mut resolved_on_destroy =
+        crate::session::config::profile_config::resolve_config_or_warn(&profile)
+            .hooks
+            .on_destroy;
 
     // Check if repo has trusted hooks that override. Only the hooks surface
     // matters here; untrusted project MCP must not suppress trusted hooks.

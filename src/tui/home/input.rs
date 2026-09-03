@@ -7,10 +7,11 @@ use tui_input::Input;
 
 use super::bindings::{self, ActionId};
 use super::{live_send, DragKind, HomeView, PreviewSelection, TerminalMode, ViewMode};
+use crate::session::config::repo_config;
 use crate::session::config::{
     load_config, update_app_state, update_config, GroupByMode, SortOrder,
 };
-use crate::session::{list_profiles, repo_config, resolve_config_or_warn, Item, Status};
+use crate::session::{list_profiles, resolve_config_or_warn, Item, Status};
 use crate::tui::app::Action;
 use crate::tui::dialogs::ServeAction;
 use crate::tui::dialogs::{
@@ -3043,7 +3044,7 @@ impl HomeView {
         if inst.is_structured() {
             return Some(true);
         }
-        let config = crate::session::repo_config::resolve_config_with_repo_or_warn(
+        let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
             &inst.source_profile,
             std::path::Path::new(&inst.project_path),
         );
@@ -3587,7 +3588,7 @@ impl HomeView {
         // fork avoidance. `setting_on = true` because the manual action runs even
         // when auto-rename-on-start is off (#3039), matching the `--force` the
         // child receives and the web endpoint's preflight.
-        let resolved = crate::session::repo_config::resolve_config_with_repo_or_warn(
+        let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
             &profile,
             std::path::Path::new(&project_path),
         );
@@ -6714,7 +6715,7 @@ impl HomeView {
         let config =
             repo_config::resolve_config_with_repo(&data.profile, std::path::Path::new(&data.path))
                 .ok()?;
-        let expansions = crate::session::container_config::preview_glob_volume_ignores(
+        let expansions = crate::session::config::container_config::preview_glob_volume_ignores(
             &data.path,
             None,
             &config.sandbox.volume_ignores,

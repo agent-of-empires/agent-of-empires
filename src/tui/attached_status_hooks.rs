@@ -243,7 +243,7 @@ mod tests {
         // `HomeView::apply_status_update` performs in
         // `src/tui/home/status.rs`. The `home` copy is covered by
         // `apply_status_update_clears_idle_entered_at_on_idle_to_running`
-        // in `src/tui/home/tests.rs`. This test locks the equivalent
+        // in `src/tui/home/tests/status_rows_menu.rs`. This test locks the equivalent
         // shape here so a Set<->Clear swap in either consumer is
         // caught at review time; without it, a swap in this file
         // compiles cleanly and passes the existing
