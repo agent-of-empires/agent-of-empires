@@ -496,8 +496,11 @@ mod tests {
 
         // Wait until the decoy's argv is observable before running recovery.
         for _ in 0..100 {
-            let flags =
-                crate::process::processes_matching(&[String::new()], &[Some(sid_b.clone())]);
+            let flags = crate::process::processes_matching(
+                &[String::new()],
+                &[Some(sid_b.clone())],
+                &[None],
+            );
             if flags.first().copied().unwrap_or(false) {
                 break;
             }

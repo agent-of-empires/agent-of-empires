@@ -205,15 +205,48 @@ impl Instance {
     ) -> bool {
         let raw_command = self.get_tool_command();
         let command = raw_command.trim();
-        let contains_control = |value: &str| {
-            value.chars().any(|ch| {
-                matches!(
-                    ch,
-                    '\n' | '\r' | '|' | '&' | ';' | '<' | '>' | '(' | ')' | '#' | '`'
-                )
-            })
+        let contains_active_shell_syntax = |value: &str| {
+            let mut quote = None;
+            let mut escaped = false;
+            for ch in value.chars() {
+                if matches!(ch, '\n' | '\r') {
+                    return true;
+                }
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                match quote {
+                    Some('\'') => {
+                        if ch == '\'' {
+                            quote = None;
+                        }
+                    }
+                    Some('"') => match ch {
+                        '"' => quote = None,
+                        '\\' => escaped = true,
+                        '$' | '`' => return true,
+                        _ => {}
+                    },
+                    _ => match ch {
+                        '\'' | '"' => quote = Some(ch),
+                        '\\' => escaped = true,
+                        '|' | '&' | ';' | '<' | '>' | '(' | ')' | '#' | '`' | '$' | '*' | '?'
+                        | '[' | ']' | '{' | '}' | '~' | '!' => return true,
+                        _ => {}
+                    },
+                }
+            }
+            false
         };
-        if command.is_empty() || contains_control(raw_command) || contains_control(&self.extra_args)
+        let launch_extra_args = if self.command.is_empty() {
+            crate::session::config::quote_model_value_in_args(&self.extra_args)
+        } else {
+            self.extra_args.clone()
+        };
+        if command.is_empty()
+            || contains_active_shell_syntax(raw_command)
+            || contains_active_shell_syntax(&launch_extra_args)
         {
             return false;
         }
@@ -413,11 +446,9 @@ impl Instance {
     }
 }
 
-/// [`Instance::resolved_agent`] for a bare `(profile, tool)` pair, so state
-/// keyed by tool name outside an `Instance` (parked conversations, peer rows)
-/// resolves its built-in the same way the row itself would. Pass an empty
-/// `detect_as` when no stored alias exists; the live registry answers then.
-pub(crate) fn resolved_agent_for(
+/// Resolve a built-in from the instance's stored alias or its profile registry.
+/// The stored value wins; legacy rows with no value consult the live registry.
+fn resolved_agent_for(
     profile: &str,
     tool: &str,
     detect_as: &str,
@@ -742,6 +773,19 @@ mod tests {
         inst.command = "claude > /tmp/transcript".to_string();
         assert!(!inst.supports_native_resume());
 
+        for command in [
+            "claude $BARRIER",
+            "claude ${BARRIER}",
+            "claude *",
+            "claude session-?",
+            "claude [abc]",
+            "claude {one,two}",
+            "claude ~/thread",
+        ] {
+            inst.command = command.to_string();
+            assert!(!inst.supports_native_resume(), "accepted {command:?}");
+        }
+
         inst.command = "/opt/wrappers/claude".to_string();
         assert!(!inst.supports_native_resume());
 
@@ -751,6 +795,11 @@ mod tests {
         inst.command = "claude".to_string();
         inst.extra_args = "--model opus | tee /tmp/transcript".to_string();
         assert!(!inst.supports_native_resume());
+        inst.extra_args = "--append-system-prompt $PROMPT".to_string();
+        assert!(!inst.supports_native_resume());
+        inst.command.clear();
+        inst.extra_args = "--model sonnet[1m]".to_string();
+        assert!(inst.supports_native_resume());
 
         inst.extra_args.clear();
         inst.command = "claude # local note".to_string();

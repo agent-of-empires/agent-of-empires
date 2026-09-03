@@ -8,8 +8,6 @@ impl Instance {
         crate::session::capture::compose_exclusion_with_persisted_peers(
             &self.id,
             &self.project_path,
-            self.resolved_agent()
-                .map_or(self.tool.as_str(), |agent| agent.name),
             &self.effective_profile(),
             &self.retroactive_capture_excludes,
         )
@@ -84,7 +82,10 @@ impl Instance {
             // owner of a freshly-observed entry. Counting it would strand the
             // live session forever behind a ghost. Mirrors the liveness gate
             // `self_heal_session_id` applies to `self`.
-            if inst.agent_session_id.is_some() || !inst.tmux_alive_cached() {
+            if inst.agent_session_id.is_some()
+                || !inst.tmux_alive_cached()
+                || inst.resolved_session_support().is_none()
+            {
                 continue;
             }
             let key = inst.contended_capture_key();
@@ -184,11 +185,11 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn contended_capture_cwds_spans_a_direct_alias_and_its_base() {
-        const PROFILE: &str = "contended-alias-test";
+    fn unauthorized_alias_does_not_contend_with_a_direct_base() {
+        const PROFILE: &str = "contended-unauthorized-alias-test";
         let _registry = crate::session::instance::test_helpers::install_aliases(
             PROFILE,
-            &[("codex-personal", "codex")],
+            &[("opencode-remote", "opencode")],
         );
         let cwd = std::env::current_dir().unwrap();
         let project = cwd.to_str().unwrap();
@@ -196,11 +197,49 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         let mut base = Instance::new("base", project);
-        base.tool = "codex".to_string();
+        base.tool = "opencode".to_string();
+        let mut remote = Instance::new("remote", project);
+        remote.source_profile = PROFILE.to_string();
+        remote.tool = "opencode-remote".to_string();
+        remote.command = "ssh host opencode".to_string();
+        assert!(base.resolved_session_support().is_some());
+        assert!(remote.resolved_session_support().is_none());
+
+        let guard = crate::tmux::SessionCacheGuard::capture();
+        guard.force_present(&[]);
+        let sessions = [&base, &remote]
+            .map(|instance| crate::tmux::Session::resolve_name(&instance.id, &instance.title));
+        let live = sessions.iter().map(String::as_str).collect::<Vec<_>>();
+        guard.force_present(&live);
+
+        assert!(
+            !Instance::contended_capture_cwds(&[base, remote])
+                .contains(&("opencode".to_string(), canonical)),
+            "an alias without capture authorization cannot veto the direct pane"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn contended_capture_cwds_spans_a_direct_alias_and_its_base() {
+        const PROFILE: &str = "contended-alias-test";
+        let _registry = crate::session::instance::test_helpers::install_aliases(
+            PROFILE,
+            &[("opencode-personal", "opencode")],
+        );
+        let cwd = std::env::current_dir().unwrap();
+        let project = cwd.to_str().unwrap();
+        let canonical = crate::session::capture::canonicalize_or_raw(project)
+            .to_string_lossy()
+            .into_owned();
+        let mut base = Instance::new("base", project);
+        base.tool = "opencode".to_string();
         let mut alias = Instance::new("alias", project);
         alias.source_profile = PROFILE.to_string();
-        alias.tool = "codex-personal".to_string();
-        alias.command = "codex".to_string();
+        alias.tool = "opencode-personal".to_string();
+        alias.command = "opencode".to_string();
+        assert!(base.resolved_session_support().is_some());
+        assert!(alias.resolved_session_support().is_some());
 
         let guard = crate::tmux::SessionCacheGuard::capture();
         guard.force_present(&[]);
@@ -211,7 +250,7 @@ mod tests {
 
         assert!(
             Instance::contended_capture_cwds(&[base, alias])
-                .contains(&("codex".to_string(), canonical)),
+                .contains(&("opencode".to_string(), canonical)),
             "a direct alias and its base share one capture identity"
         );
     }

@@ -12,27 +12,6 @@ mod omp;
 
 pub(crate) use omp::*;
 
-/// Iterate directory entries, silently skipping unreadable ones.
-///
-/// Wraps `std::fs::read_dir` and filters out individual entry errors (e.g.
-/// transient permission failures) so that one bad entry doesn't abort the
-/// entire directory scan.
-///
-/// This filters `read_dir`'s per-entry `Err` only, which is a much narrower
-/// guarantee than it sounds. Nothing here stats the entry, so a dangling
-/// symlink, a symlink cycle, a directory, or a FIFO is yielded as an ordinary
-/// entry. Callers that need a real file behind the name have to check for
-/// themselves; see `scan_claude_project_dir`.
-pub(crate) fn resilient_read_dir(
-    dir: &std::path::Path,
-) -> Result<impl Iterator<Item = std::fs::DirEntry> + '_> {
-    Ok(std::fs::read_dir(dir)?.filter_map(move |entry| {
-        entry
-            .map_err(|e| tracing::debug!(target: "session.capture", "Skipping unreadable entry in {}: {}", dir.display(), e))
-            .ok()
-    }))
-}
-
 /// Resolve an agent's home directory, checking an optional env var first.
 fn resolve_agent_home(env_var: Option<&str>, default_subdir: &str) -> Result<PathBuf> {
     if let Some(var) = env_var {
@@ -326,12 +305,11 @@ fn compose_exclusion_in(
 /// Build the capture exclusion set from live pane ownership, caller-provided
 /// exclusions, and conversation ids parked by peer engine swaps.
 ///
-/// Parked ids are keyed by the raw outgoing tool, so compare their resolved
-/// built-in identity. An alias and its base agent share one conversation store.
+/// A peer still owns every parked id until it swaps back. Exclude all of
+/// them rather than re-resolving a raw alias through mutable profile config.
 pub(crate) fn compose_exclusion_with_persisted_peers(
     current_instance_id: &str,
     current_project_path: &str,
-    current_capture_agent: &str,
     profile: &str,
     retroactive_capture_excludes: &HashSet<String>,
 ) -> HashSet<String> {
@@ -368,13 +346,7 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
         // intends to resume it on a swap back. It is excluded regardless of the
         // peer's current tool or liveness: its pane is running another engine,
         // so the live tmux ownership scan cannot discover this id.
-        for (parked_tool, parked) in &inst.prior_tool_session_ids {
-            let parked_agent =
-                crate::session::instance::resolved_agent_for(&inst.source_profile, parked_tool, "")
-                    .map_or(parked_tool.as_str(), |agent| agent.name);
-            if parked_agent != current_capture_agent {
-                continue;
-            }
+        for parked in inst.prior_tool_session_ids.values() {
             if let Some(sid) = parked
                 .agent_session_id
                 .as_deref()
@@ -1178,64 +1150,66 @@ struct PrimeAgentSession {
     mtime_ms: u64,
 }
 
-/// Scan `<prime-agent home>/sessions/*.jsonl` and parse each file's first
-/// line as a session header. Unreadable files, non-JSON first lines, headers
-/// whose `type` is not `session`, and headers missing `id`/`cwd` are skipped:
-/// a read-only poll races writers and must tolerate partial files.
-fn scan_prime_agent_sessions(sessions_dir: &Path) -> Vec<PrimeAgentSession> {
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
+/// Maximum number of Prime Agent transcript entries inspected per poll. An
+/// instance-private store should contain very few files; exceeding this bound
+/// fails closed instead of turning a poll into attacker-controlled work.
+const PRIME_AGENT_MAX_SESSION_FILES: usize = 256;
 
-    let Ok(entries) = resilient_read_dir(sessions_dir) else {
+/// Scan `<prime-agent home>/sessions/*.jsonl` through one anchored root.
+/// Intermediate and leaf symlinks, non-regular files, oversized headers, and
+/// stores above the entry cap are rejected. The launch-floor mtime comes from
+/// the opened descriptor, so a path replacement cannot swap its timestamp.
+fn scan_prime_agent_sessions(store: &Path) -> Vec<PrimeAgentSession> {
+    let Ok(root) = crate::session::AnchoredDir::open(store) else {
         return Vec::new();
     };
+    let Ok(names) = root.read_dir(
+        Path::new("sessions"),
+        PRIME_AGENT_MAX_SESSION_FILES.saturating_add(1),
+    ) else {
+        return Vec::new();
+    };
+    if names.len() > PRIME_AGENT_MAX_SESSION_FILES {
+        return Vec::new();
+    }
+
     let mut sessions = Vec::new();
-    for entry in entries.filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl")) {
-        // Guarded open, mirroring extract_pi_header_fields: O_NONBLOCK keeps
-        // a misnamed FIFO from blocking the poll on open, O_NOFOLLOW refuses
-        // symlinked entries, and only regular files are scanned.
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-        #[cfg(not(unix))]
-        if std::fs::symlink_metadata(entry.path())
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(true)
+    for name in names {
+        let path = Path::new(&name);
+        if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let relative = Path::new("sessions").join(&name);
+        let Ok(Some(file)) = root.open_regular(&relative, usize::MAX) else {
+            continue;
+        };
+        let mtime_ms = file
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .map(crate::util::system_time_to_ms)
+            .unwrap_or(0);
+        let mut header = Vec::with_capacity(4096);
+        let read = std::io::BufReader::new(file)
+            .take(PRIME_AGENT_HEADER_SCAN_BYTES.saturating_add(1))
+            .read_until(b'\n', &mut header);
+        if read.is_err()
+            || header.is_empty()
+            || u64::try_from(header.len()).unwrap_or(u64::MAX) > PRIME_AGENT_HEADER_SCAN_BYTES
         {
             continue;
         }
-        let Ok(file) = options.open(entry.path()) else {
+        let Ok(header) = serde_json::from_slice::<serde_json::Value>(&header) else {
             continue;
         };
-        if !file.metadata().map(|m| m.is_file()).unwrap_or(false) {
-            continue;
-        }
-        let mut first_line = String::new();
-        let mut reader = std::io::BufReader::new(file);
-        if (&mut reader)
-            .take(PRIME_AGENT_HEADER_SCAN_BYTES)
-            .read_line(&mut first_line)
-            .is_err()
-        {
-            continue;
-        }
-        let Ok(header) = serde_json::from_str::<serde_json::Value>(&first_line) else {
-            continue;
-        };
-        if header.get("type").and_then(|v| v.as_str()) != Some("session") {
+        if header.get("type").and_then(|value| value.as_str()) != Some("session") {
             continue;
         }
         let (Some(id), Some(cwd)) = (
-            header.get("id").and_then(|v| v.as_str()),
-            header.get("cwd").and_then(|v| v.as_str()),
+            header.get("id").and_then(|value| value.as_str()),
+            header.get("cwd").and_then(|value| value.as_str()),
         ) else {
             continue;
         };
-        let mtime_ms = std::fs::metadata(entry.path())
-            .and_then(|m| m.modified())
-            .map(crate::util::system_time_to_ms)
-            .unwrap_or(0);
         sessions.push(PrimeAgentSession {
             id: id.to_string(),
             cwd: cwd.to_string(),
@@ -1289,7 +1263,7 @@ pub(crate) fn prime_agent_poll_fn_sandboxed_store(
     move || {
         let exclusion = compose_exclusion(&instance_id, &extra_excludes);
         select_prime_agent_session(
-            scan_prime_agent_sessions(&store.join("sessions")),
+            scan_prime_agent_sessions(&store),
             &container_workdir,
             &exclusion,
             Some(launch_time_ms),
@@ -1592,7 +1566,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn parked_conversation_exclusion_resolves_alias_keys() {
+    fn parked_conversation_exclusion_survives_alias_config_changes() {
         const PROFILE: &str = "capture-parked-alias-test";
         let app = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(app.path());
@@ -1625,14 +1599,13 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        // The peer row reloads without `source_profile`, and the alias may be
+        // removed or retargeted before it swaps back. Ownership must survive
+        // both facts rather than being reconstructed from current config.
+        crate::tmux::status_rules::install_from_config(PROFILE, &crate::session::Config::default());
 
-        let exclusions = compose_exclusion_with_persisted_peers(
-            "current",
-            project,
-            "claude",
-            PROFILE,
-            &HashSet::new(),
-        );
+        let exclusions =
+            compose_exclusion_with_persisted_peers("current", project, PROFILE, &HashSet::new());
         assert!(
             exclusions.contains(parked_sid),
             "a conversation parked under an alias belongs to the same built-in store"
@@ -2084,7 +2057,7 @@ mod tests {
         // A missing directory scans empty rather than erroring.
         assert!(scan_prime_agent_sessions(&tmp.path().join("nope")).is_empty());
 
-        let scanned = scan_prime_agent_sessions(&sessions_dir);
+        let scanned = scan_prime_agent_sessions(tmp.path());
         let mut ids: Vec<&str> = scanned.iter().map(|s| s.id.as_str()).collect();
         ids.sort_unstable();
         assert_eq!(ids, vec!["id-valid"]);
@@ -2105,7 +2078,7 @@ mod tests {
         oversized.push_str("\"}\n");
         std::fs::write(sessions_dir.join("big.jsonl"), &oversized).unwrap();
 
-        assert!(scan_prime_agent_sessions(&sessions_dir).is_empty());
+        assert!(scan_prime_agent_sessions(tmp.path()).is_empty());
     }
 
     #[cfg(unix)]
@@ -2125,8 +2098,34 @@ mod tests {
         )
         .unwrap();
 
-        assert!(scan_prime_agent_sessions(&sessions_dir).is_empty());
+        assert!(scan_prime_agent_sessions(tmp.path()).is_empty());
     }
+    #[cfg(unix)]
+    #[test]
+    fn test_scan_prime_agent_sessions_rejects_symlinked_sessions_directory() {
+        use std::os::unix::fs::symlink;
+
+        let store = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        write_prime_session(outside.path(), "peer.jsonl", "peer-id", "/workspace");
+        symlink(outside.path(), store.path().join("sessions")).unwrap();
+
+        assert!(scan_prime_agent_sessions(store.path()).is_empty());
+    }
+
+    #[test]
+    fn test_scan_prime_agent_sessions_fails_closed_above_entry_cap() {
+        let store = tempfile::tempdir().unwrap();
+        let sessions = store.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        for index in 0..=PRIME_AGENT_MAX_SESSION_FILES {
+            std::fs::write(sessions.join(format!("{index:04}.txt")), b"noise").unwrap();
+        }
+        write_prime_session(&sessions, "valid.jsonl", "valid-id", "/workspace");
+
+        assert!(scan_prime_agent_sessions(store.path()).is_empty());
+    }
+
     fn capture_floor(seconds: u64) -> std::time::SystemTime {
         std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)
     }

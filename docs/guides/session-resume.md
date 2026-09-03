@@ -30,7 +30,7 @@ Runtime conversation changes such as `/clear`, `/new`, fork, continue, or a fres
 
 Sandbox config and conversation stores are staged under a separate directory for each AoE instance, including custom `agent_config_dir` roots. A cross-process lease guards each managed store. Two sessions in the same working directory therefore cannot claim each other's conversation.
 
-Custom agents inherit native resume only when `agent_detect_as` resolves to a built-in agent and the configured launch starts with that built-in's exact binary token. Built-in command overrides follow the same rule. Paths, same-basename scripts, wrappers, remote launchers, comments, redirections, pipes, and other shell control syntax fail closed.
+Custom agents inherit native resume only when `agent_detect_as` resolves to a built-in agent and the configured launch starts with that built-in's exact binary token. Built-in command overrides follow the same rule. Path-qualified scripts, differently named wrappers, remote launchers, comments, redirections, pipes, shell expansion, and other shell control syntax fail closed. A bare built-in token is resolved by the launch shell's `PATH`.
 
 Disabling `agent_status_hooks` removes status writers only. Any authoritative identity hooks declared for native resume remain installed.
 

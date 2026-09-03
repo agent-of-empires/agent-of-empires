@@ -1,6 +1,6 @@
 //! Full-stack e2e for #3638: a custom agent mapped to a supported one
 //! (`custom_agents` + `agent_detect_as`) launches with its own pinned
-//! conversation id and resumes that same conversation on restart.
+//! conversation id and preserves that identity across restart.
 //!
 //! Teeth: the shim records every launch's argv and writes no transcript, so
 //! nothing on disk can be scanned for an identity. Capture and resume used to
@@ -46,19 +46,19 @@ exec sleep 600
 }
 
 /// Declare a custom agent whose direct Claude command inherits Claude's
-/// behavior. Opaque wrappers fail closed and are covered by unit tests.
+/// behavior. Differently named or path-qualified wrappers fail closed; the
+/// test shim stands in for the `claude` command resolved by the launch `PATH`.
 fn declare_custom_agent(h: &TuiTestHarness) {
     let app_dir = app_dir_in(h.home_path());
     std::fs::create_dir_all(&app_dir).expect("create app dir");
-    std::fs::write(
-        app_dir.join("config.toml"),
-        format!(
-            "[session]\n\
-             custom_agents = {{ \"{CUSTOM_AGENT}\" = \"{SHIM_BINARY}\" }}\n\
-             agent_detect_as = {{ \"{CUSTOM_AGENT}\" = \"claude\" }}\n"
-        ),
-    )
-    .expect("write config.toml");
+    let config_path = app_dir.join("config.toml");
+    let mut config = std::fs::read_to_string(&config_path).expect("read harness config.toml");
+    config.push_str(&format!(
+        "\n[session]\n\
+         custom_agents = {{ \"{CUSTOM_AGENT}\" = \"{SHIM_BINARY}\" }}\n\
+         agent_detect_as = {{ \"{CUSTOM_AGENT}\" = \"claude\" }}\n"
+    ));
+    std::fs::write(config_path, config).expect("extend config.toml");
 }
 
 /// Every profile's `sessions.json`, so the lookup does not depend on which
@@ -209,14 +209,15 @@ fn custom_agent_resume() {
     assert_eq!(stored_a, pinned_a);
     assert_eq!(stored_b, pinned_b);
 
-    // The restart continues the same conversation rather than starting fresh.
+    // The shim writes no transcript. Relaunching the same pin avoids a
+    // guaranteed-failing `--resume` while preserving the conversation identity.
     run_session_cli(&h, "stop", &id_a);
     run_session_cli(&h, "start", &id_a);
     let relaunch = wait_for_launches(&h, 3).remove(2);
     assert_eq!(
-        flag_value(&relaunch, "--resume").as_deref(),
+        flag_value(&relaunch, "--session-id").as_deref(),
         Some(&*stored_a),
-        "a restart must resume the conversation the session already owns, got: {relaunch}"
+        "an empty-thread restart must preserve the session's pinned identity, got: {relaunch}"
     );
     assert_eq!(agent_session_id_of(&h, &id_a).as_deref(), Some(&*stored_a));
     assert_eq!(

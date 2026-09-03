@@ -593,6 +593,23 @@ impl Instance {
                         .is_some_and(|rest| rest.starts_with('='))
             })
         };
+        if agent.name == "claude" {
+            if let Some(selector) = [
+                "-c",
+                "--continue",
+                "-r",
+                "--from-pr",
+                "--teleport",
+                "--cloud",
+                "--remote",
+                "--fork-session",
+            ]
+            .into_iter()
+            .find(|selector| flag_present(selector))
+            {
+                return Some(selector.to_string());
+            }
+        }
         match strategy {
             crate::agents::ResumeStrategy::Flag(flag) => {
                 flag_present(flag).then(|| flag.to_string())
@@ -2164,6 +2181,14 @@ pi = "~/.pi-personal"
             "claude --resume external",
             "claude --resume=external",
             "claude --session-id=external",
+            "claude -c",
+            "claude --continue",
+            "claude -r external",
+            "claude --from-pr=3678",
+            "claude --teleport external",
+            "claude --cloud external",
+            "claude --remote external",
+            "claude --fork-session",
         ] {
             let mut inst = Instance::new("claude", "/tmp/x");
             inst.tool = "claude".to_string();
@@ -2200,6 +2225,34 @@ pi = "~/.pi-personal"
             assert!(error
                 .to_string()
                 .contains("clear the AoE-managed resume state"));
+        }
+    }
+
+    #[test]
+    fn alternate_claude_selectors_conflict_with_managed_state() {
+        let sid = "11111111-2222-3333-4444-555555555555";
+        for command in [
+            "claude -c",
+            "claude --continue",
+            "claude -r external",
+            "claude --from-pr 3678",
+            "claude --teleport external",
+            "claude --cloud external",
+            "claude --remote external",
+            "claude --fork-session",
+        ] {
+            let mut inst = Instance::new("claude", "/tmp/x");
+            inst.tool = "claude".to_string();
+            inst.agent_session_id = Some(sid.to_string());
+            let error = inst
+                .apply_session_flags(&mut command.to_string(), "test")
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("already contains native session selector"),
+                "command={command:?}, error={error:#}"
+            );
         }
     }
 

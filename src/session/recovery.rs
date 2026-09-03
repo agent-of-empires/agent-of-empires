@@ -153,32 +153,30 @@ fn agent_injects_instance_id_env(inst: &Instance) -> bool {
     })
 }
 
-/// The identity needles used to detect a live agent process for `inst`: the
-/// anchored `AOE_INSTANCE_ID=<id>` env entry, and (only for non-hook agents)
-/// the `agent_session_id` as a command-line needle.
+/// The identity needles used to detect a live agent process for `inst`.
 ///
-/// Hook agents deliberately do *not* use the sid needle: a live
-/// `claude --resume <parent_sid> --fork-session` child carries the *parent's*
-/// sid in its argv, so a bare-sid match could let a fork-child suppress the
-/// parent's recovery (#3006 review). The env marker names the exact instance,
-/// so it has no such collision.
-pub fn orphan_needles(inst: &Instance) -> (String, Option<String>) {
-    let env = if inst.id.is_empty() {
-        String::new()
-    } else {
-        format!("{}={}", crate::tmux::env::AOE_INSTANCE_ID_KEY, inst.id)
-    };
-    let cmdline = if agent_injects_instance_id_env(inst) {
-        None
-    } else {
-        inst.agent_session_id
-            .as_deref()
-            .filter(|sid| {
-                sid.len() >= ORPHAN_SCAN_MIN_SID_LEN && super::capture::is_valid_session_id(sid)
-            })
-            .map(str::to_string)
-    };
-    (env, cmdline)
+/// Hook agents use the exact instance environment marker plus the resolved
+/// built-in executable token. The conversation id is mutable after `/clear`,
+/// `/new`, or a first hook publication, so it cannot identify their process.
+/// Non-hook agents fall back to a valid session id in the command line.
+pub fn orphan_needles(inst: &Instance) -> (String, Option<String>, Option<String>) {
+    if agent_injects_instance_id_env(inst) {
+        if inst.id.is_empty() {
+            return (String::new(), None, None);
+        }
+        let env = format!("{}={}", crate::tmux::env::AOE_INSTANCE_ID_KEY, inst.id);
+        let executable = inst.resolved_agent().map(|agent| agent.binary.to_string());
+        return (env, None, executable);
+    }
+
+    let cmdline = inst
+        .agent_session_id
+        .as_deref()
+        .filter(|sid| {
+            sid.len() >= ORPHAN_SCAN_MIN_SID_LEN && super::capture::is_valid_session_id(sid)
+        })
+        .map(str::to_string);
+    (String::new(), cmdline, None)
 }
 
 /// Batched orphan check: one process-table walk deciding, for each instance,
@@ -190,9 +188,16 @@ pub fn orphaned_agents_alive(insts: &[Instance]) -> Vec<bool> {
     if insts.is_empty() {
         return Vec::new();
     }
-    let (env, cmdline): (Vec<String>, Vec<Option<String>>) =
-        insts.iter().map(orphan_needles).unzip();
-    crate::process::processes_matching(&env, &cmdline)
+    let mut env = Vec::with_capacity(insts.len());
+    let mut cmdline = Vec::with_capacity(insts.len());
+    let mut executable = Vec::with_capacity(insts.len());
+    for inst in insts {
+        let (env_needle, cmdline_needle, executable_needle) = orphan_needles(inst);
+        env.push(env_needle);
+        cmdline.push(cmdline_needle);
+        executable.push(executable_needle);
+    }
+    crate::process::processes_matching(&env, &cmdline, &executable)
 }
 
 /// Defense-in-depth guard against the sequential-recovery duplication in #2994.
@@ -932,16 +937,16 @@ mod tests {
         );
     }
 
-    /// End-to-end #2994, argv-rewrite-proof path: an agent whose sid is absent
-    /// from argv is still detected via the `AOE_INSTANCE_ID` env marker aoe
-    /// injects for hook agents. Linux-only (stable `/proc/<pid>/environ`).
+    /// A helper process can outlive the agent while inheriting its environment.
+    /// The marker alone must not suppress recovery once no matching agent
+    /// executable remains.
     #[cfg(target_os = "linux")]
     #[test]
-    fn orphaned_agent_process_alive_detects_live_agent_by_env_marker() {
-        let mut inst = Instance::new("orphan-env", "/tmp/test");
+    fn orphaned_agent_process_ignores_env_only_descendant() {
+        let mut inst = Instance::new("orphan-env-descendant", "/tmp/test");
         inst.id = format!("orphanenv{:012}", std::process::id());
-        // No sid at all: the only identity signal is the env marker.
-        inst.agent_session_id = None;
+        inst.agent_session_id = Some("11111111-2222-4333-8444-555555555555".to_string());
+        let marker = format!("{}={}", crate::tmux::env::AOE_INSTANCE_ID_KEY, inst.id);
 
         let mut child = std::process::Command::new("sleep")
             .arg("30")
@@ -950,7 +955,50 @@ mod tests {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .expect("spawn env-marker orphan stand-in");
+            .expect("spawn env-only descendant stand-in");
+
+        let mut visible = false;
+        for _ in 0..100 {
+            if crate::process::processes_matching(&[marker.clone()], &[None], &[None])[0] {
+                visible = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            visible,
+            "the descendant must be visible before testing the guard"
+        );
+        assert!(
+            !orphaned_agent_process_alive(&inst),
+            "an env-only descendant must not suppress recovery"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn orphaned_hook_agent_requires_env_and_executable_not_captured_sid() {
+        use std::os::unix::fs::symlink;
+
+        let mut inst = Instance::new("orphan-env-agent", "/tmp/test");
+        inst.id = format!("orphanboth{:012}", std::process::id());
+        // Model a first hook publication or a later native rotation: this id is
+        // deliberately absent from the live agent's argv.
+        inst.agent_session_id = Some("66666666-7777-4888-8999-000000000000".to_string());
+        let bin = tempfile::tempdir().unwrap();
+        let agent = bin.path().join("claude");
+        symlink("/bin/sleep", &agent).unwrap();
+        let mut child = std::process::Command::new(agent)
+            .arg("30")
+            .env(crate::tmux::env::AOE_INSTANCE_ID_KEY, &inst.id)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn orphan-agent stand-in");
 
         let mut detected = false;
         for _ in 0..100 {
@@ -963,10 +1011,9 @@ mod tests {
 
         let _ = child.kill();
         let _ = child.wait();
-
         assert!(
             detected,
-            "a live agent carrying AOE_INSTANCE_ID in its env must be detected as an orphan",
+            "instance marker and executable must detect the live agent"
         );
     }
 
