@@ -186,8 +186,16 @@ dashboard) and can be overridden per profile. Resume fires once the reported
 reset time plus a fixed 15-second cushion passes, and the reset time survives
 an `aoe serve` restart. With no reported reset time, resume retries an hour
 after the park; if the limit has not cleared the session re-parks and the next
-retry is another hour out. The manual "Continue in another agent" and reconnect paths
-stay available regardless of the setting.
+retry is another hour out.
+
+Auto-resume re-sends the interrupted prompt each time, so it stops after five
+tries that all come back rate-limited. The banner then reads "Auto-resume
+stopped: the same prompt was re-sent too many times without getting through",
+and the session stays put rather than burning the same turn once an hour
+forever. "Resume now" and sending a new prompt both restart it with a full
+five; so does switching agents, or any turn that completes. The manual
+"Continue in another agent" and reconnect paths stay available regardless of
+the setting.
 
 ### Switching agents manually
 
