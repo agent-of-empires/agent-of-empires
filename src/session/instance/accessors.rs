@@ -204,7 +204,6 @@ impl Instance {
         agent: &crate::agents::AgentDef,
     ) -> bool {
         let raw_command = self.get_tool_command();
-        let command = raw_command.trim();
         let contains_active_shell_syntax = |value: &str| {
             let mut quote = None;
             let mut escaped = false;
@@ -244,15 +243,16 @@ impl Instance {
         } else {
             self.extra_args.clone()
         };
-        if command.is_empty()
+        if raw_command.trim().is_empty()
             || contains_active_shell_syntax(raw_command)
             || contains_active_shell_syntax(&launch_extra_args)
         {
             return false;
         }
-        let Ok(mut words) = shell_words::split(command) else {
+        let Some(parsed_command) = parse_launch_command(raw_command) else {
             return false;
         };
+        let mut words = parsed_command.words;
         if let Ok(extra) = shell_words::split(&self.extra_args) {
             words.extend(extra);
         } else {
@@ -275,9 +275,10 @@ impl Instance {
         {
             return true;
         }
-        let Ok(mut words) = shell_words::split(self.get_tool_command().trim()) else {
+        let Some(parsed_command) = parse_launch_command(self.get_tool_command()) else {
             return false;
         };
+        let mut words = parsed_command.words;
         let Ok(extra) = shell_words::split(&self.extra_args) else {
             return false;
         };

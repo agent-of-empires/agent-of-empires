@@ -581,10 +581,9 @@ impl Instance {
         is_existing && !takes_pinning_arm
     }
 
-    fn existing_session_selector(&self, cmd: &str) -> Option<String> {
+    fn existing_session_selector(&self, words: &[String]) -> Option<String> {
         let agent = self.resolved_agent()?;
         let strategy = agent.session_support.as_ref()?.resume;
-        let words = shell_words::split(cmd).ok()?;
         if words.first().map(String::as_str) != Some(agent.binary) {
             return None;
         }
@@ -632,7 +631,10 @@ impl Instance {
     }
 
     pub(super) fn apply_session_flags(&mut self, cmd: &mut String, context: &str) -> Result<bool> {
-        if let Some(selector) = self.existing_session_selector(cmd) {
+        let Some(parsed_command) = parse_launch_command(cmd) else {
+            return Ok(false);
+        };
+        if let Some(selector) = self.existing_session_selector(&parsed_command.words) {
             let aoe_has_state = self.agent_session_id.is_some()
                 || matches!(
                     self.resume_intent,
@@ -665,7 +667,11 @@ impl Instance {
                         self.resolved_agent().map(|agent| &agent.fork_strategy),
                         Some(crate::agents::ForkStrategy::CodexFork)
                     );
-                    splice_subcommand_or_append(cmd, &fork_part, is_subcommand);
+                    splice_subcommand_or_append(
+                        cmd,
+                        &fork_part,
+                        is_subcommand.then_some(parsed_command.executable_end),
+                    );
                 }
             }
             // A fork is a fresh session, not an in-place resume.
@@ -706,7 +712,7 @@ impl Instance {
         if is_existing && !explicitly_pinned && session_id.is_some() {
             if let Some(path) = self.pi_resumable_transcript() {
                 let flags = format!("--session {}", shell_escape(&path));
-                splice_subcommand_or_append(cmd, &flags, false);
+                splice_subcommand_or_append(cmd, &flags, None);
                 tracing::debug!(target: "session.store", "Added resume flags to {} command: {}", context, flags);
                 return Ok(true);
             }
@@ -719,6 +725,7 @@ impl Instance {
             session_id.as_deref(),
             flag_arm_is_existing,
             cmd,
+            parsed_command.executable_end,
             context,
         );
         Ok(is_existing && emitted)

@@ -142,20 +142,73 @@ pub(super) fn build_fork_flags(tool: &str, parent_id: &str, child_id: &str) -> S
     }
 }
 
-/// Splice `part` into `cmd`: insert it right after the binary (before other
-/// flags) when it is a subcommand, else append it. Shared by the resume and
-/// fork launch-flag builders.
-pub(super) fn splice_subcommand_or_append(cmd: &mut String, part: &str, is_subcommand: bool) {
-    if is_subcommand {
-        if let Some(space_pos) = cmd.find(' ') {
-            let binary = &cmd[..space_pos];
-            let flags = &cmd[space_pos..];
-            *cmd = format!("{} {}{}", binary, part, flags);
-        } else {
-            *cmd = format!("{} {}", cmd, part);
+pub(super) struct ParsedLaunchCommand {
+    pub(super) words: Vec<String>,
+    pub(super) executable_end: usize,
+}
+
+pub(super) fn parse_launch_command(command: &str) -> Option<ParsedLaunchCommand> {
+    let words = shell_words::split(command).ok()?;
+    words.first()?;
+
+    let mut started = false;
+    let mut quote = None;
+    let mut escaped = false;
+    for (offset, ch) in command.char_indices() {
+        let separator = matches!(ch, ' ' | '\t' | '\n' | '\r');
+        if !started {
+            if separator {
+                continue;
+            }
+            started = true;
         }
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some('\'') => {
+                if ch == '\'' {
+                    quote = None;
+                }
+            }
+            Some('"') => match ch {
+                '"' => quote = None,
+                '\\' => escaped = true,
+                _ => {}
+            },
+            _ => match ch {
+                '\'' | '"' => quote = Some(ch),
+                '\\' => escaped = true,
+                _ if separator => {
+                    return Some(ParsedLaunchCommand {
+                        words,
+                        executable_end: offset,
+                    });
+                }
+                _ => {}
+            },
+        }
+    }
+    Some(ParsedLaunchCommand {
+        words,
+        executable_end: command.len(),
+    })
+}
+
+/// Insert a subcommand at the parsed executable boundary, or append flags.
+pub(super) fn splice_subcommand_or_append(
+    cmd: &mut String,
+    part: &str,
+    subcommand_at: Option<usize>,
+) {
+    cmd.reserve(part.len() + 1);
+    if let Some(offset) = subcommand_at {
+        cmd.insert_str(offset, part);
+        cmd.insert(offset, ' ');
     } else {
-        *cmd = format!("{} {}", cmd, part);
+        cmd.push(' ');
+        cmd.push_str(part);
     }
 }
 
@@ -164,6 +217,7 @@ pub(super) fn append_resume_flags(
     session_id: Option<&str>,
     is_existing_session: bool,
     cmd: &mut String,
+    executable_end: usize,
     context: &str,
 ) -> bool {
     use crate::agents::{get_agent, ResumeStrategy};
@@ -173,14 +227,15 @@ pub(super) fn append_resume_flags(
         if resume_part.is_empty() {
             return false;
         }
-        let is_subcommand = matches!(
+        let subcommand_at = matches!(
             get_agent(tool).and_then(|agent| agent.session_support.as_ref()),
             Some(crate::agents::SessionSupport {
                 resume: ResumeStrategy::Subcommand(_),
                 ..
             })
-        );
-        splice_subcommand_or_append(cmd, &resume_part, is_subcommand);
+        )
+        .then_some(executable_end);
+        splice_subcommand_or_append(cmd, &resume_part, subcommand_at);
         tracing::debug!(target: "session.store", "Added resume flags to {} command: {}", context, resume_part);
         return true;
     }
@@ -1043,6 +1098,71 @@ mod tests {
         let mut cmd = "codex --some-flag".to_string();
         inst.apply_session_flags(&mut cmd, "test").unwrap();
         assert_eq!(cmd, "codex fork parent-1234 --some-flag");
+    }
+
+    #[test]
+    fn resume_command_uses_validated_executable_anchor() {
+        let cases = [
+            (
+                "tab separator",
+                "codex",
+                "",
+                "codex\t--model o3",
+                "codex resume SID\t--model o3",
+            ),
+            (
+                "leading whitespace",
+                "codex",
+                "",
+                " \tcodex\t--model o3",
+                " \tcodex resume SID\t--model o3",
+            ),
+            (
+                "multiple spaces",
+                "codex",
+                "",
+                "codex   --model o3",
+                "codex resume SID   --model o3",
+            ),
+            (
+                "direct alias",
+                "codex-personal",
+                "codex",
+                " \tcodex\t--model o3",
+                " \tcodex resume SID\t--model o3",
+            ),
+        ];
+        for (name, tool, detect_as, command, expected) in cases {
+            let mut inst = Instance::new(name, "/tmp/x");
+            inst.tool = tool.to_string();
+            inst.detect_as = detect_as.to_string();
+            inst.command = command.to_string();
+            inst.agent_session_id = Some("SID".to_string());
+            inst.resume_intent = ResumeIntent::Use("SID".to_string());
+            let mut cmd = command.to_string();
+
+            assert!(
+                inst.apply_session_flags(&mut cmd, "test").unwrap(),
+                "{name}"
+            );
+            assert_eq!(cmd, expected, "{name}");
+            assert_eq!(
+                shell_words::split(&cmd).unwrap(),
+                ["codex", "resume", "SID", "--model", "o3"],
+                "{name}"
+            );
+        }
+
+        let mut wrapper = Instance::new("wrapper", "/tmp/x");
+        wrapper.tool = "codex-personal".to_string();
+        wrapper.detect_as = "codex".to_string();
+        wrapper.command = "codex-personal".to_string();
+        wrapper.agent_session_id = Some("SID".to_string());
+        wrapper.resume_intent = ResumeIntent::Use("SID".to_string());
+        let mut cmd = wrapper.command.clone();
+
+        assert!(!wrapper.apply_session_flags(&mut cmd, "test").unwrap());
+        assert_eq!(cmd, "codex-personal");
     }
 
     #[test]

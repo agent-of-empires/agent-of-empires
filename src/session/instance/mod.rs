@@ -88,8 +88,8 @@ pub use types::{
 use hooks::status_hook_env_prefix;
 pub(crate) use hooks::{generic_host_config_path_for, sidecar_host_config_path_for};
 use launch_command::{
-    append_resume_flags, build_fork_flags, shell_stdin_command, splice_subcommand_or_append,
-    PreparedLaunch,
+    append_resume_flags, build_fork_flags, parse_launch_command, shell_stdin_command,
+    splice_subcommand_or_append, PreparedLaunch,
 };
 use omp::{gate_omp_launch, wrap_omp_host_launch, wrap_omp_launch};
 use pane_status::{resolve_detected_status, summarize_error_from_pane};
