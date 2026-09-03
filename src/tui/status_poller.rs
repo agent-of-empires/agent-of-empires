@@ -51,7 +51,7 @@ fn polling_tier(status: Status) -> u64 {
 ///   clobbered by an unseeded snapshot.
 ///
 /// Locked by `apply_status_update_preserves_idle_entered_at_on_keep`
-/// in `src/tui/home/tests.rs` (a `#[cfg(test)]` item, so the reference
+/// in `src/tui/home/tests/status_rows_menu.rs` (a `#[cfg(test)]` item, so the reference
 /// is kept as a code-span rather than an intra-doc link that would
 /// silently degrade to literal text under `cargo doc`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -181,9 +181,9 @@ pub(super) fn poll_statuses_once(
     if has_sandboxed && state.last_credential_refresh.elapsed() >= state.credential_refresh_interval
     {
         state.last_credential_refresh = Instant::now();
-        crate::session::container_config::refresh_shared_agent_configs();
+        crate::session::config::container_config::refresh_shared_agent_configs();
         for instance in instances.iter().filter(|inst| inst.is_sandboxed()) {
-            crate::session::container_config::refresh_codex_agent_config_for_instance(
+            crate::session::config::container_config::refresh_codex_agent_config_for_instance(
                 &instance.effective_profile(),
                 &instance.id,
                 &instance.tool,

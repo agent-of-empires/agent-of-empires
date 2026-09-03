@@ -13,7 +13,7 @@ use ratatui::widgets::*;
 use tui_input::Input;
 
 use super::DialogResult;
-use crate::session::profile_config::resolve_config_or_warn;
+use crate::session::config::profile_config::resolve_config_or_warn;
 use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::components::{
     handle_tool_config_key, profile_cycler_spans, render_tool_config_overlay, tool_cycler_spans,

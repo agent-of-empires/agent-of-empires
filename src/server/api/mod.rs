@@ -220,7 +220,7 @@ pub(super) fn validate_display_label(value: &str, field_name: &str) -> Result<()
 // The settings PATCH write surface (which sections/fields the web may write,
 // which need elevation, which are host-only) is no longer a hand-kept list
 // here: it is derived from the settings schema in
-// `crate::session::settings_schema::policy`, the single source of truth shared
+// `crate::session::config::settings_schema::policy`, the single source of truth shared
 // with the TUI and web (#1692). See `update_settings` / `update_profile_settings`
 // in `system.rs`, which validate each PATCH leaf via `validate_patch`.
 
@@ -258,7 +258,7 @@ mod tests {
     //! The settings PATCH write surface (allowed sections, blocked agent-
     //! command fields, elevation surfaces) is no longer a constant here:
     //! it is derived from the settings schema and pinned by the tests in
-    //! `crate::session::settings_schema::policy` (#1692).
+    //! `crate::session::config::settings_schema::policy` (#1692).
     use super::*;
 
     /// CityHall lockdown (#7): the shared guard returns 403 so terminal, diff,
@@ -299,21 +299,51 @@ mod tests {
         // guard.
         let cases: &[(&str, &str, &[&str])] = &[
             (
-                "api/sessions.rs",
-                include_str!("sessions.rs"),
+                "api/sessions/create.rs",
+                include_str!("sessions/create.rs"),
+                &["create_session"],
+            ),
+            (
+                "api/sessions/delete.rs",
+                include_str!("sessions/delete.rs"),
+                &["delete_session", "delete_workspace"],
+            ),
+            (
+                "api/sessions/rename.rs",
+                include_str!("sessions/rename.rs"),
                 &[
-                    "create_session",
-                    "delete_session",
                     "rename_session",
                     "set_worktree_name",
                     "attach_session_project",
-                    "send_message",
+                ],
+            ),
+            (
+                "api/sessions/send.rs",
+                include_str!("sessions/send.rs"),
+                &["send_message"],
+            ),
+            (
+                "api/sessions/ensure.rs",
+                include_str!("sessions/ensure.rs"),
+                &[
                     "ensure_session",
                     "ensure_terminal",
                     "ensure_container_terminal",
+                ],
+            ),
+            (
+                "api/sessions/update.rs",
+                include_str!("sessions/update.rs"),
+                &[
                     "update_session_group",
                     "update_session_notifications",
                     "update_session_diff_base",
+                ],
+            ),
+            (
+                "api/sessions/lifecycle.rs",
+                include_str!("sessions/lifecycle.rs"),
+                &[
                     "update_session_pin",
                     "update_session_color",
                     "update_session_archive",
@@ -324,8 +354,12 @@ mod tests {
                     "stop_session",
                     "force_smart_rename",
                     "start_session",
-                    "update_workspace_ordering",
                 ],
+            ),
+            (
+                "api/sessions/list.rs",
+                include_str!("sessions/list.rs"),
+                &["update_workspace_ordering"],
             ),
             ("api/git.rs", include_str!("git.rs"), &["clone_repo"]),
             (
@@ -498,21 +532,51 @@ mod tests {
     fn mutating_handlers_extract_body_lazily() {
         let cases: &[(&str, &str, &[&str])] = &[
             (
-                "api/sessions.rs",
-                include_str!("sessions.rs"),
+                "api/sessions/create.rs",
+                include_str!("sessions/create.rs"),
+                &["create_session"],
+            ),
+            (
+                "api/sessions/delete.rs",
+                include_str!("sessions/delete.rs"),
+                &["delete_session", "delete_workspace"],
+            ),
+            (
+                "api/sessions/rename.rs",
+                include_str!("sessions/rename.rs"),
                 &[
-                    "create_session",
-                    "delete_session",
                     "rename_session",
                     "set_worktree_name",
                     "attach_session_project",
-                    "send_message",
+                ],
+            ),
+            (
+                "api/sessions/send.rs",
+                include_str!("sessions/send.rs"),
+                &["send_message"],
+            ),
+            (
+                "api/sessions/ensure.rs",
+                include_str!("sessions/ensure.rs"),
+                &[
                     "ensure_session",
                     "ensure_terminal",
                     "ensure_container_terminal",
+                ],
+            ),
+            (
+                "api/sessions/update.rs",
+                include_str!("sessions/update.rs"),
+                &[
                     "update_session_group",
                     "update_session_notifications",
                     "update_session_diff_base",
+                ],
+            ),
+            (
+                "api/sessions/lifecycle.rs",
+                include_str!("sessions/lifecycle.rs"),
+                &[
                     "update_session_pin",
                     "update_session_color",
                     "update_session_archive",
@@ -521,8 +585,12 @@ mod tests {
                     "update_session_unread",
                     "stop_session",
                     "start_session",
-                    "update_workspace_ordering",
                 ],
+            ),
+            (
+                "api/sessions/list.rs",
+                include_str!("sessions/list.rs"),
+                &["update_workspace_ordering"],
             ),
             ("api/git.rs", include_str!("git.rs"), &["clone_repo"]),
             (
@@ -759,7 +827,7 @@ mod tests {
 
     // The settings PATCH write-surface pins (allowed sections, blocked session
     // fields, elevation surfaces) moved to
-    // `crate::session::settings_schema::policy` when the curated constants were
+    // `crate::session::config::settings_schema::policy` when the curated constants were
     // replaced by schema-derived `validate_patch` (#1692). The security
     // invariants (hooks never writable, agent-command fields denied,
     // sandbox/worktree require elevation) are pinned by that module's tests.

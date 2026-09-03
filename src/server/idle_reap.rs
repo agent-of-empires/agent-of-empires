@@ -55,7 +55,7 @@ pub(super) async fn reap_idle_sessions(
             profiles
                 .into_iter()
                 .map(|p| {
-                    let secs = crate::session::profile_config::resolve_config_or_warn(&p)
+                    let secs = crate::session::config::profile_config::resolve_config_or_warn(&p)
                         .session
                         .auto_stop_idle_secs;
                     (p, secs)

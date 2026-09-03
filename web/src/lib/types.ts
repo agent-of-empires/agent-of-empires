@@ -466,7 +466,7 @@ export interface ProfileInfo {
 
 /** Per-profile lifecycle-hook overrides, as returned by
  *  GET /api/profiles/:name/settings. Mirrors the Rust
- *  HooksConfigOverride (src/session/profile_config.rs): a field that is
+ *  HooksConfigOverride (src/session/config/profile_config.rs): a field that is
  *  absent/undefined means "inherit the global hooks"; an explicit array
  *  (including the empty array) means "override". Hooks are read-only on
  *  the dashboard; see HooksReadOnlyPanel and profileWritableSections. */
@@ -599,7 +599,7 @@ export type AcpWorkerState = "absent" | "resuming" | "running";
 
 // --- Settings schema (single source of truth, see #1692) ---
 //
-// Mirrors `crate::session::settings_schema`. `GET /api/settings/schema`
+// Mirrors `crate::session::config::settings_schema`. `GET /api/settings/schema`
 // returns `SettingsFieldDescriptor[]`; the generic settings renderer builds
 // the form from it instead of hand-written per-field JSX.
 

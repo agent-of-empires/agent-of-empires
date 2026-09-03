@@ -7,7 +7,7 @@
 //
 // The UI contract under test lives in `SessionGroupModal`
 // (web/src/components/SessionGroupModal.tsx); the PATCH handler is
-// `update_session_group` in `src/server/api/sessions.rs`. Live coverage
+// `update_session_group` in `src/server/api/sessions/update.rs`. Live coverage
 // catches wire-format drift on either side that a mocked spec would miss.
 
 import { test as base, expect } from "@playwright/test";

@@ -57,7 +57,7 @@ pub const TMUX_SOCKET_ENV: &str = "AOE_TMUX_SOCKET";
 /// profile name resolves to the default profile, matching every other
 /// profile-scoped read.
 pub(crate) fn tmux_option_config(profile: &str) -> crate::session::Config {
-    crate::session::profile_config::resolve_config_or_warn(profile)
+    crate::session::config::profile_config::resolve_config_or_warn(profile)
 }
 
 /// How aoe points tmux at a specific server, if at all.

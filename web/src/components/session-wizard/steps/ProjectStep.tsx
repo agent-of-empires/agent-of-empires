@@ -90,7 +90,7 @@ export function collectRecentProjects(sessions: SessionResponse[]): RecentProjec
     if (s.workspace_repos.length > 0) continue;
     // Normalize the trailing slash before keying, mirroring the backend's
     // dedup convention (`src/session/instance/tmux_session.rs` is_duplicate_session and
-    // `src/server/api/sessions.rs` workspace_id_for_session both
+    // `src/server/api/sessions/list.rs` workspace_id_for_session both
     // `trim_end_matches('/')`). Without this, `/foo/bar` and `/foo/bar/`
     // become two separate entries with split session counts. The `|| "/"`
     // keeps the filesystem root from collapsing to an empty string.

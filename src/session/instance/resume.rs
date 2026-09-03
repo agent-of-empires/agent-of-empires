@@ -267,9 +267,11 @@ impl Instance {
         let resume_allowed_by_policy = match resume_policy {
             ResumeAttemptPolicy::Allow => true,
             ResumeAttemptPolicy::HonorAutoResumeSetting => {
-                crate::session::profile_config::resolve_config_or_warn(&self.effective_profile())
-                    .session
-                    .auto_resume_on_restart
+                crate::session::config::profile_config::resolve_config_or_warn(
+                    &self.effective_profile(),
+                )
+                .session
+                .auto_resume_on_restart
             }
         };
         if !should_attempt_resume(Some(&sid), self.capture_agent_name().unwrap_or(&self.tool)) {

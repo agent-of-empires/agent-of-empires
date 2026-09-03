@@ -4,7 +4,7 @@
 //! sub-struct so the field declaration plus its `#[setting(...)]` attributes
 //! are the single source of truth for every settings surface (TUI, web,
 //! server policy, validation). The generated code references
-//! `crate::session::settings_schema::*`, so the derive is only meant for use
+//! `crate::session::config::settings_schema::*`, so the derive is only meant for use
 //! inside the `agent-of-empires` crate.
 //!
 //! Section attribute (required):
@@ -114,8 +114,8 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             /// Schema descriptors for this section, emitted by
             /// `#[derive(SettingsSection)]`. The single source of truth for
             /// how every surface renders and guards these fields.
-            pub fn settings_descriptors() -> ::std::vec::Vec<crate::session::settings_schema::FieldDescriptor> {
-                use crate::session::settings_schema::{
+            pub fn settings_descriptors() -> ::std::vec::Vec<crate::session::config::settings_schema::FieldDescriptor> {
+                use crate::session::config::settings_schema::{
                     FieldDescriptor, WidgetKind, WebWritePolicy, ValidationKind, SelectOption,
                 };
                 ::std::vec![ #(#descriptors),* ]

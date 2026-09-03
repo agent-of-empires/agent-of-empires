@@ -3326,7 +3326,7 @@ impl App {
             now,
             &attached,
             |profile| {
-                crate::session::profile_config::resolve_config_or_warn(profile)
+                crate::session::config::profile_config::resolve_config_or_warn(profile)
                     .session
                     .auto_stop_idle_secs
             },

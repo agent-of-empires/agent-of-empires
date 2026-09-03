@@ -1,5 +1,5 @@
 //! Full-stack e2e: the web archive handler's structured-view teardown branch
-//! (`src/server/api/sessions.rs` `update_session_archive`, #1868 / #2179).
+//! (`src/server/api/sessions/lifecycle.rs` `update_session_archive`, #1868 / #2179).
 //!
 //! The handler shuts the ACP worker down via `acp_supervisor.shutdown()`
 //! (unconditional, regardless of `kill_pane`) and then, only when `kill_pane`

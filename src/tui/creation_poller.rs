@@ -7,7 +7,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use crate::session::builder::{self, CreatedWorktree, InstanceParams};
-use crate::session::repo_config::{self, HookProgress, HooksConfig};
+use crate::session::config::repo_config::{self, HookProgress, HooksConfig};
 use crate::session::Instance;
 use crate::tui::dialogs::NewSessionData;
 

@@ -243,7 +243,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         token_lifetime,
         token_grace,
     ));
-    let config = crate::session::profile_config::resolve_config_or_warn(profile);
+    let config = crate::session::config::profile_config::resolve_config_or_warn(profile);
     // Feed the unread-feature gate from this daemon's resolved config. Like
     // `push_enabled`, this is read once at startup; a config change needs a
     // restart to take effect. The TUI process maintains its own copy.
