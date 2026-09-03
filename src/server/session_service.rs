@@ -194,6 +194,10 @@ pub struct SessionService {
     /// Per-session prompt-submission locks. See
     /// [`SessionService::prompt_submission`].
     prompt_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Test-only tap on [`SessionService::prompt_submission`], fired before it
+    /// reaches `prompt_locks`. See [`SessionService::watch_submission_claims`].
+    #[cfg(test)]
+    submission_claims: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 /// Who is asking the session service to act. Constructed only by the
@@ -302,6 +306,8 @@ impl SessionService {
             pending_drains: std::sync::Mutex::new(std::collections::HashSet::new()),
             persist_locks: RwLock::new(HashMap::new()),
             prompt_locks: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            submission_claims: std::sync::OnceLock::new(),
         }
     }
 
@@ -604,11 +610,11 @@ impl SessionService {
     ///
     /// Single drain owner: callers (the create fast path and the reconciler
     /// tick) race through the `pending_drains` claim, and the delivery runs
-    /// under the session's [`Self::prompt_submission`] guard, so the turn
-    /// cannot be published twice concurrently and a direct prompt cannot
-    /// decide its own disposition mid-delivery. A delivery failure leaves the
-    /// field set; the reconciler tick retries once the worker is live.
-    /// Clearing writes memory first,
+    /// under the session's [`Self::prompt_submission_for_session`] guard, so
+    /// the turn cannot be published twice concurrently and a direct prompt
+    /// cannot decide its own disposition mid-delivery. A delivery failure
+    /// leaves the field set; the reconciler tick retries once the worker is
+    /// live. Clearing writes memory first,
     /// then disk: a crash (or failed persist) between the forward and the
     /// disk clear re-delivers after restart, which is the documented
     /// at-least-once contract.
@@ -626,7 +632,12 @@ impl SessionService {
             service: Arc::clone(self),
             id: id.to_string(),
         };
-        let _submission = self.prompt_submission(id).await;
+        // Non-vivifying: the reconciler spawns this from an earlier snapshot,
+        // so a delete can have completed in the gap and the raw guard would
+        // leave a fresh registry entry nothing prunes (#3687).
+        let Some(_submission) = self.prompt_submission_for_session(id).await else {
+            return;
+        };
         let Some((text, attachment_refs, profile, caller)) = ({
             let instances = self.instances.read().await;
             instances.iter().find(|i| i.id == id).and_then(|i| {
@@ -1144,9 +1155,10 @@ impl SessionService {
     /// Drain the leading batch of a session's server-owned queue into the live
     /// worker once the current turn has ended. Mirrors
     /// `drain_pending_initial_turn`'s single-owner `pending_drains` claim +
-    /// [`Self::prompt_submission`] delivery, so a batch is never sent twice
-    /// concurrently and the idle check below cannot be invalidated by a direct
-    /// prompt deciding its own disposition before this one reaches the agent.
+    /// [`Self::prompt_submission_for_session`] delivery, so a batch is never
+    /// sent twice concurrently and the idle check below cannot be invalidated
+    /// by a direct prompt deciding its own disposition before this one reaches
+    /// the agent.
     ///
     /// Only drains an idle turn, and asks the live control fold rather than
     /// `Instance.status`: dispatch parks a prompt on that fold, so gating the
@@ -1178,7 +1190,11 @@ impl SessionService {
             service: Arc::clone(self),
             id: id.to_string(),
         };
-        let _submission = self.prompt_submission(id).await;
+        // Non-vivifying, for the same reason as the pending-initial drain
+        // (#3687).
+        let Some(_submission) = self.prompt_submission_for_session(id).await else {
+            return;
+        };
 
         let (caller, agent_key, queue) = {
             let instances = self.instances.read().await;
@@ -1392,6 +1408,10 @@ impl SessionService {
     /// `AlreadyRunning` for a worker that is already there, so it costs a
     /// lookup rather than a wrong disposition.
     pub(crate) async fn prompt_submission(&self, id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        #[cfg(test)]
+        if let Some(tap) = self.submission_claims.get() {
+            let _ = tap.send(id.to_string());
+        }
         let lock = {
             let guard = self.prompt_locks.read().await;
             guard.get(id).cloned()
@@ -1516,6 +1536,23 @@ impl SessionService {
     #[cfg(test)]
     pub(crate) async fn prompt_locks_len(&self) -> usize {
         self.prompt_locks.read().await.len()
+    }
+
+    /// Report every [`Self::prompt_submission`] claim at the one moment a
+    /// deletion-race test can use: the claimer has cleared
+    /// [`Self::prompt_submission_for_session`]'s pre-acquisition existence
+    /// check and has not yet touched `prompt_locks`, so a delete landing now
+    /// is precisely the race the post-acquisition check exists for. Sampling
+    /// the raw claim rather than the admission above it keeps the same
+    /// checkpoint on a build where the drains take the vivifying guard, so the
+    /// test still fails there instead of hanging. One watcher per service.
+    #[cfg(test)]
+    pub(crate) fn watch_submission_claims(&self) -> tokio::sync::mpsc::UnboundedReceiver<String> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.submission_claims
+            .set(tx)
+            .expect("one submission watcher per service");
+        rx
     }
 }
 
@@ -2280,6 +2317,101 @@ mod tests {
             .expect("the clear lands once the delivery releases the session")
             .expect("clear task must not panic");
         assert!(service.queued_prompts_snapshot("sess-mut").await.is_empty());
+    }
+
+    /// #3687: a background drain spawned from a pre-deletion snapshot must not
+    /// re-create the deleted session's `prompt_locks` entry.
+    ///
+    /// The registry vivifies an entry per id it is asked for and only a
+    /// permanent delete prunes it, so a drain claiming the raw guard after the
+    /// row is gone leaves one behind for the daemon's lifetime. Both windows
+    /// count: the drain that starts after the delete finished, and the one
+    /// that proves existence first and then vivifies its entry after the
+    /// delete's own `forget_prompt_lock` has already run.
+    #[tokio::test]
+    async fn drains_leave_no_prompt_lock_for_a_deleted_session() {
+        use std::time::Duration;
+
+        fn drainable(id: &str) -> Instance {
+            let mut inst = Instance::new("drain-del", "/tmp/aoe-3687");
+            inst.id = id.to_string();
+            inst.view = crate::session::View::Structured;
+            inst.status = crate::session::Status::Idle;
+            inst.pending_initial_turn = Some("hello".to_string());
+            inst
+        }
+
+        let service = crate::server::test_support::build_test_app_state(vec![
+            drainable("sess-3687-a"),
+            drainable("sess-3687-b"),
+            drainable("sess-3687-live"),
+        ])
+        .session_service
+        .clone();
+
+        // A surviving session's entry makes the assertions a return to a prior
+        // size rather than an emptied map.
+        drop(service.prompt_submission("sess-3687-live").await);
+        let before = service.prompt_locks_len().await;
+        assert_eq!(before, 1);
+
+        // Window one: the delete completed before the reconciler's drain ran.
+        service
+            .instances
+            .write()
+            .await
+            .retain(|i| i.id != "sess-3687-a");
+        service.forget_prompt_lock("sess-3687-a").await;
+        service.drain_pending_initial_turn("sess-3687-a").await;
+        service.drain_queued_prompts_once("sess-3687-a").await;
+        assert_eq!(
+            service.prompt_locks_len().await,
+            before,
+            "a drain for an id that no longer exists must not vivify an entry"
+        );
+
+        // Window two: the drain cleared the existence check and then parked
+        // reaching the registry, so it vivifies its entry after the delete's
+        // own `forget_prompt_lock` (a no-op here: no entry existed yet) and
+        // only the post-acquisition check can retire it.
+        //
+        // The claim tap is what pins the drain to that state. A timer plus
+        // `!is_finished()` would only say the task had not returned, which is
+        // equally true of a drain that had not been polled at all and would
+        // then decline at the first check, quietly collapsing this case into
+        // window one. Holding the registry write guard is the other half: the
+        // tap fires immediately before `prompt_locks` is read, so the drain
+        // cannot advance past it while the guard is held.
+        let mut claims = service.watch_submission_claims();
+        let registry = service.prompt_locks.write().await;
+        let drain = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.drain_pending_initial_turn("sess-3687-b").await }
+        });
+        loop {
+            let claimed = tokio::time::timeout(Duration::from_secs(10), claims.recv())
+                .await
+                .expect("the drain must reach its submission claim")
+                .expect("the tap outlives the drain");
+            if claimed == "sess-3687-b" {
+                break;
+            }
+        }
+        service
+            .instances
+            .write()
+            .await
+            .retain(|i| i.id != "sess-3687-b");
+        drop(registry);
+        tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .expect("the drain finishes once the registry is free")
+            .expect("drain task must not panic");
+        assert_eq!(
+            service.prompt_locks_len().await,
+            before,
+            "an entry vivified after the delete's removal must be retired by the drain"
+        );
     }
 
     /// Queueing a follow-up is a user gesture, so it must advance

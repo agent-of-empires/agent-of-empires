@@ -5,6 +5,7 @@ use crate::file_watch::FileWatchService;
 use crate::server::push::{PushState, STATUS_CHANNEL_CAPACITY};
 use crate::server::rate_limit::RateLimiter;
 use anyhow::Context;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,6 +55,50 @@ pub(super) fn remote_serve_url_contents(
     let remote_url = with_token(remote_base_url);
     let loopback_url = with_token(&format!("http://127.0.0.1:{local_port}"));
     format!("{remote_url}\nlocalhost\t{loopback_url}\n")
+}
+
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// Post-signal shutdown: cancel the shared token, arm the force-exit
+/// deadline, then reap plugin workers within four fifths of the window,
+/// leaving the rest for the caller's own cleanup.
+///
+/// A worker that never terminates therefore cannot keep the daemon alive.
+/// It is not free: a reap cut short can leave a worker group SIGTERMed
+/// without the SIGKILL escalation, and a forced exit skips the
+/// post-`axum::serve` cleanup entirely (acp detach, tunnel SIGTERM of
+/// cloudflared, removal of serve.passphrase). The PID file is swept by
+/// `daemon_pid`'s stale-PID check on the next start.
+async fn run_shutdown_sequence<R, F>(
+    shutdown: &CancellationToken,
+    grace: Duration,
+    reap: R,
+    force_exit: F,
+) where
+    R: Future<Output = ()>,
+    F: FnOnce() + Send + 'static,
+{
+    shutdown.cancel();
+    // Build the timer here, not inside the task: `sleep` fixes its deadline
+    // from the clock at construction, so constructing it in the task would
+    // restart the window at the task's first poll, which the reap's own
+    // synchronous work can delay.
+    let deadline = tokio::time::sleep(grace);
+    tokio::spawn(async move {
+        deadline.await;
+        tracing::warn!(
+            target: "shutdown",
+            grace_secs = grace.as_secs(),
+            "graceful shutdown exceeded grace window, forcing exit"
+        );
+        force_exit();
+    });
+    if tokio::time::timeout(grace * 4 / 5, reap).await.is_err() {
+        tracing::warn!(
+            target: "shutdown",
+            "plugin worker reap did not finish in time, continuing shutdown"
+        );
+    }
 }
 
 /// Raise the soft `RLIMIT_NOFILE` so the server can sustain many WS
@@ -924,9 +969,10 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     //      terminal) wake from their `select!` and close cleanly,
     //      letting `axum::serve` return promptly instead of blocking
     //      on the open WebSockets the browser hasn't disconnected.
-    //   2. Spawns a 5s deadline as the safety net: if any handler
-    //      somehow ignores the cancel, the process force-exits so
-    //      `Ctrl-C` and `aoe serve --stop` never hang. See #1198.
+    //   2. Arms a 5s force-exit deadline, then reaps plugin workers
+    //      within part of that window: if any handler or worker ignores
+    //      the cancel, the process still force-exits, so `Ctrl-C` and
+    //      terminal hangups never hang. See #1198.
     //
     // Note: this future is awaited by `with_graceful_shutdown`, which
     // signals axum to stop accepting new connections once the future
@@ -935,7 +981,6 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // of just the post-signal drain, which is wrong (the server would
     // exit after 5s of normal uptime). The deadline lives inside the
     // signal handler so the clock only starts after the signal fires.
-    const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
     let shutdown_state = state.clone();
     let shutdown_signal = async move {
         #[cfg(unix)]
@@ -960,28 +1005,18 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             let _ = tokio::signal::ctrl_c().await;
             tracing::info!(target: "serve.shutdown", "received ctrl-c, shutting down");
         }
-        shutdown_state.shutdown.cancel();
-        // Reap plugin workers before the force-exit deadline so no worker tree
-        // is left behind when the daemon stops.
-        if let Some(host) = shutdown_state.plugin_host.clone() {
-            host.shutdown().await;
-        }
-        tokio::spawn(async {
-            tokio::time::sleep(SHUTDOWN_GRACE).await;
-            tracing::warn!(
-                target: "shutdown",
-                grace_secs = SHUTDOWN_GRACE.as_secs(),
-                "graceful shutdown exceeded grace window, forcing exit"
-            );
-            // Force-exit skips the post-`axum::serve` cleanup block below
-            // (acp detach, tunnel SIGTERM of cloudflared, removal of
-            // serve.passphrase). The PID file is swept by `daemon_pid`'s
-            // stale-PID check on the next start, but a leftover cloudflared
-            // subprocess and residual passphrase file may survive a forced
-            // exit. The common path (handlers honor cancel) returns from
-            // `axum::serve` normally and runs the full cleanup.
-            std::process::exit(0);
-        });
+        let plugin_host = shutdown_state.plugin_host.clone();
+        run_shutdown_sequence(
+            &shutdown_state.shutdown,
+            SHUTDOWN_GRACE,
+            async move {
+                if let Some(host) = plugin_host {
+                    host.shutdown().await;
+                }
+            },
+            || std::process::exit(0),
+        )
+        .await;
     };
 
     axum::serve(
@@ -1215,5 +1250,80 @@ mod tests {
         assert!(push.store.snapshot().await.is_empty());
 
         shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn shutdown_sequence_bounds_a_plugin_reap_that_never_finishes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const GRACE: Duration = Duration::from_millis(100);
+
+        // Arming the deadline first must not skip the plugin teardown.
+        let shutdown = CancellationToken::new();
+        let reaped = Arc::new(AtomicBool::new(false));
+        let flag = reaped.clone();
+        run_shutdown_sequence(
+            &shutdown,
+            GRACE,
+            async move { flag.store(true, Ordering::SeqCst) },
+            || {},
+        )
+        .await;
+        assert!(shutdown.is_cancelled());
+        assert!(reaped.load(Ordering::SeqCst));
+
+        // A reap that never finishes is bounded, so the caller still reaches
+        // its own cleanup, and the deadline still forces the exit.
+        let shutdown = CancellationToken::new();
+        let forced = Arc::new(AtomicBool::new(false));
+        let flag = forced.clone();
+        tokio::time::timeout(
+            GRACE * 10,
+            run_shutdown_sequence(&shutdown, GRACE, std::future::pending::<()>(), move || {
+                flag.store(true, Ordering::SeqCst)
+            }),
+        )
+        .await
+        .expect("a hung reap must not block the shutdown sequence");
+
+        for _ in 0..200 {
+            if forced.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(forced.load(Ordering::SeqCst));
+    }
+
+    /// The grace window must run from the cancel, not from whenever the
+    /// watchdog task first gets polled. On this single-threaded runtime a
+    /// reap that works synchronously before yielding holds the only worker,
+    /// so a deadline built inside the task would not start until the reap
+    /// released it, stretching the window past `GRACE`.
+    #[tokio::test]
+    async fn shutdown_deadline_runs_from_the_cancel_not_the_watchdog_poll() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const GRACE: Duration = Duration::from_millis(100);
+
+        let shutdown = CancellationToken::new();
+        let forced = Arc::new(AtomicBool::new(false));
+        let flag = forced.clone();
+        run_shutdown_sequence(
+            &shutdown,
+            GRACE,
+            async { std::thread::sleep(GRACE * 2) },
+            move || flag.store(true, Ordering::SeqCst),
+        )
+        .await;
+        assert!(
+            !forced.load(Ordering::SeqCst),
+            "the reap blocked the worker"
+        );
+
+        // One short park is all the watchdog needs once its deadline has
+        // already passed, and far less than another full window.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(forced.load(Ordering::SeqCst));
     }
 }
