@@ -244,15 +244,33 @@ describe("SystemNotices rate-limit handoff", () => {
     expect(container.firstChild).toBeNull();
   });
 
-  // #3688: when auto-resume gives up, the banner says so even though the
-  // session is otherwise quiet (status open, no lag, rate-limit info may
-  // have been superseded by the terminal Stopped).
-  it("shows the auto-resume stopped note when retries are exhausted", () => {
-    const { getByText, queryByRole } = mount({ rateLimitRetriesExhausted: true });
+  // #3688: the state a real cap park reaches. `Stopped` does not clear
+  // `rate_limit` in the server fold, so the adapter snapshot from the last
+  // rejection is still there and both recovery buttons render alongside the
+  // give-up note. Mounting without the snapshot would assert a combination
+  // the daemon never produces.
+  it("shows the auto-resume stopped note with both recovery paths still offered", () => {
+    const onSwitchAgent = vi.fn();
+    const onResumeRateLimit = vi.fn();
+    const { getByText, getByRole } = mount({
+      rateLimitRetriesExhausted: true,
+      rateLimit: { status: "limited", resets_at: "2099-01-01T00:00:00Z", kind: "usage" },
+      onSwitchAgent,
+      onResumeRateLimit,
+    });
     expect(getByText(/Auto-resume stopped: the same prompt was re-sent too many times/i)).toBeDefined();
-    // The park is not an adapter rate-limit snapshot, so no recovery buttons
-    // render without the snapshot.
+    expect(getByRole("button", { name: /resume now/i })).toBeDefined();
+    expect(getByRole("button", { name: /continue in another agent/i })).toBeDefined();
+  });
+
+  // The park outlives the snapshot only after a resume clears it, and the
+  // note must survive that on its own so the banner does not vanish.
+  it("shows the note with no rate-limit snapshot, without recovery buttons", () => {
+    const { getByText, queryByRole } = mount({
+      rateLimitRetriesExhausted: true,
+      onResumeRateLimit: vi.fn(),
+    });
+    expect(getByText(/Auto-resume stopped: the same prompt was re-sent too many times/i)).toBeDefined();
     expect(queryByRole("button", { name: /resume now/i })).toBeNull();
-    expect(queryByRole("button", { name: /continue in another agent/i })).toBeNull();
   });
 });

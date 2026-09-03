@@ -1680,7 +1680,8 @@ mod tests {
         // clobbering an in-progress turn. See #1722.
         assert_eq!(
             derive_acp_status(&Event::RateLimitAutoResumed {
-                resets_at: chrono::Utc::now()
+                resets_at: chrono::Utc::now(),
+                manual: false,
             }),
             Some(StatusIntent::HealError)
         );

@@ -469,7 +469,7 @@ impl TranscriptModel {
                     format!("mode switch to \"{mode_id}\" failed: {reason}"),
                 ))]
             }
-            Event::RateLimitAutoResumed { resets_at } => {
+            Event::RateLimitAutoResumed { resets_at, .. } => {
                 let group_id = self.fresh_group();
                 vec![self.append(TranscriptRow::new(
                     format!("notice-{seq}"),
@@ -1032,6 +1032,7 @@ mod tests {
                 "rate-limit resume",
                 Event::RateLimitAutoResumed {
                     resets_at: resets_at_fixture(),
+                    manual: false,
                 },
                 expected_resume.as_str(),
             ),

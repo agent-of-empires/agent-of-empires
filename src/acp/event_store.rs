@@ -1219,31 +1219,54 @@ impl EventStore {
         }
     }
 
-    /// Count the rate-limit redeliveries in the current streak: every
-    /// `RateLimitAutoResumed` breadcrumb since the last organic turn
-    /// boundary, i.e. the last `Stopped` whose reason is not
-    /// `rate_limited`, or a worker `AgentStartupError`. Each breadcrumb
-    /// caused one re-delivery of the interrupted prompt, so this is how
-    /// often auto-resume has re-sent the same prompt without a single
+    /// Count the rate-limit redeliveries in the current streak: how often
+    /// auto-resume has re-sent the same interrupted prompt without a single
     /// turn getting through. Derived from the persisted log, so the count
     /// survives a daemon restart. See #3688.
+    ///
+    /// Three rules, each one a way the cap would otherwise misfire:
+    ///
+    /// - The streak starts at the last organic boundary: a `Stopped` whose
+    ///   reason is not `rate_limited` (a turn that ended, including the cap's
+    ///   own park) or an `AgentSwitched`. A new backend must not inherit the
+    ///   old one's spent budget, which is the reset the web reducer already
+    ///   applies on its side.
+    /// - A breadcrumb whose resume never reached the agent does not count. If
+    ///   the first lifecycle event after it is an `AgentStartupError` rather
+    ///   than the redelivered `UserPromptSent`, no prompt was burned. Such a
+    ///   failure is not a boundary either: granting a fresh five for every
+    ///   failed spawn would uncap the loop the spawn-budget gate exists to
+    ///   bound.
+    /// - Manual RESUME NOW breadcrumbs do not count. The cap bounds what the
+    ///   daemon does on its own; a user re-sending by hand is the recovery,
+    ///   not the damage.
     pub fn rate_limit_redelivery_streak(&self, session_id: &str) -> i64 {
         let conn = match self.conn.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
         conn.query_row(
-            "SELECT COUNT(*) FROM acp_events
-             WHERE session_id = ?1
-               AND discriminant = 'RateLimitAutoResumed'
-               AND seq > (
+            "SELECT COUNT(*) FROM acp_events r
+             WHERE r.session_id = ?1
+               AND r.discriminant = 'RateLimitAutoResumed'
+               AND IFNULL(
+                     json_extract(r.event_json, '$.RateLimitAutoResumed.manual'), 0) = 0
+               AND r.seq > (
                    SELECT IFNULL(MAX(seq), 0) FROM acp_events
                    WHERE session_id = ?1
-                     AND (discriminant = 'AgentStartupError'
+                     AND (discriminant = 'AgentSwitched'
                        OR (discriminant = 'Stopped'
                            AND json_extract(event_json, '$.Stopped.reason')
                                != 'rate_limited'))
-               )",
+               )
+               AND IFNULL((
+                   SELECT n.discriminant FROM acp_events n
+                   WHERE n.session_id = ?1
+                     AND n.seq > r.seq
+                     AND n.discriminant IN ('AgentStartupError', 'UserPromptSent')
+                   ORDER BY n.seq ASC
+                   LIMIT 1
+               ), '') != 'AgentStartupError'",
             params![session_id],
             |row| row.get::<_, i64>(0),
         )
@@ -4183,7 +4206,14 @@ mod tests {
         // the reconciler's resume loop stops seeing the park. See #1722.
         let resets_at = Utc::now();
         store
-            .record("s-1", 3, &Event::RateLimitAutoResumed { resets_at })
+            .record(
+                "s-1",
+                3,
+                &Event::RateLimitAutoResumed {
+                    resets_at,
+                    manual: false,
+                },
+            )
             .unwrap();
         assert!(
             matches!(
@@ -4201,6 +4231,11 @@ mod tests {
         let (_tmp, store) = open_store(1000);
         let resumes_at = || Event::RateLimitAutoResumed {
             resets_at: Utc::now(),
+            manual: false,
+        };
+        let manual_resume = || Event::RateLimitAutoResumed {
+            resets_at: Utc::now(),
+            manual: true,
         };
         let stopped = |reason: &str| Event::Stopped {
             reason: reason.into(),
@@ -4246,9 +4281,10 @@ mod tests {
         store.record("s-1", 104, &resumes_at()).unwrap();
         assert_eq!(store.rate_limit_redelivery_streak("s-1"), 1);
 
-        // A worker startup failure also breaks the streak: the resume that
-        // could not spawn a worker never re-delivered the prompt, so it
-        // must not count toward the cap.
+        // A resume whose spawn failed re-delivered nothing, so it drops out
+        // of the count. It is not a boundary either: the resume before it
+        // would otherwise be forgiven too, and a crash-looping agent would
+        // buy an unlimited budget one failed spawn at a time.
         store
             .record(
                 "s-1",
@@ -4259,8 +4295,42 @@ mod tests {
             )
             .unwrap();
         assert_eq!(store.rate_limit_redelivery_streak("s-1"), 0);
-        // A resume after that boundary starts a fresh streak.
+        // The next resume did reach the agent (its redelivery landed), so it
+        // counts, and the earlier failed one still does not.
         store.record("s-1", 111, &resumes_at()).unwrap();
+        store
+            .record("s-1", 112, &user_prompt("run the nightly task"))
+            .unwrap();
+        assert_eq!(store.rate_limit_redelivery_streak("s-1"), 1);
+
+        // RESUME NOW is the user's own recovery, not the daemon burning the
+        // prompt, so it does not spend the automatic budget.
+        store.record("s-1", 113, &rate_limit_event(0)).unwrap();
+        store.record("s-1", 114, &stopped("rate_limited")).unwrap();
+        store.record("s-1", 115, &manual_resume()).unwrap();
+        store
+            .record("s-1", 116, &user_prompt("run the nightly task"))
+            .unwrap();
+        assert_eq!(store.rate_limit_redelivery_streak("s-1"), 1);
+
+        // An agent switch hands the turn to a different backend, whose quota
+        // is its own: the new one starts on a full budget.
+        store
+            .record(
+                "s-1",
+                117,
+                &Event::AgentSwitched {
+                    from: "claude".into(),
+                    to: "codex".into(),
+                    reason: "rate_limit".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(store.rate_limit_redelivery_streak("s-1"), 0);
+        store.record("s-1", 118, &resumes_at()).unwrap();
+        store
+            .record("s-1", 119, &user_prompt("run the nightly task"))
+            .unwrap();
         assert_eq!(store.rate_limit_redelivery_streak("s-1"), 1);
 
         // No history means no streak.

@@ -1344,8 +1344,17 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
             // critical section means a manual resume either advances the seq
             // first (so this park refuses) or enqueues after this old
             // continuation was cleared.
+            //
+            // `try_lock`: `/acp/spawn` holds this across a whole sandbox
+            // ensure plus agent handshake, and this pass runs inline in the
+            // reconciler tick, so blocking would stall every other session's
+            // reconcile behind one manual resume. A contended lock is also
+            // exactly the case where this park must not fire, so treat it as
+            // a refusal; the next pass retries.
             let instance_lock = state.instance_lock(&id).await;
-            let _guard = instance_lock.lock().await;
+            let Ok(_guard) = instance_lock.try_lock() else {
+                continue;
+            };
             if state.acp_supervisor.publish_stopped_if_seq(
                 &id,
                 RATE_LIMIT_EXHAUSTED_RETRIES_REASON,
@@ -1370,7 +1379,7 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
         enqueue_rate_limit_continuation(state, &id).await;
         state
             .acp_supervisor
-            .publish_rate_limit_auto_resumed(&id, resume_at);
+            .publish_rate_limit_auto_resumed(&id, resume_at, false);
         attempted.remove(&id);
         tracing::info!(
             target: "acp.supervisor",
@@ -2051,7 +2060,8 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
 mod tests {
     use super::{
         adopt_decision, rate_limit_resume_at, rate_limit_unknown_reset_retry_at, should_auto_stop,
-        should_readopt_orphan_runner, AdoptDecision, RATE_LIMIT_MIN_PARK_SECS,
+        should_readopt_orphan_runner, AdoptDecision, RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES,
+        RATE_LIMIT_EXHAUSTED_RETRIES_REASON, RATE_LIMIT_MIN_PARK_SECS,
         RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS,
     };
     use chrono::{Duration, TimeZone, Utc};
@@ -3069,6 +3079,224 @@ mod tests {
         assert!(
             woken,
             "a dormant session with a queue must be woken so the resume pass respawns it"
+        );
+    }
+
+    // --- redelivery cap (#3688) ---
+
+    /// Seed a session parked on `Stopped { rate_limited }` whose window has
+    /// elapsed, with `redeliveries` completed resume -> redeliver -> re-park
+    /// cycles behind it, and a pending continuation to lose. Returns the
+    /// state plus the temp dirs the caller must keep alive.
+    ///
+    /// The `RateLimit` event is backdated an hour so `rate_limit_resume_at`'s
+    /// minimum-park floor has passed without the test sleeping through it.
+    async fn parked_at_streak(
+        id: &str,
+        redeliveries: usize,
+    ) -> (
+        Arc<crate::server::AppState>,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
+        use crate::acp::Event;
+        let (state, home, project) = capacity_test_state(id).await;
+        // The pass is a no-op for a profile that did not opt in, and these
+        // instances carry the default (empty) profile, so the opt-in goes in
+        // the global config the isolated HOME above now owns.
+        let app_dir = crate::session::get_app_dir().expect("isolated app dir");
+        std::fs::write(
+            app_dir.join("config.toml"),
+            "[acp]\nrate_limit_auto_resume = true\n",
+        )
+        .expect("write opt-in config");
+
+        let store = &state.acp_event_store;
+        let long_ago = (chrono::Utc::now() - chrono::Duration::hours(1)).timestamp_millis();
+        let rate_limit = || Event::RateLimit {
+            info: crate::acp::state::RateLimitInfo {
+                status: "limited".into(),
+                resets_at: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+                kind: "usage".into(),
+            },
+        };
+        let prompt = || Event::UserPromptSent {
+            text: "run the nightly task".into(),
+            attachments: Vec::new(),
+            prompt_id: None,
+        };
+        let mut seq = 0u64;
+        let mut push = |event: &Event| {
+            seq += 1;
+            store
+                .record_at(id, seq, event, long_ago)
+                .expect("seed event");
+            seq
+        };
+        push(&prompt());
+        push(&rate_limit());
+        push(&Event::Stopped {
+            reason: "rate_limited".into(),
+        });
+        for _ in 0..redeliveries {
+            push(&Event::RateLimitAutoResumed {
+                resets_at: chrono::Utc::now() - chrono::Duration::hours(1),
+                manual: false,
+            });
+            push(&prompt());
+            push(&rate_limit());
+            push(&Event::Stopped {
+                reason: "rate_limited".into(),
+            });
+        }
+        // The daemon's counter normally tracks what it published; seed it so
+        // the cap's seq CAS sees the log's newest seq as the newest
+        // allocation, as it does in a live daemon.
+        state
+            .acp_supervisor
+            .hydrate_seqs([(id.to_string(), store.highest_seq(id))]);
+        state
+            .session_service
+            .set_pending_initial_turn(id, "run the nightly task".into(), Vec::new())
+            .await;
+        (state, home, project)
+    }
+
+    async fn pending_turn(state: &Arc<crate::server::AppState>, id: &str) -> Option<String> {
+        state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|i| i.id == id)
+            .and_then(|i| i.pending_initial_turn.clone())
+    }
+
+    fn latest_stop_reason(state: &Arc<crate::server::AppState>, id: &str) -> Option<String> {
+        state
+            .acp_event_store
+            .replay_from(id, 0)
+            .into_iter()
+            .rev()
+            .find_map(|(_, e)| match e {
+                crate::acp::Event::Stopped { reason } => Some(reason),
+                _ => None,
+            })
+    }
+
+    /// Under the cap the pass resumes: it re-queues the interrupted prompt,
+    /// publishes the breadcrumb, and frees the `attempted` slot so the same
+    /// tick's spawn pass brings the worker back.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rate_limit_reap_resumes_below_the_cap() {
+        let id = "sess-3688-under";
+        let (state, _home, _project) =
+            parked_at_streak(id, RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES as usize - 1).await;
+        let mut attempted: HashSet<String> = [id.to_string()].into();
+
+        super::reap_rate_limit_resumes(&state, &mut attempted).await;
+
+        assert!(
+            !attempted.contains(id),
+            "an eligible session must leave `attempted` so the spawn pass picks it up"
+        );
+        assert_eq!(
+            latest_stop_reason(&state, id).as_deref(),
+            Some("rate_limited"),
+            "a resume must not publish the terminal park"
+        );
+        assert!(
+            pending_turn(&state, id).await.is_some(),
+            "the interrupted prompt stays queued for the respawned worker"
+        );
+    }
+
+    /// At the cap it parks instead: terminal stop published, continuation
+    /// dropped, `attempted` slot held so nothing respawns on a timer.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rate_limit_reap_parks_at_the_cap() {
+        let id = "sess-3688-cap";
+        let (state, _home, _project) =
+            parked_at_streak(id, RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES as usize).await;
+        let mut attempted: HashSet<String> = [id.to_string()].into();
+
+        super::reap_rate_limit_resumes(&state, &mut attempted).await;
+
+        assert_eq!(
+            latest_stop_reason(&state, id).as_deref(),
+            Some(RATE_LIMIT_EXHAUSTED_RETRIES_REASON),
+            "the cap publishes the terminal park"
+        );
+        assert!(
+            attempted.contains(id),
+            "the park keeps its `attempted` slot so the resume pass holds off"
+        );
+        assert!(
+            pending_turn(&state, id).await.is_none(),
+            "the continuation is dropped so no later drain replays the burned prompt"
+        );
+    }
+
+    /// The seq CAS is what keeps this park off a session something else just
+    /// published into. When it refuses, the continuation must survive: the
+    /// clear is what would otherwise strand a live worker with nothing to run.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rate_limit_reap_keeps_the_continuation_when_the_cas_refuses() {
+        let id = "sess-3688-cas";
+        let (state, _home, _project) =
+            parked_at_streak(id, RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES as usize).await;
+        // Stand in for a publish landing between the probe and the CAS: the
+        // counter has moved on from the log's newest seq.
+        let ahead = state.acp_event_store.highest_seq(id) + 1;
+        state.acp_supervisor.hydrate_seqs([(id.to_string(), ahead)]);
+        let mut attempted: HashSet<String> = [id.to_string()].into();
+
+        super::reap_rate_limit_resumes(&state, &mut attempted).await;
+
+        assert_eq!(
+            latest_stop_reason(&state, id).as_deref(),
+            Some("rate_limited"),
+            "a refused CAS must publish nothing"
+        );
+        assert!(
+            pending_turn(&state, id).await.is_some(),
+            "a refused park must not clear the continuation it did not publish over"
+        );
+    }
+
+    /// `/acp/spawn` holds `instance_lock` across its whole resume, including
+    /// the continuation enqueue. The cap must yield to it rather than block
+    /// the tick, and must not park a session a manual resume is reviving.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rate_limit_reap_yields_to_a_manual_resume_holding_the_instance_lock() {
+        let id = "sess-3688-lock";
+        let (state, _home, _project) =
+            parked_at_streak(id, RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES as usize).await;
+        let held = state.instance_lock(id).await;
+        let _guard = held.lock().await;
+        let mut attempted: HashSet<String> = [id.to_string()].into();
+
+        // Bounded well under the handshake a real `/acp/spawn` holds this for:
+        // blocking on the lock would hang the whole reconciler tick.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::reap_rate_limit_resumes(&state, &mut attempted),
+        )
+        .await
+        .expect("the cap must not block the tick on a contended instance_lock");
+
+        assert_eq!(
+            latest_stop_reason(&state, id).as_deref(),
+            Some("rate_limited"),
+            "a contended lock is a refusal, not a park"
+        );
+        assert!(
+            pending_turn(&state, id).await.is_some(),
+            "and the manual resume's continuation survives"
         );
     }
 }

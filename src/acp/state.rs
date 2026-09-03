@@ -855,6 +855,14 @@ pub enum Event {
     /// rate-limit lock and drain any queued prompt. See #1722.
     RateLimitAutoResumed {
         resets_at: DateTime<Utc>,
+        /// True when a user drove the resume from RESUME NOW rather than the
+        /// reconciler's timer. The redelivery cap counts automatic resumes
+        /// only, so a user re-sending by hand does not spend the automatic
+        /// budget (#3688). Defaulted: breadcrumbs recorded before the cap
+        /// existed carry no flag and read as automatic, which is how they
+        /// were counted then.
+        #[serde(default)]
+        manual: bool,
     },
     /// Agent-reported context-window usage. Comes from ACP
     /// `SessionUpdate::UsageUpdate` (gated on the
@@ -2475,6 +2483,7 @@ mod tests {
         assert!(s.rate_limit.is_some(), "RateLimit seeds the park snapshot");
         s.apply_event(Event::RateLimitAutoResumed {
             resets_at: Utc::now(),
+            manual: false,
         })
         .unwrap();
         assert!(

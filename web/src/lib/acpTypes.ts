@@ -466,7 +466,7 @@ export type AcpEvent =
   | "ThinkingStarted"
   | "ThinkingEnded"
   | { RateLimit: { info: RateLimitInfo } }
-  | { RateLimitAutoResumed: { resets_at: string } }
+  | { RateLimitAutoResumed: { resets_at: string; manual?: boolean } }
   | { UsageUpdated: { usage: SessionUsage } }
   | { ModeChanged: { mode: SessionMode } }
   | {
