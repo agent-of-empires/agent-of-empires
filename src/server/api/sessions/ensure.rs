@@ -244,6 +244,14 @@ pub async fn ensure_terminal(
         )
             .into_response();
     }
+    // Serialize concurrent terminal-ensure calls for the same session so two
+    // parallel requests don't both try to create the same tmux session
+    // (the second would fail with "duplicate session"). Taken before the
+    // snapshot read so a concurrent mutation cannot land between the two and
+    // hand `spawn_blocking` a stale clone.
+    let inst_lock = state.instance_lock(&id).await;
+    let _guard = inst_lock.lock().await;
+
     let instances = state.instances.read().await;
     let inst = match instances.iter().find(|i| i.id == id) {
         Some(i) => i.clone(),
@@ -257,45 +265,35 @@ pub async fn ensure_terminal(
     };
     drop(instances);
 
-    // Serialize concurrent terminal-ensure calls for the same session so two
-    // parallel requests don't both try to create the same tmux session
-    // (the second would fail with "duplicate session").
-    let inst_lock = state.instance_lock(&id).await;
-    let _guard = inst_lock.lock().await;
-
-    // Re-check after acquiring the lock; the first caller may have created it.
     // Index 0 has the in-memory `terminal_info.created` fast path; additional
     // terminals (index >= 1) are queried straight from tmux. Either way the
     // pane shell can exit (Ctrl+D, `exit`, SIGHUP from a destroyed tmux client,
     // etc.) while the session keeps existing (we set `remain-on-exit on`), so a
     // live-but-dead pane must be respawned the same way the TUI does on attach.
     {
-        let instances = state.instances.read().await;
-        if let Some(i) = instances.iter().find(|i| i.id == id) {
-            let session = i.terminal_tmux_session_indexed(index).ok();
-            let known = if index == 0 {
-                i.has_terminal()
-            } else {
-                session.as_ref().map(|s| s.exists()).unwrap_or(false)
-            };
-            if known {
-                let pane_dead = session
-                    .map(|s| s.exists() && s.is_pane_dead())
-                    .unwrap_or(false);
-                if !pane_dead {
-                    return (
-                        StatusCode::OK,
-                        Json(serde_json::json!({"status": "exists"})),
-                    )
-                        .into_response();
-                }
-                tracing::warn!(
-                    target: "terminal.ws",
-                    session = %id,
-                    index,
-                    "paired terminal pane is dead, respawning"
-                );
+        let session = inst.terminal_tmux_session_indexed(index).ok();
+        let known = if index == 0 {
+            inst.has_terminal()
+        } else {
+            session.as_ref().map(|s| s.exists()).unwrap_or(false)
+        };
+        if known {
+            let pane_dead = session
+                .map(|s| s.exists() && s.is_pane_dead())
+                .unwrap_or(false);
+            if !pane_dead {
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({"status": "exists"})),
+                )
+                    .into_response();
             }
+            tracing::warn!(
+                target: "terminal.ws",
+                session = %id,
+                index,
+                "paired terminal pane is dead, respawning"
+            );
         }
     }
 
@@ -360,6 +358,10 @@ pub async fn ensure_container_terminal(
         )
             .into_response();
     }
+    // Lock-then-read, matching `ensure_terminal`.
+    let inst_lock = state.instance_lock(&id).await;
+    let _guard = inst_lock.lock().await;
+
     let instances = state.instances.read().await;
     let inst = match instances.iter().find(|i| i.id == id) {
         Some(i) => i.clone(),
@@ -373,34 +375,28 @@ pub async fn ensure_container_terminal(
     };
     drop(instances);
 
-    let inst_lock = state.instance_lock(&id).await;
-    let _guard = inst_lock.lock().await;
-
     // Same dead-pane rescue as `ensure_terminal`: an existing-but-dead
     // pane would otherwise silently swallow every keystroke from the
     // browser. Container terminals are always tmux-queried (no cache flag).
     {
-        let instances = state.instances.read().await;
-        if let Some(i) = instances.iter().find(|i| i.id == id) {
-            let session = i.container_terminal_tmux_session_indexed(index).ok();
-            if session.as_ref().map(|s| s.exists()).unwrap_or(false) {
-                let pane_dead = session
-                    .map(|s| s.exists() && s.is_pane_dead())
-                    .unwrap_or(false);
-                if !pane_dead {
-                    return (
-                        StatusCode::OK,
-                        Json(serde_json::json!({"status": "exists"})),
-                    )
-                        .into_response();
-                }
-                tracing::warn!(
-                    target: "terminal.ws",
-                    session = %id,
-                    index,
-                    "container terminal pane is dead, respawning"
-                );
+        let session = inst.container_terminal_tmux_session_indexed(index).ok();
+        if session.as_ref().map(|s| s.exists()).unwrap_or(false) {
+            let pane_dead = session
+                .map(|s| s.exists() && s.is_pane_dead())
+                .unwrap_or(false);
+            if !pane_dead {
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({"status": "exists"})),
+                )
+                    .into_response();
             }
+            tracing::warn!(
+                target: "terminal.ws",
+                session = %id,
+                index,
+                "container terminal pane is dead, respawning"
+            );
         }
     }
 
@@ -461,6 +457,10 @@ pub async fn kill_terminal(
         )
             .into_response();
     }
+    // Lock-then-read, matching `ensure_terminal`.
+    let inst_lock = state.instance_lock(&id).await;
+    let _guard = inst_lock.lock().await;
+
     let instances = state.instances.read().await;
     let inst = match instances.iter().find(|i| i.id == id) {
         Some(i) => i.clone(),
@@ -473,9 +473,6 @@ pub async fn kill_terminal(
         }
     };
     drop(instances);
-
-    let inst_lock = state.instance_lock(&id).await;
-    let _guard = inst_lock.lock().await;
 
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         // A missing session is success (the `kill_*` helpers no-op when the
