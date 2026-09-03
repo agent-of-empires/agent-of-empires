@@ -2311,6 +2311,47 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    /// The extension read must go through the anchored walk, not a stat of the
+    /// pathname followed by a second open of it. With `agent/extensions`
+    /// swapped for a link to a directory that already holds the current
+    /// extension, the check-then-open shape stats the host copy through the
+    /// link, finds it equal, and reports success without ever looking inside
+    /// the bind; the walk refuses the linked component instead, and the write
+    /// behind it fails closed.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn install_pi_sandbox_extension_refuses_a_linked_parent() {
+        let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+
+        let root = pi_sandbox_dir().expect("a Pi sandbox dir");
+        let outside = temp_home.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(
+            outside.join("aoe-session-id.js"),
+            crate::session::instance::PI_SESSION_EXTENSION,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("agent")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("agent").join("extensions")).unwrap();
+
+        assert!(
+            install_pi_sandbox_extension().is_err(),
+            "a linked parent must fail the install, not read the host copy through it"
+        );
+        let outside_entries: Vec<_> = std::fs::read_dir(&outside)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            outside_entries.len(),
+            1,
+            "nothing may be written through the link: {outside_entries:?}"
+        );
+    }
+
     #[test]
     fn sanitize_network_defaults_to_none() {
         assert_eq!(sanitize_network(None), None);
