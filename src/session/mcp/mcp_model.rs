@@ -526,9 +526,9 @@ fn native_config_dir_for(
     profile: Option<&str>,
     home: &Path,
 ) -> Option<std::path::PathBuf> {
-    let cfg = super::profile_config::resolve_config_or_warn(&super::config::effective_profile(
-        profile.unwrap_or_default(),
-    ));
+    let cfg = crate::session::config::profile_config::resolve_config_or_warn(
+        &crate::session::config::effective_profile(profile.unwrap_or_default()),
+    );
     cfg.session
         .agent_config_dir_for(agent_key, home)
         .or_else(|| match native_config_for(agent_key) {
