@@ -36,8 +36,9 @@ const PATH_VAR = /^[A-Z][A-Z0-9_]*_(HOME|DIR|DB|PATH|CREDENTIALS)$/;
 
 /**
  * Git's whole namespace is host state: config files, work trees, object
- * stores, and the helper commands git shells out to. Most of those names
- * carry no path suffix, so the family is dropped by prefix instead.
+ * stores, and the subprograms git resolves and runs, `GIT_EXEC_PATH`
+ * included. Most of those names carry no path suffix, so the family is
+ * dropped by prefix instead.
  */
 const GIT_VAR = /^GIT_/;
 
@@ -101,7 +102,6 @@ export const INHERITED_PATH_VARS = new Set([
   "CARGO_HOME",
   "DYLD_FALLBACK_LIBRARY_PATH",
   "DYLD_LIBRARY_PATH",
-  "GIT_EXEC_PATH",
   "LD_LIBRARY_PATH",
   "RUSTUP_HOME",
   "SSL_CERT_DIR",

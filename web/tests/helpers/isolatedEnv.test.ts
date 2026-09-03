@@ -124,6 +124,7 @@ describe("isolateEnv", () => {
         XDG_DATA_HOME: `${HOST}/.local/share`,
         OPENCODE_DB: `${HOST}/.local/share/opencode/opencode.db`,
         CLAUDE_CONFIG_DIR: `${HOST}/.claude`,
+        GIT_EXEC_PATH: `${HOST}/libexec/git-core`,
         AOE_DAEMON_URL: "http://a-real-daemon.internal:8080",
         TMPDIR: `${HOST}/tmp`,
         LANG: "en_US.UTF-8",
@@ -137,6 +138,9 @@ describe("isolateEnv", () => {
     expect(env.XDG_DATA_HOME).toBe(PATHS.xdgData);
     // Not a path, but it would point the harness's own `aoe` calls at it.
     expect(env.AOE_DAEMON_URL).toBeUndefined();
+    // Not inherited as a toolchain path: git resolves the subprograms it runs
+    // from it, and finds them on its own once it is gone.
+    expect(env.GIT_EXEC_PATH).toBeUndefined();
     expect(env.LANG).toBe("en_US.UTF-8");
   });
 
