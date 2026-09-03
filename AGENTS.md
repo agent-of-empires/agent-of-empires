@@ -33,8 +33,8 @@ Stay on one feature set per worktree. Each distinct combination of features is a
 separate build hash, so cargo keeps a full extra copy of the crate in `target/`
 for every one you run: plain `cargo test` and `cargo test --features web` cost
 roughly twice the disk of either alone. Pick the narrowest set that covers your
-change rather than running several to be thorough. `--all-targets` links every
-test, bench and example separately; keep it for a pre-push check, not routine
+change rather than running several to be thorough. `--all-targets` links all
+twenty-odd test binaries separately; keep it for a pre-push check, not routine
 iteration.
 
 ## Code rules
