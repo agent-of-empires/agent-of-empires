@@ -208,6 +208,26 @@ pub(crate) enum SessionCaller {
     Plugin { plugin_id: String },
 }
 
+/// Why a caller may not open a turn on a session. Settled before any live
+/// state is read, so an unauthorized caller learns nothing about what the
+/// session is currently doing (#3685).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnAdmissionError {
+    /// No session with this id.
+    SessionNotFound,
+    /// A plugin caller targeted a session it did not create.
+    NotOwner,
+}
+
+impl From<TurnAdmissionError> for SendTurnError {
+    fn from(e: TurnAdmissionError) -> Self {
+        match e {
+            TurnAdmissionError::SessionNotFound => Self::SessionNotFound,
+            TurnAdmissionError::NotOwner => Self::NotOwner,
+        }
+    }
+}
+
 /// Typed outcome of [`SessionService::send_turn`], split by whether the
 /// failure happened before or after the prompt was published into the event
 /// stream, so callers can map each stage faithfully (the HTTP handler keeps
@@ -1389,8 +1409,8 @@ impl SessionService {
         lock.lock_owned().await
     }
 
-    /// [`Self::prompt_submission`] for a caller that has not yet proved the
-    /// session exists. `None` means "do not act", and no registry entry is
+    /// [`Self::prompt_submission`] for a caller that has not yet proved it may
+    /// act on the session. `Err` means "do not act", and no registry entry is
     /// left behind for an id that was never admitted: the registry
     /// auto-vivifies per id it is asked for and nothing else prunes it, so an
     /// authenticated client probing random ids would otherwise grow it for the
@@ -1401,45 +1421,85 @@ impl SessionService {
     /// teardown and removes the session row before dropping its lock, so both
     /// a waiter parked on that lock and one that vivified a fresh entry after
     /// `forget_prompt_lock` observe the removal and decline.
+    async fn admit_prompt_submission(
+        &self,
+        caller: &SessionCaller,
+        id: &str,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, TurnAdmissionError> {
+        self.admits_turn(caller, id).await?;
+        let guard = self.prompt_submission(id).await;
+        if let Err(e) = self.admits_turn(caller, id).await {
+            drop(guard);
+            // Only for a vanished session: forgetting a live one's entry
+            // would hand the next waiter a different mutex.
+            if matches!(e, TurnAdmissionError::SessionNotFound) {
+                self.forget_prompt_lock(id).await;
+            }
+            return Err(e);
+        }
+        Ok(guard)
+    }
+
+    /// May `caller` open a turn on `id`? Existence plus, for a plugin, the
+    /// immutable ownership gate: a plugin may act only on a session it
+    /// created. Decided before any live state is folded, so a foreign session
+    /// answers `not_owner` whatever it is currently doing (#3685).
+    async fn admits_turn(
+        &self,
+        caller: &SessionCaller,
+        id: &str,
+    ) -> Result<(), TurnAdmissionError> {
+        let instances = self.instances.read().await;
+        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+            return Err(TurnAdmissionError::SessionNotFound);
+        };
+        match caller {
+            SessionCaller::User => Ok(()),
+            SessionCaller::Plugin { plugin_id } => {
+                if inst.created_by_plugin.as_deref() == Some(plugin_id.as_str()) {
+                    Ok(())
+                } else {
+                    Err(TurnAdmissionError::NotOwner)
+                }
+            }
+        }
+    }
+
+    /// [`Self::admit_prompt_submission`] for a user surface, which only ever
+    /// fails on a session that no longer exists.
     pub(crate) async fn prompt_submission_for_session(
         &self,
         id: &str,
     ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
-        if !self.session_exists(id).await {
-            return None;
-        }
-        let guard = self.prompt_submission(id).await;
-        if !self.session_exists(id).await {
-            drop(guard);
-            self.forget_prompt_lock(id).await;
-            return None;
-        }
-        Some(guard)
+        self.admit_prompt_submission(&SessionCaller::User, id)
+            .await
+            .ok()
     }
 
     /// Claim the session's submission authority and settle the prompt's
     /// disposition under it, so every turn-starting surface decides and
     /// dispatches as one step instead of dispatching unconditionally after
-    /// the wait (#3649). `None` for a session that no longer exists.
+    /// the wait (#3649). Admission is decided first, so the disposition is
+    /// only ever computed for a caller entitled to see it.
     pub(crate) async fn begin_prompt_submission(
         &self,
+        caller: &SessionCaller,
         id: &str,
         idle_dormant: bool,
-    ) -> Option<(
-        tokio::sync::OwnedMutexGuard<()>,
-        crate::acp::dispatch::PromptDispatch,
-    )> {
-        let guard = self.prompt_submission_for_session(id).await?;
+    ) -> Result<
+        (
+            tokio::sync::OwnedMutexGuard<()>,
+            crate::acp::dispatch::PromptDispatch,
+        ),
+        TurnAdmissionError,
+    > {
+        let guard = self.admit_prompt_submission(caller, id).await?;
         let liveness = crate::acp::dispatch::WorkerLiveness {
             running: self.acp_supervisor.is_running(id).await,
             idle_dormant,
         };
         let dispatch = crate::acp::dispatch::decide(&self.fold_control_state(id).await, liveness);
-        Some((guard, dispatch))
-    }
-
-    async fn session_exists(&self, id: &str) -> bool {
-        self.instances.read().await.iter().any(|i| i.id == id)
+        Ok((guard, dispatch))
     }
 
     /// Drop a deleted session's submission lock, mirroring the `instance_locks`

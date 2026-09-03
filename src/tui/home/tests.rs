@@ -15898,6 +15898,58 @@ mod preview_drag_select {
 
     #[test]
     #[serial]
+    fn drag_start_below_painted_content_is_noop() {
+        // Pane rows past the last painted line show no text, and
+        // `screen_to_content` would clamp them onto the last line, so a
+        // press there must not anchor a selection.
+        let mut env = create_test_env_empty();
+        let pane = Rect::new(40, 0, 60, 20);
+        // (first_line, total_lines, row, starts a selection)
+        let cases = [
+            (0, 3, 2, true),
+            (0, 3, 3, false),
+            (0, 3, 10, false),
+            // Scrolled into history: the window is full, so every pane
+            // row is painted and the gate rejects nothing.
+            (85, 105, 0, true),
+            (85, 105, 19, true),
+            // A partly-painted window is geometry `compute_scroll` and
+            // `TranscriptGeometry` both clamp away; the gate stays right
+            // without leaning on that.
+            (100, 105, 4, true),
+            (100, 105, 5, false),
+        ];
+        for (first_line, total_lines, row, accepted) in cases {
+            env.view.preview_selection = None;
+            env.view.drag_state = None;
+            stage_pane(&mut env, pane, first_line, total_lines);
+            let label = format!("first_line={first_line} total={total_lines} row={row}");
+            assert_eq!(env.view.handle_drag_start(50, row), accepted, "{label}");
+            assert_eq!(env.view.preview_selection.is_some(), accepted, "{label}");
+            assert_eq!(
+                matches!(env.view.drag_state, Some(DragKind::PreviewSelect)),
+                accepted,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn drag_move_below_painted_content_clamps_to_last_line() {
+        // Only the start is gated: a drag already in flight that leaves
+        // the painted rows keeps extending to the last content line.
+        let mut env = create_test_env_empty();
+        stage_pane(&mut env, Rect::new(40, 0, 60, 20), 0, 3);
+        assert!(env.view.handle_drag_start(40, 0));
+        assert!(env.view.handle_drag_move(45, 15));
+        let sel = env.view.preview_selection.expect("selection installed");
+        assert_eq!(to_abs(3, sel.anchor), (0, 0));
+        assert_eq!(to_abs(3, sel.extent), (5, 2));
+    }
+
+    #[test]
+    #[serial]
     fn drag_start_inside_live_mode_installs_selection() {
         let mut env = create_test_env_empty();
         stage_pane(&mut env, Rect::new(40, 0, 60, 20), 0, 100);

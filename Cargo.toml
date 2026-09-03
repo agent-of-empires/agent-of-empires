@@ -227,6 +227,10 @@ serve = ["web"]
 
 [dev-dependencies]
 serial_test = "4.0"
+# Test-only tokio clock control (`start_paused`), so the token-rotation
+# loop's grace deadline can be asserted without sleeping through it.
+# `cargo build` and released binaries never enable `test-util`.
+tokio = { version = "1.52", features = ["test-util"] }
 # Test-only tracing capture (#2756, I4): asserts the equal-timestamp guard's
 # drop branch logged. Its target `session.store` is rejected by the default
 # `agent_of_empires=trace` env filter, so `no-env-filter` is required; the

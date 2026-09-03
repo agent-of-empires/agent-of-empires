@@ -716,8 +716,9 @@ impl HomeView {
         }
         // Seed the selection in content coords so it survives a scroll
         // and can span more than one page. `contains` also requires the
-        // pane to hold real scrollback, so a drag over an empty / not-yet
-        // -captured pane is a no-op rather than a phantom selection.
+        // cell to sit on a painted content row, so a drag over an empty
+        // pane or the blank area below short content is a no-op rather
+        // than a phantom selection.
         let view = self.preview_text_view;
         if view.contains(col, row) {
             let cell = view.screen_to_content(col, row);

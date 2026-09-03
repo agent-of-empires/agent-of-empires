@@ -61,11 +61,12 @@ pub(super) fn strip_markdown_emphasis(s: &str) -> String {
     // Replace **bold**, __bold__, *italic*, _italic_ markers with their
     // inner text. Keep it permissive; the source is Claude's planning
     // markdown, which is usually well-formed but occasionally drops a
-    // closing marker.
+    // closing marker. Underscore markers are anchored on word boundaries
+    // so `snake_case` identifiers survive intact.
     use std::sync::OnceLock;
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
-        regex::Regex::new(r"\*\*(.+?)\*\*|__(.+?)__|\*([^*]+?)\*|_([^_]+?)_")
+        regex::Regex::new(r"\*\*(.+?)\*\*|\b__(.+?)__\b|\*([^*]+?)\*|\b_([^_]+?)_\b")
             .expect("static emphasis-strip regex must compile")
     });
     re.replace_all(s.trim(), |caps: &regex::Captures<'_>| {
@@ -166,5 +167,19 @@ mod tests {
             "mix of bold and italic"
         );
         assert_eq!(strip_markdown_emphasis("plain"), "plain");
+    }
+
+    #[test]
+    fn strip_markdown_emphasis_keeps_intraword_underscores() {
+        for (input, want) in [
+            ("rename _foo_ now", "rename foo now"),
+            ("foo_bar_baz", "foo_bar_baz"),
+            ("rename foo_bar_baz", "rename foo_bar_baz"),
+            ("call do_thing() then _stop_", "call do_thing() then stop"),
+            // `\b` is zero-width, so adjacent emphasis still unwraps.
+            ("_a_ _b_", "a b"),
+        ] {
+            assert_eq!(strip_markdown_emphasis(input), want, "input: {input}");
+        }
     }
 }

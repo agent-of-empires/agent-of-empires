@@ -894,97 +894,18 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     login_manager.spawn_cleanup_task(state.shutdown.clone());
 
     if remote {
-        // Inline the rotation loop here rather than calling
-        // token_manager.spawn_rotation_task() so we can also invalidate
-        // push subscriptions whose owner hash is no longer valid after
-        // rotation. Behavior otherwise matches the original: wait one
-        // lifetime, rotate, wait 300s grace, clear previous.
-        let rot_state = state.clone();
-        let rot_shutdown = state.shutdown.clone();
         // The tunnel URL is stable across the daemon's lifetime (Tailscale
         // and named CF tunnels are stable; quick CF rotates only on
         // restart, which is outside this task's scope). Capture once so
         // the rotation task can rebuild `serve.url` with the new token.
         let rot_base_url: Option<String> = tunnel_handle.as_ref().map(|h| h.url.clone());
-        tokio::spawn(async move {
-            loop {
-                let lifetime = rot_state.token_manager.lifetime_secs().await;
-                tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(lifetime)) => {}
-                    _ = rot_shutdown.cancelled() => break,
-                }
-
-                // Capture the hashes of the current and (about-to-be)
-                // previous tokens BEFORE rotating, so we know which
-                // owner-hashes are still valid in the store.
-                let pre_rotate_current = rot_state.token_manager.current_token().await;
-                rot_state.token_manager.rotate().await;
-                let post_rotate_current = rot_state.token_manager.current_token().await;
-
-                // Refresh `serve.url` so the TUI display and the QR-code
-                // URL stay in sync with the rotated token. Without this
-                // the TUI keeps showing `?token=<old>`, which is invalid
-                // 5 minutes after rotation (end of grace period).
-                if let (Some(base_url), Some(token)) =
-                    (rot_base_url.as_ref(), post_rotate_current.as_ref())
-                {
-                    if let Ok(app_dir) = crate::session::get_app_dir() {
-                        let contents = remote_serve_url_contents(base_url, local_port, Some(token));
-                        write_secret_file(&app_dir.join("serve.url"), &contents).await;
-                    }
-                }
-
-                if let Some(push) = rot_state.push.as_ref() {
-                    let mut valid_hashes: Vec<[u8; 32]> = Vec::new();
-                    if let Some(t) = &post_rotate_current {
-                        valid_hashes.push(push::sha256_token(t));
-                    }
-                    if let Some(t) = &pre_rotate_current {
-                        // The old token remains in the grace period (5m)
-                        // so devices that haven't yet picked up the new
-                        // token should keep receiving pushes.
-                        valid_hashes.push(push::sha256_token(t));
-                    }
-                    // In no-auth mode the token is None and we use a
-                    // zero hash; preserve that so zero-hash subs survive.
-                    if valid_hashes.is_empty() {
-                        valid_hashes.push([0u8; 32]);
-                    }
-                    match push.store.retain_owners(&valid_hashes).await {
-                        Ok(0) => {}
-                        Ok(n) => tracing::info!(target: "http.middleware",
-                            removed = n,
-                            "push: dropped subscriptions whose owner-hash is no longer valid after rotation"
-                        ),
-                        Err(e) => {
-                            tracing::warn!(target: "http.middleware", error = %e, "push: retain_owners failed")
-                        }
-                    }
-                }
-
-                // After grace period, the previous token becomes invalid.
-                // Clear it AND drop any subscriptions that were bound
-                // only to the old hash (retain_owners with only the new).
-                tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {}
-                    _ = rot_shutdown.cancelled() => break,
-                }
-                // Clear previous token inside TokenManager. Reuse its
-                // internal state access via a tiny helper on the manager.
-                rot_state.token_manager.clear_previous().await;
-
-                if let Some(push) = rot_state.push.as_ref() {
-                    let mut valid_hashes: Vec<[u8; 32]> = Vec::new();
-                    if let Some(t) = rot_state.token_manager.current_token().await {
-                        valid_hashes.push(push::sha256_token(&t));
-                    }
-                    if valid_hashes.is_empty() {
-                        valid_hashes.push([0u8; 32]);
-                    }
-                    let _ = push.store.retain_owners(&valid_hashes).await;
-                }
-            }
-        });
+        tokio::spawn(remote_rotation_loop(
+            state.token_manager.clone(),
+            state.push.clone(),
+            state.shutdown.clone(),
+            rot_base_url,
+            local_port,
+        ));
     } else if test_token_lifetime_override().is_some() && auth_token.is_some() {
         // Debug-build test path: live Playwright specs set
         // AOE_TEST_TOKEN_LIFETIME_SECS (and optionally AOE_TEST_TOKEN_GRACE_SECS)
@@ -1112,6 +1033,94 @@ pub(super) fn maybe_open_browser(url: &str) {
     }
 }
 
+/// The `--remote` token rotation loop: wait one lifetime, rotate, then wait out
+/// the grace window before clearing the previous token and dropping the push
+/// subscriptions bound only to its hash.
+///
+/// Runs here rather than in `TokenManager::spawn_rotation_task` so rotation can
+/// also refresh `serve.url` and prune the push store. Both deadlines come from
+/// the manager, so the previous token's state and its subscriptions cannot
+/// outlive the window `validate` accepts it in.
+async fn remote_rotation_loop(
+    token_manager: Arc<TokenManager>,
+    push: Option<Arc<PushState>>,
+    shutdown: CancellationToken,
+    base_url: Option<String>,
+    local_port: u16,
+) {
+    loop {
+        let lifetime = token_manager.lifetime_secs().await;
+        let grace = token_manager.grace().await;
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(lifetime)) => {}
+            _ = shutdown.cancelled() => break,
+        }
+
+        // Capture the hashes of the current and (about-to-be) previous tokens
+        // BEFORE rotating, so we know which owner-hashes are still valid in
+        // the store.
+        let pre_rotate_current = token_manager.current_token().await;
+        token_manager.rotate().await;
+        let post_rotate_current = token_manager.current_token().await;
+
+        // Refresh `serve.url` so the TUI display and the QR-code URL stay in
+        // sync with the rotated token. Without this the TUI keeps showing
+        // `?token=<old>`, which stops working once the grace window closes.
+        if let (Some(base_url), Some(token)) = (base_url.as_ref(), post_rotate_current.as_ref()) {
+            if let Ok(app_dir) = crate::session::get_app_dir() {
+                let contents = remote_serve_url_contents(base_url, local_port, Some(token));
+                write_secret_file(&app_dir.join("serve.url"), &contents).await;
+            }
+        }
+
+        if let Some(push) = push.as_ref() {
+            let mut valid_hashes: Vec<[u8; 32]> = Vec::new();
+            if let Some(t) = &post_rotate_current {
+                valid_hashes.push(push::sha256_token(t));
+            }
+            if let Some(t) = &pre_rotate_current {
+                // The old token is still inside the grace window, so devices
+                // that have not picked up the new one keep receiving pushes.
+                valid_hashes.push(push::sha256_token(t));
+            }
+            // In no-auth mode the token is None and we use a zero hash;
+            // preserve that so zero-hash subs survive.
+            if valid_hashes.is_empty() {
+                valid_hashes.push([0u8; 32]);
+            }
+            match push.store.retain_owners(&valid_hashes).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(target: "http.middleware",
+                    removed = n,
+                    "push: dropped subscriptions whose owner-hash is no longer valid after rotation"
+                ),
+                Err(e) => {
+                    tracing::warn!(target: "http.middleware", error = %e, "push: retain_owners failed")
+                }
+            }
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(grace) => {}
+            _ = shutdown.cancelled() => break,
+        }
+        token_manager.clear_previous().await;
+
+        if let Some(push) = push.as_ref() {
+            let mut valid_hashes: Vec<[u8; 32]> = Vec::new();
+            if let Some(t) = token_manager.current_token().await {
+                valid_hashes.push(push::sha256_token(&t));
+            }
+            if valid_hashes.is_empty() {
+                valid_hashes.push([0u8; 32]);
+            }
+            if let Err(e) = push.store.retain_owners(&valid_hashes).await {
+                tracing::warn!(target: "http.middleware", error = %e, "push: retain_owners failed");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1150,5 +1159,61 @@ mod tests {
         );
         // Neither configured is the security-relevant fully-open mode.
         assert_eq!(resolve_auth_mode(&no_token, &no_passphrase).await, "none");
+    }
+
+    /// The post-rotation cleanup must run on the configured grace period, not
+    /// a hardcoded default, so a token stops being accepted and stops owning
+    /// push subscriptions at the same moment.
+    #[tokio::test(start_paused = true)]
+    async fn rotation_cleanup_honors_the_configured_grace() {
+        let lifetime = Duration::from_secs(60);
+        let grace = Duration::from_secs(7);
+        let manager = Arc::new(TokenManager::with_grace(
+            Some("old_token".to_string()),
+            lifetime,
+            grace,
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let push = Arc::new(PushState::init(dir.path()).unwrap());
+        push.store
+            .upsert(push::Subscription {
+                endpoint: "https://push.example.test/old".to_string(),
+                p256dh: "pk".into(),
+                auth: "auth".into(),
+                owner_token_hash: push::sha256_token("old_token"),
+                user_agent: "UA".into(),
+                created_at: chrono::Utc::now(),
+                generation: 0,
+                origin: "https://aoe.example.test".into(),
+            })
+            .await
+            .unwrap();
+
+        let shutdown = CancellationToken::new();
+        tokio::spawn(remote_rotation_loop(
+            manager.clone(),
+            Some(push.clone()),
+            shutdown.clone(),
+            None,
+            8080,
+        ));
+
+        // Mid-grace: the rotated-out token is still accepted, and its
+        // subscription still belongs to a valid owner.
+        tokio::time::sleep(lifetime + grace / 2).await;
+        assert!(manager.validate("old_token").await.0);
+        assert!(manager.holds_previous().await);
+        assert_eq!(push.store.snapshot().await.len(), 1);
+
+        // Past the configured grace: validation and cleanup agree. With the
+        // hardcoded 300s sleep the token was rejected here while its state and
+        // subscription lingered.
+        tokio::time::sleep(grace).await;
+        assert!(!manager.validate("old_token").await.0);
+        assert!(!manager.holds_previous().await);
+        assert!(push.store.snapshot().await.is_empty());
+
+        shutdown.cancel();
     }
 }
