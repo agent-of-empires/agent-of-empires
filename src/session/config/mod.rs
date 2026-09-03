@@ -1150,8 +1150,9 @@ pub struct SessionConfig {
     /// The value is a host path in both contexts: host sessions use the
     /// directory itself, sandboxed sessions its `sandbox` subdirectory, which
     /// is the layout AoE already uses for the built-in agents. Consulted for
-    /// folder-trust records only; status hooks keep resolving their config dir
-    /// from the agent's own env var.
+    /// folder-trust records and for native MCP discovery, so the servers AoE
+    /// reconciles are the ones the agent actually loads; status hooks keep
+    /// resolving their config dir from the agent's own env var.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[setting(
         label = "Agent Config Dir",
