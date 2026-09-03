@@ -35,7 +35,7 @@ import { AcpFileRefContext } from "./AcpFileRefContext";
 import type { FileRef, FileRefSession } from "../../lib/fileRef";
 import { anchorIsStale, autoLoadDecision, isPinnedToBottom, scrollRestoreDelta } from "../../lib/historyScroll";
 import { lastClearIndex } from "../../lib/acpHistoryWindow";
-import { loadScrollState, saveScrollState } from "../../lib/acpScrollState";
+import { loadScrollState, restoredScrollTop, saveScrollState } from "../../lib/acpScrollState";
 import { repinOnResize } from "../../lib/repinOnResize";
 import { ToolDensityToggle, ToolDisplayModeProvider, useToolDensityPref } from "./ToolDisplayMode";
 import { AcpRuntime, SUBAGENT_TASK_NAME, TODO_GROUP_NAME, TOOL_GROUP_NAME, type AcpContext } from "./AcpRuntime";
@@ -582,11 +582,8 @@ function AcpChrome({
       if (stick) lastAtBottomAtRef.current = performance.now();
       setAtBottom(stick);
       const applyStart = () => {
-        if (stick) {
-          if (wasAtBottomRef.current) vp.scrollTop = vp.scrollHeight;
-        } else if (saved) {
-          vp.scrollTop = Math.max(0, Math.min(saved.top, vp.scrollHeight - vp.clientHeight));
-        }
+        const top = restoredScrollTop(saved, wasAtBottomRef.current, vp.scrollHeight, vp.clientHeight);
+        if (top != null) vp.scrollTop = top;
       };
       // Pin the rendered transcript before paint. Later passes catch markdown,
       // tool cards, and images that lay out afterward, but applyStart rechecks
