@@ -79,8 +79,13 @@ async fn run_shutdown_sequence<R, F>(
     F: FnOnce() + Send + 'static,
 {
     shutdown.cancel();
+    // Build the timer here, not inside the task: `sleep` fixes its deadline
+    // from the clock at construction, so constructing it in the task would
+    // restart the window at the task's first poll, which the reap's own
+    // synchronous work can delay.
+    let deadline = tokio::time::sleep(grace);
     tokio::spawn(async move {
-        tokio::time::sleep(grace).await;
+        deadline.await;
         tracing::warn!(
             target: "shutdown",
             grace_secs = grace.as_secs(),
@@ -1287,6 +1292,38 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        assert!(forced.load(Ordering::SeqCst));
+    }
+
+    /// The grace window must run from the cancel, not from whenever the
+    /// watchdog task first gets polled. On this single-threaded runtime a
+    /// reap that works synchronously before yielding holds the only worker,
+    /// so a deadline built inside the task would not start until the reap
+    /// released it, stretching the window past `GRACE`.
+    #[tokio::test]
+    async fn shutdown_deadline_runs_from_the_cancel_not_the_watchdog_poll() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const GRACE: Duration = Duration::from_millis(100);
+
+        let shutdown = CancellationToken::new();
+        let forced = Arc::new(AtomicBool::new(false));
+        let flag = forced.clone();
+        run_shutdown_sequence(
+            &shutdown,
+            GRACE,
+            async { std::thread::sleep(GRACE * 2) },
+            move || flag.store(true, Ordering::SeqCst),
+        )
+        .await;
+        assert!(
+            !forced.load(Ordering::SeqCst),
+            "the reap blocked the worker"
+        );
+
+        // One short park is all the watchdog needs once its deadline has
+        // already passed, and far less than another full window.
+        tokio::time::sleep(Duration::from_millis(1)).await;
         assert!(forced.load(Ordering::SeqCst));
     }
 }
