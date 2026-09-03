@@ -293,9 +293,13 @@ pub async fn reconcile_acp_workers(
     // the API handler shuts it down, defeating the archive semantics.
     // Expired snoozes naturally rejoin via `is_snoozed()` returning
     // false past the deadline. See #1581.
-    let raw_targets: Vec<RawTargetTuple> = {
+    //
+    // Sessions holding undelivered prompts come out of the same acquisition:
+    // a queued prompt is a user turn waiting on a worker, so it releases the
+    // redelivery-cap park below (#3688).
+    let (raw_targets, with_queued_prompts): (Vec<RawTargetTuple>, HashSet<String>) = {
         let instances = state.instances.read().await;
-        instances
+        let targets = instances
             .iter()
             .filter(|i| {
                 i.is_structured()
@@ -317,20 +321,14 @@ pub async fn reconcile_acp_workers(
                     i.command.clone(),
                 )
             })
-            .collect()
-    };
-    // Sessions holding undelivered prompts, snapshotted under the same lock.
-    // A queued prompt is a user turn waiting on a worker, so it releases the
-    // redelivery-cap park below just as a directly-POSTed one does (#3688).
-    let with_queued_prompts: HashSet<String> = {
-        let instances = state.instances.read().await;
-        instances
+            .collect();
+        let queued = instances
             .iter()
             .filter(|i| !i.queued_prompts.is_empty())
             .map(|i| i.id.clone())
-            .collect()
+            .collect();
+        (targets, queued)
     };
-
     let live: HashSet<&String> = raw_targets.iter().map(|t| &t.0).collect();
     attempted.retain(|id| live.contains(id));
     // Sweep budget state for sessions that no longer exist so the maps
@@ -447,13 +445,10 @@ pub async fn reconcile_acp_workers(
             // #3688: the auto-resume pass parked this session after its
             // redelivery cap. Same hold as the adapter park above, minus the
             // resume schedule: only a manual retry or a fresh prompt un-parks.
-            //
-            // A prompt already on the server queue is one of those fresh
-            // prompts, just one that arrived while the session was still on
-            // the adapter park. Nothing else would ever deliver it: the queue
-            // drain leaves a non-dormant workerless session to this pass, and
-            // this pass is what holds it. So respawn under the ordinary
-            // budget and let the next tick's drain send it.
+            // Both halves of the queued-prompt release are needed and neither
+            // works alone: `reap_rate_limit_resumes` frees the `attempted`
+            // slot (this loop never sees an id that holds one), and this test
+            // stops the same tick re-parking the session before it spawns.
             if reason == RATE_LIMIT_EXHAUSTED_RETRIES_REASON && !with_queued_prompts.contains(&id) {
                 attempted.insert(id);
                 continue;
@@ -1140,8 +1135,8 @@ const RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS: i64 = 3600;
 /// rate-limit streak before the reconciler gives up and parks the session on
 /// a terminal `Stopped{rate_limit_exhausted_retries}` (#3688). Matches the
 /// #1945 respawn budget so both bounded-retry mechanisms stop at the same
-/// attempt count. Every `RateLimitAutoResumed` breadcrumb is one re-delivery;
-/// any organic turn end (a `Stopped` with another reason) resets the count.
+/// attempt count. `EventStore::rate_limit_redelivery_streak` defines what
+/// counts toward it and what resets it.
 const RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES: i64 = 5;
 
 /// Terminal park reason the reconciler publishes when a rate-limit streak
@@ -1208,7 +1203,7 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
     // `attempted`, no live worker). Snapshot (id, profile) under the read
     // lock so we don't hold it across awaits. Archived/snoozed/dormant
     // sessions are excluded for the same reasons as the resume snapshot.
-    let candidates: Vec<(String, String)> = {
+    let candidates: Vec<(String, String, bool)> = {
         let instances = state.instances.read().await;
         instances
             .iter()
@@ -1220,7 +1215,13 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
                     && !i.is_idle_dormant()
                     && attempted.contains(&i.id)
             })
-            .map(|i| (i.id.clone(), i.source_profile.clone()))
+            .map(|i| {
+                (
+                    i.id.clone(),
+                    i.source_profile.clone(),
+                    !i.queued_prompts.is_empty(),
+                )
+            })
             .collect()
     };
     if candidates.is_empty() {
@@ -1228,10 +1229,10 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
     }
     // Only sessions without a live worker are parked; a running worker in
     // `attempted` is the steady-state perf entry, not a park.
-    let mut parked: Vec<(String, String)> = Vec::new();
-    for (id, profile) in candidates {
+    let mut parked: Vec<(String, String, bool)> = Vec::new();
+    for (id, profile, has_queue) in candidates {
         if !state.acp_supervisor.is_running(&id).await {
-            parked.push((id, profile));
+            parked.push((id, profile, has_queue));
         }
     }
     if parked.is_empty() {
@@ -1245,7 +1246,7 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
         let mut seen = HashSet::new();
         parked
             .iter()
-            .map(|(_, p)| p.clone())
+            .map(|(_, p, _)| p.clone())
             .filter(|p| seen.insert(p.clone()))
             .collect()
     };
@@ -1264,7 +1265,7 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
         .unwrap_or_default();
 
     let now = chrono::Utc::now();
-    for (id, profile) in parked {
+    for (id, profile, has_queued_prompts) in parked {
         let enabled = cfg_by_profile.get(&profile).copied().unwrap_or(false);
         if !enabled {
             continue;
@@ -1274,27 +1275,49 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
         // read the reset time, both off-thread.
         let store = Arc::clone(&state.acp_event_store);
         let id_probe = id.clone();
-        let (is_rate_limit_parked, rate_limit) = match tokio::task::spawn_blocking(move || {
-            let parked = matches!(
-                store.latest_status_event(&id_probe),
-                Some(crate::acp::Event::Stopped { reason }) if reason == "rate_limited"
-            );
-            (parked, store.latest_rate_limit_event(&id_probe))
-        })
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(
+        let (is_rate_limit_parked, is_cap_parked, rate_limit) =
+            match tokio::task::spawn_blocking(move || {
+                let latest = store.latest_status_event(&id_probe);
+                let reason = match &latest {
+                    Some(crate::acp::Event::Stopped { reason }) => Some(reason.as_str()),
+                    _ => None,
+                };
+                (
+                    reason == Some("rate_limited"),
+                    reason == Some(RATE_LIMIT_EXHAUSTED_RETRIES_REASON),
+                    store.latest_rate_limit_event(&id_probe),
+                )
+            })
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "acp.supervisor",
+                        session = %id,
+                        error = %e,
+                        "rate-limit auto-resume probe failed"
+                    );
+                    continue;
+                }
+            };
+        if !is_rate_limit_parked {
+            // #3688: a session already parked on the cap keeps its `attempted`
+            // slot, and that slot is what holds the main resume loop off it.
+            // A prompt queued before the cap fired has no other route to a
+            // worker: the queue drain hands a workerless non-dormant session
+            // straight back to that loop. So release the slot and let this
+            // tick's resume pass respawn it under the ordinary budget; the
+            // next drain delivers. A prompt POSTed after the park never gets
+            // here, because `dispatch::decide` sends it instead of queueing.
+            if is_cap_parked && has_queued_prompts {
+                tracing::info!(
                     target: "acp.supervisor",
                     session = %id,
-                    error = %e,
-                    "rate-limit auto-resume probe failed"
+                    "rate-limit auto-resume: releasing the redelivery-cap park for a queued prompt"
                 );
-                continue;
+                attempted.remove(&id);
             }
-        };
-        if !is_rate_limit_parked {
             continue;
         }
         let Some((info, recorded_at_ms)) = rate_limit else {
@@ -3204,23 +3227,32 @@ mod tests {
 
     /// #3688: a prompt POSTed while the session was still on the adapter park
     /// lands on the server queue, because the cap has not fired yet and there
-    /// is no worker. When the cap then fires, nothing else in the daemon will
-    /// ever deliver it: the queue drain leaves a non-dormant workerless
-    /// session to the resume pass, and the resume pass is what holds the park.
-    /// So the park must yield to queued work. The bogus agent name makes the
-    /// respawn fail fast, and its `AgentStartupError` is the proof one was
-    /// attempted at all.
+    /// is no worker. When the cap then fires, nothing else in the daemon
+    /// delivers it: the queue drain hands a workerless non-dormant session
+    /// back to the resume pass, and the park holds its `attempted` slot to
+    /// keep that pass off it. So the park must release the slot for queued
+    /// work.
+    ///
+    /// `attempted` is seeded, which is the whole point: the cap can only fire
+    /// for a session already in it, and the resume loop skips every id it
+    /// holds. Starting from an empty set tests the state after a daemon
+    /// restart, not the one a live daemon is in when the cap fires.
     #[tokio::test]
     #[serial_test::serial]
-    async fn cap_park_yields_to_a_prompt_already_on_the_queue() {
-        let cases = [(true, true), (false, false)];
-        for (has_queue, expect_respawn) in cases {
+    async fn cap_park_releases_attempted_for_a_prompt_already_on_the_queue() {
+        for (has_queue, expect_respawn) in [(true, true), (false, false)] {
             let id = if has_queue {
                 "sess-3688-queued"
             } else {
                 "sess-3688-unqueued"
             };
             let (state, _home, _project) = capacity_test_state(id).await;
+            let app_dir = crate::session::get_app_dir().expect("isolated app dir");
+            std::fs::write(
+                app_dir.join("config.toml"),
+                "[acp]\nrate_limit_auto_resume = true\n",
+            )
+            .expect("write opt-in config");
             assert!(state.acp_supervisor.publish_stopped_if_seq(
                 id,
                 RATE_LIMIT_EXHAUSTED_RETRIES_REASON,
@@ -3240,7 +3272,17 @@ mod tests {
                     });
             }
 
-            let mut attempted: HashSet<String> = HashSet::new();
+            // The state a live daemon is in: the cap parked this session and
+            // kept its slot.
+            let mut attempted: HashSet<String> = [id.to_string()].into();
+            super::reap_rate_limit_resumes(&state, &mut attempted).await;
+            assert_eq!(
+                !attempted.contains(id),
+                expect_respawn,
+                "cap park with queued prompts = {has_queue}: the slot is what \
+                 holds the resume pass off, so releasing it is the whole fix"
+            );
+
             let mut respawn_history: HashMap<String, Vec<Instant>> = HashMap::new();
             let mut parked: HashSet<String> = HashSet::new();
             let mut capacity_deferred: HashSet<String> = HashSet::new();
@@ -3252,7 +3294,6 @@ mod tests {
                 &mut capacity_deferred,
             )
             .await;
-
             let respawned = state
                 .acp_event_store
                 .replay_from(id, 0)
@@ -3260,8 +3301,9 @@ mod tests {
                 .any(|(_, e)| matches!(e, crate::acp::Event::AgentStartupError { .. }));
             assert_eq!(
                 respawned, expect_respawn,
-                "cap park with queued prompts = {has_queue}: a queued prompt is a \
-                 user turn waiting on a worker, and an empty queue must stay parked"
+                "cap park with queued prompts = {has_queue}: a released slot \
+                 must actually reach the spawn pass, and an empty queue must \
+                 stay parked"
             );
         }
     }

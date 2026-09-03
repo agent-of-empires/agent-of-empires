@@ -2159,12 +2159,14 @@
         "src/hooks/useRespawnSession.test.tsx",
         "src/components/acp/SystemNotices.test.tsx",
         "src/components/acp/RateLimitRecoverySection.test.tsx",
-        "src/components/acp/SwitchAgentModal.test.tsx"
+        "src/components/acp/SwitchAgentModal.test.tsx",
+        "src/hooks/useAcpSession.rateLimitPark.test.ts"
       ],
       "components": [
         "src/server/api/acp.rs",
         "web/src/components/acp/StructuredView.tsx",
         "web/src/components/acp/SwitchAgentModal.tsx",
+        "web/src/hooks/useAcpSession.ts",
         "web/src/hooks/useRespawnSession.ts",
         "web/src/lib/acpTypes.ts"
       ]
