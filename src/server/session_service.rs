@@ -194,6 +194,10 @@ pub struct SessionService {
     /// Per-session prompt-submission locks. See
     /// [`SessionService::prompt_submission`].
     prompt_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Test-only tap on [`SessionService::prompt_submission`], fired before it
+    /// reaches `prompt_locks`. See [`SessionService::watch_submission_claims`].
+    #[cfg(test)]
+    submission_claims: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 /// Who is asking the session service to act. Constructed only by the
@@ -282,6 +286,8 @@ impl SessionService {
             pending_drains: std::sync::Mutex::new(std::collections::HashSet::new()),
             persist_locks: RwLock::new(HashMap::new()),
             prompt_locks: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            submission_claims: std::sync::OnceLock::new(),
         }
     }
 
@@ -1382,6 +1388,10 @@ impl SessionService {
     /// `AlreadyRunning` for a worker that is already there, so it costs a
     /// lookup rather than a wrong disposition.
     pub(crate) async fn prompt_submission(&self, id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        #[cfg(test)]
+        if let Some(tap) = self.submission_claims.get() {
+            let _ = tap.send(id.to_string());
+        }
         let lock = {
             let guard = self.prompt_locks.read().await;
             guard.get(id).cloned()
@@ -1466,6 +1476,23 @@ impl SessionService {
     #[cfg(test)]
     pub(crate) async fn prompt_locks_len(&self) -> usize {
         self.prompt_locks.read().await.len()
+    }
+
+    /// Report every [`Self::prompt_submission`] claim at the one moment a
+    /// deletion-race test can use: the claimer has cleared
+    /// [`Self::prompt_submission_for_session`]'s pre-acquisition existence
+    /// check and has not yet touched `prompt_locks`, so a delete landing now
+    /// is precisely the race the post-acquisition check exists for. Sampling
+    /// the raw claim rather than the admission above it keeps the same
+    /// checkpoint on a build where the drains take the vivifying guard, so the
+    /// test still fails there instead of hanging. One watcher per service.
+    #[cfg(test)]
+    pub(crate) fn watch_submission_claims(&self) -> tokio::sync::mpsc::UnboundedReceiver<String> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.submission_claims
+            .set(tx)
+            .expect("one submission watcher per service");
+        rx
     }
 }
 
@@ -2283,20 +2310,33 @@ mod tests {
             "a drain for an id that no longer exists must not vivify an entry"
         );
 
-        // Window two: the drain proved existence and then parked reaching the
-        // registry, so it vivifies its entry after the delete's own
-        // `forget_prompt_lock` (a no-op here: no entry existed yet) and only
-        // the post-acquisition existence check can retire it.
+        // Window two: the drain cleared the existence check and then parked
+        // reaching the registry, so it vivifies its entry after the delete's
+        // own `forget_prompt_lock` (a no-op here: no entry existed yet) and
+        // only the post-acquisition check can retire it.
+        //
+        // The claim tap is what pins the drain to that state. A timer plus
+        // `!is_finished()` would only say the task had not returned, which is
+        // equally true of a drain that had not been polled at all and would
+        // then decline at the first check, quietly collapsing this case into
+        // window one. Holding the registry write guard is the other half: the
+        // tap fires immediately before `prompt_locks` is read, so the drain
+        // cannot advance past it while the guard is held.
+        let mut claims = service.watch_submission_claims();
         let registry = service.prompt_locks.write().await;
         let drain = tokio::spawn({
             let service = Arc::clone(&service);
             async move { service.drain_pending_initial_turn("sess-3687-b").await }
         });
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(
-            !drain.is_finished(),
-            "the drain must still be parked reaching the lock registry"
-        );
+        loop {
+            let claimed = tokio::time::timeout(Duration::from_secs(10), claims.recv())
+                .await
+                .expect("the drain must reach its submission claim")
+                .expect("the tap outlives the drain");
+            if claimed == "sess-3687-b" {
+                break;
+            }
+        }
         service
             .instances
             .write()
