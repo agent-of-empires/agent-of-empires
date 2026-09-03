@@ -267,12 +267,14 @@ impl Instance {
         let resume_allowed_by_policy = match resume_policy {
             ResumeAttemptPolicy::Allow => true,
             ResumeAttemptPolicy::HonorAutoResumeSetting => {
-                crate::session::profile_config::resolve_config_or_warn(&self.effective_profile())
-                    .session
-                    .auto_resume_on_restart
+                crate::session::config::profile_config::resolve_config_or_warn(
+                    &self.effective_profile(),
+                )
+                .session
+                .auto_resume_on_restart
             }
         };
-        if !should_attempt_resume(Some(&sid), &self.tool) {
+        if !should_attempt_resume(Some(&sid), self.capture_agent_name().unwrap_or(&self.tool)) {
             return None;
         }
         if self.resume_probe_failed_sid.as_deref() == Some(&sid) {
@@ -343,11 +345,18 @@ impl Instance {
         skipped_failed_resume_sid: Option<String>,
         profile: &str,
     ) -> Result<StartOutcome> {
+        let resume_tool = self.capture_agent_name().unwrap_or(&self.tool).to_string();
         let (attempted_sid, pinned_prior_sid) = match launch_outcome {
-            LaunchSidOutcome::Existing { sid } if should_attempt_resume(Some(&sid), &self.tool) => {
+            LaunchSidOutcome::Existing { sid }
+                if should_attempt_resume(Some(&sid), &resume_tool) =>
+            {
                 (Some(sid), None)
             }
-            LaunchSidOutcome::Fresh { pinned_prior_sid } => (None, pinned_prior_sid),
+            LaunchSidOutcome::Fresh { pinned_prior_sid }
+                if should_attempt_resume(pinned_prior_sid.as_deref(), &resume_tool) =>
+            {
+                (None, pinned_prior_sid)
+            }
             _ => (None, None),
         };
         let Some(stale_sid) = attempted_sid else {
@@ -405,6 +414,7 @@ impl Instance {
 mod tests {
     use super::*;
 
+    use crate::session::instance::launch_command::build_resume_flags;
     use serial_test::serial;
     use tempfile::tempdir;
 
@@ -435,11 +445,69 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_agent_does_not_attempt_resume() {
-        assert!(!should_attempt_resume(
-            Some("11111111-1111-1111-1111-111111111111"),
-            "cursor"
-        ));
+    fn resume_capability_controls_launch_poller_and_recovery() {
+        let sid = "11111111-1111-1111-1111-111111111111";
+        let cases = [
+            ("cursor", false),
+            ("qwen", false),
+            ("kiro", false),
+            ("claude", true),
+            ("opencode", true),
+        ];
+
+        for (tool, supported) in cases {
+            let mut inst = Instance::new("resume-contract", "/tmp/test");
+            inst.tool = tool.to_string();
+            inst.agent_session_id = Some(sid.to_string());
+            inst.resume_intent = ResumeIntent::Use(sid.to_string());
+
+            assert_eq!(
+                should_attempt_resume(Some(sid), tool),
+                supported,
+                "{tool}: resume-probe decision"
+            );
+            assert_eq!(
+                inst.supports_session_poller(),
+                supported,
+                "{tool}: poller capability"
+            );
+            assert_eq!(
+                crate::session::recovery::is_recovery_candidate(&inst),
+                supported,
+                "{tool}: startup recovery eligibility"
+            );
+
+            let mut command = crate::agents::get_agent(tool)
+                .unwrap()
+                .launch_base_command();
+            let base_command = command.clone();
+            let resumed = inst.apply_session_flags(&mut command, "test");
+            assert_eq!(resumed, supported, "{tool}: launch resume decision");
+            assert_eq!(
+                command != base_command,
+                supported,
+                "{tool}: resume argv emission: {command}"
+            );
+            assert_eq!(
+                build_resume_flags(tool, sid, true).is_empty(),
+                !supported,
+                "{tool}: direct resume flags"
+            );
+            if matches!(tool, "qwen" | "kiro") {
+                assert_eq!(
+                    inst.finish_resume_launch(
+                        LaunchSidOutcome::Fresh {
+                            pinned_prior_sid: Some(sid.to_string()),
+                        },
+                        None,
+                        "test",
+                    )
+                    .unwrap(),
+                    StartOutcome::Fresh,
+                    "{tool}: inert stored ID must not trigger the pinned launch probe"
+                );
+            }
+        }
     }
 
     #[test]
@@ -526,7 +594,6 @@ mod tests {
         std::fs::write(dir.join(format!("{sid}.jsonl")), "seed\n").expect("write transcript");
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     #[serial]
     fn restart_outcome_for_acp_session_is_fresh() {

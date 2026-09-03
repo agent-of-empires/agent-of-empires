@@ -8,12 +8,11 @@
 //! diagnostic. This proves a daemon-emitted, session-scoped `acp.protocol`
 //! breadcrumb now lands in the per-session log surfaced by `aoe acp logs`.
 //!
-//! Compiled only with the default `serve` feature (excluded by `--no-default-features`). Run via:
+//! Run via:
 //!
 //! ```sh
 //! cargo test --features e2e-tests --test e2e -- acp_session_log_tee
 //! ```
-#![cfg(feature = "serve")]
 
 use std::time::{Duration, Instant};
 

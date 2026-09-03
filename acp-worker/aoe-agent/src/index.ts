@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * aoe-agent: ACP server wrapping Vercel AI SDK 6.
+ * aoe-agent: ACP server wrapping Vercel AI SDK 7.
  *
  * One Node process per structured-view session. Accepts ACP requests from aoe
  * (the Rust ACP client) on stdin/stdout, drives a Vercel AI SDK loop
@@ -288,6 +288,12 @@ function serialiseToolOutput(output: unknown): Record<string, unknown> {
   return { value: output };
 }
 
+/**
+ * Map an `AOE_AGENT_MODEL` id onto a provider. Anthropic, OpenAI and
+ * Google only, by bare prefix or an explicit `provider:` prefix.
+ * Anything else hits the Anthropic fallback, so local-model ids are not
+ * a valid configuration until an openai-compatible branch exists.
+ */
 function pickModel(modelId: string) {
   if (modelId.startsWith("claude-") || modelId.startsWith("anthropic:")) {
     return anthropic(modelId.replace(/^anthropic:/, ""));

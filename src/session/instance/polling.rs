@@ -11,17 +11,18 @@ impl Instance {
     /// conversation, and a store keyed by cwd cannot say which pane owns what.
     /// Reads memory only: this runs per session on every TUI refresh.
     pub fn supports_session_poller(&self) -> bool {
+        let Some(agent) = self.resolved_agent() else {
+            return false;
+        };
         // Pi polls only what names a pane. Without the extension there is
         // nothing attributable to observe, so it does not poll at all.
-        if self.tool == "pi" && !self.uses_pi_session_sidecar() {
+        if agent.name == "pi" && !self.uses_pi_session_sidecar() {
             return false;
         }
-        crate::agents::get_agent(&self.tool).is_some_and(|a| {
-            !matches!(
-                a.resume_strategy,
-                crate::agents::ResumeStrategy::Unsupported
-            )
-        })
+        !matches!(
+            agent.resume_strategy,
+            crate::agents::ResumeStrategy::Unsupported
+        )
     }
 
     pub fn maybe_start_poller(&mut self) {
@@ -32,7 +33,9 @@ impl Instance {
         if !self.supports_session_poller() {
             return;
         }
-        let tool = self.tool.as_str();
+        let Some(tool) = self.capture_agent_name() else {
+            return;
+        };
 
         let tmux_session_name = self
             .tmux_env_session_name()
@@ -419,6 +422,7 @@ impl Instance {
 
 #[cfg(test)]
 mod tests {
+    use crate::session::instance::test_helpers::install_aliases;
     use crate::session::Instance;
 
     // Restart, stop, and the sid_persist path all tear down through this
@@ -518,6 +522,44 @@ mod tests {
                 .expect("a resolvable sandbox source"),
         );
         assert_eq!(poll().map(|o| o.sid).as_deref(), Some(published));
+    }
+
+    /// A custom agent resolves its poller through `agent_detect_as`. Keying
+    /// the gate off `tool` raw missed on every wrapper, so none of them ever
+    /// observed a conversation id (#3638).
+    #[test]
+    fn custom_agents_poll_through_their_detect_as_base() {
+        const PROFILE: &str = "custom-agent-poller-test";
+        let _registry = install_aliases(
+            PROFILE,
+            &[
+                ("claude-personal", "claude"),
+                ("cursor-personal", "cursor"),
+                ("pi-personal", "pi"),
+            ],
+        );
+
+        let mut wrapper = Instance::new("wrapper", "/tmp/custom-agent-poller");
+        wrapper.source_profile = PROFILE.to_string();
+        wrapper.tool = "claude-personal".to_string();
+        wrapper.command = "claude-personal".to_string();
+        assert!(wrapper.supports_session_poller());
+
+        // The base agent's strategy still decides: an unresumable one polls
+        // for nothing, and Pi polls only what names a pane.
+        for tool in ["cursor-personal", "pi-personal"] {
+            let mut inst = Instance::new("wrapper", "/tmp/custom-agent-poller");
+            inst.source_profile = PROFILE.to_string();
+            inst.tool = tool.to_string();
+            inst.command = tool.to_string();
+            assert!(!inst.supports_session_poller(), "{tool}");
+        }
+
+        // An unaliased custom agent names no built-in and still polls nothing.
+        let mut unmapped = Instance::new("wrapper", "/tmp/custom-agent-poller");
+        unmapped.source_profile = PROFILE.to_string();
+        unmapped.tool = "unmapped-agent".to_string();
+        assert!(!unmapped.supports_session_poller());
     }
 
     #[test]

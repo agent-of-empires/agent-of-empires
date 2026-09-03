@@ -12,17 +12,14 @@ use super::state::AppState;
 /// (caffeinate `-w <pid>` and the systemd-inhibit `cat` otherwise outlive every
 /// tick), and both acquire and release lag are dominated by the minutes-long
 /// grace window and the OS idle-sleep timer.
-#[cfg(feature = "serve")]
 pub(super) const SLEEP_INHIBIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// `AppState::sleep_inhibit_snapshot` bit: `prevent_sleep_when_active` was on
 /// at the last reconcile.
-#[cfg(feature = "serve")]
 pub(crate) const SLEEP_INHIBIT_SNAPSHOT_ENABLED: u8 = 0b01;
 
 /// `AppState::sleep_inhibit_snapshot` bit: an inhibitor slot is retained. This
 /// is slot presence, not held: the endpoint gates it on `backend_available`.
-#[cfg(feature = "serve")]
 pub(crate) const SLEEP_INHIBIT_SNAPSHOT_SLOT_PRESENT: u8 = 0b10;
 
 /// Acquire or release the OS sleep-inhibit assertion. Throttled to
@@ -32,7 +29,6 @@ pub(crate) const SLEEP_INHIBIT_SNAPSHOT_SLOT_PRESENT: u8 = 0b10;
 /// then reconciles: hold the assertion while the toggle is on and any session
 /// has recent activity, release once every session has been idle past the
 /// grace window.
-#[cfg(feature = "serve")]
 pub(super) async fn update_sleep_inhibit(
     state: &Arc<AppState>,
     slot: &mut Option<Box<dyn crate::process::SleepInhibit>>,
@@ -77,7 +73,6 @@ pub(super) async fn update_sleep_inhibit(
 /// here is a subprocess spawn / `try_wait` / kill that returns in milliseconds,
 /// and the call is throttled to once per interval; only the config read in
 /// `update_sleep_inhibit`, which touches disk, is offloaded.
-#[cfg(feature = "serve")]
 pub(super) fn reconcile_sleep_inhibit(
     desired: bool,
     slot: &mut Option<Box<dyn crate::process::SleepInhibit>>,

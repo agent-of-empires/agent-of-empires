@@ -5,6 +5,7 @@ use crate::file_watch::FileWatchService;
 use crate::server::push::{PushState, STATUS_CHANNEL_CAPACITY};
 use crate::server::rate_limit::RateLimiter;
 use anyhow::Context;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,6 +55,50 @@ pub(super) fn remote_serve_url_contents(
     let remote_url = with_token(remote_base_url);
     let loopback_url = with_token(&format!("http://127.0.0.1:{local_port}"));
     format!("{remote_url}\nlocalhost\t{loopback_url}\n")
+}
+
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// Post-signal shutdown: cancel the shared token, arm the force-exit
+/// deadline, then reap plugin workers within four fifths of the window,
+/// leaving the rest for the caller's own cleanup.
+///
+/// A worker that never terminates therefore cannot keep the daemon alive.
+/// It is not free: a reap cut short can leave a worker group SIGTERMed
+/// without the SIGKILL escalation, and a forced exit skips the
+/// post-`axum::serve` cleanup entirely (acp detach, tunnel SIGTERM of
+/// cloudflared, removal of serve.passphrase). The PID file is swept by
+/// `daemon_pid`'s stale-PID check on the next start.
+async fn run_shutdown_sequence<R, F>(
+    shutdown: &CancellationToken,
+    grace: Duration,
+    reap: R,
+    force_exit: F,
+) where
+    R: Future<Output = ()>,
+    F: FnOnce() + Send + 'static,
+{
+    shutdown.cancel();
+    // Build the timer here, not inside the task: `sleep` fixes its deadline
+    // from the clock at construction, so constructing it in the task would
+    // restart the window at the task's first poll, which the reap's own
+    // synchronous work can delay.
+    let deadline = tokio::time::sleep(grace);
+    tokio::spawn(async move {
+        deadline.await;
+        tracing::warn!(
+            target: "shutdown",
+            grace_secs = grace.as_secs(),
+            "graceful shutdown exceeded grace window, forcing exit"
+        );
+        force_exit();
+    });
+    if tokio::time::timeout(grace * 4 / 5, reap).await.is_err() {
+        tracing::warn!(
+            target: "shutdown",
+            "plugin worker reap did not finish in time, continuing shutdown"
+        );
+    }
 }
 
 /// Raise the soft `RLIMIT_NOFILE` so the server can sustain many WS
@@ -198,7 +243,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         token_lifetime,
         token_grace,
     ));
-    let config = crate::session::profile_config::resolve_config_or_warn(profile);
+    let config = crate::session::config::profile_config::resolve_config_or_warn(profile);
     // Feed the unread-feature gate from this daemon's resolved config. Like
     // `push_enabled`, this is read once at startup; a config change needs a
     // restart to take effect. The TUI process maintains its own copy.
@@ -266,9 +311,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         None
     };
 
-    #[cfg(feature = "serve")]
     let acp_events_tx = broadcast::channel(ACP_CHANNEL_CAPACITY).0;
-    #[cfg(feature = "serve")]
     let acp_event_store = {
         let app_dir = crate::session::get_app_dir().context("acp event store: resolve app dir")?;
         let db_path = app_dir.join("acp_events.db");
@@ -277,9 +320,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
                 .context("acp event store: open")?,
         )
     };
-    #[cfg(feature = "serve")]
     let acp_control_cache = Arc::new(crate::acp::control_cache::ControlStateCache::new());
-    #[cfg(feature = "serve")]
     let acp_supervisor = {
         // Approval pushes are dispatched from `acp_event_listener`,
         // which subscribes to the broadcast that ChannelSink::publish
@@ -312,7 +353,6 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     let idempotency_locks = Arc::new(RwLock::new(std::collections::HashMap::new()));
     let telemetry_session_creates = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let mutation_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    #[cfg(feature = "serve")]
     let session_service = Arc::new(session_service::SessionService::new(
         Arc::clone(&instances),
         Arc::clone(&instance_locks),
@@ -325,19 +365,10 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             control_cache: acp_control_cache.clone(),
         },
     ));
-    #[cfg(not(feature = "serve"))]
-    let session_service = Arc::new(session_service::SessionService::new(
-        Arc::clone(&instances),
-        Arc::clone(&instance_locks),
-        Arc::clone(&file_watch),
-        Arc::clone(&telemetry_session_creates),
-        Arc::clone(&mutation_epoch),
-    ));
 
     // the daemon serves fine without plugin workers.
     // The host API includes mutating session.meta.set/cas, so a read-only
     // daemon must not run plugin workers at all: gate the host on !read_only.
-    #[cfg(feature = "serve")]
     let plugin_host = if read_only {
         tracing::info!(target: "plugin.host", "plugin host disabled in read-only serve mode");
         None
@@ -531,11 +562,17 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             vec![(IpKind::Loopback, make_url(host))]
         };
 
-        println!("aoe web dashboard running at:");
+        // A build without the dashboard bundle still serves the API, so the
+        // banner must not promise a page that is not there.
+        if cfg!(feature = "web") {
+            println!("aoe web dashboard running at:");
+        } else {
+            println!("aoe daemon running at (API only, no dashboard bundle):");
+        }
         for (_, u) in &labeled_urls {
             println!("  {}", u);
         }
-        if auth_token.is_some() {
+        if auth_token.is_some() && cfg!(feature = "web") {
             println!();
             println!(
                 "Open any URL above in a browser. Share it to access from other devices on your network."
@@ -543,8 +580,14 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         }
 
         if open_browser && !is_daemon {
-            if let Some((_, primary)) = labeled_urls.first() {
-                maybe_open_browser(primary);
+            if cfg!(feature = "web") {
+                if let Some((_, primary)) = labeled_urls.first() {
+                    maybe_open_browser(primary);
+                }
+            } else {
+                // Opening a browser on an API-only daemon lands on a 404. Say
+                // so rather than dropping the flag on the floor.
+                eprintln!("--open ignored: this build has no dashboard bundle");
             }
         }
 
@@ -640,15 +683,10 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         remote_owner_cache: RwLock::new(std::collections::HashMap::new()),
         changed_files_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
         status_tx: broadcast::channel(STATUS_CHANNEL_CAPACITY).0,
-        #[cfg(feature = "serve")]
         acp_events_tx: acp_events_tx.clone(),
-        #[cfg(feature = "serve")]
         acp_event_store: acp_event_store.clone(),
-        #[cfg(feature = "serve")]
         acp_control_cache: acp_control_cache.clone(),
-        #[cfg(feature = "serve")]
         acp_supervisor: acp_supervisor.clone(),
-        #[cfg(feature = "serve")]
         plugin_host: plugin_host.clone(),
         plugin_jobs: Arc::new(api::plugins::PluginJobRegistry::new()),
         push: push_state,
@@ -879,7 +917,6 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // Launch plugin workers for every active plugin that declares a runtime.
     // Non-blocking: each worker runs in its own supervised task. A daemon with
     // no community plugin workers (the common case) does nothing here.
-    #[cfg(feature = "serve")]
     if let Some(host) = state.plugin_host.clone() {
         host.start(&crate::plugin::registry()).await;
     }
@@ -902,97 +939,18 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     login_manager.spawn_cleanup_task(state.shutdown.clone());
 
     if remote {
-        // Inline the rotation loop here rather than calling
-        // token_manager.spawn_rotation_task() so we can also invalidate
-        // push subscriptions whose owner hash is no longer valid after
-        // rotation. Behavior otherwise matches the original: wait one
-        // lifetime, rotate, wait 300s grace, clear previous.
-        let rot_state = state.clone();
-        let rot_shutdown = state.shutdown.clone();
         // The tunnel URL is stable across the daemon's lifetime (Tailscale
         // and named CF tunnels are stable; quick CF rotates only on
         // restart, which is outside this task's scope). Capture once so
         // the rotation task can rebuild `serve.url` with the new token.
         let rot_base_url: Option<String> = tunnel_handle.as_ref().map(|h| h.url.clone());
-        tokio::spawn(async move {
-            loop {
-                let lifetime = rot_state.token_manager.lifetime_secs().await;
-                tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(lifetime)) => {}
-                    _ = rot_shutdown.cancelled() => break,
-                }
-
-                // Capture the hashes of the current and (about-to-be)
-                // previous tokens BEFORE rotating, so we know which
-                // owner-hashes are still valid in the store.
-                let pre_rotate_current = rot_state.token_manager.current_token().await;
-                rot_state.token_manager.rotate().await;
-                let post_rotate_current = rot_state.token_manager.current_token().await;
-
-                // Refresh `serve.url` so the TUI display and the QR-code
-                // URL stay in sync with the rotated token. Without this
-                // the TUI keeps showing `?token=<old>`, which is invalid
-                // 5 minutes after rotation (end of grace period).
-                if let (Some(base_url), Some(token)) =
-                    (rot_base_url.as_ref(), post_rotate_current.as_ref())
-                {
-                    if let Ok(app_dir) = crate::session::get_app_dir() {
-                        let contents = remote_serve_url_contents(base_url, local_port, Some(token));
-                        write_secret_file(&app_dir.join("serve.url"), &contents).await;
-                    }
-                }
-
-                if let Some(push) = rot_state.push.as_ref() {
-                    let mut valid_hashes: Vec<[u8; 32]> = Vec::new();
-                    if let Some(t) = &post_rotate_current {
-                        valid_hashes.push(push::sha256_token(t));
-                    }
-                    if let Some(t) = &pre_rotate_current {
-                        // The old token remains in the grace period (5m)
-                        // so devices that haven't yet picked up the new
-                        // token should keep receiving pushes.
-                        valid_hashes.push(push::sha256_token(t));
-                    }
-                    // In no-auth mode the token is None and we use a
-                    // zero hash; preserve that so zero-hash subs survive.
-                    if valid_hashes.is_empty() {
-                        valid_hashes.push([0u8; 32]);
-                    }
-                    match push.store.retain_owners(&valid_hashes).await {
-                        Ok(0) => {}
-                        Ok(n) => tracing::info!(target: "http.middleware",
-                            removed = n,
-                            "push: dropped subscriptions whose owner-hash is no longer valid after rotation"
-                        ),
-                        Err(e) => {
-                            tracing::warn!(target: "http.middleware", error = %e, "push: retain_owners failed")
-                        }
-                    }
-                }
-
-                // After grace period, the previous token becomes invalid.
-                // Clear it AND drop any subscriptions that were bound
-                // only to the old hash (retain_owners with only the new).
-                tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {}
-                    _ = rot_shutdown.cancelled() => break,
-                }
-                // Clear previous token inside TokenManager. Reuse its
-                // internal state access via a tiny helper on the manager.
-                rot_state.token_manager.clear_previous().await;
-
-                if let Some(push) = rot_state.push.as_ref() {
-                    let mut valid_hashes: Vec<[u8; 32]> = Vec::new();
-                    if let Some(t) = rot_state.token_manager.current_token().await {
-                        valid_hashes.push(push::sha256_token(&t));
-                    }
-                    if valid_hashes.is_empty() {
-                        valid_hashes.push([0u8; 32]);
-                    }
-                    let _ = push.store.retain_owners(&valid_hashes).await;
-                }
-            }
-        });
+        tokio::spawn(remote_rotation_loop(
+            state.token_manager.clone(),
+            state.push.clone(),
+            state.shutdown.clone(),
+            rot_base_url,
+            local_port,
+        ));
     } else if test_token_lifetime_override().is_some() && auth_token.is_some() {
         // Debug-build test path: live Playwright specs set
         // AOE_TEST_TOKEN_LIFETIME_SECS (and optionally AOE_TEST_TOKEN_GRACE_SECS)
@@ -1011,9 +969,10 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     //      terminal) wake from their `select!` and close cleanly,
     //      letting `axum::serve` return promptly instead of blocking
     //      on the open WebSockets the browser hasn't disconnected.
-    //   2. Spawns a 5s deadline as the safety net: if any handler
-    //      somehow ignores the cancel, the process force-exits so
-    //      `Ctrl-C` and `aoe serve --stop` never hang. See #1198.
+    //   2. Arms a 5s force-exit deadline, then reaps plugin workers
+    //      within part of that window: if any handler or worker ignores
+    //      the cancel, the process still force-exits, so `Ctrl-C` and
+    //      terminal hangups never hang. See #1198.
     //
     // Note: this future is awaited by `with_graceful_shutdown`, which
     // signals axum to stop accepting new connections once the future
@@ -1022,7 +981,6 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // of just the post-signal drain, which is wrong (the server would
     // exit after 5s of normal uptime). The deadline lives inside the
     // signal handler so the clock only starts after the signal fires.
-    const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
     let shutdown_state = state.clone();
     let shutdown_signal = async move {
         #[cfg(unix)]
@@ -1047,29 +1005,18 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             let _ = tokio::signal::ctrl_c().await;
             tracing::info!(target: "serve.shutdown", "received ctrl-c, shutting down");
         }
-        shutdown_state.shutdown.cancel();
-        // Reap plugin workers before the force-exit deadline so no worker tree
-        // is left behind when the daemon stops.
-        #[cfg(feature = "serve")]
-        if let Some(host) = shutdown_state.plugin_host.clone() {
-            host.shutdown().await;
-        }
-        tokio::spawn(async {
-            tokio::time::sleep(SHUTDOWN_GRACE).await;
-            tracing::warn!(
-                target: "shutdown",
-                grace_secs = SHUTDOWN_GRACE.as_secs(),
-                "graceful shutdown exceeded grace window, forcing exit"
-            );
-            // Force-exit skips the post-`axum::serve` cleanup block below
-            // (acp detach, tunnel SIGTERM of cloudflared, removal of
-            // serve.passphrase). The PID file is swept by `daemon_pid`'s
-            // stale-PID check on the next start, but a leftover cloudflared
-            // subprocess and residual passphrase file may survive a forced
-            // exit. The common path (handlers honor cancel) returns from
-            // `axum::serve` normally and runs the full cleanup.
-            std::process::exit(0);
-        });
+        let plugin_host = shutdown_state.plugin_host.clone();
+        run_shutdown_sequence(
+            &shutdown_state.shutdown,
+            SHUTDOWN_GRACE,
+            async move {
+                if let Some(host) = plugin_host {
+                    host.shutdown().await;
+                }
+            },
+            || std::process::exit(0),
+        )
+        .await;
     };
 
     axum::serve(
@@ -1121,6 +1068,94 @@ pub(super) fn maybe_open_browser(url: &str) {
     }
 }
 
+/// The `--remote` token rotation loop: wait one lifetime, rotate, then wait out
+/// the grace window before clearing the previous token and dropping the push
+/// subscriptions bound only to its hash.
+///
+/// Runs here rather than in `TokenManager::spawn_rotation_task` so rotation can
+/// also refresh `serve.url` and prune the push store. Both deadlines come from
+/// the manager, so the previous token's state and its subscriptions cannot
+/// outlive the window `validate` accepts it in.
+async fn remote_rotation_loop(
+    token_manager: Arc<TokenManager>,
+    push: Option<Arc<PushState>>,
+    shutdown: CancellationToken,
+    base_url: Option<String>,
+    local_port: u16,
+) {
+    loop {
+        let lifetime = token_manager.lifetime_secs().await;
+        let grace = token_manager.grace().await;
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(lifetime)) => {}
+            _ = shutdown.cancelled() => break,
+        }
+
+        // Capture the hashes of the current and (about-to-be) previous tokens
+        // BEFORE rotating, so we know which owner-hashes are still valid in
+        // the store.
+        let pre_rotate_current = token_manager.current_token().await;
+        token_manager.rotate().await;
+        let post_rotate_current = token_manager.current_token().await;
+
+        // Refresh `serve.url` so the TUI display and the QR-code URL stay in
+        // sync with the rotated token. Without this the TUI keeps showing
+        // `?token=<old>`, which stops working once the grace window closes.
+        if let (Some(base_url), Some(token)) = (base_url.as_ref(), post_rotate_current.as_ref()) {
+            if let Ok(app_dir) = crate::session::get_app_dir() {
+                let contents = remote_serve_url_contents(base_url, local_port, Some(token));
+                write_secret_file(&app_dir.join("serve.url"), &contents).await;
+            }
+        }
+
+        if let Some(push) = push.as_ref() {
+            let mut valid_hashes: Vec<[u8; 32]> = Vec::new();
+            if let Some(t) = &post_rotate_current {
+                valid_hashes.push(push::sha256_token(t));
+            }
+            if let Some(t) = &pre_rotate_current {
+                // The old token is still inside the grace window, so devices
+                // that have not picked up the new one keep receiving pushes.
+                valid_hashes.push(push::sha256_token(t));
+            }
+            // In no-auth mode the token is None and we use a zero hash;
+            // preserve that so zero-hash subs survive.
+            if valid_hashes.is_empty() {
+                valid_hashes.push([0u8; 32]);
+            }
+            match push.store.retain_owners(&valid_hashes).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(target: "http.middleware",
+                    removed = n,
+                    "push: dropped subscriptions whose owner-hash is no longer valid after rotation"
+                ),
+                Err(e) => {
+                    tracing::warn!(target: "http.middleware", error = %e, "push: retain_owners failed")
+                }
+            }
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(grace) => {}
+            _ = shutdown.cancelled() => break,
+        }
+        token_manager.clear_previous().await;
+
+        if let Some(push) = push.as_ref() {
+            let mut valid_hashes: Vec<[u8; 32]> = Vec::new();
+            if let Some(t) = token_manager.current_token().await {
+                valid_hashes.push(push::sha256_token(&t));
+            }
+            if valid_hashes.is_empty() {
+                valid_hashes.push([0u8; 32]);
+            }
+            if let Err(e) = push.store.retain_owners(&valid_hashes).await {
+                tracing::warn!(target: "http.middleware", error = %e, "push: retain_owners failed");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1159,5 +1194,136 @@ mod tests {
         );
         // Neither configured is the security-relevant fully-open mode.
         assert_eq!(resolve_auth_mode(&no_token, &no_passphrase).await, "none");
+    }
+
+    /// The post-rotation cleanup must run on the configured grace period, not
+    /// a hardcoded default, so a token stops being accepted and stops owning
+    /// push subscriptions at the same moment.
+    #[tokio::test(start_paused = true)]
+    async fn rotation_cleanup_honors_the_configured_grace() {
+        let lifetime = Duration::from_secs(60);
+        let grace = Duration::from_secs(7);
+        let manager = Arc::new(TokenManager::with_grace(
+            Some("old_token".to_string()),
+            lifetime,
+            grace,
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let push = Arc::new(PushState::init(dir.path()).unwrap());
+        push.store
+            .upsert(push::Subscription {
+                endpoint: "https://push.example.test/old".to_string(),
+                p256dh: "pk".into(),
+                auth: "auth".into(),
+                owner_token_hash: push::sha256_token("old_token"),
+                user_agent: "UA".into(),
+                created_at: chrono::Utc::now(),
+                generation: 0,
+                origin: "https://aoe.example.test".into(),
+            })
+            .await
+            .unwrap();
+
+        let shutdown = CancellationToken::new();
+        tokio::spawn(remote_rotation_loop(
+            manager.clone(),
+            Some(push.clone()),
+            shutdown.clone(),
+            None,
+            8080,
+        ));
+
+        // Mid-grace: the rotated-out token is still accepted, and its
+        // subscription still belongs to a valid owner.
+        tokio::time::sleep(lifetime + grace / 2).await;
+        assert!(manager.validate("old_token").await.0);
+        assert!(manager.holds_previous().await);
+        assert_eq!(push.store.snapshot().await.len(), 1);
+
+        // Past the configured grace: validation and cleanup agree. With the
+        // hardcoded 300s sleep the token was rejected here while its state and
+        // subscription lingered.
+        tokio::time::sleep(grace).await;
+        assert!(!manager.validate("old_token").await.0);
+        assert!(!manager.holds_previous().await);
+        assert!(push.store.snapshot().await.is_empty());
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn shutdown_sequence_bounds_a_plugin_reap_that_never_finishes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const GRACE: Duration = Duration::from_millis(100);
+
+        // Arming the deadline first must not skip the plugin teardown.
+        let shutdown = CancellationToken::new();
+        let reaped = Arc::new(AtomicBool::new(false));
+        let flag = reaped.clone();
+        run_shutdown_sequence(
+            &shutdown,
+            GRACE,
+            async move { flag.store(true, Ordering::SeqCst) },
+            || {},
+        )
+        .await;
+        assert!(shutdown.is_cancelled());
+        assert!(reaped.load(Ordering::SeqCst));
+
+        // A reap that never finishes is bounded, so the caller still reaches
+        // its own cleanup, and the deadline still forces the exit.
+        let shutdown = CancellationToken::new();
+        let forced = Arc::new(AtomicBool::new(false));
+        let flag = forced.clone();
+        tokio::time::timeout(
+            GRACE * 10,
+            run_shutdown_sequence(&shutdown, GRACE, std::future::pending::<()>(), move || {
+                flag.store(true, Ordering::SeqCst)
+            }),
+        )
+        .await
+        .expect("a hung reap must not block the shutdown sequence");
+
+        for _ in 0..200 {
+            if forced.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(forced.load(Ordering::SeqCst));
+    }
+
+    /// The grace window must run from the cancel, not from whenever the
+    /// watchdog task first gets polled. On this single-threaded runtime a
+    /// reap that works synchronously before yielding holds the only worker,
+    /// so a deadline built inside the task would not start until the reap
+    /// released it, stretching the window past `GRACE`.
+    #[tokio::test]
+    async fn shutdown_deadline_runs_from_the_cancel_not_the_watchdog_poll() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const GRACE: Duration = Duration::from_millis(100);
+
+        let shutdown = CancellationToken::new();
+        let forced = Arc::new(AtomicBool::new(false));
+        let flag = forced.clone();
+        run_shutdown_sequence(
+            &shutdown,
+            GRACE,
+            async { std::thread::sleep(GRACE * 2) },
+            move || flag.store(true, Ordering::SeqCst),
+        )
+        .await;
+        assert!(
+            !forced.load(Ordering::SeqCst),
+            "the reap blocked the worker"
+        );
+
+        // One short park is all the watchdog needs once its deadline has
+        // already passed, and far less than another full window.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(forced.load(Ordering::SeqCst));
     }
 }

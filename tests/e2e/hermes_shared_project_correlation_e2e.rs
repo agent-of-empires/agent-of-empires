@@ -23,7 +23,7 @@
 //!
 //! The e2e covers the host capture path only; the sandboxed container path is
 //! covered by unit tests over `HERMES_CONTAINER_CAPTURE_SCRIPT` and
-//! `select_hermes_session_in_container` in src/session/capture.rs.
+//! `select_hermes_session_in_container` in src/session/capture/mod.rs.
 //!
 //! Daemon-free, so no feature gate. Run via:
 //!

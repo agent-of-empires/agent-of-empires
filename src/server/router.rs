@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tracing::Instrument;
 
 use super::access::{access_policy, cityhall_gate, security_headers};
+#[cfg(feature = "web")]
 use super::assets::{serve_asset, serve_index, serve_public_file};
 use super::state::AppState;
 use crate::server::{acp_ws, api, auth, live_ws, login, push};
@@ -289,7 +290,6 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             get(live_ws::live_container_terminal_ws),
         );
 
-    #[cfg(feature = "serve")]
     let app = app
         .route("/sessions/{id}/acp/ws", get(acp_ws::acp_ws))
         .route("/api/sessions/{id}/acp/spawn", post(api::spawn_acp))
@@ -364,31 +364,33 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/acp/option-catalog", get(api::get_option_catalog))
         .route("/api/claude-sessions", get(api::list_claude_sessions));
 
-    app
-        // Static assets (Vite build output: assets/, manifest.json, sw.js, icons)
+    // Dashboard bundle (Vite build output) plus the SPA fallback. Without
+    // `web` the daemon still answers `/api/*`; browser paths 404.
+    #[cfg(feature = "web")]
+    let app = app
         .route("/assets/{*path}", get(serve_asset))
         .route("/manifest.json", get(serve_public_file))
         .route("/sw.js", get(serve_public_file))
         .route("/icon-192.png", get(serve_public_file))
         .route("/icon-512.png", get(serve_public_file))
-        // SPA fallback: all other GET routes serve index.html
-        .fallback(get(serve_index))
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            cityhall_gate,
-        ))
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            auth::auth_middleware,
-        ))
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            access_policy,
-        ))
-        .layer(axum::middleware::from_fn(security_headers))
-        .layer(axum::middleware::from_fn(http_request_span))
-        .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
-        .with_state(state)
+        .fallback(get(serve_index));
+
+    app.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        cityhall_gate,
+    ))
+    .layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        auth::auth_middleware,
+    ))
+    .layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        access_policy,
+    ))
+    .layer(axum::middleware::from_fn(security_headers))
+    .layer(axum::middleware::from_fn(http_request_span))
+    .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
+    .with_state(state)
 }
 
 /// Placeholder logged in place of a route template when axum matched no

@@ -19,7 +19,7 @@ should use [Writing plugins](../writing-plugins.md) and the
 
 `src/plugin/mod.rs` owns a lazily loaded process-wide registry. Reloading it
 after a config change updates CLI, TUI, and web views from the same
-`PluginView`. The `aoe.web` builtin is present only with the `serve` feature.
+`PluginView`. The `aoe.web` builtin is present only with the `web` feature.
 
 The standalone `aoe-plugin-api` crate is the source of truth for
 `aoe-plugin.toml`. Parsing is strict and rejects unknown fields, unsupported API

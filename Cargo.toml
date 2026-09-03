@@ -3,7 +3,7 @@ members = [".", "xtask", "aoe-settings-derive", "aoe-plugin-api"]
 
 [package]
 name = "agent-of-empires"
-version = "1.15.1"
+version = "1.15.3"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Agent of Empires Contributors"]
@@ -140,67 +140,65 @@ which = "8.0"
 # via opencode's bun:ffi OpenTUI extract path (see anomalyco/opencode#6523).
 rusqlite = { version = "0.40", features = ["bundled"] }
 
-# Web server (optional, behind "serve" feature)
-axum = { version = "0.8", features = ["ws"], optional = true }
-# Cross-platform browser launcher for `aoe serve --open`.
-webbrowser = { version = "1", optional = true }
-tower-http = { version = "0.7", features = ["fs"], optional = true }
+# Daemon HTTP/WS server. Core: the daemon is the product, the dashboard is one
+# surface on it (see the `web` feature).
+axum = { version = "0.8", features = ["ws"] }
+# Cross-platform browser launcher: `aoe serve --open`, the plugin host's
+# `ui.open_url`, and structured-view link activation.
+webbrowser = "1"
+tower-http = { version = "0.7", features = ["fs"] }
+# Embedded dashboard bundle, behind `web`.
 rust-embed = { version = "8", features = ["debug-embed"], optional = true }
-mime_guess = { version = "2.0", optional = true }
+# Content type for the session file-read endpoint.
+mime_guess = "2.0"
+# QR of the dashboard URL (TUI serve dialog, tunnel startup). Behind `web`:
+# scanning it is only useful when there is a dashboard to open.
 qrcode = { version = "0.14", optional = true }
-argon2 = { version = "0.5", optional = true }
-subtle = { version = "2", optional = true }
+argon2 = "0.5"
+subtle = "2"
 
-# Always-on: used by the TUI for OSC 52 clipboard writes (preview
-# drag-select in live mode) and re-exported via the `serve` feature
-# for Web Push payload encoding.
+# TUI OSC 52 clipboard writes and Web Push payload encoding.
 base64 = "0.23"
 
-# Web Push (VAPID + payload encryption), optional behind "serve".
-p256 = { version = "0.13", features = ["pem", "pkcs8", "ecdsa", "ecdh"], optional = true }
-hkdf = { version = "0.13", optional = true }
-aes-gcm = { version = "0.11", optional = true }
-jsonwebtoken = { version = "11.0", features = ["aws_lc_rs"], optional = true }
-getrandom = { version = "0.4", optional = true }
+# Web Push (VAPID + payload encryption).
+p256 = { version = "0.13", features = ["pem", "pkcs8", "ecdsa", "ecdh"] }
+hkdf = "0.13"
+aes-gcm = "0.11"
+jsonwebtoken = { version = "11.0", features = ["aws_lc_rs"] }
+getrandom = "0.4"
 
-# Agent Client Protocol — drives the structured view surface bundled with `serve`.
-agent-client-protocol = { version = "2.0", optional = true, features = ["unstable_end_turn_token_usage", "unstable_elicitation", "unstable_session_fork"] }
+# Agent Client Protocol — drives the structured view surface.
+agent-client-protocol = { version = "2.0", features = ["unstable_end_turn_token_usage", "unstable_elicitation", "unstable_session_fork"] }
 
 # Semver parsing for ACP adapter compatibility checks (see src/acp/agent_compat.rs).
-semver = { version = "1", optional = true }
+semver = "1"
 
-# Tar stream handling. Used by the structured view's bundled-Node fallback
-# (with xz2 for tar.xz) and by external plugin install (with flate2 for
-# tar.gz). The `tar` and `flate2` crates are pure Rust and unconditional so
-# plugin install works in a TUI-only build; xz2 needs system liblzma and stays
-# gated to the structured view (serve).
+# Tar stream handling: the structured view's bundled-Node fallback (with xz2
+# for tar.xz) and external plugin install (with flate2 for tar.gz). xz2 needs
+# system liblzma.
 tar = "0.4"
 flate2 = "1"
-xz2 = { version = "0.1", optional = true }
+xz2 = "0.1"
 
 # WebSocket client for the structured view-in-TUI view: subscribes to the daemon's
-# `/sessions/{id}/acp/ws` stream and pumps frames into the local reducer.
-# Folded into the `serve` feature alongside the rest of the structured view surface;
-# the daemon itself uses axum's built-in WS support and never pulls this in.
-tokio-tungstenite = { version = "0.30", default-features = false, features = ["rustls-tls-webpki-roots", "connect"], optional = true }
+# `/sessions/{id}/acp/ws` stream and pumps frames into the local reducer. The
+# daemon itself uses axum's built-in WS support and never pulls this in.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
 
 # Capability-safe file opens for the session file-read endpoint (#3088): open
 # beneath a Dir so a component swapped after the containment check cannot
 # escape the intended root.
-cap-std = { version = "4.0.2", optional = true }
+cap-std = "4.0.2"
 
 # Unix-only: O_NOFOLLOW for race-free plugin-tree reads/copies (no std constant).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [features]
-# Lean by default: a plain `cargo build` needs no Node/npm. `serve` (the web
-# dashboard) stays opt-in (`cargo build --features serve`); the aoe.web builtin
-# rides along with it. Released binaries are built `--features serve`, so every
-# distributed binary ships the dashboard. `default-plugins` stays on by default
-# so the bundled-plugin set is the norm for source builds; it currently gates
-# nothing on its own (aoe.web needs `serve`), but reserves the on-by-default
-# slot for first-party plugins that do not require the dashboard.
+# The daemon (REST/WS API, auth, Web Push, ACP, structured view) is core: a
+# plain `cargo build` ships it and needs no Node. `web` adds the embedded
+# dashboard bundle, which is what invokes npm; released binaries are built
+# `--features web`, so every distributed binary ships the dashboard.
 default = ["default-plugins"]
 # Re-exports private tmux env helpers via `crate::tmux::test_support` so that
 # integration tests in `tests/` can poke them. Not enabled by default — only
@@ -210,47 +208,29 @@ test-support = []
 # criterion 1 of #268) by opting out with `--no-default-features`.
 default-plugins = []
 # Gates the `e2e` test target (tests/e2e/main.rs). Off by default so CI can run
-# the serve suite as two parallel shards without enumerating every non-e2e test
-# binary: `cargo test --features serve` runs everything except e2e (the target
-# is skipped when the feature is off), and `cargo test --features serve,e2e-tests
-# --test e2e` runs e2e only. Run the full serve suite locally with
-# `cargo test --features serve,e2e-tests`. Naming the target explicitly
-# (`cargo test --test e2e`) without the feature errors loudly rather than
-# skipping silently.
+# the suite as two parallel shards without enumerating every non-e2e test
+# binary: `cargo test` runs everything except e2e (the target is skipped when
+# the feature is off), and `cargo test --features e2e-tests --test e2e` runs
+# e2e only. Naming the target explicitly (`cargo test --test e2e`) without the
+# feature errors loudly rather than skipping silently.
 e2e-tests = []
-serve = [
-    "axum",
-    "tower-http",
-    "rust-embed",
-    "mime_guess",
-    "qrcode",
-    "argon2",
-    "subtle",
-    "p256",
-    "hkdf",
-    "aes-gcm",
-    "jsonwebtoken",
-    "getrandom",
-    "webbrowser",
-    # Structured view (ACP-based structured rendering of agent state) ships
-    # alongside the web dashboard — the two share state, REST routes,
-    # and the WebSocket fanout. Folded into `serve` so building the
-    # dashboard always includes the structured view surface; pulling them
-    # apart later is straightforward (structured view code lives entirely
-    # under src/acp/).
-    "agent-client-protocol",
-    "semver",
-    "xz2",
-    "tokio-tungstenite",
-    # Sandboxed, race-safe file reads for the session file endpoint (#3088):
-    # open beneath a capability Dir so a symlink or component swapped between
-    # the confinement check and the open cannot escape the intended root.
-    "cap-std",
-]
-cap-std = ["dep:cap-std"]
+# Embedded web dashboard. Builds `web/dist` in build.rs (needs Node and npm),
+# serves it from `src/server/assets.rs`, and registers the `aoe.web` builtin.
+# Without it the daemon still runs and answers `/api/*`; only the dashboard
+# routes are absent.
+web = ["rust-embed", "qrcode"]
+# Deprecated alias for `web`, kept for one release so existing
+# `--features serve` invocations keep building. build.rs warns when it is
+# set, and a CI guard rejects any `cfg(feature = "serve")` so the alias
+# cannot diverge from `web`.
+serve = ["web"]
 
 [dev-dependencies]
 serial_test = "4.0"
+# Test-only tokio clock control (`start_paused`), so the token-rotation
+# loop's grace deadline can be asserted without sleeping through it.
+# `cargo build` and released binaries never enable `test-util`.
+tokio = { version = "1.52", features = ["test-util"] }
 # Test-only tracing capture (#2756, I4): asserts the equal-timestamp guard's
 # drop branch logged. Its target `session.store` is rejected by the default
 # `agent_of_empires=trace` env filter, so `no-env-filter` is required; the
@@ -264,9 +244,6 @@ serde_json = "1.0"
 # dependency; the build-cache guard test parses .cargo/config.toml.
 toml = "1.1"
 cargo-husky = { version = "1", default-features = false, features = ["precommit-hook", "run-cargo-fmt"] }
-# Test-only axum dep, used by the update e2e fixture server that serves
-# a fake release tarball. The runtime code uses reqwest, not axum.
-axum = { version = "0.8", features = ["ws"] }
 # Test-only tower dep for `ServiceExt::oneshot`, so the DNS-rebinding gate
 # (#2735) can be driven through the real router without binding a socket.
 tower = { version = "0.5", features = ["util"] }
@@ -274,9 +251,22 @@ tower = { version = "0.5", features = ["util"] }
 # integration tests so they can reach `crate::tmux::test_support`. This is
 # the standard Cargo pattern for opt-in test-only re-exports; the lib build
 # (and release binaries) never see the feature. `default-features = false`
-# matters: without it this entry re-enables the default `serve` feature
-# under `cargo test --no-default-features`, making that CI job meaningless.
+# matters: without it this entry re-enables the default features under
+# `cargo test --no-default-features`, making that CI job meaningless.
 agent-of-empires = { path = ".", default-features = false, features = ["test-support"] }
+
+[profile.dev]
+# Full DWARF is cargo's `dev` default and it dominates `target/`: this table and
+# the one below take a `cargo build --lib --bins` here from 5.6 GB to 3.8 GB.
+# Line tables keep the file and line number in panics and backtraces; the cost
+# is local-variable inspection under a debugger. docs/development.md documents
+# the tradeoff and how to opt back into full debug info.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+# Dependencies only; the `"*"` glob never matches a workspace member. Nobody
+# reads DWARF for tokio internals, so it is pure weight in every target dir.
+debug = false
 
 [profile.release]
 lto = true
@@ -294,16 +284,11 @@ codegen-units = 16
 debug-assertions = false
 
 [[test]]
-# ACP runner is part of the serve / structured-view surface.
-name = "acp_runner_orphan"
-path = "tests/acp_runner_orphan.rs"
-required-features = ["serve"]
-
-[[test]]
 # Explicit target so the `e2e-tests` feature gate applies. Without this entry
 # Cargo auto-discovers tests/e2e/main.rs unconditionally; the gate lets CI split
-# the serve suite into "everything except e2e" and "e2e only" shards. The other
-# standalone test binaries stay auto-discovered.
+# the suite into "everything except e2e" and "e2e only" shards. The other
+# test targets (the consolidated `integration` harness and the standalone
+# `branch_exists_spawn_failure`) stay auto-discovered.
 name = "e2e"
 path = "tests/e2e/main.rs"
 required-features = ["e2e-tests"]

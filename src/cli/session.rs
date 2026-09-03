@@ -47,8 +47,8 @@ pub enum SessionCommands {
     /// restarts the agent so it can see it; the conversation is kept. See #3103.
     AddProject(AddProjectArgs),
 
-    /// Set the resume target for a session (pin a conversation or force a
-    /// one-shot fresh start)
+    /// Set the resume target for a session; agents with resume disabled in AoE
+    /// store the ID but do not use it
     SetSessionId(SetSessionIdArgs),
 
     /// Set or clear the per-session diff base branch. The diff view
@@ -123,7 +123,6 @@ pub struct ImportArgs {
     /// Import as structured-view sessions (rendered in the web dashboard and
     /// the structured TUI view) instead of terminal/tmux sessions. Structured
     /// sessions replay their transcript under `aoe serve`.
-    #[cfg(feature = "serve")]
     #[arg(long)]
     pub structured: bool,
 
@@ -278,9 +277,9 @@ struct CaptureOutput {
 pub struct SetSessionIdArgs {
     /// Session ID or title
     identifier: String,
-    /// Resume target: a UUID/sid pins the next launches to that
-    /// conversation; an empty string forces a one-shot fresh start (after
-    /// which the system reverts to auto-resume).
+    /// Resume target: for resume-enabled agents, a UUID/sid pins subsequent
+    /// launches to that conversation; agents with resume disabled in AoE store
+    /// but do not use it. An empty string forces a one-shot fresh start.
     session_id: String,
 }
 
@@ -654,7 +653,7 @@ async fn empty_trash(profile: &str) -> Result<()> {
     let mut being_restored_elsewhere = 0usize;
     let mut being_purged_elsewhere = 0usize;
     for inst in &trashed {
-        let config = crate::session::repo_config::resolve_config_with_repo_or_warn(
+        let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
             profile,
             std::path::Path::new(&inst.project_path),
         );
@@ -763,7 +762,7 @@ async fn empty_trash(profile: &str) -> Result<()> {
 }
 
 async fn snooze_session(profile: &str, args: SnoozeArgs) -> Result<()> {
-    let config = crate::session::profile_config::resolve_config(profile)?;
+    let config = crate::session::config::profile_config::resolve_config(profile)?;
 
     // `--minutes` overrides the profile default; otherwise use the
     // configured `snooze_duration_minutes`. Validate either way so the
@@ -879,11 +878,6 @@ async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
 /// of the session appearing on disk). Calling `start`/`stop`/`restart`
 /// from the CLI silently no-ops, which previously misled users into
 /// thinking the session was up. Bail loudly with the actual remediation.
-///
-/// `structured_view` is gated behind the `serve` feature; without it the
-/// field doesn't exist on `Instance` and no session can be in structured view
-/// mode, so this is a no-op shim.
-#[cfg(feature = "serve")]
 fn bail_if_acp(inst: &crate::session::Instance, verb: &str) -> Result<()> {
     if inst.is_structured() {
         bail!(
@@ -894,11 +888,6 @@ fn bail_if_acp(inst: &crate::session::Instance, verb: &str) -> Result<()> {
              To control an structured-view session, use the web dashboard or the REST API."
         );
     }
-    Ok(())
-}
-
-#[cfg(not(feature = "serve"))]
-fn bail_if_acp(_inst: &crate::session::Instance, _verb: &str) -> Result<()> {
     Ok(())
 }
 
@@ -920,7 +909,7 @@ fn resolve_import_roots(paths: &[String]) -> Result<Vec<std::path::PathBuf>> {
 
 /// True when `id` is already imported by some instance, so a re-run does not
 /// create duplicates. Checks the terminal resume target, the poller-observed
-/// id, and (serve builds) the structured-view id.
+/// id, and the structured-view id.
 fn already_imported(instances: &[Instance], id: &str) -> bool {
     instances.iter().any(|inst| {
         if inst.agent_session_id.as_deref() == Some(id) {
@@ -929,7 +918,6 @@ fn already_imported(instances: &[Instance], id: &str) -> bool {
         if matches!(&inst.resume_intent, ResumeIntent::Use(s) if s == id) {
             return true;
         }
-        #[cfg(feature = "serve")]
         if inst.acp_session_id.as_deref() == Some(id) {
             return true;
         }
@@ -959,7 +947,6 @@ fn build_import_instance(
     inst
 }
 
-#[cfg(feature = "serve")]
 fn apply_import_mode(
     inst: &mut Instance,
     s: &crate::session::claude_import::ClaudeSessionSummary,
@@ -974,22 +961,10 @@ fn apply_import_mode(
     }
 }
 
-#[cfg(not(feature = "serve"))]
-fn apply_import_mode(
-    inst: &mut Instance,
-    s: &crate::session::claude_import::ClaudeSessionSummary,
-    _structured: bool,
-) {
-    inst.resume_intent = ResumeIntent::Use(s.session_id.clone());
-}
-
 async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
     use crate::session::claude_import::{scan_sessions, sessions_under_paths, MAX_SESSIONS};
 
-    #[cfg(feature = "serve")]
     let structured = args.structured;
-    #[cfg(not(feature = "serve"))]
-    let structured = false;
 
     // Discover, then narrow to the requested paths unless --all.
     let mut discovered = scan_sessions();
@@ -1398,16 +1373,7 @@ fn pick_targets_for_restart_all(instances: &[crate::session::Instance]) -> Vec<S
     instances
         .iter()
         .filter(|i| !matches!(i.status, Status::Deleting | Status::Creating))
-        .filter(|_i| {
-            #[cfg(feature = "serve")]
-            {
-                !_i.is_structured()
-            }
-            #[cfg(not(feature = "serve"))]
-            {
-                true
-            }
-        })
+        .filter(|i| !i.is_structured())
         .map(|i| i.id.clone())
         .collect()
 }
@@ -1585,12 +1551,12 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
     // Resolving the profile config installs the declarative status-rule
     // registry for this profile; the status detection below never loads config
     // itself, so a rules-having custom agent would otherwise report Idle.
-    crate::session::profile_config::resolve_config_or_warn(profile);
+    crate::session::config::profile_config::resolve_config_or_warn(profile);
 
     // Refresh status from tmux so the output reflects current state
     // rather than the stale persisted value.
     crate::tmux::refresh_session_cache();
-    inst.update_status();
+    inst.update_status_once(None, None);
     let contended = crate::session::Instance::contended_capture_cwds(&instances);
     inst.self_heal_session_id(profile, &contended);
 
@@ -1649,7 +1615,7 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
     // Resolving the profile config installs the declarative status-rule
     // registry for this profile; the status detection below never loads config
     // itself, so a rules-having custom agent would otherwise report Idle.
-    crate::session::profile_config::resolve_config_or_warn(profile);
+    crate::session::config::profile_config::resolve_config_or_warn(profile);
 
     let tmux_session = crate::tmux::Session::new(&inst.id, &inst.title)?;
 
@@ -1838,7 +1804,7 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
     // Tied mode (#1927): renaming an aoe-managed worktree session also moves
     // its directory leaf to match the title (and optionally the branch), so
     // the two cannot drift. Decided per-session from the resolved setting.
-    let config = crate::session::profile_config::resolve_config_or_warn(profile);
+    let config = crate::session::config::profile_config::resolve_config_or_warn(profile);
     let tied = inst.tie_workdir_applies(config.session.tie_workdir_to_name);
     let tied_edit = tied && (args.title.is_some() || args.rename_branch);
     let duplicate_path = if tied_edit {
@@ -1885,10 +1851,15 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
             // Persisted status can lag the live tmux pane; recompute only when
             // the request will mutate the checkout. A cwd/branch-stable title
             // no-op must remain valid for an active session.
+            //
+            // Deliberately the holding entry point rather than
+            // `update_status_once`: a held proposal leaves the row on Running,
+            // so an ambiguous frame refuses the edit instead of moving a
+            // worktree out from under a live agent.
             let mut live = inst.clone();
             live.source_profile = profile.to_string();
             crate::tmux::refresh_session_cache();
-            live.update_status();
+            live.update_status_with_metadata(None, None);
             let container_holds = !live.status.blocks_worktree_edit()
                 && moves_worktree
                 && crate::session::worktree_edit::ensure_sandbox_container_released(
@@ -2215,7 +2186,7 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
     // When tied (#1927) the directory follows the title, so reject the
     // standalone edit and point at the unified rename instead.
     if inst.tie_workdir_applies(
-        crate::session::profile_config::resolve_config_or_warn(profile)
+        crate::session::config::profile_config::resolve_config_or_warn(profile)
             .session
             .tie_workdir_to_name,
     ) {
@@ -2240,10 +2211,11 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
     }
     // Persisted status can lag the real tmux pane, and moving the worktree of
     // a still-running session is unsafe. Recompute from live tmux state before
-    // enforcing the guard.
+    // enforcing the guard. The holding entry point, for the reason
+    // `rename_session` gives: an ambiguous frame must refuse the move.
     let mut live = inst.clone();
     crate::tmux::refresh_session_cache();
-    live.update_status();
+    live.update_status_with_metadata(None, None);
     // A sandbox container keeps the worktree dir mounted even while the agent
     // is Idle, so the move would fail. The gate drops a merely-stopped
     // container to free the mount and only reports held for a live one, which
@@ -2385,7 +2357,6 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
         .context("failed to acquire instance resume-target lock")?;
     let (title, tool) = storage.update(|instances, _groups| {
         super::patch_instance(instances, &target_id, |inst| {
-            #[cfg(feature = "serve")]
             if inst.is_structured() {
                 anyhow::bail!(
                     "cannot set resume target on structured view-mode session '{}'; structured view manages its own conversation lifecycle via ACP",
@@ -2407,7 +2378,10 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
                     agent.resume_strategy,
                     crate::agents::ResumeStrategy::Unsupported
                 ) {
-                    eprintln!("Warning: {} does not support session resume; this ID will be stored but not used.", tool);
+                    eprintln!(
+                        "Warning: session resume is disabled for {} in AoE; this ID will be stored but not used.",
+                        tool
+                    );
                 }
             }
         }
@@ -3045,7 +3019,7 @@ mod set_color_tests {
     }
 }
 
-#[cfg(all(test, feature = "serve"))]
+#[cfg(test)]
 mod acp_reject_tests {
     use super::{set_session_id, SetSessionIdArgs};
     use crate::session::{Instance, Storage};
@@ -3142,7 +3116,6 @@ mod import_tests {
         assert_eq!(inst.group_path, "team/imports");
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn structured_import_seeds_replay_fields() {
         let s = summary("sid-1", "/home/me/proj", Some("x"));

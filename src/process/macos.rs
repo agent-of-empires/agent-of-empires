@@ -387,19 +387,16 @@ fn find_process_in_group(pgrp: u32) -> Option<u32> {
 
 /// Prevents user-idle system sleep by holding a `caffeinate` child. `-i`
 /// inhibits system idle sleep only, so the display still sleeps normally.
-#[cfg(feature = "serve")]
 pub(super) struct CaffeinateInhibitor {
     child: Option<std::process::Child>,
 }
 
-#[cfg(feature = "serve")]
 impl CaffeinateInhibitor {
     pub(super) fn new() -> Self {
         Self { child: None }
     }
 }
 
-#[cfg(feature = "serve")]
 impl super::SleepInhibit for CaffeinateInhibitor {
     fn acquire(&mut self) -> anyhow::Result<()> {
         if super::sleep_inhibit_unavailable() {

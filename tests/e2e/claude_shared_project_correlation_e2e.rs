@@ -3,7 +3,7 @@
 //!
 //! This guards two shipped hardenings against silent regression:
 //!   * #1735, the per-instance hook sidecar fast path. `claude_poll_fn`
-//!     (`src/session/capture.rs`) reads
+//!     (`src/session/capture/mod.rs`) reads
 //!     `/tmp/aoe-hooks-<euid>/<instance_id>/session_id` first and returns it
 //!     without touching the shared `~/.claude/projects/<encoded-cwd>/` scan, so an
 //!     "empty thread" session (a UUID minted but no transcript on disk yet)

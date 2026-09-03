@@ -94,8 +94,15 @@ pub(crate) async fn attach_project(
     // prompt endpoint serialize on `prompt_submission` and never take
     // `instance_lock`, so a reconciler tick could otherwise deliver a queued
     // follow-up to the worker this is about to stop and retire the row as sent.
-    // Claimed first, which is the order `prompt_submission` documents.
-    let _submission = state.session_service.prompt_submission(id).await;
+    // Claimed first, which is the order `prompt_submission` documents, and in
+    // the admission form so an unknown id allocates neither lock.
+    let Some(_submission) = state
+        .session_service
+        .prompt_submission_for_session(id)
+        .await
+    else {
+        return Err(AttachError::NotFound);
+    };
     let inst_lock = state.instance_lock(id).await;
     // Held across the turn probe, the stop, the persist and the start. Releasing
     // it between any two of those is what would let a prompt land against a

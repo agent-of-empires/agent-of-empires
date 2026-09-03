@@ -93,7 +93,16 @@ pub(super) fn build_resume_flags(
             format!("{} {}", flag, session_id)
         }
         ResumeStrategy::Subcommand(sub) => format!("{} {}", sub, session_id),
-        ResumeStrategy::Unsupported => String::new(),
+        // A stored id survives the strategy being turned off, so say why the
+        // launch is dropping it rather than starting fresh with no trace.
+        ResumeStrategy::Unsupported => {
+            tracing::info!(target: "session.store",
+                tool = %tool,
+                sid = %session_id,
+                "session resume is disabled for this agent; stored ID left unused"
+            );
+            String::new()
+        }
     }
 }
 
@@ -615,7 +624,7 @@ mod tests {
         assert!(
             cmd.contains(&format!(
                 "AOE_PI_SESSION_ID_FILE={}/{}/session_id",
-                crate::session::container_config::PI_SIDECAR_DIR_IN_CONTAINER,
+                crate::session::config::container_config::PI_SIDECAR_DIR_IN_CONTAINER,
                 inst.id
             )),
             "the pane cannot publish without this: {cmd}"
@@ -658,7 +667,7 @@ mod tests {
             env.trim(),
             format!(
                 "AOE_PI_SESSION_ID_FILE={}/{}/session_id",
-                crate::session::container_config::PI_SIDECAR_DIR_IN_CONTAINER,
+                crate::session::config::container_config::PI_SIDECAR_DIR_IN_CONTAINER,
                 inst.id
             )
         );

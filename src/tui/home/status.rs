@@ -196,7 +196,6 @@ impl HomeView {
     /// Request the daemon's view of every structured row's status
     /// (non-blocking). Skipped entirely when no structured session is
     /// loaded, so a terminal-only home view never talks to the daemon.
-    #[cfg(feature = "serve")]
     pub fn request_daemon_status_refresh(&mut self) {
         if self.pending_daemon_status_refresh {
             return;
@@ -220,10 +219,10 @@ impl HomeView {
     ///
     /// Archived and trashed rows are also excluded. `/api/sessions` returns
     /// them unfiltered, and the `is_archived()` short-circuit that keeps the
-    /// tmux producer off a sunk row lives in `update_status_with_metadata_inner`
-    /// (`instance.rs`), which this daemon path never reaches; without this a
-    /// sunk row would be restamped and re-marked unread. See #3201 / #1868 /
-    /// #2206.
+    /// tmux producer off a sunk row lives in
+    /// `session::instance::status_update::update_status_with_metadata_inner`,
+    /// which this daemon path never reaches; without this a sunk row would be
+    /// restamped and re-marked unread. See #3201 / #1868 / #2206.
     ///
     /// The cost of that exclusion: a sunk structured row that is already in
     /// `Status::Error` now has no producer able to clear it. The daemon is
@@ -235,7 +234,6 @@ impl HomeView {
     /// legible). The tmux producer has the same property via its own
     /// `is_archived()` short-circuit, so this is consistent rather than new,
     /// but unarchiving is the only way back.
-    #[cfg(feature = "serve")]
     fn daemon_status_applies_to(&self, inst: &Instance) -> bool {
         !self.recovery_in_flight.contains(&inst.id)
             && !self.restart_in_flight.contains(&inst.id)
@@ -245,7 +243,6 @@ impl HomeView {
 
     /// Apply any pending daemon-sourced statuses. Returns true if the
     /// caller should redraw.
-    #[cfg(feature = "serve")]
     pub fn apply_daemon_status_updates(&mut self) -> bool {
         use std::sync::mpsc::TryRecvError;
 
@@ -288,7 +285,6 @@ impl HomeView {
     /// trusted from the wire: the daemon's `view` and the local row's could
     /// disagree for a session mid-conversion, and the tmux poller owns
     /// terminal rows. Dropping the mismatch keeps one producer per row.
-    #[cfg(feature = "serve")]
     pub(in crate::tui) fn apply_daemon_status_update(
         &mut self,
         update: crate::tui::daemon_status_poller::DaemonStatusUpdate,
@@ -341,6 +337,8 @@ impl HomeView {
                 // dead-pane tier never applies to them.
                 pane_dead: false,
                 live_status_baseline: Some(update.status),
+                // A structured row has no pane to detect against.
+                detection: None,
             },
             true,
             true,
@@ -390,6 +388,7 @@ impl HomeView {
             let new_error = update.last_error;
             let new_idle_entered_at = update.idle_entered_at;
             let new_live_status_baseline = update.live_status_baseline;
+            let new_detection = update.detection;
             let status_changed = old_status != Some(new_status);
             self.mutate_instance(&update.id, |inst| {
                 inst.status = new_status;
@@ -428,9 +427,16 @@ impl HomeView {
                 // and silently disables restamping on real transitions.
                 // Locked by
                 // [`apply_status_update_propagates_live_status_baseline_from_poller`]
-                // in `src/tui/home/tests.rs`. See #2690.
+                // in `src/tui/home/tests/status_rows_menu.rs`. See #2690.
                 if let Some(baseline) = new_live_status_baseline {
                     inst.live_status_baseline = Some(baseline);
+                }
+                // The poller decided on a clone, so its detection bookkeeping
+                // only reaches the next poll through here. `None` is a
+                // producer that never detected; it must not reset the row.
+                // See #3642.
+                if let Some(detection) = new_detection {
+                    inst.detection = detection;
                 }
                 inst.pane_dead_observed = new_pane_dead;
             });

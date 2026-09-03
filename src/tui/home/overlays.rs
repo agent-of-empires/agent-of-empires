@@ -16,7 +16,7 @@ impl HomeView {
     /// Tick dialog animations/timers and drain hook progress.
     /// Returns true when a redraw is needed.
     pub fn tick_dialog(&mut self) -> bool {
-        use crate::session::repo_config::HookProgress;
+        use crate::session::config::repo_config::HookProgress;
 
         let mut changed = false;
 
@@ -35,7 +35,6 @@ impl HomeView {
         }
 
         // Poll serve dialog for subprocess startup events.
-        #[cfg(feature = "serve")]
         if let Some(view) = &mut self.serve_view {
             if view.tick() {
                 changed = true;
@@ -94,10 +93,7 @@ impl HomeView {
     /// (the wheel-scroll on the dashboard preview won't work while it's
     /// off).
     pub fn wants_text_selection(&self) -> bool {
-        #[cfg(feature = "serve")]
         let serve_open = self.serve_view.is_some();
-        #[cfg(not(feature = "serve"))]
-        let serve_open = false;
 
         serve_open
             || self.info_dialog.is_some()
@@ -122,10 +118,7 @@ impl HomeView {
     /// gate off the fast path it's supposed to enable — that's why the
     /// fast path needs this method instead.
     pub(in crate::tui) fn has_non_live_send_overlay(&self) -> bool {
-        #[cfg(feature = "serve")]
         let serve_open = self.serve_view.is_some();
-        #[cfg(not(feature = "serve"))]
-        let serve_open = false;
 
         self.show_help
             || self.search_active
@@ -188,10 +181,7 @@ impl HomeView {
     }
 
     pub fn has_dialog(&self) -> bool {
-        #[cfg(feature = "serve")]
         let serve_open = self.serve_view.is_some();
-        #[cfg(not(feature = "serve"))]
-        let serve_open = false;
 
         self.live_send.is_some()
             || self.show_help

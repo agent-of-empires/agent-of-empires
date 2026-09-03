@@ -308,8 +308,7 @@ pub struct UsageSnapshot {
     /// Installed-plugin census: source bucket (`builtin` / `featured` /
     /// `community` / `local`) -> count. Counts the whole installed population
     /// per source, no identity, so it is safe for every source. Empty (and so
-    /// omitted) when no plugins are loaded, e.g. a TUI-only build with no
-    /// installs. See `telemetry::plugins`.
+    /// omitted) when no plugins are loaded. See `telemetry::plugins`.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub plugins_by_source: BTreeMap<String, u32>,
     /// Active-state for the plugins whose identity is safe to name: builtin

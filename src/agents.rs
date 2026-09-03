@@ -69,7 +69,7 @@ pub enum ResumeStrategy {
     /// The subcommand + id are inserted right after the binary name so that
     /// other flags land after it.
     Subcommand(&'static str),
-    /// Agent does not support session resume.
+    /// AoE must not emit resume arguments for this agent.
     Unsupported,
 }
 
@@ -332,7 +332,7 @@ pub struct AgentDef {
     pub binary: &'static str,
     /// Subcommand token inserted immediately after `binary` when AoE builds the
     /// default launch command (e.g. `Some("chat")` for kiro → `kiro-cli chat`).
-    /// Required for CLIs whose interactive flags (yolo, `--agent`, resume) live
+    /// Required for CLIs whose interactive flags (yolo, `--agent`) live
     /// on a subcommand rather than the top-level binary: bare
     /// `kiro-cli --trust-all-tools` is rejected with "unexpected argument",
     /// while `kiro-cli chat --trust-all-tools` parses. `None` for agents whose
@@ -1167,7 +1167,7 @@ pub const AGENTS: &[AgentDef] = &[
         name: "kiro",
         oneshot_flag: None,
         binary: "kiro-cli",
-        // Kiro's interactive flags (--trust-all-tools, --agent, --resume-id)
+        // Kiro's interactive flags (--trust-all-tools, --agent)
         // are defined on the `chat` subcommand. Bare `kiro-cli --trust-all-tools`
         // fails with "unexpected argument"; `kiro-cli chat ...` parses.
         launch_subcommand: Some("chat"),
@@ -1202,7 +1202,7 @@ pub const AGENTS: &[AgentDef] = &[
             format: SidecarFormat::KiroJson,
             events: KIRO_SIDECAR_EVENTS,
         }),
-        resume_strategy: ResumeStrategy::Flag("--resume-id"),
+        resume_strategy: ResumeStrategy::Unsupported,
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -1230,10 +1230,7 @@ pub const AGENTS: &[AgentDef] = &[
             format: HookFormat::JsonSettings,
         }),
         sidecar_hooks: None,
-        resume_strategy: ResumeStrategy::FlagPair {
-            existing: "--resume",
-            new_session: "--session-id",
-        },
+        resume_strategy: ResumeStrategy::Unsupported,
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -1483,7 +1480,7 @@ impl AgentDef {
 
     /// The base launch token(s) for the default (non-overridden) command:
     /// the binary, plus any `launch_subcommand` (e.g. `"kiro-cli chat"`). All
-    /// subsequent flags (extra args, yolo, resume) are appended after this, so
+    /// subsequent flags (extra args, yolo, agent selection) are appended after this, so
     /// subcommand-scoped flags land on the subcommand where the CLI expects
     /// them. Agents without a `launch_subcommand` just return the binary.
     pub fn launch_base_command(&self) -> String {
@@ -1557,8 +1554,7 @@ pub fn get_agent(name: &str) -> Option<&'static AgentDef> {
 /// Registry lifecycle state for an ACP-registry key. Falls back to Active
 /// for registry entries with no `AGENTS` counterpart (bundled or alias-only
 /// keys). Shared by the doctor, `/api/acp/agents`, and `aoe acp agents`
-/// surfaces; every consumer is serve-gated, so the helper is too.
-#[cfg(feature = "serve")]
+/// surfaces.
 pub(crate) fn registry_lifecycle(name: &str) -> AgentLifecycle {
     get_agent(name)
         .map(|def| def.lifecycle)
@@ -2462,7 +2458,7 @@ mod tests {
 
     #[test]
     fn test_kiro_launches_via_chat_subcommand() {
-        // Kiro's interactive flags (--trust-all-tools, --agent, --resume-id)
+        // Kiro's interactive flags (--trust-all-tools, --agent)
         // are scoped to the `chat` subcommand, so the base command must include
         // it; bare `kiro-cli --trust-all-tools` is rejected by the CLI.
         let kiro = get_agent("kiro").unwrap();
@@ -2500,9 +2496,9 @@ mod tests {
     fn test_launch_subcommand_not_combined_with_subcommand_resume() {
         // `append_resume_flags` inserts a Subcommand resume token after the
         // first whitespace token, which for a launch_subcommand agent is the
-        // binary. That lands the resume token before the subcommand and produces
-        // a malformed command (e.g. `kiro-cli resume <id> chat ...`). Forbid the
-        // pairing until that insertion is made subcommand-aware.
+        // binary. That lands the resume token before the launch subcommand and
+        // produces a malformed command. Forbid the pairing until insertion is
+        // made subcommand-aware.
         for agent in AGENTS {
             if agent.launch_subcommand.is_some() {
                 assert!(

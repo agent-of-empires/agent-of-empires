@@ -40,7 +40,7 @@ impl Instance {
         // reconciliation path feeds a different consumer, and each consumer
         // rewrites the runtime field it observes before reading
         // (`pane_dead_observed` is rewritten by the TUI's status poller
-        // before its TUI-only consumers read).
+        // before its consumers read).
         let disk_has_newer_lifecycle = disk.lifecycle_generation > self.lifecycle_generation;
         if !disk_has_newer_lifecycle {
             disk.last_error_check = self.last_error_check;
@@ -78,7 +78,7 @@ impl Instance {
     /// and `Cleared` override); excluded sids skipped (cascade re-poison
     /// guard).
     pub(super) fn reconcile_sidecar_into_disk(&mut self) {
-        if self.tool != "claude" {
+        if self.capture_agent_name() != Some("claude") {
             return;
         }
         if !matches!(self.resume_intent, ResumeIntent::Default) {
