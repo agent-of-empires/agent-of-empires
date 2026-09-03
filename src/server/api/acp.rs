@@ -3529,11 +3529,17 @@ mod tests {
         );
     }
 
+    /// #3688: a fresh prompt is the recovery the give-up banner points at, so
+    /// an exhausted park must drive a resume rather than buffer the prompt on
+    /// a queue only a live or idle-dormant worker drains.
+    ///
+    /// No `ResumeReservation` is held here on purpose: one makes `is_running`
+    /// true, which short-circuits the park probe entirely and leaves the test
+    /// asserting nothing about this path. The spawn instead fails on the
+    /// missing project path, and its `AgentStartupError` is the proof that a
+    /// resume ran at all.
     #[tokio::test]
-    async fn exhausted_rate_limit_prompt_waits_for_resume_instead_of_queueing() {
-        use crate::acp::supervisor::{ResumeKind, ResumeReservationOutcome};
-        use std::time::Duration;
-
+    async fn exhausted_rate_limit_prompt_resumes_instead_of_queueing() {
         let mut inst = crate::session::Instance::new("exhausted-3688", "/tmp/aoe-3688-project");
         inst.id = "sess-3688".to_string();
         inst.view = crate::session::View::Structured;
@@ -3545,37 +3551,22 @@ mod tests {
             0,
         ));
 
-        let reservation = match state
-            .acp_supervisor
-            .begin_resume(&id, ResumeKind::Spawn)
-            .await
-            .expect("begin_resume must not error under capacity")
-        {
-            ResumeReservationOutcome::Reserved(r) => r,
-            ResumeReservationOutcome::AlreadyPresent => panic!("expected a fresh reservation"),
-        };
-        let handler = tokio::spawn({
-            let state = Arc::clone(&state);
-            let id = id.clone();
-            async move {
-                acp_prompt(
-                    State(state),
-                    Path(id),
-                    Ok(Json(PromptRequest {
-                        text: "start a fresh retry budget".to_string(),
-                        attachments: Vec::new(),
-                        prompt_id: None,
-                    })),
-                )
-                .await
-                .into_response()
-            }
-        });
+        let response = acp_prompt(
+            State(Arc::clone(&state)),
+            Path(id.clone()),
+            Ok(Json(PromptRequest {
+                text: "start a fresh retry budget".to_string(),
+                attachments: Vec::new(),
+                prompt_id: None,
+            })),
+        )
+        .await
+        .into_response();
 
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(
-            !handler.is_finished(),
-            "an exhausted-park prompt must wait for send_turn's resume instead of queueing"
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the resume could not spawn, which is retryable, not a queued 202"
         );
         assert!(
             state
@@ -3583,19 +3574,18 @@ mod tests {
                 .queued_prompts_snapshot(&id)
                 .await
                 .is_empty(),
-            "fresh recovery prompt must not be stranded in the server queue"
+            "the recovery prompt must not be stranded on the server queue"
         );
-
-        drop(reservation);
-        let response = tokio::time::timeout(Duration::from_secs(30), handler)
-            .await
-            .expect("handler must finish once the reservation drops")
-            .expect("handler task must not panic");
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let events = state.acp_event_store.replay_from(&id, 0);
         assert!(
-            !state
-                .acp_event_store
-                .replay_from(&id, 0)
+            events
+                .iter()
+                .any(|(_, e)| matches!(e, Event::AgentStartupError { .. })),
+            "the park must have driven a resume; without one nothing ever \
+             brings this session back"
+        );
+        assert!(
+            !events
                 .iter()
                 .any(|(_, e)| matches!(e, Event::UserPromptSent { .. })),
             "a prompt with no worker must remain unpublished for retry"
@@ -3706,18 +3696,12 @@ mod tests {
     }
 
     /// #3688: the diff-comments endpoint is the other user surface that opens
-    /// a turn, and the cap park is terminal, so refusing here loses the
-    /// review the user just wrote with nothing scheduled to make a retry
-    /// work. It must wake the park like an ordinary prompt does.
-    ///
-    /// A held `ResumeReservation` stands in for a spawn in flight: pre-fix
-    /// the handler answered its refusal immediately, so still being in the
-    /// readiness wait is the whole assertion.
+    /// a turn, and the cap park is terminal, so refusing here loses the review
+    /// the user just wrote with nothing scheduled to make a retry work. It
+    /// must wake the park like an ordinary prompt does. Same no-reservation
+    /// reasoning as the prompt test above.
     #[tokio::test]
     async fn diff_comments_on_an_exhausted_park_resume_instead_of_refusing() {
-        use crate::acp::supervisor::{ResumeKind, ResumeReservationOutcome};
-        use std::time::Duration;
-
         let mut inst = crate::session::Instance::new("dc-3688", "/tmp/aoe-3688-diff");
         inst.id = "sess-3688-diff".to_string();
         inst.view = crate::session::View::Structured;
@@ -3728,52 +3712,32 @@ mod tests {
             crate::server::acp_reconciler::RATE_LIMIT_EXHAUSTED_RETRIES_REASON,
             0,
         ));
-        let reservation = match state
-            .acp_supervisor
-            .begin_resume(&id, ResumeKind::Spawn)
-            .await
-            .expect("begin_resume must not error under capacity")
-        {
-            ResumeReservationOutcome::Reserved(r) => r,
-            ResumeReservationOutcome::AlreadyPresent => panic!("expected a fresh reservation"),
-        };
 
-        let handler = tokio::spawn({
-            let state = Arc::clone(&state);
-            let id = id.clone();
-            async move {
-                acp_prompt_diff_comments(
-                    State(state),
-                    Path(id),
-                    Ok(Json(DiffCommentsPromptRequest {
-                        intro: "review".to_string(),
-                        outro: String::new(),
-                        is_multi_repo: false,
-                        comments: Vec::new(),
-                        assembled_markdown: "please address these".to_string(),
-                    })),
-                )
-                .await
-                .into_response()
-            }
-        });
+        let response = acp_prompt_diff_comments(
+            State(Arc::clone(&state)),
+            Path(id.clone()),
+            Ok(Json(DiffCommentsPromptRequest {
+                intro: "review".to_string(),
+                outro: String::new(),
+                is_multi_repo: false,
+                comments: Vec::new(),
+                assembled_markdown: "please address these".to_string(),
+            })),
+        )
+        .await
+        .into_response();
 
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(
-            !handler.is_finished(),
-            "an exhausted-park review must wait for the resume, not be refused outright"
-        );
-
-        drop(reservation);
-        let response = tokio::time::timeout(Duration::from_secs(30), handler)
-            .await
-            .expect("handler must finish once the reservation drops")
-            .expect("handler task must not panic");
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let events = state.acp_event_store.replay_from(&id, 0);
         assert!(
-            !state
-                .acp_event_store
-                .replay_from(&id, 0)
+            events
+                .iter()
+                .any(|(_, e)| matches!(e, Event::AgentStartupError { .. })),
+            "the review must have driven a resume rather than being refused \
+             against a park nothing un-parks"
+        );
+        assert!(
+            !events
                 .iter()
                 .any(|(_, e)| matches!(e, Event::UserDiffCommentsPrompt { .. })),
             "a review card with no worker behind it must stay unpublished"

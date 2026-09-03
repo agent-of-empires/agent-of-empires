@@ -189,13 +189,13 @@ after the park; if the limit has not cleared the session re-parks and the next
 retry is another hour out.
 
 Auto-resume re-sends the interrupted prompt each time, so it stops after five
-tries that all come back rate-limited. The banner then reads "Auto-resume
+re-sends that all come back rate-limited. The banner then reads "Auto-resume
 stopped: the same prompt was re-sent too many times without getting through",
 and the session stays put rather than burning the same turn once an hour
-forever. "Resume now" and sending a new prompt both restart it with a full
-five; so does switching agents, or any turn that completes. The manual
-"Continue in another agent" and reconnect paths stay available regardless of
-the setting.
+forever. Parking resets the count, so "Resume now" or a new prompt picks up
+from there with a full five; a completed turn and an agent switch reset it
+too, and "Resume now" retries never count against it. The manual "Continue in
+another agent" and reconnect paths stay available regardless of the setting.
 
 ### Switching agents manually
 

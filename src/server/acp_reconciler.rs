@@ -319,6 +319,17 @@ pub async fn reconcile_acp_workers(
             })
             .collect()
     };
+    // Sessions holding undelivered prompts, snapshotted under the same lock.
+    // A queued prompt is a user turn waiting on a worker, so it releases the
+    // redelivery-cap park below just as a directly-POSTed one does (#3688).
+    let with_queued_prompts: HashSet<String> = {
+        let instances = state.instances.read().await;
+        instances
+            .iter()
+            .filter(|i| !i.queued_prompts.is_empty())
+            .map(|i| i.id.clone())
+            .collect()
+    };
 
     let live: HashSet<&String> = raw_targets.iter().map(|t| &t.0).collect();
     attempted.retain(|id| live.contains(id));
@@ -436,7 +447,14 @@ pub async fn reconcile_acp_workers(
             // #3688: the auto-resume pass parked this session after its
             // redelivery cap. Same hold as the adapter park above, minus the
             // resume schedule: only a manual retry or a fresh prompt un-parks.
-            if reason == RATE_LIMIT_EXHAUSTED_RETRIES_REASON {
+            //
+            // A prompt already on the server queue is one of those fresh
+            // prompts, just one that arrived while the session was still on
+            // the adapter park. Nothing else would ever deliver it: the queue
+            // drain leaves a non-dormant workerless session to this pass, and
+            // this pass is what holds it. So respawn under the ordinary
+            // budget and let the next tick's drain send it.
+            if reason == RATE_LIMIT_EXHAUSTED_RETRIES_REASON && !with_queued_prompts.contains(&id) {
                 attempted.insert(id);
                 continue;
             }
@@ -3182,6 +3200,70 @@ mod tests {
                 crate::acp::Event::Stopped { reason } => Some(reason),
                 _ => None,
             })
+    }
+
+    /// #3688: a prompt POSTed while the session was still on the adapter park
+    /// lands on the server queue, because the cap has not fired yet and there
+    /// is no worker. When the cap then fires, nothing else in the daemon will
+    /// ever deliver it: the queue drain leaves a non-dormant workerless
+    /// session to the resume pass, and the resume pass is what holds the park.
+    /// So the park must yield to queued work. The bogus agent name makes the
+    /// respawn fail fast, and its `AgentStartupError` is the proof one was
+    /// attempted at all.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cap_park_yields_to_a_prompt_already_on_the_queue() {
+        let cases = [(true, true), (false, false)];
+        for (has_queue, expect_respawn) in cases {
+            let id = if has_queue {
+                "sess-3688-queued"
+            } else {
+                "sess-3688-unqueued"
+            };
+            let (state, _home, _project) = capacity_test_state(id).await;
+            assert!(state.acp_supervisor.publish_stopped_if_seq(
+                id,
+                RATE_LIMIT_EXHAUSTED_RETRIES_REASON,
+                0,
+            ));
+            if has_queue {
+                let mut instances = state.instances.write().await;
+                let inst = instances.iter_mut().find(|i| i.id == id).unwrap();
+                inst.queued_prompts
+                    .push(crate::acp::state::QueuedPromptEntry {
+                        id: "q-1".to_string(),
+                        seq: 1,
+                        text: "typed while the session was parked".to_string(),
+                        attachments: Vec::new(),
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                        origin_device: None,
+                    });
+            }
+
+            let mut attempted: HashSet<String> = HashSet::new();
+            let mut respawn_history: HashMap<String, Vec<Instant>> = HashMap::new();
+            let mut parked: HashSet<String> = HashSet::new();
+            let mut capacity_deferred: HashSet<String> = HashSet::new();
+            run_tick(
+                &state,
+                &mut attempted,
+                &mut respawn_history,
+                &mut parked,
+                &mut capacity_deferred,
+            )
+            .await;
+
+            let respawned = state
+                .acp_event_store
+                .replay_from(id, 0)
+                .into_iter()
+                .any(|(_, e)| matches!(e, crate::acp::Event::AgentStartupError { .. }));
+            assert_eq!(
+                respawned, expect_respawn,
+                "cap park with queued prompts = {has_queue}: a queued prompt is a \
+                 user turn waiting on a worker, and an empty queue must stay parked"
+            );
+        }
     }
 
     /// Under the cap the pass resumes: it re-queues the interrupted prompt,

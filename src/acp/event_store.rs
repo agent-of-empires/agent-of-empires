@@ -1231,12 +1231,14 @@ impl EventStore {
     ///   own park) or an `AgentSwitched`. A new backend must not inherit the
     ///   old one's spent budget, which is the reset the web reducer already
     ///   applies on its side.
-    /// - A breadcrumb whose resume never reached the agent does not count. If
-    ///   the first lifecycle event after it is an `AgentStartupError` rather
-    ///   than the redelivered `UserPromptSent`, no prompt was burned. Such a
-    ///   failure is not a boundary either: granting a fresh five for every
-    ///   failed spawn would uncap the loop the spawn-budget gate exists to
-    ///   bound.
+    /// - Only a breadcrumb whose resume actually re-delivered counts: the
+    ///   first thing to happen after it must be the redelivered
+    ///   `UserPromptSent`. A spawn that failed (`AgentStartupError`) burned no
+    ///   prompt, and neither did a resume for a session whose interrupted turn
+    ///   was agent-initiated, where there is no prompt to re-send at all and
+    ///   `rate_limited_turn_prompt` hands the drain nothing. Such a resume is
+    ///   not a boundary either: granting a fresh five for every failed spawn
+    ///   would uncap the loop the spawn-budget gate exists to bound.
     /// - Manual RESUME NOW breadcrumbs do not count. The cap bounds what the
     ///   daemon does on its own; a user re-sending by hand is the recovery,
     ///   not the damage.
@@ -1263,10 +1265,11 @@ impl EventStore {
                    SELECT n.discriminant FROM acp_events n
                    WHERE n.session_id = ?1
                      AND n.seq > r.seq
-                     AND n.discriminant IN ('AgentStartupError', 'UserPromptSent')
+                     AND n.discriminant IN (
+                           'UserPromptSent', 'AgentStartupError', 'RateLimitAutoResumed')
                    ORDER BY n.seq ASC
                    LIMIT 1
-               ), '') != 'AgentStartupError'",
+               ), '') = 'UserPromptSent'",
             params![session_id],
             |row| row.get::<_, i64>(0),
         )
@@ -4279,29 +4282,38 @@ mod tests {
         store.record("s-1", 102, &rate_limit_event(0)).unwrap();
         store.record("s-1", 103, &stopped("rate_limited")).unwrap();
         store.record("s-1", 104, &resumes_at()).unwrap();
+        // Not yet: the resume has fired but nothing has been re-sent, and the
+        // cap counts prompts burned, not respawns attempted.
+        assert_eq!(store.rate_limit_redelivery_streak("s-1"), 0);
+        store
+            .record("s-1", 105, &user_prompt("run the nightly task"))
+            .unwrap();
         assert_eq!(store.rate_limit_redelivery_streak("s-1"), 1);
 
-        // A resume whose spawn failed re-delivered nothing, so it drops out
-        // of the count. It is not a boundary either: the resume before it
-        // would otherwise be forgiven too, and a crash-looping agent would
-        // buy an unlimited budget one failed spawn at a time.
+        // A resume whose spawn failed re-delivered nothing, so it drops out of
+        // the count without disturbing the one before it. It is not a
+        // boundary either: forgiving the whole streak per failed spawn would
+        // buy a crash-looping agent an unlimited budget.
+        store.record("s-1", 106, &rate_limit_event(0)).unwrap();
+        store.record("s-1", 107, &stopped("rate_limited")).unwrap();
+        store.record("s-1", 108, &resumes_at()).unwrap();
         store
             .record(
                 "s-1",
-                110,
+                109,
                 &Event::AgentStartupError {
                     message: "boom".into(),
                 },
             )
             .unwrap();
-        assert_eq!(store.rate_limit_redelivery_streak("s-1"), 0);
-        // The next resume did reach the agent (its redelivery landed), so it
-        // counts, and the earlier failed one still does not.
-        store.record("s-1", 111, &resumes_at()).unwrap();
-        store
-            .record("s-1", 112, &user_prompt("run the nightly task"))
-            .unwrap();
         assert_eq!(store.rate_limit_redelivery_streak("s-1"), 1);
+        // The next resume did reach the agent, so it counts and the failed
+        // one still does not.
+        store.record("s-1", 110, &resumes_at()).unwrap();
+        store
+            .record("s-1", 111, &user_prompt("run the nightly task"))
+            .unwrap();
+        assert_eq!(store.rate_limit_redelivery_streak("s-1"), 2);
 
         // RESUME NOW is the user's own recovery, not the daemon burning the
         // prompt, so it does not spend the automatic budget.
@@ -4311,7 +4323,7 @@ mod tests {
         store
             .record("s-1", 116, &user_prompt("run the nightly task"))
             .unwrap();
-        assert_eq!(store.rate_limit_redelivery_streak("s-1"), 1);
+        assert_eq!(store.rate_limit_redelivery_streak("s-1"), 2);
 
         // An agent switch hands the turn to a different backend, whose quota
         // is its own: the new one starts on a full budget.
@@ -4332,6 +4344,28 @@ mod tests {
             .record("s-1", 119, &user_prompt("run the nightly task"))
             .unwrap();
         assert_eq!(store.rate_limit_redelivery_streak("s-1"), 1);
+
+        // A session whose rate-limited turns are agent-initiated (a wakeup,
+        // a monitor, a `/loop`) has no prompt to re-send: the continuation
+        // lookup hands the drain nothing, so those resumes burn no turn and
+        // must not spend the budget. Parking such a session would disable
+        // auto-resume with a banner blaming a re-send that never happened.
+        store.record("s-3", 1, &stopped("prompt_complete")).unwrap();
+        for seq in 2..=16 {
+            let ev = if seq % 3 == 2 {
+                rate_limit_event(0)
+            } else if seq % 3 == 0 {
+                stopped("rate_limited")
+            } else {
+                resumes_at()
+            };
+            store.record("s-3", seq, &ev).unwrap();
+        }
+        assert_eq!(
+            store.rate_limit_redelivery_streak("s-3"),
+            0,
+            "resumes that re-delivered nothing must not count toward the cap"
+        );
 
         // No history means no streak.
         assert_eq!(store.rate_limit_redelivery_streak("s-2"), 0);
