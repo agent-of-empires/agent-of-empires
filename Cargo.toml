@@ -251,6 +251,24 @@ tower = { version = "0.5", features = ["util"] }
 # `cargo test --no-default-features`, making that CI job meaningless.
 agent-of-empires = { path = ".", default-features = false, features = ["test-support"] }
 
+[profile.dev]
+# Full DWARF is the cargo default for `dev` and dominates `target/`: a single
+# sandbox here carries a 5.8 GB target dir, 5.4 GB of it in `debug/deps`, with
+# the four largest artifacts (two `libagent_of_empires` rlibs and two test
+# binaries) accounting for 3.4 GB on their own. `line-tables-only` keeps the
+# filename and line number in panics and backtraces, which is what CI logs and
+# agent sandboxes actually read; it drops variable and function-parameter info,
+# so stepping through a local debugger loses value inspection. Use
+# `RUSTFLAGS="-Cdebuginfo=2"` or a scratch `[profile.dev]` override when you
+# need a full debugging session.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+# Dependencies only (567 crates in Cargo.lock); workspace members are unaffected
+# by this table. Nobody steps through tokio internals, and their debug info is
+# pure weight in every target dir.
+debug = false
+
 [profile.release]
 lto = true
 codegen-units = 1
