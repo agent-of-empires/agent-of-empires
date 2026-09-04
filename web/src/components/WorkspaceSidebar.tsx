@@ -465,7 +465,7 @@ const CONTEXT_RESUME_UNAVAILABLE_DETAIL: Record<ContextResumeUnavailableReason, 
 
 const CONTEXT_RESUME_INDETERMINATE_DETAIL: Record<ContextResumeIndeterminateReason, string> = {
   runtime_check_required: "a runtime check is required at launch",
-  agent_handshake_required: "an agent handshake is required at launch",
+  agent_handshake_required: "the agent has not reported native resume support yet",
 };
 
 function ContextResumeBadge({ availability }: { availability: ContextResumeAvailability | undefined }) {

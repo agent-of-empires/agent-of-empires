@@ -6,7 +6,7 @@ interface MockSession {
   title: string;
   context_resume?:
     | { state: "available" }
-    | { state: "indeterminate"; reason: "runtime_check_required" }
+    | { state: "indeterminate"; reason: "runtime_check_required" | "agent_handshake_required" }
     | { state: "unavailable"; reason: "no_target" };
 }
 
@@ -51,6 +51,11 @@ test("surfaces context resume risks without cluttering healthy rows", async ({ p
       title: "Runtime check",
       context_resume: { state: "indeterminate", reason: "runtime_check_required" },
     },
+    {
+      id: "handshake",
+      title: "Agent handshake",
+      context_resume: { state: "indeterminate", reason: "agent_handshake_required" },
+    },
     { id: "available", title: "Available context", context_resume: { state: "available" } },
     { id: "old-daemon", title: "Unreported context" },
   ]);
@@ -60,6 +65,9 @@ test("surfaces context resume risks without cluttering healthy rows", async ({ p
   await expect(page.getByLabel("Context resume not yet confirmed: a runtime check is required at launch")).toHaveText(
     "ctx:check",
   );
+  await expect(
+    page.getByLabel("Context resume not yet confirmed: the agent has not reported native resume support yet"),
+  ).toHaveText("ctx:check");
   await expect(page.getByRole("link", { name: /Available context/ })).not.toContainText("ctx:");
   await expect(page.getByRole("link", { name: /Unreported context/ })).not.toContainText("ctx:");
 });
