@@ -1062,18 +1062,17 @@ pub(crate) fn install_pi_sandbox_extension_at(root: &Path) -> Result<()> {
 }
 /// Which branch [`compute_volume_paths_with_resolve`] resolved the mounts through.
 ///
-/// Reported rather than re-derived, because a caller about to act destructively on
-/// the difference between the derived paths and reality needs the state of the
-/// resolve that produced *those* paths, not a fresh look taken afterwards.
+/// Reported rather than re-derived, so a caller acting on the difference between the
+/// derived paths and reality reads the resolve that produced *those* paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MountResolve {
-    /// The mounts follow from the project's git layout, or from a path that has no
-    /// git linkage to resolve.
+    /// The mounts follow from the project's git layout.
     Resolved,
-    /// `find_main_repo` failed for a path that presents as a worktree, so the mounts
-    /// collapsed to `/workspace/{basename}` (#2414). Every path derived here is
-    /// provisional: it names a location the session's container never mounted.
-    Degraded,
+    /// The mounts fell through to `/workspace/{basename}`, which is where a worktree
+    /// lands when its linkage is broken (#2414) and its container never mounted those
+    /// paths. Also where a plain directory and a repo root legitimately land, but their
+    /// workdir never moves, so nothing keys a decision on the difference.
+    Fallthrough,
 }
 
 pub(crate) fn compute_volume_paths(
@@ -1090,7 +1089,6 @@ pub(crate) fn compute_volume_paths_with_resolve(
     project_path: &Path,
     project_path_str: &str,
 ) -> Result<(Vec<VolumeMount>, String, MountResolve)> {
-    let mut resolve = MountResolve::Resolved;
     // Only look for a main repo if the project path itself has a .git entry (file or
     // directory). This prevents git2::Repository::discover from walking up the directory
     // tree and finding an unrelated ancestor repo (e.g., a dotfile-managed home directory),
@@ -1101,7 +1099,7 @@ pub(crate) fn compute_volume_paths_with_resolve(
     // gitdir pointer. Both cases are covered by this check.
     if project_path.join(".git").exists() {
         match GitWorktree::find_main_repo(project_path) {
-            Err(_) => resolve = MountResolve::Degraded,
+            Err(_) => {}
             Ok(main_repo) => {
                 // Canonicalize paths for reliable comparison (handles symlinks like /tmp -> /private/tmp)
                 let main_repo_canonical = main_repo
@@ -1195,7 +1193,7 @@ pub(crate) fn compute_volume_paths_with_resolve(
             read_only: false,
         }],
         workspace_path,
-        resolve,
+        MountResolve::Fallthrough,
     ))
 }
 
@@ -1720,22 +1718,18 @@ fn named_volume_for(session_id: &str, container_path: &str) -> String {
 }
 
 /// The volume names a move stranded: the names the paths under `config.working_dir`
-/// carried back when the container was created at `previous_workdir`.
+/// carried when the container was created at `previous_workdir` (#3742).
 ///
-/// Deliberately scoped to the mounts that provably moved. A session's other mounts
-/// keep their container paths across a worktree move (the main repo, in a
-/// sibling-worktree layout), so their volumes are never named here even when this
-/// run's config fails to resolve them, which is what a glob whose directory is
-/// absent from the host looks like. Naming only what moved is what separates a
-/// stranded volume from a live cache; "everything this config does not mount" does
-/// not (#3742).
+/// Scoped to the mounts that provably moved. A mount whose container path survives the
+/// move keeps its volume even when this run's config fails to resolve it, which is what
+/// a glob whose directory is absent from the host looks like.
 ///
 /// Empty unless the mounts are established to have moved. `previous_workdir` is that
-/// evidence, pinned at create on `SandboxInfo::container_workdir` for #2414: absent
-/// (a session that never had a container, or an attach that cleared the pin) or equal
-/// to this config's, and nothing moved. A degraded resolve withholds it too, since
-/// there the workdir is provisional and the apparent move may be nothing but a
-/// `find_main_repo` failure.
+/// evidence, pinned on `SandboxInfo::container_workdir` at create for #2414: absent (a
+/// session that never had a container, or an attach, which clears the pin) or equal to
+/// this config's, and nothing moved. A resolve that fell through to the collapsed
+/// `/workspace/{basename}` withholds it too, since there the workdir is provisional and
+/// the apparent move may be nothing but that fallthrough.
 pub(crate) fn stranded_named_ignore_volumes(
     config: &ContainerConfig,
     instance_id: &str,
@@ -1747,12 +1741,20 @@ pub(crate) fn stranded_named_ignore_volumes(
     if !config.named_ignore_volumes_authoritative || previous == config.working_dir {
         return Vec::new();
     }
+    // A remapped name that the create is about to mount is a live cache, not a strand:
+    // the previous workdir can be the mount root of a mount that survived.
+    let live: std::collections::HashSet<&str> = config
+        .named_ignore_volumes
+        .iter()
+        .map(|volume| volume.volume_name.as_str())
+        .collect();
     let moved = format!("{}/", config.working_dir);
     config
         .named_ignore_volumes
         .iter()
         .filter_map(|volume| volume.container_path.strip_prefix(moved.as_str()))
         .map(|relative| named_volume_for(instance_id, &format!("{}/{}", previous, relative)))
+        .filter(|name| !live.contains(name.as_str()))
         .collect()
 }
 
@@ -2661,10 +2663,11 @@ mod tests {
         assert_eq!(volumes[0].container_path, working_dir);
     }
 
-    /// The collapse to `/workspace/{basename}` is reported as `Degraded` rather than
-    /// left indistinguishable from the two resolves that land there legitimately.
+    /// Every arrival at `/workspace/{basename}` is reported as `Fallthrough`, including
+    /// a worktree whose `.git` file is gone rather than merely unresolvable, which
+    /// collapses the same way without `find_main_repo` ever being asked.
     #[test]
-    fn compute_volume_paths_reports_the_collapsed_resolve_as_degraded() {
+    fn compute_volume_paths_reports_every_collapsed_resolve() {
         let dir = TempDir::new().unwrap();
 
         // An orphaned worktree: a `.git` file whose gitdir points nowhere, the
@@ -2682,15 +2685,19 @@ mod tests {
         let (_repo_dir, repo_path) = setup_regular_repo();
 
         for (case, path, expected) in [
-            ("an orphaned worktree", &orphaned, MountResolve::Degraded),
-            ("a plain directory", &plain, MountResolve::Resolved),
-            ("a healthy repo root", &repo_path, MountResolve::Resolved),
+            ("an orphaned worktree", &orphaned, MountResolve::Fallthrough),
+            (
+                "a worktree with no .git at all",
+                &plain,
+                MountResolve::Fallthrough,
+            ),
+            ("a healthy repo root", &repo_path, MountResolve::Fallthrough),
         ] {
             let (_volumes, workspace_path, resolve) =
                 compute_volume_paths_with_resolve(path, path.to_str().unwrap()).unwrap();
             assert_eq!(resolve, expected, "{case}");
-            // All three land on the same shape of path, which is why the resolve
-            // has to be reported rather than inferred from the result.
+            // All three land on the same path, which is why a caller cannot tell
+            // them apart from the result alone.
             assert_eq!(
                 workspace_path,
                 format!("/workspace/{}", path.file_name().unwrap().to_string_lossy()),
@@ -4320,32 +4327,39 @@ volume_ignores = ["**/bin", "**/obj", "target"]
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
-        let build = |healthy_repo: bool| {
-            let project_dir = TempDir::new().unwrap();
-            fs::create_dir_all(project_dir.path().join("src/App/bin")).unwrap();
-            let config_dir = project_dir.path().join(".agent-of-empires");
+        let (_dir, repo_path) = setup_regular_repo();
+        let worktree_path = repo_path.parent().unwrap().join("my-worktree");
+        {
+            let repo = git2::Repository::open(&repo_path).unwrap();
+            let head = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.branch("wt-branch", &head, false).unwrap();
+        }
+        let added = std::process::Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                worktree_path.to_str().unwrap(),
+                "wt-branch",
+            ])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        if !added.status.success() {
+            return; // git not available
+        }
+
+        let build = |project: &Path| {
+            let config_dir = project.join(".agent-of-empires");
             fs::create_dir_all(&config_dir).unwrap();
             fs::write(
                 config_dir.join("config.toml"),
                 r#"
 [sandbox]
-volume_ignores = ["target", "**/bin"]
+volume_ignores = ["target"]
 volume_ignores_strategy = "named"
 "#,
             )
             .unwrap();
-            if healthy_repo {
-                git2::Repository::init(project_dir.path()).unwrap();
-            } else {
-                // An orphaned worktree, whose collapsed resolve makes every derived
-                // path (the workdir included) provisional.
-                fs::write(
-                    project_dir.path().join(".git"),
-                    "gitdir: ../does-not-exist/.git/worktrees/x\n",
-                )
-                .unwrap();
-            }
-
             let sandbox_info = crate::session::instance::SandboxInfo {
                 enabled: true,
                 container_id: None,
@@ -4357,7 +4371,7 @@ volume_ignores_strategy = "named"
                 container_workdir: None,
             };
             build_container_config(
-                project_dir.path().to_str().unwrap(),
+                project.to_str().unwrap(),
                 &sandbox_info,
                 ContainerAgentSelection::new("claude", None),
                 false,
@@ -4368,17 +4382,29 @@ volume_ignores_strategy = "named"
             .unwrap()
         };
 
-        let healthy = build(true);
-        assert!(healthy.named_ignore_volumes_authoritative);
-
-        let degraded = build(false);
+        let healthy = build(&worktree_path);
         assert!(
-            !degraded.named_ignore_volumes.is_empty(),
-            "the literal entry still mounts, so the empty-set guard cannot be what saves this case"
+            healthy.named_ignore_volumes_authoritative,
+            "a worktree that resolves to its main repo derives real mount paths"
+        );
+
+        // Break the linkage: the same worktree now collapses to /workspace/{basename},
+        // naming volumes the session never had.
+        fs::remove_file(worktree_path.join(".git")).unwrap();
+        fs::write(
+            worktree_path.join(".git"),
+            "gitdir: ../does-not-exist/.git/worktrees/my-worktree\n",
+        )
+        .unwrap();
+
+        let orphaned = build(&worktree_path);
+        assert!(
+            !orphaned.named_ignore_volumes.is_empty(),
+            "the literal entry still mounts, so an empty set cannot be what saves this case"
         );
         assert!(
-            !degraded.named_ignore_volumes_authoritative,
-            "a collapsed resolve names volumes the session never had, so it must not drive a deletion"
+            !orphaned.named_ignore_volumes_authoritative,
+            "a collapsed resolve must not drive a deletion"
         );
     }
 
@@ -6749,6 +6775,37 @@ volume_ignores = ["target"]
             stranded,
             vec!["aoe-vi-sess1-workspace-otari-worktrees-905-target-31ddd0322290"],
             "a config gap under an unmoved mount must not name anything"
+        );
+    }
+
+    #[test]
+    fn a_remap_onto_a_live_volume_is_not_a_strand() {
+        // The previous workdir can be the mount root of a mount that survived: a
+        // session whose worktree leaf slugs to the repo's own name, whose pin was
+        // taken while the linkage was broken. The remap then lands exactly on the
+        // main repo's volume, which the create is about to mount.
+        let config = ContainerConfig {
+            working_dir: "/workspace/otari-worktrees/otari".to_string(),
+            named_ignore_volumes: vec![
+                NamedVolumeMount {
+                    volume_name: named_volume_for("sess1", "/workspace/otari/target"),
+                    container_path: "/workspace/otari/target".to_string(),
+                },
+                NamedVolumeMount {
+                    volume_name: named_volume_for(
+                        "sess1",
+                        "/workspace/otari-worktrees/otari/target",
+                    ),
+                    container_path: "/workspace/otari-worktrees/otari/target".to_string(),
+                },
+            ],
+            named_ignore_volumes_authoritative: true,
+            ..Default::default()
+        };
+
+        assert!(
+            stranded_named_ignore_volumes(&config, "sess1", Some("/workspace/otari")).is_empty(),
+            "a volume the create re-attaches must never be named for deletion"
         );
     }
 

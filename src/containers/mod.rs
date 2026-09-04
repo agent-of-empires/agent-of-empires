@@ -241,21 +241,25 @@ impl DockerContainer {
         }
     }
 
-    /// Remove the named ignore volumes a worktree move stranded.
+    /// Remove the named ignore volumes a worktree move stranded (#3742).
     ///
-    /// [`Self::discard`] deliberately preserves a session's volumes across the container
-    /// rebuild a move forces, which keeps the caches whose container path survives the
-    /// move and strands the rest, since a volume's name encodes that path. This reclaims
-    /// the stranded ones at the next create (#3742).
+    /// `names` is an allowlist, and the caller owns what belongs in it;
+    /// `stranded_named_ignore_volumes` computes it. Must be called before the create,
+    /// while no container holds the volumes.
     ///
-    /// `names` is an allowlist and the caller owns the decision of what belongs in it;
-    /// see
-    /// [`stranded_named_ignore_volumes`](crate::session::config::container_config::stranded_named_ignore_volumes).
-    /// Must be called before the create, while no container holds the volumes.
+    /// Logs at `info`: this is an irreversible delete of a build cache, and a wrong one
+    /// would otherwise reach the user as an unexplained cold rebuild with nothing to
+    /// attribute it to.
     pub fn remove_stale_named_ignore_volumes(&self, session_id: &str, names: &[String]) {
         if names.is_empty() {
             return;
         }
+        tracing::info!(
+            target: "containers.runtime",
+            %session_id,
+            ?names,
+            "reclaiming named ignore volumes stranded by a worktree move"
+        );
         let names: HashSet<&str> = names.iter().map(String::as_str).collect();
         let prefix = format!("aoe-vi-{}-", session_id);
         if let Err(e) = self
@@ -297,8 +301,8 @@ impl DockerContainer {
     /// intact so the recreated container re-attaches the ones whose container
     /// path is unchanged. Used on the worktree-move discard path where the
     /// container is dropped to pick up a new bind mount and will be recreated
-    /// immediately. The volumes the new paths strand are reclaimed by
-    /// [`Self::remove_stale_named_ignore_volumes`] at that create.
+    /// immediately; [`Self::remove_stale_named_ignore_volumes`] reclaims the rest
+    /// at that create.
     ///
     /// The same invariant as [`Self::teardown`] applies: callers must invoke
     /// this unconditionally and act on the returned outcome; it must never

@@ -1553,7 +1553,7 @@ mod tests {
         // docker's `--filter name=` is a substring match, so a listing under
         // `aoe-vi-sess1-` can carry a longer session id this prefix must not claim.
         let other_session =
-            format!("{PRE_MOVE}\naoe-vi-sess10-workspace-a-target-1f93a3fc1487\n\n");
+            format!("{PRE_MOVE}\naoe-vi-sess10-workspace-a-target-c8c9b4754ab1\n\n");
 
         // `None` selects everything, the shape the session-deletion sweep uses.
         let cases = [
