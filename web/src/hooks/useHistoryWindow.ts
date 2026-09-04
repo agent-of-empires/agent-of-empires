@@ -52,11 +52,39 @@ export function useHistoryWindow(
     }
     setAnchorLen(activity.length);
   }
-  const { start, canLoadEarlier } = useMemo(
+  const computed = useMemo(
     () => historyWindow(activity, visibleRows, showClearedTurns),
     [activity, visibleRows, showClearedTurns],
   );
+  // Once a row has been rendered at the top of the window it stays rendered
+  // for the session: the start may only move earlier. Without this pin a cut
+  // inside a long assistant turn snaps forward to the next user prompt when
+  // that prompt lands, the message's rendered part list shrinks sharply, and
+  // assistant-ui's store reads a stale part index (#3707, the #3676 mechanism
+  // without a `/clear`). A pin whose row is gone (retention trim) is dropped.
+  const [anchorRowId, setAnchorRowId] = useState<string | null>(null);
+  const [anchorSessionId, setAnchorSessionId] = useState(sessionId);
+  if (anchorSessionId !== sessionId) {
+    setAnchorSessionId(sessionId);
+    setAnchorRowId(null);
+  }
+  const start = pinnedWindowStart(activity, computed.start, anchorRowId);
+  const startRowId = start < activity.length ? (activity[start]?.id ?? null) : null;
+  if (startRowId !== anchorRowId && anchorSessionId === sessionId) {
+    setAnchorRowId(startRowId);
+  }
+  const canLoadEarlier = start === computed.start ? computed.canLoadEarlier : start > 0;
   const windowedActivity = useMemo(() => (start === 0 ? activity : activity.slice(start)), [activity, start]);
   const loadEarlier = useCallback(() => setVisibleRows((v) => v + HISTORY_WINDOW_STEP), []);
   return { windowedActivity, canLoadEarlier, loadEarlier };
+}
+
+/** Clamp a freshly computed window start so it never passes the row pinned
+ *  as the window's top on an earlier render. Returns `computed` when there is
+ *  no pin or the pinned row is no longer in `rows`. */
+export function pinnedWindowStart(rows: readonly ActivityRow[], computed: number, anchorRowId: string | null): number {
+  if (anchorRowId === null) return computed;
+  const pinned = rows.findIndex((r) => r.id === anchorRowId);
+  if (pinned < 0) return computed;
+  return Math.min(computed, pinned);
 }

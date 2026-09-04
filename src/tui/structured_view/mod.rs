@@ -875,7 +875,7 @@ async fn handle_terminal_event(
             }
             Ok(false)
         }
-        Intent::ResolveApproval(decision) => {
+        Intent::ResolveApproval(_) | Intent::ChooseApprovalOption(_) => {
             let Some(nonce) = state.selected_approval.as_deref() else {
                 return Ok(false);
             };
@@ -888,18 +888,43 @@ async fn handle_terminal_event(
             else {
                 return Ok(false);
             };
-            match state
-                .http
-                .resolve_approval(&state.session_id, &pending.nonce, decision)
-                .await
-            {
-                Ok(()) => {
-                    let label = match decision {
+            // A digit answers a choice list with that option; the trio keys
+            // resolve by kind as before (#3741).
+            let (decision, option_id, label) = match intent {
+                Intent::ChooseApprovalOption(index) => {
+                    let Some((option_id, name)) = pending
+                        .options
+                        .get(index)
+                        .filter(|_| pending.choice_list)
+                        .cloned()
+                    else {
+                        return Ok(false);
+                    };
+                    (
+                        ApprovalDecisionWire::Allow,
+                        Some(option_id),
+                        format!("answered: {name}"),
+                    )
+                }
+                Intent::ResolveApproval(decision) => (
+                    decision,
+                    None,
+                    match decision {
                         ApprovalDecisionWire::Allow => "allowed",
                         ApprovalDecisionWire::AllowAlways => "allow-always",
                         ApprovalDecisionWire::Deny => "denied",
                         ApprovalDecisionWire::Cancelled => "cancelled",
-                    };
+                    }
+                    .to_string(),
+                ),
+                _ => return Ok(false),
+            };
+            match state
+                .http
+                .resolve_approval(&state.session_id, &pending.nonce, decision, option_id)
+                .await
+            {
+                Ok(()) => {
                     // Clear the card now instead of waiting on the
                     // ApprovalResolved broadcast, which the seq dedupe can
                     // drop and leave the card stuck. See #1821.
@@ -1889,6 +1914,8 @@ mod tests {
                 kind: "read".into(),
                 args: r#"{"path":"src/lib.rs"}"#.into(),
                 destructive: false,
+                options: Vec::new(),
+                choice_list: false,
             });
         state.reconcile_selection();
         assert_eq!(state.focus, Focus::Approval);

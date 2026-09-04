@@ -590,13 +590,16 @@ fn resolve_mcp_layers(
     session_id: &str,
     profile: Option<&str>,
     cwd: &std::path::Path,
+    session_env: &[(String, String)],
 ) -> Vec<agent_client_protocol::schema::v1::McpServer> {
     use crate::session::mcp::mcp_model::{resolve_effective, summarize};
 
     // One resolver for forwarding and the management surfaces (#1996): assemble
     // the trust-gated, provenance-tagged effective set, then convert only the
     // winning definitions to ACP wire values just before forwarding.
-    let merged = resolve_effective(agent_key, profile, cwd);
+    // `session_env` is what the agent launches with, so discovery reads the
+    // same config directory the agent will (#3734).
+    let merged = resolve_effective(agent_key, profile, cwd, session_env);
     if !merged.is_empty() {
         info!(
             target: "acp.mcp",
@@ -1833,8 +1836,15 @@ impl<S: BroadcastSink> Supervisor<S> {
         let mcp_session = session_id.clone();
         let mcp_profile = source_profile.clone();
         let mcp_cwd = cwd.clone();
+        let mcp_env = host_environment.clone();
         let mcp_servers = tokio::task::spawn_blocking(move || {
-            resolve_mcp_layers(&mcp_agent, &mcp_session, mcp_profile.as_deref(), &mcp_cwd)
+            resolve_mcp_layers(
+                &mcp_agent,
+                &mcp_session,
+                mcp_profile.as_deref(),
+                &mcp_cwd,
+                &mcp_env,
+            )
         })
         .await
         .unwrap_or_else(|e| {
@@ -2338,12 +2348,14 @@ impl<S: BroadcastSink> Supervisor<S> {
                     let mcp_session = session_id.clone();
                     let mcp_profile = respawn_config.source_profile.clone();
                     let mcp_cwd = respawn_config.cwd.clone();
+                    let mcp_env = respawn_config.host_environment.clone();
                     respawn_config.mcp_servers = tokio::task::spawn_blocking(move || {
                         resolve_mcp_layers(
                             &mcp_agent,
                             &mcp_session,
                             mcp_profile.as_deref(),
                             &mcp_cwd,
+                            &mcp_env,
                         )
                     })
                     .await
@@ -2794,9 +2806,12 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: &str,
         nonce: Nonce,
         decision: ApprovalDecision,
+        option_id: Option<String>,
     ) -> Result<(), SupervisorError> {
         let client = self.client_for_session(session_id).await?;
-        client.resolve_permission(nonce, decision).await?;
+        client
+            .resolve_permission(nonce, decision, option_id)
+            .await?;
         Ok(())
     }
 
@@ -4757,7 +4772,7 @@ cursor-acp-bridge = "agent acp"
         // so this case still resolves to native + global + profile only.
         let cwd = tmp.path().to_path_buf();
         let merged = tokio::task::spawn_blocking(move || {
-            resolve_mcp_layers("claude", "resolve-test", Some("work"), &cwd)
+            resolve_mcp_layers("claude", "resolve-test", Some("work"), &cwd, &[])
         })
         .await
         .unwrap();
@@ -4818,7 +4833,7 @@ cursor-acp-bridge = "agent acp"
         // Untrusted: project-local is skipped, "shared" stays the global value.
         let cwd = repo.clone();
         let merged = tokio::task::spawn_blocking(move || {
-            resolve_mcp_layers("claude", "resolve-test", None, &cwd)
+            resolve_mcp_layers("claude", "resolve-test", None, &cwd, &[])
         })
         .await
         .unwrap();
@@ -4841,7 +4856,7 @@ cursor-acp-bridge = "agent acp"
 
         let cwd = repo.clone();
         let merged = tokio::task::spawn_blocking(move || {
-            resolve_mcp_layers("claude", "resolve-test", None, &cwd)
+            resolve_mcp_layers("claude", "resolve-test", None, &cwd, &[])
         })
         .await
         .unwrap();

@@ -30,6 +30,15 @@ pub struct BundledAdapter {
     pub binary: &'static str,
     package_json: &'static [u8],
     package_lock: &'static [u8],
+    /// In-tree sources written beside the manifest before `npm ci`, as
+    /// `(relative path, bytes)`. Empty for adapters that are pure npm
+    /// dependencies.
+    sources: &'static [(&'static str, &'static [u8])],
+    /// Entry script for an in-tree agent, run as `node
+    /// --experimental-strip-types <entry>` through a wrapper the install
+    /// writes at `node_modules/.bin/<binary>`, so resolution and the doctor
+    /// treat it like any other bundled adapter (#3553).
+    entry: Option<&'static str>,
 }
 
 pub const BUNDLED_ADAPTERS: &[BundledAdapter] = &[
@@ -39,16 +48,42 @@ pub const BUNDLED_ADAPTERS: &[BundledAdapter] = &[
         package_lock: include_bytes!(
             "../../acp-worker/adapters/claude-agent-acp/package-lock.json"
         ),
+        sources: &[],
+        entry: None,
     },
     BundledAdapter {
         binary: "codex-acp",
         package_json: include_bytes!("../../acp-worker/adapters/codex-acp/package.json"),
         package_lock: include_bytes!("../../acp-worker/adapters/codex-acp/package-lock.json"),
+        sources: &[],
+        entry: None,
     },
     BundledAdapter {
         binary: "pi-acp",
         package_json: include_bytes!("../../acp-worker/adapters/pi-acp/package.json"),
         package_lock: include_bytes!("../../acp-worker/adapters/pi-acp/package-lock.json"),
+        sources: &[],
+        entry: None,
+    },
+    BundledAdapter {
+        binary: crate::acp::install_hints::AOE_AGENT_BINARY,
+        package_json: include_bytes!("../../acp-worker/aoe-agent/package.json"),
+        package_lock: include_bytes!("../../acp-worker/aoe-agent/package-lock.json"),
+        sources: &[
+            (
+                "src/index.ts",
+                include_bytes!("../../acp-worker/aoe-agent/src/index.ts"),
+            ),
+            (
+                "src/toolKind.ts",
+                include_bytes!("../../acp-worker/aoe-agent/src/toolKind.ts"),
+            ),
+            (
+                "src/transcript.ts",
+                include_bytes!("../../acp-worker/aoe-agent/src/transcript.ts"),
+            ),
+        ],
+        entry: Some("src/index.ts"),
     },
 ];
 
@@ -115,6 +150,20 @@ pub fn bundled_adapter_bin(app_dir: &Path, binary: &str) -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
+/// Digest of everything the install is built from, so a source edit
+/// reinstalls the same way a lock bump does.
+fn install_digest(adapter: &BundledAdapter) -> String {
+    let mut bytes: Vec<u8> = Vec::with_capacity(adapter.package_lock.len());
+    bytes.extend_from_slice(adapter.package_lock);
+    for (path, contents) in adapter.sources {
+        bytes.extend_from_slice(path.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(contents);
+        bytes.push(0);
+    }
+    sha256_hex(&bytes)
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -136,7 +185,7 @@ pub fn installation_is_current(app_dir: &Path, binary: &str) -> bool {
     let Some(adapter) = lookup(binary) else {
         return false;
     };
-    let expected = sha256_hex(adapter.package_lock);
+    let expected = install_digest(adapter);
     let digest_ok = std::fs::read_to_string(adapter_dir(app_dir, binary).join(DIGEST_FILE))
         .map(|s| s.trim() == expected)
         .unwrap_or(false);
@@ -169,6 +218,13 @@ pub fn install(app_dir: &Path, node: &ResolvedNode, binary: &str) -> Result<(), 
 
     std::fs::write(tmp.join("package.json"), adapter.package_json)?;
     std::fs::write(tmp.join("package-lock.json"), adapter.package_lock)?;
+    for (path, contents) in adapter.sources {
+        let target = tmp.join(path);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(target, contents)?;
+    }
 
     let (program, args) =
         npm_ci_argv(node).ok_or_else(|| AdapterError::NpmUnavailable(node.path.clone()))?;
@@ -191,6 +247,9 @@ pub fn install(app_dir: &Path, node: &ResolvedNode, binary: &str) -> Result<(), 
         return Err(AdapterError::NpmFailed(status.to_string()));
     }
 
+    if let Some(entry) = adapter.entry {
+        write_entry_wrapper(&tmp, binary, entry)?;
+    }
     let produced = tmp.join("node_modules").join(".bin").join(binary);
     let produced = if cfg!(windows) {
         produced.with_extension("cmd")
@@ -206,7 +265,7 @@ pub fn install(app_dir: &Path, node: &ResolvedNode, binary: &str) -> Result<(), 
     // a matching digest behind.
     std::fs::write(
         tmp.join(DIGEST_FILE),
-        format!("{}\n", sha256_hex(adapter.package_lock)),
+        format!("{}\n", install_digest(adapter)),
     )?;
 
     publish(&tmp, &adapter_dir(app_dir, binary))?;
@@ -219,6 +278,33 @@ pub fn install(app_dir: &Path, node: &ResolvedNode, binary: &str) -> Result<(), 
 /// tarball ships it at `<root>/lib/node_modules/npm/bin/npm-cli.js`); for a
 /// host Node, use `npm` on PATH, because a host Node's npm layout is not
 /// something we can assume. `None` when no usable npm is found.
+/// The launcher for an in-tree agent: `node --experimental-strip-types`
+/// on the entry script, with `node` taken from `PATH`, which the spawn
+/// prepends the resolved Node's directory to (`bundled_resolution`).
+fn write_entry_wrapper(install_dir: &Path, binary: &str, entry: &str) -> std::io::Result<()> {
+    let bin = install_dir.join("node_modules").join(".bin");
+    std::fs::create_dir_all(&bin)?;
+    if cfg!(windows) {
+        let script = format!(
+            "@echo off\r\nnode --experimental-strip-types \"%~dp0..\\..\\{}\" %*\r\n",
+            entry.replace('/', "\\")
+        );
+        std::fs::write(bin.join(binary).with_extension("cmd"), script)?;
+        return Ok(());
+    }
+    let path = bin.join(binary);
+    let script = format!(
+        "#!/bin/sh\nexec node --experimental-strip-types \"$(dirname \"$0\")/../../{entry}\" \"$@\"\n"
+    );
+    std::fs::write(&path, script)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
+}
+
 pub fn npm_ci_argv(node: &ResolvedNode) -> Option<(PathBuf, Vec<String>)> {
     let ci_flags = || {
         vec![
@@ -336,7 +422,7 @@ mod tests {
         let adapter = lookup(binary).unwrap();
         std::fs::write(
             adapter_dir(app_dir, binary).join(DIGEST_FILE),
-            format!("{}\n", sha256_hex(adapter.package_lock)),
+            format!("{}\n", install_digest(adapter)),
         )
         .unwrap();
     }
@@ -359,6 +445,7 @@ mod tests {
         assert!(is_bundled("claude-agent-acp"));
         assert!(is_bundled("codex-acp"));
         assert!(is_bundled("pi-acp"));
+        assert!(is_bundled("aoe-agent"));
         assert!(!is_bundled("opencode"));
         assert!(!is_bundled("gemini"));
         assert_eq!(DEFAULT_ADAPTER, "claude-agent-acp");
@@ -498,5 +585,47 @@ mod tests {
             "pinned claude-agent-acp {pinned} is below the startup floor {floor}; \
              bump acp-worker/adapters/claude-agent-acp/package.json"
         );
+    }
+
+    /// #3553: the in-tree agent installs like the npm adapters. Its sources
+    /// land beside the manifest, its digest tracks them, and the wrapper the
+    /// install writes is what `bundled_adapter_bin` finds.
+    #[test]
+    fn aoe_agent_bundle_carries_its_sources_and_an_entry_wrapper() {
+        let adapter = lookup("aoe-agent").expect("aoe-agent is bundled");
+        assert_eq!(adapter.entry, Some("src/index.ts"));
+        assert!(adapter
+            .sources
+            .iter()
+            .any(|(path, bytes)| *path == "src/index.ts" && !bytes.is_empty()));
+        assert_ne!(
+            install_digest(adapter),
+            sha256_hex(adapter.package_lock),
+            "the digest must cover the sources, not only the lock"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_entry_wrapper(tmp.path(), "aoe-agent", "src/index.ts").unwrap();
+        let wrapper = tmp
+            .path()
+            .join("node_modules")
+            .join(".bin")
+            .join("aoe-agent");
+        let wrapper = if cfg!(windows) {
+            wrapper.with_extension("cmd")
+        } else {
+            wrapper
+        };
+        let script = std::fs::read_to_string(&wrapper).unwrap();
+        assert!(script.contains("--experimental-strip-types"));
+        assert!(script.contains("src/index.ts") || script.contains("src\\index.ts"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&wrapper).unwrap().permissions().mode() & 0o111,
+                0o111
+            );
+        }
     }
 }

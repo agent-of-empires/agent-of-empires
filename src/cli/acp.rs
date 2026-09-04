@@ -751,8 +751,19 @@ pub(crate) fn command_present(command: &str) -> bool {
     // the `/`-branch tries to stat a literal path containing `${...}`
     // and reports "missing" for every placeholder-based agent (notably
     // `aoe-agent`).
+    // A `${aoe_data_dir}` placeholder resolves the way the spawn resolves it,
+    // then the path is checked like any other; it used to report present
+    // unconditionally (#3553).
+    if command.contains("${aoe_data_dir}") {
+        return crate::session::get_app_dir()
+            .map(|dir| {
+                std::path::Path::new(&command.replace("${aoe_data_dir}", &dir.to_string_lossy()))
+                    .exists()
+            })
+            .unwrap_or(false);
+    }
     if command.contains("${") {
-        true
+        false
     } else if command.contains('/') || command.contains('\\') {
         std::path::Path::new(command).exists()
     } else {
@@ -1090,7 +1101,7 @@ async fn approve(session: &str, nonce: &str, always: bool, deny: bool) -> Result
     let endpoint = require_daemon().await?;
     let client = HttpClient::new(endpoint)?;
     client
-        .resolve_approval(session, nonce, decision)
+        .resolve_approval(session, nonce, decision, None)
         .await
         .map_err(map_http)?;
     println!("approval {nonce} -> {decision:?}");

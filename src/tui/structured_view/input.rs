@@ -42,6 +42,8 @@ pub enum Intent {
     Scroll(i32),
     /// Resolve the focused approval card.
     ResolveApproval(ApprovalDecisionWire),
+    /// Answer the focused choice-list approval with its N-th option (#3741).
+    ChooseApprovalOption(usize),
     /// Skip the oldest pending elicitation (ACP `decline`): the agent
     /// continues with no answer. The rich answer form is web-only.
     SkipElicitation,
@@ -422,6 +424,9 @@ fn pane_keys(key: &KeyEvent) -> Intent {
 
 fn approval_keys(key: &KeyEvent) -> Intent {
     match (key.modifiers, key.code) {
+        (m, KeyCode::Char(c @ '1'..='9')) if m.is_empty() => {
+            Intent::ChooseApprovalOption(c as usize - '1' as usize)
+        }
         (m, KeyCode::Char('a')) if m.is_empty() => {
             Intent::ResolveApproval(ApprovalDecisionWire::Allow)
         }

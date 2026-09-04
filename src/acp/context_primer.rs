@@ -962,6 +962,7 @@ mod tests {
                         },
                         destructive: false,
                         requested_at: Utc::now(),
+                        options: Vec::new(),
                         resolved: None,
                     },
                 },

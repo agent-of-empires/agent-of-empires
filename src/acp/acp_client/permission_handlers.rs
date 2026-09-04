@@ -2,7 +2,7 @@
 //! from the approval policy or by asking the user.
 
 use crate::acp::agent_profiles;
-use crate::acp::approvals::{ApprovalDecision, Nonce};
+use crate::acp::approvals::{ApprovalDecision, ApprovalOption, Nonce};
 use crate::acp::elicitations::{parse_elicitation, ElicitationOutcome};
 use crate::acp::permissions::build_approval;
 use crate::acp::state::{Event, ToolCall};
@@ -26,6 +26,16 @@ use super::tool_output::{preview_optional_args, tool_kind_str};
 /// Translate the user's decision into the matching option_id from the
 /// list the agent offered. Falls back gracefully if the agent didn't
 /// offer the preferred kind.
+fn permission_option_kind_str(kind: &PermissionOptionKind) -> &'static str {
+    match kind {
+        PermissionOptionKind::AllowOnce => "allow_once",
+        PermissionOptionKind::AllowAlways => "allow_always",
+        PermissionOptionKind::RejectOnce => "reject_once",
+        PermissionOptionKind::RejectAlways => "reject_always",
+        _ => "other",
+    }
+}
+
 pub(super) fn pick_option_id(
     options: &[agent_client_protocol::schema::v1::PermissionOption],
     decision: ApprovalDecision,
@@ -144,7 +154,16 @@ pub(super) async fn handle_permission_request(
             tool_call: tool_call.clone(),
         })
         .await;
-    let approval = build_approval(tool_call);
+    let options: Vec<ApprovalOption> = request
+        .options
+        .iter()
+        .map(|o| ApprovalOption {
+            option_id: o.option_id.0.to_string(),
+            name: o.name.clone(),
+            kind: permission_option_kind_str(&o.kind).to_string(),
+        })
+        .collect();
+    let approval = build_approval(tool_call, options);
     let nonce = approval.nonce.clone();
 
     let (resolve_tx, resolve_rx) = oneshot::channel::<ApprovalResolutionMessage>();
@@ -193,8 +212,23 @@ pub(super) async fn handle_permission_request(
     // a foreign `#[non_exhaustive]` enum it doesn't fully own.
     let (outcome, outcome_label): (RequestPermissionOutcome, &'static str) = match resolve_rx.await
     {
-        Ok(ApprovalResolutionMessage::Decision { decision }) => {
-            if let Some(option_id) = pick_option_id(&request.options, decision) {
+        Ok(ApprovalResolutionMessage::Decision {
+            decision,
+            option_id,
+        }) => {
+            // An explicit option (a choice-list answer, #3741) wins over kind
+            // matching, which would otherwise return the first option of a
+            // list whose entries all share one kind.
+            let chosen = option_id
+                .and_then(|id| {
+                    request
+                        .options
+                        .iter()
+                        .find(|o| o.option_id.0.as_ref() == id)
+                        .map(|o| o.option_id.clone())
+                })
+                .or_else(|| pick_option_id(&request.options, decision));
+            if let Some(option_id) = chosen {
                 // Surface the resolution to UI clients via the typed event channel.
                 let _ = event_tx
                     .send(Event::ApprovalResolved {

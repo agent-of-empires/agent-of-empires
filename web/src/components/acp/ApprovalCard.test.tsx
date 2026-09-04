@@ -44,6 +44,51 @@ afterEach(() => {
   cleanup();
 });
 
+describe("ApprovalCard (choice list, #3741)", () => {
+  const choices = ["alpha", "bravo", "charlie", "delta"].map((id) => ({
+    option_id: id,
+    name: `Option ${id[0]!.toUpperCase()}${id.slice(1)}`,
+    kind: "allow_once",
+  }));
+
+  it("lists the agent's options and resolves with the one chosen", async () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    render(<ApprovalCard approval={makeApproval({ options: choices })} onResolve={onResolve} />);
+    expect(screen.queryByRole("button", { name: /^allow$/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /always/i })).toBeNull();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /option charlie/i }));
+    });
+    expect(onResolve).toHaveBeenCalledWith("Allow", "charlie");
+  });
+
+  it("keeps the trio for a genuine allow/deny vocabulary", () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    const trio = [
+      { option_id: "y", name: "Allow once", kind: "allow_once" },
+      { option_id: "a", name: "Allow always", kind: "allow_always" },
+      { option_id: "n", name: "Reject", kind: "reject_once" },
+    ];
+    render(<ApprovalCard approval={makeApproval({ options: trio })} onResolve={onResolve} />);
+    expect(screen.getByRole("button", { name: /^allow$/i })).toBeDefined();
+    expect(screen.queryByRole("group", { name: /choose an answer/i })).toBeNull();
+  });
+
+  it("treats a pi question with two choices as a list", () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ApprovalCard
+        approval={makeApproval({
+          tool_call: { ...makeApproval().tool_call, id: "pi-ui-3" },
+          options: choices.slice(0, 2),
+        })}
+        onResolve={onResolve}
+      />,
+    );
+    expect(screen.getByRole("group", { name: /choose an answer/i })).toBeDefined();
+  });
+});
+
 describe("ApprovalCard (benign)", () => {
   it("renders the tool name and Approval-needed chrome", () => {
     const onResolve = vi.fn().mockResolvedValue(undefined);

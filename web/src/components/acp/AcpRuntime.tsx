@@ -93,7 +93,7 @@ export interface AcpContext {
   retryCountdown: number;
   maxRetries: number;
   manualReconnect: () => void;
-  resolveApproval: (nonce: string, decision: ApprovalDecision) => Promise<void>;
+  resolveApproval: (nonce: string, decision: ApprovalDecision, optionId?: string) => Promise<void>;
   resolveElicitation: (nonce: string, resolution: ElicitationResolution) => Promise<void>;
   sendPrompt: (text: string, attachments?: PromptAttachmentInput[]) => Promise<void>;
   /** Attachments the composer has staged for the next send. Owned here

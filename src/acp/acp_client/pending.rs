@@ -35,7 +35,12 @@ pub(super) enum PendingResolver {
 /// Message sent over the resolver oneshot to unblock the parked
 /// `on_receive_request` callback.
 pub(super) enum ApprovalResolutionMessage {
-    Decision { decision: ApprovalDecision },
+    Decision {
+        decision: ApprovalDecision,
+        /// An option the client picked by id (a choice list, #3741). Wins
+        /// over kind matching when it names one of the request's options.
+        option_id: Option<String>,
+    },
     Cancelled,
 }
 

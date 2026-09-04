@@ -162,6 +162,11 @@ pub struct PendingApproval {
     pub kind: String,
     pub args: String,
     pub destructive: bool,
+    /// `(option_id, label)` in the agent's order.
+    pub options: Vec<(String, String)>,
+    /// The options are a question's choices, not an allow/deny vocabulary;
+    /// the shelf lists them and a digit answers with that option (#3741).
+    pub choice_list: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -349,12 +354,21 @@ impl AcpTranscript {
             .pending_approvals
             .into_iter()
             .filter(|a| !self.locally_resolved.contains(&a.nonce.0))
-            .map(|a| PendingApproval {
-                nonce: a.nonce.0,
-                title: a.tool_call.name,
-                kind: a.tool_call.kind,
-                args: a.tool_call.args_preview,
-                destructive: a.destructive,
+            .map(|a| {
+                let choice_list = a.is_choice_list();
+                PendingApproval {
+                    nonce: a.nonce.0,
+                    title: a.tool_call.name,
+                    kind: a.tool_call.kind,
+                    args: a.tool_call.args_preview,
+                    destructive: a.destructive,
+                    options: a
+                        .options
+                        .into_iter()
+                        .map(|o| (o.option_id, o.name))
+                        .collect(),
+                    choice_list,
+                }
             })
             .collect();
         self.pending_elicitations = state
@@ -442,6 +456,7 @@ mod tests {
             tool_call: tool("t-1", "Edit a file"),
             destructive: true,
             requested_at: Utc::now(),
+            options: Vec::new(),
             resolved: None,
         }
     }

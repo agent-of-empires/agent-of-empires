@@ -73,6 +73,17 @@ pub enum ApprovalDecision {
 /// A pending or resolved approval for a tool call. Held in
 /// `AcpState::pending_approvals` until it is resolved through
 /// `apply_event(Event::ApprovalResolved { ... })`.
+/// One option the agent offered on `session/request_permission`. ACP lets
+/// an option carry any label, so an adapter can ship a multiple-choice
+/// question as N `allow_once` options (pi-acp's `ask_user_question`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalOption {
+    pub option_id: String,
+    pub name: String,
+    /// ACP kind: `allow_once`, `allow_always`, `reject_once`, `reject_always`.
+    pub kind: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Approval {
     pub nonce: Nonce,
@@ -81,7 +92,29 @@ pub struct Approval {
     /// `git push --force`, etc.). Mobile UI requires long-press for these.
     pub destructive: bool,
     pub requested_at: DateTime<Utc>,
+    /// The agent's options, in the order it offered them. Empty for
+    /// approvals recorded before options were carried (#3741).
+    #[serde(default)]
+    pub options: Vec<ApprovalOption>,
     pub resolved: Option<ResolvedApproval>,
+}
+
+impl Approval {
+    /// Whether the options are a question's choices rather than an
+    /// allow/deny vocabulary: more than two options of one kind, or pi's
+    /// `ask_user_question` tool-call id prefix. A client renders the labels
+    /// and resolves with the chosen `option_id`; the fixed Allow/Always/Deny
+    /// trio would otherwise answer with whichever option came first (#3741).
+    pub fn is_choice_list(&self) -> bool {
+        if self.tool_call.id.starts_with("pi-ui-") && !self.options.is_empty() {
+            return true;
+        }
+        self.options.len() > 2
+            && self
+                .options
+                .windows(2)
+                .all(|pair| pair[0].kind == pair[1].kind)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +122,9 @@ pub struct ResolvedApproval {
     pub decision: ApprovalDecision,
     pub message: Option<String>,
     pub resolved_at: DateTime<Utc>,
+    /// The option the user picked, when the client chose one explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub option_id: Option<String>,
 }
 
 /// Heuristic for "this tool call is destructive enough that mobile UI
@@ -128,6 +164,76 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(a.0.len(), NONCE_BYTES * 2);
         assert!(a.0.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn choice_list_is_many_options_of_one_kind_or_a_pi_question() {
+        let opt = |id: &str, kind: &str| ApprovalOption {
+            option_id: id.into(),
+            name: id.to_uppercase(),
+            kind: kind.into(),
+        };
+        let approval = |tool_id: &str, options: Vec<ApprovalOption>| Approval {
+            nonce: Nonce::new(),
+            tool_call: super::super::state::ToolCall {
+                id: tool_id.into(),
+                name: "ask".into(),
+                kind: "other".into(),
+                args_preview: String::new(),
+                started_at: Utc::now(),
+                parent_tool_call_id: None,
+                memory_recall: None,
+                diffs: Vec::new(),
+            },
+            destructive: false,
+            requested_at: Utc::now(),
+            options,
+            resolved: None,
+        };
+        let cases = [
+            (
+                "allow/deny pair",
+                "t1",
+                vec![opt("y", "allow_once"), opt("n", "reject_once")],
+                false,
+            ),
+            (
+                "allow/always/deny",
+                "t1",
+                vec![
+                    opt("y", "allow_once"),
+                    opt("a", "allow_always"),
+                    opt("n", "reject_once"),
+                ],
+                false,
+            ),
+            (
+                "four choices of one kind",
+                "t1",
+                vec![
+                    opt("alpha", "allow_once"),
+                    opt("bravo", "allow_once"),
+                    opt("charlie", "allow_once"),
+                    opt("delta", "allow_once"),
+                ],
+                true,
+            ),
+            (
+                "pi question with two choices",
+                "pi-ui-7",
+                vec![opt("a", "allow_once"), opt("b", "allow_once")],
+                true,
+            ),
+            ("pi id with no options", "pi-ui-7", vec![], false),
+            ("no options", "t1", vec![], false),
+        ];
+        for (label, tool_id, options, expected) in cases {
+            assert_eq!(
+                approval(tool_id, options).is_choice_list(),
+                expected,
+                "{label}"
+            );
+        }
     }
 
     #[test]

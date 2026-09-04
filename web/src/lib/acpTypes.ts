@@ -186,11 +186,21 @@ export interface ConfigOptionSwitchFailure {
   at: string;
 }
 
+/** Mirror of `ApprovalOption` in src/acp/approvals.rs. */
+export interface ApprovalOption {
+  option_id: string;
+  name: string;
+  kind: string;
+}
+
 export interface Approval {
   nonce: string;
   tool_call: ToolCall;
   destructive: boolean;
   requested_at: string;
+  /** The agent's options in its order; absent on approvals recorded before
+   *  options were carried (#3741). */
+  options?: ApprovalOption[];
   resolved?: {
     decision: ApprovalDecision;
     message?: string | null;

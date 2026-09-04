@@ -47,10 +47,11 @@ non-standard location, set `AOE_ACP_NODE=/path/to/node` or configure
 
 ### `aoe acp doctor` says aoe-agent is missing
 
-`aoe-agent` is not packaged with the aoe binary yet (#3553). The default
-structured-view agent is `claude-code`; leave `acp.default_agent` on an adapter
-that `aoe acp doctor` reports as installed, or build `acp-worker/aoe-agent`
-yourself and point the registry command at it.
+`aoe-agent` ships inside the `aoe` binary as sources and is installed into the
+data dir on demand, like the npm adapters: run `aoe acp doctor --fix`. It needs
+the same Node 22+ the other adapters need. Until it is installed, sessions that
+pick it fail to start with an install hint and `aoe acp agents` reports it as
+missing rather than present (#3553).
 
 ### `aoe acp doctor` says claude-code adapter is missing
 

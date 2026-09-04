@@ -2585,7 +2585,7 @@ pub async fn resolve_approval(
     let decision = req.decision;
     match state
         .acp_supervisor
-        .resolve_permission(&id, nonce, decision.into())
+        .resolve_permission(&id, nonce, decision.into(), req.option_id)
         .await
     {
         Ok(()) => {

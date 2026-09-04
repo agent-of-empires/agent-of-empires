@@ -4411,6 +4411,7 @@ mod tests {
             tool_call: tool_call.clone(),
             destructive: false,
             requested_at: Utc::now(),
+            options: Vec::new(),
             resolved: None,
         };
         let approval_b = Approval {
@@ -4418,6 +4419,7 @@ mod tests {
             tool_call: tool_call.clone(),
             destructive: false,
             requested_at: Utc::now(),
+            options: Vec::new(),
             resolved: None,
         };
         let approval_c = Approval {
@@ -4425,6 +4427,7 @@ mod tests {
             tool_call,
             destructive: false,
             requested_at: Utc::now(),
+            options: Vec::new(),
             resolved: None,
         };
         // A is requested and resolved. B and C are requested but never

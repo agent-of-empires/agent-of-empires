@@ -842,6 +842,7 @@ impl AcpClient {
         &self,
         nonce: Nonce,
         decision: ApprovalDecision,
+        option_id: Option<String>,
     ) -> Result<(), AcpError> {
         let mut map = self.pending_responders.lock().await;
         // Only consume the entry if it is actually a permission; a nonce
@@ -854,7 +855,10 @@ impl AcpClient {
             unreachable!("checked above");
         };
         resolver
-            .send(ApprovalResolutionMessage::Decision { decision })
+            .send(ApprovalResolutionMessage::Decision {
+                decision,
+                option_id,
+            })
             .map_err(|_| AcpError::AgentExited)
     }
 

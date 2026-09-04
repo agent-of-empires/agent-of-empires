@@ -204,7 +204,7 @@ async fn shim_agent_round_trips_approval_allow() {
                     let nonce = approval.nonce.clone();
                     let resolve_client = &client;
                     resolve_client
-                        .resolve_permission(nonce, ApprovalDecision::Allow)
+                        .resolve_permission(nonce, ApprovalDecision::Allow, None)
                         .await
                         .expect("resolve_permission");
                 }

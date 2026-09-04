@@ -916,6 +916,7 @@ mod tests {
             },
             destructive: false,
             requested_at: chrono::Utc::now(),
+            options: Vec::new(),
             resolved: None,
         };
         let history = vec![
@@ -1138,6 +1139,7 @@ mod tests {
             },
             destructive: false,
             requested_at: chrono::Utc::now(),
+            options: Vec::new(),
             resolved: None,
         };
         let mut reduced =

@@ -2741,6 +2741,7 @@ mod tests {
                         tool_call: tool_call("t-approval"),
                         destructive: false,
                         requested_at: Utc::now(),
+                        options: Vec::new(),
                         resolved: None,
                     },
                 }]),
