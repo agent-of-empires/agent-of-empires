@@ -16,13 +16,13 @@
 //! resolves it, and the turn only completes (recording `ApprovalResolved`)
 //! once the resolve round-trips through the daemon.
 //!
-//! Compiled only with the default `serve` feature (structured view +
+//! Compiled only with the `web` feature (structured view +
 //! `aoe add --structured-view` don't exist otherwise). Run via:
 //!
 //! ```sh
 //! cargo test --features e2e-tests --test e2e -- acp_home_approval
 //! ```
-#![cfg(feature = "serve")]
+#![cfg(feature = "web")]
 
 use std::time::{Duration, Instant};
 
