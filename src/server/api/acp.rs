@@ -2386,6 +2386,7 @@ pub async fn acp_disable(
         let mut instances = state.instances.write().await;
         if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
             slot.view = crate::session::View::Terminal;
+            slot.acp_load_session_capable = None;
             slot.acp_session_id = persist_acp_session_id.clone();
             slot.import_pending = persist_import_pending;
             if keep_context {
@@ -3866,6 +3867,7 @@ mod tests {
             inst.id = format!("sess-3650-acp-{which}");
             inst.view = crate::session::View::Structured;
             inst.status = crate::session::Status::Idle;
+            inst.acp_load_session_capable = Some(true);
             let id = inst.id.clone();
             let state = crate::server::test_support::build_test_app_state(vec![inst]);
 
@@ -3887,6 +3889,20 @@ mod tests {
                 .await
                 .unwrap_or_else(|_| panic!("{which} must finish once the submission releases"))
                 .unwrap_or_else(|e| panic!("{which} task must not panic: {e}"));
+            if which == "disable" {
+                assert_eq!(
+                    state
+                        .instances
+                        .read()
+                        .await
+                        .iter()
+                        .find(|inst| inst.id == id)
+                        .expect("instance")
+                        .acp_load_session_capable,
+                    None,
+                    "disabling ACP must clear runtime-only negotiated capabilities"
+                );
+            }
         }
     }
 

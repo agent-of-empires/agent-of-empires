@@ -295,6 +295,8 @@ struct WorkerHandle {
     /// Background task draining events from the client. Aborted on
     /// shutdown.
     drain_task: JoinHandle<()>,
+    /// Identifies this installed worker across shutdown and replacement.
+    generation: u64,
     /// Restart bookkeeping: timestamps of recent respawns (post-
     /// initial-spawn). Used by the watchdog to enforce
     /// `MAX_RESPAWNS_IN_WINDOW`. Empty on first spawn so the initial
@@ -358,6 +360,7 @@ pub struct Supervisor<S: BroadcastSink> {
     registry: Arc<Mutex<AgentRegistry>>,
     workers: Arc<Mutex<HashMap<String, WorkerHandle>>>,
     next_seqs: Arc<SeqMap>,
+    next_worker_generation: std::sync::atomic::AtomicU64,
     /// Reservation map: a session_id present here means another task is
     /// mid-resume (spawn OR attach) for it. The `ResumeKind` lets the
     /// capacity check distinguish fresh spawns (which contribute to the
@@ -744,6 +747,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             registry: Arc::new(Mutex::new(AgentRegistry::with_defaults())),
             workers: Arc::new(Mutex::new(HashMap::new())),
             next_seqs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            next_worker_generation: std::sync::atomic::AtomicU64::new(1),
             pending_resumes: Arc::new(std::sync::Mutex::new(HashMap::new())),
             cancelled_resumes: Arc::new(std::sync::Mutex::new(HashSet::new())),
             warmed_up_agents: Arc::new(std::sync::Mutex::new(HashSet::new())),
@@ -1951,11 +1955,15 @@ impl<S: BroadcastSink> Supervisor<S> {
             drop(client);
             return Err(SupervisorError::SpawnCancelled(session_id));
         }
-        let drain_task = self.start_drain_task(session_id.clone(), inbound);
+        let worker_generation = self
+            .next_worker_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let drain_task = self.start_drain_task(session_id.clone(), inbound, worker_generation);
         let client_for_mode = (acp_mode_id.is_some() || yolo_mode).then(|| Arc::clone(&client));
         workers.insert(
             session_id.clone(),
             WorkerHandle {
+                generation: worker_generation,
                 client,
                 drain_task,
                 // Empty: the initial spawn doesn't count toward the
@@ -2014,6 +2022,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         &self,
         session_id: String,
         initial_inbound: mpsc::Receiver<Event>,
+        worker_generation: u64,
     ) -> JoinHandle<()> {
         let sink = Arc::clone(&self.sink);
         let workers = Arc::clone(&self.workers);
@@ -2050,7 +2059,14 @@ impl<S: BroadcastSink> Supervisor<S> {
                     // different ACP backend via `/acp/switch-agent`. See
                     // #1281.
                     let mut rate_limited = false;
-                    while let Some(event) = inbound.recv().await {
+                    while let Some(mut event) = inbound.recv().await {
+                        if let Event::PromptCapabilities {
+                            worker_generation: event_generation,
+                            ..
+                        } = &mut event
+                        {
+                            *event_generation = Some(worker_generation);
+                        }
                         if let Event::Stopped { reason } = &event {
                             if reason == "agent_unresponsive"
                                 || reason == "prompt_orphaned"
@@ -3206,10 +3222,14 @@ impl<S: BroadcastSink> Supervisor<S> {
             drop(client);
             return Err(SupervisorError::SpawnCancelled(session_id));
         }
-        let drain_task = self.start_drain_task(session_id.clone(), inbound);
+        let worker_generation = self
+            .next_worker_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let drain_task = self.start_drain_task(session_id.clone(), inbound, worker_generation);
         workers.insert(
             session_id.clone(),
             WorkerHandle {
+                generation: worker_generation,
                 client,
                 drain_task,
                 restart_history: vec![],
@@ -3330,6 +3350,19 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
         lock_recover(&self.pending_resumes).contains_key(session_id)
     }
+    /// Whether a live event came from the worker currently installed for the
+    /// session. Queued frames from a replaced worker must not mutate runtime state.
+    pub(crate) async fn is_current_worker_generation(
+        &self,
+        session_id: &str,
+        generation: u64,
+    ) -> bool {
+        self.workers
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|worker| worker.generation == generation)
+    }
 
     /// Return the number of running workers (for the doctor + stats).
     pub async fn count(&self) -> usize {
@@ -3342,9 +3375,9 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// `begin_resume` and `is_running`, but no registry entry is written, so
     /// the reconciler's orphan sweep never touches it.
     #[cfg(test)]
-    pub(crate) async fn test_insert_worker(&self, session_id: &str) {
+    pub(crate) async fn test_insert_worker(&self, session_id: &str) -> u64 {
         let (client, _tx) = AcpClient::fake_for_test(AcpSessionId(format!("acp-{session_id}")));
-        self.test_install_worker(session_id, client).await;
+        self.test_install_worker(session_id, client).await
     }
 
     /// Like `test_insert_worker`, but the fake worker's command loop records
@@ -3366,16 +3399,21 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// `test_insert_worker*` fixtures so they differ only in which fake
     /// client they build.
     #[cfg(test)]
-    async fn test_install_worker(&self, session_id: &str, client: AcpClient) {
+    async fn test_install_worker(&self, session_id: &str, client: AcpClient) -> u64 {
+        let generation = self
+            .next_worker_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.workers.lock().await.insert(
             session_id.to_string(),
             WorkerHandle {
                 client: Arc::new(client),
                 drain_task: tokio::spawn(async {}),
+                generation,
                 restart_history: vec![],
                 kind: WorkerKind::Stdio,
             },
         );
+        generation
     }
 
     /// Drop a fake in-memory worker inserted by `test_insert_worker`, freeing
@@ -4491,6 +4529,7 @@ cursor-acp-bridge = "agent acp"
         workers.insert(
             "s-1".into(),
             WorkerHandle {
+                generation: 0,
                 client: Arc::new(client),
                 drain_task: drain,
                 restart_history: vec![Instant::now()],
@@ -4766,6 +4805,7 @@ cursor-acp-bridge = "agent acp"
             workers.insert(
                 "s-1".into(),
                 WorkerHandle {
+                    generation: 0,
                     client: Arc::new(client),
                     drain_task: drain,
                     restart_history: vec![],
@@ -4848,6 +4888,7 @@ cursor-acp-bridge = "agent acp"
             workers.insert(
                 "s-stop".into(),
                 WorkerHandle {
+                    generation: 0,
                     client: Arc::new(client),
                     drain_task: drain,
                     restart_history: vec![],
@@ -4880,6 +4921,7 @@ cursor-acp-bridge = "agent acp"
             workers.insert(
                 "s-3401".into(),
                 WorkerHandle {
+                    generation: 0,
                     client: Arc::new(AcpClient::fake_for_test_dead_connection(AcpSessionId(
                         "acp-3401".into(),
                     ))),
@@ -4966,6 +5008,7 @@ cursor-acp-bridge = "agent acp"
             workers.insert(
                 "s-reap".into(),
                 WorkerHandle {
+                    generation: 0,
                     client: Arc::new(client),
                     drain_task: drain,
                     restart_history: vec![],
@@ -5047,6 +5090,7 @@ cursor-acp-bridge = "agent acp"
             workers.insert(
                 "s-restart".into(),
                 WorkerHandle {
+                    generation: 0,
                     client: Arc::new(client),
                     drain_task: drain,
                     restart_history: vec![],
@@ -5116,6 +5160,7 @@ cursor-acp-bridge = "agent acp"
             workers.insert(
                 "s-stdio".into(),
                 WorkerHandle {
+                    generation: 0,
                     client: Arc::new(client),
                     drain_task: drain,
                     restart_history: vec![],
@@ -5182,6 +5227,7 @@ cursor-acp-bridge = "agent acp"
             workers.insert(
                 "s-stop".into(),
                 WorkerHandle {
+                    generation: 0,
                     client: Arc::new(client),
                     drain_task: drain,
                     restart_history: vec![],
@@ -5222,13 +5268,15 @@ cursor-acp-bridge = "agent acp"
         let sup = Supervisor::new(sink.clone());
 
         let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<Event>(16);
-        let drain = sup.start_drain_task("s-rl".into(), inbound_rx);
+        let worker_generation = 1;
+        let drain = sup.start_drain_task("s-rl".into(), inbound_rx, worker_generation);
         {
             let mut workers = sup.workers.lock().await;
             let (client, _client_tx) = AcpClient::fake_for_test(AcpSessionId("s-rl".into()));
             workers.insert(
                 "s-rl".into(),
                 WorkerHandle {
+                    generation: worker_generation,
                     client: Arc::new(client),
                     // Drain task installed above owns the only handle we
                     // care about; this field is just a placeholder so
@@ -5290,6 +5338,7 @@ cursor-acp-bridge = "agent acp"
             workers.insert(
                 "s-stdio".into(),
                 WorkerHandle {
+                    generation: 0,
                     client: Arc::new(client),
                     drain_task: drain,
                     restart_history: vec![],
@@ -5315,6 +5364,7 @@ cursor-acp-bridge = "agent acp"
         workers.insert(
             session_id.into(),
             WorkerHandle {
+                generation: 0,
                 client: Arc::new(client),
                 drain_task: drain,
                 restart_history: vec![],
@@ -5464,6 +5514,7 @@ cursor-acp-bridge = "agent acp"
             workers.insert(
                 session.into(),
                 WorkerHandle {
+                    generation: 0,
                     client: Arc::new(client),
                     drain_task: tokio::spawn(async {}),
                     restart_history: vec![],
@@ -5782,6 +5833,7 @@ cursor-acp-bridge = "agent acp"
         sup.workers.lock().await.insert(
             "s-reset".into(),
             WorkerHandle {
+                generation: 0,
                 client: Arc::new(client),
                 drain_task: tokio::spawn(async {}),
                 restart_history: vec![],
@@ -5834,6 +5886,7 @@ cursor-acp-bridge = "agent acp"
         sup.workers.lock().await.insert(
             "s-reset-busy".into(),
             WorkerHandle {
+                generation: 0,
                 client: Arc::new(client),
                 drain_task: tokio::spawn(async {}),
                 restart_history: vec![],
@@ -6529,6 +6582,7 @@ cursor-acp-bridge = "agent acp"
         workers.insert(
             "s-1".into(),
             WorkerHandle {
+                generation: 0,
                 client: Arc::new(client),
                 drain_task: drain,
                 restart_history: vec![],
