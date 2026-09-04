@@ -57,7 +57,16 @@ import {
 } from "@dnd-kit/core";
 import { SortableContext, useSortable, verticalListSortingStrategy, arrayMove } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import type { ProjectInfo, RepoGroup, SessionResponse, SessionStatus, Workspace } from "../lib/types";
+import type {
+  ContextResumeAvailability,
+  ContextResumeIndeterminateReason,
+  ContextResumeUnavailableReason,
+  ProjectInfo,
+  RepoGroup,
+  SessionResponse,
+  SessionStatus,
+  Workspace,
+} from "../lib/types";
 import { ProjectsSection } from "./ProjectsSection";
 import type { SidebarAxis } from "../lib/sidebarAxis";
 import {
@@ -441,6 +450,44 @@ function loadSunkExpanded(): boolean {
   const raw = safeGetItem(SUNK_EXPANDED_KEY);
   if (raw === "true") return true;
   return false;
+}
+
+const CONTEXT_RESUME_UNAVAILABLE_DETAIL: Record<ContextResumeUnavailableReason, string> = {
+  agent_unsupported: "this agent has no verified native resume path",
+  sandbox_unsupported: "the sandbox has no authoritative resume target",
+  command_unsupported: "the launch command hides the agent behind a launcher",
+  forced_fresh: "the next launch was explicitly reset",
+  invalid_target: "the saved resume target is invalid",
+  fork_pending: "the requested fork has not completed",
+  previous_failure: "the previous resume attempt failed",
+  no_target: "no resume target has been captured",
+};
+
+const CONTEXT_RESUME_INDETERMINATE_DETAIL: Record<ContextResumeIndeterminateReason, string> = {
+  runtime_check_required: "a runtime check is required at launch",
+  agent_handshake_required: "an agent handshake is required at launch",
+};
+
+function ContextResumeBadge({ availability }: { availability: ContextResumeAvailability | undefined }) {
+  if (!availability || availability.state === "available") return null;
+  const unavailable = availability.state === "unavailable";
+  const title = unavailable
+    ? "Context resume unavailable: " + CONTEXT_RESUME_UNAVAILABLE_DETAIL[availability.reason]
+    : "Context resume not yet confirmed: " + CONTEXT_RESUME_INDETERMINATE_DETAIL[availability.reason];
+  return (
+    <span
+      title={title}
+      aria-label={title}
+      className={
+        "inline-flex shrink-0 items-center rounded border px-1 py-0 text-[10px] font-mono font-medium " +
+        (unavailable
+          ? "border-amber-700/40 bg-amber-950/30 text-amber-300"
+          : "border-surface-700/40 bg-surface-800/40 text-text-dim")
+      }
+    >
+      {unavailable ? "ctx:no" : "ctx:check"}
+    </span>
+  );
 }
 
 /** One-line sidebar affordance showing plan progress for structured view
@@ -1043,6 +1090,7 @@ export const SessionRow = memo(function SessionRow({
   // rare; pick the first structured view session in the workspace.
   const acpSession = workspace.sessions.find((s) => s.view === "structured");
   const runningSession = workspace.sessions.find((s) => isSessionActive(s, idleDecayWindowMs));
+  const navigationSession = runningSession ?? firstSession;
   const singleSession = workspace.sessions.length === 1;
   const sessionTitle = firstSession?.title.trim() ?? "";
   const branchLabel = workspace.branch ?? null;
@@ -1101,7 +1149,7 @@ export const SessionRow = memo(function SessionRow({
         ? "needs attention (error)"
         : "needs your attention";
   const sessionId = firstSession?.id;
-  const navigationSessionId = runningSession?.id ?? firstSession?.id ?? null;
+  const navigationSessionId = navigationSession?.id ?? null;
   const sessionPath = navigationSessionId ? `/session/${encodeURIComponent(navigationSessionId)}` : "/";
   const isDeleting = sessionStatus === "Deleting";
   // Compact rail: keep status glyph + color dot + truncated title, drop the
@@ -1662,6 +1710,7 @@ export const SessionRow = memo(function SessionRow({
                       <span>{formatSnoozeRemainingShort(effectiveSnoozedUntil)}</span>
                     </span>
                   )}
+                  <ContextResumeBadge availability={navigationSession?.context_resume} />
                   {firstSession?.view === "structured" && firstSession.acp_worker_state === "resuming" && (
                     <span
                       title="Structured view worker is resuming"

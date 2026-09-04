@@ -121,6 +121,9 @@ export interface SessionResponse {
   /** True when this session uses ACP acp rendering instead of a
    *  tmux-backed PTY. Absent on builds without the acp feature. */
   view?: "structured" | "terminal";
+  /** Daemon-derived continuity state for the next lifecycle transition.
+   *  Optional because older daemons do not report it. */
+  context_resume?: ContextResumeAvailability;
   /** Live acp worker lifecycle. `absent` for tmux sessions or
    *  acp sessions whose worker has not been spawned yet; `resuming`
    *  while the reconciler is mid-spawn or mid-attach; `running` once
@@ -245,6 +248,23 @@ export type SessionStatus =
   | "Unknown"
   | "Deleting"
   | "Creating";
+
+export type ContextResumeUnavailableReason =
+  | "agent_unsupported"
+  | "sandbox_unsupported"
+  | "command_unsupported"
+  | "forced_fresh"
+  | "invalid_target"
+  | "fork_pending"
+  | "previous_failure"
+  | "no_target";
+
+export type ContextResumeIndeterminateReason = "runtime_check_required" | "agent_handshake_required";
+
+export type ContextResumeAvailability =
+  | { state: "available" }
+  | { state: "indeterminate"; reason: ContextResumeIndeterminateReason }
+  | { state: "unavailable"; reason: ContextResumeUnavailableReason };
 
 /** WebSocket control messages sent from browser to server */
 export interface ResizeMessage {
