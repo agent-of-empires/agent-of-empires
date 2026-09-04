@@ -1719,6 +1719,43 @@ fn named_volume_for(session_id: &str, container_path: &str) -> String {
     format!("aoe-vi-{}-{}-{}", session_id, slug, hash12)
 }
 
+/// The volume names a move stranded: the names the paths under `config.working_dir`
+/// carried back when the container was created at `previous_workdir`.
+///
+/// Deliberately scoped to the mounts that provably moved. A session's other mounts
+/// keep their container paths across a worktree move (the main repo, in a
+/// sibling-worktree layout), so their volumes are never named here even when this
+/// run's config fails to resolve them, which is what a glob whose directory is
+/// absent from the host looks like. Naming only what moved is what separates a
+/// stranded volume from a live cache; "everything this config does not mount" does
+/// not (#3742).
+///
+/// Empty unless the mounts are established to have moved. `previous_workdir` is that
+/// evidence, pinned at create on `SandboxInfo::container_workdir` for #2414: absent
+/// (a session that never had a container, or an attach that cleared the pin) or equal
+/// to this config's, and nothing moved. A degraded resolve withholds it too, since
+/// there the workdir is provisional and the apparent move may be nothing but a
+/// `find_main_repo` failure.
+pub(crate) fn stranded_named_ignore_volumes(
+    config: &ContainerConfig,
+    instance_id: &str,
+    previous_workdir: Option<&str>,
+) -> Vec<String> {
+    let Some(previous) = previous_workdir else {
+        return Vec::new();
+    };
+    if !config.named_ignore_volumes_authoritative || previous == config.working_dir {
+        return Vec::new();
+    }
+    let moved = format!("{}/", config.working_dir);
+    config
+        .named_ignore_volumes
+        .iter()
+        .filter_map(|volume| volume.container_path.strip_prefix(moved.as_str()))
+        .map(|relative| named_volume_for(instance_id, &format!("{}/{}", previous, relative)))
+        .collect()
+}
+
 /// Build a full `ContainerConfig` for creating a sandboxed container.
 ///
 /// `profile` selects which profile's overrides (volumes, mount_ssh, volume_ignores)
@@ -6656,6 +6693,102 @@ volume_ignores = ["target"]
     }
 
     // --- named_volume_for tests ---
+
+    /// The reporter's layout (#3742): a sibling-worktree session whose worktree
+    /// moved from otari-worktrees/905 to otari-worktrees/rev-912. The main repo's
+    /// mount does not move, so its volume must never be named.
+    fn moved_config() -> ContainerConfig {
+        ContainerConfig {
+            working_dir: "/workspace/otari-worktrees/rev-912".to_string(),
+            named_ignore_volumes: vec![
+                NamedVolumeMount {
+                    volume_name: named_volume_for("sess1", "/workspace/otari/target"),
+                    container_path: "/workspace/otari/target".to_string(),
+                },
+                NamedVolumeMount {
+                    volume_name: named_volume_for(
+                        "sess1",
+                        "/workspace/otari-worktrees/rev-912/target",
+                    ),
+                    container_path: "/workspace/otari-worktrees/rev-912/target".to_string(),
+                },
+            ],
+            named_ignore_volumes_authoritative: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn stranded_volumes_are_the_moved_paths_old_names() {
+        let stranded = stranded_named_ignore_volumes(
+            &moved_config(),
+            "sess1",
+            Some("/workspace/otari-worktrees/905"),
+        );
+
+        // Exactly the volume the reporter found orphaned, and not the main repo's,
+        // whose container path a worktree move leaves alone.
+        assert_eq!(
+            stranded,
+            vec!["aoe-vi-sess1-workspace-otari-worktrees-905-target-31ddd0322290"]
+        );
+    }
+
+    #[test]
+    fn a_mount_that_did_not_move_is_never_stranded_by_one_that_did() {
+        // The main repo's `**/bin` is absent from the host this run, so the config
+        // does not mount it. Its container path did not move, so its volume is a
+        // live cache the next matching create re-attaches, not a strand.
+        let mut config = moved_config();
+        config.named_ignore_volumes.remove(0);
+
+        let stranded =
+            stranded_named_ignore_volumes(&config, "sess1", Some("/workspace/otari-worktrees/905"));
+
+        assert_eq!(
+            stranded,
+            vec!["aoe-vi-sess1-workspace-otari-worktrees-905-target-31ddd0322290"],
+            "a config gap under an unmoved mount must not name anything"
+        );
+    }
+
+    #[test]
+    fn nothing_is_stranded_without_evidence_of_a_move() {
+        let degraded = ContainerConfig {
+            named_ignore_volumes_authoritative: false,
+            ..moved_config()
+        };
+        let previous = Some("/workspace/otari-worktrees/905");
+
+        for (case, config, previous_workdir) in [
+            (
+                // An edited volume_ignores, or a glob that matched nothing, changes
+                // the config without moving a mount.
+                "the workdir did not move",
+                moved_config(),
+                Some("/workspace/otari-worktrees/rev-912"),
+            ),
+            (
+                // A session that never had a container, and the attach path, which
+                // clears the pin.
+                "no pinned workdir",
+                moved_config(),
+                None,
+            ),
+            (
+                // The workdir is provisional too, so the apparent move may be
+                // nothing but a find_main_repo failure.
+                "a degraded mount resolve",
+                degraded,
+                previous,
+            ),
+        ] {
+            assert!(
+                stranded_named_ignore_volumes(&config, "sess1", previous_workdir).is_empty(),
+                "{case} must not name a volume for deletion"
+            );
+        }
+    }
 
     #[test]
     fn test_named_volume_for_is_deterministic() {

@@ -124,9 +124,11 @@ ancestor of the workspace and every repo. Build caches (`target/`,
 `node_modules/`) go with the container under the default
 [volume ignores strategy](sandbox.md#volume-ignores-strategy-macosvirtiofs). Under
 `"named"` they are keyed on their container path, so they survive an attach that
-leaves that path alone; attaching a repo from outside the current common ancestor
-moves every mount, so those caches start empty and the volumes they leave behind
-are reclaimed at the next start.
+leaves that path alone. Attaching a repo from outside the current common ancestor
+moves every mount, so those caches start empty, and the volumes they leave behind
+are not reclaimed: the attach clears the pin AoE compares against to recognize a
+move. Remove them by hand with the `docker volume ls` command under
+[Volume Ignores Strategy](sandbox.md#volume-ignores-strategy-macosvirtiofs).
 
 ## The Project Registry
 

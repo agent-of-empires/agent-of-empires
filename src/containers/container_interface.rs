@@ -90,14 +90,13 @@ pub struct ContainerConfig {
     pub anonymous_volumes: Vec<String>,
     /// Named volumes for volume_ignores when strategy = "named". Cleaned up explicitly on session delete.
     pub named_ignore_volumes: Vec<NamedVolumeMount>,
-    /// Whether `named_ignore_volumes` is the whole set this session's mounts imply,
-    /// so a volume outside it is provably stranded rather than merely unresolved.
+    /// Whether these paths, `working_dir` included, follow from the project's real
+    /// layout rather than from the collapsed fallback a failed `find_main_repo` takes.
     ///
-    /// False when the mount resolve was degraded (broken worktree linkage) or a glob
-    /// `volume_ignores` entry matched nothing, where the set is a floor. Gates the
-    /// reclaim in `DockerContainer::prune_stale_named_ignore_volumes`, so it defaults
-    /// to false: a config that has not positively established completeness never
-    /// drives a deletion.
+    /// Gates the volume reclaim in `stranded_named_ignore_volumes`, which reads a
+    /// changed `working_dir` as a move; under the fallback that change may be nothing
+    /// but the failure. Defaults to false, so a config that has not positively
+    /// established its paths never drives a deletion.
     pub named_ignore_volumes_authoritative: bool,
     pub environment: Vec<EnvEntry>,
     pub cpu_limit: Option<String>,
