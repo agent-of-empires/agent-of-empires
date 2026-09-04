@@ -1,5 +1,4 @@
 import type { Page } from "@playwright/test";
-import { mockSessionsEnvelope } from "./sessionMocks";
 
 // Shared mocks so a running `aoe serve` + tmux aren't required. We stub the
 // REST API and route the PTY WebSocket so the xterm.js terminal mounts and the
@@ -79,7 +78,7 @@ export async function mockTerminalApis(
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() === "POST") return r.fulfill({ status: 400 });
     return r.fulfill({
-      json: mockSessionsEnvelope({
+      json: {
         sessions: [
           {
             id: "pinch-test",
@@ -101,7 +100,7 @@ export async function mockTerminalApis(
           },
         ],
         workspace_ordering: [],
-      }),
+      },
     });
   });
   await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));

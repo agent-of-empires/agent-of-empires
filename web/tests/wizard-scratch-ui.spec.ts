@@ -1,5 +1,4 @@
 import { test, expect } from "./helpers/mockedTest";
-import { mockSessionsEnvelope } from "./helpers/sessionMocks";
 import { Page } from "@playwright/test";
 import { openWizard, expandMoreOptions, wizard } from "./helpers/wizard";
 
@@ -66,7 +65,10 @@ async function mockApis(
       return r.fulfill({ json: { session: { id: "new-session" } } });
     }
     return r.fulfill({
-      json: mockSessionsEnvelope({ sessions: opts.sessions ?? [sessionStub({})], workspace_ordering: [] }),
+      json: {
+        sessions: opts.sessions ?? [sessionStub({})],
+        workspace_ordering: [],
+      },
     });
   });
 }

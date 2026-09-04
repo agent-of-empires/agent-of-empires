@@ -1,5 +1,4 @@
 import { test, expect } from "./helpers/mockedTest";
-import { mockSessionsEnvelope } from "./helpers/sessionMocks";
 import { Page } from "@playwright/test";
 import { clickSidebarSession } from "./helpers/sidebar";
 
@@ -14,7 +13,7 @@ async function setupMultiRepoSession(page: Page) {
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() === "POST") return r.fulfill({ status: 400 });
     return r.fulfill({
-      json: mockSessionsEnvelope({
+      json: {
         sessions: [
           {
             id: "multi-repo",
@@ -39,7 +38,7 @@ async function setupMultiRepoSession(page: Page) {
           },
         ],
         workspace_ordering: [],
-      }),
+      },
     });
   });
   await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));

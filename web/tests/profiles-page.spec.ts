@@ -12,7 +12,6 @@
 // the /api/about read_only flag, and the dropdown/rail refresh loops.
 
 import { test, expect } from "./helpers/mockedTest";
-import { mockSessionsEnvelope } from "./helpers/sessionMocks";
 import type { Page } from "@playwright/test";
 
 interface ProfileState {
@@ -45,7 +44,7 @@ async function installProfilesPageMocks(
 
   await page.route(
     (url) => url.pathname === "/api/sessions",
-    (r) => r.fulfill({ json: mockSessionsEnvelope({ sessions: [], workspace_ordering: [] }) }),
+    (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }),
   );
   await page.route(
     (url) => url.pathname === "/api/about",

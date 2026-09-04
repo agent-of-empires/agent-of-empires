@@ -178,29 +178,17 @@ everything and filtering client-side.
 | --- | --- | --- |
 | `state` | (unfiltered) | `live` excludes trashed and archived sessions. `trashed` returns only trashed sessions. `all` (or omitting the param) is the historical unfiltered behavior. An unrecognized value is rejected with `400` rather than ignored, so a typo surfaces instead of silently returning every session. |
 
-**Request headers**
-
-`X-Aoe-Client-Capabilities` is an optional comma-separated list of attach
-transports the caller can consume. Supported values are `acp_ws_v1` and
-`terminal_ws_v1`. Unknown well-formed values are ignored. Empty values, invalid
-tokens, more than 32 tokens, tokens longer than 64 bytes, or a combined value
-over 1,024 bytes return `400`. The response includes
-`Vary: x-aoe-client-capabilities`.
-
 Each session row includes `context_resume`, the request-invariant availability
 of preserving that agent's context. Unavailable reasons are
 `agent_unsupported`, `sandbox_unsupported`, `command_unsupported`,
 `forced_fresh`, `invalid_target`, `fork_pending`, `previous_failure`, and
-`no_target`. The `session_attach` object contains one request-scoped attach
-result per returned session id. Without the capability header, each attach
-result is `unavailable` with reason `client_missing_transport`.
+`no_target`.
 
 **Example**
 
 ```bash
 curl -sS \
   -H "Authorization: Bearer $AOE_TOKEN" \
-  -H "X-Aoe-Client-Capabilities: acp_ws_v1" \
   "http://localhost:7777/api/sessions?state=live"
 ```
 

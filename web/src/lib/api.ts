@@ -36,29 +36,8 @@ export interface SessionsEnvelope {
   workspace_ordering: string[];
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function decodeSessionsEnvelope(value: unknown): SessionsEnvelope | null {
-  if (
-    !isRecord(value) ||
-    !Array.isArray(value.sessions) ||
-    !Array.isArray(value.workspace_ordering) ||
-    !value.workspace_ordering.every((id) => typeof id === "string")
-  ) {
-    return null;
-  }
-  const ids = new Set<string>();
-  for (const session of value.sessions) {
-    if (!isRecord(session) || typeof session.id !== "string" || ids.has(session.id)) return null;
-    ids.add(session.id);
-  }
-  return value as unknown as SessionsEnvelope;
-}
-
-export async function fetchSessions(): Promise<SessionsEnvelope | null> {
-  return decodeSessionsEnvelope(await fetchJson<unknown>("/api/sessions"));
+export function fetchSessions(): Promise<SessionsEnvelope | null> {
+  return fetchJson<SessionsEnvelope>("/api/sessions");
 }
 
 export interface ConversationSearchHit {

@@ -1,18 +1,14 @@
 //! Remote home screen for cross-machine structured-session attach.
 //!
-//! The daemon supplies request-scoped attach availability while each session
-//! row carries its request-invariant context-resume state.
+//! Each session row carries its daemon-derived context-resume state.
 mod render;
 
-use std::collections::BTreeMap;
 use std::io::Stdout;
 
 use crate::acp::client::discovery::DaemonEndpoint;
-use crate::acp::client::{ClientCapability, HttpClient};
+use crate::acp::client::HttpClient;
 use crate::plugin::ui_state::UiSnapshot;
-use crate::server::api::sessions::{
-    AttachAvailability, AttachTransport, ContextResumeAvailability,
-};
+use crate::server::api::sessions::ContextResumeAvailability;
 use crate::session::config::{resolve_theme_name, resolve_theme_palette_mode};
 use crate::tui::styles::Theme;
 use anyhow::Result;
@@ -26,10 +22,12 @@ struct RemoteSessionWire {
     id: String,
     title: String,
     project_path: String,
+    #[serde(default)]
     status: String,
     #[serde(default)]
     view: crate::session::View,
-    context_resume: ContextResumeAvailability,
+    #[serde(default)]
+    context_resume: Option<ContextResumeAvailability>,
 }
 #[derive(Debug, Clone)]
 pub struct RemoteSession {
@@ -37,19 +35,7 @@ pub struct RemoteSession {
     pub title: String,
     pub project_path: String,
     pub status: String,
-    pub context_resume: ContextResumeAvailability,
-    pub attach: AttachAvailability,
-}
-
-impl RemoteSession {
-    fn can_open(&self) -> bool {
-        matches!(
-            self.attach,
-            AttachAvailability::Available {
-                transport: AttachTransport::AcpWebsocketV1
-            }
-        )
-    }
+    pub context_resume: Option<ContextResumeAvailability>,
 }
 
 pub struct RemoteHomeState {
@@ -176,12 +162,7 @@ async fn run(
             KeyCode::Down | KeyCode::Char('j') => state.move_cursor(1),
             KeyCode::Up | KeyCode::Char('k') => state.move_cursor(-1),
             KeyCode::Enter => {
-                if let Some(session) = state
-                    .sessions
-                    .get(state.cursor)
-                    .filter(|session| session.can_open())
-                    .cloned()
-                {
+                if let Some(session) = state.sessions.get(state.cursor).cloned() {
                     let endpoint = state.endpoint.clone();
                     super::structured_view::run_for_endpoint(
                         terminal,
@@ -191,10 +172,7 @@ async fn run(
                         &session.id,
                     )
                     .await?;
-                    // Use the shared helper, not `terminal.clear()`: the latter
-                    // does an `ESC[6n` cursor read that races the live
-                    // `EventStream` and can abort with "cursor position could
-                    // not be read" (see `crate::tui::clear_terminal`).
+                    // Avoid a cursor query that races the live event stream.
                     crate::tui::clear_terminal(terminal)?;
                 }
             }
@@ -205,35 +183,20 @@ async fn run(
     Ok(())
 }
 
-fn sessions_from_snapshot(
-    (wire_sessions, mut session_attach): (
-        Vec<RemoteSessionWire>,
-        BTreeMap<String, AttachAvailability>,
-    ),
-) -> Result<Vec<RemoteSession>, String> {
-    let mut seen = std::collections::HashSet::new();
-    let mut sessions = Vec::with_capacity(wire_sessions.len());
-    for session in wire_sessions {
-        if !seen.insert(session.id.clone()) {
-            return Err(format!("duplicate session id: {}", session.id));
-        }
-        if session.view != crate::session::View::Structured {
-            continue;
-        }
-        let attach = session_attach
-            .remove(&session.id)
-            .ok_or_else(|| format!("missing attach availability for session {}", session.id))?;
-        sessions.push(RemoteSession {
+fn sessions_from_snapshot(wire_sessions: Vec<RemoteSessionWire>) -> Vec<RemoteSession> {
+    let mut sessions: Vec<_> = wire_sessions
+        .into_iter()
+        .filter(|session| session.view == crate::session::View::Structured)
+        .map(|session| RemoteSession {
             id: session.id,
             title: session.title,
             project_path: session.project_path,
             status: session.status,
             context_resume: session.context_resume,
-            attach,
-        });
-    }
+        })
+        .collect();
     sessions.sort_by(|a, b| a.title.cmp(&b.title));
-    Ok(sessions)
+    sessions
 }
 
 fn apply_session_result(state: &mut RemoteHomeState, result: Result<Vec<RemoteSession>, String>) {
@@ -258,12 +221,10 @@ async fn refresh(state: &mut RemoteHomeState) {
     state.last_error = None;
     let sessions = state
         .client
-        .list_sessions_with_attach::<RemoteSessionWire, AttachAvailability>(&[
-            ClientCapability::AcpWebsocketV1,
-        ])
+        .list_sessions::<RemoteSessionWire>()
         .await
-        .map_err(|error| error.to_string())
-        .and_then(sessions_from_snapshot);
+        .map(sessions_from_snapshot)
+        .map_err(|error| error.to_string());
     apply_session_result(state, sessions);
 
     state.plugin_ui = match state.client.plugin_ui_state().await {
@@ -280,20 +241,13 @@ mod tests {
     use super::*;
     use crate::acp::client::discovery::Source;
 
-    fn available_attach() -> AttachAvailability {
-        AttachAvailability::Available {
-            transport: AttachTransport::AcpWebsocketV1,
-        }
-    }
-
     fn session(id: &str) -> RemoteSession {
         RemoteSession {
             id: id.to_string(),
             title: id.to_string(),
             project_path: format!("/tmp/{id}"),
             status: "Stopped".to_string(),
-            context_resume: ContextResumeAvailability::Available,
-            attach: available_attach(),
+            context_resume: Some(ContextResumeAvailability::Available),
         }
     }
 
@@ -304,7 +258,7 @@ mod tests {
             project_path: format!("/tmp/{id}"),
             status: "Stopped".to_string(),
             view,
-            context_resume: ContextResumeAvailability::Available,
+            context_resume: Some(ContextResumeAvailability::Available),
         }
     }
 
@@ -318,48 +272,44 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_requires_attach_for_every_structured_session() {
-        let error = sessions_from_snapshot((
-            vec![wire("missing", crate::session::View::Structured)],
-            BTreeMap::new(),
-        ))
-        .unwrap_err();
-        assert_eq!(error, "missing attach availability for session missing");
+    fn old_daemon_session_without_new_fields_stays_openable() {
+        let wire: RemoteSessionWire = serde_json::from_value(serde_json::json!({
+            "id": "legacy",
+            "title": "Legacy",
+            "project_path": "/tmp/legacy",
+            "view": "structured"
+        }))
+        .unwrap();
+
+        let sessions = sessions_from_snapshot(vec![wire]);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "legacy");
+        assert_eq!(sessions[0].status, "");
+        assert_eq!(sessions[0].context_resume, None);
     }
 
     #[test]
-    fn snapshot_failure_clears_stale_sessions_and_handoff() {
+    fn snapshot_failure_clears_stale_sessions() {
         let mut state = state();
         state.sessions = vec![session("stale")];
         state.cursor = 4;
         state.status_text = Some("stale status".to_string());
 
-        apply_session_result(&mut state, Err("missing attach availability".to_string()));
+        apply_session_result(&mut state, Err("daemon unavailable".to_string()));
 
         assert!(state.sessions.is_empty());
         assert_eq!(state.cursor, 0);
-        assert_eq!(
-            state.last_error.as_deref(),
-            Some("missing attach availability")
-        );
+        assert_eq!(state.last_error.as_deref(), Some("daemon unavailable"));
         assert!(state.status_text.is_none());
     }
 
     #[test]
     fn successful_snapshot_restores_sorted_structured_scope() {
-        let mut attach = BTreeMap::new();
-        attach.insert("second".to_string(), available_attach());
-        attach.insert("first".to_string(), available_attach());
-        attach.insert("extra".to_string(), available_attach());
-        let sessions = sessions_from_snapshot((
-            vec![
-                wire("second", crate::session::View::Structured),
-                wire("terminal", crate::session::View::Terminal),
-                wire("first", crate::session::View::Structured),
-            ],
-            attach,
-        ))
-        .unwrap();
+        let sessions = sessions_from_snapshot(vec![
+            wire("second", crate::session::View::Structured),
+            wire("terminal", crate::session::View::Terminal),
+            wire("first", crate::session::View::Structured),
+        ]);
 
         let mut state = state();
         apply_session_result(&mut state, Ok(sessions));

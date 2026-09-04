@@ -6,7 +6,6 @@
 //! `Authorization: Bearer <token>` on every request, never as a
 //! query string, so it doesn't leak via logs or `ps`.
 
-use std::collections::BTreeMap;
 use std::time::Duration;
 
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
@@ -47,27 +46,6 @@ const PATH_SEGMENT: &AsciiSet = &CONTROLS
 #[derive(serde::Deserialize)]
 struct SessionsEnvelope<T> {
     sessions: Vec<T>,
-}
-#[derive(serde::Deserialize)]
-struct SessionsAttachEnvelope<T, A> {
-    sessions: Vec<T>,
-    session_attach: BTreeMap<String, A>,
-}
-
-/// Transport features this HTTP client can consume for a sessions request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClientCapability {
-    AcpWebsocketV1,
-    TerminalWebsocketV1,
-}
-
-impl ClientCapability {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::AcpWebsocketV1 => "acp_ws_v1",
-            Self::TerminalWebsocketV1 => "terminal_ws_v1",
-        }
-    }
 }
 
 /// One active plugin command as the daemon reports it (`GET
@@ -598,40 +576,12 @@ impl HttpClient {
         Err(classify_resolve_error(status, &text, nonce, session_id))
     }
 
-    /// `GET /api/sessions`. Returns the daemon's session list as
-    /// whatever shape the caller deserialises into. Used by the
-    /// remote-structured view picker so the bespoke `reqwest::Client` it used
-    /// to keep can be retired in favour of the shared auth/header
-    /// plumbing.
+    /// Returns session rows from `GET /api/sessions` using shared authentication.
     pub async fn list_sessions<T: serde::de::DeserializeOwned>(&self) -> Result<Vec<T>, HttpError> {
         let url = format!("{}/api/sessions", self.endpoint.base_url);
         let res = self.auth(self.http.get(&url)).send().await?;
         let res = check_status(res, "<sessions>").await?;
         Ok(res.json::<SessionsEnvelope<T>>().await?.sessions)
-    }
-    /// `GET /api/sessions` with request-scoped attach negotiation.
-    pub async fn list_sessions_with_attach<T, A>(
-        &self,
-        capabilities: &[ClientCapability],
-    ) -> Result<(Vec<T>, BTreeMap<String, A>), HttpError>
-    where
-        T: serde::de::DeserializeOwned,
-        A: serde::de::DeserializeOwned,
-    {
-        let url = format!("{}/api/sessions", self.endpoint.base_url);
-        let mut request = self.http.get(&url);
-        if !capabilities.is_empty() {
-            let value = capabilities
-                .iter()
-                .map(|capability| capability.as_str())
-                .collect::<Vec<_>>()
-                .join(",");
-            request = request.header("X-Aoe-Client-Capabilities", value);
-        }
-        let res = self.auth(request).send().await?;
-        let res = check_status(res, "<sessions>").await?;
-        let envelope = res.json::<SessionsAttachEnvelope<T, A>>().await?;
-        Ok((envelope.sessions, envelope.session_attach))
     }
 
     /// Session title, resolved ACP agent, and path roots used by the native

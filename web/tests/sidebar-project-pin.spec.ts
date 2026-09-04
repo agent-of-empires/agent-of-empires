@@ -1,5 +1,4 @@
 import { test, expect } from "./helpers/mockedTest";
-import { mockSessionsEnvelope } from "./helpers/sessionMocks";
 import { Page } from "@playwright/test";
 
 // Mocked coverage for the web sidebar pin/unpin handlers (#2208). The live
@@ -27,7 +26,7 @@ async function mockApis(page: Page, sessions: MockSession[], projects: MockProje
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
     return r.fulfill({
-      json: mockSessionsEnvelope({
+      json: {
         sessions: sessions.map((s) => ({
           id: s.id,
           title: s.title,
@@ -47,7 +46,7 @@ async function mockApis(page: Page, sessions: MockSession[], projects: MockProje
           workspace_repos: [],
         })),
         workspace_ordering: [],
-      }),
+      },
     });
   });
   // GET lists the registry; POST registers (returns the created project).

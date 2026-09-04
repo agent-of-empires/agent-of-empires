@@ -1,12 +1,12 @@
 //! Session CRUD, ensure-* lifecycle endpoints, and per-file diff handlers.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
     extract::{Path, State},
-    http::{header::VARY, HeaderMap, HeaderValue, StatusCode},
-    response::{IntoResponse, Response},
+    http::StatusCode,
+    response::IntoResponse,
     Json,
 };
 use serde::{Deserialize, Serialize};

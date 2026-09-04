@@ -1,5 +1,4 @@
 import { test, expect } from "./helpers/mockedTest";
-import { mockSessionsEnvelope } from "./helpers/sessionMocks";
 import { Page } from "@playwright/test";
 import { clickSidebarSession } from "./helpers/sidebar";
 import { mockTerminalApis } from "./helpers/terminal-mocks";
@@ -111,7 +110,7 @@ test.describe("Diff base override (#970)", () => {
     await page.route("**/api/sessions", (r) => {
       if (r.request().method() === "POST") return r.fulfill({ status: 400 });
       return r.fulfill({
-        json: mockSessionsEnvelope({
+        json: {
           sessions: [
             {
               id: "pinch-test",
@@ -134,7 +133,7 @@ test.describe("Diff base override (#970)", () => {
             },
           ],
           workspace_ordering: [],
-        }),
+        },
       });
     });
     let patched: { base_branch?: string | null } | null = null;

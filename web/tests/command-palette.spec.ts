@@ -1,5 +1,4 @@
 import { test, expect } from "./helpers/mockedTest";
-import { mockSessionsEnvelope } from "./helpers/sessionMocks";
 
 test.describe("Command palette", () => {
   test("opens with Ctrl+K", async ({ page }) => {
@@ -98,9 +97,7 @@ test.describe("Command palette", () => {
     // time out waiting for the button to become enabled. The dashboard
     // offline-indicator test in dashboard.spec.ts exercises the
     // opposite case (no stub → offline UI surfaces).
-    await page.route("**/api/sessions", (r) =>
-      r.fulfill({ json: mockSessionsEnvelope({ sessions: [], workspace_ordering: [] }) }),
-    );
+    await page.route("**/api/sessions", (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }));
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
     await page.getByLabel("New project session").first().click();

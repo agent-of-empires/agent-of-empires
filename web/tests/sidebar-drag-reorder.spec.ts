@@ -1,5 +1,4 @@
 import { test, expect } from "./helpers/mockedTest";
-import { mockSessionsEnvelope } from "./helpers/sessionMocks";
 import { Page } from "@playwright/test";
 
 // End-to-end coverage for drag-to-reorder workspaces in the sidebar.
@@ -44,7 +43,10 @@ async function mockApis(page: Page, getSessions: () => MockSession[], getOrderin
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
     return r.fulfill({
-      json: mockSessionsEnvelope({ sessions: getSessions().map(sessionResponse), workspace_ordering: getOrdering() }),
+      json: {
+        sessions: getSessions().map(sessionResponse),
+        workspace_ordering: getOrdering(),
+      },
     });
   });
   // The client only PUTs `/api/workspace-ordering` from an explicit

@@ -1,5 +1,4 @@
 import { test, expect } from "./helpers/mockedTest";
-import { mockSessionsEnvelope } from "./helpers/sessionMocks";
 import { Page } from "@playwright/test";
 import { openWizard } from "./helpers/wizard";
 
@@ -22,9 +21,7 @@ async function mockApis(page: Page) {
   await page.route("**/api/agents", (r) =>
     r.fulfill({ json: [{ name: "claude", binary: "claude", host_only: false, installed: true, install_hint: "" }] }),
   );
-  await page.route("**/api/sessions", (r) =>
-    r.fulfill({ json: mockSessionsEnvelope({ sessions: [], workspace_ordering: [] }) }),
-  );
+  await page.route("**/api/sessions", (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }));
 }
 
 test("wizard overlay outranks the z-50 tooltip layer on mobile", async ({ page }) => {

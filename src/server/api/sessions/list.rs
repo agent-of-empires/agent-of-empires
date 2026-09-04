@@ -23,93 +23,6 @@ pub async fn get_recent_projects() -> Json<RecentProjectsResponse> {
     Json(RecentProjectsResponse { projects })
 }
 
-const CLIENT_CAPABILITIES_HEADER: &str = "x-aoe-client-capabilities";
-const MAX_CLIENT_CAPABILITIES_BYTES: usize = 1024;
-const MAX_CLIENT_CAPABILITIES: usize = 32;
-const MAX_CLIENT_CAPABILITY_BYTES: usize = 64;
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct RequestedClientCapabilities {
-    acp_websocket_v1: bool,
-    terminal_websocket_v1: bool,
-}
-
-fn parse_client_capabilities(
-    headers: &HeaderMap,
-) -> Result<RequestedClientCapabilities, &'static str> {
-    let mut parsed = RequestedClientCapabilities::default();
-    let mut bytes = 0;
-    let mut count = 0;
-    for value in headers.get_all(CLIENT_CAPABILITIES_HEADER) {
-        let value = value
-            .to_str()
-            .map_err(|_| "invalid x-aoe-client-capabilities header")?;
-        bytes += value.len();
-        if bytes > MAX_CLIENT_CAPABILITIES_BYTES || value.is_empty() {
-            return Err("invalid x-aoe-client-capabilities header");
-        }
-        for token in value.split(',') {
-            count += 1;
-            if count > MAX_CLIENT_CAPABILITIES
-                || token.is_empty()
-                || token.len() > MAX_CLIENT_CAPABILITY_BYTES
-                || !token.bytes().all(|byte| {
-                    byte.is_ascii_alphanumeric()
-                        || matches!(
-                            byte,
-                            b'!' | b'#'
-                                | b'$'
-                                | b'%'
-                                | b'&'
-                                | b'*'
-                                | b'+'
-                                | b'-'
-                                | b'.'
-                                | b'^'
-                                | b'_'
-                                | b'|'
-                                | b'~'
-                        )
-                        || byte == 39
-                        || byte == 96
-                })
-            {
-                return Err("invalid x-aoe-client-capabilities header");
-            }
-            match token {
-                "acp_ws_v1" => parsed.acp_websocket_v1 = true,
-                "terminal_ws_v1" => parsed.terminal_websocket_v1 = true,
-                _ => {}
-            }
-        }
-    }
-    Ok(parsed)
-}
-
-fn attach_for(inst: &Instance, capabilities: RequestedClientCapabilities) -> AttachAvailability {
-    match inst.view {
-        crate::session::View::Structured if capabilities.acp_websocket_v1 => {
-            AttachAvailability::Available {
-                transport: AttachTransport::AcpWebsocketV1,
-            }
-        }
-        crate::session::View::Terminal if capabilities.terminal_websocket_v1 => {
-            AttachAvailability::Available {
-                transport: AttachTransport::TerminalWebsocketV1,
-            }
-        }
-        _ => AttachAvailability::Unavailable {
-            reason: AttachUnavailableReason::ClientMissingTransport,
-        },
-    }
-}
-
-fn with_client_capabilities_vary(mut response: Response) -> Response {
-    response
-        .headers_mut()
-        .insert(VARY, HeaderValue::from_static(CLIENT_CAPABILITIES_HEADER));
-    response
-}
 /// Query params for `GET /api/sessions`. `state` shares its vocabulary with
 /// the CLI's `aoe list --state` via [`crate::session::SessionScope`] so a
 /// future third caller cannot drift.
@@ -120,17 +33,8 @@ pub struct ListSessionsQuery {
 
 pub async fn list_sessions(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<ListSessionsQuery>,
-) -> Response {
-    let capabilities = match parse_client_capabilities(&headers) {
-        Ok(capabilities) => capabilities,
-        Err(message) => {
-            return with_client_capabilities_vary(
-                (StatusCode::BAD_REQUEST, message).into_response(),
-            );
-        }
-    };
+) -> Json<SessionsEnvelope> {
     let instances = state.instances.read().await;
     let claude_fullscreen = crate::claude_settings::read_tui_fullscreen();
     // Snapshot the supervisor's worker lifecycle map once per request
@@ -148,10 +52,6 @@ pub async fn list_sessions(
         // structured-target gate. See #7.
         .filter(|inst| !state.cityhall_mode || inst.is_structured())
         .filter(|inst| crate::session::SessionScope::matches(query.state, inst))
-        .collect();
-    let session_attach: BTreeMap<String, AttachAvailability> = scoped_instances
-        .iter()
-        .map(|inst| (inst.id.clone(), attach_for(inst, capabilities)))
         .collect();
     let mut sessions: Vec<SessionResponse> = scoped_instances
         .iter()
@@ -388,14 +288,10 @@ pub async fn list_sessions(
             Vec::new()
         });
 
-    with_client_capabilities_vary(
-        Json(SessionsEnvelope {
-            sessions,
-            workspace_ordering,
-            session_attach,
-        })
-        .into_response(),
-    )
+    Json(SessionsEnvelope {
+        sessions,
+        workspace_ordering,
+    })
 }
 // Workspace id derivation. Mirrors the client logic in `useWorkspaces.ts`:
 // a session with a branch collapses to `${repoPath}::${branch}`; a
@@ -537,61 +433,11 @@ pub async fn update_workspace_ordering(
 }
 
 #[cfg(test)]
-mod client_capability_tests {
+mod context_resume_tests {
     use super::*;
 
-    fn capability_headers(value: &str) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            CLIENT_CAPABILITIES_HEADER,
-            HeaderValue::from_str(value).unwrap(),
-        );
-        headers
-    }
-
-    #[derive(serde::Deserialize)]
-    struct DecodedSessionsEnvelope {
-        session_attach: BTreeMap<String, AttachAvailability>,
-    }
-
-    async fn decode_sessions_response(response: Response) -> DecodedSessionsEnvelope {
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        serde_json::from_slice(&body).unwrap()
-    }
-
     #[test]
-    fn client_capabilities_are_bounded_and_request_scoped() {
-        let parsed =
-            parse_client_capabilities(&capability_headers("acp_ws_v1,unknown_v2,terminal_ws_v1"))
-                .unwrap();
-        assert_eq!(
-            parsed,
-            RequestedClientCapabilities {
-                acp_websocket_v1: true,
-                terminal_websocket_v1: true,
-            }
-        );
-
-        for invalid in ["", ",acp_ws_v1", "acp_ws_v1,", "contains space"] {
-            assert!(parse_client_capabilities(&capability_headers(invalid)).is_err());
-        }
-        assert!(parse_client_capabilities(&capability_headers(&"x".repeat(65))).is_err());
-        assert!(parse_client_capabilities(&capability_headers(&vec!["x"; 33].join(","))).is_err());
-
-        let response = with_client_capabilities_vary(StatusCode::OK.into_response());
-        assert_eq!(
-            response
-                .headers()
-                .get(VARY)
-                .and_then(|value| value.to_str().ok()),
-            Some(CLIENT_CAPABILITIES_HEADER)
-        );
-    }
-
-    #[test]
-    fn projections_separate_context_resume_from_attach() {
+    fn context_resume_projects_structured_and_terminal_states() {
         let mut structured = Instance::new("structured", "/tmp/structured");
         structured.view = crate::session::View::Structured;
         assert_eq!(
@@ -600,30 +446,12 @@ mod client_capability_tests {
                 reason: ContextResumeUnavailableReason::NoTarget,
             }
         );
-        assert_eq!(
-            attach_for(&structured, RequestedClientCapabilities::default()),
-            AttachAvailability::Unavailable {
-                reason: AttachUnavailableReason::ClientMissingTransport,
-            }
-        );
 
         structured.acp_session_id = Some("opaque-server-target".to_string());
         assert_eq!(
             context_resume_for(&structured),
             ContextResumeAvailability::Indeterminate {
                 reason: ContextResumeIndeterminateReason::AgentHandshakeRequired,
-            }
-        );
-        assert_eq!(
-            attach_for(
-                &structured,
-                RequestedClientCapabilities {
-                    acp_websocket_v1: true,
-                    terminal_websocket_v1: false,
-                },
-            ),
-            AttachAvailability::Available {
-                transport: AttachTransport::AcpWebsocketV1,
             }
         );
 
@@ -643,46 +471,6 @@ mod client_capability_tests {
             ContextResumeAvailability::Indeterminate {
                 reason: ContextResumeIndeterminateReason::RuntimeCheckRequired,
             }
-        );
-        assert_eq!(
-            attach_for(
-                &terminal,
-                RequestedClientCapabilities {
-                    acp_websocket_v1: false,
-                    terminal_websocket_v1: true,
-                },
-            ),
-            AttachAvailability::Available {
-                transport: AttachTransport::TerminalWebsocketV1,
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn list_sessions_projects_attach_from_request_capabilities() {
-        let mut structured = Instance::new("structured", "/tmp/structured");
-        structured.id = "structured".to_string();
-        structured.view = crate::session::View::Structured;
-        let state = crate::server::test_support::build_test_app_state(vec![structured]);
-
-        let envelope = decode_sessions_response(
-            list_sessions(
-                axum::extract::State(state),
-                capability_headers("acp_ws_v1"),
-                axum::extract::Query(ListSessionsQuery { state: None }),
-            )
-            .await,
-        )
-        .await;
-
-        assert_eq!(
-            envelope.session_attach,
-            BTreeMap::from([(
-                "structured".to_string(),
-                AttachAvailability::Available {
-                    transport: AttachTransport::AcpWebsocketV1,
-                },
-            )])
         );
     }
 }

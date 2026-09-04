@@ -9,7 +9,6 @@
 // endpoint lockdown are covered by unit tests and the manual test steps.
 
 import { test, expect } from "./helpers/mockedTest";
-import { mockSessionsEnvelope } from "./helpers/sessionMocks";
 import type { Page } from "@playwright/test";
 import { openWizard, wizard } from "./helpers/wizard";
 
@@ -57,7 +56,7 @@ async function installCityHallMocks(page: Page) {
   );
   await page.route(
     (url) => url.pathname === "/api/sessions",
-    (r) => r.fulfill({ json: mockSessionsEnvelope({ sessions: [], workspace_ordering: [] }) }),
+    (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }),
   );
   await page.route(
     (url) => url.pathname === "/api/profiles",

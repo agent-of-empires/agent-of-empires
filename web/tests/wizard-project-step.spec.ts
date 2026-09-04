@@ -1,5 +1,4 @@
 import { test, expect } from "./helpers/mockedTest";
-import { mockSessionsEnvelope } from "./helpers/sessionMocks";
 import { Page } from "@playwright/test";
 import { openWizard } from "./helpers/wizard";
 
@@ -39,7 +38,7 @@ async function mockBaseApis(page: Page) {
 }
 
 function seedRecentSession() {
-  return mockSessionsEnvelope({
+  return {
     sessions: [
       {
         id: "seed",
@@ -61,7 +60,7 @@ function seedRecentSession() {
       },
     ],
     workspace_ordering: [],
-  });
+  };
 }
 
 test.describe("Wizard project section (#1219)", () => {
@@ -81,9 +80,7 @@ test.describe("Wizard project section (#1219)", () => {
 
   test("Browse tab defaults when no recents", async ({ page }) => {
     await mockBaseApis(page);
-    await page.route("**/api/sessions", (r) =>
-      r.fulfill({ json: mockSessionsEnvelope({ sessions: [], workspace_ordering: [] }) }),
-    );
+    await page.route("**/api/sessions", (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }));
     await page.route("**/api/filesystem/browse**", (r) => r.fulfill({ json: { entries: [], has_more: false } }));
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
@@ -96,9 +93,7 @@ test.describe("Wizard project section (#1219)", () => {
 
   test("saved projects show under the Recent tab even with no sessions (#2140)", async ({ page }) => {
     await mockBaseApis(page);
-    await page.route("**/api/sessions", (r) =>
-      r.fulfill({ json: mockSessionsEnvelope({ sessions: [], workspace_ordering: [] }) }),
-    );
+    await page.route("**/api/sessions", (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }));
     // Saved registry has one project; no live sessions exist.
     await page.route("**/api/projects", (r) =>
       r.fulfill({ json: [{ name: "my-saved-repo", path: "/srv/my-saved-repo", scope: "global" }] }),
@@ -161,9 +156,7 @@ test.describe("Wizard project section (#1219)", () => {
 
   test("Browse tab can load entries beyond the first page", async ({ page }) => {
     await mockBaseApis(page);
-    await page.route("**/api/sessions", (r) =>
-      r.fulfill({ json: mockSessionsEnvelope({ sessions: [], workspace_ordering: [] }) }),
-    );
+    await page.route("**/api/sessions", (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }));
     const entries = Array.from({ length: 125 }, (_, i) => {
       const n = String(i + 1).padStart(3, "0");
       return {
@@ -203,9 +196,7 @@ test.describe("Wizard project section (#1219)", () => {
 
   test("Browse tab filters entries beyond the first page on the server", async ({ page }) => {
     await mockBaseApis(page);
-    await page.route("**/api/sessions", (r) =>
-      r.fulfill({ json: mockSessionsEnvelope({ sessions: [], workspace_ordering: [] }) }),
-    );
+    await page.route("**/api/sessions", (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }));
     const entries = [
       ...Array.from({ length: 124 }, (_, i) => {
         const n = String(i + 1).padStart(3, "0");

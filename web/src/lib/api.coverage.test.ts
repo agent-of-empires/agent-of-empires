@@ -107,27 +107,12 @@ function bodyOf(init: RequestInit | undefined): unknown {
 // Sessions
 
 describe("fetchSessions", () => {
-  it("returns the base envelope without negotiating unused interaction metadata", async () => {
-    const env = {
-      sessions: [{ id: "s1" }],
-      workspace_ordering: ["s1"],
-      session_attach: { s1: { state: "available", transport: "future_ws" } },
-    };
+  it("GETs /api/sessions and returns the envelope", async () => {
+    const env = { sessions: [{ id: "s1" }], workspace_ordering: ["s1"] };
     fetchSpy.mockResolvedValueOnce(jsonResponse(env));
-
-    expect(await fetchSessions()).toEqual(env);
-    expect(lastCall()).toEqual(["/api/sessions", undefined]);
-  });
-
-  it.each([
-    null,
-    { sessions: null, workspace_ordering: [] },
-    { sessions: [], workspace_ordering: [1] },
-    { sessions: [{}], workspace_ordering: [] },
-    { sessions: [{ id: "s1" }, { id: "s1" }], workspace_ordering: [] },
-  ])("rejects malformed base envelopes %#", async (body) => {
-    fetchSpy.mockResolvedValueOnce(jsonResponse(body));
-    expect(await fetchSessions()).toBeNull();
+    const result = await fetchSessions();
+    expect(result).toEqual(env);
+    expect(lastCall()[0]).toBe("/api/sessions");
   });
 
   it("returns null on non-2xx", async () => {

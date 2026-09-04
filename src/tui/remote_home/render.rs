@@ -11,8 +11,7 @@ use unicode_width::UnicodeWidthStr;
 use super::RemoteHomeState;
 use crate::plugin::ui_state::Tone;
 use crate::server::api::sessions::{
-    AttachAvailability, AttachTransport, ContextResumeAvailability,
-    ContextResumeIndeterminateReason, ContextResumeUnavailableReason,
+    ContextResumeAvailability, ContextResumeIndeterminateReason, ContextResumeUnavailableReason,
 };
 use crate::tui::components::truncate_to_width;
 use crate::tui::plugin_ui;
@@ -84,24 +83,25 @@ fn selected_row_style(style: Style, theme: &Theme) -> Style {
     }
 }
 
-fn context_resume_summary(availability: ContextResumeAvailability) -> &'static str {
+fn context_resume_summary(availability: Option<ContextResumeAvailability>) -> &'static str {
     match availability {
-        ContextResumeAvailability::Available => "ctx:yes",
-        ContextResumeAvailability::Indeterminate { .. } => "ctx:check",
-        ContextResumeAvailability::Unavailable { .. } => "ctx:no",
+        Some(ContextResumeAvailability::Available) => "ctx:yes",
+        Some(ContextResumeAvailability::Indeterminate { .. }) => "ctx:check",
+        Some(ContextResumeAvailability::Unavailable { .. }) => "ctx:no",
+        None => "ctx:?",
     }
 }
 
-fn context_resume_detail(availability: ContextResumeAvailability) -> &'static str {
+fn context_resume_detail(availability: Option<ContextResumeAvailability>) -> &'static str {
     match availability {
-        ContextResumeAvailability::Available => "available",
-        ContextResumeAvailability::Indeterminate {
+        Some(ContextResumeAvailability::Available) => "available",
+        Some(ContextResumeAvailability::Indeterminate {
             reason: ContextResumeIndeterminateReason::RuntimeCheckRequired,
-        } => "runtime check required",
-        ContextResumeAvailability::Indeterminate {
+        }) => "runtime check required",
+        Some(ContextResumeAvailability::Indeterminate {
             reason: ContextResumeIndeterminateReason::AgentHandshakeRequired,
-        } => "agent handshake required",
-        ContextResumeAvailability::Unavailable { reason } => match reason {
+        }) => "agent handshake required",
+        Some(ContextResumeAvailability::Unavailable { reason }) => match reason {
             ContextResumeUnavailableReason::AgentUnsupported => "agent unsupported",
             ContextResumeUnavailableReason::SandboxUnsupported => "sandbox unsupported",
             ContextResumeUnavailableReason::CommandUnsupported => "command unsupported",
@@ -111,18 +111,7 @@ fn context_resume_detail(availability: ContextResumeAvailability) -> &'static st
             ContextResumeUnavailableReason::PreviousFailure => "previous failure",
             ContextResumeUnavailableReason::NoTarget => "no target",
         },
-    }
-}
-
-fn attach_detail(availability: AttachAvailability) -> &'static str {
-    match availability {
-        AttachAvailability::Available {
-            transport: AttachTransport::AcpWebsocketV1,
-        } => "ACP websocket",
-        AttachAvailability::Available {
-            transport: AttachTransport::TerminalWebsocketV1,
-        } => "terminal websocket",
-        AttachAvailability::Unavailable { .. } => "client transport unavailable",
+        None => "not reported",
     }
 }
 pub fn render(frame: &mut Frame, area: Rect, theme: &Theme, state: &RemoteHomeState) {
@@ -176,7 +165,7 @@ fn render_list(frame: &mut Frame, area: Rect, theme: &Theme, state: &RemoteHomeS
     }
     if state.sessions.is_empty() {
         let para = Paragraph::new(
-            "No sessions on this daemon.
+            "No structured view sessions on this daemon.
 
 Press r to refresh, q to quit.",
         )
@@ -207,7 +196,6 @@ Press r to refresh, q to quit.",
                     style
                 }
             };
-            let attach = if s.can_open() { "open" } else { "view-only" };
             let mut spans = vec![
                 Span::styled(
                     format!(" {:<24}  ", truncate(&s.title, 24)),
@@ -218,7 +206,6 @@ Press r to refresh, q to quit.",
                     format!("{:<11}  ", context_resume_summary(s.context_resume)),
                     readable(status_style),
                 ),
-                Span::styled(format!("{attach:<9}  "), readable(status_style)),
             ];
             if plugin_width > 0 {
                 let (cells, width) = &plugin_cells[idx];
@@ -267,25 +254,15 @@ fn render_footer(frame: &mut Frame, area: Rect, theme: &Theme, state: &RemoteHom
         ));
     }
     let selected = state.sessions.get(state.cursor);
-    let enter = selected
-        .map(|session| {
-            if session.can_open() {
-                "Enter=open"
-            } else {
-                "Enter=unavailable"
-            }
-        })
-        .unwrap_or("Enter=unavailable");
     spans.push(Span::styled(
-        format!(" j/k=navigate · {enter} · r=refresh · q=quit "),
+        " j/k=navigate · Enter=open · r=refresh · q=quit ",
         Style::default().fg(theme.hint),
     ));
     if let Some(session) = selected {
         spans.push(Span::styled(
             format!(
-                " · context resume: {} · attach: {} ",
+                " · context resume: {} ",
                 context_resume_detail(session.context_resume),
-                attach_detail(session.attach),
             ),
             Style::default().fg(theme.dimmed),
         ));
@@ -309,7 +286,6 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use crate::acp::client::discovery::{DaemonEndpoint, Source};
-    use crate::server::api::sessions::AttachUnavailableReason;
     use crate::tui::remote_home::RemoteSession;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -329,10 +305,7 @@ mod tests {
                 title: format!("session {id}"),
                 project_path: format!("/tmp/{id}"),
                 status: "idle".to_string(),
-                context_resume: ContextResumeAvailability::Available,
-                attach: AttachAvailability::Available {
-                    transport: AttachTransport::AcpWebsocketV1,
-                },
+                context_resume: Some(ContextResumeAvailability::Available),
             })
             .collect();
         state.plugin_ui = serde_json::from_value(json!({
@@ -414,9 +387,9 @@ mod tests {
     #[test]
     fn no_plugin_entries_reserve_no_width() {
         let painted = rows(&state_with(&["s1"], json!([])));
-        // Highlight, title, status, context-resume and attach columns occupy 65
-        // cells before the path when no plugin column is present.
-        assert_eq!(column_of(&painted, "/tmp/s1"), 65);
+        // Highlight, title, status and context-resume columns occupy 54 cells
+        // before the path when no plugin column is present.
+        assert_eq!(column_of(&painted, "/tmp/s1"), 54);
     }
 
     #[test]
@@ -443,8 +416,10 @@ mod tests {
         // The four CJK chars paint 8 cells, followed by the two-cell gap.
         let both = state_with(&["s1", "s2"], json!([row_column("s1", "検査失敗")]));
         let painted = rows(&both);
-        assert_eq!(column_of(&painted, "/tmp/s1"), 75);
-        assert_eq!(column_of(&painted, "/tmp/s2"), 75);
+        assert_eq!(
+            column_of(&painted, "/tmp/s1"),
+            column_of(&painted, "/tmp/s2")
+        );
     }
 
     #[test]
@@ -520,24 +495,21 @@ mod tests {
         assert_eq!(selected_row_style(style, &theme).fg, Some(theme.text));
     }
     #[test]
-    fn unavailable_attach_is_visible_and_disables_enter() {
+    fn missing_context_metadata_is_visible_without_disabling_enter() {
         let mut state = state_with(&["s1"], json!([]));
-        state.sessions[0].attach = AttachAvailability::Unavailable {
-            reason: AttachUnavailableReason::ClientMissingTransport,
-        };
-        state.sessions[0].context_resume = ContextResumeAvailability::Unavailable {
-            reason: ContextResumeUnavailableReason::SandboxUnsupported,
-        };
+        state.sessions[0].context_resume = None;
 
         let painted = rows(&state);
         assert!(
-            painted.iter().any(|line| line.contains("view-only")),
+            painted.iter().any(|line| line.contains("ctx:?")),
             "{painted:?}"
         );
         assert!(
-            painted
-                .iter()
-                .any(|line| line.contains("Enter=unavailable")),
+            painted.iter().any(|line| line.contains("not reported")),
+            "{painted:?}"
+        );
+        assert!(
+            painted.iter().any(|line| line.contains("Enter=open")),
             "{painted:?}"
         );
     }

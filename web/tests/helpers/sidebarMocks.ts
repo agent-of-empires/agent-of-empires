@@ -6,7 +6,6 @@
 // the story specs actually need.
 
 import type { Page, Route } from "@playwright/test";
-import { mockSessionsEnvelope } from "./sessionMocks";
 
 export interface MockSessionInput {
   id: string;
@@ -117,7 +116,10 @@ export async function installSidebarMocks(page: Page, opts: SidebarMockOptions):
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
     return r.fulfill({
-      json: mockSessionsEnvelope({ sessions: filled.map(sessionResponse), workspace_ordering: ordering }),
+      json: {
+        sessions: filled.map(sessionResponse),
+        workspace_ordering: ordering,
+      },
     });
   });
   await page.route("**/api/workspace-ordering", (r: Route) => {

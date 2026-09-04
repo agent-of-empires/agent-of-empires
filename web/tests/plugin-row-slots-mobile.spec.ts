@@ -10,7 +10,6 @@
 // which jsdom cannot reproduce.
 
 import { test, expect } from "./helpers/mockedTest";
-import { mockSessionsEnvelope } from "./helpers/sessionMocks";
 import { Page } from "@playwright/test";
 
 const LONG_TITLE = "this-is-a-deliberately-very-long-session-name-that-eats-the-whole-row-width-on-mobile";
@@ -69,7 +68,7 @@ async function mockApis(page: Page) {
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
     return r.fulfill({
-      json: mockSessionsEnvelope({ sessions: [sessionResponse()], workspace_ordering: ["/tmp/repo::feature/x"] }),
+      json: { sessions: [sessionResponse()], workspace_ordering: ["/tmp/repo::feature/x"] },
     });
   });
   await page.route("**/api/plugins/ui-state", (r) => r.fulfill({ json: { entries: UI_ENTRIES, notifications: [] } }));

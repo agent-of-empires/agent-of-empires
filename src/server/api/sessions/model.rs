@@ -566,26 +566,6 @@ pub enum ContextResumeAvailability {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AttachTransport {
-    AcpWebsocketV1,
-    TerminalWebsocketV1,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AttachUnavailableReason {
-    ClientMissingTransport,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum AttachAvailability {
-    Available { transport: AttachTransport },
-    Unavailable { reason: AttachUnavailableReason },
-}
-
 pub(super) fn context_resume_for(inst: &Instance) -> ContextResumeAvailability {
     if inst.is_structured() {
         return if inst.fork_pending.is_some() {
@@ -639,7 +619,6 @@ pub(super) fn context_resume_for(inst: &Instance) -> ContextResumeAvailability {
 pub struct SessionsEnvelope {
     pub sessions: Vec<SessionResponse>,
     pub workspace_ordering: Vec<String>,
-    pub session_attach: BTreeMap<String, AttachAvailability>,
 }
 
 /// Process-wide built-in ACP registry, built once. Used to compute

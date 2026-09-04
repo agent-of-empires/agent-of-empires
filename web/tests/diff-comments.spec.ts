@@ -1,5 +1,4 @@
 import { test, expect } from "./helpers/mockedTest";
-import { mockSessionsEnvelope } from "./helpers/sessionMocks";
 import { Page } from "@playwright/test";
 import { clickSidebarSession } from "./helpers/sidebar";
 import { makePatch } from "./helpers/patch";
@@ -89,7 +88,7 @@ async function setup(page: Page, opts: SetupOpts = {}) {
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() === "POST") return r.fulfill({ status: 400 });
     return r.fulfill({
-      json: mockSessionsEnvelope({
+      json: {
         sessions: [
           {
             id: "sess-1",
@@ -114,7 +113,7 @@ async function setup(page: Page, opts: SetupOpts = {}) {
           },
         ],
         workspace_ordering: [],
-      }),
+      },
     });
   });
   await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));

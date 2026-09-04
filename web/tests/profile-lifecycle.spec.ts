@@ -14,7 +14,6 @@
 // component-level validation branches live in ProfileSelector.test.tsx.
 
 import { test, expect } from "./helpers/mockedTest";
-import { mockSessionsEnvelope } from "./helpers/sessionMocks";
 import type { Page } from "@playwright/test";
 
 interface ProfileState {
@@ -50,7 +49,7 @@ async function installProfileMocks(page: Page, initial: string[] = ["main"]): Pr
   // disable the content fieldset (the Default profile select lives inside it).
   await page.route(
     (url) => url.pathname === "/api/sessions",
-    (r) => r.fulfill({ json: mockSessionsEnvelope({ sessions: [], workspace_ordering: [] }) }),
+    (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }),
   );
   await page.route(
     (url) => url.pathname === "/api/about",

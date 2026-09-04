@@ -1,5 +1,4 @@
 import { test, expect } from "./helpers/mockedTest";
-import { mockSessionsEnvelope } from "./helpers/sessionMocks";
 
 const NEW_SESSION_PANE_NAME = /New session Pick a project, then launch a new session/i;
 
@@ -45,9 +44,7 @@ test.describe("Sidebar", () => {
     // saved (non-pinned) project with no live session renders as a row in the
     // sidebar, alongside an add-project button. Stub /api/sessions so the app
     // reports online, otherwise the add button stays hidden.
-    await page.route("**/api/sessions", (r) =>
-      r.fulfill({ json: mockSessionsEnvelope({ sessions: [], workspace_ordering: [] }) }),
-    );
+    await page.route("**/api/sessions", (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }));
     await page.route("**/api/projects*", (r) =>
       r.fulfill({ json: [{ name: "saved-repo", path: "/work/saved-repo", scope: "global", pinned: false }] }),
     );
@@ -119,9 +116,7 @@ test.describe("Create session from home screen", () => {
     // Ported from the live wizard-open-close story. Stub /api/sessions
     // so useSessions reports the server reachable; otherwise the
     // offline-state UI disables the sidebar "New session" trigger.
-    await page.route("**/api/sessions", (r) =>
-      r.fulfill({ json: mockSessionsEnvelope({ sessions: [], workspace_ordering: [] }) }),
-    );
+    await page.route("**/api/sessions", (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }));
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
 
@@ -251,9 +246,7 @@ test.describe("Mobile responsive", () => {
       notify_on_error: null,
       trashed_at: id === "trash" ? "2026-01-08T00:00:00Z" : null,
     }));
-    await page.route("**/api/sessions", (route) =>
-      route.fulfill({ json: mockSessionsEnvelope({ sessions, workspace_ordering: [] }) }),
-    );
+    await page.route("**/api/sessions", (route) => route.fulfill({ json: { sessions, workspace_ordering: [] } }));
 
     await page.setViewportSize({ width: 375, height: 812 });
     await page.goto("/");

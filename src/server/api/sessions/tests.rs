@@ -9,8 +9,8 @@ struct DecodedSession {
     id: String,
 }
 
-async fn decode_sessions_response(response: Response) -> DecodedSessionsEnvelope {
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+async fn decode_sessions_response(response: impl IntoResponse) -> DecodedSessionsEnvelope {
+    let body = axum::body::to_bytes(response.into_response().into_body(), usize::MAX)
         .await
         .unwrap();
     serde_json::from_slice(&body).unwrap()
@@ -660,7 +660,6 @@ async fn list_sessions_shares_config_resolution_across_overlays() {
     LIST_SESSIONS_RESOLVER_MISSES.store(0, Ordering::Relaxed);
     let _envelope = list_sessions(
         axum::extract::State(state.clone()),
-        HeaderMap::new(),
         axum::extract::Query(ListSessionsQuery { state: None }),
     )
     .await;
@@ -697,7 +696,6 @@ async fn list_sessions_state_filter() {
     let all = decode_sessions_response(
         list_sessions(
             axum::extract::State(state.clone()),
-            HeaderMap::new(),
             axum::extract::Query(ListSessionsQuery { state: None }),
         )
         .await,
@@ -712,7 +710,6 @@ async fn list_sessions_state_filter() {
     let live_only = decode_sessions_response(
         list_sessions(
             axum::extract::State(state.clone()),
-            HeaderMap::new(),
             axum::extract::Query(ListSessionsQuery {
                 state: Some(crate::session::SessionScope::Live),
             }),
@@ -725,7 +722,6 @@ async fn list_sessions_state_filter() {
     let trashed_only = decode_sessions_response(
         list_sessions(
             axum::extract::State(state.clone()),
-            HeaderMap::new(),
             axum::extract::Query(ListSessionsQuery {
                 state: Some(crate::session::SessionScope::Trashed),
             }),
@@ -738,7 +734,6 @@ async fn list_sessions_state_filter() {
     let explicit_all = decode_sessions_response(
         list_sessions(
             axum::extract::State(state),
-            HeaderMap::new(),
             axum::extract::Query(ListSessionsQuery {
                 state: Some(crate::session::SessionScope::All),
             }),

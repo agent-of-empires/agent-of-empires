@@ -5,7 +5,6 @@
 // isolation; this spec is the real-DOM cross-tab jump.
 
 import { test, expect } from "./helpers/mockedTest";
-import { mockSessionsEnvelope } from "./helpers/sessionMocks";
 import type { Page } from "@playwright/test";
 
 const ALLOW = { policy: "allow" };
@@ -45,7 +44,7 @@ const SCHEMA = [
 async function installMocks(page: Page) {
   await page.route(
     (url) => url.pathname === "/api/sessions",
-    (r) => r.fulfill({ json: mockSessionsEnvelope({ sessions: [], workspace_ordering: [] }) }),
+    (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }),
   );
   await page.route(
     (url) => url.pathname === "/api/about",

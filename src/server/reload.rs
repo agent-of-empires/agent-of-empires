@@ -242,7 +242,7 @@ pub(super) fn skip_tmux_decision_for_structured(inst: &mut Instance) -> bool {
 }
 
 // INVARIANTS for `reload_state_instances_from_disk` (do not break without
-// revisiting `tests/integration/serve_disk_reload_helper_equivalence.rs`):
+// revisiting `tests/serve_disk_reload_helper_equivalence.rs`):
 // 1. Both call sites (`status_poll_loop` and `disk_watcher_consumer`) must
 //    invoke this helper. They differ in cadence, in what they do BEFORE
 //    calling it (tmux scrape lives only in `status_poll_loop`), and in

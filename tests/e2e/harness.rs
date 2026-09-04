@@ -425,10 +425,14 @@ last_seen_version = "{}"
         self.acp_fork_fail = true;
     }
 
-    /// Install the shared Node fake-ACP agent as the claude, claude-agent-acp,
-    /// and aoe-agent commands on PATH. The shim pins Node's resolved executable
-    /// because version-manager launchers may stop working under the isolated
-    /// HOME. It also raises the runner-socket timeout for contended CI hosts.
+    /// Install the shared Node fake-ACP agent as the `claude`,
+    /// `claude-agent-acp`, and `aoe-agent` commands on PATH. The structured view
+    /// supervisor resolves the `claude` tool key to the `claude-agent-acp`
+    /// command via `AgentRegistry`, so all three names must point at the
+    /// fake. `FAKE_ACP_SCRIPT` / `FAKE_ACP_DEBUG_LOG` are baked into the
+    /// shim (the daemon -> runner -> node spawn chain does not reliably
+    /// propagate process env). Also sets the runner-socket timeout high
+    /// so a contended CI box doesn't trip the spawn deadline.
     pub fn install_acp_shim(&mut self, fake_acp_script: &Path) {
         self.install_acp_shim_inner(fake_acp_script, None);
     }
@@ -454,53 +458,26 @@ last_seen_version = "{}"
             "fake ACP agent not found at {}",
             fake_agent.display()
         );
-        let node_output = std::process::Command::new("node")
-            .args(["-p", "process.execPath"])
-            .output()
-            .expect("resolve Node executable");
-        assert!(
-            node_output.status.success(),
-            "resolve Node executable failed: {}",
-            String::from_utf8_lossy(&node_output.stderr)
-        );
-        let node_executable = String::from_utf8(node_output.stdout).expect("Node path is UTF-8");
-        let node_executable = node_executable.trim();
-        assert!(
-            !node_executable.is_empty()
-                && std::path::Path::new(node_executable).is_file()
-                && !node_executable
-                    .bytes()
-                    .any(|byte| matches!(byte, b'"' | b'$') || byte == 92 || byte == 96),
-            "invalid Node executable path: {node_executable:?}"
-        );
         let debug_log = app_dir_in(self.home_dir.path()).join("fake-acp.log");
+        // Bake the fork-fail knob into the shim (not the daemon env) so it
+        // survives the daemon's env_clear + allowlist when spawning the worker.
         let fork_fail_line = if self.acp_fork_fail {
-            r#"export FAKE_ACP_FORK_FAIL="1"
-"#
+            "export FAKE_ACP_FORK_FAIL=\"1\"\n"
         } else {
             ""
         };
         let capture_line = capture_dir
             .map(|dir| {
                 let dir = dir.display();
-                format!(
-                    r#"mkdir -p "{dir}"
-env | sort > "{dir}/$$"
-"#
-                )
+                format!("mkdir -p \"{dir}\"\nenv | sort > \"{dir}/$$\"\n")
             })
             .unwrap_or_default();
         let script = format!(
-            r#"#!/bin/sh
-export FAKE_ACP_SCRIPT="{}"
-export FAKE_ACP_DEBUG_LOG="{}"
-{}{}exec "{}" "{}" "$@"
-"#,
+            "#!/bin/sh\nexport FAKE_ACP_SCRIPT=\"{}\"\nexport FAKE_ACP_DEBUG_LOG=\"{}\"\n{}{}exec node \"{}\" \"$@\"\n",
             fake_acp_script.display(),
             debug_log.display(),
             fork_fail_line,
             capture_line,
-            node_executable,
             fake_agent.display(),
         );
         for name in ["claude", "claude-agent-acp", "aoe-agent"] {
