@@ -448,7 +448,7 @@ fn hook_command_session_id_sandbox(base: &str, field: crate::agents::HookIdentit
          case \"$M\" in drwx------|drwx------.|drwx------+|drwx------@) ;; *) exit 0 ;; esac; \
          command -v jq >/dev/null 2>&1 || exit 0; \
          SID=$(jq -r '\\''{selector}'\\'' 2>/dev/null); \
-         case \"$SID\" in \"\"|*[!0-9a-zA-Z._-]*) exit 0 ;; esac; \
+         case \"$SID\" in \"\"|-*|*[!0-9a-zA-Z._-]*) exit 0 ;; esac; \
          [ \"${{#SID}}\" -le 256 ] || exit 0; \
          printf \"%s\" \"$SID\" > \"$D/.session_id.$$.tmp\" 2>/dev/null && mv \"$D/.session_id.$$.tmp\" \"$D/session_id\" 2>/dev/null; \
          exit 0 # {AOE_HOOK_MARKER}'"
@@ -5296,8 +5296,15 @@ hooks_auto_accept: false
             "missing jq string-type gate: {cmd}"
         );
         assert!(
-            cmd.contains("case \"$SID\" in \"\"|*[!0-9a-zA-Z._-]*) exit 0 ;; esac"),
+            cmd.contains("case \"$SID\" in \"\"|-*|*[!0-9a-zA-Z._-]*) exit 0 ;; esac"),
             "missing session-id allowlist: {cmd}"
+        );
+        // Same contract as the host extractor's `is_valid_session_id`, which
+        // refuses a leading `-` so an option-shaped id cannot be written and
+        // then rejected by the reader on the way back out.
+        assert!(
+            cmd.contains("\"\"|-*|"),
+            "sandbox extractor must refuse an option-shaped id like the host: {cmd}"
         );
         assert!(
             cmd.contains("[ \"${#SID}\" -le 256 ] || exit 0"),
