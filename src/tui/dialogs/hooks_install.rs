@@ -444,7 +444,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_content_shows_settings_path() {
+        // The dialog now follows the resolved config root, so a developer with
+        // `CLAUDE_CONFIG_DIR` exported would otherwise see their own path here.
+        let _overrides = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
         let dialog = HooksInstallDialog::new("claude");
         let lines = dialog.build_content_lines();
         let text: String = lines
