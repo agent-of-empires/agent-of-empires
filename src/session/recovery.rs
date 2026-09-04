@@ -147,25 +147,28 @@ const ORPHAN_SCAN_MIN_SID_LEN: usize = 8;
 /// on the same hook presence as `status_hook_env_prefix`, so it tracks exactly
 /// the agents whose live process carries the anchored env marker.
 fn agent_injects_instance_id_env(inst: &Instance) -> bool {
-    inst.resolved_agent().is_some_and(|agent| {
-        inst.launch_invokes_resolved_agent_directly(agent)
-            && (agent.hook_config.is_some() || agent.sidecar_hooks.is_some())
-    })
+    inst.resolved_agent()
+        .is_some_and(|agent| agent.hook_config.is_some() || agent.sidecar_hooks.is_some())
 }
 
 /// The identity needles used to detect a live agent process for `inst`.
 ///
-/// Hook agents use the exact instance environment marker plus the resolved
-/// built-in executable token. The conversation id is mutable after `/clear`,
-/// `/new`, or a first hook publication, so it cannot identify their process.
-/// Non-hook agents fall back to a valid session id in the command line.
+/// Hook agents use the exact instance environment marker plus the token the
+/// launch actually runs. The conversation id is mutable after `/clear`,
+/// `/new`, or a first hook publication, and a `--fork-session` child carries
+/// its *parent's* sid in argv, so a bare-sid match would let a fork child
+/// suppress the parent's recovery (#3006). Non-hook agents have no marker and
+/// fall back to that sid anyway, which is why the two arms differ.
 pub fn orphan_needles(inst: &Instance) -> (String, Option<String>, Option<String>) {
     if agent_injects_instance_id_env(inst) {
         if inst.id.is_empty() {
             return (String::new(), None, None);
         }
         let env = format!("{}={}", crate::tmux::env::AOE_INSTANCE_ID_KEY, inst.id);
-        let executable = inst.resolved_agent().map(|agent| agent.binary.to_string());
+        // The wrapper's own name when the launch renames the agent: the
+        // marker is injected on hook presence alone, so a wrapper carries it
+        // and must be matched by the token its process really shows.
+        let executable = inst.launch_executable_token();
         return (env, None, executable);
     }
 
@@ -978,6 +981,42 @@ mod tests {
 
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    /// A renamed wrapper still carries the pane's marker, because
+    /// `status_hook_env_prefix` injects it on hook presence alone. Its needles
+    /// must therefore stay on the env-plus-executable pair. Falling back to
+    /// the sid would let a `--fork-session` child, which carries its parent's
+    /// sid in argv, suppress the parent's recovery (#3006).
+    #[test]
+    fn wrapper_hook_agent_keeps_the_env_marker_and_never_matches_on_sid() {
+        const PROFILE: &str = "orphan-wrapper-needles";
+        let _registry = crate::session::instance::test_helpers::install_aliases(
+            PROFILE,
+            &[("claude-personal", "claude")],
+        );
+        let mut inst = Instance::new("wrapper", "/tmp/orphan-wrapper");
+        inst.source_profile = PROFILE.to_string();
+        inst.tool = "claude-personal".to_string();
+        inst.command = "claude-personal".to_string();
+        inst.id = "orphanwrapper01".to_string();
+        inst.agent_session_id = Some("11111111-2222-4333-8444-555555555555".to_string());
+
+        let (env, cmdline, executable) = orphan_needles(&inst);
+        assert_eq!(
+            env,
+            format!("{}={}", crate::tmux::env::AOE_INSTANCE_ID_KEY, inst.id),
+            "a wrapper carries the marker and must be matched on it"
+        );
+        assert_eq!(
+            cmdline, None,
+            "a fork child carries the parent's sid, so it must never be a needle here"
+        );
+        assert_eq!(
+            executable.as_deref(),
+            Some("claude-personal"),
+            "the needle must be the token the wrapper's process really shows"
+        );
     }
 
     #[cfg(target_os = "linux")]

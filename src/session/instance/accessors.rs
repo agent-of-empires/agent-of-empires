@@ -268,6 +268,22 @@ impl Instance {
             && !words.iter().any(|word| word == "--")
     }
 
+    /// The basename of the program this launch actually runs, which is the
+    /// token a live process carries in argv.
+    ///
+    /// A command override names it; otherwise it is the resolved agent's own
+    /// binary. Matching on this rather than on `agent.binary` is what lets the
+    /// orphan scan see a renamed wrapper, which carries the pane's
+    /// `AOE_INSTANCE_ID` because [`status_hook_env_prefix`] injects the marker
+    /// on hook presence alone.
+    pub(crate) fn launch_executable_token(&self) -> Option<String> {
+        let words = parse_launch_command(self.get_tool_command())?.words;
+        Path::new(words.first()?)
+            .file_name()?
+            .to_str()
+            .map(str::to_owned)
+    }
+
     /// Whether a resume selector appended to this launch reaches the agent.
     ///
     /// [`Self::launch_invokes_resolved_agent_directly`] is the stricter test

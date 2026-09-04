@@ -60,7 +60,7 @@ mod status;
 mod status_update;
 mod terminal;
 #[cfg(test)]
-mod test_helpers;
+pub(crate) mod test_helpers;
 mod tmux_session;
 mod types;
 
