@@ -252,7 +252,7 @@ impl DockerContainer {
     /// attribute it to. Runtimes without named volumes never reach that log, since
     /// `named_ignore_volumes` stays populated there while the mounts render as
     /// anonymous, so there is nothing to delete.
-    pub fn remove_stale_named_ignore_volumes(&self, session_id: &str, names: &[String]) {
+    pub fn remove_stranded_named_ignore_volumes(&self, session_id: &str, names: &[String]) {
         if names.is_empty() || !self.runtime.base.supports_named_volumes {
             return;
         }
@@ -274,7 +274,7 @@ impl DockerContainer {
                 name = %self.name,
                 %session_id,
                 error = %e,
-                "failed to remove stale named ignore volumes"
+                "failed to remove stranded named ignore volumes"
             );
         }
     }
@@ -303,7 +303,7 @@ impl DockerContainer {
     /// intact so the recreated container re-attaches the ones whose container
     /// path is unchanged. Used on the worktree-move discard path where the
     /// container is dropped to pick up a new bind mount and will be recreated
-    /// immediately; [`Self::remove_stale_named_ignore_volumes`] reclaims the rest
+    /// immediately; [`Self::remove_stranded_named_ignore_volumes`] reclaims the rest
     /// at that create.
     ///
     /// The same invariant as [`Self::teardown`] applies: callers must invoke

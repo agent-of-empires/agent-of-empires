@@ -669,7 +669,7 @@ impl RuntimeBase {
     /// The targeted counterpart to [`Self::remove_named_ignore_volumes`], for reclaiming
     /// the volumes a worktree move stranded. `names` is an allowlist, so a volume the
     /// caller did not name is never touched; see
-    /// [`DockerContainer::remove_stale_named_ignore_volumes`](crate::containers::DockerContainer::remove_stale_named_ignore_volumes).
+    /// [`DockerContainer::remove_stranded_named_ignore_volumes`](crate::containers::DockerContainer::remove_stranded_named_ignore_volumes).
     pub fn remove_named_ignore_volumes_in(
         &self,
         prefix: &str,
