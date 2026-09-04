@@ -6,7 +6,7 @@
 //
 // The contract under test lives in `SessionRow.commitRename` in
 // `web/src/components/WorkspaceSidebar.tsx`. The PATCH handler is
-// `update_session` in `src/server/api/sessions.rs`; live coverage
+// `rename_session` in `src/server/api/sessions/rename.rs`; live coverage
 // catches a wire-format drift on either side that mocked specs miss.
 
 import { test as base, expect } from "@playwright/test";

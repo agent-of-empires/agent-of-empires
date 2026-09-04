@@ -109,10 +109,10 @@
           # build.rs respects AOE_WEB_DIST to use the pre-built frontend.
           # buildDepsOnly uses a dummy crate source so AOE_WEB_DIST is irrelevant there.
           commonArgsWithWeb = commonArgs // {
-            cargoExtraArgs = "--package agent-of-empires --features serve";
+            cargoExtraArgs = "--package agent-of-empires --features web";
           };
 
-          # Rust dep cache compiled with --features serve (no npm involved).
+          # Rust dep cache compiled with --features web (no npm involved).
           cargoArtifactsWithWeb = craneLib.buildDepsOnly commonArgsWithWeb;
 
           aoeWithWeb = craneLib.buildPackage (commonArgsWithWeb // {
@@ -175,7 +175,7 @@
             packages = with pkgs; [
               rust-analyzer
               tmux
-              nodejs # for web frontend development (--features serve)
+              nodejs # for web frontend development (--features web)
             ];
           };
         };

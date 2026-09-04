@@ -624,7 +624,7 @@ mod tests {
         assert!(
             cmd.contains(&format!(
                 "AOE_PI_SESSION_ID_FILE={}/{}/session_id",
-                crate::session::container_config::PI_SIDECAR_DIR_IN_CONTAINER,
+                crate::session::config::container_config::PI_SIDECAR_DIR_IN_CONTAINER,
                 inst.id
             )),
             "the pane cannot publish without this: {cmd}"
@@ -667,7 +667,7 @@ mod tests {
             env.trim(),
             format!(
                 "AOE_PI_SESSION_ID_FILE={}/{}/session_id",
-                crate::session::container_config::PI_SIDECAR_DIR_IN_CONTAINER,
+                crate::session::config::container_config::PI_SIDECAR_DIR_IN_CONTAINER,
                 inst.id
             )
         );

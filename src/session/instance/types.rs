@@ -251,7 +251,6 @@ mod tests {
     // A non-fork session omits fork_pending on the wire (skip_serializing_if),
     // so legacy sessions.json without the key deserializes to None and no
     // migration is needed. A seeded fork id round-trips.
-    #[cfg(feature = "serve")]
     #[test]
     fn test_fork_pending_serde_roundtrip_and_default() {
         let fresh = Instance::new("s", "/tmp/x");

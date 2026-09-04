@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-#[cfg(feature = "serve")]
 use std::process::{Child, ChildStdin, Command, Stdio};
 
 pub(super) use super::unix::{
@@ -315,13 +314,11 @@ fn parse_stat_field(content: &str, field_idx: usize) -> Option<i64> {
 
 /// Prevents user-idle system sleep by holding a `systemd-inhibit` block lock.
 /// `--what=idle:sleep` blocks idle sleep only (the display still sleeps).
-#[cfg(feature = "serve")]
 pub(super) struct SystemdInhibitor {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
 }
 
-#[cfg(feature = "serve")]
 impl SystemdInhibitor {
     pub(super) fn new() -> Self {
         Self {
@@ -331,7 +328,6 @@ impl SystemdInhibitor {
     }
 }
 
-#[cfg(feature = "serve")]
 impl super::SleepInhibit for SystemdInhibitor {
     fn acquire(&mut self) -> anyhow::Result<()> {
         if super::sleep_inhibit_unavailable() {

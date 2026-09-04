@@ -282,12 +282,9 @@ impl HomeView {
         )?;
         let mut instance = build_result.instance;
         instance.source_profile = target_profile.clone();
-        #[cfg(feature = "serve")]
         if structured {
             builder::structured::apply_structured_choice(&mut instance);
         }
-        #[cfg(not(feature = "serve"))]
-        let _ = structured;
         let session_id = instance.id.clone();
 
         // Ensure target profile storage exists
@@ -2210,7 +2207,7 @@ impl HomeView {
 
             self.set_instance_status(&id, Status::Deleting);
 
-            let config = crate::session::repo_config::resolve_config_with_repo_or_warn(
+            let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
                 &inst.source_profile,
                 std::path::Path::new(&inst.project_path),
             );

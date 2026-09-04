@@ -1554,8 +1554,7 @@ pub fn get_agent(name: &str) -> Option<&'static AgentDef> {
 /// Registry lifecycle state for an ACP-registry key. Falls back to Active
 /// for registry entries with no `AGENTS` counterpart (bundled or alias-only
 /// keys). Shared by the doctor, `/api/acp/agents`, and `aoe acp agents`
-/// surfaces; every consumer is serve-gated, so the helper is too.
-#[cfg(feature = "serve")]
+/// surfaces.
 pub(crate) fn registry_lifecycle(name: &str) -> AgentLifecycle {
     get_agent(name)
         .map(|def| def.lifecycle)

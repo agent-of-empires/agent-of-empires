@@ -9,7 +9,7 @@
 // The contract under test lives in `SessionRow.handleFork` in
 // `web/src/components/WorkspaceSidebar.tsx`, gated on the server-provided
 // `acp_can_fork` projection (`SessionResponse::from_instance` in
-// `src/server/api/sessions.rs`). The ACP `session/fork` wire handshake itself
+// `src/server/api/sessions/model.rs`). The ACP `session/fork` wire handshake itself
 // is covered end-to-end by `tests/e2e/fork_structured_e2e.rs`; this spec
 // covers the browser-driven affordance and round trip that Vitest's mocked
 // `ForkSessionAction.test.tsx` cannot (real render, real context menu, real

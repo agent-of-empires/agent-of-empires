@@ -18,8 +18,9 @@ use axum::{
 use serde::Deserialize;
 
 use super::AppState;
-use crate::session::mcp_state::{self, ConflictWinner};
-use crate::session::{mcp_model, profile_config};
+use crate::session::config::profile_config;
+use crate::session::mcp::mcp_model;
+use crate::session::mcp::mcp_state::{self, ConflictWinner};
 
 #[derive(Debug, Deserialize)]
 pub struct AgentQuery {
@@ -123,10 +124,12 @@ pub async fn resolve_mcp_conflict(
         }
     };
 
+    let profile = state.profile.clone();
     let result = tokio::task::spawn_blocking(move || {
         // Re-resolve the current conflicts and find the one for `name`. The
         // fingerprint guard in resolve_conflict rejects a stale resolution.
-        let read = mcp_model::load_native_mcp_servers_checked_from_home(&body.agent)?;
+        let profile_opt = (!profile.is_empty()).then_some(profile.as_str());
+        let read = mcp_model::load_native_mcp_servers_checked_from_home(&body.agent, profile_opt)?;
         let reconcile = mcp_state::reconcile_agent(&body.agent, &read)?;
         let Some(conflict) = reconcile
             .conflicts

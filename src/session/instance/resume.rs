@@ -267,12 +267,14 @@ impl Instance {
         let resume_allowed_by_policy = match resume_policy {
             ResumeAttemptPolicy::Allow => true,
             ResumeAttemptPolicy::HonorAutoResumeSetting => {
-                crate::session::profile_config::resolve_config_or_warn(&self.effective_profile())
-                    .session
-                    .auto_resume_on_restart
+                crate::session::config::profile_config::resolve_config_or_warn(
+                    &self.effective_profile(),
+                )
+                .session
+                .auto_resume_on_restart
             }
         };
-        if !should_attempt_resume(Some(&sid), &self.tool) {
+        if !should_attempt_resume(Some(&sid), self.capture_agent_name().unwrap_or(&self.tool)) {
             return None;
         }
         if self.resume_probe_failed_sid.as_deref() == Some(&sid) {
@@ -343,12 +345,15 @@ impl Instance {
         skipped_failed_resume_sid: Option<String>,
         profile: &str,
     ) -> Result<StartOutcome> {
+        let resume_tool = self.capture_agent_name().unwrap_or(&self.tool).to_string();
         let (attempted_sid, pinned_prior_sid) = match launch_outcome {
-            LaunchSidOutcome::Existing { sid } if should_attempt_resume(Some(&sid), &self.tool) => {
+            LaunchSidOutcome::Existing { sid }
+                if should_attempt_resume(Some(&sid), &resume_tool) =>
+            {
                 (Some(sid), None)
             }
             LaunchSidOutcome::Fresh { pinned_prior_sid }
-                if should_attempt_resume(pinned_prior_sid.as_deref(), &self.tool) =>
+                if should_attempt_resume(pinned_prior_sid.as_deref(), &resume_tool) =>
             {
                 (None, pinned_prior_sid)
             }
@@ -589,7 +594,6 @@ mod tests {
         std::fs::write(dir.join(format!("{sid}.jsonl")), "seed\n").expect("write transcript");
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     #[serial]
     fn restart_outcome_for_acp_session_is_fresh() {

@@ -20,7 +20,7 @@
 
 use serde_json::{json, Value};
 
-use crate::session::settings_schema::{
+use crate::session::config::settings_schema::{
     clear_path, merge_json, FieldDescriptor, ValidationKind, WidgetKind,
 };
 use crate::session::{validate_snooze_duration, Config, ProfileConfig};
@@ -318,7 +318,7 @@ impl SettingField {
 }
 
 /// Validate a `FieldValue` against the schema rule, reusing the same
-/// [`crate::session::settings_schema::validate_value`] the server applies.
+/// [`crate::session::config::settings_schema::validate_value`] the server applies.
 fn validate_field_value(kind: &ValidationKind, value: &FieldValue) -> Result<(), String> {
     let json = field_value_to_json_for_validation(value);
     // A cleared optional field projects to JSON null. Clearing means "unset",
@@ -329,7 +329,7 @@ fn validate_field_value(kind: &ValidationKind, value: &FieldValue) -> Result<(),
     if json.is_null() {
         return Ok(());
     }
-    crate::session::settings_schema::validate_value(kind, &json).map_err(|e| e.reason)
+    crate::session::config::settings_schema::validate_value(kind, &json).map_err(|e| e.reason)
 }
 
 /// Best-effort JSON projection of a `FieldValue` for validation. Selects pass
@@ -739,7 +739,7 @@ pub fn build_fields_for_category(
         });
     }
 
-    for desc in crate::session::settings_schema::runtime_schema()
+    for desc in crate::session::config::settings_schema::runtime_schema()
         .into_iter()
         .filter(|d| d.category == category.schema_name())
         // Global-only fields (e.g. the theme) are not profile-overridable, so
@@ -753,7 +753,9 @@ pub fn build_fields_for_category(
         // offering the rest here would write a value nothing reads.
         .filter(|d| {
             scope != SettingsScope::Repo
-                || crate::session::repo_config::repo_may_override_field(&d.section, &d.field)
+                || crate::session::config::repo_config::repo_may_override_field(
+                    &d.section, &d.field,
+                )
         })
     {
         // The per-target logging matrix expands one descriptor into N rows.
@@ -821,8 +823,8 @@ fn build_schema_row(
     // path (`plugins.<id>.settings.<field>`) and fall back to the manifest's
     // declared default when unset; core fields read their `section.field` leaf,
     // which always exists via the struct Default.
-    let current = match crate::session::settings_schema::section_plugin_id(&desc.section) {
-        Some(id) => crate::session::settings_schema::plugin_storage_value(
+    let current = match crate::session::config::settings_schema::section_plugin_id(&desc.section) {
+        Some(id) => crate::session::config::settings_schema::plugin_storage_value(
             ctx.effective_json,
             id,
             &desc.field,
@@ -1024,7 +1026,7 @@ pub fn apply_field_to_config(
         SettingsScope::Global => {
             // Plugin settings are global-only and persist under
             // `plugins.<id>.settings`; core fields write their `section.field`.
-            match crate::session::settings_schema::section_plugin_id(&section) {
+            match crate::session::config::settings_schema::section_plugin_id(&section) {
                 Some(id) => set_config_plugin_path(global, id, &sub, leaf),
                 None => set_config_path(global, &section, &sub, leaf),
             }
@@ -1043,7 +1045,7 @@ fn set_config_plugin_path(config: &mut Config, plugin_id: &str, field: &str, lea
     let mut j = serde_json::to_value(&*config).unwrap_or_else(|_| json!({}));
     merge_json(
         &mut j,
-        &crate::session::settings_schema::plugin_storage_leaf(plugin_id, field, leaf),
+        &crate::session::config::settings_schema::plugin_storage_leaf(plugin_id, field, leaf),
     );
     if let Ok(updated) = serde_json::from_value(j) {
         *config = updated;

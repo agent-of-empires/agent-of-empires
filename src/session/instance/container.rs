@@ -8,7 +8,7 @@ impl Instance {
     /// falling back to the global list when the profile has no override.
     pub(super) fn profile_host_environment(&self) -> Vec<String> {
         let profile = self.effective_profile();
-        crate::session::profile_config::resolve_config_or_warn(&profile).environment
+        crate::session::config::profile_config::resolve_config_or_warn(&profile).environment
     }
 
     /// The host environment the agent process will actually see: the static
@@ -182,10 +182,11 @@ impl Instance {
         // sandbox installs status hooks into that agent's config, matching the
         // host path. Gated by the same setting; only applies to agents that
         // declare selected_agent_hooks.
-        let merge_selected =
-            crate::session::profile_config::resolve_config_or_warn(&self.effective_profile())
-                .session
-                .merge_hooks_into_selected_agent;
+        let merge_selected = crate::session::config::profile_config::resolve_config_or_warn(
+            &self.effective_profile(),
+        )
+        .session
+        .merge_hooks_into_selected_agent;
         let selected_agent = if merge_selected {
             // Mirror the host path's agent resolution (a custom wrapper detected
             // as kiro carries kiro's sidecar via detect_as), and the sandbox's
@@ -228,7 +229,7 @@ impl Instance {
             return Ok(());
         }
         let commands =
-            crate::session::repo_config::resolve_before_start_hooks(&self.source_profile);
+            crate::session::config::repo_config::resolve_before_start_hooks(&self.source_profile);
         if commands.is_empty() {
             if let Some(sb) = self.sandbox_info.as_mut() {
                 sb.before_start_env.clear();
@@ -243,7 +244,7 @@ impl Instance {
             return Ok(());
         }
 
-        let hook_env = crate::session::repo_config::lifecycle_env_vars(self);
+        let hook_env = crate::session::config::repo_config::lifecycle_env_vars(self);
         let project_path = PathBuf::from(&self.project_path);
         // Feed the session's sandbox env into the hook so it can read a
         // per-session value (e.g. `$TEST_VAR`) to scope what it mints.
@@ -260,7 +261,7 @@ impl Instance {
                 )
             })
             .unwrap_or_default();
-        let minted = crate::session::repo_config::run_before_start_hooks(
+        let minted = crate::session::config::repo_config::run_before_start_hooks(
             &commands,
             &project_path,
             &hook_env,
@@ -289,19 +290,19 @@ impl Instance {
     /// must mint here, or `before_session` would silently not run for it.
     ///
     /// Resolved from global + profile config only; a repo cannot contribute the
-    /// command. See [`crate::session::repo_config::resolve_before_session_hooks`].
+    /// command. See [`crate::session::config::repo_config::resolve_before_session_hooks`].
     pub(super) fn mint_host_session_env(&mut self) -> Result<()> {
         self.pending_host_env.clear();
         if self.is_sandboxed() {
             return Ok(());
         }
         let commands =
-            crate::session::repo_config::resolve_before_session_hooks(&self.source_profile);
+            crate::session::config::repo_config::resolve_before_session_hooks(&self.source_profile);
         if commands.is_empty() {
             return Ok(());
         }
-        let hook_env = crate::session::repo_config::lifecycle_env_vars(self);
-        self.pending_host_env = crate::session::repo_config::run_before_session_hooks(
+        let hook_env = crate::session::config::repo_config::lifecycle_env_vars(self);
+        self.pending_host_env = crate::session::config::repo_config::run_before_session_hooks(
             &commands,
             Path::new(&self.project_path),
             &hook_env,

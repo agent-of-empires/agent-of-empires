@@ -104,7 +104,9 @@ If you already declared MCP servers in your agent's own config, AoE reads them
 too (read-only), so you do not have to copy them into `mcp.json`. The native
 config read per agent:
 
-- **Claude**: `~/.claude.json` (top-level `mcpServers`).
+- **Claude**: `~/.claude.json` (top-level `mcpServers`). A `session.agent_config_dir`
+  entry for the agent, else `CLAUDE_CONFIG_DIR` in AoE's own environment, replaces
+  the `~` here, so AoE reads the file the launched CLI does.
 - **Gemini**: `~/.gemini/settings.json` (`mcpServers`; transport is chosen by
   which key the entry sets, `command` for stdio, `httpUrl` for http, `url` for
   sse).

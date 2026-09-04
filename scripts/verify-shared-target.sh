@@ -27,8 +27,8 @@ set -euo pipefail
 #                 store, then reads kache's restore counters and asserts the
 #                 second (warm) build restored its dependency artifacts as
 #                 reflinks/hardlinks (shared blocks) rather than copies. Also
-#                 builds --no-default-features into a third dir to prove serve and
-#                 non-serve builds coexist against one store. Needs kache
+#                 builds --no-default-features into a third dir to prove both
+#                 feature sets coexist against one store. Needs kache
 #                 installed and a single filesystem under $TMPDIR; skips cleanly
 #                 otherwise.
 #
@@ -168,10 +168,10 @@ full_run() {
     fail "kache copied dependency artifacts instead of sharing them; no disk dedup across worktrees"
   fi
 
-  info "building --no-default-features into a third dir (serve + non-serve coexist)..."
+  info "building --no-default-features into a third dir (feature sets coexist)..."
   cargo build --manifest-path "$ROOT_DIR/Cargo.toml" --no-default-features --target-dir "$target_serve" >/dev/null ||
     fail "--no-default-features build failed against the shared store"
-  ok "--no-default-features builds against the same store as the default (serve) builds"
+  ok "--no-default-features builds against the same store as the default builds"
 
   trap - EXIT
   rm -rf "$base"

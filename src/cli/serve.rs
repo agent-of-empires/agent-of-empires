@@ -95,7 +95,7 @@ pub struct ServeArgs {
     #[arg(long)]
     pub cityhall: bool,
 
-    /// Expose the dashboard over a public HTTPS tunnel. Prefers Tailscale
+    /// Expose the daemon over a public HTTPS tunnel. Prefers Tailscale
     /// Funnel when `tailscale` is installed and logged in (stable
     /// `.ts.net` URL, installable PWAs survive restarts). Falls back to a
     /// Cloudflare quick tunnel otherwise (fresh URL on every restart).
@@ -153,8 +153,9 @@ pub struct ServeArgs {
     pub passphrase: Option<String>,
 
     /// Open the dashboard URL in the default browser once the server is ready.
-    /// Ignored under --daemon, --remote, SSH (SSH_CONNECTION/SSH_TTY), or when
-    /// no display server is reachable on Linux/BSD.
+    /// Ignored in a build with no dashboard bundle, and under --daemon,
+    /// --remote, SSH (SSH_CONNECTION/SSH_TTY), or when no display server is
+    /// reachable on Linux/BSD.
     #[arg(long)]
     pub open: bool,
 

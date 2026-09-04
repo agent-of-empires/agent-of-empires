@@ -498,7 +498,7 @@ pub fn build_instance(
         std::path::PathBuf::from(&params.path)
     };
     let config =
-        super::repo_config::resolve_config_with_repo(profile, &config_path).unwrap_or_else(|e| {
+        super::config::repo_config::resolve_config_with_repo(profile, &config_path).unwrap_or_else(|e| {
             tracing::warn!(target: "session.create", "Failed to load config, using defaults: {}", e);
             Config::default()
         });
@@ -839,19 +839,10 @@ pub fn build_instance(
             } => {
                 // Structured fork: force the structured view, seed the parent
                 // for the ACP session/fork handshake, and replay history into
-                // the (empty) event store on first connect. The marker fields
-                // live behind the serve feature, so without it a structured
-                // fork is inapplicable and this arm is a no-op. Bind the field
-                // to `_` on bare-core so the destructure reads it without an
-                // `allow(unused_variables)` suppression (AGENTS.md).
-                #[cfg(feature = "serve")]
-                {
-                    instance.view = crate::session::View::Structured;
-                    instance.fork_pending = Some(parent_acp_session_id);
-                    instance.import_pending = Some(true);
-                }
-                #[cfg(not(feature = "serve"))]
-                let _ = parent_acp_session_id;
+                // the (empty) event store on first connect.
+                instance.view = crate::session::View::Structured;
+                instance.fork_pending = Some(parent_acp_session_id);
+                instance.import_pending = Some(true);
             }
         }
     }
@@ -1031,11 +1022,10 @@ pub fn cleanup_instance(
 }
 
 /// Structured-view (ACP) helpers for the TUI create paths. The web create
-/// path does the equivalent inline in `src/server/api/sessions.rs` (it also
+/// path does the equivalent inline in `src/server/api/sessions/create.rs` (it also
 /// handles explicit agent / model / import fields the TUI wizard doesn't
 /// expose), and the CLI in `src/cli/add.rs` with bail-vs-downgrade semantics
 /// keyed on how explicit the user's flag was. Keep the three in sync.
-#[cfg(feature = "serve")]
 pub mod structured {
     use super::Instance;
 
@@ -1119,7 +1109,7 @@ pub mod structured {
     /// skipped [`validate_structured_choice`] can't persist a structured
     /// session no agent can serve.
     pub fn apply_structured_choice(instance: &mut Instance) {
-        let config = crate::session::repo_config::resolve_config_with_repo_or_warn(
+        let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
             &instance.source_profile,
             std::path::Path::new(&instance.project_path),
         );
@@ -2385,7 +2375,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     #[serial_test::serial]
     fn build_instance_applies_structured_fork_seed() {
@@ -2440,7 +2429,6 @@ mod tests {
         const RULE_AGENT: &str = "fork-seed-registry-rule";
         let cases: &[(&str, fn())] = &[
             ("terminal", build_instance_applies_terminal_fork_seed),
-            #[cfg(feature = "serve")]
             ("structured", build_instance_applies_structured_fork_seed),
         ];
 

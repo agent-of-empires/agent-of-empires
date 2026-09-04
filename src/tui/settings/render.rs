@@ -1667,7 +1667,7 @@ mod status_message_tests {
     use super::super::fields::FieldKind;
     use super::super::test_util::fresh_view;
     use super::super::{FieldValue, SettingField, SettingsCategory, SettingsScope};
-    use crate::session::settings_schema::{ValidationKind, WidgetKind};
+    use crate::session::config::settings_schema::{ValidationKind, WidgetKind};
     use crate::tui::styles::load_theme;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;

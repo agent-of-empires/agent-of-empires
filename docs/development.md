@@ -5,10 +5,10 @@ Install Rust and tmux. Node.js and npm are required only for the web dashboard.
 ## Build and test
 
 ```sh
-cargo build                         # debug TUI build
+cargo build                         # debug build: TUI + daemon, no Node
 cargo build --release               # shipping build with LTO
 cargo build --profile dev-release   # optimized build without LTO
-cargo build --features serve        # include the web dashboard
+cargo build --features web          # include the web dashboard
 cargo test
 cargo fmt
 cargo clippy
@@ -16,6 +16,11 @@ cargo clippy
 
 The binary is `target/{profile}/aoe`. Web commands and test selection are in
 `web/AGENTS.md`.
+
+Debug builds carry line tables only, and dependencies carry no debug info, to
+keep `target/` small across worktrees. Panics and backtraces still name the file
+and line in this crate; a debugger has no local-variable values. Rebuild with
+`RUSTFLAGS="-Cdebuginfo=2"` for a full debugging session.
 
 ## Run and inspect logs
 
@@ -28,7 +33,7 @@ AOE_TERMINAL_TRACE=1 cargo run
 aoe logs
 ```
 
-For the dashboard, `cargo xtask dev` runs a serve-enabled debug backend on 8081
+For the dashboard, `cargo xtask dev` runs a dashboard-enabled debug backend on 8081
 and Vite with HMR on 5173. Add `--watch` to rebuild and restart the backend when
 Rust inputs change. A failed rebuild leaves the previous backend running.
 

@@ -483,7 +483,6 @@ mod tests {
     /// The pin is only meaningful if it satisfies the floor the startup gate
     /// enforces; otherwise `doctor --fix` would install an adapter that
     /// `initialize` then rejects. Mirrors `dockerfile_pin_matches_floor`.
-    #[cfg(feature = "serve")]
     #[test]
     fn claude_pin_satisfies_startup_floor() {
         let manifest: serde_json::Value =

@@ -612,8 +612,7 @@ impl HttpClient {
     /// the daemon already resolves the active profile's value for the web
     /// dashboard. See #3253.
     pub async fn compaction_reminder(&self) -> Result<Option<u8>, HttpError> {
-        /// The two `/api/about` fields the view needs. `ServerAbout` lives
-        /// behind the `serve` feature, so a TUI-only build cannot name it.
+        /// The two `/api/about` fields the view needs.
         #[derive(serde::Deserialize)]
         struct ReminderAbout {
             acp_compaction_reminder: bool,

@@ -209,23 +209,7 @@ pub(crate) fn replace_file_no_follow(root: &Path, rel: &Path, content: &[u8]) ->
     use nix::unistd::{unlinkat, UnlinkatFlags};
     use std::os::fd::OwnedFd;
 
-    let mut dirs = Vec::new();
-    let mut file_name = None;
-    let mut components = rel.components().peekable();
-    while let Some(component) = components.next() {
-        let std::path::Component::Normal(name) = component else {
-            return Err(anyhow!(
-                "replace_file_no_follow needs a plain relative path, got {}",
-                rel.display()
-            ));
-        };
-        if components.peek().is_some() {
-            dirs.push(name);
-        } else {
-            file_name = Some(name);
-        }
-    }
-    let file_name = file_name.ok_or_else(|| anyhow!("replace_file_no_follow needs a file name"))?;
+    let (dirs, file_name) = split_no_follow_rel(rel, "replace_file_no_follow")?;
 
     let dir_flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
     // The anchor is created the ordinary way; anything that could plant a
@@ -282,10 +266,113 @@ pub(crate) fn replace_file_no_follow(root: &Path, rel: &Path, content: &[u8]) ->
     written.with_context(|| format!("writing {} under {}", rel.display(), root.display()))
 }
 
+/// Split `rel` into the directories to walk and the final name, rejecting
+/// anything but plain relative components so no `..` or absolute segment can
+/// leave the anchor. `what` names the caller for the error.
+fn split_no_follow_rel<'a>(
+    rel: &'a Path,
+    what: &str,
+) -> Result<(Vec<&'a std::ffi::OsStr>, &'a std::ffi::OsStr)> {
+    let mut dirs = Vec::new();
+    let mut file_name = None;
+    let mut components = rel.components().peekable();
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(anyhow!(
+                "{what} needs a plain relative path, got {}",
+                rel.display()
+            ));
+        };
+        if components.peek().is_some() {
+            dirs.push(name);
+        } else {
+            file_name = Some(name);
+        }
+    }
+    let file_name = file_name.ok_or_else(|| anyhow!("{what} needs a file name"))?;
+    Ok((dirs, file_name))
+}
+
+/// Read `root`/`rel` as UTF-8 without ever traversing a symlink below `root`.
+///
+/// The read half of [`replace_file_no_follow`]'s contract, for the same
+/// bind-mounted files. Validating the pathname and then reopening it to read
+/// leaves a window a process sharing the bind wins by swapping the file for a
+/// symlink, which pulls a host file into the config AoE merges and republishes
+/// into the container. Here every component is opened `O_NOFOLLOW` from the
+/// previous descriptor, and the decisive regular-file check and the bytes both
+/// come from that one descriptor, so there is no pathname to re-resolve.
+///
+/// `None` when the entry is missing, is not a regular file (a planted link
+/// included), or cannot be read: callers merge into what they read, so absent
+/// is the fail-closed answer.
+#[cfg(unix)]
+pub(crate) fn read_file_no_follow(root: &Path, rel: &Path) -> Result<Option<String>> {
+    use nix::fcntl::{open, openat, AtFlags, OFlag};
+    use nix::sys::stat::{fstat, fstatat, Mode};
+    use std::io::Read;
+
+    let (dirs, file_name) = split_no_follow_rel(rel, "read_file_no_follow")?;
+
+    let dir_flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
+    let Ok(mut dir) = open(root, dir_flags, Mode::empty()) else {
+        return Ok(None);
+    };
+    for name in dirs {
+        let Ok(next) = openat(&dir, name, dir_flags | OFlag::O_NOFOLLOW, Mode::empty()) else {
+            return Ok(None);
+        };
+        dir = next;
+    }
+
+    let regular = |mode| mode & libc::S_IFMT == libc::S_IFREG;
+
+    // Stat the name on the descriptor first. Opening is not free of side
+    // effects on every file type a container can plant: a character device
+    // arms on open, and `O_NONBLOCK` only covers a fifo parking the open until
+    // a peer shows up. This stat is not what makes the read safe, so do not
+    // read it as the check-then-open shape this function exists to replace:
+    // the open still decides, and the identity check below pins the descriptor
+    // to the entry stat'd here, so a swap in between yields nothing.
+    let Ok(before) = fstatat(&dir, file_name, AtFlags::AT_SYMLINK_NOFOLLOW) else {
+        return Ok(None);
+    };
+    if !regular(before.st_mode) {
+        return Ok(None);
+    }
+
+    let flags = OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK;
+    let Ok(fd) = openat(&dir, file_name, flags, Mode::empty()) else {
+        return Ok(None);
+    };
+    let mut file = fs::File::from(fd);
+    let Ok(after) = fstat(&file) else {
+        return Ok(None);
+    };
+    if !regular(after.st_mode) || after.st_dev != before.st_dev || after.st_ino != before.st_ino {
+        return Ok(None);
+    }
+    let mut content = String::new();
+    Ok(file.read_to_string(&mut content).ok().map(|_| content))
+}
+
 /// Serial for the per-attempt temp name in [`replace_file_no_follow`], so two
 /// writers in one process cannot pick the same one inside a clock tick.
 #[cfg(unix)]
 static NO_FOLLOW_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Windows keeps the check-then-open the unix arm closes; the sandbox this
+/// guards against is Linux and macOS only. Kept so the module compiles. `rel`
+/// is still validated, so the two arms agree on what a caller may ask for.
+#[cfg(not(unix))]
+pub(crate) fn read_file_no_follow(root: &Path, rel: &Path) -> Result<Option<String>> {
+    split_no_follow_rel(rel, "read_file_no_follow")?;
+    let path = root.join(rel);
+    Ok(fs::symlink_metadata(&path)
+        .is_ok_and(|metadata| metadata.is_file())
+        .then(|| fs::read_to_string(&path).ok())
+        .flatten())
+}
 
 /// Windows has no `O_NOFOLLOW` walk here; the sandbox this guards against is
 /// Linux and macOS only. Kept so the module compiles.
@@ -2825,6 +2912,76 @@ mod tests {
             .filter(|name| name != "extension.js")
             .collect();
         assert!(leftovers.is_empty(), "stray temp files: {leftovers:?}");
+    }
+
+    /// The read half of the same contract: whatever a container plants at the
+    /// name, the bytes AoE merges come from a regular file it opened
+    /// `O_NOFOLLOW` below the bind root, or from nothing at all. The
+    /// substitution the fix closes is a swap between the type check and the
+    /// open, so the check runs on the descriptor the read uses and there is no
+    /// second resolution of the pathname to redirect.
+    #[cfg(unix)]
+    #[test]
+    fn read_file_no_follow_reads_only_regular_files_below_root() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("bind");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(root.join("agent")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let secret = outside.join("host-secret");
+        fs::write(&secret, "host-only").unwrap();
+
+        let rel = Path::new("agent/config.json");
+        assert_eq!(read_file_no_follow(&root, rel).unwrap(), None, "missing");
+        assert_eq!(
+            read_file_no_follow(&tmp.path().join("no-such-bind"), rel).unwrap(),
+            None,
+            "missing root"
+        );
+
+        fs::write(root.join(rel), "inside").unwrap();
+        assert_eq!(
+            read_file_no_follow(&root, rel).unwrap().as_deref(),
+            Some("inside")
+        );
+
+        // A link planted at the name reads as absent, not as its target.
+        fs::remove_file(root.join(rel)).unwrap();
+        std::os::unix::fs::symlink(&secret, root.join(rel)).unwrap();
+        assert_eq!(
+            read_file_no_follow(&root, rel).unwrap(),
+            None,
+            "planted link"
+        );
+
+        // So does anything else that is not a regular file. The fifo also
+        // pins that the open does not park waiting for a writer.
+        fs::remove_file(root.join(rel)).unwrap();
+        nix::unistd::mkfifo(
+            &root.join(rel),
+            nix::sys::stat::Mode::from_bits_truncate(0o600),
+        )
+        .unwrap();
+        assert_eq!(read_file_no_follow(&root, rel).unwrap(), None, "fifo");
+        fs::remove_file(root.join(rel)).unwrap();
+        fs::create_dir(root.join(rel)).unwrap();
+        assert_eq!(read_file_no_follow(&root, rel).unwrap(), None, "directory");
+
+        // A parent swapped for a link fails the walk rather than resolving
+        // out of the bind, even though the entry it points at is a plain file.
+        fs::write(outside.join("config.json"), "host-only").unwrap();
+        fs::remove_dir_all(root.join("agent")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("agent")).unwrap();
+        assert_eq!(
+            read_file_no_follow(&root, rel).unwrap(),
+            None,
+            "linked parent"
+        );
+
+        assert!(
+            read_file_no_follow(&root, Path::new("../outside/host-secret")).is_err(),
+            "a path that leaves the anchor is rejected"
+        );
     }
 
     #[cfg(unix)]

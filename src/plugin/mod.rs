@@ -15,22 +15,14 @@ pub mod update_check;
 pub mod view;
 
 // Worker modules need the event and session stores owned by `aoe serve`.
-#[cfg(feature = "serve")]
 pub(crate) mod automation_policy;
-#[cfg(feature = "serve")]
 pub mod host;
-#[cfg(feature = "serve")]
 pub mod host_api;
-#[cfg(feature = "serve")]
 pub mod protocol;
-#[cfg(feature = "serve")]
 pub mod sandbox;
-#[cfg(feature = "serve")]
 pub mod session_api;
-#[cfg(feature = "serve")]
 pub mod ui_state;
 
-// Launch resolution is also used by the installer, so it is not serve-gated.
 pub mod launch;
 
 use std::path::PathBuf;

@@ -316,7 +316,7 @@ fn plan_conversion(
     };
     let primary_name = repo_leaf_name(&main_repo);
     let git_wt = GitWorktree::new(main_repo.clone())?;
-    let config = super::repo_config::resolve_config_with_repo_or_warn(profile, &main_repo);
+    let config = super::config::repo_config::resolve_config_with_repo_or_warn(profile, &main_repo);
     let workspace_dir = git_wt.compute_path(
         session_branch(instance).unwrap_or(&branch_for_plain_session(&instance.title)),
         &config.worktree.workspace_path_template,
@@ -494,7 +494,8 @@ pub fn plan(
     // Resolved against the repo being attached: it is the repo a worktree gets
     // created in, so its own `.agent-of-empires/config.toml` governs submodule
     // init and the default base branch.
-    let config = super::repo_config::resolve_config_with_repo_or_warn(profile, &main_repo_path);
+    let config =
+        super::config::repo_config::resolve_config_with_repo_or_warn(profile, &main_repo_path);
     let git_wt = GitWorktree::new(main_repo_path.clone())?
         .with_init_submodules(config.worktree.init_submodules);
 
@@ -931,7 +932,6 @@ pub fn quiesce_for_conversion(storage: &Storage, instance: &super::Instance) -> 
 
     // The worker registry only exists in a build with the structured view, and
     // without it there is no ACP worker to stop.
-    #[cfg(feature = "serve")]
     if let Ok(Some(record)) = crate::process::worker_registry::load(&instance.id) {
         crate::process::worker_registry::delete(&instance.id).ok();
         crate::process::worker::terminate_process_group(record.pid);
@@ -1013,7 +1013,6 @@ pub fn resume_after_conversion(
         }
     }
 
-    #[cfg(feature = "serve")]
     if quiesced.worker_was_running {
         crate::process::worker_registry::mark_restart_pending(session_id);
     }

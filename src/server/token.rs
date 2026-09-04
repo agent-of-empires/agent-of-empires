@@ -79,12 +79,24 @@ impl TokenManager {
         self.state.read().await.lifetime.as_secs()
     }
 
-    /// Clear the previous token after the grace period has expired.
-    /// Used by the rotation task after the 5-minute grace window.
+    /// How long a rotated-out token stays valid. The rotation loop reads it
+    /// here so its cleanup deadline cannot drift from what `validate` accepts.
+    pub(super) async fn grace(&self) -> Duration {
+        self.state.read().await.grace
+    }
+
+    /// Clear the previous token once its grace window has closed.
     pub async fn clear_previous(&self) {
         let mut state = self.state.write().await;
         state.previous = None;
         state.grace_expires = None;
+    }
+
+    /// Whether a rotated-out token is still held, so the rotation loop's
+    /// cleanup deadline can be asserted.
+    #[cfg(test)]
+    pub(super) async fn holds_previous(&self) -> bool {
+        self.state.read().await.previous.is_some()
     }
 
     /// Rotate: generate new token, move current to previous with grace period.

@@ -39,11 +39,8 @@ impl Instance {
             created_by_plugin: None,
             plugin_create_idempotency: None,
             pending_initial_turn: None,
-            #[cfg(feature = "serve")]
             pending_initial_turn_attachments: Vec::new(),
-            #[cfg(feature = "serve")]
             queued_prompts: Vec::new(),
-            #[cfg(feature = "serve")]
             queued_prompt_next_seq: 0,
             acp_mode_id: None,
             prior_tool_session_ids: HashMap::new(),
@@ -186,8 +183,15 @@ impl Instance {
     /// agent does have bails on `[ -n "$AOE_INSTANCE_ID" ]` and the session
     /// reports Idle forever with nothing logged.
     pub(super) fn resolved_agent(&self) -> Option<&'static crate::agents::AgentDef> {
-        crate::agents::get_agent(&self.tool)
-            .or_else(|| crate::agents::get_agent(&self.effective_detect_as()))
+        resolved_agent_for(&self.source_profile, &self.tool, &self.detect_as)
+    }
+
+    /// The built-in agent name whose capture and resume behavior applies to
+    /// this session. Both paths fail closed on an unknown tool, so keying them
+    /// off `tool` raw leaves a custom wrapper with no poller, no pre-minted id
+    /// and no resume flag, silently and forever (#3638).
+    pub(crate) fn capture_agent_name(&self) -> Option<&'static str> {
+        self.resolved_agent().map(|a| a.name)
     }
 
     pub fn is_sub_session(&self) -> bool {
@@ -214,10 +218,9 @@ impl Instance {
         self.yolo_mode
     }
 
-    /// True when this session renders in the structured (ACP) view. The
-    /// persisted `view` field exists in every build so non-serve writers
-    /// round-trip it intact; rows damaged by pre-fix writers are healed on
-    /// reload by the server's structured row repair path.
+    /// True when this session renders in the structured (ACP) view. Rows
+    /// damaged by pre-fix writers are healed on reload by the server's
+    /// structured row repair path.
     pub fn is_structured(&self) -> bool {
         self.view == View::Structured
     }
@@ -233,10 +236,6 @@ impl Instance {
     /// CLI-resumable transcript (see `agents::acp_transcript_cli_resumable`).
     /// When `acp_session_id` is unset this only flips the view, leaving no
     /// resume target, which is why the caller also gates on it being present.
-    ///
-    /// Only the serve-gated `acp_disable` handler calls this, so it is
-    /// `cfg(serve)` to stay dead-code-free in a TUI-only build.
-    #[cfg(feature = "serve")]
     pub(crate) fn switch_to_terminal_keep_context(&mut self) {
         if let Some(sid) = self.acp_session_id.take() {
             self.agent_session_id = Some(sid.clone());
@@ -247,12 +246,27 @@ impl Instance {
     }
 }
 
+/// [`Instance::resolved_agent`] for a bare `(profile, tool)` pair, so state
+/// keyed by tool name outside an `Instance` (parked conversations, peer rows)
+/// resolves its built-in the same way the row itself would. Pass an empty
+/// `detect_as` when no stored alias exists; the live registry answers then.
+pub(crate) fn resolved_agent_for(
+    profile: &str,
+    tool: &str,
+    detect_as: &str,
+) -> Option<&'static crate::agents::AgentDef> {
+    crate::agents::get_agent(tool).or_else(|| {
+        crate::agents::get_agent(&tmux::status_rules::effective_detect_as(
+            profile, tool, detect_as,
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::session::instance::test_helpers::*;
 
-    #[cfg(feature = "serve")]
     #[test]
     fn switch_to_terminal_keep_context_carries_acp_id_into_resume_target() {
         let mut inst = Instance::new("claude", "/tmp");
