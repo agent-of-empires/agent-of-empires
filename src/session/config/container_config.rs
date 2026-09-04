@@ -6750,7 +6750,9 @@ volume_ignores = ["target"]
         );
 
         // Exactly the volume the reporter found orphaned, and not the main repo's,
-        // whose container path a worktree move leaves alone.
+        // whose container path a worktree move leaves alone. The literal suffix is
+        // the same `DefaultHasher` canary as in `containers::runtime_base`: a
+        // toolchain bump that changed it would orphan every existing named volume.
         assert_eq!(
             stranded,
             vec!["aoe-vi-sess1-workspace-otari-worktrees-905-target-31ddd0322290"]
