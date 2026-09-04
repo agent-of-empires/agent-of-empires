@@ -75,11 +75,11 @@ pub struct UnifiedDeleteDialog {
 impl UnifiedDeleteDialog {
     pub fn new(session_title: String, config: DeleteDialogConfig, profile: &str) -> Self {
         let user_config = match config.project_path.as_ref() {
-            Some(p) => crate::session::repo_config::resolve_config_with_repo_or_warn(
+            Some(p) => crate::session::config::repo_config::resolve_config_with_repo_or_warn(
                 profile,
                 std::path::Path::new(p),
             ),
-            None => crate::session::profile_config::resolve_config_or_warn(profile),
+            None => crate::session::config::profile_config::resolve_config_or_warn(profile),
         };
 
         let options = DeleteOptions {

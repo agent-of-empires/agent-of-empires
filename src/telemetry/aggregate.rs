@@ -6,7 +6,7 @@
 //! peak. `aoe serve` folds a sample of the live session list into a
 //! [`UsageAggregator`] every ~30 min and reports the window's peak concurrency
 //! and distinct-sessions-seen maps at flush time, while keeping the send cadence
-//! at one POST per send window (see `src/server/mod.rs`).
+//! at one POST per send window (see `src/server/serve_snapshot.rs`).
 //!
 //! Sampling is coarse on purpose (the issue, #1870, chose a ~30-min interval):
 //! a session born and gone entirely between two samples is still missed, but

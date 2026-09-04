@@ -399,7 +399,7 @@ impl SettingsView {
     /// Notifications / System) so the list isn't 14 unrelated tabs in
     /// arbitrary order. Status Hooks, Tmux, and Sound are dropped in Repo
     /// scope because their sections are not repo-overridable (see
-    /// `REPO_OVERRIDABLE_SECTIONS` in `session::repo_config`), so a repo
+    /// `REPO_OVERRIDABLE_SECTIONS` in `session::config::repo_config`), so a repo
     /// edit would strand at save.
     fn categories_for_scope(scope: SettingsScope) -> Vec<CategoryRow> {
         let mut rows: Vec<CategoryRow> = Vec::new();
@@ -566,7 +566,7 @@ impl SettingsView {
             let selected = self.plugin_manager.selected().map(|p| p.id.clone());
             self.fields.retain(|f| {
                 f.schema_section()
-                    .and_then(crate::session::settings_schema::section_plugin_id)
+                    .and_then(crate::session::config::settings_schema::section_plugin_id)
                     == selected.as_deref()
             });
         }
@@ -894,7 +894,7 @@ impl SettingsView {
                 let baseline = self.baseline_global.clone();
                 update_config(|c| -> anyhow::Result<()> {
                     let mut fresh = serde_json::to_value(&*c)?;
-                    crate::session::settings_schema::apply_changed_leaves(
+                    crate::session::config::settings_schema::apply_changed_leaves(
                         &mut fresh, &baseline, &edited,
                     );
                     *c = serde_json::from_value(fresh)?;

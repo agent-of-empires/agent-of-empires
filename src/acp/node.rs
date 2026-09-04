@@ -18,9 +18,10 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
-/// The minimum Node major version aoe-agent supports. Matches the
-/// `engines.node` field in `acp-worker/aoe-agent/package.json`.
-pub const MIN_NODE_MAJOR: u32 = 20;
+/// The minimum Node major version aoe-agent supports. Pinned to the
+/// `engines.node` field in `acp-worker/aoe-agent/package.json` by
+/// `package_engines_matches_min_node_major`.
+pub const MIN_NODE_MAJOR: u32 = 22;
 
 /// The pinned Node version aoe downloads when no host Node is found.
 /// Bumping this requires bumping the SHA-256 below at the same time.
@@ -96,12 +97,7 @@ fn verify_path(path: &Path, source: NodeSource) -> Result<ResolvedNode, NodeErro
         });
     }
     let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let major = parse_major(&raw).ok_or_else(|| NodeError::TooOld {
-        path: path.to_path_buf(),
-        found: raw.clone(),
-        min: MIN_NODE_MAJOR,
-    })?;
-    if major < MIN_NODE_MAJOR {
+    if meets_minimum(&raw) != Some(true) {
         return Err(NodeError::TooOld {
             path: path.to_path_buf(),
             found: raw,
@@ -120,6 +116,14 @@ fn parse_major(raw: &str) -> Option<u32> {
     let trimmed = raw.trim_start_matches('v');
     let major_str = trimmed.split('.').next()?;
     major_str.parse::<u32>().ok()
+}
+
+/// Whether a raw `node --version` string satisfies [`MIN_NODE_MAJOR`].
+/// `None` for unrecognisable output, which callers must treat as "not
+/// proven compatible" rather than as a pass. The spawn path and
+/// `aoe acp doctor` share this so their verdicts cannot diverge.
+pub fn meets_minimum(raw: &str) -> Option<bool> {
+    parse_major(raw).map(|major| major >= MIN_NODE_MAJOR)
 }
 
 fn which(binary: &str) -> Option<PathBuf> {
@@ -306,6 +310,43 @@ mod tests {
         assert_eq!(parse_major("v20.0.0"), Some(20));
         assert_eq!(parse_major("18.17.1"), Some(18));
         assert_eq!(parse_major("not a version"), None);
+    }
+
+    #[test]
+    fn meets_minimum_is_inclusive_at_the_boundary() {
+        for (raw, expected) in [
+            (format!("v{}.9.9", MIN_NODE_MAJOR - 1), Some(false)),
+            (format!("v{MIN_NODE_MAJOR}.0.0"), Some(true)),
+            (format!("{MIN_NODE_MAJOR}.0.0"), Some(true)),
+            (format!("v{}.0.0", MIN_NODE_MAJOR + 1), Some(true)),
+            ("not a version".to_string(), None),
+            (String::new(), None),
+        ] {
+            assert_eq!(meets_minimum(&raw), expected, "for {raw:?}");
+        }
+    }
+
+    #[test]
+    fn package_engines_matches_min_node_major() {
+        // package.json cannot read a Rust const, so `engines.node` is the
+        // one restatement of the floor outside this module. Assert it
+        // tracks the gate so a bump that forgets one side fails CI instead
+        // of letting a host pass `aoe acp doctor` and fail at spawn.
+        let manifest = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/acp-worker/aoe-agent/package.json"
+        ));
+        let json: serde_json::Value = serde_json::from_str(manifest).expect("valid package.json");
+        let engines = json["engines"]["node"]
+            .as_str()
+            .expect("package.json declares engines.node");
+        let declared = parse_major(engines.trim_start_matches(">="))
+            .unwrap_or_else(|| panic!("unparseable engines.node range {engines:?}"));
+        assert_eq!(declared, MIN_NODE_MAJOR, "engines.node is {engines:?}");
+
+        // The runtime we download when the host has none must clear the
+        // same bar, or `download` returns a Node `verify_path` rejects.
+        assert_eq!(meets_minimum(PINNED_NODE_VERSION), Some(true));
     }
 
     #[test]

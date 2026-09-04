@@ -1517,9 +1517,6 @@ mod tests {
         use crate::server::login::{LoginManager, SESSION_LIFETIME};
         use std::time::Duration;
 
-        // Direct pin on the server-side TTL. Any future edit that
-        // shortens this without updating the test (and the docs in
-        // `docs/guides/remote-phone-access.md`) will fail here.
         assert_eq!(
             SESSION_LIFETIME,
             Duration::from_secs(30 * 24 * 60 * 60),

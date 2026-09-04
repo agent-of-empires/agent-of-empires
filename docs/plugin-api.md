@@ -30,7 +30,7 @@ Schema additions by `api_version`: `2` added contributions (commands, keybinds, 
 id = "dev.example.my-plugin"
 name = "My Plugin"
 version = "0.1.0"
-api_version = 8
+api_version = 13
 aoe_version = ">=1.11.0, <2.0.0"
 description = "What the plugin does."
 capabilities = ["runtime.worker"]
@@ -298,6 +298,11 @@ for the full model.
 
 **Ownership.** `sessions.turn.send` only reaches a session the calling plugin
 created; a plugin cannot deliver turns to a user's or another plugin's session.
+
+**Busy sessions.** A turn aimed at a session whose agent is already running a
+non-steerable turn (or cancelling, or compacting) is refused with a retryable
+`agent_busy` rather than accepted and dropped. A stopped or dormant session is
+not busy: the host resumes it and waits.
 
 **Idempotency.** `sessions.create` accepts an `idempotency_key` scoped to the
 plugin: retrying with the same key and payload returns the existing session

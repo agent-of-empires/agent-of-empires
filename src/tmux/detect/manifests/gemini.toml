@@ -1,0 +1,25 @@
+id = "gemini"
+
+[[rules]]
+extends = "interrupt_hint"
+id = "interrupt_hint"
+priority = 970
+
+[[rules]]
+extends = "spinner"
+id = "spinner"
+priority = 960
+
+[[rules]]
+extends = "approval_prompt"
+id = "approval_prompt"
+priority = 950
+contains_any = ["execute?", "enter to select", "esc to cancel"]
+
+# Only a bare `>`: Gemini renders ordinary prose behind the same glyph, so the
+# `> something` form the other agents accept would fire on transcript text.
+[[rules]]
+extends = "input_prompt"
+id = "input_prompt"
+priority = 930
+line_regex = ['(?i)^\s*>\s*$']

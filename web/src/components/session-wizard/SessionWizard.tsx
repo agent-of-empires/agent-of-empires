@@ -322,7 +322,7 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
       // the server's per-agent
       // `acp_capable` flag (including custom agents with an
       // `agent_acp_cmd`) with hardcoded fallback while loading. The
-      // server re-resolves capability (see src/server/api/sessions.rs),
+      // server re-resolves capability (see src/server/api/sessions/create.rs),
       // so a tampered request can't escalate structured view on for a
       // non-capable agent.
       view: selectedAgentAcpCapable && d.useStructuredView ? "structured" : "terminal",

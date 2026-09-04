@@ -34,7 +34,7 @@ impl HooksInstallDialog {
         if let Some(agent) = crate::agents::get_agent(tool_name) {
             if let Some(hook_cfg) = &agent.hook_config {
                 let host_env = profile
-                    .map(crate::session::profile_config::resolve_config_or_warn)
+                    .map(crate::session::config::profile_config::resolve_config_or_warn)
                     .map(|config| config.environment)
                     .unwrap_or_default();
                 match hook_cfg.format {

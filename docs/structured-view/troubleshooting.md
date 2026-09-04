@@ -35,10 +35,10 @@ handshake times out after 30s.
 
 ### `aoe acp doctor` says Node is missing
 
-Install Node.js 20 or newer:
+Install Node.js 22 or newer:
 
 - macOS: `brew install node`
-- Linux: `apt install nodejs` or `nvm install 20`
+- Linux: `apt install nodejs` or `nvm install 22`
 - Windows: download from <https://nodejs.org/>
 
 Then re-run `aoe acp doctor` to verify. If you have Node installed in a
@@ -47,9 +47,10 @@ non-standard location, set `AOE_ACP_NODE=/path/to/node` or configure
 
 ### `aoe acp doctor` says aoe-agent is missing
 
-`aoe-agent` ships with the aoe binary. If the doctor reports it missing, your
-install is incomplete. Reinstall aoe via your package manager (e.g.,
-`brew reinstall aoe`).
+`aoe-agent` is not packaged with the aoe binary yet (#3553). The default
+structured-view agent is `claude-code`; leave `acp.default_agent` on an adapter
+that `aoe acp doctor` reports as installed, or build `acp-worker/aoe-agent`
+yourself and point the registry command at it.
 
 ### `aoe acp doctor` says claude-code adapter is missing
 
