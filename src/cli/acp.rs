@@ -745,15 +745,8 @@ fn find_in_path(binary: &str) -> Option<String> {
 }
 
 pub(crate) fn command_present(command: &str) -> bool {
-    // Placeholders like `${aoe_data_dir}/acp-worker/...` resolve at
-    // runtime against the app data dir, so the literal string contains
-    // both `${` and `/`. Check the placeholder branch FIRST — otherwise
-    // the `/`-branch tries to stat a literal path containing `${...}`
-    // and reports "missing" for every placeholder-based agent (notably
-    // `aoe-agent`).
     // A `${aoe_data_dir}` placeholder resolves the way the spawn resolves it,
-    // then the path is checked like any other; it used to report present
-    // unconditionally (#3553).
+    // then the path is checked like any other (#3553).
     if command.contains("${aoe_data_dir}") {
         return crate::session::get_app_dir()
             .map(|dir| {

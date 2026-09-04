@@ -29,11 +29,11 @@ aoe ships an ACP registry entry for each tool whose ACP server we've verified. F
 | `omp` | `omp acp` (native) | `curl -fsSL https://omp.sh/install \| sh` | provider environment or OMP login |
 | `kimi` | `kimi acp` (native) | `curl -fsSL https://code.kimi.com/kimi-code/install.sh \| bash` | `kimi login`, or provider env |
 | `prime-agent` | `prime-agent --mode acp` (native) | `curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh \| sh` | `/login` once, or provider env |
-| `aoe-agent` | bundled (Vercel AI SDK 7, runs on the resolved Node) | `aoe acp doctor --fix` installs it into the data dir; nothing to install globally | provider env vars |
+| `aoe-agent` | bundled (Vercel AI SDK 7, runs on the resolved Node) | `aoe acp doctor --fix --adapter aoe-agent` installs it into the data dir; nothing to install globally | provider env vars |
 
 Gemini CLI is deprecated upstream for individual accounts since 2026-06-18. Enterprise and API-key authentication remain valid; Antigravity CLI is the replacement for consumer accounts.
 
-The `npm install -g` commands above are optional: `aoe acp doctor --fix` installs the `claude` / `codex` / `pi` adapters and `aoe-agent` into the data dir for you, one adapter at a time (see [Requirements](#requirements)). Run it, or install the npm ones globally yourself.
+The `npm install -g` commands above are optional: `aoe acp doctor --fix` installs the `claude` / `codex` / `pi` adapters and `aoe-agent` into the data dir for you, one adapter at a time (`--adapter <name>`, or `--all-adapters`) (see [Requirements](#requirements)). Run it, or install the npm ones globally yourself.
 
 Tools not yet wired into the registry (aider, cursor, copilot, droid, hermes, kiro) always run in the terminal view. A **custom agent** can opt in two ways. Set an explicit ACP launch command via `agent_acp_cmd` (see [Configuration](guides/configuration.md#running-a-custom-agent-in-the-structured-view)); or, if the custom agent only wraps a supported one (for example a Claude wrapper that overrides profile/oauth locations), map it to that base with `agent_detect_as` (`my-claude = "claude"`) and it inherits the base's ACP adapter automatically, with no `agent_acp_cmd` needed. An inheriting agent runs through the base adapter, so it renders exactly like the base agent; its profile/oauth overrides ride the session's `extra_env` / `environment` the same as any other agent. This also lights up the "Switch to structured view" action for an existing terminal session of that agent.
 
@@ -94,7 +94,7 @@ If Node is missing or too old, the session falls back to the terminal view with 
 aoe acp doctor                                  # reports Node + each configured agent's reachability
 aoe acp doctor --fix                            # download bundled Node if missing, then install claude-agent-acp
 aoe acp doctor --fix --adapter codex-acp        # install a specific adapter instead
-aoe acp doctor --fix --all-adapters            # install all three
+aoe acp doctor --fix --all-adapters            # install every bundled adapter
 ```
 
 `--fix` installs a pinned npm adapter under `$AOE_DATA_DIR/acp-worker/adapters/<adapter>/` with the bundled Node's own npm; no `npm install -g` and no sudo, at a version aoe pins per release. Each adapter is a separate several-hundred-MB tree (`claude-agent-acp` ~304 MB, `codex-acp` ~336 MB, `pi-acp` ~7 MB), so `--fix` installs only `claude-agent-acp` unless you ask for more.

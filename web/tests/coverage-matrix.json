@@ -2759,8 +2759,8 @@
       "id": "sidebar.rate-limit-hook",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/hooks/__tests__/useAcpRateLimit.test.tsx"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/lib/acpStateStorage.ts"]
+      "specs": ["src/lib/rateLimitSummary.test.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/lib/rateLimitSummary.ts"]
     },
     {
       "id": "story.sidebar-select-focuses-input",

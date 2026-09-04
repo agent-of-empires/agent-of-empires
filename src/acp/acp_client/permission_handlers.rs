@@ -23,9 +23,6 @@ use super::pending::{
 use super::tool_context::{permission_raw_input_with_context, ToolContextCache};
 use super::tool_output::{preview_optional_args, tool_kind_str};
 
-/// Translate the user's decision into the matching option_id from the
-/// list the agent offered. Falls back gracefully if the agent didn't
-/// offer the preferred kind.
 fn permission_option_kind_str(kind: &PermissionOptionKind) -> &'static str {
     match kind {
         PermissionOptionKind::AllowOnce => "allow_once",
@@ -36,6 +33,9 @@ fn permission_option_kind_str(kind: &PermissionOptionKind) -> &'static str {
     }
 }
 
+/// Translate the user's decision into the matching option_id from the
+/// list the agent offered. Falls back gracefully if the agent didn't
+/// offer the preferred kind.
 pub(super) fn pick_option_id(
     options: &[agent_client_protocol::schema::v1::PermissionOption],
     decision: ApprovalDecision,

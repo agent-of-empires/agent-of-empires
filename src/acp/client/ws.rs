@@ -11,10 +11,9 @@
 //! - `{"kind":"heartbeat"}`: the app-level keepalive the daemon emits
 //!   on every ping tick (`PING_INTERVAL` in `src/server/acp_ws.rs`).
 //!   Carries no state, so the reader loop drops it without waking the
-//!   consumer. Any new `kind` sentinel the daemon grows must be added
-//!   here too: an unrecognised sentinel falls through to the frame
-//!   parse and surfaces as [`WsError::Parse`], which consumers treat
-//!   as a dropped socket. See #2287 and `parse_text`.
+//!   consumer. A `kind` this build does not recognise is a control
+//!   frame from a newer daemon and is dropped the same way, never
+//!   parsed as an event frame (#3560). See `parse_text`.
 //!
 //! Auth: the bearer token is sent as a `?token=<>` query string on the
 //! WebSocket URL. Most WS clients do not surface custom headers cleanly,

@@ -692,14 +692,6 @@ impl EventStore {
         }
     }
 
-    /// Return the most recent unfired `WakeupScheduled` for `session_id`.
-    /// "Pending" means the latest scheduled `at` is still in the future;
-    /// the previous heuristic (any `UserPromptSent` with a higher seq
-    /// marks the wakeup as fired) is wrong because a user-typed
-    /// follow-up message during the wait wasn't the wake firing; the
-    /// next ScheduleWakeup turn could still arrive minutes later. Pick
-    /// the latest WakeupScheduled and gate on the timestamp instead.
-    /// See #1091.
     /// The session's durable rate-limit park, if any. A park is the latest
     /// `RateLimit` event (or a terminal `Stopped { rate_limit_exhausted_retries }`)
     /// with nothing after it that shows the session moved on: a prompt, an
@@ -787,6 +779,14 @@ impl EventStore {
         })
     }
 
+    /// Return the most recent unfired `WakeupScheduled` for `session_id`.
+    /// "Pending" means the latest scheduled `at` is still in the future;
+    /// the previous heuristic (any `UserPromptSent` with a higher seq
+    /// marks the wakeup as fired) is wrong because a user-typed
+    /// follow-up message during the wait wasn't the wake firing; the
+    /// next ScheduleWakeup turn could still arrive minutes later. Pick
+    /// the latest WakeupScheduled and gate on the timestamp instead.
+    /// See #1091.
     pub fn latest_pending_wakeup(
         &self,
         session_id: &str,

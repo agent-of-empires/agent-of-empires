@@ -196,6 +196,17 @@ pub fn summarize(servers: &[ResolvedMcpServer]) -> String {
         .join(", ")
 }
 
+/// The environment a host session of `profile` launches with, as far as it
+/// can be known without spawning: the static `environment` entries, values
+/// resolved. `host_hooks.before_session` output is only known at spawn, so
+/// the spawn path passes its minted environment instead (#3734).
+pub fn session_env_for_discovery(profile: Option<&str>) -> Vec<(String, String)> {
+    let cfg = crate::session::config::profile_config::resolve_config_or_warn(
+        &crate::session::config::effective_profile(profile.unwrap_or_default()),
+    );
+    crate::session::environment::resolve_host_environment_pairs(&cfg.environment)
+}
+
 /// Resolve the effective MCP server set for a session context, applying the
 /// full precedence stack: agent-native -> global -> per-profile ->
 /// project-local (trust-gated), higher wins per name. This is the single source
@@ -211,17 +222,6 @@ pub fn summarize(servers: &[ResolvedMcpServer]) -> String {
 /// project-local layer is forwarded ONLY when the repo is trusted at the file's
 /// current fingerprint; an untrusted (or changed) file is skipped and logged,
 /// exactly like the create-time trust gate refuses untrusted hooks.
-/// The environment a host session of `profile` launches with, as far as it
-/// can be known without spawning: the static `environment` entries, values
-/// resolved. `host_hooks.before_session` output is only known at spawn, so
-/// the spawn path passes its minted environment instead (#3734).
-pub fn session_env_for_discovery(profile: Option<&str>) -> Vec<(String, String)> {
-    let cfg = crate::session::config::profile_config::resolve_config_or_warn(
-        &crate::session::config::effective_profile(profile.unwrap_or_default()),
-    );
-    crate::session::environment::resolve_host_environment_pairs(&cfg.environment)
-}
-
 pub fn resolve_effective(
     agent_key: &str,
     profile: Option<&str>,

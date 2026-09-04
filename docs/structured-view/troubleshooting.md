@@ -48,7 +48,8 @@ non-standard location, set `AOE_ACP_NODE=/path/to/node` or configure
 ### `aoe acp doctor` says aoe-agent is missing
 
 `aoe-agent` ships inside the `aoe` binary as sources and is installed into the
-data dir on demand, like the npm adapters: run `aoe acp doctor --fix`. It needs
+data dir on demand, like the npm adapters: run
+`aoe acp doctor --fix --adapter aoe-agent`. It needs
 the same Node 22+ the other adapters need. Until it is installed, sessions that
 pick it fail to start with an install hint and `aoe acp agents` reports it as
 missing rather than present (#3553).

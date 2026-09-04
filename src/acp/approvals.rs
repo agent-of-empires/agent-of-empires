@@ -70,9 +70,6 @@ pub enum ApprovalDecision {
     Cancelled,
 }
 
-/// A pending or resolved approval for a tool call. Held in
-/// `AcpState::pending_approvals` until it is resolved through
-/// `apply_event(Event::ApprovalResolved { ... })`.
 /// One option the agent offered on `session/request_permission`. ACP lets
 /// an option carry any label, so an adapter can ship a multiple-choice
 /// question as N `allow_once` options (pi-acp's `ask_user_question`).
@@ -84,6 +81,9 @@ pub struct ApprovalOption {
     pub kind: String,
 }
 
+/// A pending or resolved approval for a tool call. Held in
+/// `AcpState::pending_approvals` until it is resolved through
+/// `apply_event(Event::ApprovalResolved { ... })`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Approval {
     pub nonce: Nonce,
