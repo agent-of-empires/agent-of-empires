@@ -192,7 +192,13 @@ impl Instance {
         // carries the values (leak-safe via the inherit path in run_create).
         self.ensure_before_start_env(true)?;
         let config = self.build_container_config()?;
-        container.prune_stale_named_ignore_volumes(&self.id, &config);
+        // Still the workdir the *previous* container was created with; the pin below
+        // is what moves it forward.
+        let previous_workdir = self
+            .sandbox_info
+            .as_ref()
+            .and_then(|sandbox| sandbox.container_workdir.as_deref());
+        container.prune_stale_named_ignore_volumes(&self.id, &config, previous_workdir);
         let container_id = container.create(&config)?;
         self.identity_publisher_launched = config.identity_publisher_installed
             && identity_publisher_dependencies_available(&container)

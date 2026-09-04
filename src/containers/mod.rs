@@ -125,18 +125,28 @@ fn classify_running_probe(result: Result<bool>) -> Probe {
 }
 
 /// The named ignore volumes a create is about to mount, or `None` when the prune
-/// must be skipped because the config does not establish what the session should
-/// have.
+/// must be skipped.
 ///
-/// Two ways it does not. The set can be incomplete, which
-/// [`ContainerConfig::named_ignore_volumes_authoritative`] reports: a mount resolve
-/// that fell back to `/workspace/{basename}` names volumes the session never had, so
-/// every volume it does have reads as stale. The set can also be empty, which does
-/// not distinguish "this session has no caches" from a switch to the anonymous
-/// strategy. Either way the difference between the config and reality is not evidence
-/// of a stranded volume, and a cache is worth more than a prompt reclaim.
-fn named_ignore_volumes_to_keep(config: &ContainerConfig) -> Option<HashSet<&str>> {
+/// A volume is stranded when the mounts moved out from under it, so the prune needs
+/// evidence of a move, not merely a config that differs from the volumes on disk.
+/// `previous_workdir` is that evidence: the workdir the last container was created
+/// with (`SandboxInfo::container_workdir`, pinned at create for #2414). Equal to this
+/// config's, or absent, and the session's mounts sit where they always did, so a
+/// volume outside the config was dropped by an edited `volume_ignores` or a glob that
+/// matched nothing this time, and deleting it would destroy a live cache.
+///
+/// Two further skips. `named_ignore_volumes_authoritative` is false when the mount
+/// resolve was degraded, where the paths (workdir included) are provisional, so the
+/// "move" may be nothing but a `find_main_repo` failure. An empty set does not
+/// distinguish "this session has no caches" from a switch to the anonymous strategy.
+fn named_ignore_volumes_to_keep<'a>(
+    config: &'a ContainerConfig,
+    previous_workdir: Option<&str>,
+) -> Option<HashSet<&'a str>> {
     if !config.named_ignore_volumes_authoritative || config.named_ignore_volumes.is_empty() {
+        return None;
+    }
+    if previous_workdir.is_none_or(|previous| previous == config.working_dir) {
         return None;
     }
     Some(
@@ -276,10 +286,15 @@ impl DockerContainer {
     ///
     /// Must be called before the create, while no container holds the volumes.
     ///
-    /// Prunes nothing unless the config establishes the whole set the session should
-    /// have; see [`named_ignore_volumes_to_keep`].
-    pub fn prune_stale_named_ignore_volumes(&self, session_id: &str, config: &ContainerConfig) {
-        let Some(keep) = named_ignore_volumes_to_keep(config) else {
+    /// Prunes nothing unless the session's mounts are established to have moved;
+    /// `previous_workdir` is that evidence, see [`named_ignore_volumes_to_keep`].
+    pub fn prune_stale_named_ignore_volumes(
+        &self,
+        session_id: &str,
+        config: &ContainerConfig,
+        previous_workdir: Option<&str>,
+    ) {
+        let Some(keep) = named_ignore_volumes_to_keep(config, previous_workdir) else {
             return;
         };
         let prefix = format!("aoe-vi-{}-", session_id);
@@ -392,9 +407,11 @@ impl DockerContainer {
 mod tests {
     use super::*;
 
-    #[test]
-    fn keep_set_is_the_configs_volume_names() {
-        let config = ContainerConfig {
+    /// A config that mounts these two, for a session whose worktree moved from
+    /// otari-worktrees/905 to otari-worktrees/rev-912 (#3742).
+    fn moved_config() -> ContainerConfig {
+        ContainerConfig {
+            working_dir: "/workspace/otari-worktrees/rev-912".to_string(),
             named_ignore_volumes: vec![
                 NamedVolumeMount {
                     volume_name: "aoe-vi-sess1-workspace-otari-target-8ec07926d6b0".to_string(),
@@ -409,47 +426,65 @@ mod tests {
             ],
             named_ignore_volumes_authoritative: true,
             ..Default::default()
-        };
+        }
+    }
 
-        let keep = named_ignore_volumes_to_keep(&config).expect("an authoritative config prunes");
+    #[test]
+    fn a_moved_workdir_keeps_exactly_what_the_new_container_mounts() {
+        let config = moved_config();
+        let keep = named_ignore_volumes_to_keep(&config, Some("/workspace/otari-worktrees/905"))
+            .expect("a moved workdir is evidence of a strand");
+
         assert_eq!(keep.len(), 2);
         assert!(keep.contains("aoe-vi-sess1-workspace-otari-target-8ec07926d6b0"));
         assert!(keep.contains("aoe-vi-sess1-workspace-otari-worktrees-rev-912-target-873cf2685e47"));
     }
 
     #[test]
-    fn an_unestablished_volume_set_skips_the_prune() {
-        let volumes = || {
-            vec![NamedVolumeMount {
-                volume_name: "aoe-vi-sess1-workspace-otari-target-8ec07926d6b0".to_string(),
-                container_path: "/workspace/otari/target".to_string(),
-            }]
+    fn without_evidence_of_a_move_nothing_is_pruned() {
+        let unmoved = "/workspace/otari-worktrees/rev-912";
+
+        let degraded = ContainerConfig {
+            named_ignore_volumes_authoritative: false,
+            ..moved_config()
+        };
+        let no_volumes = ContainerConfig {
+            named_ignore_volumes: vec![],
+            ..moved_config()
         };
 
-        for (case, config) in [
+        for (case, config, previous_workdir) in [
             (
-                // A degraded mount resolve names volumes the session never had, so
-                // every volume it does have would read as stale.
-                "not authoritative",
-                ContainerConfig {
-                    named_ignore_volumes: volumes(),
-                    named_ignore_volumes_authoritative: false,
-                    ..Default::default()
-                },
+                // An edited volume_ignores or a glob that matched nothing this time
+                // drops a volume from the config while the mounts sit where they
+                // always did. The cache is live, not stranded.
+                "the workdir did not move",
+                moved_config(),
+                Some(unmoved),
+            ),
+            (
+                // A session that has never had a container has nothing to reclaim.
+                "no previous workdir",
+                moved_config(),
+                None,
+            ),
+            (
+                // A degraded resolve makes the workdir provisional too, so the
+                // apparent move may be nothing but a find_main_repo failure.
+                "a degraded mount resolve",
+                degraded,
+                Some("/workspace/otari-worktrees/905"),
             ),
             (
                 // Does not distinguish "no caches" from a switch to the anonymous
                 // strategy.
-                "empty",
-                ContainerConfig {
-                    named_ignore_volumes_authoritative: true,
-                    ..Default::default()
-                },
+                "an empty volume set",
+                no_volumes,
+                Some("/workspace/otari-worktrees/905"),
             ),
-            ("empty and not authoritative", ContainerConfig::default()),
         ] {
             assert!(
-                named_ignore_volumes_to_keep(&config).is_none(),
+                named_ignore_volumes_to_keep(&config, previous_workdir).is_none(),
                 "{case} must not drive a deletion"
             );
         }

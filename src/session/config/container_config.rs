@@ -1060,10 +1060,37 @@ pub(crate) fn install_pi_sandbox_extension_at(root: &Path) -> Result<()> {
     }
     Ok(())
 }
+/// Which branch [`compute_volume_paths_with_resolve`] resolved the mounts through.
+///
+/// Reported rather than re-derived, because a caller about to act destructively on
+/// the difference between the derived paths and reality needs the state of the
+/// resolve that produced *those* paths, not a fresh look taken afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MountResolve {
+    /// The mounts follow from the project's git layout, or from a path that has no
+    /// git linkage to resolve.
+    Resolved,
+    /// `find_main_repo` failed for a path that presents as a worktree, so the mounts
+    /// collapsed to `/workspace/{basename}` (#2414). Every path derived here is
+    /// provisional: it names a location the session's container never mounted.
+    Degraded,
+}
+
 pub(crate) fn compute_volume_paths(
     project_path: &Path,
     project_path_str: &str,
 ) -> Result<(Vec<VolumeMount>, String)> {
+    let (volumes, workspace_path, _) =
+        compute_volume_paths_with_resolve(project_path, project_path_str)?;
+    Ok((volumes, workspace_path))
+}
+
+/// [`compute_volume_paths`] plus the branch it resolved through; see [`MountResolve`].
+pub(crate) fn compute_volume_paths_with_resolve(
+    project_path: &Path,
+    project_path_str: &str,
+) -> Result<(Vec<VolumeMount>, String, MountResolve)> {
+    let mut resolve = MountResolve::Resolved;
     // Only look for a main repo if the project path itself has a .git entry (file or
     // directory). This prevents git2::Repository::discover from walking up the directory
     // tree and finding an unrelated ancestor repo (e.g., a dotfile-managed home directory),
@@ -1073,77 +1100,82 @@ pub(crate) fn compute_volume_paths(
     // Legitimate git repos have a .git directory; worktrees have a .git file containing a
     // gitdir pointer. Both cases are covered by this check.
     if project_path.join(".git").exists() {
-        if let Ok(main_repo) = GitWorktree::find_main_repo(project_path) {
-            // Canonicalize paths for reliable comparison (handles symlinks like /tmp -> /private/tmp)
-            let main_repo_canonical = main_repo
-                .canonicalize()
-                .unwrap_or_else(|_| main_repo.clone());
-            let project_canonical = project_path
-                .canonicalize()
-                .unwrap_or_else(|_| project_path.to_path_buf());
+        match GitWorktree::find_main_repo(project_path) {
+            Err(_) => resolve = MountResolve::Degraded,
+            Ok(main_repo) => {
+                // Canonicalize paths for reliable comparison (handles symlinks like /tmp -> /private/tmp)
+                let main_repo_canonical = main_repo
+                    .canonicalize()
+                    .unwrap_or_else(|_| main_repo.clone());
+                let project_canonical = project_path
+                    .canonicalize()
+                    .unwrap_or_else(|_| project_path.to_path_buf());
 
-            // Check if project_path is a worktree (different from the main repo root).
-            // Mount enough of the filesystem so the worktree's relative gitdir reference
-            // resolves correctly inside the container.
-            if main_repo_canonical != project_canonical {
-                if project_canonical.starts_with(&main_repo_canonical) {
-                    // Worktree is inside the main repo (bare repo layout) --
-                    // mounting the main repo is sufficient.
-                    let name = main_repo_canonical
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "workspace".to_string());
-                    let container_base = format!("/workspace/{}", name);
-                    let relative_worktree = project_canonical
-                        .strip_prefix(&main_repo_canonical)
-                        .map(|p| p.to_path_buf())
-                        .unwrap_or_default();
-                    let working_dir = if relative_worktree.as_os_str().is_empty() {
-                        container_base.clone()
-                    } else {
-                        format!("{}/{}", container_base, relative_worktree.display())
-                    };
+                // Check if project_path is a worktree (different from the main repo root).
+                // Mount enough of the filesystem so the worktree's relative gitdir reference
+                // resolves correctly inside the container.
+                if main_repo_canonical != project_canonical {
+                    if project_canonical.starts_with(&main_repo_canonical) {
+                        // Worktree is inside the main repo (bare repo layout) --
+                        // mounting the main repo is sufficient.
+                        let name = main_repo_canonical
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "workspace".to_string());
+                        let container_base = format!("/workspace/{}", name);
+                        let relative_worktree = project_canonical
+                            .strip_prefix(&main_repo_canonical)
+                            .map(|p| p.to_path_buf())
+                            .unwrap_or_default();
+                        let working_dir = if relative_worktree.as_os_str().is_empty() {
+                            container_base.clone()
+                        } else {
+                            format!("{}/{}", container_base, relative_worktree.display())
+                        };
 
-                    return Ok((
-                        vec![VolumeMount {
-                            host_path: main_repo_canonical.to_string_lossy().to_string(),
-                            container_path: container_base,
-                            read_only: false,
-                        }],
-                        working_dir,
-                    ));
-                } else {
-                    // Worktree is a sibling of the main repo (non-bare layout).
-                    // Mount each separately under /workspace/, preserving their
-                    // relative path structure from their common ancestor. This
-                    // ensures the worktree's .git file (which contains a relative
-                    // gitdir path) resolves correctly inside the container.
-                    let common = common_ancestor(&main_repo_canonical, &project_canonical);
-                    let repo_rel = main_repo_canonical
-                        .strip_prefix(&common)
-                        .unwrap_or(&main_repo_canonical);
-                    let wt_rel = project_canonical
-                        .strip_prefix(&common)
-                        .unwrap_or(&project_canonical);
-
-                    let repo_container = format!("/workspace/{}", repo_rel.display());
-                    let wt_container = format!("/workspace/{}", wt_rel.display());
-
-                    return Ok((
-                        vec![
-                            VolumeMount {
+                        return Ok((
+                            vec![VolumeMount {
                                 host_path: main_repo_canonical.to_string_lossy().to_string(),
-                                container_path: repo_container,
+                                container_path: container_base,
                                 read_only: false,
-                            },
-                            VolumeMount {
-                                host_path: project_canonical.to_string_lossy().to_string(),
-                                container_path: wt_container.clone(),
-                                read_only: false,
-                            },
-                        ],
-                        wt_container,
-                    ));
+                            }],
+                            working_dir,
+                            MountResolve::Resolved,
+                        ));
+                    } else {
+                        // Worktree is a sibling of the main repo (non-bare layout).
+                        // Mount each separately under /workspace/, preserving their
+                        // relative path structure from their common ancestor. This
+                        // ensures the worktree's .git file (which contains a relative
+                        // gitdir path) resolves correctly inside the container.
+                        let common = common_ancestor(&main_repo_canonical, &project_canonical);
+                        let repo_rel = main_repo_canonical
+                            .strip_prefix(&common)
+                            .unwrap_or(&main_repo_canonical);
+                        let wt_rel = project_canonical
+                            .strip_prefix(&common)
+                            .unwrap_or(&project_canonical);
+
+                        let repo_container = format!("/workspace/{}", repo_rel.display());
+                        let wt_container = format!("/workspace/{}", wt_rel.display());
+
+                        return Ok((
+                            vec![
+                                VolumeMount {
+                                    host_path: main_repo_canonical.to_string_lossy().to_string(),
+                                    container_path: repo_container,
+                                    read_only: false,
+                                },
+                                VolumeMount {
+                                    host_path: project_canonical.to_string_lossy().to_string(),
+                                    container_path: wt_container.clone(),
+                                    read_only: false,
+                                },
+                            ],
+                            wt_container,
+                            MountResolve::Resolved,
+                        ));
+                    }
                 }
             }
         }
@@ -1163,6 +1195,7 @@ pub(crate) fn compute_volume_paths(
             read_only: false,
         }],
         workspace_path,
+        resolve,
     ))
 }
 
@@ -1658,17 +1691,6 @@ fn glob_roots(project_volumes: &[VolumeMount]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// True when `project_path` presents as a git worktree whose linkage is broken.
-///
-/// [`compute_volume_paths`] resolves a worktree's mounts through
-/// `find_main_repo`; when that fails it falls through to `/workspace/{basename}`,
-/// a path the session's container never mounted (#2414). Every container path
-/// derived in that state is provisional, so a caller about to act destructively
-/// on the difference between the derived set and reality must not.
-fn worktree_linkage_broken(project_path: &Path) -> bool {
-    project_path.join(".git").exists() && GitWorktree::find_main_repo(project_path).is_err()
-}
-
 /// Produce a deterministic Docker volume name for a named volume_ignores mount.
 ///
 /// Uses the full session ID as a prefix so volumes can be enumerated on deletion.
@@ -1764,10 +1786,14 @@ pub(crate) fn build_container_config(
     // For multi-repo workspaces, mount the workspace dir and all main repos.
     // For bare repo worktrees, mount the entire bare repo and set working_dir to the worktree.
     // For sibling worktrees, mount the main repo and worktree as separate volumes.
-    let (project_volumes, workspace_path) = if let Some(ws_info) = workspace_info {
-        compute_workspace_volume_paths(project_path, ws_info)?
+    // A workspace resolve is always Resolved: compute_workspace_volume_paths derives
+    // its mounts from the stored `main_repo_path` of each repo and never consults
+    // `find_main_repo`, so it has no degraded fallback to report.
+    let (project_volumes, workspace_path, mount_resolve) = if let Some(ws_info) = workspace_info {
+        let (volumes, path) = compute_workspace_volume_paths(project_path, ws_info)?;
+        (volumes, path, MountResolve::Resolved)
     } else {
-        compute_volume_paths(project_path, project_path_str)?
+        compute_volume_paths_with_resolve(project_path, project_path_str)?
     };
 
     // Collect all paths that should receive volume_ignores: the workspace_path
@@ -2210,12 +2236,9 @@ pub(crate) fn build_container_config(
     // expanded against the host filesystem now (#2045): a point-in-time snapshot,
     // since Docker needs concrete mount paths when the container starts.
     let mut resolved_ignore_paths: Vec<String> = Vec::new();
-    let mut glob_matched_nothing = false;
     for ignore in &sandbox_config.volume_ignores {
         if has_glob_metachars(ignore) {
-            let matches = expand_glob_ignore(ignore, &glob_roots);
-            glob_matched_nothing |= matches.is_empty();
-            resolved_ignore_paths.extend(matches);
+            resolved_ignore_paths.extend(expand_glob_ignore(ignore, &glob_roots));
         } else {
             for base_path in &volume_ignore_bases {
                 resolved_ignore_paths.push(format!("{}/{}", base_path, ignore));
@@ -2240,11 +2263,7 @@ pub(crate) fn build_container_config(
         })
         .collect();
 
-    // A degraded mount resolve or a glob that matched nothing both leave the
-    // resolved set a floor rather than the whole truth, which is the difference
-    // between reclaiming a stranded volume and destroying a live cache.
-    let named_ignore_volumes_authoritative = !glob_matched_nothing
-        && !(workspace_info.is_none() && worktree_linkage_broken(project_path));
+    let named_ignore_volumes_authoritative = mount_resolve == MountResolve::Resolved;
 
     // Route by strategy: anonymous volumes are the default; named volumes fix VirtioFS on macOS.
     let (anonymous_volumes, named_ignore_volumes): (Vec<String>, Vec<NamedVolumeMount>) =
@@ -2605,14 +2624,14 @@ mod tests {
         assert_eq!(volumes[0].container_path, working_dir);
     }
 
+    /// The collapse to `/workspace/{basename}` is reported as `Degraded` rather than
+    /// left indistinguishable from the two resolves that land there legitimately.
     #[test]
-    fn worktree_linkage_broken_flags_only_the_degraded_resolve() {
+    fn compute_volume_paths_reports_the_collapsed_resolve_as_degraded() {
         let dir = TempDir::new().unwrap();
 
         // An orphaned worktree: a `.git` file whose gitdir points nowhere, the
-        // state a pruned admin entry leaves behind. compute_volume_paths collapses
-        // to /workspace/{basename} here (#2414), so the paths it derives are
-        // provisional and must not drive a deletion.
+        // state a pruned admin entry leaves behind (#2414).
         let orphaned = dir.path().join("myrepo-worktrees").join("contexec");
         std::fs::create_dir_all(&orphaned).unwrap();
         std::fs::write(
@@ -2620,16 +2639,27 @@ mod tests {
             "gitdir: ../../does-not-exist/.git/worktrees/contexec\n",
         )
         .unwrap();
-        assert!(worktree_linkage_broken(&orphaned));
 
-        // A plain directory has no linkage to break, and neither does a healthy
-        // repo; both resolve to /workspace/{basename} legitimately.
         let plain = dir.path().join("plain");
         std::fs::create_dir_all(&plain).unwrap();
-        assert!(!worktree_linkage_broken(&plain));
-
         let (_repo_dir, repo_path) = setup_regular_repo();
-        assert!(!worktree_linkage_broken(&repo_path));
+
+        for (case, path, expected) in [
+            ("an orphaned worktree", &orphaned, MountResolve::Degraded),
+            ("a plain directory", &plain, MountResolve::Resolved),
+            ("a healthy repo root", &repo_path, MountResolve::Resolved),
+        ] {
+            let (_volumes, workspace_path, resolve) =
+                compute_volume_paths_with_resolve(path, path.to_str().unwrap()).unwrap();
+            assert_eq!(resolve, expected, "{case}");
+            // All three land on the same shape of path, which is why the resolve
+            // has to be reported rather than inferred from the result.
+            assert_eq!(
+                workspace_path,
+                format!("/workspace/{}", path.file_name().unwrap().to_string_lossy()),
+                "{case}"
+            );
+        }
     }
 
     #[test]
@@ -4243,22 +4273,19 @@ volume_ignores = ["**/bin", "**/obj", "target"]
         );
     }
 
-    /// The named-volume reclaim (#3742) only runs against a resolve that establishes
-    /// the whole set. A literal entry always mounts, so it alone keeps the set
-    /// non-empty while a glob silently contributes nothing.
+    /// The named-volume reclaim (#3742) runs off the resolve the mounts came from,
+    /// carried on the config so the gate cannot re-derive a different answer.
     #[test]
     #[serial_test::serial]
-    fn named_ignore_volumes_are_authoritative_only_when_every_glob_matched() {
+    fn named_ignore_volumes_authoritative_tracks_the_mount_resolve() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
-        let build = |glob_dir_exists: bool| {
+        let build = |healthy_repo: bool| {
             let project_dir = TempDir::new().unwrap();
-            if glob_dir_exists {
-                fs::create_dir_all(project_dir.path().join("src/App/bin")).unwrap();
-            }
+            fs::create_dir_all(project_dir.path().join("src/App/bin")).unwrap();
             let config_dir = project_dir.path().join(".agent-of-empires");
             fs::create_dir_all(&config_dir).unwrap();
             fs::write(
@@ -4270,7 +4297,17 @@ volume_ignores_strategy = "named"
 "#,
             )
             .unwrap();
-            git2::Repository::init(project_dir.path()).unwrap();
+            if healthy_repo {
+                git2::Repository::init(project_dir.path()).unwrap();
+            } else {
+                // An orphaned worktree, whose collapsed resolve makes every derived
+                // path (the workdir included) provisional.
+                fs::write(
+                    project_dir.path().join(".git"),
+                    "gitdir: ../does-not-exist/.git/worktrees/x\n",
+                )
+                .unwrap();
+            }
 
             let sandbox_info = crate::session::instance::SandboxInfo {
                 enabled: true,
@@ -4294,17 +4331,17 @@ volume_ignores_strategy = "named"
             .unwrap()
         };
 
-        let matched = build(true);
-        assert!(matched.named_ignore_volumes_authoritative);
+        let healthy = build(true);
+        assert!(healthy.named_ignore_volumes_authoritative);
 
-        let unmatched = build(false);
+        let degraded = build(false);
         assert!(
-            !unmatched.named_ignore_volumes.is_empty(),
-            "the literal entry must still mount, so the empty-set guard cannot be what saves this case"
+            !degraded.named_ignore_volumes.is_empty(),
+            "the literal entry still mounts, so the empty-set guard cannot be what saves this case"
         );
         assert!(
-            !unmatched.named_ignore_volumes_authoritative,
-            "a glob that matched nothing leaves the set a floor, so it must not drive a deletion"
+            !degraded.named_ignore_volumes_authoritative,
+            "a collapsed resolve names volumes the session never had, so it must not drive a deletion"
         );
     }
 

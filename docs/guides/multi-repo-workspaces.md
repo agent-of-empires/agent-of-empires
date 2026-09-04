@@ -121,11 +121,12 @@ throwaway directory that deletion removes.
 Sandboxed sessions have their container removed and recreated, since bind mounts
 are fixed when the container is created and the container mounts the common
 ancestor of the workspace and every repo. Build caches (`target/`,
-`node_modules/`) are named volumes keyed on their container path, so they
-survive an attach that leaves that path alone. Attaching a repo from outside the
-current common ancestor moves every mount, so those caches start empty; see
-[Volume Ignores Strategy](sandbox.md#volume-ignores-strategy-macosvirtiofs) for
-what happens to the volumes they leave behind.
+`node_modules/`) go with the container under the default
+[volume ignores strategy](sandbox.md#volume-ignores-strategy-macosvirtiofs). Under
+`"named"` they are keyed on their container path, so they survive an attach that
+leaves that path alone; attaching a repo from outside the current common ancestor
+moves every mount, so those caches start empty and the volumes they leave behind
+are reclaimed at the next start.
 
 ## The Project Registry
 
