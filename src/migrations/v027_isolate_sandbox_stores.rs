@@ -17,6 +17,40 @@ pub(crate) const LOCK: &str = ".v027-sandbox-transition.lock";
 
 type RunningProbe<'a> = dyn Fn(&str) -> Result<bool> + 'a;
 
+/// Reaps the stopped container of a row whose store has moved. `Ok(false)`
+/// leaves the row pending; see [`reap_migrated_container`].
+type ReapProbe<'a> = dyn Fn(&str) -> Result<bool> + 'a;
+
+/// Remove the stopped container of a row whose store has moved, so its next
+/// launch recreates it against the private layout.
+///
+/// `Ok(false)` means no container runtime could answer. AoE must still start
+/// when the runtime is absent, its daemon is down, or the user is not in the
+/// `docker` group, and a runtime that cannot be asked is no evidence that
+/// nothing is left to reap. Those rows stay pending for a later pass instead
+/// of failing the migration, which would otherwise abort every `aoe`
+/// invocation before the schema version is committed.
+fn reap_migrated_container(id: &str) -> Result<bool> {
+    use crate::containers::error::DockerError;
+    let container = crate::containers::DockerContainer::from_session_id(id);
+    match container.exists() {
+        Ok(true) => {
+            container.remove(false)?;
+            Ok(true)
+        }
+        Ok(false) => Ok(true),
+        Err(
+            error @ (DockerError::NotInstalled
+            | DockerError::DaemonNotRunning
+            | DockerError::PermissionDenied),
+        ) => {
+            tracing::warn!("v027 deferring {id}: container runtime unavailable ({error})");
+            Ok(false)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 #[derive(Clone)]
 struct Target {
     registry: usize,
@@ -35,9 +69,12 @@ struct Registry {
 pub fn run() -> Result<()> {
     let app_dir = crate::session::get_app_dir()?;
     let home = dirs::home_dir().context("home directory unavailable for sandbox migration")?;
-    run_in(&app_dir, &home, &|id| {
-        Ok(crate::containers::DockerContainer::from_session_id(id).is_running()?)
-    })
+    run_in(
+        &app_dir,
+        &home,
+        &|id| Ok(crate::containers::DockerContainer::from_session_id(id).is_running()?),
+        &reap_migrated_container,
+    )
 }
 
 /// Retry cohorts that were live during the schema migration. This is called on
@@ -48,9 +85,12 @@ pub(crate) fn reconcile_pending() -> Result<()> {
         return Ok(());
     }
     let home = dirs::home_dir().context("home directory unavailable for sandbox migration")?;
-    run_in(&app_dir, &home, &|id| {
-        Ok(crate::containers::DockerContainer::from_session_id(id).is_running()?)
-    })
+    run_in(
+        &app_dir,
+        &home,
+        &|id| Ok(crate::containers::DockerContainer::from_session_id(id).is_running()?),
+        &reap_migrated_container,
+    )
 }
 
 fn transition_may_be_pending(app_dir: &Path) -> Result<bool> {
@@ -81,7 +121,12 @@ fn transition_may_be_pending(app_dir: &Path) -> Result<bool> {
     Ok(false)
 }
 
-fn run_in(app_dir: &Path, home: &Path, is_running: &RunningProbe<'_>) -> Result<()> {
+fn run_in(
+    app_dir: &Path,
+    home: &Path,
+    is_running: &RunningProbe<'_>,
+    reap: &ReapProbe<'_>,
+) -> Result<()> {
     fs::create_dir_all(app_dir)?;
     let _lock = crate::session::acquire_storage_flock(app_dir, LOCK)?;
     let registry_paths = registry_paths(app_dir)?;
@@ -445,7 +490,7 @@ fn run_in(app_dir: &Path, home: &Path, is_running: &RunningProbe<'_>) -> Result<
                 Some(root),
                 false,
             )?;
-            orphan_ready_ids.insert(id.into_owned());
+            orphan_ready_ids.insert((root.clone(), id.into_owned()));
         }
     }
 
@@ -482,29 +527,47 @@ fn run_in(app_dir: &Path, home: &Path, is_running: &RunningProbe<'_>) -> Result<
         }
     }
 
-    for id in orphan_ready_ids {
-        let container = crate::containers::DockerContainer::from_session_id(&id);
-        if container.exists()? {
-            container.remove(false)?;
+    for (root, id) in orphan_ready_ids {
+        if !reap(&id)? {
+            blocked_roots.insert(root);
         }
     }
 
     // Remove stopped containers only after every store for the row is durable.
     // `force=false` makes a concurrent start fail the transition rather than
-    // stopping a container that became live after the probe.
-    let ready_ids: BTreeSet<String> = ready_rows
-        .iter()
-        .filter_map(|(registry, row)| {
-            registries[*registry].value.as_array()?[*row]
-                .get("id")?
-                .as_str()
-                .map(str::to_owned)
-        })
-        .collect();
-    for id in ready_ids {
-        let container = crate::containers::DockerContainer::from_session_id(&id);
-        if container.exists()? {
-            container.remove(false)?;
+    // stopping a container that became live after the probe. A runtime that
+    // cannot be asked defers the row instead, so its legacy source survives for
+    // the pass that can finish it. Keyed by id to reap once, but carrying every
+    // row naming it: two profiles can hold one instance and all must be held.
+    let mut ready_ids: BTreeMap<String, BTreeSet<(usize, usize)>> = BTreeMap::new();
+    for &(registry, row) in &ready_rows {
+        if let Some(id) = registries[registry]
+            .value
+            .as_array()
+            .and_then(|rows| rows.get(row))
+            .and_then(|value| value.get("id"))
+            .and_then(Value::as_str)
+        {
+            ready_ids
+                .entry(id.to_owned())
+                .or_default()
+                .insert((registry, row));
+        }
+    }
+    let mut deferred_rows = BTreeSet::new();
+    for (id, keys) in &ready_ids {
+        if !reap(id)? {
+            deferred_rows.extend(keys.iter().copied());
+        }
+    }
+    for key in deferred_rows {
+        ready_rows.remove(&key);
+        for target in cohorts
+            .values()
+            .flatten()
+            .filter(|target| (target.registry, target.row) == key)
+        {
+            blocked_roots.insert(target.cleanup_root.clone());
         }
     }
 
@@ -1136,8 +1199,56 @@ fn sync_parent(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// [`super::run_in`] with every container reported reaped, which is what
+    /// each case below assumes unless it drives the probe itself. Shadowing
+    /// the glob import keeps these tests hermetic: they assert the migration's
+    /// own logic and must not depend on a container runtime being installed.
+    fn run_in(app_dir: &Path, home: &Path, is_running: &RunningProbe<'_>) -> Result<()> {
+        super::run_in(app_dir, home, is_running, &|_| Ok(true))
+    }
+
     fn row(id: &str) -> String {
         format!(r#"{{"id":"{id}","tool":"gemini","sandbox_info":{{"enabled":true}}}}"#)
+    }
+
+    /// A machine whose container runtime is absent or unreachable must still
+    /// complete startup. The row stays pending and its legacy source survives,
+    /// so the pass that can reach the runtime finishes the transition.
+    #[test]
+    #[serial_test::serial]
+    fn unreachable_container_runtime_defers_instead_of_failing() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        let home = dirs::home_dir().unwrap();
+        fs::create_dir_all(&app).unwrap();
+        fs::create_dir_all(home.join(".gemini/sandbox/history")).unwrap();
+        fs::write(home.join(".gemini/sandbox/history/id.json"), b"legacy").unwrap();
+        fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
+
+        super::run_in(&app, &home, &|_| Ok(false), &|_| Ok(false)).unwrap();
+        let deferred: Value =
+            serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
+        assert_eq!(
+            deferred[0]["sandbox_store_generation"], 1,
+            "an unreaped row must not commit the current generation"
+        );
+        assert!(
+            home.join(".gemini/sandbox").is_dir(),
+            "the legacy source must survive a deferred reap"
+        );
+        assert!(transition_may_be_pending(&app).unwrap());
+
+        super::run_in(&app, &home, &|_| Ok(false), &|_| Ok(true)).unwrap();
+        let committed: Value =
+            serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
+        assert_eq!(committed[0]["sandbox_store_generation"], 2);
+        assert_eq!(
+            fs::read(home.join(".gemini/sandbox-v2/one/history/id.json")).unwrap(),
+            b"legacy"
+        );
+        assert!(!home.join(".gemini/sandbox").exists());
+        assert!(!transition_may_be_pending(&app).unwrap());
     }
 
     #[test]
