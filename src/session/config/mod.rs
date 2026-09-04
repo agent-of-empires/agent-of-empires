@@ -1612,6 +1612,8 @@ pub enum NewSessionMode {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttachMode {
+    /// Attach to the session's tmux pane (the historical behavior; the
+    /// user lands inside tmux with the agent running).
     #[default]
     Tmux,
     /// Enter live-send mode against the session's pane: the agent runs
@@ -4378,6 +4380,36 @@ mod tests {
             "vt_live is machine-level (the server reads global config); a \
              profile override would desync the TUI and web transports"
         );
+    }
+
+    #[test]
+    fn test_new_session_mode_in_settings_schema() {
+        // The single-source schema must expose the select so the TUI and
+        // web settings both render it (docs/development/adding-settings.md).
+        // The option values are hand-written in the `#[setting(...)]`
+        // attribute, so each one is round-tripped through `NewSessionMode`:
+        // a typo would offer a choice that the config layer rejects on save.
+        let schema = crate::session::config::settings_schema::schema();
+        let field = schema
+            .iter()
+            .find(|f| f.section == "session" && f.field == "new_session_mode")
+            .expect("new_session_mode field in session schema section");
+        let settings_schema::WidgetKind::Select { options } = &field.widget else {
+            panic!("new_session_mode must render as a select");
+        };
+        let values: Vec<&str> = options.iter().map(|o| o.value.as_str()).collect();
+        assert_eq!(values, ["match_default", "tmux", "live_send"]);
+        for value in values {
+            let parsed: NewSessionMode = serde_json::from_str(&format!("\"{value}\""))
+                .unwrap_or_else(|e| {
+                    panic!("select option {value:?} must deserialize into NewSessionMode: {e}")
+                });
+            assert_eq!(
+                serde_json::to_string(&parsed).unwrap(),
+                format!("\"{value}\""),
+                "select option {value:?} must round-trip"
+            );
+        }
     }
 
     // Tests for DiffConfig

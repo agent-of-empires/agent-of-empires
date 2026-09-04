@@ -1626,6 +1626,7 @@ mod tests {
         let interaction = idents(SettingsCategory::Interaction);
         for ident in [
             "session.default_attach_mode",
+            "session.new_session_mode",
             "session.click_action",
             "session.live_send_exit_chord",
             "session.mouse_capture",

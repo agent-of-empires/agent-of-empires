@@ -61,7 +61,7 @@ fn returns_none_for_missing_instance() {
     // signals the caller to fall back to the structured view-aware
     // attach_session path rather than try to attach to a ghost.
     let env = create_test_env_empty();
-    let mode = env.view.default_attach_mode("nonexistent-id");
+    let mode = env.view.new_session_attach_mode("nonexistent-id");
     assert!(mode.is_none());
 }
 
@@ -78,7 +78,7 @@ fn returns_none_for_acp_session() {
     env.view.mutate_instance(&id, |inst| {
         inst.view = crate::session::View::Structured;
     });
-    let mode = env.view.default_attach_mode(&id);
+    let mode = env.view.new_session_attach_mode(&id);
     assert!(mode.is_none(), "structured view sessions must return None");
 }
 
