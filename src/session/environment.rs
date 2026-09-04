@@ -244,18 +244,7 @@ pub(crate) fn shell_escape(val: &str) -> String {
 /// Unlike [`shell_escape`], literal CR and LF bytes remain inside the quoted
 /// word. Use this only when writing a script, not a single-line command.
 pub(crate) fn shell_escape_script_word(value: &str) -> String {
-    let quote_count = value.bytes().filter(|byte| *byte == b'\'').count();
-    let mut escaped = String::with_capacity(value.len() + 2 + quote_count * 3);
-    escaped.push('\'');
-    let mut rest = value;
-    while let Some(index) = rest.find('\'') {
-        escaped.push_str(&rest[..index]);
-        escaped.push_str("'\\''");
-        rest = &rest[index + 1..];
-    }
-    escaped.push_str(rest);
-    escaped.push('\'');
-    escaped
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// Resolve a session's sandbox environment entries to concrete `(KEY, VALUE)`
