@@ -15,6 +15,10 @@ use super::*;
 /// uses to spawn the session, so the embedded `$()` runs in the container. The
 /// host does not propagate its own `$SHELL` into the container, so this reads the
 /// container's value, not the host's.
+///
+/// `@KNOWN_SHELLS@` and `@LOGIN_FLAG_SHELLS@` are substituted from
+/// [`crate::session::environment`] so the container tab recognizes the same
+/// shells, and makes the same login-mode call, as the host tab.
 const CONTAINER_TERMINAL_AUTODETECT_SCRIPT: &str = r#"passwd_file=$1
 shells_file=$2
 
@@ -51,7 +55,7 @@ resolve_shell() {
     [ -f "$resolved" ] && [ -x "$resolved" ] || return 1
 
     case "${resolved##*/}" in
-        sh|ash|bash|dash|zsh|fish|ksh|mksh|csh|tcsh|nu|nushell|pwsh|powershell)
+        @KNOWN_SHELLS@)
             printf "%s\n" "$resolved"
             return
             ;;
@@ -97,15 +101,24 @@ shell=$(resolve_shell "$passwd_shell" || resolve_shell "${SHELL-}" || resolve_sh
 }
 export SHELL=$shell
 case "${shell##*/}" in
-    sh|ash|bash|dash|zsh|fish|ksh|mksh|csh|tcsh) exec "$shell" -l ;;
+    @LOGIN_FLAG_SHELLS@) exec "$shell" -l ;;
     *) exec "$shell" ;;
 esac
 "#;
 
 fn container_terminal_autodetect_command(passwd_file: &str, shells_file: &str) -> String {
+    let script = CONTAINER_TERMINAL_AUTODETECT_SCRIPT
+        .replace(
+            "@KNOWN_SHELLS@",
+            &crate::session::environment::known_shell_case_pattern(),
+        )
+        .replace(
+            "@LOGIN_FLAG_SHELLS@",
+            &crate::session::environment::login_flag_shell_case_pattern(),
+        );
     format!(
         "/bin/sh -c {} aoe-container-terminal {} {}",
-        shell_escape_script_word(CONTAINER_TERMINAL_AUTODETECT_SCRIPT),
+        shell_escape_script_word(&script),
         shell_escape_script_word(passwd_file),
         shell_escape_script_word(shells_file)
     )
