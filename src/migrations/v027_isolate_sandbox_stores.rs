@@ -15,23 +15,63 @@ use std::path::{Path, PathBuf};
 const JOURNAL: &str = ".v027-sandbox-transition.json";
 pub(crate) const LOCK: &str = ".v027-sandbox-transition.lock";
 
+/// Reports whether a migrated row's container is live. See
+/// [`migrated_container_is_running`] for what an unreachable runtime answers.
 type RunningProbe<'a> = dyn Fn(&str) -> Result<bool> + 'a;
 
 /// Reaps the stopped container of a row whose store has moved. `Ok(false)`
 /// leaves the row pending; see [`reap_migrated_container`].
 type ReapProbe<'a> = dyn Fn(&str) -> Result<bool> + 'a;
 
+/// Whether a runtime error means the runtime could not answer, rather than
+/// telling us anything about the container.
+///
+/// An absent binary, a stopped daemon, a denied socket, and the
+/// `InspectFailed` catch-all that a timed-out or unrecognised probe falls
+/// through to ([`crate::containers::error::DockerError`], produced by
+/// `classify_probe_failure`) all mean the same thing: AoE asked and learned
+/// nothing. None of them may abort the migration, because that aborts
+/// `run_migrations` before the schema version is committed and so fails every
+/// later `aoe` invocation too. Callers substitute their own fail-closed answer
+/// and leave the row pending. A local I/O fault is a real failure and still
+/// propagates.
+fn runtime_cannot_answer(error: &crate::containers::error::DockerError) -> bool {
+    use crate::containers::error::DockerError;
+    matches!(
+        error,
+        DockerError::NotInstalled
+            | DockerError::DaemonNotRunning
+            | DockerError::PermissionDenied
+            | DockerError::InspectFailed(_)
+    )
+}
+
+/// Whether a migrated row's container is live, so its store must be left
+/// alone this pass.
+///
+/// A runtime that cannot answer reports live. Publishing a store and retiring
+/// its legacy source while a container AoE cannot see may still be writing to
+/// it is the one outcome this migration must never produce, so an unknown
+/// answer takes the arm that copies nothing.
+fn migrated_container_is_running(id: &str) -> Result<bool> {
+    match crate::containers::DockerContainer::from_session_id(id).is_running() {
+        Ok(running) => Ok(running),
+        Err(error) if runtime_cannot_answer(&error) => {
+            tracing::warn!("v027 treating {id} as live: container runtime unavailable ({error})");
+            Ok(true)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Remove the stopped container of a row whose store has moved, so its next
 /// launch recreates it against the private layout.
 ///
-/// `Ok(false)` means no container runtime could answer. AoE must still start
-/// when the runtime is absent, its daemon is down, or the user is not in the
-/// `docker` group, and a runtime that cannot be asked is no evidence that
-/// nothing is left to reap. Those rows stay pending for a later pass instead
-/// of failing the migration, which would otherwise abort every `aoe`
-/// invocation before the schema version is committed.
+/// `Ok(false)` means the runtime could not answer, which leaves the row
+/// pending for a later pass. A `remove` that fails for any other reason still
+/// aborts: `force=false` is what makes a container that became live after the
+/// probe fail the transition rather than be stopped underneath its agent.
 fn reap_migrated_container(id: &str) -> Result<bool> {
-    use crate::containers::error::DockerError;
     let container = crate::containers::DockerContainer::from_session_id(id);
     match container.exists() {
         Ok(true) => {
@@ -39,11 +79,7 @@ fn reap_migrated_container(id: &str) -> Result<bool> {
             Ok(true)
         }
         Ok(false) => Ok(true),
-        Err(
-            error @ (DockerError::NotInstalled
-            | DockerError::DaemonNotRunning
-            | DockerError::PermissionDenied),
-        ) => {
+        Err(error) if runtime_cannot_answer(&error) => {
             tracing::warn!("v027 deferring {id}: container runtime unavailable ({error})");
             Ok(false)
         }
@@ -72,7 +108,7 @@ pub fn run() -> Result<()> {
     run_in(
         &app_dir,
         &home,
-        &|id| Ok(crate::containers::DockerContainer::from_session_id(id).is_running()?),
+        &migrated_container_is_running,
         &reap_migrated_container,
     )
 }
@@ -88,7 +124,7 @@ pub(crate) fn reconcile_pending() -> Result<()> {
     run_in(
         &app_dir,
         &home,
-        &|id| Ok(crate::containers::DockerContainer::from_session_id(id).is_running()?),
+        &migrated_container_is_running,
         &reap_migrated_container,
     )
 }
@@ -1211,6 +1247,35 @@ mod tests {
         format!(r#"{{"id":"{id}","tool":"gemini","sandbox_info":{{"enabled":true}}}}"#)
     }
 
+    /// Every runtime error that means "could not answer" must be classified
+    /// as such. `InspectFailed` is the catch-all `classify_probe_failure`
+    /// returns for an unrecognised stderr, which is what a timed-out probe on
+    /// a loaded daemon produces, so leaving it out aborts startup on exactly
+    /// the transient failure this is meant to survive.
+    #[test]
+    fn every_unanswerable_runtime_error_defers_rather_than_aborting() {
+        use crate::containers::error::DockerError;
+        for error in [
+            DockerError::NotInstalled,
+            DockerError::DaemonNotRunning,
+            DockerError::PermissionDenied,
+            DockerError::InspectFailed("context deadline exceeded".to_string()),
+        ] {
+            assert!(
+                runtime_cannot_answer(&error),
+                "{error} must defer the row rather than fail the migration"
+            );
+        }
+        // A local fault is a real failure and must still surface.
+        assert!(!runtime_cannot_answer(&DockerError::IoError(
+            std::io::Error::other("disk")
+        )));
+        // A refused removal is the deliberate `force=false` abort.
+        assert!(!runtime_cannot_answer(&DockerError::RemoveFailed(
+            "container is running".to_string()
+        )));
+    }
+
     /// A machine whose container runtime is absent or unreachable must still
     /// complete startup. The row stays pending and its legacy source survives,
     /// so the pass that can reach the runtime finishes the transition.
@@ -1226,7 +1291,9 @@ mod tests {
         fs::write(home.join(".gemini/sandbox/history/id.json"), b"legacy").unwrap();
         fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
 
-        super::run_in(&app, &home, &|_| Ok(false), &|_| Ok(false)).unwrap();
+        // The answers the production probes give when the runtime is
+        // unreachable: liveness cannot be disproved, and nothing is reaped.
+        super::run_in(&app, &home, &|_| Ok(true), &|_| Ok(false)).unwrap();
         let deferred: Value =
             serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
         assert_eq!(
