@@ -470,6 +470,61 @@ impl SessionService {
         }
     }
 
+    /// Record that a prompt is arriving: bump `last_accessed_at` and clear
+    /// any archive, snooze or idle-dormant park, in memory and on disk,
+    /// under the instance lock so it serializes with other lifecycle edits.
+    /// Returns whether the session was idle-dormant, which callers pass to
+    /// `begin_prompt_submission` and `send_turn` so the wake forces a
+    /// resume. Shared by the user prompt handlers and the plugin turn path
+    /// (#3686).
+    pub(crate) async fn touch_and_wake_on_prompt(&self, id: &str) -> bool {
+        let inst_lock = self.instance_lock(id).await;
+        let _guard = inst_lock.lock().await;
+        let (profile, wake, woke_idle_dormant) = {
+            let mut instances = self.instances.write().await;
+            let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+                return false;
+            };
+            let was_idle_dormant = inst.is_idle_dormant();
+            let wake = inst.is_archived() || inst.is_snoozed() || was_idle_dormant;
+            inst.touch_last_accessed();
+            if was_idle_dormant {
+                tracing::info!(
+                    target: "acp.supervisor",
+                    session = %id,
+                    "waking idle-dormant structured view session on prompt; spawning a fresh worker"
+                );
+            }
+            (inst.source_profile.clone(), wake, was_idle_dormant)
+        };
+        if let Ok(storage) = crate::session::Storage::new(&profile, self.file_watch.clone()) {
+            let id_clone = id.to_string();
+            let outcome = tokio::task::spawn_blocking(move || {
+                storage.update(|instances, _groups| {
+                    if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
+                        apply_prompt_persist_to_disk(inst, wake);
+                    }
+                    Ok(())
+                })
+            })
+            .await;
+            match outcome {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!(
+                    target: "http.api.acp",
+                    session = %id,
+                    "failed to save after prompt touch and wake: {e}"
+                ),
+                Err(join_err) => tracing::warn!(
+                    target: "http.api.acp",
+                    session = %id,
+                    "spawn_blocking join error during prompt touch save: {join_err}"
+                ),
+            }
+        }
+        woke_idle_dormant
+    }
+
     /// Deliver a turn to a structured session: resume a dead/dormant worker
     /// if needed, publish the prompt into the event stream, then forward it
     /// to the agent. Extracted from the `acp_prompt` HTTP handler so a
@@ -1464,6 +1519,16 @@ impl SessionService {
     /// immutable ownership gate: a plugin may act only on a session it
     /// created. Decided before any live state is folded, so a foreign session
     /// answers `not_owner` whatever it is currently doing (#3685).
+    /// Ownership check alone, for callers that must not touch a session
+    /// they do not own before admission.
+    pub(crate) async fn admit_turn_for(
+        &self,
+        caller: &SessionCaller,
+        id: &str,
+    ) -> Result<(), TurnAdmissionError> {
+        self.admits_turn(caller, id).await
+    }
+
     async fn admits_turn(
         &self,
         caller: &SessionCaller,
@@ -1725,6 +1790,35 @@ fn spec_payload_hash(spec: &StructuredSessionSpec) -> String {
         let _ = write!(out, "{byte:02x}");
     }
     out
+}
+
+/// Disk-side half of [`SessionService::touch_and_wake_on_prompt`], mirroring onto disk
+/// whatever the memory side actually did. A waking prompt keeps touch semantics
+/// and lifts the sink; any other prompt advances recency monotonically and
+/// leaves sink state alone.
+///
+/// What the second tier buys, precisely: `wake` is computed from
+/// `state.instances`, so a daemon whose memory predates a peer's archive would
+/// otherwise clear a sink it has never observed. Tier 2 stops that, and only
+/// that.
+///
+/// It does NOT make this save path safe against #3465's wipe, and it was a
+/// mistake to claim otherwise. Advancing `last_accessed_at` on disk arms the
+/// very signal the wipe keys on: `merge_user_action_diff` computes
+/// `touched = self.last_accessed_at > pre.last_accessed_at`
+/// (`session/instance/merge.rs`) and clears `archived_at` / `snoozed_until` /
+/// `idle_dormant_since` when it holds, so a writer whose `pre` snapshot
+/// predates this advance still loses its archive one hop later. That is the
+/// documented invariant rather than a bug (a prompt is a real user gesture, and
+/// a real touch is meant to dethrone a concurrent archive); what #3465 was
+/// about is a *passive* stamp reaching the same arm with no gesture behind it.
+pub(crate) fn apply_prompt_persist_to_disk(disk: &mut crate::session::Instance, wake: bool) {
+    if wake {
+        disk.touch_last_accessed();
+    } else {
+        let now = chrono::Utc::now();
+        disk.last_accessed_at = disk.last_accessed_at.max(Some(now));
+    }
 }
 
 #[cfg(test)]

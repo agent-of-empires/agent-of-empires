@@ -7,7 +7,7 @@ use agent_client_protocol::schema::v1::PromptResponse;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
 use super::errors::{acp_error_from_value, acp_internal_error, AcpError};
@@ -25,21 +25,24 @@ impl Drop for ShutdownControlOnDrop {
     }
 }
 
-/// Bidirectional client for the runner's sibling control socket
-/// (#2976 Phase B). The runner owns the ACP handshake and the turn, so the
+/// Daemon side of the runner's v2 control channel (see #2976): the
 /// daemon drives `initialize` / `session/*` / `session/prompt` /
 /// `session/cancel` over this channel and receives the typed results,
 /// rather than speaking those methods over the byte relay.
 ///
 /// `initialize` / `session/*` responses arrive sequentially on
-/// `handshake_rx`; a turn's `PromptCompleted` is routed to the oneshot in
-/// `completion` when a prompt is awaiting, else (an adopted turn on a
-/// mid-flight resume, where this daemon never issued the prompt) the reader
+/// `handshake_rx`. A turn's `PromptCompleted` lands in `completion_rx`
+/// while a prompt is in flight, else (an adopted turn on a mid-flight
+/// resume, where this daemon never issued the prompt) the reader
 /// CAS-claims the terminal guard and fires `Stopped` so the UI clears.
 pub(super) struct DaemonControlClient {
     write: Mutex<tokio::net::unix::OwnedWriteHalf>,
     handshake_rx: Mutex<mpsc::Receiver<ControlBody>>,
-    completion: Arc<std::sync::Mutex<Option<oneshot::Sender<control_protocol::PromptOutcome>>>>,
+    /// Outcomes of turns this daemon issued. Persistent rather than a
+    /// per-prompt oneshot so the reader always has somewhere to deliver
+    /// while a prompt is in flight; a completion can never find "no
+    /// waiter" and strand the prompt future (#3203).
+    completion_rx: Mutex<mpsc::Receiver<control_protocol::PromptOutcome>>,
     raw_fd: RawFd,
 }
 
@@ -102,43 +105,28 @@ impl DaemonControlClient {
         }
     }
 
-    /// Issue a turn: register the completion oneshot, send the `Prompt`
-    /// frame, and return the receiver the prompt loop awaits. The runner
-    /// assigns the `session/prompt` id and reports `PromptCompleted`.
+    /// Issue a turn and wait for the runner's `PromptCompleted`. Outcomes
+    /// left over from a turn the caller stopped waiting on are drained
+    /// first so they cannot end this one early. A failed write resolves
+    /// as `Aborted` at once.
     pub(super) async fn prompt(
         &self,
         request: serde_json::Value,
-    ) -> oneshot::Receiver<control_protocol::PromptOutcome> {
-        let (tx, rx) = oneshot::channel();
-        let displaced = self
-            .completion
-            .lock()
-            .expect("completion mutex poisoned")
-            .replace(tx);
-        // Installing over an unresolved waiter drops the previous prompt's
-        // receiver, so that turn's loop sees `Err -> Aborted` instead of its
-        // real outcome. It should be impossible (one prompt is in flight at a
-        // time) which is exactly why it is worth a line when it happens: a
-        // stranded prompt future is the leading suspect for a session that
-        // keeps rendering Running with no terminal event. See #3190.
-        if displaced.is_some() {
-            warn!(
+    ) -> control_protocol::PromptOutcome {
+        let mut rx = self.completion_rx.lock().await;
+        while rx.try_recv().is_ok() {
+            debug!(
                 target: "acp.protocol",
-                "installing a prompt completion waiter over an unresolved one"
+                "discarding a prompt outcome nothing was waiting on"
             );
-        } else {
-            debug!(target: "acp.protocol", "prompt completion waiter installed");
         }
         if self.send(ControlBody::Prompt { request }).await.is_err() {
-            // Write failed: drop the parked sender so `rx` resolves to Err ->
-            // Aborted immediately instead of hanging until the cancel /
-            // orphan watchdog eventually unwedges the turn.
-            self.completion
-                .lock()
-                .expect("completion mutex poisoned")
-                .take();
+            return control_protocol::PromptOutcome::Aborted;
         }
-        rx
+        debug!(target: "acp.protocol", "prompt issued; awaiting its completion");
+        rx.recv()
+            .await
+            .unwrap_or(control_protocol::PromptOutcome::Aborted)
     }
 
     pub(super) async fn cancel(&self) {
@@ -205,10 +193,10 @@ pub(super) async fn connect_runner_control_v2(
 
     let reader_prompt_in_flight = prompt_in_flight.clone();
     let (hs_tx, hs_rx) = mpsc::channel::<ControlBody>(8);
-    let completion: Arc<
-        std::sync::Mutex<Option<oneshot::Sender<control_protocol::PromptOutcome>>>,
-    > = Arc::new(std::sync::Mutex::new(None));
-    let reader_completion = completion.clone();
+    // Capacity one: a turn has one completion. A second for the same turn
+    // is a runner bug and is dropped with a warning rather than queued to
+    // end the next turn.
+    let (completion_tx, completion_rx) = mpsc::channel::<control_protocol::PromptOutcome>(1);
     let reader_session = session_label.clone();
     tokio::spawn(async move {
         loop {
@@ -223,56 +211,38 @@ pub(super) async fn connect_runner_control_v2(
                     }
                 }
                 Ok(Some(ControlBody::PromptCompleted { outcome, .. })) => {
-                    let waiter = reader_completion
-                        .lock()
-                        .expect("completion mutex poisoned")
-                        .take();
-                    if let Some(tx) = waiter {
-                        let _ = tx.send(outcome);
-                    } else {
-                        // Adopted turn on a mid-flight resume: this daemon
-                        // never issued the prompt, so surface the completion
-                        // as Stopped and stand the watchdogs down.
-                        //
-                        // The waiter being absent means no `prompt_fut` on
-                        // this connection can ever resolve for this turn, so a
-                        // `prompt_in_flight` still set here is stale by
-                        // definition. Left set, it silently disables the whole
-                        // between-prompt lane (every bit of that bookkeeping is
-                        // gated on `!prompt_active`), so the next
-                        // agent-initiated turn gets no terminal either and the
-                        // session renders Running until the reconciler's repair
-                        // pass. Clearing it hands idle ownership back the way
-                        // the prompt drain would have.
-                        //
-                        // Partial cure by construction: it re-arms the lane but
-                        // cannot unpark a prompt loop still awaiting that dead
-                        // future, which keeps rejecting new prompts as
-                        // `agent_busy`. See #3190 and PR #3192 review.
-                        let claimed = terminal_claim.claim();
-                        let was_in_flight =
-                            reader_prompt_in_flight.swap(false, AtomicOrdering::Relaxed);
-                        if claimed {
-                            // The expected shape: a turn adopted at reattach,
-                            // whose completion this connection has to surface.
-                            debug!(
+                    if reader_prompt_in_flight.load(AtomicOrdering::Relaxed) {
+                        // The prompt arm set `prompt_in_flight` before it
+                        // issued the prompt, so it is awaiting this outcome
+                        // (or will drain it before its next prompt).
+                        match completion_tx.try_send(outcome) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => warn!(
                                 target: "acp.protocol",
                                 session = %reader_session,
-                                stranded_prompt = was_in_flight,
-                                "runner reported PromptCompleted with no waiter; surfacing as Stopped"
-                            );
-                            let reason = control_outcome_reason(&outcome);
-                            let _ = event_tx.send(Event::Stopped { reason }).await;
-                        } else {
-                            // Something already published this turn's terminal,
-                            // so this completion is a duplicate. Not expected.
-                            warn!(
-                                target: "acp.protocol",
-                                session = %reader_session,
-                                stranded_prompt = was_in_flight,
-                                "runner reported PromptCompleted with no waiter and the turn's terminal was already claimed"
-                            );
+                                "runner reported a second PromptCompleted for the in-flight turn; dropping it"
+                            ),
+                            Err(mpsc::error::TrySendError::Closed(_)) => return,
                         }
+                        continue;
+                    }
+                    // No prompt of ours is in flight: an adopted turn from a
+                    // mid-flight resume, whose completion this connection
+                    // still has to surface.
+                    if terminal_claim.claim() {
+                        debug!(
+                            target: "acp.protocol",
+                            session = %reader_session,
+                            "runner reported PromptCompleted for an adopted turn; surfacing as Stopped"
+                        );
+                        let reason = control_outcome_reason(&outcome);
+                        let _ = event_tx.send(Event::Stopped { reason }).await;
+                    } else {
+                        warn!(
+                            target: "acp.protocol",
+                            session = %reader_session,
+                            "runner reported PromptCompleted with no prompt in flight and the turn's terminal already claimed"
+                        );
                     }
                 }
                 Ok(Some(_)) => {}
@@ -293,7 +263,7 @@ pub(super) async fn connect_runner_control_v2(
     Some(Arc::new(DaemonControlClient {
         write: Mutex::new(write_half),
         handshake_rx: Mutex::new(hs_rx),
-        completion,
+        completion_rx: Mutex::new(completion_rx),
         raw_fd,
     }))
 }
@@ -429,9 +399,8 @@ mod tests {
 
         let (event_tx, mut event_rx) = mpsc::channel::<Event>(8);
         let guard = Arc::new(TerminalClaim::new());
-        // Set, as a stranded prompt loop would leave it: the reader must hand
-        // idle ownership back when it surfaces the waiterless completion.
-        let prompt_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        // Adopted turn: this daemon never issued the prompt.
+        let prompt_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let client = connect_runner_control_v2(
             &main_socket,
             event_tx,
@@ -448,10 +417,168 @@ mod tests {
             .expect("event channel closed");
         assert!(matches!(ev, Event::Stopped { reason } if reason == "prompt_complete"));
         assert!(guard.claimed(), "the turn's terminal must be claimed");
-        assert!(
-            !prompt_in_flight.load(std::sync::atomic::Ordering::Relaxed),
-            "a waiterless completion must hand idle ownership back so the lane can arm"
+        drop(client);
+        let _ = fake.await;
+    }
+
+    /// A fake runner that completes the handshake, then answers every
+    /// `Prompt` frame with the outcomes given, in order. `unsolicited` is
+    /// sent before any prompt arrives.
+    fn scripted_runner(
+        control: std::path::PathBuf,
+        unsolicited: Vec<crate::acp::control_protocol::PromptOutcome>,
+        replies: Vec<crate::acp::control_protocol::PromptOutcome>,
+    ) -> tokio::task::JoinHandle<()> {
+        use crate::acp::control_protocol::{self, ControlBody};
+        use tokio::net::UnixListener;
+        let listener = UnixListener::bind(&control).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (mut r, mut w) = stream.into_split();
+            control_protocol::write_frame(
+                &mut w,
+                &ControlBody::Hello {
+                    control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
+                    session_id: "s".into(),
+                },
+            )
+            .await
+            .unwrap();
+            let _ = control_protocol::read_frame(&mut r).await;
+            for (i, outcome) in unsolicited.into_iter().enumerate() {
+                control_protocol::write_frame(
+                    &mut w,
+                    &ControlBody::PromptCompleted {
+                        prompt_req_id: i as i64,
+                        outcome,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            for (i, outcome) in replies.into_iter().enumerate() {
+                loop {
+                    match control_protocol::read_frame(&mut r).await {
+                        Ok(Some(ControlBody::Prompt { .. })) => break,
+                        Ok(Some(_)) => continue,
+                        _ => return,
+                    }
+                }
+                control_protocol::write_frame(
+                    &mut w,
+                    &ControlBody::PromptCompleted {
+                        prompt_req_id: 100 + i as i64,
+                        outcome,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        })
+    }
+
+    /// The cure for #3203: a completion for the prompt this daemon issued
+    /// resolves that prompt, never a `Stopped` beside a still-parked future.
+    #[tokio::test]
+    async fn runner_control_completion_resolves_the_in_flight_prompt() {
+        use crate::acp::control_protocol::PromptOutcome;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let main_socket = tmp.path().join("s.sock");
+        let control = crate::process::worker::control_socket_sibling(&main_socket);
+        let fake = scripted_runner(
+            control,
+            vec![],
+            vec![PromptOutcome::Completed {
+                stop_reason: Some("end_turn".into()),
+            }],
         );
+
+        let (event_tx, mut event_rx) = mpsc::channel::<Event>(8);
+        let guard = Arc::new(TerminalClaim::new());
+        let prompt_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let client = connect_runner_control_v2(
+            &main_socket,
+            event_tx,
+            "s".into(),
+            guard.clone(),
+            prompt_in_flight.clone(),
+        )
+        .await
+        .expect("v2 control client");
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.prompt(serde_json::json!({ "prompt": [] })),
+        )
+        .await
+        .expect("the prompt must resolve when the runner reports completion");
+        assert!(matches!(
+            outcome,
+            PromptOutcome::Completed { stop_reason: Some(ref r) } if r == "end_turn"
+        ));
+        assert!(
+            !guard.claimed(),
+            "the prompt arm owns the terminal for a turn it issued"
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "no synthetic Stopped may be emitted beside the resolved prompt"
+        );
+        drop(client);
+        let _ = fake.await;
+    }
+
+    /// An outcome that arrived while nothing was awaiting (the arm had
+    /// already moved on) is drained before the next prompt, so it cannot end
+    /// the new turn early.
+    #[tokio::test]
+    async fn runner_control_drains_a_stale_outcome_before_the_next_prompt() {
+        use crate::acp::control_protocol::PromptOutcome;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let main_socket = tmp.path().join("s.sock");
+        let control = crate::process::worker::control_socket_sibling(&main_socket);
+        let fake = scripted_runner(
+            control,
+            vec![PromptOutcome::Completed {
+                stop_reason: Some("stale".into()),
+            }],
+            vec![PromptOutcome::Completed {
+                stop_reason: Some("fresh".into()),
+            }],
+        );
+
+        let (event_tx, mut event_rx) = mpsc::channel::<Event>(8);
+        let guard = Arc::new(TerminalClaim::new());
+        let prompt_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let client = connect_runner_control_v2(
+            &main_socket,
+            event_tx,
+            "s".into(),
+            guard.clone(),
+            prompt_in_flight.clone(),
+        )
+        .await
+        .expect("v2 control client");
+        // Let the unsolicited completion land in the channel first.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.prompt(serde_json::json!({ "prompt": [] })),
+        )
+        .await
+        .expect("the prompt must resolve with its own completion");
+        assert!(
+            matches!(
+                outcome,
+                PromptOutcome::Completed { stop_reason: Some(ref r) } if r == "fresh"
+            ),
+            "got {outcome:?}"
+        );
+        assert!(event_rx.try_recv().is_err());
         drop(client);
         let _ = fake.await;
     }

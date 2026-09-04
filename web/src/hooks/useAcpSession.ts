@@ -42,7 +42,6 @@ import {
   STATE_TTL_MS,
   clearQueueCount,
   setQueueCount,
-  setRateLimit,
   type PersistedEntry,
 } from "../lib/acpStateStorage";
 import { getToken } from "../lib/token";
@@ -223,7 +222,6 @@ function persistState(sessionId: string, state: AcpState): void {
   } satisfies PersistedEntry);
   if (safeSetItem(key, body)) {
     setQueueCount(sessionId, state.queuedPrompts.length);
-    setRateLimit(sessionId, state.rateLimit);
     return;
   }
   // Storage write failed (likely QuotaExceeded). Evict a single oldest
@@ -233,7 +231,6 @@ function persistState(sessionId: string, state: AcpState): void {
   if (!evictOldestPersistedAcpState(key)) return;
   if (safeSetItem(key, body)) {
     setQueueCount(sessionId, state.queuedPrompts.length);
-    setRateLimit(sessionId, state.rateLimit);
   }
 }
 

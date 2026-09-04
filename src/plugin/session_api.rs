@@ -569,9 +569,21 @@ async fn sessions_turn_send(
         // foreign session is refused before its disposition is computed, so
         // it cannot answer `agent_busy` for a session the caller may not see
         // (#3685).
+        // Ownership is checked before the wake so a foreign session is never
+        // touched. The wake clears an idle-dormant (or manually stopped)
+        // park the same way a user prompt does: a turn is intent to continue,
+        // so the host resumes rather than refusing (#3686).
+        deps.session_service
+            .admit_turn_for(&caller, &req.session_id)
+            .await
+            .map_err(|e| map_send_error(e.into()))?;
+        let woke_idle_dormant = deps
+            .session_service
+            .touch_and_wake_on_prompt(&req.session_id)
+            .await;
         let (_submission, dispatch) = deps
             .session_service
-            .begin_prompt_submission(&caller, &req.session_id, false)
+            .begin_prompt_submission(&caller, &req.session_id, woke_idle_dormant)
             .await
             .map_err(|e| map_send_error(e.into()))?;
         // A cold worker is not a refusal on this path: `send_turn` resumes it
@@ -589,7 +601,14 @@ async fn sessions_turn_send(
             }
         }
         deps.session_service
-            .send_turn(&caller, &req.session_id, &req.text, &[], false, None)
+            .send_turn(
+                &caller,
+                &req.session_id,
+                &req.text,
+                &[],
+                woke_idle_dormant,
+                None,
+            )
             .await
             .map_err(map_send_error)
     }
@@ -1049,6 +1068,40 @@ mod tests {
     /// and nothing ever prunes one, so a plugin probing distinct nonexistent
     /// session ids must be refused before the guard is claimed, or the
     /// registry grows without bound within the caller's turn quota.
+    /// #3686: an idle-reaped plugin session is woken by a turn, not refused
+    /// as missing. The resume itself fails here (no real agent), which is a
+    /// worker error, never `session_not_found`.
+    #[tokio::test]
+    async fn turn_send_wakes_an_idle_dormant_session() {
+        let mut dormant = Instance::new("dormant-owned", "/tmp/aoe-3686-plugin");
+        dormant.id = "sess-3686".to_string();
+        dormant.view = crate::session::View::Structured;
+        dormant.agent_name = Some("aoe-no-such-agent-3686".to_string());
+        dormant.created_by_plugin = Some("cron".to_string());
+        dormant.mark_idle_dormant();
+        let (deps, state, _dir) = test_deps_with_state(vec![dormant]);
+        let ctx = ctx_with(&["session.prompt"]);
+
+        let result = dispatch(
+            &deps,
+            &ctx,
+            "sessions.turn.send",
+            &serde_json::json!({ "session_id": "sess-3686", "text": "wake up" }),
+        )
+        .await;
+        if let Err(err) = &result {
+            assert_ne!(
+                kind(err),
+                "session_not_found",
+                "a dormant session is resumed, not reported missing: {err:?}"
+            );
+        }
+        let instances = state.instances.read().await;
+        let inst = instances.iter().find(|i| i.id == "sess-3686").unwrap();
+        assert!(!inst.is_idle_dormant(), "the turn clears the dormant park");
+        assert!(inst.last_accessed_at.is_some());
+    }
+
     #[tokio::test]
     async fn turn_send_does_not_grow_the_lock_registry_for_nonexistent_sessions() {
         let (deps, _dir) = test_deps(Vec::new());

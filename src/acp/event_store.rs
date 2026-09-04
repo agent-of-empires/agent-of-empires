@@ -133,6 +133,22 @@ fn is_user_turn_boundary(ev: &Event) -> bool {
     )
 }
 
+/// A session parked on a provider rate limit. See `EventStore::rate_limit_park`.
+#[derive(Debug, Clone)]
+pub struct RateLimitPark {
+    /// The latest reported limit; `None` for a cap park whose `RateLimit`
+    /// row was pruned.
+    pub info: Option<RateLimitInfo>,
+    /// When the latest `RateLimit` was recorded (epoch ms), 0 when unknown.
+    pub recorded_at_ms: i64,
+    /// The redelivery cap already parked the session terminally; only a
+    /// queued prompt or a manual resume releases it.
+    pub cap_reached: bool,
+    /// When auto-resume last fired for this park, so a resume whose spawn
+    /// failed is retried on a schedule rather than every pass.
+    pub last_resume_attempt_ms: Option<i64>,
+}
+
 /// SQLite-backed structured view event log. One row per (session_id, seq).
 ///
 /// The generic storage mechanics (schema, append, retention prune, keyset
@@ -684,6 +700,93 @@ impl EventStore {
     /// next ScheduleWakeup turn could still arrive minutes later. Pick
     /// the latest WakeupScheduled and gate on the timestamp instead.
     /// See #1091.
+    /// The session's durable rate-limit park, if any. A park is the latest
+    /// `RateLimit` event (or a terminal `Stopped { rate_limit_exhausted_retries }`)
+    /// with nothing after it that shows the session moved on: a prompt, an
+    /// agent switch, or a stop for any other reason. Activity that does not
+    /// end the park (an `AgentStartupError` from a failed resume, a
+    /// `RateLimitAutoResumed` breadcrumb, approvals) leaves it in place, so a
+    /// resume that failed is retried instead of silently disarmed (#3514).
+    pub fn rate_limit_park(&self, session_id: &str) -> Option<RateLimitPark> {
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let latest_rate_limit: Option<(i64, String, i64)> = conn
+            .query_row(
+                "SELECT seq, event_json, created_at FROM acp_events
+                 WHERE session_id = ?1 AND discriminant = 'RateLimit'
+                 ORDER BY seq DESC LIMIT 1",
+                params![session_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .unwrap_or_else(|e| {
+                warn!(target: "acp.event_store", "rate_limit_park query for {session_id}: {e}");
+                None
+            });
+        let (anchor_seq, info, recorded_at_ms) = match latest_rate_limit {
+            Some((seq, json, created_at)) => match serde_json::from_str::<Event>(&json) {
+                Ok(Event::RateLimit { info }) => (seq, Some(info), created_at),
+                _ => (seq, None, created_at),
+            },
+            None => (0, None, 0),
+        };
+        let cap_seq: Option<i64> = conn
+            .query_row(
+                "SELECT MAX(seq) FROM acp_events
+                 WHERE session_id = ?1 AND seq > ?2 AND discriminant = 'Stopped'
+                   AND json_extract(event_json, '$.Stopped.reason') = ?3",
+                params![
+                    session_id,
+                    anchor_seq,
+                    crate::acp::state::RATE_LIMIT_EXHAUSTED_RETRIES_REASON
+                ],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .unwrap_or(None);
+        let park_seq = match (cap_seq, info.is_some()) {
+            (Some(cap), _) => cap,
+            (None, true) => anchor_seq,
+            (None, false) => return None,
+        };
+        let superseded: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM acp_events
+                   WHERE session_id = ?1 AND seq > ?2
+                     AND (discriminant IN ('UserPromptSent', 'AgentSwitched')
+                       OR (discriminant = 'Stopped'
+                           AND json_extract(event_json, '$.Stopped.reason')
+                               NOT IN ('rate_limited', ?3))))",
+                params![
+                    session_id,
+                    park_seq,
+                    crate::acp::state::RATE_LIMIT_EXHAUSTED_RETRIES_REASON
+                ],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap_or(false);
+        if superseded {
+            return None;
+        }
+        let last_resume_attempt_ms: Option<i64> = conn
+            .query_row(
+                "SELECT MAX(created_at) FROM acp_events
+                 WHERE session_id = ?1 AND seq > ?2
+                   AND discriminant = 'RateLimitAutoResumed'",
+                params![session_id, anchor_seq],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .unwrap_or(None);
+        Some(RateLimitPark {
+            info,
+            recorded_at_ms,
+            cap_reached: cap_seq.is_some(),
+            last_resume_attempt_ms,
+        })
+    }
+
     pub fn latest_pending_wakeup(
         &self,
         session_id: &str,
@@ -4127,6 +4230,127 @@ mod tests {
     /// a quota-blocked session. `latest_seed_status_event` is free to move on
     /// (the sidebar shows the resumed work), but the park query stays put.
     /// See #1722, #2625.
+    /// The durable park (#3514): only a prompt, an agent switch or a stop for
+    /// another reason ends it. A failed resume's `AgentStartupError`, the
+    /// auto-resume breadcrumb and approvals leave it in place, so the reaper
+    /// keeps its schedule instead of being disarmed for the session's life.
+    #[test]
+    fn rate_limit_park_survives_everything_but_a_real_continuation() {
+        let (_tmp, store) = open_store(1000);
+        let info = crate::acp::state::RateLimitInfo {
+            status: "limited".into(),
+            resets_at: None,
+            kind: "usage".into(),
+        };
+        let park = |store: &EventStore, id: &str| {
+            store
+                .record(id, 1, &Event::RateLimit { info: info.clone() })
+                .unwrap();
+            store
+                .record(
+                    id,
+                    2,
+                    &Event::Stopped {
+                        reason: "rate_limited".into(),
+                    },
+                )
+                .unwrap();
+        };
+        let cases: Vec<(&str, Vec<Event>, bool, bool)> = vec![
+            ("bare park", vec![], true, false),
+            (
+                "failed resume",
+                vec![
+                    Event::RateLimitAutoResumed {
+                        resets_at: chrono::Utc::now(),
+                        manual: false,
+                    },
+                    Event::AgentStartupError {
+                        message: "spawn failed".into(),
+                    },
+                ],
+                true,
+                false,
+            ),
+            (
+                "approval noise",
+                vec![Event::Stopped {
+                    reason: "rate_limited".into(),
+                }],
+                true,
+                false,
+            ),
+            (
+                "prompt got through",
+                vec![Event::UserPromptSent {
+                    text: "again".into(),
+                    attachments: Vec::new(),
+                    prompt_id: None,
+                }],
+                false,
+                false,
+            ),
+            (
+                "agent switched",
+                vec![Event::AgentSwitched {
+                    from: "claude".into(),
+                    to: "codex".into(),
+                    reason: "rate_limited".into(),
+                }],
+                false,
+                false,
+            ),
+            (
+                "user stopped",
+                vec![Event::Stopped {
+                    reason: "user_stopped".into(),
+                }],
+                false,
+                false,
+            ),
+            (
+                "cap reached",
+                vec![Event::Stopped {
+                    reason: crate::acp::state::RATE_LIMIT_EXHAUSTED_RETRIES_REASON.into(),
+                }],
+                true,
+                true,
+            ),
+        ];
+        for (i, (label, events, parked, cap)) in cases.into_iter().enumerate() {
+            let id = format!("s-{i}");
+            park(&store, &id);
+            for (n, event) in events.iter().enumerate() {
+                store.record(&id, 3 + n as u64, event).unwrap();
+            }
+            let got = store.rate_limit_park(&id);
+            assert_eq!(got.is_some(), parked, "{label}: parked");
+            if let Some(got) = got {
+                assert_eq!(got.cap_reached, cap, "{label}: cap");
+                assert!(got.info.is_some(), "{label}: carries the limit");
+                assert_eq!(
+                    got.last_resume_attempt_ms.is_some(),
+                    label == "failed resume",
+                    "{label}: resume attempt"
+                );
+            }
+        }
+
+        // A cap park whose RateLimit row is gone still reads as a cap park.
+        store
+            .record(
+                "s-cap-only",
+                1,
+                &Event::Stopped {
+                    reason: crate::acp::state::RATE_LIMIT_EXHAUSTED_RETRIES_REASON.into(),
+                },
+            )
+            .unwrap();
+        let cap_only = store.rate_limit_park("s-cap-only").expect("cap park");
+        assert!(cap_only.cap_reached && cap_only.info.is_none());
+        assert!(store.rate_limit_park("never-limited").is_none());
+    }
+
     #[test]
     fn latest_status_event_ignores_activity_after_rate_limit_park() {
         let (_tmp, store) = open_store(1000);

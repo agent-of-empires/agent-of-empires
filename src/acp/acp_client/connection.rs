@@ -3,7 +3,7 @@
 
 use crate::acp::agent_compat::{self, ExpectedAgent};
 use crate::acp::state::{Event, ModeInfo, StartupErrorDetail};
-use crate::acp::{agent_profiles, control_protocol, mcp_config};
+use crate::acp::{agent_profiles, mcp_config};
 use agent_client_protocol::schema::v1::{
     CancelNotification, ContentBlock, CreateElicitationRequest, CreateElicitationResponse,
     CreateTerminalRequest, CreateTerminalResponse, ForkSessionRequest, ForkSessionResponse,
@@ -34,6 +34,7 @@ use super::config_options::{
 };
 use super::control::{establish_session_v2, prompt_outcome_to_response, DaemonControlClient};
 use super::delete::handle_delete_session_cmd;
+use super::errors::is_unsupported_session_error;
 use super::errors::{acp_internal_error, AcpError, IncompatibleAgentError};
 use super::fs_handlers::{handle_read_text_file, handle_write_text_file};
 use super::handshake::{build_initialize_request, should_fork};
@@ -1760,18 +1761,9 @@ pub(super) async fn run_connection_task<W, R>(
                                 blocks,
                             )) {
                                 Ok(params) => {
-                                    let rx = control.prompt(params).await;
+                                    let control = Arc::clone(control);
                                     Box::pin(async move {
-                                        match rx.await {
-                                            Ok(outcome) => prompt_outcome_to_response(outcome),
-                                            // Control channel closed before
-                                            // completion: end the turn
-                                            // cleanly; the dying connection
-                                            // surfaces the underlying failure.
-                                            Err(_) => prompt_outcome_to_response(
-                                                control_protocol::PromptOutcome::Aborted,
-                                            ),
-                                        }
+                                        prompt_outcome_to_response(control.prompt(params).await)
                                     })
                                 }
                                 Err(e) => Box::pin(async move {
@@ -1963,6 +1955,27 @@ pub(super) async fn run_connection_task<W, R>(
                                                 rate_limited = true;
                                                 shutdown = true;
                                                 break;
+                                            }
+                                            // A resumed worker reuses the stored
+                                            // acp_session_id without session/load; an
+                                            // agent that dropped that session rejects
+                                            // the first prompt. Reset the context so
+                                            // the respawn opens a fresh session/new
+                                            // (the transcript is preserved for replay)
+                                            // instead of terminating the runner (#3560).
+                                            if is_unsupported_session_error(&e) {
+                                                warn!(
+                                                    target: "acp.protocol",
+                                                    session = %session_label,
+                                                    "resumed ACP session rejected; resetting context so the respawn starts fresh: {e}"
+                                                );
+                                                let _ = event_tx_for_block
+                                                    .send(Event::SessionContextReset {
+                                                        reason: format!(
+                                                            "resumed session no longer available: {e}"
+                                                        ),
+                                                    })
+                                                    .await;
                                             }
                                             return Err(e);
                                         }
@@ -2921,16 +2934,29 @@ pub(super) async fn run_connection_task<W, R>(
                 "ACP connection task ended with error: {:?}", e
             );
             let message = format!("ACP connection failed: {e}");
-            // If the handshake never completed, hand the failure back so
-            // `spawn()` can surface a typed error to the caller; otherwise
-            // publish a synthetic event so the UI can show a remediation
-            // hint instead of a silent dead session.
-            if let Some(tx) = ready_tx.lock().await.take() {
-                let _ = tx.send(Err(AcpError::Spawn(message.clone())));
-            } else if let Some(info) = classify_rate_limit_from_message(
+            let rate_limit = classify_rate_limit_from_message(
                 &message,
                 captured_rate_limit_resets_at(&last_rate_limit_rejections, chrono::Utc::now()),
-            ) {
+            );
+            if let Some(tx) = ready_tx.lock().await.take() {
+                // A limit hit during the handshake is still a rate limit:
+                // fail the spawn with the typed error so the supervisor
+                // parks the session instead of burning respawn budget on a
+                // generic startup error (#3514).
+                let err = match rate_limit {
+                    Some(info) => {
+                        info!(
+                            target: "acp.protocol",
+                            session = %session_label_for_log,
+                            resets_at = ?info.resets_at,
+                            "handshake failed on rate_limit; failing spawn as rate-limited"
+                        );
+                        AcpError::RateLimited(Box::new(info))
+                    }
+                    None => AcpError::Spawn(message.clone()),
+                };
+                let _ = tx.send(Err(err));
+            } else if let Some(info) = rate_limit {
                 // Defensive: rate-limit can also surface from paths the
                 // prompt arm doesn't cover (handshake-time, mid-handshake
                 // request). Treat it as a parked terminal state instead

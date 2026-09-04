@@ -1200,122 +1200,6 @@ pub async fn switch_acp_agent(
     .into_response()
 }
 
-/// Touches the row's `last_accessed_at` on every prompt (a prompt is a
-/// user gesture, and structured rows have no other per-prompt recency
-/// writer since the intent stamp was dropped for #3465), then wakes a
-/// sunk row: archived_at/snoozed_until are cleared and an idle-dormant
-/// worker respawns; the frontend's queue drains as soon as the fresh
-/// `AcpSessionAssigned` lands. The idle_dormant clear is the wake path for
-/// auto-stopped idle workers (#1689); a worker reaped for inactivity
-/// respawns on the next prompt. See #1581.
-///
-/// The in-memory mutation and the disk persistence are both held under
-/// `state.instance_lock(&id)` so they serialize against other
-/// session-mutating endpoints (archive / snooze / pin / rename) on the
-/// same id. Without this guard, a concurrent archive PATCH could
-/// interleave with the touch and produce a lost write (archive sets
-/// archived_at = Some, touch clears it, archive's persist lands first,
-/// touch's persist lands second and overwrites the archive). The lock is
-/// dropped before the caller reaches the supervisor: publish/send take
-/// their own locks downstream and holding ours across the agent forward
-/// would serialize prompts unnecessarily and stall siblings.
-/// Returns whether the wake cleared an idle-dormant marker, so the caller
-/// can synchronously kick a background respawn (the reconciler's ~2s tick
-/// is too slow for the prompt that triggered the wake; see #1748).
-async fn touch_on_prompt_and_wake_if_sunk(state: &Arc<AppState>, id: &str) -> bool {
-    let inst_lock = state.instance_lock(id).await;
-    let _guard = inst_lock.lock().await;
-    let (found, wake, woke_idle_dormant) = {
-        let mut instances = state.instances.write().await;
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-            let was_idle_dormant = inst.is_idle_dormant();
-            let wake = inst.is_archived() || inst.is_snoozed() || was_idle_dormant;
-            // Memory side: a prompt is a user gesture, so refresh recency
-            // and lift sinks unconditionally.
-            inst.touch_last_accessed();
-            if was_idle_dormant {
-                // Pairs with the "auto-stopped idle structured view worker"
-                // info log in the reconciler's reap pass (#1689) so the
-                // stop/resume cycle is traceable in the daemon log.
-                tracing::info!(
-                    target: "acp.supervisor",
-                    session = %id,
-                    "waking idle-dormant structured view session on prompt; spawning a fresh worker"
-                );
-            }
-            (true, wake, was_idle_dormant)
-        } else {
-            (false, false, false)
-        }
-    };
-    if found {
-        let profile = {
-            let instances = state.instances.read().await;
-            instances
-                .iter()
-                .find(|i| i.id == id)
-                .map(|i| i.source_profile.clone())
-                .unwrap_or_default()
-        };
-        if let Ok(storage) = crate::session::Storage::new(&profile, state.file_watch.clone()) {
-            let id_clone = id.to_string();
-            let session_id_for_log = id.to_string();
-            match tokio::task::spawn_blocking(move || {
-                storage.update(|instances, _groups| {
-                    if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
-                        apply_prompt_persist_to_disk(inst, wake);
-                    }
-                    Ok(())
-                })
-            })
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::warn!(
-                    target: "http.api.acp",
-                    session = %session_id_for_log,
-                    "failed to save after prompt touch and wake: {e}"
-                ),
-                Err(join_err) => tracing::warn!(
-                    target: "http.api.acp",
-                    session = %session_id_for_log,
-                    "spawn_blocking join error during prompt touch save: {join_err}"
-                ),
-            }
-        }
-    }
-    woke_idle_dormant
-}
-
-/// Disk-side half of [`touch_on_prompt_and_wake_if_sunk`], mirroring onto disk
-/// whatever the memory side actually did. A waking prompt keeps touch semantics
-/// and lifts the sink; any other prompt advances recency monotonically and
-/// leaves sink state alone.
-///
-/// What the second tier buys, precisely: `wake` is computed from
-/// `state.instances`, so a daemon whose memory predates a peer's archive would
-/// otherwise clear a sink it has never observed. Tier 2 stops that, and only
-/// that.
-///
-/// It does NOT make this save path safe against #3465's wipe, and it was a
-/// mistake to claim otherwise. Advancing `last_accessed_at` on disk arms the
-/// very signal the wipe keys on: `merge_user_action_diff` computes
-/// `touched = self.last_accessed_at > pre.last_accessed_at`
-/// (`session/instance/merge.rs`) and clears `archived_at` / `snoozed_until` /
-/// `idle_dormant_since` when it holds, so a writer whose `pre` snapshot
-/// predates this advance still loses its archive one hop later. That is the
-/// documented invariant rather than a bug (a prompt is a real user gesture, and
-/// a real touch is meant to dethrone a concurrent archive); what #3465 was
-/// about is a *passive* stamp reaching the same arm with no gesture behind it.
-fn apply_prompt_persist_to_disk(disk: &mut crate::session::Instance, wake: bool) {
-    if wake {
-        disk.touch_last_accessed();
-    } else {
-        let now = chrono::Utc::now();
-        disk.last_accessed_at = disk.last_accessed_at.max(Some(now));
-    }
-}
-
 /// `POST /api/sessions/{id}/acp/prompt` success body.
 ///
 /// **Breaking**: this endpoint used to answer a bare 202 with no body. It now
@@ -1345,7 +1229,7 @@ pub async fn acp_prompt(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
-    let woke_idle_dormant = touch_on_prompt_and_wake_if_sunk(&state, &id).await;
+    let woke_idle_dormant = state.session_service.touch_and_wake_on_prompt(&id).await;
     {
         let instances = state.instances.read().await;
         if !instances.iter().any(|i| i.id == id) {
@@ -1523,7 +1407,7 @@ pub async fn acp_prompt_diff_comments(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
-    let woke_idle_dormant = touch_on_prompt_and_wake_if_sunk(&state, &id).await;
+    let woke_idle_dormant = state.session_service.touch_and_wake_on_prompt(&id).await;
     // This opens a turn (`UserDiffCommentsPrompt` folds to `turn_active`) just
     // as an ordinary prompt does, so it takes the same submission authority
     // and settles the same disposition under it (#3621, #3649).
@@ -3459,7 +3343,7 @@ mod tests {
 
         // The 2s budget is far under the 10s `WORKER_READY_TIMEOUT` the
         // pre-fix handler holds the lock for, and far over the microseconds
-        // `touch_on_prompt_and_wake_if_sunk` holds it now.
+        // `SessionService::touch_and_wake_on_prompt` holds it now.
         let inst_lock = state.instance_lock(&id).await;
         let acquired = tokio::time::timeout(Duration::from_secs(2), inst_lock.lock()).await;
         assert!(
@@ -4216,7 +4100,7 @@ mod tests {
         disk.last_accessed_at = Some(chrono::Utc::now() - chrono::Duration::seconds(60));
         disk.archived_at = Some(chrono::Utc::now() - chrono::Duration::seconds(30));
 
-        apply_prompt_persist_to_disk(&mut disk, false);
+        crate::server::session_service::apply_prompt_persist_to_disk(&mut disk, false);
 
         assert!(
             disk.archived_at.is_some(),
@@ -4231,7 +4115,7 @@ mod tests {
         disk.view = crate::session::View::Structured;
         disk.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::minutes(10));
 
-        apply_prompt_persist_to_disk(&mut disk, true);
+        crate::server::session_service::apply_prompt_persist_to_disk(&mut disk, true);
 
         assert!(
             disk.snoozed_until.is_none(),

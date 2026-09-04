@@ -1168,34 +1168,43 @@ impl<S: BroadcastSink> Supervisor<S> {
         true
     }
 
-    /// Mirror an `AcpError::IncompatibleAgent` onto the broadcast sink
-    /// and tear down the detached runner. Called from every spawn-
-    /// failure site so the structured detail reaches the reducer (the
-    /// in-process event_tx on the failed AcpClient never delivers) and
-    /// socket-mode workers don't survive a compatibility rejection. On
-    /// non-compat errors this is a no-op.
-    fn publish_compat_rejection(&self, session_id: &str, err: &AcpError) {
-        let AcpError::IncompatibleAgent(payload) = err else {
-            return;
-        };
-        self.publish_next(
-            session_id,
-            &Event::IncompatibleAgent {
-                detail: payload.detail.clone(),
-            },
-        );
-        self.publish_next(
-            session_id,
-            &Event::AgentStartupError {
-                message: payload.message.clone(),
-            },
-        );
-        // SIGTERM the detached runner so a stale claude-agent-acp@0.32.0
-        // child doesn't keep the worker socket alive. `terminate_runner_for_session`
-        // also deletes the registry entry so a retry via the API doesn't
-        // hit AlreadyRunning. Idempotent: it's a no-op if the registry
-        // entry is missing or the PID is dead. No-op on non-unix.
-        terminate_runner_for_session(session_id);
+    /// Publish what a failed spawn means for the session. An incompatible
+    /// adapter gets the typed rejection plus a startup error and its runner
+    /// is retired; a provider rate limit hit during the handshake parks the
+    /// session on `RateLimit` + `Stopped { rate_limited }` so the resume
+    /// schedule owns it (#3514). Other errors are the caller's to report.
+    fn publish_spawn_rejection(&self, session_id: &str, err: &AcpError) {
+        match err {
+            AcpError::IncompatibleAgent(payload) => {
+                self.publish_next(
+                    session_id,
+                    &Event::IncompatibleAgent {
+                        detail: payload.detail.clone(),
+                    },
+                );
+                self.publish_next(
+                    session_id,
+                    &Event::AgentStartupError {
+                        message: payload.message.clone(),
+                    },
+                );
+            }
+            AcpError::RateLimited(info) => {
+                self.publish_next(
+                    session_id,
+                    &Event::RateLimit {
+                        info: (**info).clone(),
+                    },
+                );
+                self.publish_next(
+                    session_id,
+                    &Event::Stopped {
+                        reason: "rate_limited".into(),
+                    },
+                );
+            }
+            _ => {}
+        }
     }
 
     /// Publish a synthetic `AgentSwitched` event after a successful
@@ -1883,7 +1892,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 if matches!(err, AcpError::IncompatibleAgent(_)) {
                     self.mark_incompatible_binary(&session_id, &config.spec.command);
                 }
-                self.publish_compat_rejection(&session_id, &err);
+                self.publish_spawn_rejection(&session_id, &err);
                 self.reap_failed_launch(&lease).await;
                 return Err(SupervisorError::Acp(err));
             }
@@ -2424,36 +2433,36 @@ impl<S: BroadcastSink> Supervisor<S> {
                                     session = %session_id,
                                     "respawn failed: {e}"
                                 );
-                                if let AcpError::IncompatibleAgent(payload) = &e {
-                                    lock_recover(&incompatible_binaries).insert(
-                                        session_id.clone(),
-                                        respawn_config.spec.command.clone(),
-                                    );
+                                let publish = |event: Event| {
                                     let seq = next_seq(&next_seqs, &session_id);
-                                    sink.publish(
-                                        &session_id,
-                                        seq,
-                                        &Event::IncompatibleAgent {
+                                    sink.publish(&session_id, seq, &event);
+                                };
+                                match &e {
+                                    AcpError::IncompatibleAgent(payload) => {
+                                        lock_recover(&incompatible_binaries).insert(
+                                            session_id.clone(),
+                                            respawn_config.spec.command.clone(),
+                                        );
+                                        publish(Event::IncompatibleAgent {
                                             detail: payload.detail.clone(),
-                                        },
-                                    );
-                                    let seq = next_seq(&next_seqs, &session_id);
-                                    sink.publish(
-                                        &session_id,
-                                        seq,
-                                        &Event::AgentStartupError {
+                                        });
+                                        publish(Event::AgentStartupError {
                                             message: payload.message.clone(),
-                                        },
-                                    );
-                                } else {
-                                    let seq = next_seq(&next_seqs, &session_id);
-                                    sink.publish(
-                                        &session_id,
-                                        seq,
-                                        &Event::AgentStartupError {
-                                            message: format!("ACP agent respawn failed: {e}"),
-                                        },
-                                    );
+                                        });
+                                    }
+                                    // The respawn hit the provider limit: park
+                                    // rather than report a crash (#3514).
+                                    AcpError::RateLimited(info) => {
+                                        publish(Event::RateLimit {
+                                            info: (**info).clone(),
+                                        });
+                                        publish(Event::Stopped {
+                                            reason: "rate_limited".into(),
+                                        });
+                                    }
+                                    _ => publish(Event::AgentStartupError {
+                                        message: format!("ACP agent respawn failed: {e}"),
+                                    }),
                                 }
                                 workers.lock().await.remove(&session_id);
                                 // A runner launched under this epoch is retired
@@ -3643,15 +3652,6 @@ async fn kill_wedged_runner(control: &dyn ProcessControl, session_id: &str) {
             let _ = std::fs::remove_file(&socket_path);
         }
     }
-}
-/// SIGTERM the per-session runner if its registry entry has a live PID,
-/// then delete the entry. Used by `shutdown` and `shutdown_all` to take
-/// down detached workers explicitly.
-fn terminate_runner_for_session(session_id: &str) {
-    // Group-kill (runner + agent + grandchildren) then delete the entry.
-    // Single-pid SIGTERM here used to orphan the agent's node/SDK children
-    // under PID 1; see worker_registry::terminate and #1689.
-    crate::process::worker_registry::terminate(session_id);
 }
 
 #[derive(Debug)]

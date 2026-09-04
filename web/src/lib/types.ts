@@ -1,3 +1,4 @@
+import type { RateLimitInfo } from "./acpTypes";
 import type { RepoColor } from "./repoAppearance";
 import type { AgentLifecycleInfo } from "./agentProfiles";
 
@@ -127,6 +128,15 @@ export interface SessionResponse {
    *  the supervisor holds a live worker. Drives the sidebar `Resuming…`
    *  chip and the per-session banner in the acp view. See #1088. */
   acp_worker_state?: AcpWorkerState;
+  /** The provider rate limit the daemon has this session parked on, from
+   *  its durable event-store park. Absent when not parked. Drives the
+   *  sidebar badge, replacing the browser-side mirror that went stale when
+   *  a session resumed with no tab open (#3514). */
+  rate_limit?: RateLimitInfo | null;
+  /** Whether `[acp] rate_limit_auto_resume` is on for the session's
+   *  profile, so the rate-limit banner can say whether the park ends by
+   *  itself. */
+  rate_limit_auto_resume?: boolean;
   /** Smart-rename indicator for structured view sessions. `pending`: still
    *  default-named and eligible, will auto-name on the next prompt; `running`:
    *  a one-shot title call is in flight; `inactive`/absent otherwise. Drives

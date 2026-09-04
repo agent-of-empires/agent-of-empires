@@ -928,4 +928,81 @@ mod tests {
             assert_eq!(scrub_stderr_secrets(line), line);
         }
     }
+
+    /// Scripted stdio agent: completes `initialize` and `session/new`, then
+    /// rejects every `session/prompt` the way OMP rejects a stored session
+    /// id it no longer holds.
+    #[cfg(unix)]
+    fn write_unsupported_session_fake_agent(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script_path = dir.join("fake-unsupported-session-agent.sh");
+        let script = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -En 's/.*"id":("[^"]*"|[0-9]+).*/\1/p')
+  case $line in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":false}}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sid-1"}}\n' "$id"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32602,"message":"Unsupported ACP session"}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+        std::fs::write(&script_path, script).expect("write fake agent script");
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake agent script");
+        script_path
+    }
+
+    /// #3560: a prompt rejected because the agent no longer holds the
+    /// resumed session emits `SessionContextReset` before the connection
+    /// ends on the error, so the respawn opens a fresh `session/new`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unsupported_session_prompt_rejection_emits_context_reset_before_error() {
+        use crate::acp::acp_client::test_helpers::reset_fake_spawn_config;
+        use crate::acp::Event;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let script = write_unsupported_session_fake_agent(dir.path());
+        let config = reset_fake_spawn_config(&script, cwd.path());
+        let mut client = AcpClient::spawn(config, AcpSessionId("resume-reject".into()))
+            .await
+            .expect("spawn fake agent");
+        client
+            .send_prompt("continue", &[])
+            .await
+            .expect("queue prompt");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut saw_reset = false;
+        loop {
+            let ev = tokio::time::timeout_at(deadline, client.next_event())
+                .await
+                .expect("timed out waiting for the recovery reset");
+            match ev {
+                Some(Event::SessionContextReset { reason }) => {
+                    assert!(
+                        reason.contains("resumed session no longer available"),
+                        "reset reason should name the rejected resume, got {reason:?}"
+                    );
+                    saw_reset = true;
+                }
+                // The channel closes once the connection task takes the
+                // error path: reaching it after the reset pins the order.
+                None => break,
+                _ => {}
+            }
+        }
+        assert!(
+            saw_reset,
+            "the rejection must emit SessionContextReset before ending"
+        );
+        let _ = client.shutdown().await;
+    }
 }

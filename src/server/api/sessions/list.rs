@@ -175,6 +175,29 @@ pub async fn list_sessions(
         }
     }
 
+    {
+        use std::collections::HashMap;
+        let mut auto_resume_cache: HashMap<String, bool> = HashMap::new();
+        for (resp, inst) in sessions.iter_mut().zip(scoped_instances.iter().copied()) {
+            if !inst.is_structured() {
+                continue;
+            }
+            resp.rate_limit_auto_resume = *auto_resume_cache
+                .entry(inst.source_profile.clone())
+                .or_insert_with(|| {
+                    crate::session::config::profile_config::resolve_config_or_warn(
+                        &inst.source_profile,
+                    )
+                    .acp
+                    .rate_limit_auto_resume
+                });
+            resp.rate_limit = state
+                .acp_event_store
+                .rate_limit_park(&inst.id)
+                .and_then(|park| park.info);
+        }
+    }
+
     // Overlay the smart-rename indicator. `Running` comes from the live
     // in-flight set; `Pending` from the shared eligibility predicate, so the
     // indicator cannot drift from the runtime gate. Config is projected from
@@ -531,6 +554,8 @@ mod workspace_ordering_tests {
                 reason: ContextResumeUnavailableReason::NoTarget,
             },
             acp_worker_state: crate::acp::supervisor::AcpWorkerState::Absent,
+            rate_limit: None,
+            rate_limit_auto_resume: false,
             queued_prompts: Vec::new(),
             acp_capable: false,
             acp_session_id: None,
