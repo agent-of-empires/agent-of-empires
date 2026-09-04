@@ -25,7 +25,7 @@ import { readVisibleSessionTitles, seedSessionsInRepo } from "../helpers/sidebar
 base.describe("workspace ordering live round-trip (#1220)", () => {
   base("press-and-hold drag reorders and round-trips PUT /api/workspace-ordering", async ({ page }, testInfo) => {
     // `aoe add` records workspace ids as `<project_path>::<title>` (see
-    // `merge_workspace_ordering` in `src/server/api/sessions.rs`); the
+    // `merge_workspace_ordering` in `src/server/api/sessions/list.rs`); the
     // server prepends new ids newest-first, so the seeded order in
     // arrival sequence is gamma at the top, beta in the middle, alpha
     // at the bottom.

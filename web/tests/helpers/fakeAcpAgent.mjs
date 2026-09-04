@@ -2,7 +2,7 @@
 // Fake ACP agent for structured view Playwright tests.
 //
 // Speaks just enough of the Agent Client Protocol (newline-delimited
-// JSON-RPC 2.0) for `src/acp/acp_client.rs` to drive a turn:
+// JSON-RPC 2.0) for `src/acp/acp_client/` to drive a turn:
 //
 //   initialize          -> return protocolVersion + agentCapabilities
 //   session/new         -> return a deterministic sessionId
@@ -225,7 +225,7 @@ function resolveOutbound(msg) {
 
 // Default permission options when a `permission_request` script entry
 // omits its own. Covers every PermissionOptionKind aoe's
-// `pick_option_id` (src/acp/acp_client.rs) consults so an
+// `pick_option_id` (src/acp/acp_client/permission_handlers.rs) consults so an
 // `allow` / `allow_always` / `deny` decision always maps cleanly.
 const DEFAULT_PERMISSION_OPTIONS = [
   { optionId: "allow-once", name: "Allow once", kind: "allow_once" },

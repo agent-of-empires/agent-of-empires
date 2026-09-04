@@ -16,7 +16,7 @@ use super::validate_profile_name;
 use super::AppState;
 use crate::server::auth::AuthenticatedTokenHash;
 use crate::server::auth::{handler_elevated, AuthenticatedSession, LoopbackTrusted};
-use crate::session::settings_schema::{
+use crate::session::config::settings_schema::{
     clear_path, rewrite_plugin_sections, runtime_schema, strip_local_only, validate_patch,
     validate_patch_with, PatchRejection, Scope,
 };
@@ -98,6 +98,12 @@ pub struct AgentInfo {
     /// or for custom agents.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub acp_args: Vec<String>,
+    /// Registry lifecycle state. Omitted while Active so the common wire
+    /// shape is unchanged; the dashboard mirrors the shape in
+    /// `web/src/lib/types.ts` (`AgentLifecycleInfo`) and renders a
+    /// deprecated badge in the wizard picker and switch-agent modal.
+    #[serde(skip_serializing_if = "crate::agents::AgentLifecycle::is_active")]
+    pub lifecycle: crate::agents::AgentLifecycle,
 }
 
 /// Resolve the acp launch command + args for a built-in agent from
@@ -138,6 +144,7 @@ fn build_custom_agent_infos(
                 && crate::agents::get_agent(name).is_none()
         })
         .map(|(name, _command)| AgentInfo {
+            lifecycle: crate::agents::AgentLifecycle::Active,
             kind: "custom".to_string(),
             name: name.clone(),
             binary: name.clone(),
@@ -167,7 +174,7 @@ fn build_custom_agent_infos(
 pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentInfo>> {
     let profile = state.profile.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let config = crate::session::profile_config::resolve_config_or_warn(&profile);
+        let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
         let custom_agents = config.session.custom_agents;
         let agent_acp_cmd = config.session.agent_acp_cmd;
         let agent_detect_as = config.session.agent_detect_as;
@@ -191,6 +198,7 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
                     installed: available.iter().any(|s| s == a.name),
                     install_hint: a.install_hint.to_string(),
                     oneshot_capable: a.oneshot_flag.is_some(),
+                    lifecycle: a.lifecycle,
                     acp_capable: acp_registry.get(a.name).is_some(),
                     acp_installed: acp_command
                         .as_deref()
@@ -312,7 +320,7 @@ pub async fn update_settings(
         .map(|obj| {
             obj.iter()
                 .filter_map(|(section, value)| {
-                    let id = crate::session::settings_schema::section_plugin_id(section)?;
+                    let id = crate::session::config::settings_schema::section_plugin_id(section)?;
                     let keys: Vec<String> = value
                         .as_object()
                         .map(|m| m.keys().cloned().collect())
@@ -329,7 +337,7 @@ pub async fn update_settings(
     let result = tokio::task::spawn_blocking(move || {
         crate::session::update_config(|config| -> anyhow::Result<()> {
             let mut current = serde_json::to_value(&*config)?;
-            crate::session::settings_schema::merge_json(&mut current, &body);
+            crate::session::config::settings_schema::merge_json(&mut current, &body);
             *config = serde_json::from_value(current)?;
             Ok(())
         })
@@ -352,7 +360,6 @@ pub async fn update_settings(
             }
             // Tell each touched plugin's worker its settings changed (#2897),
             // after the durable write. Best-effort; config.get is the fallback.
-            #[cfg(feature = "serve")]
             if !plugin_changes.is_empty() {
                 if let Some(host) = &state.plugin_host {
                     host.emit_settings_changed(&plugin_changes).await;
@@ -438,7 +445,8 @@ pub async fn get_cityhall_bundle(
 /// per-field JSX, so a new config field appears on the web automatically. No
 /// secrets: descriptors are pure metadata (labels, widgets, validation, write
 /// policy), so this needs no elevation, only normal authentication.
-pub async fn get_settings_schema() -> Json<Vec<crate::session::settings_schema::FieldDescriptor>> {
+pub async fn get_settings_schema(
+) -> Json<Vec<crate::session::config::settings_schema::FieldDescriptor>> {
     Json(runtime_schema())
 }
 
@@ -447,10 +455,10 @@ pub async fn get_settings_schema() -> Json<Vec<crate::session::settings_schema::
 /// default for core; stored value > manifest default for plugin settings). The
 /// dashboard uses it to show where a value comes from. Pure metadata derived
 /// from the same schema the surfaces render, so only normal authentication.
-pub async fn get_settings_resolved() -> Json<Vec<crate::session::settings_schema::ResolvedSetting>>
-{
+pub async fn get_settings_resolved(
+) -> Json<Vec<crate::session::config::settings_schema::ResolvedSetting>> {
     Json(
-        tokio::task::spawn_blocking(crate::session::settings_schema::resolve_all)
+        tokio::task::spawn_blocking(crate::session::config::settings_schema::resolve_all)
             .await
             .unwrap_or_default(),
     )
@@ -1466,7 +1474,8 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
     let passphrase_enabled = state.login_manager.is_enabled();
     let auth_mode =
         crate::server::resolve_auth_mode(&state.token_manager, &state.login_manager).await;
-    let acp_cfg = crate::session::profile_config::resolve_config_or_warn(&state.profile).acp;
+    let acp_cfg =
+        crate::session::config::profile_config::resolve_config_or_warn(&state.profile).acp;
     let acp_show_tool_durations = acp_cfg.show_tool_durations;
     let acp_replay_events = acp_cfg.replay_events;
     let acp_compaction_reminder = acp_cfg.compaction_reminder;
@@ -1528,7 +1537,7 @@ pub struct UpdateStatusResponse {
 }
 
 pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<UpdateStatusResponse> {
-    let cfg = crate::session::profile_config::resolve_config_or_warn(&state.profile);
+    let cfg = crate::session::config::profile_config::resolve_config_or_warn(&state.profile);
     let current = env!("CARGO_PKG_VERSION").to_string();
     let mode = cfg.updates.update_check_mode;
 
@@ -2311,6 +2320,37 @@ mod tests {
         assert!(!serialized.contains("ssh -t prod.example claude"));
         assert!(!serialized.contains("prod.example"));
         assert!(!serialized.contains("agent_detect_as"));
+    }
+
+    #[test]
+    fn agent_info_lifecycle_wire_shape() {
+        // The /api/agents contract: lifecycle omitted for Active agents,
+        // full metadata for deprecated ones. Mirrored by
+        // web/src/lib/types.ts (AgentLifecycleInfo).
+        let mk = |name: &str| {
+            let def = crate::agents::get_agent(name).unwrap();
+            AgentInfo {
+                kind: "builtin".to_string(),
+                name: def.name.to_string(),
+                binary: def.binary.to_string(),
+                host_only: def.host_only,
+                installed: true,
+                install_hint: def.install_hint.to_string(),
+                oneshot_capable: def.oneshot_flag.is_some(),
+                acp_capable: false,
+                acp_installed: false,
+                acp_allowed: true,
+                acp_command: None,
+                acp_args: Vec::new(),
+                lifecycle: def.lifecycle,
+            }
+        };
+        let claude = serde_json::to_value(mk("claude")).unwrap();
+        assert!(claude.get("lifecycle").is_none(), "{claude}");
+        let gemini = serde_json::to_value(mk("gemini")).unwrap();
+        assert_eq!(gemini["lifecycle"]["state"], "deprecated", "{gemini}");
+        assert_eq!(gemini["lifecycle"]["since"], "2026-06-18");
+        assert_eq!(gemini["lifecycle"]["replacement"], "antigravity");
     }
 
     #[test]

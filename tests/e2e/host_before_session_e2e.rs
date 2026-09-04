@@ -36,13 +36,11 @@
 //! `before_session` is trusted enough to set HOME or PATH, but never aoe's own
 //! auth token.
 //!
-//! Compiled only with the `serve` feature (structured view and
-//! `aoe add --structured-view` do not exist otherwise). Run via:
+//! Run via:
 //!
 //! ```sh
-//! cargo test --features serve,e2e-tests --test e2e -- host_before_session
+//! cargo test --features e2e-tests --test e2e -- host_before_session
 //! ```
-#![cfg(feature = "serve")]
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};

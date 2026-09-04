@@ -1,7 +1,3 @@
-// Vitest for the server-owned prompt queue API client. These wrap the
-// /queue endpoints; the queue itself reflects on SessionResponse.queued_prompts.
-// See docs/development/server-side-prompt-queue.md.
-
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {

@@ -55,7 +55,7 @@ use serde::Deserialize;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, watch, Mutex};
 use tracing::{debug, info, warn};
 
 use super::worker_registry::{self, WorkerRecord};
@@ -128,7 +128,7 @@ const NOTIFICATION_BUFFER_LINES: usize = 256;
 /// An agent that exits within this window of being spawned is treated as a
 /// broken spawn and logged at warn (not info), so a crash loop is visible in
 /// debug.log without grepping for the absence of success. Intentionally
-/// mirrors `runner_socket_deadline()` in `acp/acp_client.rs` (the
+/// mirrors `runner_socket_deadline()` in `acp/acp_client/runner.rs` (the
 /// daemon's 10s wait for this runner's socket to appear); update both if
 /// the handshake window changes. See #1945.
 const FAST_EXIT_THRESHOLD: Duration = Duration::from_secs(10);
@@ -360,7 +360,7 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
     let control_shared = Arc::clone(&shared);
     let control_session = args.session_id.clone();
     let control_stdin = Arc::clone(&agent_stdin);
-    let control_accept_task = tokio::spawn(async move {
+    let mut control_accept_task = tokio::spawn(async move {
         loop {
             match control_listener.accept().await {
                 Ok((stream, _addr)) => {
@@ -369,13 +369,16 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
                         session = %control_session,
                         "daemon connected (control channel)"
                     );
-                    handle_control_connection(
+                    if handle_control_connection(
                         stream,
                         Arc::clone(&control_shared),
                         Arc::clone(&control_stdin),
                         control_session.clone(),
                     )
-                    .await;
+                    .await
+                    {
+                        return;
+                    }
                     info!(
                         target: "acp.runner",
                         session = %control_session,
@@ -517,6 +520,21 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         }
         _ = accept_loop => {
             warn!(target: "acp.runner", session = %session_id, "accept loop exited unexpectedly");
+        }
+        result = &mut control_accept_task => {
+            match result {
+                Ok(()) => {
+                    // The daemon owns path cleanup after cancelling an
+                    // incomplete handshake and may already have spawned a
+                    // replacement. Never unlink that replacement here.
+                    preserve_registry = true;
+                }
+                Err(error) => {
+                    warn!(target: "acp.runner", session = %session_id, "control accept task failed: {error}");
+                }
+            }
+            let _ = agent_child.start_kill();
+            let _ = agent_child.wait().await;
         }
     }
 
@@ -694,6 +712,10 @@ struct RunnerShared {
     /// gap (buffer it for the next control attach). Set/cleared alongside
     /// `active_outbound`.
     main_attached: std::sync::atomic::AtomicBool,
+    /// Advances when the active daemon's relay write half fails. The
+    /// connection reader watches this so a daemon that keeps only its write
+    /// half open cannot pin the sequential accept loop.
+    relay_failures: watch::Sender<u64>,
     /// Runner-owned ACP handshake cache (#2976 Phase B). Populated the
     /// first time a v2 daemon drives `initialize` / `session/new|load|fork`
     /// through the control channel; replayed verbatim on every later
@@ -841,6 +863,7 @@ impl RunnerShared {
             prompt_requests: Mutex::new(HashSet::new()),
             control: Mutex::new(ControlChannel::default()),
             main_attached: std::sync::atomic::AtomicBool::new(false),
+            relay_failures: watch::channel(0).0,
             handshake: Mutex::new(RunnerHandshake::default()),
             next_req_id: AtomicI64::new(RUNNER_REQUEST_ID_BASE),
             pending_client_responses: Mutex::new(HashMap::new()),
@@ -894,17 +917,22 @@ impl RunnerShared {
         // session does not JSON-parse every agent line twice (this on top
         // of `note_daemon_response`). Independent of the byte-relay
         // outbound below, since the control channel is a separate socket.
-        if !self.prompt_requests.lock().await.is_empty() {
+        let prompt_completed = if !self.prompt_requests.lock().await.is_empty() {
             if let Some((id, outcome)) = parse_response(line) {
                 if self.prompt_requests.lock().await.remove(&id) {
-                    self.emit_control(ControlBody::PromptCompleted {
+                    Some(ControlBody::PromptCompleted {
                         prompt_req_id: id,
                         outcome,
                     })
-                    .await;
+                } else {
+                    None
                 }
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
 
         // #2979: refresh the cached handshake session when this line answers
         // a daemon-driven relay `session/new` (conversation reset). Gated on
@@ -915,11 +943,21 @@ impl RunnerShared {
         let mut guard = self.active_outbound.lock().await;
         if let Some(out) = guard.as_mut() {
             if out.write_all(line).await.is_ok() && out.flush().await.is_ok() {
+                drop(guard);
+                if let Some(body) = prompt_completed {
+                    self.emit_control(body).await;
+                }
                 return true;
             }
             // Write failure: daemon side closed. Drop the writer and
-            // buffer this line for the next attach.
+            // buffer this line for the next attach. Advance the failure
+            // signal while holding `active_outbound` so the reader cannot
+            // observe a half-updated attachment state.
             *guard = None;
+            self.main_attached
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            self.relay_failures
+                .send_modify(|generation| *generation = generation.wrapping_add(1));
         }
         // Buffer while STILL holding `active_outbound`. Dropping it before
         // locking `pending` opens a TOCTOU window: a reattaching
@@ -933,6 +971,13 @@ impl RunnerShared {
             pending.pop_front();
         }
         pending.push_back(line.to_vec());
+        drop(pending);
+        // Keep replacement attach behind the completion decision so it cannot
+        // set `main_attached` and make `emit_control` discard this completion.
+        if let Some(body) = prompt_completed {
+            self.emit_control(body).await;
+        }
+        drop(guard);
         false
     }
 
@@ -1045,7 +1090,7 @@ impl RunnerShared {
     async fn install_outbound(
         &self,
         mut out: tokio::net::unix::OwnedWriteHalf,
-    ) -> Option<tokio::net::unix::OwnedWriteHalf> {
+    ) -> Result<Option<tokio::net::unix::OwnedWriteHalf>, ()> {
         // Hold `active_outbound` across the whole drain + install so a
         // concurrent `deliver_line` (which locks `active_outbound` first,
         // sees None, then buffers into `pending`) cannot slip a line into
@@ -1062,24 +1107,30 @@ impl RunnerShared {
                 // stays None (via the earlier take), matching the old
                 // behavior of leaving no live writer on a failed attach.
                 pending.push_front(line);
-                return None;
+                self.main_attached
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                self.relay_failures
+                    .send_modify(|generation| *generation = generation.wrapping_add(1));
+                return Err(());
             }
         }
         drop(pending);
         *guard = Some(out);
         self.main_attached
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        prev
+        Ok(prev)
     }
 
-    async fn clear_outbound(&self) {
+    async fn clear_outbound(&self, preserve_completion: bool) {
         *self.active_outbound.lock().await = None;
         self.main_attached
             .store(false, std::sync::atomic::Ordering::Relaxed);
         // A main-relay disconnect starts a no-daemon gap. Drop any
         // completion left un-drained from a prior gap so only the current
         // gap's completion is ever replayed to the next resuming daemon.
-        self.control.lock().await.pending = None;
+        if !preserve_completion {
+            self.control.lock().await.pending = None;
+        }
     }
 
     /// Peek a daemon to agent line: if it is a `session/prompt` request,
@@ -1648,7 +1699,18 @@ async fn handle_connection(
     session_id: String,
 ) {
     let (read_half, write_half) = stream.into_split();
-    let prev = shared.install_outbound(write_half).await;
+    let mut relay_failures = shared.relay_failures.subscribe();
+    let relay_generation = *relay_failures.borrow_and_update();
+    let prev = match shared.install_outbound(write_half).await {
+        Ok(prev) => prev,
+        Err(()) => {
+            shared
+                .cancel_outstanding_requests(&agent_stdin, &session_id)
+                .await;
+            shared.clear_outbound(true).await;
+            return;
+        }
+    };
     if prev.is_some() {
         debug!(
             target: "acp.runner",
@@ -1659,8 +1721,19 @@ async fn handle_connection(
 
     let mut reader = BufReader::with_capacity(STDOUT_READ_BUF, read_half);
     let mut line = Vec::with_capacity(4096);
+    let mut relay_failed = false;
     loop {
-        match read_frame_bounded(&mut reader, &mut line).await {
+        let read = tokio::select! {
+            biased;
+            changed = relay_failures.changed() => {
+                if changed.is_ok() {
+                    relay_failed = true;
+                }
+                break;
+            }
+            read = read_frame_bounded(&mut reader, &mut line) => read,
+        };
+        match read {
             Ok(0) => break, // EOF: daemon closed the connection.
             Ok(_) => {
                 // #2976: once the runner owns the session, answer a relay
@@ -1701,7 +1774,29 @@ async fn handle_connection(
     shared
         .cancel_outstanding_requests(&agent_stdin, &session_id)
         .await;
-    shared.clear_outbound().await;
+    relay_failed |= *relay_failures.borrow() != relay_generation;
+    shared.clear_outbound(relay_failed).await;
+}
+
+enum ControlRead {
+    Frame(ControlBody),
+    Closed,
+    Failed(String),
+}
+
+async fn await_handshake_or_control_loss<T>(
+    control_closed: &mut watch::Receiver<bool>,
+    handshake: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    if *control_closed.borrow() {
+        return None;
+    }
+    tokio::pin!(handshake);
+    tokio::select! {
+        biased;
+        _ = control_closed.changed() => None,
+        result = &mut handshake => Some(result),
+    }
 }
 
 /// Handle one control-channel connection (#2976 Phase B). Greets with
@@ -1724,7 +1819,7 @@ async fn handle_control_connection(
     shared: Arc<RunnerShared>,
     agent_stdin: Arc<Mutex<tokio::process::ChildStdin>>,
     session_id: String,
-) {
+) -> bool {
     let (mut read_half, write_half) = stream.into_split();
     let mut write_half = Some(write_half);
     if !shared
@@ -1732,25 +1827,60 @@ async fn handle_control_connection(
         .await
     {
         shared.clear_control_outbound().await;
-        return;
+        return false;
     }
-    loop {
-        let body = match control_protocol::read_frame(&mut read_half).await {
-            Ok(Some(body)) => body,
-            Ok(None) => break, // clean EOF: daemon closed the control socket.
-            Err(e) => {
-                warn!(
-                    target: "acp.runner",
-                    session = %session_id,
-                    "control read error: {e}"
-                );
-                break;
+
+    let (frame_tx, mut frame_rx) = mpsc::channel(8);
+    let (control_closed_tx, mut control_closed_rx) = watch::channel(false);
+    let reader_session = session_id.clone();
+    let frame_reader = tokio::spawn(async move {
+        loop {
+            match control_protocol::read_frame(&mut read_half).await {
+                Ok(Some(frame)) => match frame_tx.try_send(ControlRead::Frame(frame)) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Closed(_)) => return,
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        warn!(target: "acp.runner", session = %reader_session, "control command queue exceeded capacity");
+                        let _ = control_closed_tx.send(true);
+                        return;
+                    }
+                },
+                Ok(None) => {
+                    let _ = frame_tx.try_send(ControlRead::Closed);
+                    let _ = control_closed_tx.send(true);
+                    return;
+                }
+                Err(error) => {
+                    let _ = frame_tx.try_send(ControlRead::Failed(error.to_string()));
+                    let _ = control_closed_tx.send(true);
+                    return;
+                }
+            }
+        }
+    });
+
+    let mut handshake_complete = shared.acp_session_id().await.is_some();
+    let terminate_runner = 'connection: loop {
+        let body = match frame_rx.recv().await {
+            Some(ControlRead::Frame(frame)) => frame,
+            Some(ControlRead::Closed) | None => break 'connection !handshake_complete,
+            Some(ControlRead::Failed(error)) => {
+                warn!(target: "acp.runner", session = %session_id, "control read error: {error}");
+                break 'connection !handshake_complete;
             }
         };
         match body {
             ControlBody::Attach { .. } => {}
             ControlBody::Initialize { request } => {
-                let frame = match shared.run_or_replay_initialize(&agent_stdin, request).await {
+                let Some(result) = await_handshake_or_control_loss(
+                    &mut control_closed_rx,
+                    shared.run_or_replay_initialize(&agent_stdin, request),
+                )
+                .await
+                else {
+                    break 'connection true;
+                };
+                let frame = match result {
                     Ok(result) => ControlBody::Initialized { result },
                     Err(error) => {
                         warn!(target: "acp.runner", session = %session_id, "initialize failed: {error}");
@@ -1760,14 +1890,22 @@ async fn handle_control_connection(
                 shared.emit_control(frame).await;
             }
             ControlBody::EstablishSession { method, request } => {
-                let frame = match shared
-                    .run_or_replay_session(&agent_stdin, &method, request)
-                    .await
-                {
-                    Ok((acp_session_id, result)) => ControlBody::SessionReady {
-                        acp_session_id,
-                        result,
-                    },
+                let Some(result) = await_handshake_or_control_loss(
+                    &mut control_closed_rx,
+                    shared.run_or_replay_session(&agent_stdin, &method, request),
+                )
+                .await
+                else {
+                    break 'connection true;
+                };
+                let frame = match result {
+                    Ok((acp_session_id, result)) => {
+                        handshake_complete = true;
+                        ControlBody::SessionReady {
+                            acp_session_id,
+                            result,
+                        }
+                    }
                     Err(error) => {
                         warn!(target: "acp.runner", session = %session_id, "{method} failed: {error}");
                         ControlBody::HandshakeFailed { error }
@@ -1792,8 +1930,10 @@ async fn handle_control_connection(
             // Runner -> daemon frames should never arrive here; ignore.
             _ => {}
         }
-    }
+    };
+    frame_reader.abort();
     shared.clear_control_outbound().await;
+    terminate_runner
 }
 
 fn spawn_agent(
@@ -1818,7 +1958,7 @@ fn spawn_agent(
         .stderr(Stdio::piped());
     // The rest of the env is inherited from the launching daemon, which has
     // already applied `env_clear` + the shared allowlist (see
-    // `apply_env_filter` in acp_client.rs), so no second filter pass is
+    // `apply_env_filter` in acp_client/spawn.rs), so no second filter pass is
     // needed here.
     //
     // The one exception is the daemon's configured host environment
@@ -2335,6 +2475,189 @@ mod tests {
         assert!(
             shared.control.lock().await.pending.is_none(),
             "a live main-relay daemon owns the completion; nothing should buffer"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_completion_survives_main_relay_write_failure() {
+        use std::sync::atomic::Ordering;
+
+        let shared = RunnerShared::new();
+        let (peer, ours) = tokio::net::UnixStream::pair().unwrap();
+        drop(peer);
+        let (_read, write) = ours.into_split();
+        *shared.active_outbound.lock().await = Some(write);
+        shared.main_attached.store(true, Ordering::Relaxed);
+
+        shared
+            .note_prompt_request(
+                br#"{"jsonrpc":"2.0","id":9,"method":"session/prompt","params":{}}"#,
+            )
+            .await;
+        let response = br#"{"jsonrpc":"2.0","id":9,"result":{"stopReason":"end_turn"}}
+"#;
+        assert!(!shared.deliver_line(response).await);
+
+        assert!(!shared.main_attached.load(Ordering::Relaxed));
+        assert_eq!(
+            shared.control.lock().await.pending,
+            Some(ControlBody::PromptCompleted {
+                prompt_req_id: 9,
+                outcome: PromptOutcome::Completed {
+                    stop_reason: Some("end_turn".into()),
+                },
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_attach_cannot_overtake_failed_prompt_completion() {
+        use std::sync::atomic::Ordering;
+        use tokio::io::AsyncReadExt;
+
+        let shared = Arc::new(RunnerShared::new());
+        let (closed_daemon, failed_runner) = UnixStream::pair().expect("failed relay pair");
+        drop(closed_daemon);
+        let (_failed_read, failed_write) = failed_runner.into_split();
+        *shared.active_outbound.lock().await = Some(failed_write);
+        shared.main_attached.store(true, Ordering::Relaxed);
+        shared
+            .note_prompt_request(
+                br#"{"jsonrpc":"2.0","id":10,"method":"session/prompt","params":{}}"#,
+            )
+            .await;
+
+        let control = shared.control.lock().await;
+        let mut failures = shared.relay_failures.subscribe();
+        let response = br#"{"jsonrpc":"2.0","id":10,"result":{"stopReason":"end_turn"}}
+"#;
+        let delivery = {
+            let shared = Arc::clone(&shared);
+            tokio::spawn(async move { shared.deliver_line(response).await })
+        };
+        failures.changed().await.expect("relay failure signal");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if shared
+                    .pending
+                    .lock()
+                    .await
+                    .back()
+                    .is_some_and(|line| line == response)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed response buffered");
+
+        let (replacement_daemon, replacement_runner) =
+            UnixStream::pair().expect("replacement relay pair");
+        let (mut replacement_read, _replacement_write) = replacement_daemon.into_split();
+        let (_runner_read, replacement_write) = replacement_runner.into_split();
+        let (replacement_started_tx, replacement_started_rx) = tokio::sync::oneshot::channel();
+        let replacement = {
+            let shared = Arc::clone(&shared);
+            tokio::spawn(async move {
+                replacement_started_tx
+                    .send(())
+                    .expect("replacement start receiver");
+                shared.install_outbound(replacement_write).await
+            })
+        };
+        replacement_started_rx
+            .await
+            .expect("replacement install task starts");
+        assert!(
+            !replacement.is_finished(),
+            "replacement attach must wait for completion preservation"
+        );
+        assert!(!shared.main_attached.load(Ordering::Relaxed));
+
+        drop(control);
+        assert!(!delivery.await.expect("failed response delivery task"));
+        assert!(replacement
+            .await
+            .expect("replacement install task")
+            .expect("replacement relay installs")
+            .is_none());
+        let mut replayed = vec![0; response.len()];
+        replacement_read
+            .read_exact(&mut replayed)
+            .await
+            .expect("read buffered response");
+        assert_eq!(replayed, response);
+        assert!(shared.main_attached.load(Ordering::Relaxed));
+        assert_eq!(
+            shared.control.lock().await.pending,
+            Some(ControlBody::PromptCompleted {
+                prompt_req_id: 10,
+                outcome: PromptOutcome::Completed {
+                    stop_reason: Some("end_turn".into()),
+                },
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_failure_preempts_ready_stale_daemon_frame() {
+        use tokio::io::AsyncReadExt;
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn agent stdin fixture");
+        let agent_stdin = Arc::new(Mutex::new(child.stdin.take().expect("agent stdin")));
+        let mut agent_stdout = child.stdout.take().expect("agent stdout");
+        let shared = Arc::new(RunnerShared::new());
+        let (daemon, runner) = UnixStream::pair().expect("relay socket pair");
+        let handler = tokio::spawn(handle_connection(
+            runner,
+            Arc::clone(&shared),
+            Arc::clone(&agent_stdin),
+            "fixture-session".into(),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !shared.main_attached.load(Ordering::Relaxed) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("relay handler installs outbound within timeout");
+
+        // Mirror relay write failure state, then make the failure notification
+        // and a stale inbound frame ready without yielding to the handler.
+        drop(shared.active_outbound.lock().await.take());
+        shared.main_attached.store(false, Ordering::Relaxed);
+        shared
+            .relay_failures
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+        let stale = b"stale daemon frame\n";
+        assert_eq!(
+            daemon.try_write(stale).expect("queue stale frame"),
+            stale.len()
+        );
+
+        handler.await.expect("connection handler");
+        drop(daemon);
+        let agent_stdin =
+            Arc::try_unwrap(agent_stdin).unwrap_or_else(|_| panic!("handler retained agent stdin"));
+        drop(agent_stdin.into_inner());
+        let mut forwarded = Vec::new();
+        agent_stdout
+            .read_to_end(&mut forwarded)
+            .await
+            .expect("read agent fixture output");
+        child.wait().await.expect("agent fixture exits");
+        assert!(
+            forwarded.is_empty(),
+            "relay failure must prevent stale daemon input from reaching agent stdin"
         );
     }
 

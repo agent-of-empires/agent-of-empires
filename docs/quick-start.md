@@ -129,7 +129,6 @@ Open the printed URL in any browser (phone, tablet, or another computer) for the
 ## Next Steps
 
 - [Web Dashboard](guides/web-dashboard.md): access sessions from any browser
-- [Workflow Guide](guides/workflow.md): recommended setup with bare repos and parallel agents
 - [Docker Sandbox](guides/sandbox.md): container configuration and custom images
 - [Repo Config & Hooks](guides/repo-config.md): per-project settings
 - [CLI Reference](cli/reference.md): every command and flag

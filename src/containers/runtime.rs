@@ -527,6 +527,17 @@ impl ContainerRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn runtime_timeout_classification_matches_io_error_kind() {
+        let cases = [
+            (std::io::ErrorKind::TimedOut, true),
+            (std::io::ErrorKind::Other, false),
+        ];
+        for (kind, expected) in cases {
+            let error = DockerError::IoError(std::io::Error::from(kind));
+            assert_eq!(is_runtime_timeout(&error), expected, "{kind:?}");
+        }
+    }
 
     fn docker_if_available() -> Option<ContainerRuntime> {
         let rt = ContainerRuntime::docker();

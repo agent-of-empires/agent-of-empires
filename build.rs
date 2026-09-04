@@ -6,9 +6,22 @@ include!("build_git_watch.rs");
 fn main() {
     check_stale_build_cache();
     emit_build_version();
+    warn_on_deprecated_serve_feature();
 
-    #[cfg(feature = "serve")]
+    #[cfg(feature = "web")]
     build_frontend();
+}
+
+/// `serve` is an alias for `web` and is removed after one release. Cargo sets
+/// `CARGO_FEATURE_SERVE` only when the alias itself was selected, so this
+/// stays quiet for a plain `--features web` build.
+fn warn_on_deprecated_serve_feature() {
+    if std::env::var_os("CARGO_FEATURE_SERVE").is_some() {
+        println!(
+            "cargo:warning=the `serve` feature is deprecated and will be removed after the next \
+             release; use `--features web` instead"
+        );
+    }
 }
 
 /// Emit `AOE_BUILD_VERSION`, the build identity stamped on each structured view
@@ -157,7 +170,7 @@ fn check_stale_build_cache() {
     let _ = std::fs::write(&hash_file, &current_hash);
 }
 
-#[cfg(feature = "serve")]
+#[cfg(feature = "web")]
 fn build_frontend() {
     use std::path::Path;
     use std::process::Command;
@@ -204,7 +217,7 @@ fn build_frontend() {
 
     assert!(
         Command::new("npm").arg("--version").output().is_ok(),
-        "npm is required to build with --features serve. Install Node.js: https://nodejs.org/"
+        "npm is required to build with --features web. Install Node.js: https://nodejs.org/"
     );
 
     maybe_install_web_deps();
@@ -229,7 +242,7 @@ fn build_frontend() {
 /// TypeScript errors like "Cannot find module 'cmdk'" because the old
 /// node_modules was considered "good enough." This now compares mtimes so any
 /// lockfile change triggers a reinstall.
-#[cfg(feature = "serve")]
+#[cfg(feature = "web")]
 fn maybe_install_web_deps() {
     use std::path::Path;
     use std::process::Command;
@@ -280,7 +293,7 @@ fn maybe_install_web_deps() {
     }
 }
 
-#[cfg(feature = "serve")]
+#[cfg(feature = "web")]
 fn copy_dir(src: &std::path::Path, dst: &std::path::Path) {
     std::fs::create_dir_all(dst).expect("Failed to create directory");
     for entry in std::fs::read_dir(src).expect("Failed to read directory") {
@@ -294,7 +307,7 @@ fn copy_dir(src: &std::path::Path, dst: &std::path::Path) {
     }
 }
 
-#[cfg(feature = "serve")]
+#[cfg(feature = "web")]
 fn is_newer_than(path: &std::path::Path, reference: std::time::SystemTime) -> bool {
     match path.metadata().and_then(|m| m.modified()) {
         Ok(mtime) => mtime > reference,

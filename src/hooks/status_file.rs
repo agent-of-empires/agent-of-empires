@@ -8,6 +8,7 @@
 
 use std::os::fd::AsFd;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::Result;
 use uuid::Uuid;
@@ -15,6 +16,9 @@ use uuid::Uuid;
 use crate::session::Status;
 
 use super::dir_guard;
+
+/// Maximum age before a sidecar `session_id` file is considered stale.
+pub(crate) const SESSION_ID_SIDECAR_MAX_AGE: Duration = Duration::from_secs(5 * 60);
 
 /// Cap used when reading a status file. The legitimate values are short
 /// tokens; an attacker-planted larger payload is irrelevant either way.
@@ -50,9 +54,10 @@ pub fn read_hook_status(instance_id: &str) -> Option<Status> {
 ///
 /// The running-mapped hooks (`PreToolUse`, `UserPromptSubmit`, `ElicitationResult`)
 /// rewrite the file on every fire, so a fresh mtime means the last write is
-/// recent. `reconcile_claude_hook_status` uses this to tell a genuinely fresh
-/// `running` (a turn that just started, spinner not yet rendered) from a stale
-/// one that a missed idle hook left standing after the turn ended.
+/// recent. The detection manifests' hook freshness bounds use this to tell a
+/// genuinely fresh `running` (a turn that just started, spinner not yet
+/// rendered) from a stale one that a missed idle hook left standing after the
+/// turn ended.
 ///
 /// Returns `None` when the file is absent or its mtime can't be read.
 pub fn read_hook_status_age(instance_id: &str) -> Option<std::time::Duration> {
@@ -75,19 +80,70 @@ fn parse_status(bytes: &[u8]) -> Option<Status> {
     }
 }
 
+/// Read the transcript path a Pi pane published beside its `session_id`.
+///
+/// Pi indexes sessions by the cwd they started in, so a managed worktree that
+/// moves leaves the transcript behind: the id alone would resolve to nothing
+/// in the new directory and `--session-id` would create an empty conversation
+/// under it. The absolute path still resolves. Absent, unreadable, oversized,
+/// or relative values give `None`; no age check, since a path does not go
+/// stale the way a fresh-conversation id does.
+pub fn read_hook_session_path(instance_id: &str) -> Option<String> {
+    let dir = dir_guard::open_instance_dir_read_only(instance_id).ok()??;
+    let bytes =
+        dir_guard::read_file_at(dir.as_fd(), "session_path", SESSION_PATH_FILE_READ_CAP).ok()??;
+    let path = std::str::from_utf8(&bytes).ok()?.trim().to_string();
+    (path.starts_with('/') && !path.contains('\n')).then_some(path)
+}
+
+/// Cap on the published transcript path, generous next to `PATH_MAX` and far
+/// below anything worth reading into memory.
+const SESSION_PATH_FILE_READ_CAP: usize = 8 * 1024;
+
+/// Whether a `session_id` sidecar exists for this instance, whatever its age.
+///
+/// [`read_hook_session_id`] answers "is there a fresh id to adopt"; this
+/// answers "does this pane publish its own id at all", which stays true while
+/// a pane sits idle for longer than `SESSION_ID_SIDECAR_MAX_AGE`.
+pub fn session_id_sidecar_exists(instance_id: &str) -> bool {
+    (|| {
+        let dir = dir_guard::open_instance_dir_read_only(instance_id).ok()??;
+        dir_guard::metadata_at(dir.as_fd(), "session_id").ok()?
+    })()
+    .is_some()
+}
+
 /// Read a Claude session UUID from the hook-written `session_id` sidecar.
 ///
-/// Returns `None` when the file is absent or malformed (non-UUID).
-///
-/// Deliberately not age-gated. The sidecar is per-instance and is rewritten by
-/// this pane's own `SessionStart` / `UserPromptSubmit` hooks, so it names the
-/// conversation Claude last ran here; going idle does not make it wrong. The
-/// only alternative on expiry is the mtime scan over a project directory shared
-/// by every pane on the same cwd, which cannot attribute a transcript to a pane
-/// at all. A reboot expires every sidecar at once, so age-gating turned mass
-/// recovery into panes resuming each other's conversations.
+/// Returns `None` when the file is absent, malformed (non-UUID), or older
+/// than `SESSION_ID_SIDECAR_MAX_AGE`.
 pub fn read_hook_session_id(instance_id: &str) -> Option<String> {
+    read_hook_session_id_within(instance_id, Some(SESSION_ID_SIDECAR_MAX_AGE))
+}
+
+/// [`read_hook_session_id`] without the freshness window.
+///
+/// The window exists so a resume does not adopt an id from some earlier run,
+/// which matters when the sidecar competes with other evidence. It has no
+/// place in a final flush at stop: the pane published that id, nothing else
+/// will, and the instance directory is about to be deleted. An idle pane whose
+/// `/new` is older than the window would otherwise lose it.
+pub fn read_hook_session_id_any_age(instance_id: &str) -> Option<String> {
+    read_hook_session_id_within(instance_id, None)
+}
+
+fn read_hook_session_id_within(
+    instance_id: &str,
+    max_age: Option<std::time::Duration>,
+) -> Option<String> {
     let dir = dir_guard::open_instance_dir_read_only(instance_id).ok()??;
+    let meta = dir_guard::metadata_at(dir.as_fd(), "session_id").ok()??;
+    if let Some(max_age) = max_age {
+        let mtime = meta.modified().ok()?;
+        if mtime.elapsed().ok()? > max_age {
+            return None;
+        }
+    }
     let bytes =
         dir_guard::read_file_at(dir.as_fd(), "session_id", SESSION_ID_FILE_READ_CAP).ok()??;
     let id = std::str::from_utf8(&bytes).ok()?.trim().to_string();
@@ -397,11 +453,13 @@ mod tests {
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(stale))
             .unwrap();
-        // Age is not evidence of wrongness: the sidecar still names the
-        // conversation this pane last ran, and the mtime-scan alternative
-        // cannot attribute a transcript to a pane at all.
+        // The windowed reader gates files older than
+        // SESSION_ID_SIDECAR_MAX_AGE; the ageless reader is the one the
+        // authoritative capture path uses, since age is not evidence that
+        // the sidecar names the wrong conversation.
+        assert_eq!(read_hook_session_id("session_id_stale"), None);
         assert_eq!(
-            read_hook_session_id("session_id_stale").as_deref(),
+            read_hook_session_id_any_age("session_id_stale").as_deref(),
             Some(uuid)
         );
     }

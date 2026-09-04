@@ -144,7 +144,7 @@ export function ExtraReposPicker({
   };
 
   return (
-    <div>
+    <div data-testid="extra-repos-picker">
       <div className="flex items-center justify-between mb-2">
         <h3 className="text-sm font-medium text-text-primary">Extra repos (optional)</h3>
         <span className="text-[11px] text-text-dim">

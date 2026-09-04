@@ -1,4 +1,5 @@
 import type { RepoColor } from "./repoAppearance";
+import type { AgentLifecycleInfo } from "./agentProfiles";
 
 /** Session data returned by the API */
 export interface SessionResponse {
@@ -146,9 +147,9 @@ export interface SessionResponse {
   acp_capable?: boolean;
   /** The session's captured ACP session id, present only once the structured
    *  view worker has minted one. The sidebar passes this as `fork_from` on a
-   *  structured fork create, and gates the "Fork" action on its presence (a
-   *  structured row with a captured id to diverge from). Absent for terminal
-   *  sessions and structured ones whose worker has not minted an id yet. */
+   *  structured fork create and gates the "Fork" action on it together with
+   *  `acp_can_fork`. Absent for terminal sessions and structured ones whose
+   *  worker has not minted an id yet. */
   acp_session_id?: string;
   /** The session's resolved ACP registry key (`agent_name` when set, else
    *  `tool`), matching the `name` entries `/api/acp/agents` returns. The
@@ -170,12 +171,13 @@ export interface SessionResponse {
    *  per-agent mirror. Absent (read as empty) for agents with no clear alias. */
   clear_aliases?: string[];
   /** True when this session's agent can run a structured ACP `session/fork`:
-   *  it is ACP-capable AND declares a real fork strategy. Resume-only ACP
-   *  agents (e.g. the bundled `aoe-agent`, which advertises `loadSession` but
-   *  not `session/fork`) are ACP-capable yet not forkable. The sidebar gates the
-   *  "Fork" action on this together with `acp_session_id` so a resume-only row
-   *  never shows a dead-end fork button. Absent (read as not-forkable) for
-   *  terminal sessions and non-forkable agents. */
+   *  it maps to a built-in ACP adapter verified to implement the handshake
+   *  (today claude alone). Resume-only ACP agents (e.g. `aoe-agent`, which
+   *  advertises `loadSession` but not `session/fork`) are ACP-capable yet not
+   *  forkable, so the sidebar gates "Fork" on this together with
+   *  `acp_session_id` and a resume-only row never shows a dead-end button.
+   *  Absent (read as not-forkable) for terminal sessions and non-forkable
+   *  agents. */
   acp_can_fork?: boolean;
   /** True when this is a Claude Code session AND the user has enabled
    *  Claude's fullscreen renderer (`tui: "fullscreen"` in
@@ -445,6 +447,11 @@ export interface AgentInfo {
   /** Registry args appended to `acp_command` (e.g. `["acp"]` for
    *  opencode, `["--acp"]` for gemini). Absent or empty when none. */
   acp_args?: string[];
+  /** Registry lifecycle state from /api/agents. Omitted for Active agents
+   *  (the common case), so fixtures and older servers read as active.
+   *  Mirrors `AgentLifecycle` in src/agents.rs; the static frontend mirror
+   *  lives in agentProfiles.ts (`resolveAgentLifecycle`). */
+  lifecycle?: AgentLifecycleInfo;
 }
 
 /** Profile info returned by /api/profiles */
@@ -459,7 +466,7 @@ export interface ProfileInfo {
 
 /** Per-profile lifecycle-hook overrides, as returned by
  *  GET /api/profiles/:name/settings. Mirrors the Rust
- *  HooksConfigOverride (src/session/profile_config.rs): a field that is
+ *  HooksConfigOverride (src/session/config/profile_config.rs): a field that is
  *  absent/undefined means "inherit the global hooks"; an explicit array
  *  (including the empty array) means "override". Hooks are read-only on
  *  the dashboard; see HooksReadOnlyPanel and profileWritableSections. */
@@ -592,7 +599,7 @@ export type AcpWorkerState = "absent" | "resuming" | "running";
 
 // --- Settings schema (single source of truth, see #1692) ---
 //
-// Mirrors `crate::session::settings_schema`. `GET /api/settings/schema`
+// Mirrors `crate::session::config::settings_schema`. `GET /api/settings/schema`
 // returns `SettingsFieldDescriptor[]`; the generic settings renderer builds
 // the form from it instead of hand-written per-field JSX.
 

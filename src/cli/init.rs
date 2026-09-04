@@ -5,7 +5,7 @@ use clap::Args;
 use std::fs;
 use std::path::PathBuf;
 
-use crate::session::repo_config::INIT_TEMPLATE;
+use crate::session::config::repo_config::INIT_TEMPLATE;
 
 #[derive(Args)]
 pub struct InitArgs {

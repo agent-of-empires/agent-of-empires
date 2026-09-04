@@ -24,13 +24,11 @@
 //!   3. the fork's one-shot `fork_pending` marker is cleared after the child id
 //!      lands.
 //!
-//! Compiled only with the default `serve` feature (the structured view and
-//! `aoe add --structured-view` do not exist otherwise). Run via:
+//! Run via:
 //!
 //! ```sh
 //! cargo test --test e2e -- fork_structured
 //! ```
-#![cfg(feature = "serve")]
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};

@@ -2,7 +2,7 @@
 
 The **structured view** is the default rendering for AI coding agents in the web dashboard and the native TUI. Instead of a terminal pane (PTY bytes through xterm.js), it renders the agent's structured state directly: plan, tool-call cards, diffs, and approvals. It is mobile-first and scales the same components into a richer multi-pane desktop layout.
 
-It speaks the [Agent Client Protocol](https://agentclientprotocol.com/) (ACP), a JSON-RPC standard for editor-agent communication. aoe is the *client*; the agent (Claude Code, Gemini, the bundled `aoe-agent`, etc.) is the *server*. Any ACP-capable agent uses the structured view by default; a session can opt into the **terminal view** instead, per session, and you can switch at any time. Agents with no ACP adapter always run in the terminal view.
+It speaks the [Agent Client Protocol](https://agentclientprotocol.com/) (ACP), a JSON-RPC standard for editor-agent communication. aoe is the *client*; the agent (Claude Code, Gemini, Codex, etc.) is the *server*. Any ACP-capable agent uses the structured view by default; a session can opt into the **terminal view** instead, per session, and you can switch at any time. Agents with no ACP adapter always run in the terminal view.
 
 ![The structured view rendering an agent's plan, tool-call cards, and a pending approval](assets/structured-view/overview.png)
 
@@ -23,12 +23,15 @@ aoe ships an ACP registry entry for each tool whose ACP server we've verified. F
 | `claude` | `claude-agent-acp` (Zed, recent version required) | `npm install -g @agentclientprotocol/claude-agent-acp@latest` | `claude login`, or `ANTHROPIC_API_KEY` |
 | `codex` | `codex-acp` (ACP) | `npm install -g @agentclientprotocol/codex-acp@latest` | `OPENAI_API_KEY`, or ChatGPT login (local-only) |
 | `opencode` | `opencode acp` (native, ≥1.16.0 recommended) | `curl -fsSL https://opencode.ai/install \| bash` | `opencode auth` / provider env |
-| `gemini` | `gemini --acp` (native) | `npm install -g @google/gemini-cli` | `GEMINI_API_KEY`, OAuth, or Vertex |
+| `gemini` (deprecated) | `gemini --acp` (native) | `npm install -g @google/gemini-cli` | `GEMINI_API_KEY`, OAuth, or Vertex |
 | `vibe` | `vibe-acp` (native) | see [mistral-vibe](https://github.com/mistralai/mistral-vibe) | Mistral API key |
 | `pi` | `pi-acp` (adapter) | `npm install -g pi-acp` (plus `@earendil-works/pi-coding-agent`) | `pi-acp --terminal-login`, or provider env |
 | `omp` | `omp acp` (native) | `curl -fsSL https://omp.sh/install \| sh` | provider environment or OMP login |
 | `kimi` | `kimi acp` (native) | `curl -fsSL https://code.kimi.com/kimi-code/install.sh \| bash` | `kimi login`, or provider env |
-| `aoe-agent` | bundled (Vercel AI SDK 6) | ships with `aoe` | provider env vars |
+| `prime-agent` | `prime-agent --mode acp` (native) | `curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh \| sh` | `/login` once, or provider env |
+| `aoe-agent` | in-tree (Vercel AI SDK 7) | not yet packaged; needs a local build of `acp-worker/aoe-agent` (#3553) | provider env vars |
+
+Gemini CLI is deprecated upstream for individual accounts since 2026-06-18. Enterprise and API-key authentication remain valid; Antigravity CLI is the replacement for consumer accounts.
 
 The `npm install -g` commands above are optional: `aoe acp doctor --fix` installs the `claude` / `codex` / `pi` adapters into the data dir for you, one adapter at a time (see [Requirements](#requirements)). Run it, or install them globally yourself.
 
@@ -44,7 +47,7 @@ Each built-in adapter receives only the provider variables it is known to read f
 | `gemini` | `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GOOGLE_GENAI_USE_VERTEXAI`, `GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION` |
 | `aoe-agent` | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `GOOGLE_GENERATIVE_AI_API_KEY` |
 
-`vibe`, `pi`, `omp`, and `kimi` have no ambient provider allowlist yet. Custom adapters also receive no ambient provider credentials. Until their variables are verified, give them auth through the per-session `extra_env` field or `environment` in your config, or set `session.inherit_host_environment = true` to forward your whole `aoe serve` environment to non-sandboxed agents. In a sandboxed session the per-adapter provider keys above still cross the container boundary (forwarded as `docker exec -e` flags), but `inherit_host_environment` does not; give a sandboxed not-yet-verified adapter its auth through `sandbox.environment`. Three ambient allowlist entries are host-only and never cross: `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, and `GOOGLE_APPLICATION_CREDENTIALS` name paths on your machine that do not exist inside the container, and each agent's config dir is already bind-mounted at its canonical container location. Values explicitly supplied through `provider_env` are not part of that ambient filtering.
+`vibe`, `pi`, `omp`, `kimi`, and `prime-agent` have no ambient provider allowlist yet. Custom adapters also receive no ambient provider credentials. Until their variables are verified, give them auth through the per-session `extra_env` field or `environment` in your config, or set `session.inherit_host_environment = true` to forward your whole `aoe serve` environment to non-sandboxed agents. In a sandboxed session the per-adapter provider keys above still cross the container boundary (forwarded as `docker exec -e` flags), but `inherit_host_environment` does not; give a sandboxed not-yet-verified adapter its auth through `sandbox.environment`. Three ambient allowlist entries are host-only and never cross: `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, and `GOOGLE_APPLICATION_CREDENTIALS` name paths on your machine that do not exist inside the container, and each agent's config dir is already bind-mounted at its canonical container location. Values explicitly supplied through `provider_env` are not part of that ambient filtering.
 
 ### Feature matrix
 
@@ -76,14 +79,13 @@ The CLI is the optional path for scripting or headless launches. Unlike the wiza
 ```bash
 aoe acp doctor                              # confirm prerequisites
 aoe add . --cmd claude --structured-view    # structured view for an ACP tool
-aoe add . --agent aoe-agent --model gpt-5   # pick an ACP agent + model (implies structured view)
+aoe add . --agent codex --model gpt-5       # pick an ACP agent + model (implies structured view)
 ```
 
 `--agent` for an uninstalled adapter errors with an install hint; `--structured-view` (no `--agent`) falls back to the terminal view with a warning so the command still succeeds.
 ## Requirements
 
-- aoe built with `--features serve`.
-- Node.js 20+ on `PATH` (the structured view spawns an ACP agent subprocess; `aoe-agent` needs Node 20+ for Vercel AI SDK 6).
+- Node.js 22+ on `PATH` (the structured view spawns an ACP agent subprocess; `aoe-agent` declares `engines.node: >=22.0.0`).
 - For Claude Code, a `claude login` session.
 
 If Node is missing or too old, the session falls back to the terminal view with an actionable warning. Verify with `aoe acp doctor`:
@@ -99,7 +101,7 @@ aoe acp doctor --fix --all-adapters            # install all three
 
 An adapter already on your `PATH` normally wins, so a manual global install keeps working. The exception is a `PATH` copy below the version floor aoe requires: rather than spawn a binary the agent handshake would reject, aoe uses the pinned bundled copy and logs the substitution. `doctor --fix` tells you when your `PATH` copy is the stale one.
 
-It exits 1 if Node is missing, 2 if some agents are unreachable, else 0. Pass `--json` for machine-readable output. Install the native CLIs (opencode / gemini / vibe / omp) through their own channels.
+It exits 1 if Node is missing, 2 if some agents are unreachable, else 0. Pass `--json` for machine-readable output. Install the native CLIs (opencode / gemini / vibe / omp / kimi / prime-agent) through their own channels.
 
 ## Choosing the view per session
 

@@ -1,0 +1,57 @@
+id = "antigravity"
+
+# Sign-in is a blocking state of its own: the CLI parks on it before any turn
+# can start, and it renders no prompt shape the approval rules would catch.
+[[rules]]
+id = "sign_in"
+state = "waiting"
+priority = 980
+region = "whole_recent"
+visible = true
+contains_any = [
+  "not signed in",
+  "signing in",
+  "authorization url",
+  "authorization code",
+  "google sign-in",
+]
+
+[[rules]]
+id = "approval_required"
+state = "waiting"
+priority = 975
+region = "whole_recent"
+visible = true
+contains_any = ["approval required", "awaiting user approval", "deny access"]
+
+[[rules]]
+extends = "approval_prompt"
+id = "approval_prompt"
+priority = 970
+contains_any = [
+  "permission request",
+  "do you trust the contents",
+  "yes, i trust this folder",
+  "execute?",
+  "enter to select",
+  "enter confirm",
+  "esc to cancel",
+]
+
+[[rules]]
+extends = "interrupt_hint"
+id = "interrupt_hint"
+priority = 960
+contains_any = ["esc to interrupt", "ctrl+c to interrupt", "ctrl+c to stop"]
+
+[[rules]]
+extends = "spinner"
+id = "spinner"
+priority = 955
+
+# An activity verb opening a line, with the completion-marker suppression the
+# shared helper applies: `Running tests completed` is a report, not activity.
+[[rules]]
+extends = "activity_line"
+id = "activity_line"
+priority = 950

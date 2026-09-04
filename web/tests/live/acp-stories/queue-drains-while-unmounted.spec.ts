@@ -42,7 +42,7 @@ const SCRIPT = {
         },
         // Long enough to queue and leave the chat while turn 1 runs, but
         // under the supervisor's resume idle grace (see
-        // `RESUME_IDLE_GRACE_DEFAULT` in src/acp/acp_client.rs).
+        // `RESUME_IDLE_GRACE_DEFAULT` in src/acp/acp_client/connection.rs).
         { sessionUpdate: "wait_ms", ms: 6_000 },
       ],
       stopReason: "end_turn",

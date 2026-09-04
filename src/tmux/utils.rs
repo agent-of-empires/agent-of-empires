@@ -252,6 +252,32 @@ pub(crate) fn pane_current_command(session_name: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// The terminal title the pane's program published over OSC, for callers
+/// outside the batched poll that reads it as part of [`crate::tmux::PaneMetadata`].
+///
+/// Only `display-message`'s own trailing newline comes off, where the sibling
+/// helpers above trim: the batched read does not trim either, and a title is
+/// matched by `^`-anchored rules, so trimming here would let the same pane
+/// read one way through the poller and another through `aoe session capture`.
+pub(crate) fn pane_title(session_name: &str) -> Option<String> {
+    let target = format!("{session_name}:^.0");
+    crate::tmux::tmux_command()
+        .args(["display-message", "-t", &target, "-p", "#{pane_title}"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| strip_display_delimiter(&s).to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Drop the single newline `display-message -p` appends, and only that one.
+/// Trimming every trailing newline would also eat one the title itself
+/// carried, which is the difference between reporting a title and reporting a
+/// truncated one.
+fn strip_display_delimiter(raw: &str) -> &str {
+    raw.strip_suffix('\n').unwrap_or(raw)
+}
+
 fn pane_start_command_is_protected(session_name: &str) -> bool {
     let target = format!("{session_name}:^.0");
     crate::tmux::tmux_command()
@@ -900,6 +926,51 @@ mod tests {
         assert!(
             !exists,
             "session should be gone after kill_session_if_present"
+        );
+    }
+
+    /// `aoe session capture` reads the pane title through this helper, and the
+    /// only test that covers that path runs an agent with no `osc_title`
+    /// rules: a wrong target here would silently restore the empty title
+    /// #3625 was about.
+    #[test]
+    #[serial_test::serial]
+    fn pane_title_reads_the_panes_published_title() {
+        if !tmux_available() {
+            return;
+        }
+        let name = "aoe_test_pane_title";
+        let _ = crate::tmux::tmux_command()
+            .args(["kill-session", "-t", name])
+            .output();
+        let spawn = crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", name, "sleep", "30"])
+            .status();
+        if !spawn.map(|s| s.success()).unwrap_or(false) {
+            return;
+        }
+        let target = format!("{name}:^.0");
+        let _ = crate::tmux::tmux_command()
+            .args(["select-pane", "-t", &target, "-T", "aoe-title-probe"])
+            .output();
+        let title = pane_title(name);
+        let _ = kill_session_if_present(name);
+        assert_eq!(title.as_deref(), Some("aoe-title-probe"));
+    }
+
+    /// Only the delimiter `display-message` adds comes off. tmux 3.6 will not
+    /// store a newline in a title (`select-pane -T` refuses one and an OSC
+    /// title is sanitized), so this is locked here rather than against a live
+    /// pane, which cannot produce the input.
+    #[test]
+    fn strip_display_delimiter_removes_only_the_delimiter() {
+        assert_eq!(strip_display_delimiter("title\n"), "title");
+        assert_eq!(strip_display_delimiter("title"), "title");
+        assert_eq!(strip_display_delimiter(""), "");
+        assert_eq!(
+            strip_display_delimiter("title\n\n"),
+            "title\n",
+            "a newline the title itself carried must survive"
         );
     }
 }

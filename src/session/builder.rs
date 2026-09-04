@@ -498,7 +498,7 @@ pub fn build_instance(
         std::path::PathBuf::from(&params.path)
     };
     let config =
-        super::repo_config::resolve_config_with_repo(profile, &config_path).unwrap_or_else(|e| {
+        super::config::repo_config::resolve_config_with_repo(profile, &config_path).unwrap_or_else(|e| {
             tracing::warn!(target: "session.create", "Failed to load config, using defaults: {}", e);
             Config::default()
         });
@@ -758,6 +758,13 @@ pub fn build_instance(
         .filter(|a| a.set_default_command)
         .map(|a| a.binary.to_string())
         .unwrap_or_default();
+    if let Some(notice) =
+        crate::agents::get_agent(&params.tool).and_then(crate::agents::AgentDef::lifecycle_notice)
+    {
+        // Non-blocking: deprecated agents still launch; every support path
+        // is unchanged. The warning only informs.
+        tracing::warn!(target: "session.builder", "agent '{}' is {notice}", params.tool);
+    }
     instance.worktree_info = worktree_info;
     instance.workspace_info = workspace_info;
     instance.yolo_mode = params.yolo_mode;
@@ -832,19 +839,10 @@ pub fn build_instance(
             } => {
                 // Structured fork: force the structured view, seed the parent
                 // for the ACP session/fork handshake, and replay history into
-                // the (empty) event store on first connect. The marker fields
-                // live behind the serve feature, so without it a structured
-                // fork is inapplicable and this arm is a no-op. Bind the field
-                // to `_` on bare-core so the destructure reads it without an
-                // `allow(unused_variables)` suppression (AGENTS.md).
-                #[cfg(feature = "serve")]
-                {
-                    instance.view = crate::session::View::Structured;
-                    instance.fork_pending = Some(parent_acp_session_id);
-                    instance.import_pending = Some(true);
-                }
-                #[cfg(not(feature = "serve"))]
-                let _ = parent_acp_session_id;
+                // the (empty) event store on first connect.
+                instance.view = crate::session::View::Structured;
+                instance.fork_pending = Some(parent_acp_session_id);
+                instance.import_pending = Some(true);
             }
         }
     }
@@ -1024,11 +1022,10 @@ pub fn cleanup_instance(
 }
 
 /// Structured-view (ACP) helpers for the TUI create paths. The web create
-/// path does the equivalent inline in `src/server/api/sessions.rs` (it also
+/// path does the equivalent inline in `src/server/api/sessions/create.rs` (it also
 /// handles explicit agent / model / import fields the TUI wizard doesn't
 /// expose), and the CLI in `src/cli/add.rs` with bail-vs-downgrade semantics
 /// keyed on how explicit the user's flag was. Keep the three in sync.
-#[cfg(feature = "serve")]
 pub mod structured {
     use super::Instance;
 
@@ -1038,8 +1035,8 @@ pub mod structured {
     /// inherits a registry-backed base through `[session.agent_detect_as]`
     /// (e.g. a Claude wrapper that only overrides profile/oauth locations).
     /// Mirrors the server create path's capability re-validation; deliberately
-    /// NOT the aoe-agent fallback (`pick_acp_agent_name`), which would make
-    /// every tool look capable.
+    /// NOT the configured-default fallback (`pick_acp_agent_name`), which
+    /// would make every tool look capable.
     pub fn tool_acp_capable(tool: &str, config: &crate::session::Config) -> bool {
         crate::acp::agent_registry::AgentRegistry::with_defaults()
             .get(tool)
@@ -1112,7 +1109,7 @@ pub mod structured {
     /// skipped [`validate_structured_choice`] can't persist a structured
     /// session no agent can serve.
     pub fn apply_structured_choice(instance: &mut Instance) {
-        let config = crate::session::repo_config::resolve_config_with_repo_or_warn(
+        let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
             &instance.source_profile,
             std::path::Path::new(&instance.project_path),
         );
@@ -1552,6 +1549,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_git_sanitize_branch_name_replaces_forbidden_chars() {
         assert_eq!(git_sanitize_branch_name("has spaces"), "has-spaces");
         assert_eq!(git_sanitize_branch_name("a:b?c*d"), "a-b-c-d");
@@ -2192,6 +2190,10 @@ mod tests {
         )
         .unwrap();
         let project = tempfile::tempdir().unwrap();
+        // resolve_config inside build_instance installs this config's
+        // agent_detect_as into the process-global registry; restore the
+        // prior entries afterwards.
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
 
         let result = build_instance(
             custom_agent_params(project.path(), "remote-claude"),
@@ -2222,6 +2224,7 @@ mod tests {
         )
         .unwrap();
         let project = tempfile::tempdir().unwrap();
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
 
         let result = build_instance(
             custom_agent_params(project.path(), "remote-opencode"),
@@ -2329,8 +2332,10 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn build_instance_applies_terminal_fork_seed() {
         use crate::session::ForkSeed;
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
         let params = InstanceParams {
             title: "Forked".into(),
             path: "/tmp".into(),
@@ -2370,10 +2375,11 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "serve")]
     #[test]
+    #[serial_test::serial]
     fn build_instance_applies_structured_fork_seed() {
         use crate::session::ForkSeed;
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
         let params = InstanceParams {
             title: "Forked".into(),
             path: "/tmp".into(),
@@ -2414,6 +2420,49 @@ mod tests {
             inst.resume_intent,
             crate::session::instance::ResumeIntent::Fork { .. }
         ));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn fork_seed_tests_restore_default_profile_registry() {
+        const ALIAS_AGENT: &str = "fork-seed-registry-alias";
+        const RULE_AGENT: &str = "fork-seed-registry-rule";
+        let cases: &[(&str, fn())] = &[
+            ("terminal", build_instance_applies_terminal_fork_seed),
+            ("structured", build_instance_applies_structured_fork_seed),
+        ];
+
+        // serial_test 4's default-key lock is reentrant: the wrapper must call
+        // each serialized test directly to inspect state after its guard drops.
+        for (label, run) in cases {
+            let _cleanup = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
+            let mut sentinels = crate::session::Config::default();
+            sentinels
+                .session
+                .agent_detect_as
+                .insert(ALIAS_AGENT.to_string(), "codex".to_string());
+            sentinels
+                .agents
+                .entry(RULE_AGENT.to_string())
+                .or_default()
+                .status_rules = vec![crate::session::config::StatusRule {
+                status: crate::agents::HookStatus::Running,
+                contains: Some("fork-seed-working".to_string()),
+                regex: None,
+            }];
+            crate::tmux::status_rules::install_from_config("default", &sentinels);
+
+            run();
+
+            let alias = crate::tmux::status_rules::effective_detect_as("default", ALIAS_AGENT, "");
+            let rule =
+                crate::tmux::status_rules::detect("default", RULE_AGENT, "fork-seed-working");
+            assert_eq!(
+                (alias.as_ref(), rule),
+                ("codex", Some(crate::session::Status::Running)),
+                "{label}: fork-seed build must restore the prior alias and compiled rule"
+            );
+        }
     }
 
     #[test]
