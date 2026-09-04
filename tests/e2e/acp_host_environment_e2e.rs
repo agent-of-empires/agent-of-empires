@@ -1,9 +1,10 @@
 //! Full-stack e2e: the configured Host Environment (`Config.environment`)
 //! reaches a non-sandboxed STRUCTURED worker, not just a terminal pane.
 //!
-//! Terminal view prefixes the pane command with the resolved entries
-//! (`host_environment_prefix`), so `CODEX_HOME=... claude` is what a tmux row
-//! runs. The structured path builds its own `SpawnConfig`, and before the fix
+//! Terminal view installs the resolved entries through the protected pane
+//! environment channel (`create_with_size_env`), so `CODEX_HOME=...` reaches the
+//! agent a tmux row runs without ever entering the pane command's argv. The
+//! structured path builds its own `SpawnConfig`, and before the fix
 //! it dropped those entries entirely: a Codex structured worker launched with
 //! no `CODEX_HOME`, fell back to a directory it could not write, and died
 //! during startup.
@@ -26,13 +27,11 @@
 //! reopened for the structured view. It is asserted here rather than in its own
 //! live-daemon test so the coverage costs no extra daemon spawn.
 //!
-//! Compiled only with the `serve` feature (structured view and
-//! `aoe add --structured-view` do not exist otherwise). Run via:
+//! Run via:
 //!
 //! ```sh
-//! cargo test --features serve,e2e-tests --test e2e -- acp_host_environment
+//! cargo test --features e2e-tests --test e2e -- acp_host_environment
 //! ```
-#![cfg(feature = "serve")]
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};

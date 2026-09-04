@@ -9,7 +9,7 @@
 //
 // Icons via lucide-react.
 
-import { ComposerPrimitive, useComposerRuntime, useThreadRuntime } from "@assistant-ui/react";
+import { ComposerPrimitive, useAui, useAuiState } from "@assistant-ui/react";
 import {
   unstable_defaultDirectiveFormatter as defaultDirectiveFormatter,
   type Unstable_TriggerAdapter,
@@ -19,6 +19,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 import { AtSign, ChevronUp, Paperclip, Pencil, Slash, Square, X } from "lucide-react";
 
 import { useFilesIndex, fuzzyFilter } from "./useFilesIndex";
+import { replaceSlashCommand } from "./slashCompletion";
 import { SessionConfigControls } from "./SessionConfigControls";
 import { Tooltip } from "../Tooltip";
 import { ProvenanceBadge } from "../ProvenanceBadge";
@@ -41,7 +42,7 @@ import { clearDraft, clearDraftAttachments, getDraft, setDraft } from "../../lib
 import { isIOS, isStandalone } from "../../lib/platform";
 import { TOUR_ANCHORS, tourAnchor } from "../../lib/tourSteps";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
-import { useAgentProfile } from "../../lib/agentProfileContext";
+import { useAgentProfile, useClearAliases } from "../../lib/agentProfileContext";
 import { resolveModeChannel } from "../../lib/modeChannel";
 import { useFocusTerminalTarget } from "../../hooks/useFocusTerminalTarget";
 import { useDictationBurstGuard } from "./useDictationBurstGuard";
@@ -58,6 +59,11 @@ export {
   type DictationDecision,
   type DictationEvent,
 } from "./useDictationBurstGuard";
+
+/** Live handle onto the composer scope: the slice of `aui.composer` this file
+ *  drives. Replaces the `useComposerRuntime()` hook dropped in
+ *  @assistant-ui/react 0.15. */
+export type ComposerClient = Pick<ReturnType<typeof useAui>["composer"], "getState" | "setText">;
 
 /** Decision returned by {@link decideEnterAction} for an Enter
  *  keystroke on the structured view composer textarea.
@@ -173,30 +179,46 @@ export function decideBeforeInputAction(
  *  the standard iOS accessory-bar height; a device tweak may refine it. */
 export const IOS_ACCESSORY_BAR_PX = 44;
 
-/** Wrapper class + inline style for the composer's outer <div>. When the
- *  soft keyboard is open we drop the bottom padding and apply a negative
- *  bottom margin equal to the App root's safe-area-inset-bottom so the
- *  composer sits flush with the top of the keyboard instead of leaving a
- *  visible gap (the home-indicator inset is physically occluded by the
- *  keyboard anyway). `accessoryBarPx` adds bottom padding that lifts the footer
- *  above the iOS accessory bar (see IOS_ACCESSORY_BAR_PX); it is 0 off iOS-PWA.
+/** Wrapper class + inline style for the composer's outer <div>.
+ *
+ *  Both keyboard states cancel the App root's `safe-area-inset-bottom` padding
+ *  with a negative bottom margin so the composer's background and top border
+ *  reach the physical bottom of the screen. Without this the App root reserves
+ *  its home-indicator inset (~34px) BELOW the composer, leaving a visible empty
+ *  strip under the input on an installed iOS PWA. See #1143 and the
+ *  keyboard-closed bottom-gap fix.
+ *
+ *  The App root no longer reserves the bottom safe-area inset (see
+ *  `.safe-area-inset` in index.css), so the composer sits at the physical
+ *  bottom edge on its own; there is no App-root padding to cancel, hence no
+ *  negative margin.
+ *
+ *  Keyboard CLOSED: just the base `pb-3` gap. The input hugs the bottom (no
+ *  home-indicator reservation, per the user preference for the composer).
+ *
+ *  Keyboard OPEN: drop the bottom padding (the home indicator is occluded by
+ *  the keyboard). `accessoryBarPx` re-adds padding that lifts the footer above
+ *  the iOS predictive/AutoFill accessory bar (see IOS_ACCESSORY_BAR_PX); it is
+ *  0 off iOS-PWA. The keyboard lift itself is handled by the structured-view
+ *  root's `keyboardHeight` padding, not here.
+ *
  *  Extracted as a pure helper so the layout decision can be unit-tested without
- *  mounting the whole composer. See #1143. */
+ *  mounting the whole composer. */
 export function composerWrapperLayout(opts: { keyboardOpen: boolean; accessoryBarPx?: number }): {
   className: string;
   style: React.CSSProperties | undefined;
 } {
   if (!opts.keyboardOpen) {
-    return { className: "border-t border-surface-800 bg-surface-900 px-4 pt-3 pb-3", style: undefined };
+    return {
+      className: "border-t border-surface-800 bg-surface-900 px-4 pt-3 pb-3",
+      style: undefined,
+    };
   }
   const clearance = opts.accessoryBarPx ?? 0;
   return {
     className: "border-t border-surface-800 bg-surface-900 px-4 pt-3 pb-0",
     // Inline paddingBottom overrides pb-0 when we need accessory-bar clearance.
-    style: {
-      marginBottom: "calc(-1 * env(safe-area-inset-bottom))",
-      ...(clearance > 0 ? { paddingBottom: clearance } : {}),
-    },
+    style: clearance > 0 ? { paddingBottom: clearance } : undefined,
   };
 }
 
@@ -295,9 +317,6 @@ interface Props {
    *  #1031). When false the regular ComposerPrimitive.Send path runs as
    *  before. */
   turnActive: boolean;
-  /** Number of items already enqueued for after the current turn.
-   *  Drives the badge on the queue-send button. */
-  queuedCount: number;
   /** Push the composer text straight onto the structured view queue. Bypasses
    *  the ComposerPrimitive.Send path (which assistant-ui hard-disables
    *  while `thread.isRunning && !capabilities.queue`). Used by the
@@ -340,7 +359,6 @@ export function Composer({
   availableCommands,
   connected,
   turnActive,
-  queuedCount,
   enqueuePrompt,
   promptCapabilities,
   pendingAttachments,
@@ -458,13 +476,14 @@ export function Composer({
   );
 
   // Slash commands: built from the agent's AvailableCommandsUpdate, plus
-  // any profile-declared clear aliases the agent doesn't advertise
+  // any server-declared clear aliases the agent doesn't advertise
   // itself (codex / opencode emit `/new` as a UI affordance but their
   // ACP servers don't list it in `available_commands_update`, so the
   // palette would otherwise be missing the very command we detect
-  // server-side as a session-clear boundary). See #1133 + multi-agent
-  // parity follow-up.
-  const profile = useAgentProfile();
+  // server-side as a session-clear boundary). Server-owned via
+  // `SessionResponse.clear_aliases`. See #1133 + multi-agent parity
+  // follow-up.
+  const clearAliases = useClearAliases();
   const slashItems: Unstable_TriggerItem[] = useMemo(() => {
     const advertised = new Set(availableCommands.map((c) => c.name));
     const items: Unstable_TriggerItem[] = availableCommands.map((c) => ({
@@ -474,7 +493,7 @@ export function Composer({
       description: c.description,
       acceptsInput: c.accepts_input,
     }));
-    for (const alias of profile.clearAliases ?? []) {
+    for (const alias of clearAliases) {
       const name = alias.startsWith("/") ? alias.slice(1) : alias;
       if (!name || advertised.has(name)) continue;
       const item = {
@@ -488,7 +507,7 @@ export function Composer({
       advertised.add(name);
     }
     return items;
-  }, [availableCommands, profile]);
+  }, [availableCommands, clearAliases]);
   const slashAdapter: Unstable_TriggerAdapter = useMemo(
     () => ({
       categories: () => [],
@@ -505,7 +524,50 @@ export function Composer({
   // and the SkillToolCard.
   const skillIndex = useSkillIndex();
 
-  const composerRuntime = useComposerRuntime();
+  // 0.15 swapped the stable `useComposerRuntime()` handle for `aui.composer`,
+  // a bound accessor that gets a fresh identity on every store update and
+  // whose `getState()` is the snapshot of the render it came from. The
+  // handlers below are long-lived (a debounced draft writer, keydown recall,
+  // plugin draft ops), so hand them a stable wrapper that always reads
+  // through to the current scope. Without this, an effect keyed on the
+  // accessor tears down on every keystroke and its cleanup persists a stale
+  // draft (#3094 regression).
+  const aui = useAui();
+  const composerRef = useRef(aui.composer);
+  useEffect(() => {
+    composerRef.current = aui.composer;
+  }, [aui]);
+  const composerText = useAuiState((s) => s.composer.text);
+  // The text that draft persistence should write. The store applies `setText`
+  // on a scheduled task, so `getState()` still reports the pre-send text for a
+  // tick after a send clears the composer; a persist racing that window would
+  // put the just-sent prompt back (#3094). This ref is stamped synchronously
+  // by the `setText` wrapper below and reconciled from the store whenever it
+  // actually changes, so it is never behind either source.
+  const draftTextRef = useRef(composerText);
+  useEffect(() => {
+    draftTextRef.current = composerText;
+  }, [composerText]);
+  const composerRuntime = useMemo<ComposerClient>(
+    () => ({
+      getState: () => composerRef.current.getState(),
+      setText: (text: string) => {
+        draftTextRef.current = text;
+        composerRef.current.setText(text);
+      },
+    }),
+    [],
+  );
+
+  // Reactive send-eligibility: the send buttons are grayed out and inert
+  // unless there is something to send, i.e. non-whitespace text OR at least
+  // one supported attachment (an attachment-only prompt is valid, e.g. a
+  // pasted screenshot). Mirrors the guard in `sendFromTextarea`, so clicking
+  // Send with an empty composer can no longer be a silent no-op. The text
+  // lives in the assistant-ui composer store, which 0.15 exposes through the
+  // `useAuiState` selector above rather than a per-scope `subscribe`.
+  const composerHasText = composerText.trim().length > 0;
+  const canSend = composerHasText || supportedPendingAttachments.length > 0;
 
   // ArrowUp/ArrowDown queue recall (shell-history style). recallRef holds
   // the id of the queued prompt currently loaded into the composer plus
@@ -770,25 +832,14 @@ export function Composer({
       });
     }
 
-    let writeTimer: number | null = null;
-    const flush = () => {
-      if (writeTimer !== null) {
-        window.clearTimeout(writeTimer);
-        writeTimer = null;
-      }
-      setDraft(sessionId, composerRuntime.getState().text);
-    };
-    const unsub = composerRuntime.subscribe(() => {
-      if (writeTimer !== null) window.clearTimeout(writeTimer);
-      writeTimer = window.setTimeout(flush, 250);
-    });
     // Page-unload flush. Effect cleanup runs on React unmount (sidebar
     // navigation) but not on a full reload, PWA cold start, or mobile
-    // OS evicting the tab. Without these listeners, whatever sits in
-    // writeTimer at the moment the page dies is lost; on a fast typer
-    // that's the last sentence or two of the draft (#1358).
+    // OS evicting the tab. Without these listeners, whatever the debounce
+    // below is still holding at the moment the page dies is lost; on a fast
+    // typer that's the last sentence or two of the draft (#1358).
     // visibilitychange covers iOS Safari, which fires pagehide only on
     // real unload, not on app-switch.
+    const flush = () => setDraft(sessionId, draftTextRef.current);
     const onHidden = () => {
       if (document.visibilityState === "hidden") flush();
     };
@@ -796,13 +847,23 @@ export function Composer({
     window.addEventListener("pagehide", flush);
     document.addEventListener("visibilitychange", onHidden);
     return () => {
-      unsub();
       window.removeEventListener("beforeunload", flush);
       window.removeEventListener("pagehide", flush);
       document.removeEventListener("visibilitychange", onHidden);
       flush();
     };
   }, [composerRuntime, sessionId]);
+
+  // Debounced mirror of the live composer text. Re-running on each edit is
+  // the debounce: the cleanup cancels the pending write before the next one
+  // is scheduled. Kept separate from the effect above so the unload listeners
+  // and its unmount flush survive individual keystrokes. The value is read at
+  // fire time, not captured, so a write scheduled just before a send persists
+  // the cleared text rather than resurrecting the sent prompt.
+  useEffect(() => {
+    const writeTimer = window.setTimeout(() => setDraft(sessionId, draftTextRef.current), 250);
+    return () => window.clearTimeout(writeTimer);
+  }, [composerText, sessionId]);
 
   // Claim focus on mount, then re-claim a couple of times if focus fell to
   // <body> (some surfaces grab and release focus shortly after mount). Only
@@ -902,7 +963,7 @@ export function Composer({
               className="absolute bottom-full left-0 right-0 mb-2 z-30 overflow-hidden rounded-lg border border-surface-700 bg-surface-850 shadow-xl"
             >
               <ComposerPrimitive.Unstable_TriggerPopover.Action
-                onExecute={(item) => insertSlashCommand(composerRuntime, item)}
+                onExecute={(item) => insertSlashCommand(taRef, item)}
                 removeOnExecute
               />
               <PopoverItems trigger="/" skillIndex={skillIndex} />
@@ -1196,12 +1257,12 @@ export function Composer({
                     <QueueSendButton
                       connected={connected}
                       steering={!!promptCapabilities?.steering}
-                      queuedCount={queuedCount}
+                      disabled={!canSend}
                       onSend={submitComposer}
                     />
                   </>
                 ) : (
-                  <SendButton connected={connected} onSend={submitComposer} />
+                  <SendButton connected={connected} disabled={!canSend} onSend={submitComposer} />
                 )}
               </div>
             </div>
@@ -1278,25 +1339,55 @@ function PopoverItems({ trigger, skillIndex }: { trigger: string; skillIndex?: S
   );
 }
 
-/** Insert the picked slash command into the composer text. The Action
- *  popover already stripped the user's `/<typed>` from the input via
- *  `removeOnExecute`, so we set the canonical `/<name>` form and add
- *  a trailing space. The trailing space halts assistant-ui's
- *  `detectTrigger` backward scan (which keys off whitespace as the
- *  trigger boundary) so the popover does not immediately re-open on
- *  the inserted `/<name>` and consume the next Enter as a re-pick;
- *  it also positions the cursor for free-form arg typing when the
- *  agent advertised the command as `acceptsInput=true`. See #1512. */
-export function insertSlashCommand(runtime: ReturnType<typeof useComposerRuntime>, item: Unstable_TriggerItem) {
-  if (!runtime) return;
-  const current = runtime.getState().text;
-  const suffix = " ";
-  // Preserve any text that was already in the buffer (e.g. user typed
-  // a long prompt then ran `/foo` mid-message). We just append the
-  // command at the end; the typed `/typed` token has already been
-  // removed by removeOnExecute, so trailing whitespace is rare.
-  const sep = current.length > 0 && !current.endsWith(" ") ? " " : "";
-  runtime.setText(`${current}${sep}/${item.id}${suffix}`);
+/** Write the picked slash command into the composer, replacing the
+ *  `/token` the caret sits in (or inserting at the caret when there is
+ *  no token, the toolbar-button path).
+ *
+ *  Goes through the DOM rather than `runtime.setText` on purpose.
+ *  assistant-ui keeps its own cursor position for trigger detection and
+ *  only advances it from composer input events, so a bare `setText`
+ *  moves the text out from under a stale cursor: detection keeps
+ *  matching the old prefix, the popover never closes, and its keyboard
+ *  handler claims the next Enter and re-picks with a stale trigger
+ *  range, which is how `/address-pr-comments` came back as
+ *  `ess-pr-comments /address-pr-comments` (#3418). Writing through the
+ *  textarea and dispatching a real `InputEvent` makes
+ *  `ComposerPrimitive.Input`'s own `onChange` apply the text and the
+ *  caret together, in one handler.
+ *
+ *  The trailing space `replaceSlashCommand` leaves after the command is
+ *  what keeps detection from re-firing on the text we just wrote, for
+ *  no-arg commands as much as for ones taking arguments (#1512).
+ *
+ *  Runs after the popover's `removeOnExecute` strip, which rebuilds the
+ *  buffer from its own trigger snapshot; ours is the last write in
+ *  `selectItem`, so it is the one that lands. */
+export function insertSlashCommand(ref: React.RefObject<HTMLTextAreaElement | null>, item: Unstable_TriggerItem) {
+  const ta = ref.current;
+  if (!ta) return;
+  const caret = ta.selectionStart ?? ta.value.length;
+  const { text, cursor } = replaceSlashCommand(ta.value, caret, ta.selectionEnd ?? caret, item.id);
+  writeComposerValue(ta, text, cursor, "insertText", `/${item.id}`);
+}
+
+/** Replace the textarea's value the way a keystroke would, so
+ *  assistant-ui picks it up.
+ *
+ *  Uses the native `value` setter because React patches its own on the
+ *  instance, and dispatches an `InputEvent` carrying `inputType` and
+ *  `data` because the trigger popover keys off those fields (#1149).
+ *
+ *  The caret is set BEFORE the dispatch: `ComposerPrimitive.Input`'s
+ *  `onChange` reads `selectionStart` in the same handler that applies
+ *  the text, and assigning `value` parks the caret at the end, so
+ *  dispatching first hands the popover a cursor pointing past the text
+ *  it is about to detect against. */
+function writeComposerValue(ta: HTMLTextAreaElement, next: string, caret: number, inputType: string, data?: string) {
+  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+  setter?.call(ta, next);
+  ta.focus();
+  ta.setSelectionRange(caret, caret);
+  ta.dispatchEvent(new InputEvent("input", { bubbles: true, inputType, ...(data === undefined ? {} : { data }) }));
 }
 
 /** Insert a literal "\n" at the textarea's caret. Used by the
@@ -1314,17 +1405,7 @@ export function insertNewlineAtCaret(ref: React.RefObject<HTMLTextAreaElement | 
   const end = ta.selectionEnd ?? start;
   const before = ta.value.slice(0, start);
   const after = ta.value.slice(end);
-  const next = `${before}\n${after}`;
-  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
-  setter?.call(ta, next);
-  ta.dispatchEvent(
-    new InputEvent("input", {
-      bubbles: true,
-      inputType: "insertLineBreak",
-    }),
-  );
-  const pos = before.length + 1;
-  ta.setSelectionRange(pos, pos);
+  writeComposerValue(ta, `${before}\n${after}`, before.length + 1, "insertLineBreak");
 }
 
 /** Insert `text` at the textarea's caret and re-focus. The toolbar
@@ -1348,36 +1429,14 @@ export function insertAtCaret(ref: React.RefObject<HTMLTextAreaElement | null>, 
   // the trigger char; pad if we're mid-word.
   const needsSpace = before.length > 0 && !/[\s\n\t]$/.test(before) ? " " : "";
   const next = before + needsSpace + text + ta.value.slice(end);
-  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
-  setter?.call(ta, next);
-  ta.dispatchEvent(
-    new InputEvent("input", {
-      bubbles: true,
-      inputType: "insertText",
-      data: text,
-    }),
-  );
-  const pos = before.length + needsSpace.length + text.length;
-  ta.focus();
-  ta.setSelectionRange(pos, pos);
+  writeComposerValue(ta, next, before.length + needsSpace.length + text.length, "insertText", text);
 }
 
 function insertRawTextAtCaret(ta: HTMLTextAreaElement, text: string, replaceSelection: boolean) {
   const start = ta.selectionStart ?? ta.value.length;
   const end = replaceSelection ? (ta.selectionEnd ?? start) : start;
   const next = ta.value.slice(0, start) + text + ta.value.slice(end);
-  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
-  setter?.call(ta, next);
-  ta.dispatchEvent(
-    new InputEvent("input", {
-      bubbles: true,
-      inputType: "insertText",
-      data: text,
-    }),
-  );
-  const pos = start + text.length;
-  ta.focus();
-  ta.setSelectionRange(pos, pos);
+  writeComposerValue(ta, next, start + text.length, "insertText", text);
   ta.style.height = "auto";
   ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
 }
@@ -1626,7 +1685,15 @@ function formatCost(amount: number, currency: string): string {
 
 /* ── Send / Stop ─────────────────────────────────────────────────── */
 
-function SendButton({ connected = true, onSend }: { connected?: boolean; onSend: () => void }) {
+function SendButton({
+  connected = true,
+  disabled = false,
+  onSend,
+}: {
+  connected?: boolean;
+  disabled?: boolean;
+  onSend: () => void;
+}) {
   // When the session is inactive (WS closed, worker stopped, worker
   // restarting) we leave the button clickable: `sendPrompt` routes the
   // text into the local queue and the drain effect fires it on resume.
@@ -1634,7 +1701,15 @@ function SendButton({ connected = true, onSend }: { connected?: boolean; onSend:
   // sent. A custom button (not ComposerPrimitive.Send) drives submit so
   // the staged attachments ride along and an attachment-only prompt can
   // send even with empty text. See #1359 / #1000.
-  const title = connected ? "Send, Enter" : "Session not active, will send on resume";
+  //
+  // `disabled` grays it out and blocks the click when there is nothing to
+  // send (empty text, no attachments), so an empty click is no longer a
+  // silent no-op.
+  const title = disabled
+    ? "Type a message to send"
+    : connected
+      ? "Send, Enter"
+      : "Session not active, will send on resume";
   const label = connected ? "Send message" : "Queue message until session resumes";
   return (
     <button
@@ -1642,11 +1717,12 @@ function SendButton({ connected = true, onSend }: { connected?: boolean; onSend:
       aria-label={label}
       title={title}
       onClick={onSend}
+      disabled={disabled}
       className={[
         "group/send inline-flex items-center justify-center gap-1",
         "rounded-lg bg-brand-600 px-2.5 py-1.5 text-white shadow-sm",
-        "hover:bg-brand-500 active:scale-[0.98]",
         "transition-all duration-100",
+        disabled ? "cursor-not-allowed opacity-40" : "hover:bg-brand-500 active:scale-[0.98]",
       ].join(" ")}
     >
       <PaperPlaneIcon />
@@ -1655,13 +1731,13 @@ function SendButton({ connected = true, onSend }: { connected?: boolean; onSend:
 }
 
 function StopButton() {
-  const runtime = useThreadRuntime();
+  const aui = useAui();
   return (
     <button
       type="button"
       aria-label="Stop"
       title="Stop the agent"
-      onClick={() => runtime.cancelRun()}
+      onClick={() => aui.thread.cancelRun()}
       className={[
         "inline-flex items-center justify-center gap-1.5",
         "rounded-lg border border-surface-600 bg-surface-800",
@@ -1687,26 +1763,29 @@ function StopButton() {
 function QueueSendButton({
   connected,
   steering,
-  queuedCount,
+  disabled = false,
   onSend,
 }: {
   connected: boolean;
   steering: boolean;
-  queuedCount: number;
+  disabled?: boolean;
   onSend: () => void;
 }) {
   // A steerable agent takes the message into the turn already running,
   // so the queue-after copy would be wrong. Disconnected still wins:
   // steering does nothing for a prompt that cannot reach the daemon,
   // and those really do park. See #2805.
-  const title = !connected
-    ? queuedCount > 0
-      ? `Queue follow-up (${queuedCount} pending), will send on resume, Enter`
-      : "Queue follow-up, will send on resume, Enter"
-    : steering
-      ? "Send into the current turn, Enter"
-      : queuedCount > 0
-        ? `Queue follow-up (${queuedCount} pending), Enter`
+  //
+  // No queue-count badge here: the QueuedPromptsStrip above the composer
+  // already lists the queued items and their count, so a badge on this
+  // button just duplicated it. `disabled` grays it out when there is nothing
+  // to queue (empty composer, no attachments).
+  const title = disabled
+    ? "Type a message to queue"
+    : !connected
+      ? "Queue follow-up, will send on resume, Enter"
+      : steering
+        ? "Send into the current turn, Enter"
         : "Queue follow-up (sent when current turn ends), Enter";
   return (
     <button
@@ -1715,26 +1794,15 @@ function QueueSendButton({
       {...tourAnchor(TOUR_ANCHORS.queueSend)}
       title={title}
       onClick={onSend}
+      disabled={disabled}
       className={[
         "group/send relative inline-flex items-center justify-center gap-1",
         "rounded-lg bg-brand-600 px-2.5 py-1.5 text-white shadow-sm",
-        "hover:bg-brand-500 active:scale-[0.98]",
         "transition-all duration-100",
+        disabled ? "cursor-not-allowed opacity-40" : "hover:bg-brand-500 active:scale-[0.98]",
       ].join(" ")}
     >
       <PaperPlaneIcon />
-      {queuedCount > 0 && (
-        <span
-          aria-hidden
-          className={[
-            "absolute -right-1.5 -top-1.5 inline-flex h-4 min-w-[16px] items-center justify-center",
-            "rounded-full bg-sky-500 px-1 text-[10px] font-semibold text-surface-900",
-            "ring-2 ring-surface-900",
-          ].join(" ")}
-        >
-          {queuedCount}
-        </span>
-      )}
     </button>
   );
 }
@@ -1744,7 +1812,7 @@ function QueueSendButton({
  *  button and the Enter-while-running keyboard handler. */
 function sendFromTextarea(
   taRef: React.RefObject<HTMLTextAreaElement | null>,
-  composerRuntime: ReturnType<typeof useComposerRuntime>,
+  composerRuntime: ComposerClient,
   enqueuePrompt: (text: string, attachments?: PromptAttachmentInput[]) => void | Promise<void>,
   sessionId: string,
   attachments: PromptAttachmentInput[] = [],

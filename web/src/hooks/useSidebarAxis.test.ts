@@ -21,6 +21,12 @@ describe("useSidebarAxis", () => {
     expect(result.current[0]).toBe("repo");
   });
 
+  it("hydrates from a stored 'org' value (#3283)", () => {
+    window.localStorage.setItem(SIDEBAR_AXIS_KEY, "org");
+    const { result } = renderHook(() => useSidebarAxis());
+    expect(result.current[0]).toBe("org");
+  });
+
   it("hydrates from a stored 'group' value", () => {
     window.localStorage.setItem(SIDEBAR_AXIS_KEY, "group");
     const { result } = renderHook(() => useSidebarAxis());
@@ -48,6 +54,17 @@ describe("useSidebarAxis", () => {
 
     expect(result.current[0]).toBe("group");
     expect(window.localStorage.getItem(SIDEBAR_AXIS_KEY)).toBe("group");
+  });
+
+  it("setter persists the 'org' axis (#3283)", () => {
+    const { result } = renderHook(() => useSidebarAxis());
+
+    act(() => {
+      result.current[1]("org");
+    });
+
+    expect(result.current[0]).toBe("org");
+    expect(window.localStorage.getItem(SIDEBAR_AXIS_KEY)).toBe("org");
   });
 
   it("setter persists the 'repo+group' axis (#1720)", () => {

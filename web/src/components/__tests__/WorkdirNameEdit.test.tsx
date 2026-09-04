@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { useRef, type ReactNode } from "react";
 
-import { reportError } from "../../lib/toastBus";
+import { reportError, reportInfo } from "../../lib/toastBus";
 import { DragSuppressContext, SessionRow, type RowBulkApi } from "../WorkspaceSidebar";
 
 // Single-row stub for the bulk-triage bridge; this harness mounts one
@@ -85,6 +85,8 @@ const fetchSpy = vi.fn<typeof fetch>();
 
 beforeEach(() => {
   fetchSpy.mockReset();
+  vi.mocked(reportError).mockClear();
+  vi.mocked(reportInfo).mockClear();
   vi.stubGlobal("fetch", fetchSpy);
   fetchSpy.mockImplementation(
     async () =>
@@ -179,6 +181,32 @@ describe("sidebar Edit workdir name", () => {
     expect(JSON.parse(init?.body as string)).toEqual({ title: "new title" });
   });
 
+  it("surfaces warnings returned by a successful inline rename", async () => {
+    fetchSpy.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          id: "s1",
+          warnings: ["Session was saved, but its live tmux session could not be rekeyed"],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+    openMenu(workspace("w", [session()]));
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-rename"));
+    fireEvent.change(screen.getByTestId("sidebar-rename-input"), {
+      target: { value: "new title" },
+    });
+    fireEvent.keyDown(screen.getByTestId("sidebar-rename-input"), {
+      key: "Enter",
+    });
+
+    await vi.waitFor(() =>
+      expect(reportInfo).toHaveBeenCalledWith("Session was saved, but its live tmux session could not be rekeyed"),
+    );
+    // Non-fatal: the rename itself succeeded, so it must not surface as an error.
+    expect(reportError).not.toHaveBeenCalled();
+  });
+
   it("surfaces the server message when a tied rename is rejected (#1927)", async () => {
     fetchSpy.mockImplementation(
       async () =>
@@ -200,6 +228,22 @@ describe("sidebar Edit workdir name", () => {
     });
 
     await vi.waitFor(() => expect(reportError).toHaveBeenCalledWith("Stop the session before renaming it."));
+  });
+
+  it("surfaces a fallback when inline rename has no server message", async () => {
+    fetchSpy.mockRejectedValueOnce(new Error("network unavailable"));
+    openMenu(workspace("w", [session()]));
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-rename"));
+    fireEvent.change(screen.getByTestId("sidebar-rename-input"), {
+      target: { value: "new title" },
+    });
+    fireEvent.keyDown(screen.getByTestId("sidebar-rename-input"), {
+      key: "Enter",
+    });
+
+    await vi.waitFor(() =>
+      expect(reportError).toHaveBeenCalledWith("Could not rename this session. Please try again."),
+    );
   });
 
   it("surfaces the server validation message on failure", async () => {

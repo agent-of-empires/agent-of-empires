@@ -17,7 +17,7 @@ use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use crate::session::settings_schema::{OptionSource, SelectOption};
+use crate::session::config::settings_schema::{OptionSource, SelectOption};
 
 use super::super::AppState;
 
@@ -111,14 +111,28 @@ async fn acp_agent_options(profile: &str) -> Vec<SelectOption> {
     // valid ACP adapter. Config IO runs off the async runtime.
     let profile = profile.to_string();
     let custom = tokio::task::spawn_blocking(move || {
-        crate::session::profile_config::resolve_config_or_warn(&profile)
-            .session
+        let session =
+            crate::session::config::profile_config::resolve_config_or_warn(&profile).session;
+        let detect_as = &session.agent_detect_as;
+        session
             .agent_acp_cmd
-            .into_iter()
+            .iter()
             .filter(|(name, cmd)| {
                 !name.is_empty() && crate::acp::AgentSpec::from_acp_cmd(name, cmd).is_ok()
             })
-            .map(|(name, _)| name)
+            .map(|(name, _)| name.clone())
+            // Plus custom agents that inherit a registry-backed base via
+            // `agent_detect_as` (e.g. a Claude wrapper); they run in structured
+            // view through the base adapter.
+            .chain(
+                detect_as
+                    .keys()
+                    .filter(|name| {
+                        !name.is_empty()
+                            && crate::acp::inherited_acp_base(name, detect_as).is_some()
+                    })
+                    .cloned(),
+            )
             .collect::<Vec<_>>()
     })
     .await

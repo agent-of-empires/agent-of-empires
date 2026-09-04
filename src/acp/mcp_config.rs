@@ -1,9 +1,9 @@
 //! ACP boundary for MCP server forwarding.
 //!
 //! Parsing, layering, provenance, and the precedence merge all live in the
-//! always-compiled `session::mcp_model` resolver, which the unified management
-//! surface (#1996), the CLI, and the TUI also read. This serve-gated module is
-//! the thin edge that converts the resolver's winning set into ACP `McpServer`
+//! always-compiled `session::mcp::mcp_model` resolver, which the unified management
+//! surface (#1996), the CLI, and the TUI also read. This module is the thin
+//! edge that converts the resolver's winning set into ACP `McpServer`
 //! wire values and drops any transport the agent did not advertise. Sharing one
 //! resolver across forwarding and display guarantees what the user sees equals
 //! what the agent receives.
@@ -15,10 +15,10 @@ use agent_client_protocol::schema::v1::{
 use std::collections::BTreeMap;
 use tracing::warn;
 
-use crate::session::project_mcp::{ProjectMcpServer, ProjectMcpTransport};
+use crate::session::mcp::project_mcp::{ProjectMcpServer, ProjectMcpTransport};
 
 /// Convert resolved, transport-typed servers (parsed and merged by
-/// `session::mcp_model`) into ACP `McpServer` values for forwarding through
+/// `session::mcp::mcp_model`) into ACP `McpServer` values for forwarding through
 /// `session/new` and `session/load`. The caller passes the winning set of the
 /// precedence merge, so the converted list is exactly what reaches the agent.
 pub fn project_servers_to_acp(servers: Vec<ProjectMcpServer>) -> Vec<McpServer> {
@@ -107,7 +107,7 @@ fn server_kind(server: &McpServer) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::project_mcp::parse_standard_mcp_servers;
+    use crate::session::mcp::project_mcp::parse_standard_mcp_servers;
 
     fn names(servers: &[McpServer]) -> Vec<&str> {
         servers.iter().map(server_name).collect()

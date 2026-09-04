@@ -34,6 +34,11 @@ export interface WizardData {
   /** Additional repo paths to include in the multi-repo workspace.
    *  Free-text paths and registered project paths flow into the same list. */
   extraRepoPaths: string[];
+  /** Base branch per extra repo, keyed by that repo's path. Outranks
+   *  `baseBranch`, which stays the base for every repo with no entry here,
+   *  so one repo can fork from develop while another forks from its own
+   *  epic branch. See #3329. */
+  repoBases: Record<string, string>;
   advancedEnabled: boolean;
   customInstruction: string;
   extraArgs: string;
@@ -59,7 +64,7 @@ export interface WizardData {
    *  can turn it off in AgentStep to launch a tmux/terminal session. The
    *  submit path sends `view: "structured"` only when the tool is
    *  ACP-capable and this flag is set; the server re-validates
-   *  capability (src/server/api/sessions.rs). Intentionally not
+   *  capability (src/server/api/sessions/create.rs). Intentionally not
    *  tracked in `profileDirty` (see SET_FIELD) and not persisted: a
    *  remembered opt-out would silently override the per-session default. */
   useStructuredView: boolean;
@@ -130,6 +135,7 @@ export const initialData: WizardData = {
   sandboxImage: "",
   extraEnv: [],
   extraRepoPaths: [],
+  repoBases: {},
   advancedEnabled: false,
   profileDirty: false,
   customInstruction: "",
@@ -162,6 +168,7 @@ export function reducer(state: WizardState, action: Action): WizardState {
       if (action.field === "scratch" && action.value === true) {
         newData.path = "";
         newData.extraRepoPaths = [];
+        newData.repoBases = {};
         newData.useWorktree = false;
         // Clear a stale non-repo probe result too, so toggling scratch back
         // off doesn't show "not a git repository" for a not-yet-chosen path.

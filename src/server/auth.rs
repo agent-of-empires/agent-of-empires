@@ -854,7 +854,6 @@ pub async fn auth_middleware(
         source = ?source,
         "auth accepted via token (bootstrap)"
     );
-    state.touch_web_activity();
     if let Some(hash) = matched_token_hash {
         request
             .extensions_mut()
@@ -940,7 +939,6 @@ async fn handle_session_authenticated(
         path = %request.uri().path(),
         "auth accepted via session+binding"
     );
-    state.touch_web_activity();
 
     let owner_hash = match state.token_manager.current_token().await {
         Some(t) => super::push::sha256_token(&t),
@@ -1519,9 +1517,6 @@ mod tests {
         use crate::server::login::{LoginManager, SESSION_LIFETIME};
         use std::time::Duration;
 
-        // Direct pin on the server-side TTL. Any future edit that
-        // shortens this without updating the test (and the docs in
-        // `docs/guides/remote-phone-access.md`) will fail here.
         assert_eq!(
             SESSION_LIFETIME,
             Duration::from_secs(30 * 24 * 60 * 60),

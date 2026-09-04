@@ -305,6 +305,14 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
       sandbox_image: d.sandboxEnabled ? d.sandboxImage : undefined,
       extra_env: d.sandboxEnabled && d.extraEnv.length > 0 ? d.extraEnv.filter(Boolean) : undefined,
       extra_repo_paths: !d.scratch && d.extraRepoPaths.length > 0 ? d.extraRepoPaths : undefined,
+      // Only repos still selected, and only when aoe is creating the branch:
+      // a base is meaningless when attaching to an existing one. See #3329.
+      repo_bases:
+        !d.scratch && d.useWorktree && !d.attachExisting
+          ? d.extraRepoPaths
+              .map((p) => ({ repo: p, base_branch: (d.repoBases[p] ?? "").trim() }))
+              .filter((r) => r.base_branch)
+          : undefined,
       extra_args: d.extraArgs || undefined,
       command_override: d.commandOverride || undefined,
       custom_instruction: d.customInstruction || undefined,
@@ -314,7 +322,7 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
       // the server's per-agent
       // `acp_capable` flag (including custom agents with an
       // `agent_acp_cmd`) with hardcoded fallback while loading. The
-      // server re-resolves capability (see src/server/api/sessions.rs),
+      // server re-resolves capability (see src/server/api/sessions/create.rs),
       // so a tampered request can't escalate structured view on for a
       // non-capable agent.
       view: selectedAgentAcpCapable && d.useStructuredView ? "structured" : "terminal",

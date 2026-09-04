@@ -138,7 +138,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --features serve --target ${{ matrix.target }}
+        run: cargo build --release --features web --target ${{ matrix.target }}
 
       - name: Verify Linux binary glibc floor
         if: matrix.container != ''
@@ -200,7 +200,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install git-cliff
-        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2.85.2
+        uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2.86.7
         with:
           tool: git-cliff
 

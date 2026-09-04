@@ -41,7 +41,6 @@ function HarnessComposer({ sessionId }: { sessionId: string }) {
         availableCommands={[]}
         connected
         turnActive={false}
-        queuedCount={0}
         enqueuePrompt={() => {}}
         promptCapabilities={null}
         pendingAttachments={[]}

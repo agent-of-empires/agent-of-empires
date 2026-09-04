@@ -13,7 +13,7 @@ use agent_of_empires::acp::acp_client::{AcpClient, SpawnConfig};
 use agent_of_empires::acp::agent_registry::AgentSpec;
 use agent_of_empires::acp::mcp_config;
 use agent_of_empires::acp::state::AcpSessionId;
-use agent_of_empires::session::mcp_model::{self, McpLayer, McpProvenance};
+use agent_of_empires::session::mcp::mcp_model::{self, McpLayer, McpProvenance};
 
 use crate::common::{shim_path, shim_ready};
 
@@ -22,6 +22,7 @@ use crate::common::{shim_path, shim_ready};
 fn base_config(cwd: std::path::PathBuf, record_path: &std::path::Path) -> SpawnConfig {
     let shim = shim_path();
     SpawnConfig {
+        wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {

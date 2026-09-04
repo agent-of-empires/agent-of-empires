@@ -167,21 +167,6 @@ describe("useMobileKeyboard", () => {
     expect(result.current.keyboardHeight).toBe(0);
   });
 
-  it("snaps stray layout-viewport scroll back to the top on measure", () => {
-    stubMatchMedia(true);
-    const vp = stubVisualViewport(800);
-    Object.defineProperty(window, "scrollY", { configurable: true, value: 120, writable: true });
-
-    renderHook(() => useMobileKeyboard());
-
-    act(() => {
-      vp.fire("scroll");
-      drainRaf();
-    });
-
-    expect(window.scrollTo).toHaveBeenCalledWith(0, 0);
-  });
-
   it("starts polling when a text input gains focus", () => {
     stubMatchMedia(true);
     const vp = stubVisualViewport(800);

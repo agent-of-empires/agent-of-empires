@@ -69,7 +69,7 @@ pub enum ResumeStrategy {
     /// The subcommand + id are inserted right after the binary name so that
     /// other flags land after it.
     Subcommand(&'static str),
-    /// Agent does not support session resume.
+    /// AoE must not emit resume arguments for this agent.
     Unsupported,
 }
 
@@ -89,6 +89,75 @@ pub enum ForkStrategy {
     Flag(&'static str),
     /// Agent cannot fork a session.
     Unsupported,
+}
+
+/// Lifecycle state of an agent CLI in the registry. Data-only: it never
+/// gates spawning, resume, hook installs, or any other support path; every
+/// surface that lists or launches an agent renders the state alongside it
+/// (CLI listings, doctor, spawn warnings, TUI picker badge, dashboard).
+///
+/// Wire mirror: `web/src/lib/types.ts` (`AgentLifecycleInfo`, served by
+/// `/api/agents` and `/api/acp/agents`) and the static fallback mirror in
+/// `web/src/lib/agentProfiles.ts`. When adding a variant, update both TS
+/// files and give the variant an arm in [`AgentDef::lifecycle_label`] in
+/// the same change: the closed `"state"` union on the TS side and that
+/// match arm are the two places a new variant does not fail compilation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum AgentLifecycle {
+    /// Fully supported upstream; nothing to surface.
+    Active,
+    /// Still functional in AoE but deprecated upstream. Support (detection,
+    /// status, resume, hooks) is unchanged; the notice travels with the
+    /// agent everywhere it appears.
+    Deprecated {
+        /// ISO date (`YYYY-MM-DD`) the deprecation took effect upstream.
+        since: &'static str,
+        /// One-line human-facing reason.
+        note: &'static str,
+        /// Canonical registry name of a suggested replacement, when one exists.
+        replacement: Option<&'static str>,
+    },
+}
+
+impl AgentLifecycle {
+    /// True for the plain [`AgentLifecycle::Active`] default. Used by
+    /// serializers to omit the field for active agents so the common case
+    /// keeps its wire shape.
+    pub fn is_active(&self) -> bool {
+        matches!(self, AgentLifecycle::Active)
+    }
+
+    /// Full one-line notice for any non-active state; `None` while Active.
+    /// The single rendering entry point for CLI listings and spawn
+    /// warnings, so a future variant automatically surfaces its Display
+    /// everywhere without per-site match updates.
+    pub fn notice(&self) -> Option<String> {
+        if self.is_active() {
+            None
+        } else {
+            Some(self.to_string())
+        }
+    }
+}
+
+impl std::fmt::Display for AgentLifecycle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AgentLifecycle::Active => write!(f, "active"),
+            AgentLifecycle::Deprecated {
+                since,
+                note,
+                replacement,
+            } => {
+                write!(f, "deprecated since {since}: {note}")?;
+                match replacement {
+                    Some(name) => write!(f, "; consider switching to {name}"),
+                    None => Ok(()),
+                }
+            }
+        }
+    }
 }
 
 /// A single hook event that AoE registers in an agent's settings file.
@@ -263,7 +332,7 @@ pub struct AgentDef {
     pub binary: &'static str,
     /// Subcommand token inserted immediately after `binary` when AoE builds the
     /// default launch command (e.g. `Some("chat")` for kiro → `kiro-cli chat`).
-    /// Required for CLIs whose interactive flags (yolo, `--agent`, resume) live
+    /// Required for CLIs whose interactive flags (yolo, `--agent`) live
     /// on a subcommand rather than the top-level binary: bare
     /// `kiro-cli --trust-all-tools` is rejected with "unexpected argument",
     /// while `kiro-cli chat --trust-all-tools` parses. `None` for agents whose
@@ -319,6 +388,16 @@ pub struct AgentDef {
     /// newlines within a paste rather than as "submit". A delay longer than the
     /// agent's burst window lets the suppression expire before Enter arrives.
     pub send_keys_enter_delay_ms: u64,
+    /// Pane-content substring (matched case-insensitively) that indicates
+    /// this agent's TUI has finished booting and is ready to accept input,
+    /// if known. `None` means no such per-agent signal is known yet;
+    /// callers fall back to a generic content-settle heuristic
+    /// (`tmux::Session::wait_until_content_settles`), which cannot tell a
+    /// genuinely idle prompt from a still-booting pane that merely hasn't
+    /// printed anything new in the last couple of samples. Used to avoid
+    /// typing into a pane before the agent is actually listening (see `aoe
+    /// send`'s pre-send wait).
+    pub ready_marker: Option<&'static str>,
     /// One-line install command shown when the agent is missing from PATH.
     pub install_hint: &'static str,
     /// Static keystroke sequences for answering this agent's own interactive
@@ -328,6 +407,10 @@ pub struct AgentDef {
     /// `docs/development/adding-agents.md` for how to determine these
     /// sequences for a new agent.
     pub permission_response: Option<PermissionResponse>,
+    /// Lifecycle state (active, deprecated, ...). Data-only: rendered by the
+    /// agent-facing surfaces (`aoe agents`, `aoe acp doctor`, spawn warnings,
+    /// TUI picker badge, dashboard), never consulted by support paths.
+    pub lifecycle: AgentLifecycle,
 }
 
 /// A tmux keystroke: either literal text sent verbatim (e.g. a menu digit) or
@@ -374,17 +457,17 @@ pub struct PermissionResponse {
 /// "done working, waiting for the user" signal and fires whenever Claude parks
 /// at the prompt regardless of why the turn ended, so it backstops `Stop`;
 /// `StopFailure` covers the API-error path deterministically. The remaining
-/// gap (silent tool stop) has no hook, so it is recovered pane-side by
-/// `reconcile_claude_hook_status`.
+/// gap (silent tool stop) has no hook, so it is recovered pane-side by the
+/// parked-evidence rules in `detect/manifests/claude.toml`.
 ///
 /// The `idle_prompt` backstop also introduces a write race: `Stop` and
 /// `UserPromptSubmit` hooks are awaited, but `Notification` hooks are
 /// fire-and-forget, so when a queued prompt submits the moment a turn ends,
 /// the notification's `idle` write can land after `UserPromptSubmit`'s
 /// `running`, leaving the file on `idle` while the new turn generates (no
-/// running-mapped hook fires again until its first `PreToolUse`). An `idle`
-/// read on a session last observed Running/Waiting is therefore reconciled
-/// against the pane (`reconcile_claude_idle_hook_status`).
+/// running-mapped hook fires again until its first `PreToolUse`). The pane's
+/// own running evidence outranks an `idle` write in the detection manifest,
+/// which is what recovers that race.
 ///
 /// The `Notification` matchers also carry the agent-view identifiers added in
 /// Claude Code 2.1.198: `agent_needs_input` (background session blocked on the
@@ -400,8 +483,8 @@ pub struct PermissionResponse {
 /// makes the status command write `waiting` when the payload's `tool_name` is
 /// `AskUserQuestion`, and the `PostToolUse` matcher restores `running` the
 /// moment the answer lands (the rest of the turn is ordinary generation). The
-/// pane-side `reconcile_claude_hook_status` stays as the backstop for hooks
-/// installed before this pair existed.
+/// pane-side detection rules stay as the backstop for hooks installed before
+/// this pair existed.
 const CLAUDE_HOOK_EVENTS: &[HookEvent] = &[
     HookEvent {
         name: "SessionStart",
@@ -713,13 +796,22 @@ pub const AGENTS: &[AgentDef] = &[
         },
         fork_strategy: ForkStrategy::ClaudeFork,
         host_only: false,
-        send_keys_enter_delay_ms: 0,
+        // Claude Code has paste-burst suppression like Codex. Its input handler
+        // (usePasteHandler.ts) sets PASTE_COMPLETION_TIMEOUT_MS = 100 and, while a
+        // bracketed paste is still pending, appends any incoming Enter to the paste
+        // buffer instead of submitting it. When we send the message via
+        // send_via_paste_buffer and fire Enter immediately (0ms), that Enter lands
+        // inside the 100ms window and is swallowed, leaving an unsubmitted
+        // "[Pasted text]" placeholder. 150ms > 100ms lets the window expire first.
+        send_keys_enter_delay_ms: 150,
+        ready_marker: None,
         install_hint: "npm install -g @anthropic-ai/claude-code",
         permission_response: Some(PermissionResponse {
             allow: &[KeyToken::Literal("1")],
             allow_always: Some(&[KeyToken::Literal("2")]),
             deny: &[KeyToken::Literal("3")],
         }),
+        lifecycle: AgentLifecycle::Active,
     },
     AgentDef {
         name: "opencode",
@@ -739,6 +831,11 @@ pub const AGENTS: &[AgentDef] = &[
         fork_strategy: ForkStrategy::Flag("--fork"),
         host_only: false,
         send_keys_enter_delay_ms: 0,
+        // Live-tested by an external headless-dispatch wrapper against
+        // real unattended runs: opencode's TUI shows this placeholder in
+        // its input box once it's finished booting and is ready to accept
+        // input, well before it necessarily prints anything else.
+        ready_marker: Some("ask anything"),
         install_hint: "curl -fsSL https://opencode.ai/install | bash",
         permission_response: Some(PermissionResponse {
             allow: &[KeyToken::Named("Enter")],
@@ -753,6 +850,7 @@ pub const AGENTS: &[AgentDef] = &[
                 KeyToken::Named("Enter"),
             ],
         }),
+        lifecycle: AgentLifecycle::Active,
     },
     AgentDef {
         name: "vibe",
@@ -772,8 +870,10 @@ pub const AGENTS: &[AgentDef] = &[
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
+        ready_marker: None,
         install_hint: "pip install mistral-vibe",
         permission_response: None,
+        lifecycle: AgentLifecycle::Active,
     },
     AgentDef {
         name: "codex",
@@ -805,8 +905,14 @@ pub const AGENTS: &[AgentDef] = &[
         // Enter keys arriving within that window after a character stream are
         // swallowed as newlines instead of triggering submit. 150ms > 120ms.
         send_keys_enter_delay_ms: 150,
+        ready_marker: None,
         install_hint: "npm install -g @openai/codex",
-        permission_response: None,
+        permission_response: Some(PermissionResponse {
+            allow: &[KeyToken::Literal("y")],
+            allow_always: Some(&[KeyToken::Literal("a")]),
+            deny: &[KeyToken::Literal("d")],
+        }),
+        lifecycle: AgentLifecycle::Active,
     },
     AgentDef {
         name: "gemini",
@@ -860,8 +966,14 @@ pub const AGENTS: &[AgentDef] = &[
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
+        ready_marker: None,
         install_hint: "npm install -g @google/gemini-cli",
         permission_response: None,
+        lifecycle: AgentLifecycle::Deprecated {
+            since: "2026-06-18",
+            note: "consumer accounts cut off by Google; enterprise/API-key remain valid",
+            replacement: Some("antigravity"),
+        },
     },
     AgentDef {
         name: "cursor",
@@ -886,8 +998,10 @@ pub const AGENTS: &[AgentDef] = &[
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
+        ready_marker: None,
         install_hint: "see https://docs.cursor.com/cli",
         permission_response: None,
+        lifecycle: AgentLifecycle::Active,
     },
     AgentDef {
         name: "copilot",
@@ -913,8 +1027,10 @@ pub const AGENTS: &[AgentDef] = &[
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
+        ready_marker: None,
         install_hint: "see https://docs.github.com/en/copilot/github-copilot-in-the-cli",
         permission_response: None,
+        lifecycle: AgentLifecycle::Active,
     },
     AgentDef {
         name: "pi",
@@ -931,12 +1047,21 @@ pub const AGENTS: &[AgentDef] = &[
         container_env: &[("PI_CODING_AGENT_DIR", "/root/.pi/agent")],
         hook_config: None,
         sidecar_hooks: None,
-        resume_strategy: ResumeStrategy::Flag("--session"),
+        // `--session-id` both creates and attaches, so it carries a pinned
+        // id; `--session` (every pi version) only resumes one already on
+        // file, and is what an unpinnable binary falls back to. See
+        // `pi_supports_session_id_flag`.
+        resume_strategy: ResumeStrategy::FlagPair {
+            existing: "--session",
+            new_session: "--session-id",
+        },
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
+        ready_marker: None,
         install_hint: "npm install -g @earendil-works/pi-coding-agent",
         permission_response: None,
+        lifecycle: AgentLifecycle::Active,
     },
     AgentDef {
         name: "droid",
@@ -956,8 +1081,10 @@ pub const AGENTS: &[AgentDef] = &[
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
+        ready_marker: None,
         install_hint: "npm install -g droid",
         permission_response: None,
+        lifecycle: AgentLifecycle::Active,
     },
     AgentDef {
         name: "settl",
@@ -969,7 +1096,7 @@ pub const AGENTS: &[AgentDef] = &[
         yolo: Some(YoloMode::AlwaysYolo),
         instruction_flag: None,
         set_default_command: false,
-        detect_status: status_detection::detect_settl_status,
+        detect_status: status_detection::detect_hook_only_status,
         container_env: &[],
         // settl uses TOML config (`[[hooks]]` entries), not the JSON
         // settings.json schema, so it installs via a sidecar hook. host_only,
@@ -989,8 +1116,10 @@ pub const AGENTS: &[AgentDef] = &[
         fork_strategy: ForkStrategy::Unsupported,
         host_only: true,
         send_keys_enter_delay_ms: 0,
+        ready_marker: None,
         install_hint: "brew install --cask mozilla-ai/tap/settl",
         permission_response: None,
+        lifecycle: AgentLifecycle::Active,
     },
     AgentDef {
         name: "hermes",
@@ -1028,15 +1157,17 @@ pub const AGENTS: &[AgentDef] = &[
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
+        ready_marker: None,
         install_hint:
             "curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash",
         permission_response: None,
+        lifecycle: AgentLifecycle::Active,
     },
     AgentDef {
         name: "kiro",
         oneshot_flag: None,
         binary: "kiro-cli",
-        // Kiro's interactive flags (--trust-all-tools, --agent, --resume-id)
+        // Kiro's interactive flags (--trust-all-tools, --agent)
         // are defined on the `chat` subcommand. Bare `kiro-cli --trust-all-tools`
         // fails with "unexpected argument"; `kiro-cli chat ...` parses.
         launch_subcommand: Some("chat"),
@@ -1045,7 +1176,7 @@ pub const AGENTS: &[AgentDef] = &[
         yolo: Some(YoloMode::CliFlag("--trust-all-tools")),
         instruction_flag: None,
         set_default_command: false,
-        detect_status: status_detection::detect_kiro_status,
+        detect_status: status_detection::detect_hook_only_status,
         container_env: &[("KIRO_CONFIG_DIR", "/root/.kiro")],
         // Kiro uses a per-agent JSON config (lowercase event names, flat
         // {command} objects) rather than the JSON settings.json schema shared
@@ -1071,12 +1202,14 @@ pub const AGENTS: &[AgentDef] = &[
             format: SidecarFormat::KiroJson,
             events: KIRO_SIDECAR_EVENTS,
         }),
-        resume_strategy: ResumeStrategy::Flag("--resume-id"),
+        resume_strategy: ResumeStrategy::Unsupported,
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
+        ready_marker: None,
         install_hint: "curl -fsSL https://cli.kiro.dev/install | bash",
         permission_response: None,
+        lifecycle: AgentLifecycle::Active,
     },
     AgentDef {
         name: "qwen",
@@ -1097,15 +1230,14 @@ pub const AGENTS: &[AgentDef] = &[
             format: HookFormat::JsonSettings,
         }),
         sidecar_hooks: None,
-        resume_strategy: ResumeStrategy::FlagPair {
-            existing: "--resume",
-            new_session: "--session-id",
-        },
+        resume_strategy: ResumeStrategy::Unsupported,
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
+        ready_marker: None,
         install_hint: "npm install -g @qwen-code/qwen-code",
         permission_response: None,
+        lifecycle: AgentLifecycle::Active,
     },
     AgentDef {
         name: "antigravity",
@@ -1125,8 +1257,10 @@ pub const AGENTS: &[AgentDef] = &[
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
+        ready_marker: None,
         install_hint: "curl -fsSL https://antigravity.google/cli/install.sh | bash",
         permission_response: None,
+        lifecycle: AgentLifecycle::Active,
     },
     AgentDef {
         name: "kimi",
@@ -1138,7 +1272,7 @@ pub const AGENTS: &[AgentDef] = &[
         yolo: Some(YoloMode::CliFlag("--yolo")),
         instruction_flag: None,
         set_default_command: false,
-        detect_status: status_detection::detect_kimi_status,
+        detect_status: status_detection::detect_hook_only_status,
         container_env: &[("KIMI_CODE_HOME", "/root/.kimi-code")],
         // Kimi Code stores hooks as `[[hooks]]` entries in its runtime
         // `config.toml` (which also holds provider/oauth settings), so it
@@ -1164,8 +1298,10 @@ pub const AGENTS: &[AgentDef] = &[
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
+        ready_marker: None,
         install_hint: "curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash",
         permission_response: None,
+        lifecycle: AgentLifecycle::Active,
     },
     AgentDef {
         name: "omp",
@@ -1185,17 +1321,72 @@ pub const AGENTS: &[AgentDef] = &[
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
+        ready_marker: None,
         install_hint: "curl -fsSL https://omp.sh/install | sh",
         permission_response: Some(PermissionResponse {
             allow: &[KeyToken::Named("Enter")],
             allow_always: None,
             deny: &[KeyToken::Named("Down"), KeyToken::Named("Enter")],
         }),
+        lifecycle: AgentLifecycle::Active,
+    },
+    AgentDef {
+        name: "prime-agent",
+        oneshot_flag: Some("-p"),
+        binary: "prime-agent",
+        launch_subcommand: None,
+        aliases: &[],
+        detection: DetectionMethod::Which("prime-agent"),
+        // Prime Agent executes model-generated Python and project commands
+        // with the user's permissions and has no built-in approval gate
+        // (upstream ships permission gating only as an example extension),
+        // so like its pi ancestor it runs YOLO by default and no flag is
+        // needed.
+        yolo: Some(YoloMode::AlwaysYolo),
+        instruction_flag: Some("--append-system-prompt {}"),
+        set_default_command: false,
+        detect_status: status_detection::detect_hook_only_status,
+        container_env: &[("PRIME_AGENT_CODING_AGENT_DIR", "/root/.prime/agent")],
+        // Level 3 (hooks) is skipped by design: upstream has no hook system
+        // at all (no Claude/Codex/Kiro-style config file to write), so status
+        // stays on the stub below.
+        hook_config: None,
+        sidecar_hooks: None,
+        resume_strategy: ResumeStrategy::Flag("--resume"),
+        // Upstream `--fork <path|id>` requires the parent id as its value,
+        // but build_fork_flags' Flag arm appends the fork flag bare after
+        // `<resume> <parent_id>`, which prime-agent's parser silently drops
+        // (an unknown valueless flag), so a fork would quietly not fork.
+        // Unsupported keeps terminal_agent_can_fork fail-closed until a
+        // value-carrying fork variant exists.
+        fork_strategy: ForkStrategy::Unsupported,
+        host_only: false,
+        send_keys_enter_delay_ms: 0,
+        ready_marker: None,
+        install_hint:
+            "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh",
+        permission_response: None,
+        lifecycle: AgentLifecycle::Active,
     },
 ];
 
 /// Look up an agent by canonical name.
 impl AgentDef {
+    /// Short lifecycle label for compact surfaces (TUI picker suffix, web
+    /// badge); `None` while Active so those surfaces stay unchanged.
+    pub fn lifecycle_label(&self) -> Option<&'static str> {
+        match self.lifecycle {
+            AgentLifecycle::Active => None,
+            AgentLifecycle::Deprecated { .. } => Some("deprecated"),
+        }
+    }
+
+    /// Full one-line lifecycle notice for CLI listings and spawn warnings;
+    /// `None` while Active.
+    pub fn lifecycle_notice(&self) -> Option<String> {
+        self.lifecycle.notice()
+    }
+
     /// Extra argv tokens inserted between the one-shot flag and the prompt for a
     /// one-shot (smart-rename) title call. These are static, never user input,
     /// so the no-injection contract (prompt stays the final argv element) holds.
@@ -1236,7 +1427,7 @@ impl AgentDef {
     /// ignored rather than mis-injected (fail-closed).
     pub fn oneshot_model_flag(&self) -> Option<&'static str> {
         match self.name {
-            "claude" | "copilot" | "omp" => Some("--model"),
+            "claude" | "copilot" | "omp" | "prime-agent" => Some("--model"),
             "codex" | "gemini" | "opencode" | "kimi" => Some("-m"),
             _ => None,
         }
@@ -1267,19 +1458,29 @@ impl AgentDef {
     /// `-p`/`--prompt` value-binding flags (copilot, gemini, kimi) consume the
     /// next token as the prompt, so model args must follow the prompt (in the
     /// trailing region); placing them before it would make the flag swallow the
-    /// model selector. Positional-prompt one-shots (claude and omp's boolean
-    /// `-p`, codex `exec`, opencode `run`) take the model args before the prompt.
+    /// model selector. Positional-prompt one-shots (claude's, omp's, and
+    /// prime-agent's boolean `-p`, codex `exec`, opencode `run`) take the
+    /// model args before the prompt.
     ///
     /// Verified 2026-07-21 against each CLI: gemini `-p` is yargs
     /// `type: string, nargs: 1`; kimi `-p` is a `typer.Option(str)`; copilot
-    /// `-p <text>` takes a value; claude `-p`/`--print` is boolean.
+    /// `-p <text>` takes a value; claude `-p`/`--print` is boolean. Verified
+    /// 2026-08-23 for prime-agent from `packages/coding-agent/src/cli/args.ts`:
+    /// its `-p`/`--print` sets a boolean print mode and then opportunistically
+    /// pushes the next token into `messages` only when that token is not a
+    /// flag, which is the same slot a positional prompt lands in. Classifying
+    /// it as positional is therefore correct for both argv shapes we emit:
+    /// `-p --model <m> <prompt>` leaves `--model` for its own arm, and
+    /// `-p <prompt>` (no title model configured) binds the prompt into the
+    /// same `messages` array. It is NOT a value-binding flag in the copilot /
+    /// gemini / kimi sense, where the model args must trail the prompt.
     pub fn oneshot_flag_binds_prompt(&self) -> bool {
         matches!(self.name, "copilot" | "gemini" | "kimi")
     }
 
     /// The base launch token(s) for the default (non-overridden) command:
     /// the binary, plus any `launch_subcommand` (e.g. `"kiro-cli chat"`). All
-    /// subsequent flags (extra args, yolo, resume) are appended after this, so
+    /// subsequent flags (extra args, yolo, agent selection) are appended after this, so
     /// subcommand-scoped flags land on the subcommand where the CLI expects
     /// them. Agents without a `launch_subcommand` just return the binary.
     pub fn launch_base_command(&self) -> String {
@@ -1290,8 +1491,74 @@ impl AgentDef {
     }
 }
 
+/// Whether `help` advertises `flag`, matched on the whole flag: what follows
+/// must end it (whitespace, `=`, or the `,` of an alias list such as
+/// `--extension, -e`), so `--session-id` is never read out of
+/// `--session-id-file`.
+fn help_advertises_flag(help: &str, flag: &str) -> bool {
+    help.match_indices(flag).any(|(index, _)| {
+        help[index + flag.len()..]
+            .chars()
+            .next()
+            .is_none_or(|next| next.is_whitespace() || next == '=' || next == ',')
+    })
+}
+
+/// One cached `pi --help` per process: two launch decisions read it, and a
+/// launch cannot afford to re-run it.
+fn pi_help_text() -> &'static str {
+    static HELP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HELP.get_or_init(|| {
+        let Some(agent) = get_agent("pi") else {
+            return String::new();
+        };
+        let mut cmd = std::process::Command::new(agent.binary);
+        cmd.arg("--help");
+        crate::process::run_with_timeout(&mut cmd, PI_HELP_PROBE_TIMEOUT)
+            .ok()
+            .flatten()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .unwrap_or_default()
+    })
+}
+
+/// Whether the `pi` on PATH loads an extension from the command line
+/// (`--extension`, `-e`). That is what lets AoE publish the pane's current
+/// conversation, `/new` included, instead of inferring it from a store keyed
+/// by cwd.
+pub(crate) fn pi_supports_extension_flag() -> bool {
+    help_advertises_flag(pi_help_text(), "--extension")
+}
+
+/// Whether the `pi` on PATH understands `--session-id` (pi 0.76.0+), which is
+/// what lets AoE pin a conversation at launch instead of guessing which file
+/// in the shared store belongs to this pane (#3576).
+///
+/// Probed once per process from `pi --help` and cached: the answer is a
+/// property of the installed binary, and a launch cannot afford to re-run it.
+/// Any failure (binary absent, non-zero exit, timeout) reports `false`, so an
+/// unknown binary launches exactly as it did before pinning existed rather
+/// than emitting a flag it may not accept. The cache keeps a failure too, so
+/// a transient one disables pinning until the process restarts.
+pub(crate) fn pi_supports_session_id_flag() -> bool {
+    help_advertises_flag(pi_help_text(), "--session-id")
+}
+
+const PI_HELP_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub fn get_agent(name: &str) -> Option<&'static AgentDef> {
     AGENTS.iter().find(|a| a.name == name)
+}
+
+/// Registry lifecycle state for an ACP-registry key. Falls back to Active
+/// for registry entries with no `AGENTS` counterpart (bundled or alias-only
+/// keys). Shared by the doctor, `/api/acp/agents`, and `aoe acp agents`
+/// surfaces.
+pub(crate) fn registry_lifecycle(name: &str) -> AgentLifecycle {
+    get_agent(name)
+        .map(|def| def.lifecycle)
+        .unwrap_or(AgentLifecycle::Active)
 }
 
 /// Whether switching a structured-view session back to a terminal can hand
@@ -1309,9 +1576,9 @@ pub fn get_agent(name: &str) -> Option<&'static AgentDef> {
 /// Today only claude qualifies: `claude-agent-acp`'s `session/new` UUID is
 /// the claude SDK session id in `~/.claude/projects/*.jsonl`, exactly what
 /// `claude --resume` reads. `claude-code` is the legacy alias for the same
-/// adapter. codex-acp and the bundled `aoe-agent` do not share a
-/// CLI-resumable store, so a claude session whose adapter was swapped to one
-/// of them does not qualify.
+/// adapter. codex-acp and `aoe-agent` do not share a CLI-resumable store, so
+/// a claude session whose adapter was swapped to one of them does not
+/// qualify.
 pub fn acp_transcript_cli_resumable(tool: &str, acp_agent: &str) -> bool {
     tool == "claude" && matches!(acp_agent, "claude" | "claude-code")
 }
@@ -1515,6 +1782,12 @@ pub fn send_keys_enter_delay(tool: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// The known-ready pane-content marker for this agent, if any. See
+/// `AgentDef::ready_marker`.
+pub fn ready_marker(tool: &str) -> Option<&'static str> {
+    get_agent(tool).and_then(|a| a.ready_marker)
+}
+
 /// All canonical agent names in registry order.
 pub fn agent_names() -> Vec<&'static str> {
     AGENTS.iter().map(|a| a.name).collect()
@@ -1522,22 +1795,24 @@ pub fn agent_names() -> Vec<&'static str> {
 
 /// Given a command string (e.g. `"claude --resume xyz"` or `"open-code"`),
 /// return the canonical agent name if one is recognised.
+///
+/// When several tokens match, the LONGEST one wins regardless of registry
+/// order: `prime-agent` contains cursor's `"agent"` alias, and a naive
+/// first-match scan would resolve every prime-agent command to cursor.
 pub fn resolve_tool_name(cmd: &str) -> Option<&'static str> {
     let cmd_lower = cmd.to_lowercase();
     if cmd_lower.is_empty() {
         return Some("claude");
     }
+    let mut best: Option<(usize, &'static str)> = None;
     for agent in AGENTS {
-        if cmd_lower.contains(agent.name) {
-            return Some(agent.name);
-        }
-        for alias in agent.aliases {
-            if cmd_lower.contains(alias) {
-                return Some(agent.name);
+        for token in std::iter::once(agent.name).chain(agent.aliases.iter().copied()) {
+            if cmd_lower.contains(token) && best.is_none_or(|(len, _)| token.len() > len) {
+                best = Some((token.len(), agent.name));
             }
         }
     }
-    None
+    best.map(|(_, name)| name)
 }
 
 /// Return the install hint for an agent, looked up by canonical name.
@@ -1672,7 +1947,7 @@ mod tests {
         // flag to emit it.
         for agent in AGENTS {
             let expected = match agent.name {
-                "claude" | "copilot" | "omp" => Some("--model"),
+                "claude" | "copilot" | "omp" | "prime-agent" => Some("--model"),
                 "codex" | "gemini" | "opencode" | "kimi" => Some("-m"),
                 _ => None,
             };
@@ -1742,10 +2017,12 @@ mod tests {
                     agent.name
                 );
             }
-            // Semi-independent oracle (not a copy of the impl's name list): the
-            // `-p` is value-binding except for claude and omp, where it is the
-            // boolean `--print` flag.
-            if agent.oneshot_flag == Some("-p") && !matches!(agent.name, "claude" | "omp") {
+            // Semi-independent oracle (not a copy of the impl's name list):
+            // `-p` is value-binding except for claude, omp, and prime-agent,
+            // where it is the boolean `--print` flag.
+            if agent.oneshot_flag == Some("-p")
+                && !matches!(agent.name, "claude" | "omp" | "prime-agent")
+            {
                 assert!(
                     agent.oneshot_flag_binds_prompt(),
                     "agent '{}' has a `-p` one-shot flag but is not classified value-binding",
@@ -1753,6 +2030,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn pi_help_probe_matches_only_the_whole_flag() {
+        // The probe decides whether AoE may pin a Pi conversation at launch,
+        // so a longer flag that merely starts the same way must not pass for
+        // it, and an old help text without the flag must not either.
+        assert!(help_advertises_flag(
+            "  --session-id <id>    Use exact project session ID\n",
+            "--session-id"
+        ));
+        assert!(help_advertises_flag("--session-id=<id>", "--session-id"));
+        assert!(help_advertises_flag("--session-id", "--session-id"));
+        assert!(!help_advertises_flag(
+            "  --session-id-file <path>\n",
+            "--session-id"
+        ));
+        assert!(!help_advertises_flag(
+            "  --extensions-dir <dir>\n",
+            "--extension"
+        ));
+        assert!(!help_advertises_flag(
+            "  --session <path|id>    Use specific session file\n",
+            "--session-id"
+        ));
+        assert!(help_advertises_flag(
+            "  --extension, -e <path>   Load an extension file\n",
+            "--extension"
+        ));
     }
 
     #[test]
@@ -1773,6 +2079,130 @@ mod tests {
         assert_eq!(get_agent("antigravity").unwrap().binary, "agy");
         assert_eq!(get_agent("kimi").unwrap().binary, "kimi");
         assert_eq!(get_agent("omp").unwrap().binary, "omp");
+        assert_eq!(get_agent("prime-agent").unwrap().binary, "prime-agent");
+    }
+
+    #[test]
+    fn test_lifecycle_active_by_default_except_gemini() {
+        // Invariant across the registry: exactly one deprecated agent today
+        // (gemini); a new entry that forgets its lifecycle must fail here.
+        let cases: Vec<(&str, bool)> = AGENTS
+            .iter()
+            .map(|a| (a.name, a.lifecycle.is_active()))
+            .collect();
+        for (name, active) in cases {
+            let expect_active = name != "gemini";
+            assert_eq!(active, expect_active, "{name}");
+        }
+    }
+
+    #[test]
+    fn test_lifecycle_notice_and_label() {
+        // (agent, label, notice fragment or None). Active agents surface
+        // nothing; the deprecated one carries date, reason, and replacement.
+        let cases = [
+            ("claude", None, None),
+            ("antigravity", None, None),
+            (
+                "gemini",
+                Some("deprecated"),
+                Some("deprecated since 2026-06-18"),
+            ),
+        ];
+        for (name, label, notice_fragment) in cases {
+            let def = get_agent(name).unwrap();
+            assert_eq!(def.lifecycle_label(), label, "{name}");
+            match (notice_fragment, def.lifecycle_notice()) {
+                (None, None) => {}
+                (Some(fragment), Some(notice)) => {
+                    assert!(notice.contains(fragment), "{name}: {notice}");
+                    if name == "gemini" {
+                        assert!(
+                            notice.contains("consider switching to antigravity"),
+                            "{notice}"
+                        );
+                        assert!(
+                            notice.contains("enterprise/API-key remain valid"),
+                            "{notice}"
+                        );
+                    }
+                }
+                _ => panic!("{name}: label and notice must agree"),
+            }
+            // The enum-level entry point (used by the acp surfaces) must
+            // agree with the AgentDef helper for every variant, including
+            // future ones: any non-active state surfaces its Display.
+            assert_eq!(def.lifecycle.notice(), def.lifecycle_notice(), "{name}");
+        }
+    }
+
+    #[test]
+    fn test_lifecycle_notice_without_replacement() {
+        // Boundary: a Deprecated state with no suggested replacement must
+        // still render its full notice, minus the "consider switching"
+        // clause (Display's None arm).
+        let lifecycle = AgentLifecycle::Deprecated {
+            since: "2026-01-01",
+            note: "upstream shut down",
+            replacement: None,
+        };
+        let notice = lifecycle.to_string();
+        assert_eq!(notice, "deprecated since 2026-01-01: upstream shut down");
+        assert!(!notice.contains("consider switching"), "{notice}");
+        assert_eq!(lifecycle.notice().as_deref(), Some(notice.as_str()));
+    }
+
+    #[test]
+    fn test_lifecycle_serialization_shape() {
+        // Wire contract consumed by the dashboard (`web/src/lib/types.ts`
+        // AgentLifecycleInfo). Active agents are omitted by callers via
+        // skip_serializing_if; here we pin each variant's JSON shape.
+        assert_eq!(
+            serde_json::to_string(&AgentLifecycle::Active).unwrap(),
+            r#"{"state":"active"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&get_agent("gemini").unwrap().lifecycle).unwrap(),
+            concat!(
+                r#"{"state":"deprecated","since":"2026-06-18","#,
+                r#""note":"consumer accounts cut off by Google; enterprise/API-key remain valid","#,
+                r#""replacement":"antigravity"}"#
+            )
+        );
+    }
+
+    #[test]
+    fn test_lifecycle_facts_stay_synced_with_ts_mirror() {
+        // The dashboard keeps a static fallback mirror of the gemini facts
+        // (web/src/lib/agentProfiles.ts). Each side has its own pinning
+        // tests, so a coordinated update of one side alone would ship a
+        // silent desync; this cross-checks the literal strings instead.
+        let mirror_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web/src/lib/agentProfiles.ts");
+        let Ok(mirror) = std::fs::read_to_string(&mirror_path) else {
+            // Nix-filtered cargo-test sources omit web/. The TS suite still
+            // pins the mirror there; cross-check it whenever the monorepo
+            // source is available instead of failing a filtered package.
+            eprintln!(
+                "skipping TS lifecycle mirror check: {} is absent",
+                mirror_path.display()
+            );
+            return;
+        };
+        let AgentLifecycle::Deprecated {
+            since,
+            note,
+            replacement: Some(replacement),
+        } = get_agent("gemini").unwrap().lifecycle
+        else {
+            panic!("gemini must stay Deprecated with a replacement");
+        };
+        for fact in [since, note, replacement] {
+            assert!(
+                mirror.contains(fact),
+                "TS mirror is missing {fact:?}; update web/src/lib/agentProfiles.ts in the same change"
+            );
+        }
     }
 
     #[test]
@@ -1937,7 +2367,8 @@ mod tests {
                 "qwen",
                 "antigravity",
                 "kimi",
-                "omp"
+                "omp",
+                "prime-agent"
             ]
         );
     }
@@ -1969,6 +2400,12 @@ mod tests {
         assert_eq!(resolve_tool_name("omp"), Some("omp"));
         assert_eq!(resolve_tool_name(""), Some("claude"));
         assert_eq!(resolve_tool_name("agent"), Some("cursor"));
+        // Longest token wins: prime-agent contains cursor's "agent" alias.
+        assert_eq!(resolve_tool_name("prime-agent"), Some("prime-agent"));
+        assert_eq!(
+            resolve_tool_name("prime-agent --mode acp"),
+            Some("prime-agent")
+        );
         assert_eq!(resolve_tool_name("unknown-tool"), None);
     }
 
@@ -1988,6 +2425,7 @@ mod tests {
         assert_eq!(settings_index_from_name(Some("antigravity")), 14);
         assert_eq!(settings_index_from_name(Some("kimi")), 15);
         assert_eq!(settings_index_from_name(Some("omp")), 16);
+        assert_eq!(settings_index_from_name(Some("prime-agent")), 17);
 
         assert_eq!(name_from_settings_index(0), None);
         assert_eq!(name_from_settings_index(1), Some("claude"));
@@ -2003,6 +2441,7 @@ mod tests {
         assert_eq!(name_from_settings_index(14), Some("antigravity"));
         assert_eq!(name_from_settings_index(15), Some("kimi"));
         assert_eq!(name_from_settings_index(16), Some("omp"));
+        assert_eq!(name_from_settings_index(17), Some("prime-agent"));
         assert_eq!(name_from_settings_index(99), None);
     }
 
@@ -2019,7 +2458,7 @@ mod tests {
 
     #[test]
     fn test_kiro_launches_via_chat_subcommand() {
-        // Kiro's interactive flags (--trust-all-tools, --agent, --resume-id)
+        // Kiro's interactive flags (--trust-all-tools, --agent)
         // are scoped to the `chat` subcommand, so the base command must include
         // it; bare `kiro-cli --trust-all-tools` is rejected by the CLI.
         let kiro = get_agent("kiro").unwrap();
@@ -2057,9 +2496,9 @@ mod tests {
     fn test_launch_subcommand_not_combined_with_subcommand_resume() {
         // `append_resume_flags` inserts a Subcommand resume token after the
         // first whitespace token, which for a launch_subcommand agent is the
-        // binary. That lands the resume token before the subcommand and produces
-        // a malformed command (e.g. `kiro-cli resume <id> chat ...`). Forbid the
-        // pairing until that insertion is made subcommand-aware.
+        // binary. That lands the resume token before the launch subcommand and
+        // produces a malformed command. Forbid the pairing until insertion is
+        // made subcommand-aware.
         for agent in AGENTS {
             if agent.launch_subcommand.is_some() {
                 assert!(
@@ -2171,11 +2610,17 @@ mod tests {
     fn test_send_keys_enter_delay() {
         // Codex needs a delay to outlast its 120ms paste-burst suppression window
         assert!(send_keys_enter_delay("codex") >= 150);
-        // Other agents should not delay
-        assert_eq!(send_keys_enter_delay("claude"), 0);
+        // Claude Code also has paste-burst suppression: usePasteHandler.ts sets
+        // PASTE_COMPLETION_TIMEOUT_MS = 100 and, while a paste is pending, routes
+        // an incoming Enter into the paste buffer instead of submitting it (the
+        // `[Pasted text]` sits unsubmitted). The Enter must arrive after that
+        // 100ms window expires, so claude needs a delay > 100ms.
+        assert!(send_keys_enter_delay("claude") > 100);
+        // Other agents have no paste-burst suppression and should not delay
         assert_eq!(send_keys_enter_delay("opencode"), 0);
         assert_eq!(send_keys_enter_delay("hermes"), 0);
         assert_eq!(send_keys_enter_delay("kiro"), 0);
+        assert_eq!(send_keys_enter_delay("prime-agent"), 0);
         assert_eq!(send_keys_enter_delay("antigravity"), 0);
         assert_eq!(send_keys_enter_delay("unknown_agent"), 0);
     }
@@ -2226,12 +2671,16 @@ mod tests {
             Some("curl -fsSL https://antigravity.google/cli/install.sh | bash")
         );
         assert_eq!(
+            install_hint("omp"),
+            Some("curl -fsSL https://omp.sh/install | sh")
+        );
+        assert_eq!(
             install_hint("kimi"),
             Some("curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash")
         );
         assert_eq!(
-            install_hint("omp"),
-            Some("curl -fsSL https://omp.sh/install | sh")
+            install_hint("prime-agent"),
+            Some("curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh")
         );
         assert!(install_hint("unknown").is_none());
     }
@@ -2320,6 +2769,13 @@ mod tests {
             get_agent("opencode").unwrap().fork_strategy,
             ForkStrategy::Flag("--fork")
         ));
+        // prime-agent documents `--fork <path|id>`, but the flag needs the
+        // parent id as its value and build_fork_flags' Flag arm appends the
+        // fork flag bare, so it stays Unsupported (see its AgentDef comment).
+        assert!(matches!(
+            get_agent("prime-agent").unwrap().fork_strategy,
+            ForkStrategy::Unsupported
+        ));
         for agent in AGENTS {
             let fork_capable = matches!(agent.name, "claude" | "codex" | "opencode");
             assert_eq!(
@@ -2344,5 +2800,41 @@ mod tests {
                 agent.name
             );
         }
+    }
+
+    #[test]
+    fn test_prime_agent_definition() {
+        let prime = get_agent("prime-agent").unwrap();
+        assert_eq!(prime.binary, "prime-agent");
+        assert!(matches!(
+            &prime.detection,
+            DetectionMethod::Which("prime-agent")
+        ));
+        // No built-in approval gate upstream, so like pi it is AlwaysYolo.
+        assert!(matches!(&prime.yolo, Some(YoloMode::AlwaysYolo)));
+        assert!(matches!(
+            &prime.resume_strategy,
+            ResumeStrategy::Flag("--resume")
+        ));
+        // Fork stays Unsupported: upstream `--fork` needs the parent id as
+        // its value, which build_fork_flags does not emit (see AGENTS entry).
+        assert!(matches!(&prime.fork_strategy, ForkStrategy::Unsupported));
+        // `-p` is boolean print mode; the prompt stays positional (args.ts).
+        assert_eq!(prime.oneshot_flag, Some("-p"));
+        assert_eq!(prime.oneshot_model_flag(), Some("--model"));
+        assert!(!prime.oneshot_flag_binds_prompt());
+        assert!(!prime.host_only);
+        assert_eq!(prime.send_keys_enter_delay_ms, 0);
+        assert_eq!(prime.launch_subcommand, None);
+        assert!(prime.hook_config.is_none());
+        assert!(prime.sidecar_hooks.is_none());
+        assert_eq!(
+            prime.container_env,
+            &[("PRIME_AGENT_CODING_AGENT_DIR", "/root/.prime/agent")]
+        );
+        assert_eq!(
+            prime.install_hint,
+            "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh"
+        );
     }
 }

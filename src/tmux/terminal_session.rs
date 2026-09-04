@@ -68,6 +68,31 @@ fn host_pane_inputs(
     (pairs, cmd)
 }
 
+/// Resolve a shell name or path to an absolute path via a PATH lookup.
+///
+/// tmux's `default-shell` rejects a bare name ("not a suitable shell: bash"),
+/// and [`user_shell`] falls back to a bare `bash` when `$SHELL` is unset (e.g.
+/// an `aoe serve` daemon started from launchd/systemd). Returns an already
+/// absolute, existing path unchanged, and `None` when the shell is not found
+/// so the caller can skip `default-shell` rather than fail creation.
+fn absolute_shell(shell: &str) -> Option<String> {
+    absolute_shell_in(shell, std::env::var_os("PATH").as_deref())
+}
+
+/// [`absolute_shell`] with an explicit PATH-style lookup list, split out so the
+/// unit test can resolve against a controlled directory instead of the
+/// process `$PATH`. `paths` is a `$PATH`-style joined string; when it is `None`
+/// no directories are searched, so a bare name will not resolve (an absolute
+/// path still does).
+fn absolute_shell_in(shell: &str, paths: Option<&std::ffi::OsStr>) -> Option<String> {
+    // `which_in` requires a cwd; it is only used to resolve a relative shell
+    // path, which bare names and absolute paths ignore.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    which::which_in(shell, paths, cwd)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
 /// Shared implementation of the paired-terminal lifecycle. Not exposed; the
 /// public [`TerminalSession`] and [`ContainerTerminalSession`] wrap one of
 /// these with a fixed [`TerminalKind`].
@@ -110,16 +135,35 @@ impl PairedTerminal {
     /// spawn a fresh shell under the new name and orphan the pane the user was
     /// working in, exactly as the agent pane did before #3157.
     fn resolve_name(kind: TerminalKind, id: &str, title: &str, index: u32) -> String {
+        Self::resolve_name_inner(kind, id, title, index, false)
+    }
+
+    /// [`Self::resolve_name`] restricted to the current snapshot: no refresh,
+    /// so a stale snapshot yields the derived name until the background
+    /// snapshot poller refreshes it. Render paths only.
+    fn resolve_name_for_display(kind: TerminalKind, id: &str, title: &str, index: u32) -> String {
+        Self::resolve_name_inner(kind, id, title, index, true)
+    }
+
+    fn resolve_name_inner(
+        kind: TerminalKind,
+        id: &str,
+        title: &str,
+        index: u32,
+        display_only: bool,
+    ) -> String {
         let derived = Self::generate_name(kind, id, title, index);
         let suffix = Self::name_suffix(id, index);
-        crate::tmux::live_session_name(
-            &derived,
-            &crate::tmux::NameShape {
-                prefix: kind.prefix(),
-                suffix: &suffix,
-                excluded_prefixes: &[],
-            },
-        )
+        let shape = crate::tmux::NameShape {
+            prefix: kind.prefix(),
+            suffix: &suffix,
+            excluded_prefixes: &[],
+        };
+        if display_only {
+            crate::tmux::session_name_for_display(&derived, &shape)
+        } else {
+            crate::tmux::live_session_name(&derived, &shape)
+        }
     }
 
     fn new(kind: TerminalKind, id: &str, title: &str, index: u32) -> Self {
@@ -156,11 +200,20 @@ impl PairedTerminal {
         // server and poison `default-shell` + base env for every session,
         // including release ones (#2608). Container terminals are excluded;
         // their HOME/shell belong to the container, not the host.
+        // `user_shell` yields a bare `bash` when `$SHELL` is unset (a daemon
+        // launched from launchd/systemd), and tmux's `default-shell` rejects
+        // anything that is not an absolute path to an existing executable
+        // ("not a suitable shell: bash"). Resolve it once: `default_shell` is
+        // `Some` only when `which` finds an executable, and pins `default-shell`
+        // only then so tmux never fails `new-session` on an unusable shell. The
+        // pane's SHELL env and login command prefer that resolved path but fall
+        // back to the raw name so a pane still launches when it cannot resolve.
         let host_shell = matches!(self.kind, TerminalKind::Host).then(user_shell);
+        let default_shell = host_shell.as_deref().and_then(absolute_shell);
+        let shell_for_pane = default_shell.as_deref().or(host_shell.as_deref());
         let home = std::env::var("HOME").unwrap_or_default();
         let path = std::env::var("PATH").unwrap_or_default();
-        let (pinned_pairs, effective_cmd) =
-            host_pane_inputs(host_shell.as_deref(), command, &home, &path);
+        let (pinned_pairs, effective_cmd) = host_pane_inputs(shell_for_pane, command, &home, &path);
         // Host terminals also forward the inherited host env (DISPLAY, XDG_*,
         // DBUS, ... plus every other var under `session.inherit_host_environment`)
         // so a browser opened from the pane reaches the user's desktop;
@@ -191,7 +244,9 @@ impl PairedTerminal {
         append_remain_on_exit_args(&mut args, &self.name);
         append_pane_base_index_args(&mut args, &self.name);
         append_window_size_args(&mut args, &self.name);
-        if let Some(shell) = &host_shell {
+        // `default_shell` is `Some` only when `which` resolved an existing
+        // executable, so pinning it can never fail `new-session`.
+        if let Some(shell) = default_shell.as_deref() {
             append_default_shell_args(&mut args, &self.name, shell);
         }
         append_tmux_setting_args(&mut args, &self.name, &config);
@@ -266,13 +321,6 @@ impl PairedTerminal {
 
         Ok(())
     }
-
-    fn capture_window_composited(&self, lines: usize) -> Result<String> {
-        if !self.exists() {
-            return Ok(String::new());
-        }
-        super::Session::from_name(&self.name).capture_window_composited(lines)
-    }
 }
 
 pub struct TerminalSession {
@@ -302,6 +350,12 @@ impl TerminalSession {
     /// [`Self::resolve_name`] for the web dashboard's additional terminal tabs.
     pub fn resolve_name_indexed(id: &str, title: &str, index: u32) -> String {
         PairedTerminal::resolve_name(TerminalKind::Host, id, title, index)
+    }
+
+    /// [`Self::resolve_name`] for render paths: snapshot-only, never
+    /// refreshing.
+    pub fn resolve_name_for_display(id: &str, title: &str) -> String {
+        PairedTerminal::resolve_name_for_display(TerminalKind::Host, id, title, 0)
     }
 
     pub fn generate_name(id: &str, title: &str) -> String {
@@ -346,12 +400,6 @@ impl TerminalSession {
     pub fn attach(&self) -> Result<()> {
         self.inner.attach()
     }
-
-    /// Preview capture with the window's other panes composited in; see
-    /// [`super::Session::capture_window_composited`].
-    pub fn capture_window_composited(&self, lines: usize) -> Result<String> {
-        self.inner.capture_window_composited(lines)
-    }
 }
 
 /// Container terminal session for sandboxed sessions.
@@ -383,6 +431,12 @@ impl ContainerTerminalSession {
     /// [`Self::resolve_name`] for the web dashboard's additional terminal tabs.
     pub fn resolve_name_indexed(id: &str, title: &str, index: u32) -> String {
         PairedTerminal::resolve_name(TerminalKind::Container, id, title, index)
+    }
+
+    /// [`Self::resolve_name`] for render paths: snapshot-only, never
+    /// refreshing.
+    pub fn resolve_name_for_display(id: &str, title: &str) -> String {
+        PairedTerminal::resolve_name_for_display(TerminalKind::Container, id, title, 0)
     }
 
     pub fn generate_name(id: &str, title: &str) -> String {
@@ -427,12 +481,6 @@ impl ContainerTerminalSession {
     pub fn attach(&self) -> Result<()> {
         self.inner.attach()
     }
-
-    /// Preview capture with the window's other panes composited in; see
-    /// [`super::Session::capture_window_composited`].
-    pub fn capture_window_composited(&self, lines: usize) -> Result<String> {
-        self.inner.capture_window_composited(lines)
-    }
 }
 
 /// Kill every paired terminal tmux session (host and container, any index)
@@ -443,7 +491,7 @@ impl ContainerTerminalSession {
 pub fn kill_all_terminals_for_id(id: &str) {
     let needle = format!("_{}", truncate_id(id, 8));
 
-    let output = crate::tmux::tmux_command()
+    let output = crate::tmux::tmux_query_command()
         .args(["list-sessions", "-F", "#{session_name}"])
         .output();
 
@@ -661,6 +709,29 @@ mod tests {
     }
 
     #[test]
+    fn absolute_shell_resolves_bare_name_and_rejects_missing() {
+        // Hermetic: resolve against a controlled directory rather than the
+        // process `$PATH`, so the result does not depend on which shells the
+        // host happens to have installed. tmux's `default-shell` needs an
+        // absolute path; an unknown name yields None so create_with_size skips
+        // the option instead of failing `new-session`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = dir.path().join("aoe-test-shell");
+        std::fs::write(&bin, b"#!/bin/sh\n").expect("write shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        let paths = Some(dir.path().as_os_str());
+        // `which_in` returns the search dir joined with the name verbatim, so
+        // the resolved path equals the planted shim exactly.
+        let resolved = absolute_shell_in("aoe-test-shell", paths).expect("shim must resolve");
+        assert_eq!(std::path::Path::new(&resolved), bin);
+        assert_eq!(absolute_shell_in("aoe-not-a-real-shell-xyzzy", paths), None);
+    }
+
+    #[test]
     fn test_container_pane_inputs_unchanged() {
         // Container terminals (shell = None) get no host env and keep their
         // command verbatim; their HOME/shell belong to the container.
@@ -791,8 +862,10 @@ mod tests {
         }
 
         let key = "XDG_AOE_TERM_ENV_TEST_3075";
-        let original = std::env::var(key).ok();
-        std::env::set_var(key, "host-sentinel");
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            (key, "host-sentinel"),
+            ("SHELL", "/bin/sh"),
+        ]);
 
         let guard = TmuxTestSession::new("aoe_test_term_host_fwd");
         let session = PairedTerminal {
@@ -807,11 +880,6 @@ mod tests {
             .ok()
             .and_then(|o| String::from_utf8(o.stdout).ok())
             .map(|s| s.trim().to_string());
-
-        match original {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
 
         created.expect("create host terminal");
         assert_eq!(
@@ -835,8 +903,7 @@ mod tests {
         }
 
         let key = "XDG_AOE_TERM_ENV_TEST_3075_CTR";
-        let original = std::env::var(key).ok();
-        std::env::set_var(key, "must-not-leak");
+        let _env = crate::session::test_support::EnvGuard::set(&[(key, "must-not-leak")]);
 
         let guard = TmuxTestSession::new("aoe_test_term_ctr_excl");
         let session = PairedTerminal {
@@ -854,11 +921,6 @@ mod tests {
             .ok()
             .and_then(|o| String::from_utf8(o.stdout).ok())
             .map(|s| s.trim().to_string());
-
-        match original {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
 
         created.expect("create container terminal");
         assert_eq!(

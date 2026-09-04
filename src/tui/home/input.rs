@@ -7,12 +7,12 @@ use tui_input::Input;
 
 use super::bindings::{self, ActionId};
 use super::{live_send, DragKind, HomeView, PreviewSelection, TerminalMode, ViewMode};
+use crate::session::config::repo_config;
 use crate::session::config::{
     load_config, update_app_state, update_config, GroupByMode, SortOrder,
 };
-use crate::session::{list_profiles, repo_config, resolve_config_or_warn, Item, Status};
+use crate::session::{list_profiles, resolve_config_or_warn, Item, Status};
 use crate::tui::app::Action;
-#[cfg(feature = "serve")]
 use crate::tui::dialogs::ServeAction;
 use crate::tui::dialogs::{
     builtin_commands, CommandPaletteDialog, ConfirmDialog, ContextMenuAction, ContextMenuDialog,
@@ -99,17 +99,6 @@ fn persist_telemetry_consent(opt_in: bool) {
     crate::telemetry::apply_opt_in_change(opt_in);
 }
 
-/// xterm bracketed-paste start sequence: `ESC [ 2 0 0 ~`. An agent that
-/// has enabled bracketed paste mode (`\e[?2004h`) treats everything
-/// between this marker and the matching end marker as one paste rather
-/// than as keystrokes, so interior newlines accumulate in the input
-/// buffer instead of firing `submit` per line.
-const BRACKETED_PASTE_START: &[u8] = &[0x1b, b'[', b'2', b'0', b'0', b'~'];
-
-/// xterm bracketed-paste end sequence: `ESC [ 2 0 1 ~`. Pairs with
-/// [`BRACKETED_PASTE_START`].
-const BRACKETED_PASTE_END: &[u8] = &[0x1b, b'[', b'2', b'0', b'1', b'~'];
-
 /// Decompose pasted text into a series of `TmuxKey`s safe for the
 /// live-send worker to dispatch.
 ///
@@ -120,17 +109,17 @@ const BRACKETED_PASTE_END: &[u8] = &[0x1b, b'[', b'2', b'0', b'1', b'~'];
 /// literal text. Tabs in single-line pastes still go through as
 /// `Named("Tab")` to mirror the historical path.
 ///
-/// Multi-line pastes get wrapped in xterm bracketed-paste markers
-/// (`\e[200~` / `\e[201~`) so the receiving agent sees the entire
-/// payload as one paste rather than as N independent Enter keypresses.
+/// Multi-line pastes are handed to tmux as a single paste
+/// (`load-buffer` + `paste-buffer -p`), so the receiving agent sees the
+/// entire payload as one paste rather than as N independent Enter
+/// keypresses, and tmux emits the bracketed-paste markers only for panes
+/// that actually set DECSET 2004.
 /// Without the wrapping, agents that submit on Enter (Claude Code,
 /// Codex, OpenCode, ...) post one user message per pasted line, which
-/// is the bug behind #1546. The whole payload (markers, printable
-/// runs, interior CRs, and tabs) goes through as a single `HexBytes`
-/// action, which the worker dispatches as one or more size-bounded
-/// `tmux send-keys -H` forks (a per-byte argv overflows `ARG_MAX` on a
-/// large paste, so it can't always be one fork). `\r\n` pairs coalesce
-/// to a single CR so
+/// is the bug behind #1546. The whole payload goes through as a single
+/// `Paste` action, which the worker delivers with one `load-buffer` +
+/// `paste-buffer` pair (no `ARG_MAX` chunking, unlike the per-byte hex
+/// encoding this replaced). `\r\n` pairs coalesce to a single newline so
 /// Windows-line-ending pastes don't double up; other control bytes
 /// (BEL, ESC, ...) are dropped rather than risk that an embedded
 /// escape closes the bracketed-paste sequence on the agent's side.
@@ -167,40 +156,38 @@ fn split_inline_paste(text: &str) -> Vec<live_send::TmuxKey> {
 }
 
 fn split_bracketed_paste(text: &str) -> Vec<live_send::TmuxKey> {
-    // Build one contiguous byte payload: start marker, then the paste
-    // content with printables as their UTF-8 bytes / interior newlines
-    // as CR (0x0d) / tabs as 0x09, then the end marker. Sending it as
-    // one `HexBytes` means the worker fires exactly one `tmux send-keys
-    // -H` subprocess per paste rather than one per chunk.
-    let mut bytes = Vec::with_capacity(text.len() + BRACKETED_PASTE_START.len() * 2);
-    bytes.extend_from_slice(BRACKETED_PASTE_START);
-
+    // Hand the payload to tmux as one paste and let `paste-buffer -p` decide
+    // about the markers. Emitting `\e[200~` / `\e[201~` ourselves delivered
+    // them to every pane, including raw shells and SQL REPLs that never set
+    // DECSET 2004; those parse `\e[2` as a partial Insert-key sequence, drop
+    // it, and self-insert the leftover `00~` / `01~` into the user's text.
+    // tmux tracks the pane's paste mode and brackets only when the program
+    // asked for it, which keeps the #1546 fix for agents intact.
+    //
+    // tmux replaces LF with CR in the buffer by default, so interior newlines
+    // land exactly as the old raw-byte encoding delivered them. `\r\n` pairs
+    // still coalesce here so Windows-line-ending pastes don't double up, and
+    // other control bytes (BEL, ESC, ...) are still dropped rather than risk
+    // an embedded escape closing the bracketed-paste sequence on the agent's
+    // side.
+    let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
-    let mut utf8_buf = [0u8; 4];
     while let Some(ch) = chars.next() {
         match ch {
-            '\n' => bytes.push(0x0d),
+            '\n' => out.push('\n'),
             '\r' => {
                 if chars.peek() == Some(&'\n') {
                     chars.next();
                 }
-                bytes.push(0x0d);
+                out.push('\n');
             }
-            '\t' => bytes.push(0x09),
-            c if (c as u32) < 0x20 || c == '\x7f' => {
-                // Embedded ESC / BEL / etc. has no safe encoding
-                // inside the paste payload; drop rather than risk a
-                // bogus terminal escape closing the paste early.
-            }
-            c => {
-                let s = c.encode_utf8(&mut utf8_buf);
-                bytes.extend_from_slice(s.as_bytes());
-            }
+            '\t' => out.push('\t'),
+            c if (c as u32) < 0x20 || c == '\x7f' => {}
+            c => out.push(c),
         }
     }
 
-    bytes.extend_from_slice(BRACKETED_PASTE_END);
-    vec![live_send::TmuxKey::HexBytes(bytes)]
+    vec![live_send::TmuxKey::Paste(out)]
 }
 
 /// The rectangle mouse coordinates are mapped into, or `None` when the pointer
@@ -215,8 +202,12 @@ fn split_bracketed_paste(text: &str) -> Vec<live_send::TmuxKey> {
 /// report at all, so it is dropped rather than clamped to the nearest edge,
 /// which would otherwise synthesise a click or hover on pane 0's border.
 ///
-/// Pane 0 sits at the window origin, so the sub-rectangle shares the preview's
-/// top-left corner and only its extent differs.
+/// Pane 0 may have a non-zero origin within the full composite. The TUI
+/// bottom-follows a composite taller than its output, clipping reserved rows
+/// above pane 0 before mouse mapping, so its first visible cell still starts
+/// at `pane.x`/`pane.y`. Mapping a non-bottom-aligned slice would additionally
+/// need that slice's first visible row; adding `rect.top` here alone would
+/// shift input below the displayed pane.
 fn mouse_target_rect(
     cursor: &crate::tmux::PaneCursor,
     pane: ratatui::layout::Rect,
@@ -249,11 +240,11 @@ fn mouse_pane_rect(
     pane: ratatui::layout::Rect,
 ) -> ratatui::layout::Rect {
     match cursor.composite_pane0 {
-        Some((width, height)) => ratatui::layout::Rect {
+        Some(rect) => ratatui::layout::Rect {
             x: pane.x,
             y: pane.y,
-            width: width.min(pane.width),
-            height: height.min(pane.height),
+            width: rect.width.min(pane.width),
+            height: rect.height.min(pane.height),
         },
         None => pane,
     }
@@ -644,6 +635,19 @@ impl HomeView {
         }
     }
 
+    /// Open the read-only System Health view when the compact strip is clicked.
+    pub fn handle_diagnostics_click(&mut self, col: u16, row: u16) -> bool {
+        if self.has_non_live_send_overlay() {
+            return false;
+        }
+        if self.diagnostics_area.contains(Position::from((col, row))) {
+            self.open_system_health();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Click on the footer tips badge: open the tips overlay. Returns true when
     /// the click was on the badge (so the caller stops routing it). Gated on no
     /// overlay being open, the badge rect is captured behind any modal, so this
@@ -713,8 +717,9 @@ impl HomeView {
         }
         // Seed the selection in content coords so it survives a scroll
         // and can span more than one page. `contains` also requires the
-        // pane to hold real scrollback, so a drag over an empty / not-yet
-        // -captured pane is a no-op rather than a phantom selection.
+        // cell to sit on a painted content row, so a drag over an empty
+        // pane or the blank area below short content is a no-op rather
+        // than a phantom selection.
         let view = self.preview_text_view;
         if view.contains(col, row) {
             let cell = view.screen_to_content(col, row);
@@ -1035,7 +1040,6 @@ impl HomeView {
         // (see `wrapped_transcript`), so (row, column) slicing below maps
         // one-to-one onto the on-screen cells. Terminal previews keep
         // reading the tmux capture cache.
-        #[cfg(feature = "serve")]
         let structured_lines = self
             .structured_preview
             .as_ref()
@@ -1045,13 +1049,10 @@ impl HomeView {
                     .is_some_and(|id| id == v.session_id())
             })
             .map(|v| v.selection_text(width));
-        #[cfg(feature = "serve")]
         let lines = match structured_lines.as_ref() {
             Some(text) => text,
             None => self.active_preview_cache().parsed_text.as_ref()?,
         };
-        #[cfg(not(feature = "serve"))]
-        let lines = self.active_preview_cache().parsed_text.as_ref()?;
         // Resolve `from_bottom` distances to absolute indices against the
         // SAME `total_lines` the renderer used this frame, so the copied
         // range matches the painted highlight cell for cell.
@@ -1186,12 +1187,10 @@ impl HomeView {
                 None
             }
             "pull_sandbox_image" => self.pending_image_pull.take().map(Action::SpawnImagePull),
-            #[cfg(feature = "serve")]
             "switch_view" => self
                 .pending_switch_view_session
                 .take()
                 .map(Action::SwitchSessionView),
-            #[cfg(feature = "serve")]
             "start_daemon_structured" => self
                 .pending_daemon_start_session
                 .take()
@@ -1246,7 +1245,7 @@ impl HomeView {
     }
 
     /// Confirm before archiving every active session under the focused group.
-    /// Archiving a whole project at once is a bigger hammer than the single-row
+    /// Archiving a whole project or organization at once is a bigger hammer than the single-row
     /// `z`, so it routes through a prompt. Archiving is reversible, hence the
     /// calmer neutral tone rather than the destructive red. No-ops silently
     /// (no prompt) when the group has no active sessions left to archive.
@@ -1258,19 +1257,22 @@ impl HomeView {
         if count == 0 {
             return;
         }
-        // Project mode groups by repo, Manual mode by user-assigned path; name
-        // the scope accordingly and show the full path so nested groups that
-        // share a leaf segment aren't ambiguous.
-        let (title, scope) = if self.group_by == crate::session::config::GroupByMode::Project {
-            ("Archive project", "project")
-        } else {
-            ("Archive group", "group")
+        // Project/Org mode groups by repo/owner, Manual mode by
+        // user-assigned path; name the scope accordingly and show the full
+        // path so nested groups that share a leaf segment aren't ambiguous.
+        let (title, scope) = match self.group_by {
+            crate::session::config::GroupByMode::Project => ("Archive project", "project"),
+            crate::session::config::GroupByMode::Org => ("Archive org", "org"),
+            crate::session::config::GroupByMode::Manual => ("Archive group", "group"),
         };
         let noun = if count == 1 { "session" } else { "sessions" };
         self.confirm_dialog = Some(
             ConfirmDialog::new(
                 title,
-                &format!("Archive all {count} {noun} in {scope} \"{group_path}\"?"),
+                &format!(
+                    "Archive all {count} {noun} in {scope} \"{}\"?",
+                    crate::session::project_group_display_name(&group_path)
+                ),
                 "archive_group",
             )
             .neutral(),
@@ -1419,8 +1421,8 @@ impl HomeView {
                             self.pending_dialog_click_action =
                                 Some(self.discard_settings_changes());
                         } else {
-                            if action == "quit" && dont_ask_again {
-                                self.disable_confirm_before_quit();
+                            if dont_ask_again {
+                                self.apply_confirm_dont_ask_again(&action);
                             }
                             self.pending_dialog_click_action =
                                 self.dispatch_confirm_submit(&action);
@@ -1857,7 +1859,6 @@ impl HomeView {
         }
 
         // Handle serve view (full-screen takeover)
-        #[cfg(feature = "serve")]
         if let Some(ref mut serve) = self.serve_view {
             match serve.handle_key(key) {
                 ServeAction::Continue => return None,
@@ -2236,8 +2237,8 @@ impl HomeView {
                     let action = dialog.action().to_string();
                     let dont_ask_again = dialog.dont_ask_again();
                     self.confirm_dialog = None;
-                    if action == "quit" && dont_ask_again {
-                        self.disable_confirm_before_quit();
+                    if dont_ask_again {
+                        self.apply_confirm_dont_ask_again(&action);
                     }
                     if let Some(emit) = self.dispatch_confirm_submit(&action) {
                         return Some(emit);
@@ -2860,7 +2861,6 @@ impl HomeView {
                 }
             }
             ActionId::SendMessage => {
-                #[cfg(feature = "serve")]
                 if let Some(id) = self.selected_structured_session() {
                     // Drain pending_paste into the structured composer so
                     // buffered paste / dictation text is not lost when the
@@ -2921,6 +2921,8 @@ impl HomeView {
             }
             ActionId::ToggleContainer => self.toggle_container_for_selected(),
             ActionId::TogglePreviewInfo => self.toggle_preview_info(),
+            ActionId::ToggleDiagnostics => self.toggle_diagnostics(),
+            ActionId::OpenSystemHealth => self.open_system_health(),
             ActionId::SortPicker => self.show_sort_picker(),
             ActionId::GroupBy => self.show_group_picker(),
             ActionId::ToggleProjectPin => self.toggle_project_pin_at_cursor(),
@@ -2973,7 +2975,13 @@ impl HomeView {
                     Some(inst.group_path.clone())
                 }
             })
-            .or_else(|| self.selected_group.clone());
+            .or_else(|| {
+                // The scratch bucket's group_path is an internal sentinel; show
+                // its display label in the Group field, not the raw sentinel (#3237).
+                self.selected_group
+                    .as_deref()
+                    .map(|g| crate::session::project_group_display_name(g).to_string())
+            });
 
         if prefill_path.is_some() || prefill_group.is_some() {
             let existing_groups: Vec<String> =
@@ -3023,17 +3031,7 @@ impl HomeView {
             return false;
         };
         if inst.is_structured() {
-            #[cfg(feature = "serve")]
-            {
-                crate::session::fork::structured_fork_capable(
-                    &inst.tool,
-                    inst.agent_name.as_deref(),
-                )
-            }
-            #[cfg(not(feature = "serve"))]
-            {
-                false
-            }
+            crate::session::fork::structured_fork_capable(&inst.tool, inst.agent_name.as_deref())
         } else {
             crate::session::fork::terminal_agent_can_fork(&inst.tool)
         }
@@ -3045,42 +3043,33 @@ impl HomeView {
     /// always go back to a terminal; a terminal session can go structured
     /// only when its tool is ACP-capable and the `offer_structured_in_new_session`
     /// opt-in is on (the structured view is still maturing, so switching into it
-    /// is gated the same way the new-session toggle is). Serve builds only (the swap runs
-    /// through the daemon and the result needs a structured view to open).
+    /// is gated the same way the new-session toggle is).
     /// Archived / trashed / mid-lifecycle rows are excluded: their agent is
     /// deliberately stopped, and the swap would boot a worker or tmux pane
     /// behind the parked state.
     pub(super) fn session_switch_view_target(&self, id: &str) -> Option<bool> {
-        #[cfg(feature = "serve")]
+        let inst = self.get_instance(id)?;
+        if inst.is_archived()
+            || inst.is_trashed()
+            || matches!(inst.status, Status::Creating | Status::Deleting)
         {
-            let inst = self.get_instance(id)?;
-            if inst.is_archived()
-                || inst.is_trashed()
-                || matches!(inst.status, Status::Creating | Status::Deleting)
-            {
-                return None;
-            }
-            if inst.is_structured() {
-                return Some(true);
-            }
-            let config = crate::session::repo_config::resolve_config_with_repo_or_warn(
-                &inst.source_profile,
-                std::path::Path::new(&inst.project_path),
-            );
-            // Switching a terminal session INTO the structured view is gated on
-            // the same opt-in as the new-session toggle: the structured view is
-            // still maturing, so don't offer to switch into it unless the user
-            // turned it on. The reverse direction (already-structured -> terminal)
-            // stays available above regardless, so a session can always get out.
-            (config.acp.offer_structured_in_new_session
-                && crate::session::builder::structured::tool_acp_capable(&inst.tool, &config))
-            .then_some(false)
+            return None;
         }
-        #[cfg(not(feature = "serve"))]
-        {
-            let _ = id;
-            None
+        if inst.is_structured() {
+            return Some(true);
         }
+        let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+            &inst.source_profile,
+            std::path::Path::new(&inst.project_path),
+        );
+        // Switching a terminal session INTO the structured view is gated on
+        // the same opt-in as the new-session toggle: the structured view is
+        // still maturing, so don't offer to switch into it unless the user
+        // turned it on. The reverse direction (already-structured -> terminal)
+        // stays available above regardless, so a session can always get out.
+        (config.acp.offer_structured_in_new_session
+            && crate::session::builder::structured::tool_acp_capable(&inst.tool, &config))
+        .then_some(false)
     }
 
     /// Confirm before flipping the selected session's view. Enabling
@@ -3144,7 +3133,6 @@ impl HomeView {
     /// found no daemon running. Neutral tone: nothing is destroyed; the
     /// user is just about to run a background process they may not have
     /// expected. Remote setups keep their manual commands.
-    #[cfg(feature = "serve")]
     pub(in crate::tui) fn prompt_start_daemon_for_structured(&mut self, session_id: &str) {
         self.pending_daemon_start_session = Some(session_id.to_string());
         self.confirm_dialog = Some(
@@ -3165,7 +3153,6 @@ impl HomeView {
     /// archive or trash (those render their own placeholder pages, so a
     /// mounted view would be invisible while still streaming). Drives
     /// preview-on-select and the active-view liveness check.
-    #[cfg(feature = "serve")]
     pub(in crate::tui) fn selected_structured_session(&self) -> Option<String> {
         let id = self.selected_session.clone()?;
         let inst = self.get_instance(&id)?;
@@ -3180,7 +3167,6 @@ impl HomeView {
     /// Used by the embedded structured view open path: both modes route
     /// keystrokes away from the home view and paint the preview pane,
     /// so they cannot coexist.
-    #[cfg(feature = "serve")]
     pub(in crate::tui) fn exit_live_send_if_active(&mut self) {
         if let Some(state) = self.live_send.clone() {
             self.exit_live_send_and_restore_sizing(&state);
@@ -3209,9 +3195,7 @@ impl HomeView {
         // Pull the few parent fields we need into owned locals so the
         // immutable borrow of `self` is dropped before the mutable `self.`
         // calls below (dialog construction, info_dialog assignment). A
-        // structured view parent forks through ACP. The captured ACP session
-        // id is read into a local only under `serve`, since only that fork
-        // branch consumes it.
+        // structured view parent forks through ACP.
         let Some(parent) = self
             .selected_session
             .as_ref()
@@ -3225,9 +3209,7 @@ impl HomeView {
         let group_path = parent.group_path.clone();
         let title = parent.title.clone();
         let parent_is_structured = parent.is_structured();
-        #[cfg(feature = "serve")]
         let parent_agent_name = parent.agent_name.clone();
-        #[cfg(feature = "serve")]
         let parent_acp_session_id = parent.acp_session_id.clone();
 
         let seed = if parent_is_structured {
@@ -3235,55 +3217,35 @@ impl HomeView {
             // not the terminal resume-with-fork-flag path. The captured ACP
             // session id is the parent to fork from; without one there is no
             // conversation to fork yet.
-            #[cfg(feature = "serve")]
-            {
-                // Gate on the same predicate the REST create-guard and the web
-                // `acp_can_fork` projection use: a resume-only ACP agent (e.g.
-                // `aoe-agent`) has no fork strategy, so `session/fork` would be
-                // refused at the handshake and silently downgrade to
-                // `session/new`, handing the user an empty session they think is
-                // a fork. Refuse up front with the same info dialog terminal
-                // denial uses.
-                if !crate::session::fork::structured_fork_capable(
-                    &tool,
-                    parent_agent_name.as_deref(),
-                ) {
-                    self.info_dialog = Some(InfoDialog::new(
+            // Gate on the same predicate the REST create-guard and the web
+            // `acp_can_fork` projection use: a resume-only ACP agent (e.g.
+            // `aoe-agent`) has no fork strategy, so `session/fork` would be
+            // refused at the handshake and silently downgrade to
+            // `session/new`, handing the user an empty session they think is
+            // a fork. Refuse up front with the same info dialog terminal
+            // denial uses.
+            if !crate::session::fork::structured_fork_capable(&tool, parent_agent_name.as_deref()) {
+                self.info_dialog = Some(InfoDialog::new(
                         "Fork not supported",
                         &format!(
                             "The '{}' agent cannot fork a structured view session. Fork is available for agents that support the ACP fork capability, such as Claude.",
                             tool
                         ),
                     ));
-                    return;
-                }
-                let Some(acp_id) = parent_acp_session_id.filter(|s| !s.is_empty()) else {
-                    self.info_dialog = Some(InfoDialog::new(
+                return;
+            }
+            let Some(acp_id) = parent_acp_session_id.filter(|s| !s.is_empty()) else {
+                self.info_dialog = Some(InfoDialog::new(
                         "Nothing to fork yet",
                         "This session has no captured conversation to fork from. Send it at least one message first.",
                     ));
-                    return;
-                };
-                crate::session::ForkSeed::Structured {
-                    parent_acp_session_id: acp_id,
-                }
-            }
-            #[cfg(not(feature = "serve"))]
-            {
-                self.info_dialog = Some(InfoDialog::new(
-                    "Fork not available in this build",
-                    "This `aoe` binary was built without the web dashboard \
-                     (a `--no-default-features` source build), so structured \
-                     view session forking is not included.\n\n\
-                     To fork this session:\n\
-                       \u{2022} Install a release build from GitHub Releases, or\n\
-                       \u{2022} Build from source with default features:\n\
-                         cargo build --release",
-                ));
                 return;
+            };
+            crate::session::ForkSeed::Structured {
+                parent_acp_session_id: acp_id,
             }
         } else {
-            let child_id = crate::session::capture::generate_claude_session_id();
+            let child_id = crate::session::capture::generate_session_uuid();
             match crate::session::fork::terminal_fork_seed(
                 &tool,
                 parent_agent_session_id.as_deref(),
@@ -3337,17 +3299,29 @@ impl HomeView {
     }
 
     /// Pick a representative repo path for a selected group so "New Session"
-    /// from a project/group can prefill the working directory. In project mode
-    /// the group label is a derived basename, so match members by
-    /// `project_group_name`; in manual mode match by the stored `group_path`,
-    /// including nested subgroups. Returns `None` for an empty group (no member
-    /// to borrow a path from), leaving the dialog on the default cwd.
+    /// from a project/group can prefill the working directory. In project
+    /// mode the group label is a derived repo basename, so match members by
+    /// `project_group_key`; in manual mode match by the stored
+    /// `group_path`, including nested subgroups. In org mode there is no
+    /// single unambiguous repo to prefill (unlike Project, an org spans many
+    /// repos by design), so this always returns `None` there, mirroring the
+    /// web org header, which routes "New Session" through the generic
+    /// create flow instead of a specific repo path. Also returns `None` for
+    /// an empty group (no member to borrow a path from), leaving the dialog
+    /// on the default cwd. The synthetic scratch bucket lends no path either:
+    /// a session under it would return its throwaway `<app_dir>/scratch/<id>`
+    /// as the prefill, and creating a new session rooted there ties its cwd
+    /// to another scratch session's lifetime (#3237).
     pub(super) fn group_repo_path(&self, group_path: &str) -> Option<String> {
+        if crate::session::is_synthetic_project_header(group_path) {
+            return None;
+        }
         self.instances
             .values()
             .find(|inst| match self.group_by {
-                GroupByMode::Project => super::project_group_name(inst) == group_path,
-                _ => {
+                GroupByMode::Project => super::project_group_key(inst) == group_path,
+                GroupByMode::Org => false,
+                GroupByMode::Manual => {
                     inst.group_path == group_path
                         || inst.group_path.starts_with(&format!("{group_path}/"))
                 }
@@ -3581,7 +3555,7 @@ impl HomeView {
     /// "Auto-name now": run the agent one-shot title generator for the
     /// selected still-default-named session, on demand and even when
     /// auto-rename-on-start is disabled (#3039). Terminal sessions rename via a
-    /// detached child; structured sessions go through the daemon (serve builds).
+    /// detached child; structured sessions go through the daemon.
     /// Best-effort: a 202-style "started", not a synchronous rename.
     fn auto_name_selected(&mut self) -> Option<Action> {
         let Some(id) = self.selected_session.clone() else {
@@ -3619,18 +3593,7 @@ impl HomeView {
         }
 
         if structured {
-            #[cfg(feature = "serve")]
-            {
-                return Some(Action::SmartRenameNow(id));
-            }
-            #[cfg(not(feature = "serve"))]
-            {
-                self.info_dialog = Some(InfoDialog::new(
-                    "Unavailable",
-                    "Auto-naming a structured-view session needs a serve-enabled build.",
-                ));
-                return None;
-            }
+            return Some(Action::SmartRenameNow(id));
         }
 
         // Preflight the gates the detached child re-applies, so this action stops
@@ -3639,7 +3602,7 @@ impl HomeView {
         // fork avoidance. `setting_on = true` because the manual action runs even
         // when auto-rename-on-start is off (#3039), matching the `--force` the
         // child receives and the web endpoint's preflight.
-        let resolved = crate::session::repo_config::resolve_config_with_repo_or_warn(
+        let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
             &profile,
             std::path::Path::new(&project_path),
         );
@@ -3697,38 +3660,20 @@ impl HomeView {
     }
 
     fn open_serve(&mut self) {
-        #[cfg(feature = "serve")]
-        {
-            let web_disabled = crate::plugin::registry()
-                .get("aoe.web")
-                .is_some_and(|p| !p.enabled);
-            if web_disabled {
-                self.info_dialog = Some(InfoDialog::new(
-                    "Web dashboard disabled",
-                    "The aoe.web plugin is disabled, so the web dashboard cannot \
+        let web_disabled = crate::plugin::registry()
+            .get("aoe.web")
+            .is_some_and(|p| !p.enabled);
+        if web_disabled {
+            self.info_dialog = Some(InfoDialog::new(
+                "Web dashboard disabled",
+                "The aoe.web plugin is disabled, so the web dashboard cannot \
                      be served.\n\n\
                      Re-enable it in Settings > Plugins (or run \
                      `aoe plugin enable aoe.web`), then press R again.",
-                ));
-                return;
-            }
-            self.serve_view = Some(crate::tui::dialogs::ServeView::new());
-        }
-        #[cfg(not(feature = "serve"))]
-        {
-            self.info_dialog = Some(InfoDialog::new(
-                "Serve unavailable",
-                "This `aoe` binary was built without the web dashboard \
-                 (a `--no-default-features` source build), so local network \
-                 serving and Cloudflare Tunnel integration are not included.\n\n\
-                 To serve to your phone (LAN / Tailscale / tunnel):\n\
-                   \u{2022} Install a release build from GitHub Releases, or\n\
-                   \u{2022} Build from source with default features:\n\
-                     cargo build --release\n\n\
-                 Once you have a `serve`-enabled binary, press R again to \
-                 open the serve dialog.",
             ));
+            return;
         }
+        self.serve_view = Some(crate::tui::dialogs::ServeView::new());
     }
 
     pub(super) fn open_settings(&mut self) {
@@ -3811,8 +3756,7 @@ impl HomeView {
     }
 
     fn open_command_palette(&mut self) {
-        let serve_enabled = cfg!(feature = "serve");
-        let mut entries: Vec<PaletteCommand> = builtin_commands(serve_enabled, self.strict_hotkeys);
+        let mut entries: Vec<PaletteCommand> = builtin_commands(self.strict_hotkeys);
 
         // Quit lives in the registry but is excluded from `builtin_commands`
         // (no palette metadata) so it can sit in the Settings group at the end;
@@ -3875,10 +3819,14 @@ impl HomeView {
                     {
                         continue;
                     }
-                    let label = if name == path {
+                    // The parenthetical disambiguates org keys (owner vs
+                    // owner@host); route it through the display mapper so a
+                    // synthetic bucket's sentinel path never leaks (#3237).
+                    let disambiguator = crate::session::project_group_display_name(path);
+                    let label = if name.as_str() == disambiguator {
                         format!("Jump to group: {}", name)
                     } else {
-                        format!("Jump to group: {} ({})", name, path)
+                        format!("Jump to group: {} ({})", name, disambiguator)
                     };
                     entries.push(PaletteCommand {
                         id: "jump-group",
@@ -4161,26 +4109,18 @@ impl HomeView {
     /// between the `Enter` keybind and double-click activation so the two
     /// paths can't drift.
     pub(super) fn activate_selected_session(&mut self) -> Option<Action> {
+        self.system_health_open = false;
         let id = self.selected_session.clone()?;
         if let Some(inst) = self.get_instance(&id) {
             if matches!(inst.status, Status::Deleting | Status::Creating) {
                 return None;
             }
             if inst.is_structured() {
-                #[cfg(feature = "serve")]
-                {
-                    // The embedded structured view takes over the preview
-                    // pane; leave live-send first so the two don't fight
-                    // over it (mirrors `exit_live_send_before_attach`).
-                    self.exit_live_send_if_active();
-                    return Some(Action::OpenStructuredView(id));
-                }
-                #[cfg(not(feature = "serve"))]
-                {
-                    return Some(Action::SetTransientStatus(
-                        "Acp session: rebuild with default features to attach".to_string(),
-                    ));
-                }
+                // The embedded structured view takes over the preview
+                // pane; leave live-send first so the two don't fight
+                // over it (mirrors `exit_live_send_before_attach`).
+                self.exit_live_send_if_active();
+                return Some(Action::OpenStructuredView(id));
             }
         }
         match self.view_mode {
@@ -4310,6 +4250,7 @@ impl HomeView {
                 }
             }
             if self.selected_session != prev_session {
+                self.system_health_open = false;
                 self.preview_scroll_offset = 0;
                 // A finalized preview selection pins to the previous pane's
                 // cells; carried into a different session it would paint a
@@ -4382,6 +4323,26 @@ impl HomeView {
         }
     }
 
+    /// Info-dialog copy for rename/delete attempted on a header whose
+    /// grouping mode derives it automatically (Project/Org), so there is no
+    /// user-owned group to rename or delete. Returns `None` for `Manual`,
+    /// where group membership is user-managed and the caller should proceed
+    /// with its normal rename/delete flow instead.
+    fn automatic_group_hint(&self) -> Option<(String, String)> {
+        let mode_label = match self.group_by {
+            GroupByMode::Manual => return None,
+            GroupByMode::Project => "Project",
+            GroupByMode::Org => "Org",
+        };
+        let toggle = if self.strict_hotkeys { "Ctrl+G" } else { "'g'" };
+        Some((
+            format!("Cannot Modify {mode_label} Groups"),
+            format!(
+                "{mode_label} groups are automatic. Press {toggle} and pick Manual to manage groups."
+            ),
+        ))
+    }
+
     fn toggle_group_collapsed(&mut self, path: &str) {
         // The synthetic Archived section is not a member of any
         // GroupTree; its collapsed state lives on HomeView and persists
@@ -4405,6 +4366,14 @@ impl HomeView {
                 .insert(path.to_string(), !collapsed);
             self.rebuild_flat_items();
             self.save_project_group_collapsed();
+            return;
+        }
+        if self.group_by == GroupByMode::Org {
+            let collapsed = self.org_group_collapsed.get(path).copied().unwrap_or(false);
+            self.org_group_collapsed
+                .insert(path.to_string(), !collapsed);
+            self.rebuild_flat_items();
+            self.save_org_group_collapsed();
             return;
         }
         // Route to the correct profile's GroupTree
@@ -4432,7 +4401,7 @@ impl HomeView {
     /// * **Mouse tracking on**: forward the wheel as a mouse event, encoding
     ///   following the app (SGR 1006 when `mouse_sgr` is set, else legacy
     ///   X10). The previewed pane is sized to the preview rect in both modes
-    ///   (`preview_pane_synced` / the live-send sync resize), so the mapped
+    ///   (`passive_pane_synced` / the live-send sync resize), so the mapped
     ///   coordinates land inside it.
     /// * **Mouse tracking off**: send `PageUp`/`PageDown`, not arrow keys. A
     ///   full-screen app reads arrows as cursor / input-history navigation,
@@ -4447,10 +4416,7 @@ impl HomeView {
     /// so it goes out as a one-shot fork to the previewed pane's tmux target.
     /// Returns true when the event was forwarded.
     fn forward_wheel_to_preview(&self, up: bool, col: u16, row: u16) -> bool {
-        let cursor = self
-            .preview_capture_worker
-            .as_ref()
-            .and_then(|w| w.current_cursor());
+        let cursor = self.active_preview_cursor();
         let Some(cursor) = cursor else { return false };
         let Some(key) = wheel_forward_key(&cursor, up, self.preview_text_view.pane, col, row)
         else {
@@ -4473,11 +4439,7 @@ impl HomeView {
     /// forward) direction; `col`/`row` is the held pointer cell, mapped into the
     /// pane for the mouse-byte encoding. Returns true when something was sent.
     fn forward_scroll_to_preview(&self, up: bool, col: u16, row: u16) -> bool {
-        let Some(cursor) = self
-            .preview_capture_worker
-            .as_ref()
-            .and_then(|w| w.current_cursor())
-        else {
+        let Some(cursor) = self.active_preview_cursor() else {
             return false;
         };
         let Some(key) = wheel_forward_key(&cursor, up, self.preview_text_view.pane, col, row)
@@ -4520,10 +4482,7 @@ impl HomeView {
     /// caller's escape hatch back to aoe-side selection / copy. Returns the
     /// cursor so the caller can read `mouse_sgr` for the encoding.
     fn preview_forwards_mouse(&self) -> Option<crate::tmux::PaneCursor> {
-        let cursor = self
-            .preview_capture_worker
-            .as_ref()
-            .and_then(|w| w.current_cursor())?;
+        let cursor = self.active_preview_cursor()?;
         (cursor.alternate_on && cursor.mouse_tracking).then_some(cursor)
     }
 
@@ -4622,11 +4581,7 @@ impl HomeView {
             self.hover_forward_cell = None;
             return false;
         }
-        let Some(cursor) = self
-            .preview_capture_worker
-            .as_ref()
-            .and_then(|w| w.current_cursor())
-        else {
+        let Some(cursor) = self.active_preview_cursor() else {
             return false;
         };
         let pane = self.preview_text_view.pane;
@@ -4650,6 +4605,10 @@ impl HomeView {
         // the wheel via `has_dialog()`.
         if let Some(view) = &mut self.settings_view {
             return view.handle_wheel_scroll(true);
+        }
+        if self.system_health_open && self.hit_preview(col, row) {
+            self.system_health_scroll = self.system_health_scroll.saturating_sub(3);
+            return true;
         }
         // A preview selection is anchored to absolute scrollback lines,
         // not screen cells, so scrolling no longer invalidates it: the
@@ -4910,8 +4869,7 @@ impl HomeView {
                 // View switching mirrors the web sidebar's per-session
                 // switch action: offered when a structured session can go
                 // back to a terminal, or a terminal session's tool is
-                // ACP-capable. Serve builds only; the swap runs through
-                // the daemon.
+                // ACP-capable. The swap runs through the daemon.
                 let switch_view = match &self.flat_items[idx] {
                     super::Item::Session { id, .. } => self.session_switch_view_target(id),
                     super::Item::Group { .. } => None,
@@ -5104,6 +5062,8 @@ impl HomeView {
         let signals = crate::tips::TipSignals {
             new_session_with_selection_count: config.app_state.new_session_with_selection_count,
             used_new_from_selection: config.app_state.used_new_from_selection,
+            system_health_tip_earned: config.app_state.system_health_tip_earned,
+            used_system_health: config.app_state.used_system_health,
         };
         let eligible = crate::tips::eligible(crate::tips::TipSurface::Tui, &signals);
         self.tips_dialog = Some(TipsDialog::new(
@@ -5200,6 +5160,8 @@ impl HomeView {
         let signals = crate::tips::TipSignals {
             new_session_with_selection_count: config.app_state.new_session_with_selection_count,
             used_new_from_selection: config.app_state.used_new_from_selection,
+            system_health_tip_earned: config.app_state.system_health_tip_earned,
+            used_system_health: config.app_state.used_system_health,
         };
         self.pending_tip_pop = crate::tips::next_earned_pop(
             crate::tips::TipSurface::Tui,
@@ -5261,7 +5223,7 @@ impl HomeView {
     }
 
     /// Open the rename dialog for whatever the sidebar has selected (a
-    /// session row, or a manual-mode group). Project-mode groups can't be
+    /// session row, or a manual-mode group). Project and organization-mode groups can't be
     /// renamed, so they raise an info dialog explaining how to switch
     /// modes. No-op when nothing is selected, or when the selected session
     /// is mid-create or mid-delete (renaming under those states would race
@@ -5314,13 +5276,8 @@ impl HomeView {
             }
             self.rename_dialog = Some(dialog);
         } else if let Some(group_path) = &self.selected_group {
-            if self.group_by == GroupByMode::Project {
-                let hint = if self.strict_hotkeys {
-                    "Project groups are automatic. Press Ctrl+G and pick Manual to manage groups."
-                } else {
-                    "Project groups are automatic. Press 'g' and pick Manual to manage groups."
-                };
-                self.info_dialog = Some(InfoDialog::new("Cannot Modify Project Groups", hint));
+            if let Some((title, hint)) = self.automatic_group_hint() {
+                self.info_dialog = Some(InfoDialog::new(&title, &hint));
                 return;
             }
             let group_path = group_path.clone();
@@ -5411,7 +5368,7 @@ impl HomeView {
     ///   - Terminal view rejects deletion with an info dialog,
     ///   - Creating sessions are inert,
     ///   - Stuck-Deleting sessions get a force-remove confirm,
-    ///   - Project-mode groups can't be deleted (info dialog).
+    ///   - Project and organization-mode groups can't be deleted (info dialog).
     ///
     /// Shared by the `'d'` / `'D'` key handlers and the right-click
     /// context menu.
@@ -5462,21 +5419,46 @@ impl HomeView {
                 let delete_to_trash = session_cfg.delete_to_trash;
                 if delete_to_trash && !already_trashed {
                     let sid = session_id.clone();
-                    // When session.confirm_delete is on, guard the trash with a
-                    // confirmation dialog instead of trashing on the keystroke.
-                    // The accept path (dispatch_confirm_submit "trash_session")
-                    // runs the same trash_session_by_id as the instant path.
+                    // When session.confirm_delete is on (the default), guard the
+                    // trash with a confirmation dialog instead of trashing on the
+                    // keystroke. The delete key itself accepts the dialog, so the
+                    // deliberate gesture stays two taps of one key while a single
+                    // stray keystroke is harmless. The accept path
+                    // (dispatch_confirm_submit "trash_session") runs the same
+                    // trash_session_by_id as the instant path.
                     if session_cfg.confirm_delete {
-                        let message = format!(
-                            "Move '{}' to the trash? It can be restored from the Trash section.",
-                            inst.title
-                        );
+                        // Read the accept key off the binding table instead of
+                        // spelling it out here, so relocating Delete can't drift
+                        // the hint (or the key that accepts) from the key that
+                        // opened the dialog. A chord that isn't a bare character
+                        // (a hypothetical Ctrl+D) can't be an opt-in confirm
+                        // char, so it falls back to the dialog's own y/Enter.
+                        let delete_key = bindings::label(ActionId::Delete, self.strict_hotkeys);
+                        let mut key_chars = delete_key.chars();
+                        let accept_char = match (key_chars.next(), key_chars.next()) {
+                            (Some(c), None) => Some(c),
+                            _ => None,
+                        };
+                        let hint = match accept_char {
+                            Some(_) => {
+                                format!("Press {delete_key} again to confirm, Esc to cancel.")
+                            }
+                            None => "Press y to confirm, Esc to cancel.".to_string(),
+                        };
+                        let message = format!("Move '{}' to the trash?\n{hint}", inst.title);
                         self.pending_trash_session = Some(sid);
-                        self.confirm_dialog = Some(ConfirmDialog::new(
-                            "Confirm Delete",
-                            &message,
-                            "trash_session",
-                        ));
+                        // Offer the same in-dialog opt-out the quit confirm has:
+                        // this guard is on by default, so a user who wants the
+                        // one-keystroke trash back shouldn't have to go find the
+                        // setting. Ticking it persists confirm_delete = false.
+                        let mut dialog =
+                            ConfirmDialog::new("Confirm Delete", &message, "trash_session")
+                                .buttons("Delete", "Cancel")
+                                .offering_dont_ask_again();
+                        if let Some(c) = accept_char {
+                            dialog = dialog.confirmed_by(c);
+                        }
+                        self.confirm_dialog = Some(dialog);
                         return;
                     }
                     self.trash_session_by_id(&sid);
@@ -5510,13 +5492,8 @@ impl HomeView {
                 ));
             }
         } else if let Some(group_path) = &self.selected_group {
-            if self.group_by == GroupByMode::Project {
-                let hint = if self.strict_hotkeys {
-                    "Project groups are automatic. Press Ctrl+G and pick Manual to manage groups."
-                } else {
-                    "Project groups are automatic. Press 'g' and pick Manual to manage groups."
-                };
-                self.info_dialog = Some(InfoDialog::new("Cannot Modify Project Groups", hint));
+            if let Some((title, hint)) = self.automatic_group_hint() {
+                self.info_dialog = Some(InfoDialog::new(&title, &hint));
                 return;
             }
             // Scope the count to the selected group's profile: two groups in
@@ -5628,6 +5605,7 @@ impl HomeView {
                 None
             }
             Item::Session { id, .. } => {
+                self.system_health_open = false;
                 if self.cursor != abs_idx {
                     self.cursor = abs_idx;
                     self.update_selected();
@@ -5841,6 +5819,11 @@ impl HomeView {
             .map(|(_, key)| *key);
         let footer_changed = prev_footer_hover != self.footer_hover;
 
+        let diagnostics_hovered = !self.has_non_live_send_overlay()
+            && self.diagnostics_area.contains(Position::from((col, row)));
+        let diagnostics_changed = diagnostics_hovered != self.diagnostics_hovered;
+        self.diagnostics_hovered = diagnostics_hovered;
+
         // Hover is live over both the scrolling list and the pinned shelf, so
         // a shelf row (Trash / Archived) highlights under the pointer the same
         // way a list row does. `resolve_row_to_index` maps either region.
@@ -5861,7 +5844,11 @@ impl HomeView {
         let badge_changed = badge_hover != self.tips_badge_hovered;
         self.tips_badge_hovered = badge_hover;
 
-        overlay_changed || footer_changed || badge_changed || prev_idx != new_idx
+        overlay_changed
+            || footer_changed
+            || diagnostics_changed
+            || badge_changed
+            || prev_idx != new_idx
     }
 
     /// Route a mouse-wheel-down at (col, row); see handle_scroll_up.
@@ -5870,6 +5857,14 @@ impl HomeView {
         // Settings takeover owns the wheel; see handle_scroll_up.
         if let Some(view) = &mut self.settings_view {
             return view.handle_wheel_scroll(false);
+        }
+        if self.system_health_open && self.hit_preview(col, row) {
+            let visible_rows = crate::tui::components::diagnostics::agent_table_visible_rows(
+                self.preview_area.height,
+            );
+            let max = self.metrics.agents.len().saturating_sub(visible_rows);
+            self.system_health_scroll = self.system_health_scroll.saturating_add(3).min(max);
+            return true;
         }
         // Mirror handle_scroll_up: the selection is anchored to scrollback
         // lines, so it survives the scroll and is left in place.
@@ -6284,12 +6279,13 @@ impl HomeView {
     /// re-asserting `window-size latest` would stomp it (the exact flap
     /// the size-owner lock exists to kill).
     fn teardown_live_send(&mut self) {
-        self.live_send = None;
+        let live_session_id = self.live_send.take().map(|state| state.session_id);
         self.live_send_worker = None;
         // Leave the capture worker running: the same pane is still
         // previewed after exit, just at the idle cadence. The render
         // reconcile retunes it (and retargets if the view later changes).
         self.live_send_last_resize = None;
+        self.live_send_resize_retry_at = None;
         // The leader menu is live-mode-only: drop any half-entered chord so
         // the home view is never left armed. The sidebar collapse is now a
         // general, persisted home-view state (the collapsed strip stays
@@ -6302,7 +6298,9 @@ impl HomeView {
         // Live mode just owned the pane's size; the non-live preview must
         // re-assert its geometry on the next render now that the header is
         // visible again (and so the agent reflows back to the previewed size).
-        self.preview_pane_synced = None;
+        if let Some(id) = &live_session_id {
+            self.clear_preview_pane_sync(id);
+        }
         // Preview selections also work outside live mode now, but a
         // live-mode highlight pins to the live-resized pane coords,
         // and exiting reflows the preview back to its normal size.
@@ -6731,7 +6729,7 @@ impl HomeView {
         let config =
             repo_config::resolve_config_with_repo(&data.profile, std::path::Path::new(&data.path))
                 .ok()?;
-        let expansions = crate::session::container_config::preview_glob_volume_ignores(
+        let expansions = crate::session::config::container_config::preview_glob_volume_ignores(
             &data.path,
             None,
             &config.sandbox.volume_ignores,
@@ -7023,6 +7021,8 @@ mod tests {
     /// goes to pane 0 alone, so a pointer over a neighbouring pane must not be
     /// mapped against the full rect: that reported a column past pane 0's right
     /// edge to the agent as though its own pane were window-wide.
+    /// It also round-trips a painted composite cursor cell through mouse mapping,
+    /// pinning the bottom-follow clipping semantics.
     #[test]
     fn composited_preview_maps_the_mouse_into_pane_zero_only() {
         use ratatui::layout::Rect;
@@ -7030,7 +7030,12 @@ mod tests {
         let pane = Rect::new(0, 0, 80, 24);
         let mut split = cursor_for(true, true, true);
         split.mouse_all = true;
-        split.composite_pane0 = Some((40, 24));
+        split.composite_pane0 = Some(crate::tmux::PaneGeom {
+            left: 0,
+            top: 0,
+            width: 40,
+            height: 24,
+        });
 
         // Inside pane 0: maps as before, 1-based.
         assert_eq!(
@@ -7045,10 +7050,43 @@ mod tests {
         assert!(hover_forward_bytes(&split, pane, 39, 5).is_some());
         assert_eq!(hover_forward_bytes(&split, pane, 40, 5), None);
 
+        // In the bottom-follow layout, the composite's top border row is
+        // clipped before painting: `first_line == pane0.top == 1`. The cursor
+        // mapper adds `top` after its anchor delta, while the mouse rect stays
+        // at the visible output origin. A click on the painted cursor must
+        // round-trip to that cursor's 1-based app cell.
+        let mut bottom_follow = cursor_for(true, true, true);
+        bottom_follow.x = 10;
+        bottom_follow.y = 4;
+        bottom_follow.pane_height = 25;
+        bottom_follow.composite_pane0 = Some(crate::tmux::PaneGeom {
+            left: 0,
+            top: 1,
+            width: 40,
+            height: 24,
+        });
+        let painted = crate::tui::home::render::map_live_preview_cursor(
+            pane,
+            usize::from(pane.height),
+            25,
+            bottom_follow,
+        )
+        .expect("visible pane cursor");
+        assert_eq!(
+            map_pane_cell(mouse_pane_rect(&bottom_follow, pane), painted.x, painted.y,),
+            (bottom_follow.x + 1, bottom_follow.y + 1),
+            "clicking the painted cursor must report the same app cell"
+        );
+
         // A no-mouse full-screen agent gets no page key from a wheel aimed at
         // the neighbour either, but keeps it over pane 0.
         let mut no_mouse = cursor_for(true, false, false);
-        no_mouse.composite_pane0 = Some((40, 24));
+        no_mouse.composite_pane0 = Some(crate::tmux::PaneGeom {
+            left: 0,
+            top: 0,
+            width: 40,
+            height: 24,
+        });
         assert_eq!(wheel_forward_key(&no_mouse, true, pane, 60, 5), None);
         assert!(wheel_forward_key(&no_mouse, true, pane, 10, 5).is_some());
 
@@ -7081,7 +7119,12 @@ mod tests {
         use ratatui::layout::Rect;
         let pane = Rect::new(2, 3, 20, 10);
         let mut cursor = cursor_for(true, true, true);
-        cursor.composite_pane0 = Some((999, 999));
+        cursor.composite_pane0 = Some(crate::tmux::PaneGeom {
+            left: 0,
+            top: 0,
+            width: 999,
+            height: 999,
+        });
         assert_eq!(mouse_pane_rect(&cursor, pane), pane);
         // And the origin is honoured: a cell above/left of the rect is outside.
         assert_eq!(mouse_target_rect(&cursor, pane, 1, 3), None);

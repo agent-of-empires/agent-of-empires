@@ -1,0 +1,55 @@
+name: CodeQL
+
+# Advanced setup, so query and path filtering can live in the repository. It
+# replaces default setup rather than supplementing it: while default setup is
+# enabled, GitHub rejects the SARIF this workflow uploads. Disable it under
+# Settings > Advanced Security > Code scanning before merging a change here.
+
+on:
+  push:
+    branches: [main]
+  # No branch filter, for the same reason as ci.yml: a stacked PR targets its
+  # parent branch rather than main.
+  pull_request:
+  schedule:
+    - cron: "27 4 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [actions, javascript-typescript, python, rust]
+    env:
+      # The Rust extractor enables `cfg(test)`, so `#[cfg(test)]` modules under
+      # src/ are analyzed as shipped code. A path filter cannot reach them
+      # because they sit in production files. The value is parsed as a list, so
+      # the brackets are load-bearing: a bare `-test` fails the extractor.
+      CODEQL_EXTRACTOR_RUST_OPTION_CARGO_CFG_OVERRIDES: "[-test]"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          config-file: ./.github/codeql/codeql-config.yml
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          category: "/language:${{ matrix.language }}"

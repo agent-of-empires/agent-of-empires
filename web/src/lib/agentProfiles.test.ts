@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_AGENT_PROFILE, isClearAlias, isSubagentToolName, resolveAgentProfile } from "./agentProfiles";
+import {
+  DEFAULT_AGENT_PROFILE,
+  isClearAlias,
+  isSubagentToolName,
+  resolveAgentLifecycle,
+  resolveAgentProfile,
+} from "./agentProfiles";
 
 describe("resolveAgentProfile", () => {
   it("resolves known agent keys", () => {
@@ -12,6 +18,7 @@ describe("resolveAgentProfile", () => {
     expect(resolveAgentProfile("pi").key).toBe("pi");
     expect(resolveAgentProfile("omp").key).toBe("omp");
     expect(resolveAgentProfile("kimi").key).toBe("kimi");
+    expect(resolveAgentProfile("prime-agent").key).toBe("prime-agent");
     expect(resolveAgentProfile("aoe-agent").key).toBe("aoe-agent");
   });
 
@@ -50,7 +57,6 @@ describe("resolveAgentProfile", () => {
 
   it("omp uses its native ACP clear boundary without guessed capabilities", () => {
     const p = resolveAgentProfile("omp");
-    expect(p.clearAliases).toEqual(["/new"]);
     expect(p.capabilities.todos).toBe(false);
     expect(p.capabilities.skills).toBe(false);
     expect(p.capabilities.wakeup).toBe(false);
@@ -85,14 +91,38 @@ describe("resolveAgentProfile", () => {
     expect(p.aliases.read).toContain("read_many_files");
     expect(p.aliases.fetch).toEqual(["web_fetch"]);
   });
+});
 
-  it("clearAliases match the server-side rust profile", () => {
-    expect(resolveAgentProfile("claude").clearAliases).toEqual(["/clear"]);
-    expect(resolveAgentProfile("codex").clearAliases).toEqual(["/new"]);
-    expect(resolveAgentProfile("opencode").clearAliases).toEqual(["/new"]);
-    expect(resolveAgentProfile("gemini").clearAliases).toEqual([]);
-    expect(resolveAgentProfile("kimi").clearAliases).toEqual(["/new"]);
-    expect(resolveAgentProfile("omp").clearAliases).toEqual(["/new"]);
+describe("resolveAgentLifecycle", () => {
+  it("marks gemini deprecated with the antigravity replacement", () => {
+    const lifecycle = resolveAgentLifecycle("gemini");
+    expect(lifecycle.state).toBe("deprecated");
+    expect(lifecycle.since).toBe("2026-06-18");
+    expect(lifecycle.note).toContain("consumer accounts cut off by Google");
+    expect(lifecycle.replacement).toBe("antigravity");
+  });
+
+  it("resolves active for every other registered key", () => {
+    // Table over the remaining mirror keys; all must be plain Active.
+    const cases = ["claude", "claude-code", "codex", "opencode", "vibe", "pi", "omp", "kimi", "aoe-agent"];
+    for (const key of cases) {
+      expect(resolveAgentLifecycle(key).state).toBe("active");
+      expect(resolveAgentLifecycle(key).since).toBeUndefined();
+    }
+  });
+
+  it("falls back to active for unknown / nullish keys", () => {
+    const cases = [undefined, null, "", "custom-agent"] as const;
+    for (const key of cases) {
+      expect(resolveAgentLifecycle(key)).toEqual({ state: "active" });
+    }
+  });
+
+  it("mirrors the profile lifecycle field for deprecated entries", () => {
+    // The static flag on AgentProfile and the resolver must agree, so a
+    // consumer reading either source sees the same state.
+    expect(resolveAgentProfile("gemini").lifecycle).toEqual(resolveAgentLifecycle("gemini"));
+    expect(DEFAULT_AGENT_PROFILE.lifecycle).toBeUndefined();
   });
 });
 

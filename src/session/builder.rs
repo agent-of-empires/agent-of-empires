@@ -3,7 +3,10 @@
 //! This module provides shared logic for building new session instances,
 //! used by both synchronous (TUI operations) and asynchronous (background poller) code paths.
 
-use std::{collections::HashSet, path::PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{bail, Result};
 use chrono::Utc;
@@ -43,6 +46,12 @@ pub struct InstanceParams {
     pub command_override: String,
     /// Additional repository paths for multi-repo workspace mode
     pub extra_repo_paths: Vec<String>,
+    /// Per-repo base branches as `(selector, base)` pairs, from
+    /// `aoe add --repo-base <selector>=<ref>` or the web wizard. The
+    /// selector is a repo directory name or one of the paths in `path` /
+    /// `extra_repo_paths`. Outranks `base_branch`, which stays the base for
+    /// every repo that no pair names. See #3329.
+    pub repo_base_branches: Vec<(String, String)>,
     /// Scratch session: ignore `path`, provision a fresh directory under
     /// `<app_dir>/scratch/<id>/`, and persist `instance.scratch = true` so
     /// the deletion path removes the directory. Mutually exclusive with
@@ -65,10 +74,12 @@ pub struct BuildResult {
     pub warnings: Vec<String>,
 }
 
-/// Info about a worktree created during instance building.
+/// A worktree provisioned during instance building and owned by this build.
 pub struct CreatedWorktree {
     pub path: PathBuf,
     pub main_repo_path: PathBuf,
+    /// Branch created by this build. `None` when attaching an existing branch.
+    pub owned_branch: Option<String>,
 }
 
 /// Result of creating a multi-repo workspace.
@@ -117,6 +128,60 @@ fn resolve_repo_base_branch(
     let key = crate::session::projects::canonical_key(&main_repo.to_string_lossy());
     let project = project_bases.get(&key).map(String::as_str);
     resolve_base_branch(session, project, global)
+}
+
+/// Match `(selector, base)` pairs to the repos a session is being built from.
+///
+/// A selector is either a repo's directory name (what every other surface
+/// calls it: the diff panel, `aoe list --json`, `set-base --repo`) or the
+/// literal path the caller passed. Returns a map keyed by the same `PathBuf`
+/// the spec builder uses, so a lookup there is exact.
+///
+/// An unmatched or ambiguous selector is an error rather than a silent
+/// no-op: a typo would otherwise fork the worktree from the wrong base and
+/// only show up as a confusing diff much later. See #3329.
+pub(crate) fn resolve_repo_base_selectors(
+    repos: &[PathBuf],
+    pairs: &[(String, String)],
+) -> Result<std::collections::HashMap<PathBuf, String>> {
+    let mut out = std::collections::HashMap::new();
+    for (selector, base) in pairs {
+        let sel = selector.trim();
+        let Some(base) = normalize_base(Some(base)) else {
+            bail!("No base branch given for repo '{}'", sel);
+        };
+        let matches: Vec<&PathBuf> = repos
+            .iter()
+            .filter(|p| {
+                p.as_os_str() == sel
+                    || p.file_name()
+                        .is_some_and(|n| n == std::ffi::OsStr::new(sel))
+            })
+            .collect();
+        match matches.as_slice() {
+            [one] => {
+                if out.insert((*one).clone(), base).is_some() {
+                    bail!("Repo '{}' was given a base branch twice", sel);
+                }
+            }
+            [] => {
+                let known: Vec<String> = repos
+                    .iter()
+                    .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                    .collect();
+                bail!(
+                    "No repo named '{}' in this session. Available: {}",
+                    sel,
+                    known.join(", ")
+                );
+            }
+            _ => bail!(
+                "Repo name '{}' is ambiguous; pass the full path instead",
+                sel
+            ),
+        }
+    }
+    Ok(out)
 }
 
 /// Map of canonical repo path to configured default base branch for every
@@ -213,10 +278,9 @@ pub fn create_workspace(
     }
 
     let cleanup = |created: &[CreatedWorktree], ws_path: &std::path::Path| {
-        for wt in created {
-            if let Ok(git_wt) = GitWorktree::new(wt.main_repo_path.clone()) {
-                let _ = git_wt.remove_worktree(&wt.path, false);
-            }
+        let protection = CleanupProtection::default();
+        for worktree in created {
+            cleanup_created_worktree(worktree, "workspace worktree", &protection);
         }
         let _ = std::fs::remove_dir_all(ws_path);
     };
@@ -329,6 +393,7 @@ pub fn create_workspace(
                 created_worktrees.push(CreatedWorktree {
                     path: plan.worktree_subdir.clone(),
                     main_repo_path: plan.main_repo_path.clone(),
+                    owned_branch: create_new_branch.then(|| branch.to_string()),
                 });
                 repos.push(WorkspaceRepo {
                     name: plan.repo_name.clone(),
@@ -341,6 +406,14 @@ pub fn create_workspace(
                     // and worktree ownership coincide for a repo present at
                     // creation. Only `attach_project` can set this.
                     branch_preexisting: false,
+                    // The ref this repo's branch was forked from, so the diff
+                    // view can default to it per repo (#3329). Recorded only
+                    // when the branch was created here; `create_worktree`
+                    // ignores the base when checking out an existing branch.
+                    base_branch: create_new_branch
+                        .then(|| plan.base_branch.clone())
+                        .flatten(),
+                    base_branch_override: None,
                 });
             }
             Err(msg) => errors.push(msg),
@@ -425,7 +498,7 @@ pub fn build_instance(
         std::path::PathBuf::from(&params.path)
     };
     let config =
-        super::repo_config::resolve_config_with_repo(profile, &config_path).unwrap_or_else(|e| {
+        super::config::repo_config::resolve_config_with_repo(profile, &config_path).unwrap_or_else(|e| {
             tracing::warn!(target: "session.create", "Failed to load config, using defaults: {}", e);
             Config::default()
         });
@@ -491,17 +564,25 @@ pub fn build_instance(
             let global_default = config.worktree.default_base_branch.as_deref();
             let project_bases = project_base_branches(profile);
 
-            // Every repo, including the launch repo, forks from its own
-            // registered per-project default when no explicit session base is
-            // given. Keyed by repo root so a launch path inside a subdirectory
-            // still matches a root-registered project.
+            // An explicit per-repo base outranks every shared layer, which is
+            // the point: one repo forks from develop while the others fork from
+            // their own epic branches. See #3329.
+            let mut all_paths = vec![primary_path.clone()];
+            all_paths.extend(params.extra_repo_paths.iter().map(PathBuf::from));
+            let per_repo = resolve_repo_base_selectors(&all_paths, &params.repo_base_branches)?;
+            let base_for = |path: &PathBuf| {
+                per_repo.get(path).cloned().or_else(|| {
+                    // Every repo, including the launch repo, otherwise forks
+                    // from its own registered per-project default when no
+                    // explicit session base is given. Keyed by repo root so a
+                    // launch path inside a subdirectory still matches a
+                    // root-registered project.
+                    resolve_repo_base_branch(path, session_base, &project_bases, global_default)
+                })
+            };
+
             let primary = WorkspaceRepoSpec {
-                base_branch: resolve_repo_base_branch(
-                    &primary_path,
-                    session_base,
-                    &project_bases,
-                    global_default,
-                ),
+                base_branch: base_for(&primary_path),
                 path: primary_path,
             };
             let extra_repos: Vec<WorkspaceRepoSpec> = params
@@ -510,12 +591,7 @@ pub fn build_instance(
                 .map(|p| {
                     let path = PathBuf::from(p);
                     WorkspaceRepoSpec {
-                        base_branch: resolve_repo_base_branch(
-                            &path,
-                            session_base,
-                            &project_bases,
-                            global_default,
-                        ),
+                        base_branch: base_for(&path),
                         path,
                     }
                 })
@@ -590,6 +666,7 @@ pub fn build_instance(
                     created_worktree = Some(CreatedWorktree {
                         path: worktree_path,
                         main_repo_path: main_repo_path.clone(),
+                        owned_branch: None,
                     });
                     worktree_info = Some(WorktreeInfo {
                         branch: branch.clone(),
@@ -607,16 +684,26 @@ pub fn build_instance(
                     return Err(GitError::WorktreeAlreadyExists(worktree_path.clone()).into());
                 }
 
-                // The launch repo forks from its registered per-project default
-                // when no explicit session base is given (then global/profile,
-                // then auto-detect). Keyed by repo root via the shared helper.
+                // One repo, so a per-repo base can only name this one. Resolved
+                // anyway rather than ignored, so a typo'd selector fails loudly
+                // instead of quietly forking from the wrong base.
+                let per_repo = resolve_repo_base_selectors(
+                    std::slice::from_ref(&main_repo_path),
+                    &params.repo_base_branches,
+                )?;
+                // The launch repo otherwise forks from its registered
+                // per-project default when no explicit session base is given
+                // (then global/profile, then auto-detect). Keyed by repo root
+                // via the shared helper.
                 let project_bases = project_base_branches(profile);
-                let base = resolve_repo_base_branch(
-                    &main_repo_path,
-                    params.base_branch.as_deref(),
-                    &project_bases,
-                    config.worktree.default_base_branch.as_deref(),
-                );
+                let base = per_repo.get(&main_repo_path).cloned().or_else(|| {
+                    resolve_repo_base_branch(
+                        &main_repo_path,
+                        params.base_branch.as_deref(),
+                        &project_bases,
+                        config.worktree.default_base_branch.as_deref(),
+                    )
+                });
 
                 let w = git_wt.create_worktree(branch, &worktree_path, true, base.as_deref())?;
                 warnings.extend(w);
@@ -625,6 +712,7 @@ pub fn build_instance(
                 created_worktree = Some(CreatedWorktree {
                     path: worktree_path,
                     main_repo_path: main_repo_path.clone(),
+                    owned_branch: Some(branch.clone()),
                 });
                 worktree_info = Some(WorktreeInfo {
                     branch: branch.clone(),
@@ -670,6 +758,13 @@ pub fn build_instance(
         .filter(|a| a.set_default_command)
         .map(|a| a.binary.to_string())
         .unwrap_or_default();
+    if let Some(notice) =
+        crate::agents::get_agent(&params.tool).and_then(crate::agents::AgentDef::lifecycle_notice)
+    {
+        // Non-blocking: deprecated agents still launch; every support path
+        // is unchanged. The warning only informs.
+        tracing::warn!(target: "session.builder", "agent '{}' is {notice}", params.tool);
+    }
     instance.worktree_info = worktree_info;
     instance.workspace_info = workspace_info;
     instance.yolo_mode = params.yolo_mode;
@@ -744,19 +839,10 @@ pub fn build_instance(
             } => {
                 // Structured fork: force the structured view, seed the parent
                 // for the ACP session/fork handshake, and replay history into
-                // the (empty) event store on first connect. The marker fields
-                // live behind the serve feature, so without it a structured
-                // fork is inapplicable and this arm is a no-op. Bind the field
-                // to `_` on bare-core so the destructure reads it without an
-                // `allow(unused_variables)` suppression (AGENTS.md).
-                #[cfg(feature = "serve")]
-                {
-                    instance.view = crate::session::View::Structured;
-                    instance.fork_pending = Some(parent_acp_session_id);
-                    instance.import_pending = Some(true);
-                }
-                #[cfg(not(feature = "serve"))]
-                let _ = parent_acp_session_id;
+                // the (empty) event store on first connect.
+                instance.view = crate::session::View::Structured;
+                instance.fork_pending = Some(parent_acp_session_id);
+                instance.import_pending = Some(true);
             }
         }
     }
@@ -769,17 +855,136 @@ pub fn build_instance(
     })
 }
 
+#[derive(Default)]
+struct CleanupProtection<'a> {
+    owner: Option<&'a Instance>,
+}
+
+impl CleanupProtection<'_> {
+    fn paths_equal(left: &Path, right: &Path) -> bool {
+        left == right
+            || left
+                .canonicalize()
+                .ok()
+                .zip(right.canonicalize().ok())
+                .is_some_and(|(left, right)| left == right)
+    }
+
+    /// Exact matches protect a winner-owned worktree; containment protects a
+    /// winner path nested under a workspace root from recursive root cleanup.
+    fn path_references_target(reference: &Path, target: &Path) -> bool {
+        if reference == target || reference.starts_with(target) {
+            return true;
+        }
+        reference
+            .canonicalize()
+            .ok()
+            .zip(target.canonicalize().ok())
+            .is_some_and(|(reference, target)| reference == target || reference.starts_with(target))
+    }
+
+    fn references_path(&self, target: &Path) -> bool {
+        let Some(owner) = self.owner else {
+            return false;
+        };
+        if Self::path_references_target(Path::new(&owner.project_path), target) {
+            return true;
+        }
+        owner.workspace_info.as_ref().is_some_and(|workspace| {
+            Self::path_references_target(Path::new(&workspace.workspace_dir), target)
+                || workspace.repos.iter().any(|repo| {
+                    Self::path_references_target(Path::new(&repo.worktree_path), target)
+                })
+        })
+    }
+
+    fn references_branch(&self, main_repo_path: &Path, branch: &str) -> bool {
+        let Some(owner) = self.owner else {
+            return false;
+        };
+        owner.worktree_info.as_ref().is_some_and(|worktree| {
+            Self::paths_equal(Path::new(&worktree.main_repo_path), main_repo_path)
+                && worktree.branch == branch
+        }) || owner.workspace_info.as_ref().is_some_and(|workspace| {
+            workspace.repos.iter().any(|repo| {
+                Self::paths_equal(Path::new(&repo.main_repo_path), main_repo_path)
+                    && repo.branch == branch
+            })
+        })
+    }
+}
+
+/// Remove a worktree and then its build-owned branch. The branch stays intact
+/// when worktree removal fails because Git still considers it checked out.
+fn cleanup_created_worktree(
+    created: &CreatedWorktree,
+    label: &str,
+    protection: &CleanupProtection<'_>,
+) {
+    if protection.references_path(&created.path) {
+        tracing::debug!(
+            target: "session.create",
+            path = %created.path.display(),
+            "Preserving {label} referenced by the persisted uniqueness winner"
+        );
+        return;
+    }
+    let Ok(worktree) = GitWorktree::new(created.main_repo_path.clone()) else {
+        return;
+    };
+    if let Err(error) = worktree.remove_worktree(&created.path, false) {
+        tracing::warn!(target: "session.create", "Failed to clean up {label}: {error}");
+        return;
+    }
+    if let Some(branch) = created
+        .owned_branch
+        .as_deref()
+        .filter(|branch| !protection.references_branch(&created.main_repo_path, branch))
+    {
+        if let Err(error) = worktree.delete_branch(branch) {
+            tracing::warn!(target: "session.create", branch, "Failed to clean up branch: {error}");
+        }
+    }
+}
+
 /// Clean up resources created during a failed or cancelled instance build.
 ///
-/// This handles:
-/// - Removing worktrees created by aoe
-/// - Removing Docker containers
-/// - Killing tmux sessions
+/// Runtime resources always belong to the losing build and are stopped first,
+/// so a sandbox bind mount cannot block worktree removal. `protected_owner`
+/// is the persisted row that won a final uniqueness race; filesystem and Git
+/// resources referenced by that row are retained.
 pub fn cleanup_instance(
     instance: &Instance,
     created_worktree: Option<&CreatedWorktree>,
     created_workspace_worktrees: &[CreatedWorktree],
+    protected_owner: Option<&Instance>,
 ) {
+    // The loser may never have reached storage, so lifecycle-coordinated stop
+    // cannot reserve its row. Tear down only tmux resources named by its id.
+    // There is no per-build poller/monitor thread to stop here: the build
+    // path's only extra threads are the scoped worktree-creation threads that
+    // join before `build_instance` returns, and the async creation poller's
+    // build thread has already finished delivering its result before a rollback
+    // reaches this helper. So the tmux (below) and container (further down)
+    // teardown reclaim every runtime resource with no thread left running.
+    instance.kill_all_tmux_sessions_without_lifecycle_row();
+
+    if let Some(sandbox) = &instance.sandbox_info {
+        if sandbox.enabled {
+            // Direct idempotent teardown, never gated on a separate existence
+            // probe. This must precede filesystem cleanup because the
+            // container bind-mounts the worktree.
+            let container = containers::DockerContainer::from_session_id(&instance.id);
+            if let containers::Teardown::Failed(e) = container.teardown(&instance.id) {
+                tracing::warn!(target: "session.create", "Failed to clean up container: {}", e);
+            }
+        }
+    }
+
+    let protection = CleanupProtection {
+        owner: protected_owner,
+    };
+
     // Scratch dirs are provisioned eagerly inside `build_instance`
     // (well before this helper's other cleanup targets exist), so an
     // abort between provisioning and the caller finishing the session
@@ -788,7 +993,9 @@ pub fn cleanup_instance(
     // wipe unrelated app data.
     if instance.scratch {
         let scratch_path = PathBuf::from(&instance.project_path);
-        if super::scratch::is_scratch_path(&scratch_path) {
+        if !protection.references_path(&scratch_path)
+            && super::scratch::is_scratch_path(&scratch_path)
+        {
             if let Err(e) = std::fs::remove_dir_all(&scratch_path) {
                 tracing::warn!(
                     target: "session.create",
@@ -799,57 +1006,37 @@ pub fn cleanup_instance(
         }
     }
 
-    if let Some(wt) = created_worktree {
-        if let Ok(git_wt) = GitWorktree::new(wt.main_repo_path.clone()) {
-            if let Err(e) = git_wt.remove_worktree(&wt.path, false) {
-                tracing::warn!(target: "session.create", "Failed to clean up worktree: {}", e);
-            }
-        }
+    if let Some(worktree) = created_worktree {
+        cleanup_created_worktree(worktree, "worktree", &protection);
     }
 
-    // Workspace worktree cleanup
-    for wt in created_workspace_worktrees {
-        if let Ok(git_wt) = GitWorktree::new(wt.main_repo_path.clone()) {
-            if let Err(e) = git_wt.remove_worktree(&wt.path, false) {
-                tracing::warn!(target: "session.create", "Failed to clean up workspace worktree: {}", e);
-            }
+    for worktree in created_workspace_worktrees {
+        cleanup_created_worktree(worktree, "workspace worktree", &protection);
+    }
+    if let Some(workspace) = &instance.workspace_info {
+        let workspace_dir = Path::new(&workspace.workspace_dir);
+        if !protection.references_path(workspace_dir) {
+            let _ = std::fs::remove_dir_all(workspace_dir);
         }
     }
-    // Clean up workspace directory if workspace was created
-    if let Some(ws_info) = &instance.workspace_info {
-        let _ = std::fs::remove_dir_all(&ws_info.workspace_dir);
-    }
-
-    if let Some(sandbox) = &instance.sandbox_info {
-        if sandbox.enabled {
-            // Direct idempotent teardown, never gated on a separate existence
-            // probe: a transient `inspect` failure must not skip removal and
-            // orphan a live container. Volumes are swept inside `teardown`.
-            let container = containers::DockerContainer::from_session_id(&instance.id);
-            if let containers::Teardown::Failed(e) = container.teardown(&instance.id) {
-                tracing::warn!(target: "session.create", "Failed to clean up container: {}", e);
-            }
-        }
-    }
-
-    let _ = instance.kill();
 }
 
 /// Structured-view (ACP) helpers for the TUI create paths. The web create
-/// path does the equivalent inline in `src/server/api/sessions.rs` (it also
+/// path does the equivalent inline in `src/server/api/sessions/create.rs` (it also
 /// handles explicit agent / model / import fields the TUI wizard doesn't
 /// expose), and the CLI in `src/cli/add.rs` with bail-vs-downgrade semantics
 /// keyed on how explicit the user's flag was. Keep the three in sync.
-#[cfg(feature = "serve")]
 pub mod structured {
     use super::Instance;
 
     /// True when `tool` can back a structured-view session: it resolves in
-    /// the ACP agent registry, or the resolved config declares a parsable
-    /// `[session.agent_acp_cmd]` command for it. Mirrors the server create
-    /// path's capability re-validation; deliberately NOT the aoe-agent
-    /// fallback (`pick_acp_agent_name`), which would make every tool look
-    /// capable.
+    /// the ACP agent registry, the resolved config declares a parsable
+    /// `[session.agent_acp_cmd]` command for it, or it is a custom agent that
+    /// inherits a registry-backed base through `[session.agent_detect_as]`
+    /// (e.g. a Claude wrapper that only overrides profile/oauth locations).
+    /// Mirrors the server create path's capability re-validation; deliberately
+    /// NOT the configured-default fallback (`pick_acp_agent_name`), which
+    /// would make every tool look capable.
     pub fn tool_acp_capable(tool: &str, config: &crate::session::Config) -> bool {
         crate::acp::agent_registry::AgentRegistry::with_defaults()
             .get(tool)
@@ -859,6 +1046,7 @@ pub mod structured {
                 .agent_acp_cmd
                 .get(tool)
                 .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(tool, cmd).is_ok())
+            || crate::acp::inherited_acp_base(tool, &config.session.agent_detect_as).is_some()
     }
 
     /// Pre-create validation for an explicit structured-view choice from the
@@ -892,7 +1080,14 @@ pub mod structured {
             None => match config.session.agent_acp_cmd.get(tool) {
                 Some(cmd) => crate::acp::AgentSpec::from_acp_cmd(tool, cmd)
                     .map_err(|e| format!("invalid [session.agent_acp_cmd] for `{tool}`: {e}"))?,
-                None => unreachable!("tool_acp_capable implies a resolvable spec"),
+                // A custom agent that inherits a registry-backed base runs the
+                // base agent's adapter, so the on-PATH check targets that.
+                None => match crate::acp::inherited_acp_base(tool, &config.session.agent_detect_as)
+                    .and_then(|base| registry.get(&base).cloned())
+                {
+                    Some(spec) => spec,
+                    None => unreachable!("tool_acp_capable implies a resolvable spec"),
+                },
             },
         };
         if !crate::cli::acp::command_present(&spec.command) {
@@ -914,7 +1109,7 @@ pub mod structured {
     /// skipped [`validate_structured_choice`] can't persist a structured
     /// session no agent can serve.
     pub fn apply_structured_choice(instance: &mut Instance) {
-        let config = crate::session::repo_config::resolve_config_with_repo_or_warn(
+        let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
             &instance.source_profile,
             std::path::Path::new(&instance.project_path),
         );
@@ -1354,6 +1549,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_git_sanitize_branch_name_replaces_forbidden_chars() {
         assert_eq!(git_sanitize_branch_name("has spaces"), "has-spaces");
         assert_eq!(git_sanitize_branch_name("a:b?c*d"), "a-b-c-d");
@@ -1759,6 +1955,184 @@ mod tests {
             extra_release_tip,
             "extra repo worktree should branch from its configured `release` base"
         );
+        // The base the branch was forked from is recorded per repo, which is
+        // what lets the diff view default to the right ref for each one (#3329).
+        assert_eq!(extra_repo.base_branch.as_deref(), Some("release"));
+        assert_eq!(
+            result
+                .workspace_info
+                .repos
+                .iter()
+                .find(|r| r.name == "primary")
+                .unwrap()
+                .base_branch,
+            None,
+            "a repo with no configured base records none, so the diff falls through to detection"
+        );
+        assert!(result
+            .created_worktrees
+            .iter()
+            .all(|worktree| worktree.owned_branch.as_deref() == Some("feature-x")));
+        for worktree in &result.created_worktrees {
+            cleanup_created_worktree(worktree, "test worktree", &CleanupProtection::default());
+            let repo = git2::Repository::open(&worktree.main_repo_path).unwrap();
+            assert!(repo
+                .find_branch("feature-x", git2::BranchType::Local)
+                .is_err());
+        }
+    }
+
+    /// A repo whose branch aoe did not create has no base of its own: the base
+    /// argument is ignored when checking out an existing branch, so recording
+    /// it would make "reset to default" compare against a ref that was never
+    /// this checkout's base. See #3329.
+    #[test]
+    fn create_workspace_records_no_base_when_attaching_an_existing_branch() {
+        let (parent_primary, _) = init_repo_with_branch("primary", "feature-x");
+        let primary = parent_primary.path().join("primary");
+        let workspaces_root = tempfile::TempDir::new().unwrap();
+        let template = workspaces_root
+            .path()
+            .join("{branch}")
+            .to_string_lossy()
+            .into_owned();
+
+        let result = create_workspace(
+            &WorkspaceRepoSpec {
+                path: primary,
+                base_branch: Some("main".to_string()),
+            },
+            &[],
+            "feature-x",
+            false,
+            &template,
+            true,
+        )
+        .expect("workspace creation should succeed");
+
+        assert_eq!(result.workspace_info.repos[0].base_branch, None);
+        assert_eq!(result.created_worktrees[0].owned_branch, None);
+        let worktree = &result.created_worktrees[0];
+        cleanup_created_worktree(worktree, "test worktree", &CleanupProtection::default());
+        let repo = git2::Repository::open(&worktree.main_repo_path).unwrap();
+        assert!(repo
+            .find_branch("feature-x", git2::BranchType::Local)
+            .is_ok());
+    }
+
+    #[test]
+    fn cleanup_keeps_owned_branch_when_worktree_removal_fails() {
+        let (parent, _) = init_repo_with_branch("cleanup", "release");
+        let main_repo_path = parent.path().join("cleanup");
+        let worktree_path = parent.path().join("dirty-worktree");
+        let git = GitWorktree::new(main_repo_path.clone()).unwrap();
+        git.create_worktree("rollback-branch", &worktree_path, true, None)
+            .unwrap();
+        std::fs::write(worktree_path.join("README.md"), "dirty\n").unwrap();
+
+        let created = CreatedWorktree {
+            path: worktree_path.clone(),
+            main_repo_path: main_repo_path.clone(),
+            owned_branch: Some("rollback-branch".to_string()),
+        };
+        cleanup_created_worktree(&created, "test worktree", &CleanupProtection::default());
+
+        assert!(worktree_path.exists(), "dirty worktree must survive");
+        let repo = git2::Repository::open(&main_repo_path).unwrap();
+        assert!(
+            repo.find_branch("rollback-branch", git2::BranchType::Local)
+                .is_ok(),
+            "owned branch must not be deleted while its worktree remains"
+        );
+
+        git.remove_worktree(&worktree_path, true).unwrap();
+        git.delete_branch("rollback-branch").unwrap();
+    }
+
+    #[test]
+    fn resolve_repo_base_selectors_matches_name_or_path() {
+        let repos = vec![
+            PathBuf::from("/src/app"),
+            PathBuf::from("/src/api"),
+            PathBuf::from("/elsewhere/web"),
+        ];
+
+        // Directory name and full path both resolve, and whitespace is trimmed.
+        let out = resolve_repo_base_selectors(
+            &repos,
+            &[
+                ("api".to_string(), "epic/checkout".to_string()),
+                ("/elsewhere/web".to_string(), " develop ".to_string()),
+            ],
+        )
+        .expect("both selectors resolve");
+        assert_eq!(
+            out.get(&PathBuf::from("/src/api")).map(String::as_str),
+            Some("epic/checkout")
+        );
+        assert_eq!(
+            out.get(&PathBuf::from("/elsewhere/web"))
+                .map(String::as_str),
+            Some("develop")
+        );
+        assert!(!out.contains_key(&PathBuf::from("/src/app")));
+
+        // No pairs is the common case and must stay cheap and quiet.
+        assert!(resolve_repo_base_selectors(&repos, &[]).unwrap().is_empty());
+
+        let cases = [
+            // A typo would otherwise fork from the wrong base and only show up
+            // much later as a confusing diff.
+            (
+                vec![("nope".to_string(), "develop".to_string())],
+                "No repo named",
+            ),
+            // Empty base.
+            (
+                vec![("api".to_string(), "  ".to_string())],
+                "No base branch",
+            ),
+            // Same repo twice.
+            (
+                vec![
+                    ("api".to_string(), "develop".to_string()),
+                    ("/src/api".to_string(), "main".to_string()),
+                ],
+                "twice",
+            ),
+        ];
+        for (pairs, expected) in cases {
+            let err = resolve_repo_base_selectors(&repos, &pairs)
+                .expect_err("should reject")
+                .to_string();
+            assert!(err.contains(expected), "got: {err}");
+        }
+
+        // A selector matches on the leaf of whatever path it is given, so
+        // callers must pass repo roots. Handing it a subdirectory would make
+        // the documented selector (the repo's own name) fail to match, which
+        // is exactly what `aoe add` got wrong when it keyed by the launch path
+        // rather than `find_main_repo`'s result.
+        let subdir = vec![PathBuf::from("/src/api/crates/core")];
+        assert!(
+            resolve_repo_base_selectors(&subdir, &[("api".to_string(), "develop".to_string())])
+                .is_err(),
+            "a repo name must not resolve against a subdirectory path"
+        );
+        assert!(resolve_repo_base_selectors(
+            &subdir,
+            &[("core".to_string(), "develop".to_string())]
+        )
+        .is_ok());
+
+        // Two repos sharing a directory name are ambiguous by name. The
+        // workspace builder rejects that pair later anyway, but the base
+        // selector must not silently pick one.
+        let dupes = vec![PathBuf::from("/a/api"), PathBuf::from("/b/api")];
+        let err = resolve_repo_base_selectors(&dupes, &[("api".to_string(), "x".to_string())])
+            .expect_err("ambiguous name")
+            .to_string();
+        assert!(err.contains("ambiguous"), "got: {err}");
     }
 
     fn isolated_app_dir(temp_home: &std::path::Path) -> std::path::PathBuf {
@@ -1791,6 +2165,7 @@ mod tests {
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: Vec::new(),
+            repo_base_branches: Vec::new(),
             scratch: false,
             fork_seed: None,
         }
@@ -1815,6 +2190,10 @@ mod tests {
         )
         .unwrap();
         let project = tempfile::tempdir().unwrap();
+        // resolve_config inside build_instance installs this config's
+        // agent_detect_as into the process-global registry; restore the
+        // prior entries afterwards.
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
 
         let result = build_instance(
             custom_agent_params(project.path(), "remote-claude"),
@@ -1845,6 +2224,7 @@ mod tests {
         )
         .unwrap();
         let project = tempfile::tempdir().unwrap();
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
 
         let result = build_instance(
             custom_agent_params(project.path(), "remote-opencode"),
@@ -1952,8 +2332,10 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn build_instance_applies_terminal_fork_seed() {
         use crate::session::ForkSeed;
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
         let params = InstanceParams {
             title: "Forked".into(),
             path: "/tmp".into(),
@@ -1970,6 +2352,7 @@ mod tests {
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: vec![],
+            repo_base_branches: Vec::new(),
             scratch: false,
             fork_seed: Some(ForkSeed::Terminal {
                 parent_agent_session_id: "parent-uuid".into(),
@@ -1992,10 +2375,11 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "serve")]
     #[test]
+    #[serial_test::serial]
     fn build_instance_applies_structured_fork_seed() {
         use crate::session::ForkSeed;
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
         let params = InstanceParams {
             title: "Forked".into(),
             path: "/tmp".into(),
@@ -2012,6 +2396,7 @@ mod tests {
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: vec![],
+            repo_base_branches: Vec::new(),
             scratch: false,
             fork_seed: Some(ForkSeed::Structured {
                 parent_acp_session_id: "parent-acp-id".into(),
@@ -2035,6 +2420,49 @@ mod tests {
             inst.resume_intent,
             crate::session::instance::ResumeIntent::Fork { .. }
         ));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn fork_seed_tests_restore_default_profile_registry() {
+        const ALIAS_AGENT: &str = "fork-seed-registry-alias";
+        const RULE_AGENT: &str = "fork-seed-registry-rule";
+        let cases: &[(&str, fn())] = &[
+            ("terminal", build_instance_applies_terminal_fork_seed),
+            ("structured", build_instance_applies_structured_fork_seed),
+        ];
+
+        // serial_test 4's default-key lock is reentrant: the wrapper must call
+        // each serialized test directly to inspect state after its guard drops.
+        for (label, run) in cases {
+            let _cleanup = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
+            let mut sentinels = crate::session::Config::default();
+            sentinels
+                .session
+                .agent_detect_as
+                .insert(ALIAS_AGENT.to_string(), "codex".to_string());
+            sentinels
+                .agents
+                .entry(RULE_AGENT.to_string())
+                .or_default()
+                .status_rules = vec![crate::session::config::StatusRule {
+                status: crate::agents::HookStatus::Running,
+                contains: Some("fork-seed-working".to_string()),
+                regex: None,
+            }];
+            crate::tmux::status_rules::install_from_config("default", &sentinels);
+
+            run();
+
+            let alias = crate::tmux::status_rules::effective_detect_as("default", ALIAS_AGENT, "");
+            let rule =
+                crate::tmux::status_rules::detect("default", RULE_AGENT, "fork-seed-working");
+            assert_eq!(
+                (alias.as_ref(), rule),
+                ("codex", Some(crate::session::Status::Running)),
+                "{label}: fork-seed build must restore the prior alias and compiled rule"
+            );
+        }
     }
 
     #[test]

@@ -127,18 +127,27 @@ test.describe("Keyboard auto-resize (#1432)", () => {
     expect(extractResizes(handle).length, "keyboard close must not emit a tmux resize").toBe(baselineCount);
   });
 
-  test("Safari mode: the prompt cursor stays visible in the keyboard-shrunk viewport", async ({ page }) => {
+  test("Safari mode: opening the keyboard returns a scrollback reader to the visible prompt", async ({ page }) => {
     const handle = await mockTerminalApis(page);
     await page.goto("/");
     await openSession(page, handle);
     await page.waitForTimeout(1000);
 
-    // The mock screen is a fresh-agent shape: prompt + cursor on the
-    // FIRST screen row, blank rows below. With rows latched, the screen
-    // is now taller than the shrunk viewport; a literal bottom pin would
-    // show only the blank tail and scroll the prompt off the top (the
-    // original bug). The live-edge target must anchor the cursor near
-    // the viewport bottom instead.
+    // Leave the live edge first. Keyboard-open is an explicit intent to type,
+    // so it must return to the prompt rather than retain this reading position.
+    await page.evaluate(() => {
+      const el = document.querySelector<HTMLElement>("[data-live-terminal] > div");
+      if (!el) throw new Error("live terminal scroller missing");
+      el.scrollTop = 0;
+      el.dispatchEvent(new Event("scroll"));
+    });
+    await expect(page.getByRole("button", { name: "Back to live" })).toBeVisible();
+
+    await page.locator('textarea[aria-label="Live terminal input"]').focus();
+
+    // The mock screen is a fresh-agent shape: prompt + cursor on the FIRST
+    // screen row, blank rows below. With rows latched, the live target must
+    // anchor that prompt near the keyboard rather than the literal tail.
     await setKeyboard(page, { open: true, px: 320, pwa: false });
     await page.waitForTimeout(800);
 
@@ -151,6 +160,7 @@ test.describe("Keyboard auto-resize (#1432)", () => {
     expect(m, "live cursor is rendered").not.toBeNull();
     expect(m!.cursorTop, "cursor is not above the viewport").toBeGreaterThanOrEqual(m!.scrollTop - 2);
     expect(m!.cursorTop, "cursor is not below the viewport").toBeLessThanOrEqual(m!.scrollTop + m!.clientHeight);
+    await expect(page.getByRole("button", { name: "Back to live" })).toHaveCount(0);
   });
 
   test("PWA mode: dvh shrink owns the layout; no inset, no tmux resize", async ({ page }) => {

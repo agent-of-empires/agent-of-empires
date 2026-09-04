@@ -1,6 +1,5 @@
 //! CLI command implementations
 
-#[cfg(feature = "serve")]
 pub mod acp;
 pub mod add;
 pub mod agents;
@@ -12,7 +11,6 @@ pub mod group;
 pub mod init;
 pub mod killall;
 pub mod list;
-#[cfg(feature = "serve")]
 pub mod log_level;
 pub mod logs;
 pub mod mcp;
@@ -23,7 +21,6 @@ pub mod project;
 pub mod ps;
 pub mod remove;
 pub mod send;
-#[cfg(feature = "serve")]
 pub mod serve;
 pub mod session;
 pub mod settings;
@@ -35,13 +32,29 @@ pub mod theme;
 pub mod tmux;
 pub mod uninstall;
 pub mod update;
-#[cfg(feature = "serve")]
 pub mod url;
 pub mod worktree;
 
 pub use definition::{command_name, Cli, Commands, CLI_COMMAND_NAMES};
 
-use crate::session::{ClaimOp, Instance};
+/// Whether CLI stdout should contain ANSI color. Color is terminal-only and
+/// follows the NO_COLOR convention (only a non-empty value disables it).
+pub(crate) fn color_enabled() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
+}
+
+/// One rendered lifecycle-notice line for CLI listings. Amber on a color-
+/// capable terminal; plain text otherwise, so pipes and CI logs stay clean.
+pub(crate) fn lifecycle_notice_line(indent: &str, notice: &str) -> String {
+    if color_enabled() {
+        format!("{indent}\x1b[33m⚠ {notice}\x1b[0m")
+    } else {
+        format!("{indent}⚠ {notice}")
+    }
+}
+
+use crate::session::Instance;
 use anyhow::{bail, Result};
 
 pub fn resolve_session<'a>(identifier: &str, instances: &'a [Instance]) -> Result<&'a Instance> {
@@ -100,12 +113,9 @@ pub fn resolve_session<'a>(identifier: &str, instances: &'a [Instance]) -> Resul
 /// not exist; a failure to open or write it returns `Err` so callers keep the
 /// session row rather than orphan its transcript. See #2489, #2524.
 ///
-/// The delete is idempotent and feature-independent: `rusqlite` is a
-/// non-optional dependency, so a default (non-`serve`) build can reach the
-/// store too. It deliberately does NOT gate on `Instance::is_structured()`,
-/// which always returns `false` in a non-`serve` build (the `view` field is
-/// serve-gated), so the old guard left the non-serve bail unreachable and
-/// orphaned transcripts. Deleting zero rows for a terminal session is harmless.
+/// The delete is idempotent and deliberately does NOT gate on
+/// `Instance::is_structured()`: deleting zero rows for a terminal session is
+/// harmless, and the old guard orphaned transcripts (#2524).
 pub(crate) fn purge_acp_transcript(inst: &Instance) -> Result<()> {
     let app_dir = crate::session::get_app_dir()
         .map_err(|e| anyhow::anyhow!("acp transcript purge: resolve app dir: {e}"))?;
@@ -119,8 +129,7 @@ pub(crate) fn purge_acp_transcript(inst: &Instance) -> Result<()> {
 /// Delete a session's rows from the ACP event store at `db_path`, removing both
 /// the event rows and their attachment blobs (mirrors
 /// `crate::events::delete_topic`'s cascade so no orphaned bytes are left).
-/// A missing table means the store predates it: nothing to purge. Kept
-/// feature-independent so non-`serve` CLI builds can clean transcripts too.
+/// A missing table means the store predates it: nothing to purge.
 fn purge_acp_transcript_rows(db_path: &std::path::Path, session_id: &str) -> Result<()> {
     let mut conn = rusqlite::Connection::open(db_path)
         .map_err(|e| anyhow::anyhow!("acp transcript purge: open event store: {e}"))?;
@@ -134,11 +143,12 @@ fn purge_acp_transcript_rows(db_path: &std::path::Path, session_id: &str) -> Res
     let tx = conn
         .transaction()
         .map_err(|e| anyhow::anyhow!("acp transcript purge: begin transaction: {e}"))?;
-    // The source of truth for these names is `crate::events::Schema` (prefix
-    // "acp"), which is serve-gated and so cannot be referenced from here. They
-    // are fixed literals, not user input, and `session_id` is bound, so the
-    // `format!` only interpolates a constant.
-    for table in ["acp_events", "acp_attachments"] {
+    // Table names come from the same `crate::events::Schema` the store is
+    // opened with, so they cannot drift; `session_id` is bound, so the
+    // `format!` only interpolates a validated constant.
+    let schema = crate::events::Schema::new("acp")
+        .map_err(|e| anyhow::anyhow!("acp transcript purge: schema: {e}"))?;
+    for table in [schema.events_table(), schema.attachments_table()] {
         match tx.execute(
             &format!("DELETE FROM {table} WHERE session_id = ?1"),
             rusqlite::params![session_id],
@@ -157,34 +167,8 @@ fn purge_acp_transcript_rows(db_path: &std::path::Path, session_id: &str) -> Res
     Ok(())
 }
 
-/// Apply a completed `empty-trash` purge to the latest storage snapshot under
-/// the lock: drop every successfully-purged row that is still trashed, and keep
-/// any that a concurrent restore brought back (its teardown already ran, so the
-/// caller should warn). Returns `(removed, restored_kept)`. The `removed` count
-/// is what callers must report instead of the candidate count. See #2527, #2534.
-pub(crate) fn apply_empty_trash_purge(
-    instances: &mut Vec<Instance>,
-    purged: &std::collections::HashSet<String>,
-) -> (usize, usize) {
-    let before = instances.len();
-    let mut restored = 0usize;
-    instances.retain(|i| {
-        if !purged.contains(&i.id) {
-            return true;
-        }
-        if crate::session::claim::purge_restored_row_must_be_kept(true, i.is_trashed()) {
-            restored += 1;
-            true
-        } else {
-            false
-        }
-    });
-    (before - instances.len(), restored)
-}
-
-/// Result of the Phase-2 `empty-trash` finalize under the flock. Named (not a
-/// positional tuple) because all three fields are `usize` and the semantics
-/// accreted across #2527/#2534/#2541, so a positional swap would be silent.
+/// Aggregated `empty-trash` outcome across per-session purge transactions.
+/// Named rather than positional because every field is a `usize`.
 pub(crate) struct EmptyTrashOutcome {
     /// Successfully-purged rows dropped from storage.
     pub removed: usize,
@@ -194,34 +178,6 @@ pub(crate) struct EmptyTrashOutcome {
     /// Rows WE claimed whose teardown/transcript purge failed and are still
     /// trashed: genuinely kept for retry (distinct from peer restores).
     pub kept_for_retry: usize,
-}
-
-/// Phase-2 finalize for `empty-trash` under the flock: drop successfully-purged
-/// rows still trashed, keep rows a restore brought back, and release the Purge
-/// claim on every row we claimed (purged-but-restored, or claimed-and-failed),
-/// ownership-guarded so a peer's fresh Restore claim survives. See #2527, #2534,
-/// #2541.
-pub(crate) fn finalize_empty_trash(
-    instances: &mut Vec<Instance>,
-    purged: &std::collections::HashSet<String>,
-    claimed_failed: &std::collections::HashSet<String>,
-) -> EmptyTrashOutcome {
-    let (removed, restored_after_teardown) = apply_empty_trash_purge(instances, purged);
-    let mut kept_for_retry = 0usize;
-    for stored in instances.iter_mut() {
-        if !(purged.contains(&stored.id) || claimed_failed.contains(&stored.id)) {
-            continue;
-        }
-        stored.clear_op_claim_if_owned(ClaimOp::Purge);
-        if claimed_failed.contains(&stored.id) && stored.is_trashed() {
-            kept_for_retry += 1;
-        }
-    }
-    EmptyTrashOutcome {
-        removed,
-        restored_after_teardown,
-        kept_for_retry,
-    }
 }
 
 pub fn truncate(s: &str, max: usize) -> String {
@@ -350,107 +306,9 @@ mod tests {
         assert!(!purge_restored_row_must_be_kept(false, true));
     }
 
-    // #2527 + #2534: empty-trash must report the count actually removed (not
-    // the candidate count), drop only rows still trashed, and keep rows a
-    // concurrent restore brought back.
-    #[test]
-    fn apply_empty_trash_purge_counts_removed_and_keeps_restored() {
-        use std::collections::HashSet;
-
-        let mut still_trashed = Instance::new("gone", "/tmp/a");
-        still_trashed.trash();
-        let restored = Instance::new("restored", "/tmp/b"); // purged but no longer trashed
-        let mut untargeted = Instance::new("other", "/tmp/c");
-        untargeted.trash();
-
-        let purged: HashSet<String> = [still_trashed.id.clone(), restored.id.clone()]
-            .into_iter()
-            .collect();
-        let restored_id = restored.id.clone();
-        let untargeted_id = untargeted.id.clone();
-        let mut instances = vec![still_trashed, restored, untargeted];
-
-        let (removed, kept_restored) = apply_empty_trash_purge(&mut instances, &purged);
-
-        assert_eq!(removed, 1, "only the still-trashed candidate is removed");
-        assert_eq!(
-            kept_restored, 1,
-            "the restored candidate is kept and counted"
-        );
-        let surviving: Vec<&str> = instances.iter().map(|i| i.id.as_str()).collect();
-        assert!(surviving.contains(&restored_id.as_str()));
-        assert!(surviving.contains(&untargeted_id.as_str()));
-        assert_eq!(instances.len(), 2);
-    }
-
-    // #2541: empty-trash Phase 2 releases the Purge claim on every row WE
-    // claimed (a row a peer restored mid-purge, or one whose teardown failed) so
-    // it is not wedged; it never clears a peer's fresh Restore claim; and
-    // `kept_for_retry` counts only our failed teardowns, not peer restores.
-    #[test]
-    fn empty_trash_clears_claim_on_kept_row() {
-        use std::collections::HashSet;
-
-        let now = chrono::Utc::now();
-        let ttl = Instance::OP_CLAIM_TTL;
-
-        // Purged and still trashed: removed (its claim goes with the row).
-        let mut removed_row = Instance::new("removed", "/tmp/a");
-        removed_row.trash();
-        removed_row.try_claim(ClaimOp::Purge, ttl, now).unwrap();
-
-        // Purged but a peer restored it mid-purge (stale-override): now untrashed
-        // and holding the peer's Restore claim. Kept, counted in `restored`, and
-        // the peer's Restore claim must survive the ownership-guarded clear.
-        let mut restored_row = Instance::new("restored", "/tmp/b");
-        restored_row.try_claim(ClaimOp::Restore, ttl, now).unwrap();
-
-        // We claimed it and its teardown failed (in `claimed_failed`): still
-        // trashed, still holding OUR Purge claim. Kept for retry, claim released.
-        let mut failed_row = Instance::new("failed", "/tmp/c");
-        failed_row.trash();
-        failed_row.try_claim(ClaimOp::Purge, ttl, now).unwrap();
-
-        let purged: HashSet<String> = [removed_row.id.clone(), restored_row.id.clone()]
-            .into_iter()
-            .collect();
-        let claimed_failed: HashSet<String> = [failed_row.id.clone()].into_iter().collect();
-        let restored_id = restored_row.id.clone();
-        let failed_id = failed_row.id.clone();
-        let mut instances = vec![removed_row, restored_row, failed_row];
-
-        let outcome = finalize_empty_trash(&mut instances, &purged, &claimed_failed);
-
-        assert_eq!(
-            outcome.removed, 1,
-            "only the still-trashed purged row is removed"
-        );
-        assert_eq!(
-            outcome.restored_after_teardown, 1,
-            "the peer-restored purged row is kept and counted"
-        );
-        assert_eq!(
-            outcome.kept_for_retry, 1,
-            "only the failed-teardown row is kept for retry; the peer-restored \
-             row is reported via `restored_after_teardown`, not as a retry"
-        );
-
-        let restored_kept = instances.iter().find(|i| i.id == restored_id).unwrap();
-        assert_eq!(
-            restored_kept.op_claim.as_ref().map(|c| c.op),
-            Some(ClaimOp::Restore),
-            "a peer's fresh Restore claim is never cleared by the purge finalize"
-        );
-        let failed_kept = instances.iter().find(|i| i.id == failed_id).unwrap();
-        assert_eq!(
-            failed_kept.op_claim, None,
-            "our Purge claim is released on the kept failed-teardown row"
-        );
-    }
-
-    // #2524: the non-serve purge path used to be unreachable, orphaning
-    // transcripts. The feature-independent row delete must drop both the
-    // event rows and their attachment blobs for the target session only.
+    // #2524: the purge path used to be unreachable, orphaning transcripts.
+    // The row delete must drop both the event rows and their attachment blobs
+    // for the target session only.
     #[test]
     fn purge_acp_transcript_rows_deletes_only_target_session() {
         let dir = tempfile::tempdir().unwrap();

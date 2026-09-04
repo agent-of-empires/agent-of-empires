@@ -1,9 +1,20 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { Puzzle } from "lucide-react";
 import { useMatch, useNavigate, useSearchParams } from "react-router-dom";
 import { IDLE_DECAY_WINDOW_MS, isSessionActive } from "./lib/session";
 import { diffSelectionStale } from "./lib/diffSelection";
 import { useSessions } from "./hooks/useSessions";
+import { useDashboardPresence } from "./hooks/useDashboardPresence";
 import { clearAcpCache } from "./hooks/useAcpSession";
 import { clearDraft, sweepOrphanDrafts } from "./lib/acpDrafts";
 import { AcpPrefsProvider } from "./lib/acpPrefs";
@@ -14,6 +25,7 @@ import { useLastSessionRestore } from "./hooks/useLastSessionRestore";
 import { useRepoGroups } from "./hooks/useRepoGroups";
 import { useSessionGroups } from "./hooks/useSessionGroups";
 import { useNestedSidebarGroups } from "./hooks/useNestedSidebarGroups";
+import { useOrgGroups } from "./hooks/useOrgGroups";
 import { PluginUiProvider, usePluginUiEntries } from "./lib/pluginUiContext";
 import { buildSortValueMap, pluginSortSpecs } from "./lib/pluginUi";
 import type { PluginSortContext, SidebarSortMode } from "./lib/sidebarSort";
@@ -34,6 +46,7 @@ import { usePluginCommands } from "./hooks/usePluginCommands";
 import { useSettingsCommands } from "./hooks/useSettingsCommands";
 import { useEdgeSwipe } from "./hooks/useEdgeSwipe";
 import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
+import { useMobileViewportLock } from "./hooks/useMobileViewportLock";
 import { useIsWideViewport } from "./hooks/useIsWideViewport";
 import type { RightPanelView } from "./lib/rightPanelView";
 import { usePaneLayout, dockTabs, dockGroups, dockOf, isActiveTab, isDockCollapsed } from "./lib/paneLayout";
@@ -86,12 +99,12 @@ import { toastBus, reportError } from "./lib/toastBus";
 import { isAbsolutePath, resolveToRepoRelative, type FileRef } from "./lib/fileRef";
 import { OPEN_SESSION_EVENT } from "./lib/sessionRoute";
 import { dispatchFocusTerminal, requestSessionInputFocus, setPendingTerminalFocus } from "./lib/terminalFocus";
+import { clearMobileKeyboardProxyInput, deliverMobileKeyboardProxyInput } from "./lib/mobileKeyboardProxy";
 import { hydrateWebUiStateFromServer, initWebUiSync } from "./lib/webUiSync";
 import { WorkspaceSidebar, SnoozeModal } from "./components/WorkspaceSidebar";
 import { DeleteSessionDialog } from "./components/DeleteSessionDialog";
 import { StopSessionDialog } from "./components/StopSessionDialog";
 import { SwitchViewDialog } from "./components/SwitchViewDialog";
-import { acpTranscriptCliResumable } from "./lib/acpKeepContext";
 import { TopBar } from "./components/TopBar";
 import { AppShellSkeleton, MainPaneSkeleton } from "./components/AppShellSkeleton";
 import { ContentSplit } from "./components/ContentSplit";
@@ -119,6 +132,7 @@ import { PairedShellPane } from "./components/PairedTerminal";
 import { BUILTIN_PANES, isTerminalTabId, terminalIndexOf, terminalTabId, type DockLocation } from "./lib/panes";
 import { MobileRightPanelPicker } from "./components/MobileRightPanelPicker";
 import { MobileMainPane } from "./components/MobileMainPane";
+import { ChromeCollapseHandle, CollapsibleRegion } from "./components/CollapsibleChrome";
 import { DiffFileViewer } from "./components/diff/DiffFileViewer";
 import { SettingsView } from "./components/SettingsView";
 import { ProjectFormModal } from "./components/ProjectFormModal";
@@ -150,6 +164,7 @@ import { DashboardUpdateBanner } from "./components/DashboardUpdateBanner";
 const LEGACY_TOUR_SEEN_KEY = "aoe-tour-seen";
 
 export default function App() {
+  useMobileViewportLock();
   // Apply the user-selected theme as CSS custom properties on the root
   // element. Runs once on mount + on settings-driven theme changes.
   // The pre-React /theme-bootstrap.js (referenced from index.html)
@@ -290,6 +305,7 @@ function AppContent({
   onLogout: () => void;
   onSettingsRefresh: () => Promise<void> | void;
 }) {
+  useDashboardPresence();
   // Wire the localStorage write chokepoint and pull the server-side UI-state
   // blob into localStorage. AppContent only mounts past auth, so this runs as
   // the authenticated user. Background (does NOT gate render): blocking first
@@ -419,6 +435,15 @@ function AppContent({
     sidebarSortMode,
     pluginSort,
   );
+  // The org axis (#3283) partitions the same repo groups by remote owner;
+  // it needs no sort/plugin-sort input of its own since it reuses each
+  // repo's already-ordered workspace list verbatim, just like the nested
+  // axis's repo header.
+  const {
+    groups: orgGroups,
+    toggleOrgCollapsed,
+    toggleRepoCollapsed: toggleOrgRepoCollapsed,
+  } = useOrgGroups(repoGroups);
 
   // The sidebar render path consumes one honest model (SidebarGroup): the
   // repo axis maps in via an adapter, the user-group axis is already in
@@ -659,6 +684,14 @@ function AppContent({
   const singlePane = !isMdUp;
   const [rightPanelView, setRightPanelView] = useState<RightPanelView>("agent");
   const [pickerOpen, setPickerOpen] = useState(false);
+  // Reading mode for the phone conversation view: the top bar folds away so the
+  // transcript gets its 48px back (the composer has its own, independent
+  // handle inside StructuredView). Kept here rather than in the structured view
+  // because the top bar is the App shell's own child. State is App-level, so it
+  // survives switching sessions; the collapse only *applies* on the mobile
+  // conversation view, so leaving it on and navigating to settings or the
+  // dashboard shows the bar again.
+  const [headerCollapsed, setHeaderCollapsed] = useState(false);
   // The paired shell mounts lazily on first activation, then stays mounted
   // (kept alive but hidden) so its PTY, scrollback, and focus survive view
   // switches. Mounting it eagerly would spawn a shell for every mobile
@@ -695,6 +728,11 @@ function AppContent({
   const [telemetryConsentKnown, setTelemetryConsentKnown] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth >= 768);
   const keyboardProxyRef = useRef<HTMLTextAreaElement>(null);
+  const [keyboardProxy, setKeyboardProxy] = useState<HTMLTextAreaElement | null>(null);
+  const setKeyboardProxyRef = useCallback((element: HTMLTextAreaElement | null) => {
+    keyboardProxyRef.current = element;
+    setKeyboardProxy(element);
+  }, []);
 
   const [serverAbout, setServerAbout] = useState<ServerAbout | null>(null);
   // CityHall client mode collapses the dashboard to a locked-down end-user
@@ -736,10 +774,18 @@ function AppContent({
   // DiffFileViewer, so the store is lifted here and threaded to both.
   const diffComments = useDiffComments(activeSessionId);
   const commentsEnabled = activeSession?.view === "structured";
-  const commentSendEnabled = commentsEnabled && activeSession?.acp_worker_state === "running";
+  // Sending does not require a live worker: the diff-comments handler runs the
+  // same auto-wake as a plain composer prompt (touch_on_prompt_and_wake_if_sunk +
+  // trigger_resume_background, #1748), so an archived / snoozed / idle-dormant
+  // session respawns its worker on send instead of sinking the prompt. A
+  // trashed session is the one exception: the reconciler never resumes it, so
+  // there is nothing to drain into.
+  const commentSendEnabled = commentsEnabled && !activeSession?.trashed_at;
+  // Every disabled state names its cause and what the user can do about it: a
+  // tooltip that only says "unavailable" leaves them staring at a dead button.
   const commentSendDisabledReason = !commentsEnabled
-    ? "Diff comments require an acp session"
-    : "Acp worker is not running";
+    ? "Diff comments can only be sent from the agent view. Switch this session to the agent view first."
+    : "This session is in the trash. Restore it to send comments to the agent.";
   const commentsIsMultiRepo = (activeSession?.workspace_repos.length ?? 0) > 0;
   const [sendDialogOpen, setSendDialogOpen] = useState(false);
 
@@ -817,6 +863,55 @@ function AppContent({
       keyboardProxyRef.current?.focus();
     }
   };
+  const closeKeyboardProxy = () => {
+    if (window.innerWidth < 768 && navigator.maxTouchPoints > 0) {
+      keyboardProxyRef.current?.blur();
+      if (document.activeElement instanceof HTMLTextAreaElement) document.activeElement.blur();
+    }
+  };
+
+  // The keyboard proxy survives terminal mounts so iOS can retain the focus
+  // authorized by a sidebar tap. Drop its receiver only at a real session
+  // boundary: clearing it while reselecting the active session leaves that
+  // still-mounted terminal without anything to re-register it.
+  const keyboardProxySessionIdRef = useRef(activeSessionId);
+  const transitionKeyboardProxy = useCallback((nextSessionId: string | null) => {
+    if (keyboardProxySessionIdRef.current === nextSessionId) return;
+    keyboardProxySessionIdRef.current = nextSessionId;
+    clearMobileKeyboardProxyInput();
+  }, []);
+
+  // Sidebar selection clears before the proxy can accept another edit. This
+  // also covers browser history and every other route change before the next
+  // input event, without clearing an unchanged session.
+  useLayoutEffect(() => {
+    transitionKeyboardProxy(activeSessionId);
+  }, [activeSessionId, transitionKeyboardProxy]);
+
+  useEffect(() => {
+    const proxy = keyboardProxy;
+    if (!proxy) return;
+    const onBeforeInput = (e: InputEvent) => {
+      switch (e.inputType) {
+        case "insertText":
+        case "insertLineBreak":
+        case "insertParagraph":
+        case "deleteContentBackward":
+        case "insertFromPaste":
+          e.preventDefault();
+          deliverMobileKeyboardProxyInput({
+            inputType: e.inputType,
+            data: e.data,
+            isComposing: e.isComposing,
+          });
+          break;
+        default:
+          break;
+      }
+    };
+    proxy.addEventListener("beforeinput", onBeforeInput);
+    return () => proxy.removeEventListener("beforeinput", onBeforeInput);
+  }, [keyboardProxy]);
 
   // Selecting a session in the sidebar should land focus on its canonical
   // "type here" target so the user can start typing without a second click:
@@ -833,15 +928,23 @@ function AppContent({
       const ws = workspaces.find((w) => w.sessions.some((s) => s.id === sessionId));
       if (ws) {
         const picked = ws.sessions.find((s) => s.id === sessionId);
+        transitionKeyboardProxy(sessionId);
         navigate(`/session/${encodeURIComponent(sessionId)}`);
-        // On touch devices, raise the soft keyboard within the tap gesture and
-        // latch the terminal/composer to take focus once it mounts (keeping the
-        // keyboard up) — but only when the user opted into auto-open keyboard.
-        // On desktop the proxy is a no-op and we focus the real input directly.
+        // iOS does not permit a session's asynchronously mounted terminal
+        // input to inherit this sidebar tap's keyboard authorization. The
+        // persistent keyboard input keeps the gesture-authorized focus while
+        // a terminal is starting; the terminal consumes its input directly
+        // rather than attempting a second, unreliable focus transfer.
         if (isCoarse) {
-          if (webSettings.autoOpenKeyboard) {
+          // Claude's alternate-screen startup still loses the first keyboard
+          // input on iOS (#3285). Start it as a monitoring view until that
+          // separate transport race is fixed; other terminal agents remain
+          // safe to auto-open.
+          if (picked?.tool === "claude" && picked.view !== "structured") {
+            closeKeyboardProxy();
+          } else if (webSettings.autoOpenKeyboard) {
             focusKeyboardProxy();
-            setPendingTerminalFocus(picked?.view === "structured" ? "composer" : "agent");
+            if (picked?.view === "structured") setPendingTerminalFocus("composer");
           }
         } else {
           focusKeyboardProxy();
@@ -850,7 +953,7 @@ function AppContent({
         if (window.innerWidth < 768) setSidebarOpen(false);
       }
     },
-    [navigate, workspaces, focusAgentInput, isCoarse, webSettings.autoOpenKeyboard],
+    [navigate, workspaces, focusAgentInput, isCoarse, transitionKeyboardProxy, webSettings.autoOpenKeyboard],
   );
 
   const handleSelectWorkspace = (workspaceId: string) => {
@@ -859,19 +962,23 @@ function AppContent({
       const running = ws.sessions.find((s) => isSessionActive(s, idleDecayWindowMs));
       const picked = running ?? ws.sessions[0] ?? null;
       if (picked) {
+        transitionKeyboardProxy(picked.id);
         navigate(`/session/${encodeURIComponent(picked.id)}`);
-        // Mirror handleSelectSession: on touch, raise the keyboard + latch focus
-        // only when auto-open keyboard is enabled; on desktop focus directly.
+        // See handleSelectSession: keep focus on the persistent keyboard input
+        // until the selected surface can receive it.
         if (isCoarse) {
-          if (webSettings.autoOpenKeyboard) {
+          if (picked.tool === "claude" && picked.view !== "structured") {
+            closeKeyboardProxy();
+          } else if (webSettings.autoOpenKeyboard) {
             focusKeyboardProxy();
-            setPendingTerminalFocus(picked.view === "structured" ? "composer" : "agent");
+            if (picked.view === "structured") setPendingTerminalFocus("composer");
           }
         } else {
           focusKeyboardProxy();
           focusAgentInput(picked);
         }
       } else {
+        transitionKeyboardProxy(null);
         navigate("/");
       }
     }
@@ -1780,6 +1887,7 @@ function AppContent({
                         acpWorkerState={activeSession.acp_worker_state ?? "absent"}
                         tool={activeSession.tool}
                         acpAgent={activeSession.acp_agent ?? null}
+                        clearAliases={activeSession.clear_aliases}
                         archivedAt={activeSession.archived_at ?? null}
                         snoozedUntil={activeSession.snoozed_until ?? null}
                         trashedAt={activeSession.trashed_at ?? null}
@@ -2051,43 +2159,80 @@ function AppContent({
     return <div className="h-dvh bg-surface-900 safe-area-inset" />;
   }
 
+  // The header collapse is a phone affordance for the conversation view only:
+  // at md and up there is room for both the bar and the transcript, and on the
+  // dashboard / settings / diff panes the bar is the only navigation there is.
+  const headerCollapsible =
+    singlePane &&
+    !showSettings &&
+    !!activeWorkspace &&
+    activeSession?.view === "structured" &&
+    rightPanelView === "agent";
+
   return (
     <AcpPrefsProvider value={acpPrefs}>
       <div className="h-dvh flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">
-        <TopBar
-          activeWorkspace={activeWorkspace}
-          activeSession={activeSession ?? null}
-          onToggleSidebar={handleToggleSidebar}
-          onOpenPalette={() => setShowPalette(true)}
-          onToggleDiff={toggleDiff}
-          paneIds={allPaneIds}
-          paneDescriptor={paneDescriptor}
-          isPaneOpen={isPaneOpen}
-          onTogglePane={togglePaneAny}
-          onOpenHelp={handleOpenHelp}
-          onOpenAbout={handleOpenAbout}
-          onStartTutorial={tour.startTour}
-          onLogout={onLogout}
-          loginRequired={loginRequired}
-          isOffline={!!error}
-          isDevBuild={isDebugBuild(serverAbout)}
-          onOpenTips={tips.open}
-          onGoDashboard={handleGoDashboard}
-          sidebarColumnVisible={!showSettings && sidebarOpen}
-          rightColumnVisible={isMdUp && !showSettings && !!activeWorkspace && !!activeSession && !rightDockCollapsed}
-        />
+        {/* Wrapped unconditionally, not behind the `headerCollapsible`
+            ternary: swapping the element type at this position would remount
+            `TopBar` (and reset its overflow menu) every time the boundary
+            flips, e.g. opening settings on a phone. An expanded region is a
+            `1fr` grid row around a fixed-height bar, so the wrapper is inert
+            for every view that cannot collapse. */}
+        <CollapsibleRegion id="conversation-header" collapsed={headerCollapsible && headerCollapsed}>
+          <TopBar
+            activeWorkspace={activeWorkspace}
+            activeSession={activeSession ?? null}
+            onToggleSidebar={handleToggleSidebar}
+            onOpenPalette={() => setShowPalette(true)}
+            onToggleDiff={toggleDiff}
+            paneIds={allPaneIds}
+            paneDescriptor={paneDescriptor}
+            isPaneOpen={isPaneOpen}
+            onTogglePane={togglePaneAny}
+            onOpenHelp={handleOpenHelp}
+            onOpenAbout={handleOpenAbout}
+            onStartTutorial={tour.startTour}
+            onLogout={onLogout}
+            loginRequired={loginRequired}
+            isOffline={!!error}
+            isDevBuild={isDebugBuild(serverAbout)}
+            onOpenTips={tips.open}
+            onGoDashboard={handleGoDashboard}
+            sidebarColumnVisible={!showSettings && sidebarOpen}
+            rightColumnVisible={isMdUp && !showSettings && !!activeWorkspace && !!activeSession && !rightDockCollapsed}
+          />
+        </CollapsibleRegion>
 
         <DisconnectBanner />
         <UpdateBanner />
         <DashboardUpdateBanner />
+
+        {/* Below the banners, not directly under the bar: the handle is
+            absolutely positioned at the top-right, and hanging it off the bar
+            puts it on top of the update banner's dismiss button (same corner),
+            which then cannot be tapped at all. */}
+        {headerCollapsible && (
+          <ChromeCollapseHandle
+            edge="top"
+            collapsed={headerCollapsed}
+            onToggle={() => setHeaderCollapsed((v) => !v)}
+            collapseLabel="Collapse conversation header"
+            expandLabel="Expand conversation header"
+            controlsId="conversation-header"
+            testId="header-collapse-toggle"
+          />
+        )}
 
         <div className="flex flex-1 min-h-0">
           {!showSettings && (
             <WorkspaceSidebar
               groups={sidebarGroups}
               nestedGroups={nestedGroups}
+              orgGroups={orgGroups}
               trashedWorkspaces={trashedWorkspaces}
               onToggleSubgroup={toggleSubgroupCollapsed}
+              onToggleOrg={toggleOrgCollapsed}
+              onToggleOrgRepo={toggleOrgRepoCollapsed}
               onReorderWorkspaces={handleReorderWorkspaces}
               onReorderGroups={reorderRepoGroups}
               activeId={activeWorkspace?.id ?? null}
@@ -2208,10 +2353,7 @@ function AppContent({
           <SwitchViewDialog
             sessionTitle={switchViewSession.title}
             toStructured={switchViewTarget.toStructured}
-            keepsContext={acpTranscriptCliResumable(
-              switchViewSession.tool,
-              switchViewSession.acp_agent ?? switchViewSession.tool,
-            )}
+            keepsContext={switchViewSession.keeps_context ?? false}
             onConfirm={handleConfirmSwitchView}
             onCancel={() => setSwitchViewTarget(null)}
           />
@@ -2256,11 +2398,16 @@ function AppContent({
         )}
 
         <textarea
-          ref={keyboardProxyRef}
+          ref={setKeyboardProxyRef}
+          data-keyboard-proxy
           aria-hidden="true"
           tabIndex={-1}
-          className="fixed opacity-0 w-0 h-0 pointer-events-none"
-          style={{ top: -9999, left: -9999 }}
+          // Keep the element in the visual viewport. Focusing a zero-size
+          // textarea thousands of pixels above an iOS PWA can leave WebKit's
+          // focus scroll in a broken state until the keyboard is toggled.
+          // This matches the live terminal's hidden input geometry.
+          className="fixed bottom-0 left-0 w-px h-px opacity-0 pointer-events-none"
+          style={{ caretColor: "transparent", color: "transparent" }}
         />
       </div>
     </AcpPrefsProvider>

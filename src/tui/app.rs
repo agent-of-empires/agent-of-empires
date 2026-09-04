@@ -189,27 +189,22 @@ pub struct App {
     /// Set by `Action::OpenStructuredView` so the async main loop can pick it
     /// up and enter the acp view (which needs `event_stream` access
     /// the sync `execute_action` can't lend out).
-    #[cfg(feature = "serve")]
     pending_structured_view_open: Option<String>,
     /// Set by `Action::SwitchSessionView` so the async main loop can run
     /// the daemon switch POST (awaited; the sync handler can't).
-    #[cfg(feature = "serve")]
     pending_view_switch: Option<String>,
     /// Set by `Action::StartDaemonThenOpenStructured` (the Yes on the
     /// "start a local daemon?" confirm) so the async loop can spawn the
     /// daemon, wait for health, and then open the structured view.
-    #[cfg(feature = "serve")]
     pending_daemon_start_open: Option<String>,
     /// Set by `Action::SmartRenameNow` so the async loop can run the daemon
     /// `/smart-rename` POST for a structured session (#3039).
-    #[cfg(feature = "serve")]
     pending_smart_rename: Option<String>,
     /// Debounce for structured preview-on-select: the session the cursor
     /// settled on and when, so rapid list navigation doesn't connect a
     /// WebSocket per keystroke. The mounted view itself lives on
     /// `HomeView::structured_preview` (it is preview content); this App
     /// side only drives the async mount/unmount.
-    #[cfg(feature = "serve")]
     preview_mount_pending: Option<(String, std::time::Instant)>,
     /// Version of the install currently being attempted (auto or manual).
     /// Set when the install task is spawned; transferred to
@@ -357,6 +352,21 @@ impl App {
         }
     }
 
+    /// Holding a key produces a stream of Press events on terminals that do not
+    /// report key-event types, or an initial Press followed by Repeat events on
+    /// terminals that do. That stream has the same timing as Mosh's paste
+    /// fallback, but it is navigation, not pasted text. Keep it on the normal
+    /// input path so held `j`/`k` continue scrolling the session list instead of
+    /// opening the message composer.
+    fn is_auto_repeat_burst(keys: &[KeyEvent]) -> bool {
+        let Some(first) = keys.first() else {
+            return false;
+        };
+        keys.iter()
+            .skip(1)
+            .all(|key| key.code == first.code && key.modifiers == first.modifiers)
+    }
+
     /// Peel a trailing Enter off a paste burst so plain-Enter Submit
     /// semantics survive when the user types or dictates fast enough to
     /// pump everything through the burst path.
@@ -492,15 +502,10 @@ impl App {
             mouse_captured: crate::tui::mouse_capture_requested(&config.session) && !mosh_active,
             mouse_capture_allowed: crate::tui::mouse_capture_requested(&config.session),
             mosh_active,
-            #[cfg(feature = "serve")]
             pending_structured_view_open: None,
-            #[cfg(feature = "serve")]
             pending_daemon_start_open: None,
-            #[cfg(feature = "serve")]
             preview_mount_pending: None,
-            #[cfg(feature = "serve")]
             pending_view_switch: None,
-            #[cfg(feature = "serve")]
             pending_smart_rename: None,
             pending_install_version: None,
             last_installed_version_in_session: None,
@@ -563,26 +568,30 @@ impl App {
         // blinks really fast"). Skip the pre-draw Hide while it's active,
         // the same treatment live-send gets. A preview shows no caret, so
         // it needs no skip.
-        #[cfg(feature = "serve")]
         let embedded_active = self
             .home
             .structured_preview
             .as_ref()
             .is_some_and(|v| v.is_active());
-        #[cfg(not(feature = "serve"))]
-        let embedded_active = false;
         let skip_hide = embedded_active
             || skip_predraw_cursor_hide(
                 self.home.live_send.is_some(),
                 self.home.has_non_live_send_overlay(),
             );
-        crossterm::execute!(
+        // QUEUE, never execute: `execute!` flushes, and flushing the batch
+        // opener on its own puts the ~10ms widget build INSIDE the
+        // synchronized-update bracket, so the terminal holds its display
+        // frozen for a third of every frame instead of batching the result of
+        // one. Queued, these ride out in `terminal.draw`'s own flush together
+        // with the cells and the trailing Show, which is the whole point of
+        // the bracket: one write, one atomic frame.
+        crossterm::queue!(
             terminal.backend_mut(),
             crossterm::terminal::BeginSynchronizedUpdate
         )?;
         let draw_result = (|| -> Result<()> {
             if !skip_hide {
-                crossterm::execute!(terminal.backend_mut(), crossterm::cursor::Hide)?;
+                crossterm::queue!(terminal.backend_mut(), crossterm::cursor::Hide)?;
             }
             terminal.draw(|f| self.render(f))?;
             Ok(())
@@ -739,6 +748,14 @@ impl App {
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     ) -> Result<()> {
+        // Keep the display snapshots (sessions, pane metadata) fresh off the
+        // paint thread: every _for_display helper and the passive preview
+        // resize executor answers from these snapshots and never forks in render.
+        // The poller's first cycle runs immediately. Do not warm the cache
+        // here: tmux may consume the full command deadline, and startup must
+        // paint its conservative empty snapshot before any such wait.
+        crate::tmux::spawn_snapshot_poller();
+
         // Initial render
         crate::tui::clear_terminal(terminal)?;
         // Sync mouse capture before the first paint so any onboarding
@@ -747,9 +764,6 @@ impl App {
         // Otherwise the user would have to press a key first.
         self.sync_mouse_capture(terminal)?;
         self.draw(terminal)?;
-
-        // Refresh tmux session cache
-        crate::tmux::refresh_session_cache();
 
         // Spawn async update check at startup. The periodic re-check below
         // covers long-running sessions (#1471). `last_update_check` stays
@@ -830,7 +844,7 @@ impl App {
         let mut last_refresh_at: Option<std::time::Instant> = None;
         const REFRESH_COOLDOWN: Duration = Duration::from_millis(15);
         let mut last_status_refresh = std::time::Instant::now();
-        #[cfg(feature = "serve")]
+        let mut last_metrics_sample = std::time::Instant::now();
         let mut last_daemon_status_refresh = std::time::Instant::now();
         let mut last_disk_refresh = std::time::Instant::now();
         let mut last_spinner_redraw = std::time::Instant::now();
@@ -847,9 +861,12 @@ impl App {
         // than from a local tmux scrape, and `/api/sessions` costs the daemon
         // a few SQLite lookups per structured row. Half the tmux cadence
         // keeps a status dot feeling live while halving that request rate.
-        #[cfg(feature = "serve")]
         const DAEMON_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
         const DISK_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+        // Diagnostics-strip sampling. 1s keeps the sparkline responsive to a
+        // fast memory climb; request_metrics_refresh is a no-op unless the strip
+        // is visible, so this costs nothing when the pane is hidden.
+        const METRICS_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
         // Fastest spinner (breathe) changes every 180ms; 120ms ensures smooth animation
         const SPINNER_REDRAW_INTERVAL: Duration = Duration::from_millis(120);
         const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
@@ -864,14 +881,14 @@ impl App {
         // never double-stop a session when run side by side.
         const SESSION_IDLE_REAP_INTERVAL: Duration = Duration::from_secs(60);
         // A presence file counts as live while its mtime is within this window.
-        // Larger than HEARTBEAT_INTERVAL so a couple of missed beats (busy loop,
+        // Larger than the liveness heartbeat so a couple of missed beats (busy loop,
         // brief stall) don't drop an instance; matches the push consumer.
         const PRESENCE_FRESH_WINDOW: Duration = Duration::from_secs(30);
 
-        // Signal that the TUI is active so the web push consumer can
-        // suppress notifications while the user is watching the dashboard, and
-        // so other TUIs can count this instance.
+        // Register this TUI as live for the footer, and as recently interacted
+        // with for short-lived push suppression.
         crate::session::write_tui_heartbeat();
+        crate::session::write_tui_activity();
         self.home.active_tui_count = crate::session::count_active_tuis(PRESENCE_FRESH_WINDOW);
 
         // Telemetry (opt-in, no-op otherwise): announce this surface on boot,
@@ -911,10 +928,7 @@ impl App {
             // preview too (it streams into the pane), not just an active
             // view. Computed outside the select! so the arm's `expect` is
             // guarded by the same check that enables it.
-            #[cfg(feature = "serve")]
             let embedded_mounted = self.home.structured_preview.is_some();
-            #[cfg(not(feature = "serve"))]
-            let embedded_mounted = false;
 
             // All event sources are polled cooperatively via tokio::select!.
             // This ensures signal futures actually get scheduled (fixing #608
@@ -934,6 +948,7 @@ impl App {
                             if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                                 continue;
                             }
+                            crate::session::write_tui_activity();
                             // Paste-burst detector for VoiceInk + Mosh ergonomics.
                             // Mosh strips bracketed-paste markers, so pasted
                             // dictation arrives as a stream of individual KeyEvents
@@ -988,7 +1003,9 @@ impl App {
                                         _ => break,
                                     }
                                 }
-                                if burst_keys.len() >= PASTE_BURST_MIN_LEN {
+                                if burst_keys.len() >= PASTE_BURST_MIN_LEN
+                                    && !Self::is_auto_repeat_burst(&burst_keys)
+                                {
                                     // Peel a trailing Enter so the dialog's
                                     // plain-Enter Submit branch still fires.
                                     // Embedded mid-burst Enters stay as '\n'
@@ -1006,7 +1023,6 @@ impl App {
                                         // composer, same as a real Paste
                                         // event. A merely-mounted preview
                                         // must not eat it.
-                                        #[cfg(feature = "serve")]
                                         if let Some(view) = self
                                             .home
                                             .structured_preview
@@ -1026,8 +1042,6 @@ impl App {
                                         } else {
                                             self.home.handle_paste(&paste_text);
                                         }
-                                        #[cfg(not(feature = "serve"))]
-                                        self.home.handle_paste(&paste_text);
                                     }
                                     if let Some(enter) = trailing_enter {
                                         if !self.should_quit {
@@ -1086,6 +1100,8 @@ impl App {
                                                             // Sidebar collapse/expand toggle; must
                                                             // precede hit_list (button is on the
                                                             // list's top border).
+                                                        } else if self.home.handle_diagnostics_click(mouse.column, mouse.row) {
+                                                            // Compact system-health strip opened the read-only detail view.
                                                         } else if self.home.handle_tips_badge_click(mouse.column, mouse.row) {
                                                             // Footer tips badge opened the overlay;
                                                             // drop any stale preview highlight, like
@@ -1167,6 +1183,9 @@ impl App {
                             continue;
                         }
                         Some(Ok(Event::Mouse(mouse))) => {
+                            if !matches!(mouse.kind, MouseEventKind::Moved) {
+                                crate::session::write_tui_activity();
+                            }
                             // Structured preview mouse routing is deliberately
                             // thin: the transcript is ordinary preview content,
                             // so drags fall through to the home view's own
@@ -1178,8 +1197,6 @@ impl App {
                             // transcript, which home cannot do), plus the
                             // "clicked off the pane while entered" drop back
                             // to preview so sidebar clicks keep selecting.
-                            #[cfg(feature = "serve")]
-                            {
                                 let in_pane = self.home.structured_preview.is_some()
                                     && self.home.preview_pane_area.contains(
                                         ratatui::layout::Position::from((
@@ -1234,7 +1251,6 @@ impl App {
                                     }
                                     continue;
                                 }
-                            }
                             // Footer toolbar: a left-click on a button
                             // synthesizes its shortcut and routes it through
                             // the full key handler, so clicking behaves
@@ -1280,7 +1296,6 @@ impl App {
                                 // Mirror the list double-click path: an acp
                                 // session only stashes its id, so drain and open
                                 // the structured view here too.
-                                #[cfg(feature = "serve")]
                                 if let Some(session_id) =
                                     self.pending_structured_view_open.take()
                                 {
@@ -1385,6 +1400,13 @@ impl App {
                                     None
                                 } else if self
                                     .home
+                                    .handle_diagnostics_click(mouse.column, mouse.row)
+                                {
+                                    let _ = self.home.clear_preview_selection();
+                                    self.draw(terminal)?;
+                                    None
+                                } else if self
+                                    .home
                                     .handle_tips_badge_click(mouse.column, mouse.row)
                                 {
                                     // Footer tips badge opened the overlay.
@@ -1428,8 +1450,14 @@ impl App {
                                     self.home.handle_diff_click(mouse.column, mouse.row);
                                     self.draw(terminal)?;
                                     None
+                                } else if self.home.clear_preview_selection() {
+                                    // A click on no surface at all still
+                                    // dismisses a finalized highlight, and
+                                    // nothing below repaints for a bare
+                                    // Down(Left), so draw the clear here.
+                                    self.draw(terminal)?;
+                                    None
                                 } else {
-                                    let _ = self.home.clear_preview_selection();
                                     None
                                 }
                             } else {
@@ -1517,7 +1545,6 @@ impl App {
                                 // `execute_action` can't lend. Drain here so a
                                 // double-click on an acp session actually
                                 // opens it.
-                                #[cfg(feature = "serve")]
                                 if let Some(session_id) = self.pending_structured_view_open.take() {
                                     self.open_structured_view(&session_id).await?;
                                 }
@@ -1532,18 +1559,15 @@ impl App {
                                 // A [Yes] click on the switch-view confirm
                                 // stashes the switch; run it now, since this
                                 // click path never reaches the key-path drain.
-                                #[cfg(feature = "serve")]
                                 if let Some(session_id) = self.pending_view_switch.take() {
                                     self.perform_view_switch(&session_id, terminal).await;
                                 }
                                 // Same for a [Yes] click on the start-daemon
                                 // confirm from a structured-view open.
-                                #[cfg(feature = "serve")]
                                 if let Some(session_id) = self.pending_daemon_start_open.take() {
                                     self.start_daemon_then_open(&session_id, terminal).await;
                                 }
                                 // Same for an "Auto-name now" palette/menu click.
-                                #[cfg(feature = "serve")]
                                 if let Some(session_id) = self.pending_smart_rename.take() {
                                     self.perform_smart_rename(&session_id).await;
                                 }
@@ -1551,12 +1575,12 @@ impl App {
                             continue;
                         }
                         Some(Ok(Event::Paste(text))) => {
+                            crate::session::write_tui_activity();
                             // An ACTIVE structured view owns pasted text (it
                             // goes to its composer, same as the full-screen
                             // view). A merely-mounted preview must NOT eat
                             // it: the user is driving the home screen, and a
                             // paste belongs to whatever home surface is up.
-                            #[cfg(feature = "serve")]
                             if let Some(view) = self
                                 .home
                                 .structured_preview
@@ -1614,30 +1638,16 @@ impl App {
                 // runs in the arm body where it can no longer be raced,
                 // so a mid-replay cancellation cannot corrupt the state.
                 ev = async {
-                    #[cfg(feature = "serve")]
-                    {
                         self.home.structured_preview
                             .as_mut()
                             .expect("guarded by embedded_mounted")
                             .next_event()
                             .await
-                    }
-                    #[cfg(not(feature = "serve"))]
-                    {
-                        std::future::pending::<()>().await
-                    }
                 }, if embedded_mounted => {
-                    #[cfg(feature = "serve")]
-                    {
                         if let Some(view) = self.home.structured_preview.as_mut() {
                             view.apply_event(ev).await;
                         }
                         self.draw(terminal)?;
-                    }
-                    #[cfg(not(feature = "serve"))]
-                    {
-                        let _: () = ev;
-                    }
                 }
                 _ = refresh_interval.tick() => {}
                 _ = preview_wake.notified() => {
@@ -1767,6 +1777,7 @@ impl App {
 
             if last_status_refresh.elapsed() >= STATUS_REFRESH_INTERVAL {
                 self.home.request_status_refresh();
+                self.home.repair_session_id_pollers();
                 last_status_refresh = std::time::Instant::now();
             }
 
@@ -1775,16 +1786,24 @@ impl App {
                 needs_full_refresh = true;
             }
 
-            #[cfg(feature = "serve")]
-            {
-                if last_daemon_status_refresh.elapsed() >= DAEMON_STATUS_REFRESH_INTERVAL {
-                    self.home.request_daemon_status_refresh();
-                    last_daemon_status_refresh = std::time::Instant::now();
-                }
-                if self.home.apply_daemon_status_updates() {
-                    refresh_needed = true;
-                    needs_full_refresh = true;
-                }
+            if last_metrics_sample.elapsed() >= METRICS_SAMPLE_INTERVAL {
+                self.home.request_metrics_refresh();
+                last_metrics_sample = std::time::Instant::now();
+            }
+
+            // A new sample only repaints the strip, so a diffed redraw is
+            // enough; no full clear.
+            if self.home.apply_metrics_updates() {
+                refresh_needed = true;
+            }
+
+            if last_daemon_status_refresh.elapsed() >= DAEMON_STATUS_REFRESH_INTERVAL {
+                self.home.request_daemon_status_refresh();
+                last_daemon_status_refresh = std::time::Instant::now();
+            }
+            if self.home.apply_daemon_status_updates() {
+                refresh_needed = true;
+                needs_full_refresh = true;
             }
 
             if self.home.apply_deletion_results() {
@@ -1798,6 +1817,11 @@ impl App {
             }
 
             if self.home.apply_trash_results() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
+            if self.home.apply_reconcile_results() {
                 refresh_needed = true;
                 needs_full_refresh = true;
             }
@@ -1835,7 +1859,6 @@ impl App {
                 // A structured session routes the post-create attach into
                 // `pending_structured_view_open`; drain it here (this tick
                 // path sits outside the key/click drains).
-                #[cfg(feature = "serve")]
                 if let Some(sid) = self.pending_structured_view_open.take() {
                     self.open_structured_view(&sid).await?;
                 }
@@ -2001,7 +2024,6 @@ impl App {
 
             // Preview-on-select: mount/drop the streaming transcript
             // preview to track the selected structured session (debounced).
-            #[cfg(feature = "serve")]
             if self.reconcile_structured_preview().await {
                 refresh_needed = true;
                 needs_full_refresh = true;
@@ -2010,7 +2032,6 @@ impl App {
             // Embedded structured view: expire its toast, surface queued
             // plugin notifications, and repaint on the same 120ms cadence
             // the full-screen view used so the composer caret blinks.
-            #[cfg(feature = "serve")]
             if let Some(view) = self.home.structured_preview.as_mut() {
                 let toast_changed = view.tick();
                 if toast_changed || last_spinner_redraw.elapsed() >= SPINNER_REDRAW_INTERVAL {
@@ -2119,7 +2140,7 @@ impl App {
     /// (mirroring the serve deferred-clear).
     fn build_telemetry_snapshot(&self) -> Option<crate::telemetry::UsageSnapshot> {
         // Boundary snapshot: `build_usage_snapshot` takes `&[Instance]`
-        // (shared API with the daemon caller in `src/server/mod.rs`).
+        // (shared API with the daemon caller in `src/server/serve_snapshot.rs`).
         let instances: Vec<crate::session::Instance> = self.home.instances().cloned().collect();
         crate::telemetry::build_usage_snapshot(
             crate::telemetry::Surface::Tui,
@@ -2164,9 +2185,9 @@ impl App {
         let image_update = self
             .image_banner_active()
             .then_some(self.image_update.as_ref());
-        // Reset before the render so a frame that skips the preview path
-        // (dialog open, non-home view) reads as zero capture/parse rather
-        // than leaking the previous frame's durations.
+        // Reset before render so a frame that skips the preview path
+        // (dialog open, non-home view) reads as zero apply/parse rather than
+        // leaking the previous frame durations.
         self.home.preview_timings = Default::default();
         self.home.render(
             frame,
@@ -2177,13 +2198,10 @@ impl App {
             image_update.flatten(),
         );
         // Sampled trace for frame-budget diagnostics. A full-frame trace on
-        // every paint would dominate the log at `default_level = trace`, so
-        // we only emit for (a) frames that break the 16ms / 60fps budget and
-        // (b) live-send frames, where the per-frame `tmux capture-pane` fork
-        // is the latency we're profiling and individual frames usually stay
-        // under 16ms. `capture_us` / `parse_us` break the frame down into the
-        // capture fork vs. the `ansi-to-tui` parse; the remainder (frame_ms
-        // minus those two) is the widget build + ratatui diff.
+        // every paint would dominate the log at default_level = trace, so emit
+        // only for frames over the 16ms / 60fps budget and live-send frames.
+        // preview_apply_us and parse_us split mailbox/cache application from
+        // ANSI parsing; the remainder is widget build plus ratatui diff.
         let elapsed = start.elapsed();
         let in_live = self.home.live_send.is_some();
         if (elapsed.as_millis() > 16 || in_live)
@@ -2194,7 +2212,7 @@ impl App {
                 target: "tui.render",
                 frame_ms = elapsed.as_millis() as u64,
                 frame_us = elapsed.as_micros() as u64,
-                capture_us = timings.capture.as_micros() as u64,
+                preview_apply_us = timings.apply.as_micros() as u64,
                 parse_us = timings.parse.as_micros() as u64,
                 live = in_live,
                 width = frame.area().width,
@@ -2810,7 +2828,6 @@ impl App {
         // previewed view (mounted but not entered) does NOT capture: list
         // navigation keeps working, and Enter enters it. Ctrl+Q leaves
         // interactive mode back to the read-only preview.
-        #[cfg(feature = "serve")]
         if self
             .home
             .structured_preview
@@ -2939,22 +2956,18 @@ impl App {
         // ('y' / Enter on the switch-view confirm) stashes the id during
         // `execute_action` above, and draining before `handle_key` would
         // sit on it until the next keypress (#2925).
-        #[cfg(feature = "serve")]
         if let Some(session_id) = self.pending_view_switch.take() {
             self.perform_view_switch(&session_id, terminal).await;
         }
 
-        #[cfg(feature = "serve")]
         if let Some(session_id) = self.pending_daemon_start_open.take() {
             self.start_daemon_then_open(&session_id, terminal).await;
         }
 
-        #[cfg(feature = "serve")]
         if let Some(session_id) = self.pending_structured_view_open.take() {
             self.open_structured_view(&session_id).await?;
         }
 
-        #[cfg(feature = "serve")]
         if let Some(session_id) = self.pending_smart_rename.take() {
             self.perform_smart_rename(&session_id).await;
         }
@@ -2968,7 +2981,6 @@ impl App {
     /// structured-view WS and the file watcher refreshes the row, so the TUI
     /// mutates no session state itself. A no-daemon state surfaces as a
     /// transient status rather than failing the loop (#3039).
-    #[cfg(feature = "serve")]
     async fn perform_smart_rename(&mut self, session_id: &str) {
         use crate::acp::client::{require_daemon, HttpClient, ManagerError};
 
@@ -3020,7 +3032,6 @@ impl App {
     /// `aoe serve`, so the spawn is part of the consented action rather
     /// than a hidden side effect. `terminal` is borrowed to paint the
     /// "Starting…" status before the (up to several seconds) wait.
-    #[cfg(feature = "serve")]
     async fn perform_view_switch(
         &mut self,
         session_id: &str,
@@ -3087,7 +3098,6 @@ impl App {
     /// when selected), connect now; and with no daemon at all, offer to
     /// start a localhost one (the Yes path resumes through
     /// `start_daemon_then_open`).
-    #[cfg(feature = "serve")]
     async fn open_structured_view(&mut self, session_id: &str) -> Result<()> {
         use crate::acp::client::{require_daemon, ManagerError};
 
@@ -3133,7 +3143,6 @@ impl App {
 
     /// Flip the mounted embedded view to interactive mode (exiting
     /// live-send first, since both own the preview pane and keyboard).
-    #[cfg(feature = "serve")]
     fn activate_embedded(&mut self) {
         self.home.exit_live_send_if_active();
         if let Some(v) = self.home.structured_preview.as_mut() {
@@ -3145,7 +3154,6 @@ impl App {
     /// activates.  Leaves the text in `pending_paste_for_structured_view`
     /// when there is no mounted view (activation failed), so the next 'm'
     /// press can still surface it.
-    #[cfg(feature = "serve")]
     fn drain_pending_paste_for_structured_view(&mut self) {
         if let Some(buf) = self.home.pending_paste_for_structured_view.take() {
             if let Some(view) = self.home.structured_preview.as_mut() {
@@ -3161,7 +3169,6 @@ impl App {
     /// Mount the embedded view against a located daemon in preview
     /// (read-only) state. The caller activates it if the user is
     /// entering rather than just previewing.
-    #[cfg(feature = "serve")]
     async fn connect_embedded_structured(
         &mut self,
         endpoint: crate::acp::client::DaemonEndpoint,
@@ -3189,7 +3196,6 @@ impl App {
     /// reported Ctrl+Q flash). The home view repaints the same preview
     /// rect the structured view drew into, so the ordinary diffed draw
     /// covers it cleanly, the same way exiting live-send does.
-    #[cfg(feature = "serve")]
     fn close_embedded_structured(&mut self) {
         self.home.structured_preview = None;
     }
@@ -3197,7 +3203,6 @@ impl App {
     /// The Yes path of the "start a local daemon?" confirm: spawn a
     /// localhost daemon with visible feedback, wait for it to become
     /// healthy, then mount + enter the embedded structured view.
-    #[cfg(feature = "serve")]
     async fn start_daemon_then_open(
         &mut self,
         session_id: &str,
@@ -3226,7 +3231,6 @@ impl App {
     /// while a daemon is already reachable (a down daemon leaves the
     /// "press Enter" placeholder). An active (entered) view is never
     /// disturbed. Returns true if the mount set changed (needs redraw).
-    #[cfg(feature = "serve")]
     async fn reconcile_structured_preview(&mut self) -> bool {
         // An entered view owns the selection and keyboard; leave it be,
         // but only while its session is still a live structured row AND
@@ -3333,14 +3337,14 @@ impl App {
         };
         let now = chrono::Utc::now();
         // Boundary snapshot: `idle_reap_candidates` takes `&[Instance]`
-        // (shared API with the daemon caller in `src/server/mod.rs`).
+        // (shared API with the daemon caller in `src/server/idle_reap.rs`).
         let instances: Vec<crate::session::Instance> = self.home.instances().cloned().collect();
         let candidates = crate::session::idle_reap::idle_reap_candidates(
             &instances,
             now,
             &attached,
             |profile| {
-                crate::session::profile_config::resolve_config_or_warn(profile)
+                crate::session::config::profile_config::resolve_config_or_warn(profile)
                     .session
                     .auto_stop_idle_secs
             },
@@ -3468,7 +3472,7 @@ impl App {
                 // bottom-anchored preview paint up a row for the frame's
                 // lifetime, and a warm send is too fast for the toast to
                 // inform anyone.
-                let warm = self.home.agent_pane_is_warm(&id);
+                let warm = self.home.send_entry_is_warm(&id);
                 if !warm {
                     self.home
                         .set_instance_status(&id, crate::session::Status::Starting);
@@ -3503,14 +3507,10 @@ impl App {
                     self.draw(terminal)?;
                 }
                 let outcome = self.home.prepare_live_send(&id);
-                // Settle the toast to its final state BEFORE the sync resize
-                // and redraw, so HomeView's cached `preview_pane_area`
-                // matches the geometry the user will see for the next
-                // several frames. Otherwise the toast row that was on screen
-                // during `prepare_live_send` would make the preview pane one
-                // row shorter than post-toast, the sync resize would target
-                // the smaller pane, and the first capture would render
-                // shifted up.
+                // Settle the toast before redraw so HomeView computes the
+                // geometry the user will actually see. That draw queues the
+                // resize through LiveSendWorker; the action thread never
+                // performs or waits for a tmux resize.
                 if !warm {
                     self.update_status = match &outcome {
                         // On clean ready, drop the toast entirely. On Err the
@@ -3521,7 +3521,6 @@ impl App {
                 }
                 if outcome.is_ok() {
                     self.draw(terminal)?;
-                    self.home.finalize_live_send_resize();
                 }
             }
             Action::AttachToolSession(id, tool_name) => {
@@ -3530,7 +3529,6 @@ impl App {
             Action::RunBackgroundToolSession(id, tool_name) => {
                 self.run_background_tool_session(&id, &tool_name);
             }
-            #[cfg(feature = "serve")]
             Action::OpenStructuredView(id) => {
                 // Stash for the async main loop. The acp view needs
                 // `event_stream` access that this sync handler can't
@@ -3538,19 +3536,16 @@ impl App {
                 // we return.
                 self.pending_structured_view_open = Some(id);
             }
-            #[cfg(feature = "serve")]
             Action::SwitchSessionView(id) => {
                 // Same stash-for-the-async-loop pattern: the daemon POST
                 // must be awaited, which this sync handler can't do.
                 self.pending_view_switch = Some(id);
             }
-            #[cfg(feature = "serve")]
             Action::StartDaemonThenOpenStructured(id) => {
                 // Same stash pattern: spawning the daemon and waiting for
                 // its health check must be awaited.
                 self.pending_daemon_start_open = Some(id);
             }
-            #[cfg(feature = "serve")]
             Action::SmartRenameNow(id) => {
                 // Same stash pattern: the daemon POST must be awaited.
                 self.pending_smart_rename = Some(id);
@@ -3577,7 +3572,6 @@ impl App {
         session_id: &str,
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     ) -> Result<()> {
-        #[cfg(feature = "serve")]
         if self
             .home
             .get_instance(session_id)
@@ -3756,7 +3750,7 @@ impl App {
         // preview geometry against the now-grown window instead of leaving the
         // top clipped.
         tmux_session.reset_size_to_latest_client();
-        self.home.clear_preview_pane_sync();
+        self.home.clear_preview_pane_sync(session_id);
         let (attach_result, attached_status_updates) =
             self.with_attached_status_hooks(terminal, || tmux_session.attach())?;
 
@@ -4185,25 +4179,21 @@ pub enum Action {
     /// stashes the id in `pending_structured_view_open`; the main loop drains it
     /// after `execute_action` returns and runs the async acp loop
     /// against the borrowed terminal + event stream.
-    #[cfg(feature = "serve")]
     OpenStructuredView(String),
     /// Flip a session's persisted view (structured ↔ terminal) through the
     /// daemon's switch endpoints. Stashed in `pending_view_switch` (the
     /// POST needs the async loop) and drained alongside
     /// `pending_structured_view_open`; the daemon persists the change and
     /// the file watcher refreshes the row.
-    #[cfg(feature = "serve")]
     SwitchSessionView(String),
     /// The Yes on the "no daemon running, start a local one?" confirm
     /// shown when opening a structured view. Stashed in
     /// `pending_daemon_start_open` (spawn + health wait must be
     /// awaited) and drained alongside the other structured stashes.
-    #[cfg(feature = "serve")]
     StartDaemonThenOpenStructured(String),
     /// On-demand "Auto-name now" for a structured session. Stashed in
     /// `pending_smart_rename` (the daemon POST needs the async loop) and
     /// drained alongside the other structured stashes (#3039).
-    #[cfg(feature = "serve")]
     SmartRenameNow(String),
 }
 
@@ -4772,6 +4762,61 @@ mod tests {
             KeyCode::Backspace,
             KeyModifiers::NONE
         )));
+    }
+
+    #[test]
+    fn auto_repeat_burst_rejects_held_navigation_but_not_pasted_text() {
+        let cases = [
+            (
+                vec![
+                    key(KeyCode::Char('j'), KeyModifiers::NONE),
+                    key(KeyCode::Char('j'), KeyModifiers::NONE),
+                    key(KeyCode::Char('j'), KeyModifiers::NONE),
+                ],
+                true,
+            ),
+            (
+                vec![
+                    key(KeyCode::Char('k'), KeyModifiers::NONE),
+                    key(KeyCode::Char('k'), KeyModifiers::NONE),
+                    key(KeyCode::Char('k'), KeyModifiers::NONE),
+                ],
+                true,
+            ),
+            (
+                vec![
+                    KeyEvent::new_with_kind(
+                        KeyCode::Char('j'),
+                        KeyModifiers::NONE,
+                        KeyEventKind::Press,
+                    ),
+                    KeyEvent::new_with_kind(
+                        KeyCode::Char('j'),
+                        KeyModifiers::NONE,
+                        KeyEventKind::Repeat,
+                    ),
+                    KeyEvent::new_with_kind(
+                        KeyCode::Char('j'),
+                        KeyModifiers::NONE,
+                        KeyEventKind::Repeat,
+                    ),
+                ],
+                true,
+            ),
+            (
+                vec![
+                    key(KeyCode::Char('p'), KeyModifiers::NONE),
+                    key(KeyCode::Char('a'), KeyModifiers::NONE),
+                    key(KeyCode::Char('s'), KeyModifiers::NONE),
+                    key(KeyCode::Char('t'), KeyModifiers::NONE),
+                    key(KeyCode::Char('e'), KeyModifiers::NONE),
+                ],
+                false,
+            ),
+        ];
+        for (keys, expected) in cases {
+            assert_eq!(App::is_auto_repeat_burst(&keys), expected, "{keys:?}");
+        }
     }
 
     #[test]

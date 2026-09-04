@@ -3,6 +3,7 @@ pub mod error;
 pub mod image_update;
 mod runtime;
 pub(crate) mod runtime_base;
+pub mod stats;
 
 use std::collections::HashMap;
 
@@ -47,6 +48,21 @@ pub fn batch_container_health() -> HashMap<String, bool> {
         count = map.len(),
         duration_ms = start.elapsed().as_millis() as u64,
         "batch container health fetched",
+    );
+    map
+}
+
+/// Resource usage of every aoe sandbox container, in a single subprocess call.
+/// Returns a map of container name -> stats; a container the runtime has no
+/// usable sample for is absent rather than zeroed.
+pub fn batch_container_stats() -> stats::StatsMap {
+    let start = std::time::Instant::now();
+    let map = get_container_runtime().batch_stats("aoe-sandbox-");
+    tracing::debug!(
+        target: "containers.runtime",
+        count = map.len(),
+        duration_ms = start.elapsed().as_millis() as u64,
+        "batch container stats fetched",
     );
     map
 }

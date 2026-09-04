@@ -85,6 +85,19 @@ export function usePushSubscription() {
       const reg = await navigator.serviceWorker.ready;
       const sub = await reg.pushManager.getSubscription();
       if (perm === "granted" && sub) {
+        // Auto-heal: re-register the existing browser subscription on every
+        // open. The server upserts by endpoint, so this re-binds the sub's
+        // owner to the current auth token and re-inserts it if the server had
+        // dropped the record (e.g. the token rotated and the rotation-prune
+        // path removed the old-owned entry). Without this, the browser still
+        // reports "enabled" while the server no longer delivers to it (#3386).
+        // Best-effort: a failure here just leaves the sub as the server has it.
+        const json = sub.toJSON();
+        await fetch("/api/push/subscribe", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ endpoint: json.endpoint, keys: json.keys }),
+        }).catch(() => {});
         setState({ kind: "enabled" });
       } else {
         setState({ kind: "off" });

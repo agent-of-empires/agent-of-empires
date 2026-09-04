@@ -872,10 +872,12 @@ impl SettingsView {
                             .chars()
                             .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
                             .collect();
-                        if collapsed.len() > 47 {
-                            format!("{}...", &collapsed[..47])
-                        } else {
-                            collapsed
+                        // Truncate on a char boundary: `&collapsed[..47]`
+                        // panics when a multi-byte char spans byte 47 of a
+                        // long custom instruction.
+                        match collapsed.char_indices().nth(47) {
+                            Some((cut, _)) => format!("{}...", &collapsed[..cut]),
+                            None => collapsed,
                         }
                     }
                     Some(text) => text.to_string(),
@@ -1665,7 +1667,7 @@ mod status_message_tests {
     use super::super::fields::FieldKind;
     use super::super::test_util::fresh_view;
     use super::super::{FieldValue, SettingField, SettingsCategory, SettingsScope};
-    use crate::session::settings_schema::{ValidationKind, WidgetKind};
+    use crate::session::config::settings_schema::{ValidationKind, WidgetKind};
     use crate::tui::styles::load_theme;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;

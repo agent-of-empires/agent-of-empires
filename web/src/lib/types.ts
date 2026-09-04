@@ -1,4 +1,5 @@
 import type { RepoColor } from "./repoAppearance";
+import type { AgentLifecycleInfo } from "./agentProfiles";
 
 /** Session data returned by the API */
 export interface SessionResponse {
@@ -106,6 +107,12 @@ export interface SessionResponse {
   profile: string;
   cleanup_defaults: CleanupDefaults;
   remote_owner: string | null;
+  /** Host-scoped identity for `remote_owner` ("owner@host"): the org axis
+   *  buckets by this instead of the bare owner, so same-named owners on
+   *  different hosts (GitHub "acme" vs GitLab "acme") never merge into one
+   *  group. `remote_owner` stays the display label. `null` whenever
+   *  `remote_owner` is `null`. */
+  remote_owner_key: string | null;
   /** Per-session push-notification overrides. null means "inherit the
    *  server default" for that event type; boolean is an explicit toggle. */
   notify_on_waiting: boolean | null;
@@ -140,9 +147,9 @@ export interface SessionResponse {
   acp_capable?: boolean;
   /** The session's captured ACP session id, present only once the structured
    *  view worker has minted one. The sidebar passes this as `fork_from` on a
-   *  structured fork create, and gates the "Fork" action on its presence (a
-   *  structured row with a captured id to diverge from). Absent for terminal
-   *  sessions and structured ones whose worker has not minted an id yet. */
+   *  structured fork create and gates the "Fork" action on it together with
+   *  `acp_can_fork`. Absent for terminal sessions and structured ones whose
+   *  worker has not minted an id yet. */
   acp_session_id?: string;
   /** The session's resolved ACP registry key (`agent_name` when set, else
    *  `tool`), matching the `name` entries `/api/acp/agents` returns. The
@@ -151,13 +158,26 @@ export interface SessionResponse {
    *  event that populates the reduced `state.agent`), so it can gray out the
    *  running backend on a never-switched session. See #2803. */
   acp_agent?: string;
+  /** Whether switching this session between terminal and structured view
+   *  preserves the conversation (only claude pairings share one CLI-resumable
+   *  transcript). Server-computed via `agents::acp_transcript_cli_resumable`;
+   *  the dashboard reads this instead of recomputing it. Absent (read as false)
+   *  for non-preserving pairings. */
+  keeps_context?: boolean;
+  /** Slash-command aliases that reset the conversation for this session's
+   *  agent (claude `/clear`, codex/opencode `/new`). Server-owned from the
+   *  Rust `AgentProfile::clear_aliases`; the composer's `/` palette and the
+   *  queued-prompt clear-boundary hint read this instead of a client-side
+   *  per-agent mirror. Absent (read as empty) for agents with no clear alias. */
+  clear_aliases?: string[];
   /** True when this session's agent can run a structured ACP `session/fork`:
-   *  it is ACP-capable AND declares a real fork strategy. Resume-only ACP
-   *  agents (e.g. the bundled `aoe-agent`, which advertises `loadSession` but
-   *  not `session/fork`) are ACP-capable yet not forkable. The sidebar gates the
-   *  "Fork" action on this together with `acp_session_id` so a resume-only row
-   *  never shows a dead-end fork button. Absent (read as not-forkable) for
-   *  terminal sessions and non-forkable agents. */
+   *  it maps to a built-in ACP adapter verified to implement the handshake
+   *  (today claude alone). Resume-only ACP agents (e.g. `aoe-agent`, which
+   *  advertises `loadSession` but not `session/fork`) are ACP-capable yet not
+   *  forkable, so the sidebar gates "Fork" on this together with
+   *  `acp_session_id` and a resume-only row never shows a dead-end button.
+   *  Absent (read as not-forkable) for terminal sessions and non-forkable
+   *  agents. */
   acp_can_fork?: boolean;
   /** True when this is a Claude Code session AND the user has enabled
    *  Claude's fullscreen renderer (`tui: "fullscreen"` in
@@ -298,6 +318,12 @@ export interface RepoBase {
   /** Omitted for single-repo sessions. */
   repo_name?: string;
   base_branch: string;
+  /** Worktree path this repo's diff was computed in. The base picker queries
+   *  it for that repo's branch list. See #3329. */
+  repo_path: string;
+  /** Set when this repo carries an explicit override, which is what the
+   *  picker's reset affordance keys off. See #3329. */
+  base_override?: string;
 }
 
 /** Response from /api/sessions/{id}/diff/files */
@@ -358,6 +384,10 @@ export interface RepoGroup {
   alias: string | null;
   color: RepoColor | null;
   remoteOwner: string | null;
+  /** Host-scoped identity for `remoteOwner` ("owner@host"); the org axis
+   *  buckets repos by this instead of the bare owner. See `SessionResponse
+   *  .remote_owner_key`. `null` whenever `remoteOwner` is `null`. */
+  remoteOwnerKey: string | null;
   workspaces: Workspace[];
   status: WorkspaceStatus;
   collapsed: boolean;
@@ -417,6 +447,11 @@ export interface AgentInfo {
   /** Registry args appended to `acp_command` (e.g. `["acp"]` for
    *  opencode, `["--acp"]` for gemini). Absent or empty when none. */
   acp_args?: string[];
+  /** Registry lifecycle state from /api/agents. Omitted for Active agents
+   *  (the common case), so fixtures and older servers read as active.
+   *  Mirrors `AgentLifecycle` in src/agents.rs; the static frontend mirror
+   *  lives in agentProfiles.ts (`resolveAgentLifecycle`). */
+  lifecycle?: AgentLifecycleInfo;
 }
 
 /** Profile info returned by /api/profiles */
@@ -431,7 +466,7 @@ export interface ProfileInfo {
 
 /** Per-profile lifecycle-hook overrides, as returned by
  *  GET /api/profiles/:name/settings. Mirrors the Rust
- *  HooksConfigOverride (src/session/profile_config.rs): a field that is
+ *  HooksConfigOverride (src/session/config/profile_config.rs): a field that is
  *  absent/undefined means "inherit the global hooks"; an explicit array
  *  (including the empty array) means "override". Hooks are read-only on
  *  the dashboard; see HooksReadOnlyPanel and profileWritableSections. */
@@ -510,6 +545,10 @@ export interface CreateSessionRequest {
   sandbox_image?: string;
   extra_env?: string[];
   extra_repo_paths?: string[];
+  /** Base branch for individual repos. `repo` is a repo directory name or one
+   *  of the paths in `path` / `extra_repo_paths`; outranks `base_branch`,
+   *  which stays the base for every repo no entry names. See #3329. */
+  repo_bases?: { repo: string; base_branch: string }[];
   command_override?: string;
   custom_instruction?: string;
   profile?: string;
@@ -560,7 +599,7 @@ export type AcpWorkerState = "absent" | "resuming" | "running";
 
 // --- Settings schema (single source of truth, see #1692) ---
 //
-// Mirrors `crate::session::settings_schema`. `GET /api/settings/schema`
+// Mirrors `crate::session::config::settings_schema`. `GET /api/settings/schema`
 // returns `SettingsFieldDescriptor[]`; the generic settings renderer builds
 // the form from it instead of hand-written per-field JSX.
 

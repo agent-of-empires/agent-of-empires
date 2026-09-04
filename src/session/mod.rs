@@ -7,15 +7,12 @@ pub(crate) mod capture;
 pub mod cityhall_bundle;
 pub mod civilizations;
 pub(crate) mod claim;
-// Discovery of on-disk Claude Code sessions. Lives here (not under the
-// serve-gated `acp` module) because terminal/tmux import via the CLI works in
-// every build; only the structured-view import path needs `serve`.
+// Discovery of on-disk Claude Code sessions. Lives here rather than under
+// `acp` because terminal/tmux import via the CLI does not involve ACP.
 pub mod claude_import;
 pub mod config;
-pub(crate) mod container_config;
 // Depends on `crate::acp` (Event / event store) and is only driven from the
-// serve daemon, both of which are serve-gated. See #2808.
-#[cfg(feature = "serve")]
+// serve daemon. See #2808.
 pub mod conversation_summary;
 pub mod deletion;
 pub(crate) mod environment;
@@ -23,19 +20,15 @@ pub mod fork;
 mod groups;
 pub mod idle_reap;
 mod instance;
-pub mod mcp_model;
-pub mod mcp_overrides;
-pub mod mcp_state;
+pub mod mcp;
+mod move_journal;
 pub mod poller;
-pub mod profile_config;
-pub mod project_mcp;
 pub mod projects;
 pub(crate) mod recovery;
-pub mod repo_config;
 pub mod restart;
+pub mod scope;
 pub mod scratch;
 pub(crate) mod serde_helpers;
-pub mod settings_schema;
 pub mod skills_model;
 pub mod smart_rename;
 pub mod stop;
@@ -45,6 +38,7 @@ pub(crate) mod sync;
 pub(crate) mod test_support;
 pub mod trash;
 pub mod worktree_edit;
+pub mod worktree_reconcile;
 
 pub use crate::sound::SoundConfig;
 pub use crate::status_hooks::StatusHookConfig;
@@ -65,19 +59,30 @@ pub(crate) use groups::is_live_favorite;
 pub use groups::{
     append_archived_section, append_archived_section_by_project, append_trash_section,
     archived_project_sub_path, flatten_sessions_by_attention, flatten_tree,
-    flatten_tree_all_profiles, is_archived_section_path, is_trash_section_path,
-    is_within_archived_section, is_within_trash_section, Group, GroupTree, Item,
-    ARCHIVED_SECTION_NAME, ARCHIVED_SECTION_PATH, TRASH_SECTION_NAME, TRASH_SECTION_PATH,
+    flatten_tree_all_profiles, is_archived_section_path, is_synthetic_project_header,
+    is_trash_section_path, is_within_archived_section, is_within_trash_section,
+    project_group_display_name, Group, GroupTree, Item, ARCHIVED_SECTION_NAME,
+    ARCHIVED_SECTION_PATH, SCRATCH_GROUP_NAME, SCRATCH_GROUP_PATH, TRASH_SECTION_NAME,
+    TRASH_SECTION_PATH,
 };
-#[cfg(feature = "serve")]
 pub(crate) use instance::ResumeAttemptPolicy;
-pub use instance::{
-    is_valid_session_color, ClaimOp, EnsureReadyError, EnsureReadyOutcome, Instance,
-    LaunchSidOutcome, PluginCreateIdempotency, SandboxInfo, SessionBucket, StartOutcome, Status,
-    TerminalInfo, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo, SESSION_COLORS,
-    TMUX_SESSION_GONE_ERROR,
+pub(crate) use instance::{
+    duplicate_session_error, find_duplicate_session, is_duplicate_session,
+    persist_omp_session_to_storage, persist_session_to_storage, PassiveStatusPatch, ResumeIntent,
+    SidWrite, NEWER_GENERATION_BUSY_REASON,
 };
-pub(crate) use instance::{persist_session_to_storage, PassiveStatusPatch, ResumeIntent, SidWrite};
+pub use instance::{
+    is_valid_session_color, DetectionState, EnsureReadyError, EnsureReadyOutcome, Instance,
+    LaunchSidOutcome, LifecycleOperation, LifecycleReservation, LifecycleReservationError,
+    PluginCreateIdempotency, SandboxInfo, SessionBucket, StartOutcome, Status, TerminalInfo, View,
+    WorkspaceInfo, WorkspaceRepo, WorktreeInfo, SESSION_COLORS, TMUX_SESSION_GONE_ERROR,
+};
+#[cfg(test)]
+pub(crate) use move_journal::{
+    record as record_move_journal, MoveJournalEntry, MOVE_JOURNAL_VERSION,
+};
+pub(crate) use storage::acquire_session_identity_lock;
+pub(crate) use storage::{reconcile_profile_duplicates, DuplicateIdReport};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -116,20 +121,24 @@ pub fn set_favorites_first(on: bool) {
     FAVORITES_FIRST.store(on, Ordering::Relaxed);
 }
 
-pub use profile_config::{
+pub use config::profile_config::{
     load_profile_config, merge_configs, resolve_config, resolve_config_or_warn,
     save_profile_config, validate_check_interval, validate_env_format, validate_memory_limit,
     validate_network_format, validate_port_mapping_format, validate_volume_format, ProfileConfig,
 };
-pub use projects::{Project, ProjectScope};
-pub use recovery::HookTimeoutScope;
-pub use repo_config::{
+pub use config::repo_config::{
     check_repo_trust, execute_hooks, execute_hooks_in_container, load_repo_config,
     merge_repo_config, profile_to_repo_config, repo_config_to_profile, resolve_config_with_repo,
     resolve_config_with_repo_or_warn, save_repo_config, trust_repo, HookTimeout, HooksConfig,
     RepoConfig, RepoTrust, TrustSurface,
 };
-pub(crate) use storage::{atomic_write, resolve_symlink_chain};
+pub use projects::{Project, ProjectScope};
+pub use recovery::HookTimeoutScope;
+pub use scope::SessionScope;
+pub(crate) use storage::{
+    acquire_session_title_lock, atomic_write, read_file_no_follow, replace_file_no_follow,
+    resolve_symlink_chain, GroupMovePlan, StorageFlock,
+};
 pub use storage::{
     load_recent_projects, load_workspace_ordering, recent_project_entry_for, record_recent_project,
     update_workspace_ordering, RecentProjectEntry, Storage, WorkspaceOrdering,
@@ -654,22 +663,103 @@ pub fn set_default_profile(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Probe the global config and the active profile's config at startup so the
-/// TUI can show a single user-visible warning when either fails to parse.
-/// `tracing::warn!` calls inside the `_or_warn` helpers are silently dropped
-/// in default TUI mode (no subscriber), so this gives users a chance to see
-/// that their settings have been ignored without needing `AGENT_OF_EMPIRES_DEBUG=1`.
-pub fn collect_startup_config_warnings(profile: &str) -> Option<String> {
+/// One file's probe result: either the parse errored out (per-key values fall
+/// back to defaults), or it loaded but some keys were unrecognized and
+/// silently dropped. The two are mutually exclusive per file: without
+/// `deny_unknown_fields`, an unknown key never fails the load.
+pub struct ConfigProbe {
+    pub load_err: Option<String>,
+    pub ignored_keys: Vec<String>,
+}
+
+/// Try to load a config file, and on success enumerate its unrecognized keys.
+/// The two arms of `ConfigProbe` are always populated the same way; this
+/// helper keeps the global and profile probes from drifting apart.
+fn probe<T, E: std::fmt::Display>(
+    load: impl FnOnce() -> Result<T, E>,
+    ignored: impl FnOnce(&T) -> Vec<String>,
+) -> ConfigProbe {
+    match load() {
+        Ok(cfg) => ConfigProbe {
+            load_err: None,
+            ignored_keys: ignored(&cfg),
+        },
+        Err(e) => ConfigProbe {
+            load_err: Some(e.to_string()),
+            ignored_keys: Vec::new(),
+        },
+    }
+}
+
+/// Probe the global `config.toml`: run the real `Config::load` and, if it
+/// succeeded, run `serde_ignored` to enumerate any unknown struct fields at
+/// any depth.
+pub fn probe_global_config() -> ConfigProbe {
+    probe(Config::load, |_| Config::config_ignored_keys())
+}
+
+/// Same shape as [`probe_global_config`] but for a profile's `config.toml`.
+pub fn probe_profile_config(profile: &str) -> ConfigProbe {
+    probe(
+        || config::profile_config::load_profile_config(profile),
+        config::profile_config::profile_config_ignored_keys,
+    )
+}
+
+/// Human-readable path of the global `config.toml`, with a stable fallback so
+/// the message reads sensibly when the app dir can't even be resolved.
+pub(crate) fn config_path_display() -> String {
+    config::config_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "config.toml".to_string())
+}
+
+/// Which classes of probe finding a caller wants surfaced.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WarningClass {
+    /// Parse failures and unrecognized keys.
+    All,
+    /// Unrecognized keys only. For paths where a tracing subscriber is already
+    /// running: a parse failure reaches the operator through that sink, but
+    /// ignored keys are collected nowhere else.
+    IgnoredKeysOnly,
+}
+
+/// Format one probe result as a user-visible line, or `None` when the file is
+/// clean (or failed to parse under [`WarningClass::IgnoredKeysOnly`], which
+/// carries no ignored-key information anyway). `scope_label` is prefixed to
+/// both messages (e.g. `"global config"`, `"profile config 'foo'"`).
+fn format_probe(
+    probe: &ConfigProbe,
+    scope_label: &str,
+    path_display: &str,
+    class: WarningClass,
+) -> Option<String> {
+    if let Some(e) = probe.load_err.as_deref() {
+        (class == WarningClass::All)
+            .then(|| format!("Failed to load {scope_label} ({path_display}); using defaults.\n{e}"))
+    } else if !probe.ignored_keys.is_empty() {
+        Some(format!(
+            "Unrecognized keys in {scope_label} ({path_display}) were ignored: {}",
+            probe.ignored_keys.join(", ")
+        ))
+    } else {
+        None
+    }
+}
+
+/// Probe the global config and the active profile's config, formatting the
+/// requested classes into one blank-line-separated message.
+fn collect_startup_warnings(profile: &str, class: WarningClass) -> Option<String> {
     let mut messages: Vec<String> = Vec::new();
 
-    let global_path_display = config::config_path()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "config.toml".to_string());
-
-    if let Err(e) = Config::load() {
-        messages.push(format!(
-            "Failed to load global config ({global_path_display}); using defaults.\n{e}"
-        ));
+    if let Some(msg) = format_probe(
+        &probe_global_config(),
+        "global config",
+        &config_path_display(),
+        class,
+    ) {
+        messages.push(msg);
     }
 
     let effective = if profile.is_empty() {
@@ -677,15 +767,22 @@ pub fn collect_startup_config_warnings(profile: &str) -> Option<String> {
     } else {
         profile.to_string()
     };
-
-    let profile_path_display = profile_config::get_profile_config_path(&effective)
-        .map(|p| p.display().to_string())
+    // Non-creating resolver: `get_profile_config_path` goes through the
+    // creating `get_profile_dir`, so naming an unknown profile (`aoe list -p
+    // ghost`) would birth `profiles/ghost/` here, before the command's own
+    // `resolve_existing_profile` gets to reject it. See
+    // `tests/e2e/profile_lazy_creation.rs`.
+    let profile_path_display = get_profile_dir_path(&effective)
+        .map(|p| p.join("config.toml").display().to_string())
         .unwrap_or_else(|_| format!("profiles/{effective}/config.toml"));
-
-    if let Err(e) = profile_config::load_profile_config(&effective) {
-        messages.push(format!(
-            "Failed to load profile config '{effective}' ({profile_path_display}); using defaults.\n{e}"
-        ));
+    let profile_scope = format!("profile config '{effective}'");
+    if let Some(msg) = format_probe(
+        &probe_profile_config(&effective),
+        &profile_scope,
+        &profile_path_display,
+        class,
+    ) {
+        messages.push(msg);
     }
 
     if messages.is_empty() {
@@ -695,31 +792,66 @@ pub fn collect_startup_config_warnings(profile: &str) -> Option<String> {
     }
 }
 
+/// Probe the global config and the active profile's config at startup so the
+/// TUI can show a single user-visible warning when either fails to parse OR
+/// contains unrecognized keys. `tracing::warn!` calls inside the `_or_warn`
+/// helpers are silently dropped in default TUI mode (no subscriber), so this
+/// gives users a chance to see that their settings have been ignored without
+/// needing `AGENT_OF_EMPIRES_DEBUG=1`.
+pub fn collect_startup_config_warnings(profile: &str) -> Option<String> {
+    collect_startup_warnings(profile, WarningClass::All)
+}
+
+/// Like [`collect_startup_config_warnings`], but only the unrecognized-keys
+/// class. Used on paths where a tracing subscriber is already running
+/// (`should_init` true, e.g. TUI startup or `serve --daemon-child`): parse
+/// failures reach the operator through `tracing::warn!` from `_or_warn`
+/// helpers, but ignored keys are collected only by this probe, so they must
+/// still be surfaced on stderr even when tracing is up (#3228 CodeRabbit).
+pub fn collect_startup_ignored_key_warnings(profile: &str) -> Option<String> {
+    collect_startup_warnings(profile, WarningClass::IgnoredKeysOnly)
+}
+
 // ── TUI presence ────────────────────────────────────────────────────────────
 //
 // Each running TUI process drops a `<pid>` file under `tui-presence/` and
-// refreshes its mtime on the heartbeat tick. This lets us (a) tell the push
-// consumer whether *any* TUI is watching, and (b) count how many TUIs are
-// alive so the footer can surface "another instance is watching" when two
-// `aoe` TUIs run at once (the launcher TUI isn't tmux-backed, so there's no
-// tmux client list to read). A presence file is considered live while its
-// mtime is fresh; stale ones (crash without cleanup) are swept on read.
+// refreshes its mtime on the heartbeat tick. This lets the footer surface
+// "another instance is watching" when two `aoe` TUIs run at once (the launcher
+// TUI isn't tmux-backed, so there's no tmux client list to read). A presence
+// file is considered live while its mtime is fresh; stale ones (crash without
+// cleanup) are swept on read.
+//
+// Push suppression deliberately uses a separate `tui-activity/` directory.
+// A live TUI can sit unattended while an agent needs attention, so process
+// liveness is not evidence that the user is looking at it. Activity files are
+// touched only for real keyboard, paste, and mouse input.
 
 const TUI_PRESENCE_DIR: &str = "tui-presence";
+const TUI_ACTIVITY_DIR: &str = "tui-activity";
 
-fn presence_dir() -> Option<std::path::PathBuf> {
-    get_app_dir().ok().map(|d| d.join(TUI_PRESENCE_DIR))
+fn tui_dir(name: &str) -> Option<std::path::PathBuf> {
+    get_app_dir().ok().map(|d| d.join(name))
 }
 
-fn own_presence_file() -> Option<std::path::PathBuf> {
-    presence_dir().map(|d| d.join(std::process::id().to_string()))
+fn own_tui_file(name: &str) -> Option<std::path::PathBuf> {
+    tui_dir(name).map(|d| d.join(std::process::id().to_string()))
 }
 
 /// Write (or touch) this process's presence file so the push consumer knows
 /// a TUI is running and other TUIs can count us. Called periodically from the
 /// TUI event loop.
 pub fn write_tui_heartbeat() {
-    if let Some(dir) = presence_dir() {
+    if let Some(dir) = tui_dir(TUI_PRESENCE_DIR) {
+        let _ = fs::create_dir_all(&dir);
+        let _ = fs::write(dir.join(std::process::id().to_string()), b"");
+    }
+}
+
+/// Record real user input in this TUI. Push notification suppression reads
+/// this separately from the process-liveness heartbeat, so an unattended TUI
+/// cannot permanently silence a phone's notifications.
+pub fn write_tui_activity() {
+    if let Some(dir) = tui_dir(TUI_ACTIVITY_DIR) {
         let _ = fs::create_dir_all(&dir);
         let _ = fs::write(dir.join(std::process::id().to_string()), b"");
     }
@@ -727,7 +859,10 @@ pub fn write_tui_heartbeat() {
 
 /// Remove this process's presence file on TUI exit.
 pub fn clear_tui_heartbeat() {
-    if let Some(file) = own_presence_file() {
+    if let Some(file) = own_tui_file(TUI_PRESENCE_DIR) {
+        let _ = fs::remove_file(file);
+    }
+    if let Some(file) = own_tui_file(TUI_ACTIVITY_DIR) {
         let _ = fs::remove_file(file);
     }
 }
@@ -736,7 +871,11 @@ pub fn clear_tui_heartbeat() {
 /// any stale entries left behind by crashed processes. Returns the number of
 /// live TUIs (including this process, if its file is fresh).
 pub fn count_active_tuis(threshold: Duration) -> usize {
-    let dir = match presence_dir() {
+    count_fresh_tui_files(TUI_PRESENCE_DIR, threshold)
+}
+
+fn count_fresh_tui_files(dir_name: &str, threshold: Duration) -> usize {
+    let dir = match tui_dir(dir_name) {
         Some(d) => d,
         None => return 0,
     };
@@ -761,11 +900,11 @@ pub fn count_active_tuis(threshold: Duration) -> usize {
     live
 }
 
-/// Returns true if any TUI presence file was modified within `threshold`.
-/// Used by the push consumer to suppress notifications when the user is
-/// actively watching a TUI.
+/// Returns true if any TUI received real input within `threshold`. Used by the
+/// push consumer to suppress notifications only while a user is interacting
+/// with a TUI, rather than merely while a TUI process is alive.
 pub fn is_tui_active(threshold: Duration) -> bool {
-    count_active_tuis(threshold) > 0
+    count_fresh_tui_files(TUI_ACTIVITY_DIR, threshold) > 0
 }
 
 #[cfg(test)]
@@ -899,6 +1038,12 @@ mod tests {
         // Our own heartbeat counts as one live TUI.
         write_tui_heartbeat();
         assert_eq!(count_active_tuis(Duration::from_secs(30)), 1);
+        assert!(
+            !is_tui_active(Duration::from_secs(30)),
+            "a live but untouched TUI must not suppress phone notifications"
+        );
+
+        write_tui_activity();
         assert!(is_tui_active(Duration::from_secs(30)));
 
         // A second instance's presence file bumps the count to two.
@@ -908,6 +1053,7 @@ mod tests {
         // A zero threshold makes every file stale; they're swept and the
         // directory is left empty.
         assert_eq!(count_active_tuis(Duration::ZERO), 0);
+        assert_eq!(count_fresh_tui_files(TUI_ACTIVITY_DIR, Duration::ZERO), 0);
         assert!(!is_tui_active(Duration::from_secs(30)));
         assert_eq!(fs::read_dir(&pdir).unwrap().count(), 0);
 
@@ -921,9 +1067,33 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_collect_startup_config_warnings_clean() {
-        let _temp = isolate_app_dir();
+        let temp = isolate_app_dir();
         // No config files written = defaults everywhere = no warning.
         assert!(collect_startup_config_warnings("").is_none());
+
+        // A config.toml written by our own serializer must probe clean too.
+        // The ignored-key probe deserializes the file (and, for profiles, a
+        // serialized `Config::default()` with the overrides merged onto it),
+        // so any Serialize/Deserialize asymmetry in the schema would warn
+        // every user on every startup rather than only on a real typo.
+        let dir = app_dir(&temp);
+        fs::write(
+            dir.join("config.toml"),
+            toml::to_string_pretty(&config::Config::default()).unwrap(),
+        )
+        .unwrap();
+        let profile_dir = dir.join("profiles").join("default");
+        fs::create_dir_all(&profile_dir).unwrap();
+        fs::write(
+            profile_dir.join("config.toml"),
+            "description = \"work\"\n[sandbox]\nenabled_by_default = true\n",
+        )
+        .unwrap();
+        let warning = collect_startup_config_warnings("default");
+        assert!(
+            warning.is_none(),
+            "round-tripped config must not warn, got: {warning:?}"
+        );
     }
 
     #[test]
@@ -957,6 +1127,150 @@ mod tests {
 
         let warning = collect_startup_config_warnings("default").expect("expected a warning");
         assert!(warning.contains("Failed to load profile config 'default'"));
+    }
+
+    /// #3228 CodeRabbit follow-up: the ignored-keys-only variant is the
+    /// path a subscribed run (TUI, foreground serve, or `AOE_LOG_LEVEL`
+    /// set) uses so ignored keys are still surfaced without duplicating
+    /// the parse-error line that `tracing::warn!` already reports. It
+    /// must report unrecognized keys but NOT parse failures.
+    #[test]
+    #[serial_test::serial]
+    fn test_collect_startup_ignored_key_warnings_reports_ignored_only() {
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        fs::write(
+            dir.join("config.toml"),
+            "[sandbox]\nenabled_by_default = true\nprivildged = true\n",
+        )
+        .unwrap();
+
+        let warning =
+            collect_startup_ignored_key_warnings("").expect("ignored key must be reported");
+        assert!(warning.contains("sandbox.privildged"));
+        assert!(!warning.contains("Failed to load"));
+    }
+
+    /// #3228 CodeRabbit follow-up: a parse failure alone is *not* reported
+    /// by the ignored-keys-only variant. `tracing::warn!` from
+    /// `Config::load_or_warn` covers that class when a subscriber is up.
+    #[test]
+    #[serial_test::serial]
+    fn test_collect_startup_ignored_key_warnings_silent_on_parse_failure() {
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        fs::write(
+            dir.join("config.toml"),
+            "[sandbox]\nenabled_by_default = \"not-a-bool\"\n",
+        )
+        .unwrap();
+
+        assert!(collect_startup_ignored_key_warnings("").is_none());
+    }
+
+    /// #3228: a nested typo inside a known section is silently dropped by
+    /// serde today (no `deny_unknown_fields`). The startup probe surfaces it.
+    #[test]
+    #[serial_test::serial]
+    fn test_collect_startup_config_warnings_flags_nested_unknown_key() {
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        // The exact typo shape from #3218: an unknown key nested inside a
+        // known section. Must show up as `sandbox.privildged` in the warning.
+        fs::write(
+            dir.join("config.toml"),
+            "[sandbox]\nenabled_by_default = true\nprivildged = true\n",
+        )
+        .unwrap();
+
+        let warning = collect_startup_config_warnings("").expect("expected a warning");
+        assert!(
+            warning.contains("Unrecognized keys in global config"),
+            "warning should announce unrecognized keys, got: {warning}"
+        );
+        assert!(
+            warning.contains("sandbox.privildged"),
+            "warning should name the dotted path, got: {warning}"
+        );
+    }
+
+    /// #3228: user-defined map-key sections must never false-positive. These
+    /// are all documented in `docs/guides/configuration.md`.
+    #[test]
+    #[serial_test::serial]
+    fn test_collect_startup_config_warnings_allows_documented_map_sections() {
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        // `session.custom_agents` is a `HashMap<String,String>` (name -> shell
+        // command), so it must be an inline table, not a section. The other
+        // three are the real map-key-plus-struct shapes (`agents.<name>`,
+        // `tools.<name>`, `plugins.<id>`) that exercise the "user-defined
+        // section with typed contents" pattern.
+        fs::write(
+            dir.join("config.toml"),
+            "[session]\n\
+             custom_agents = { myagent = \"true\" }\n\
+             [agents.claude.status_map]\n\
+             SessionStart = \"running\"\n\
+             [tools.lazygit]\n\
+             command = \"lazygit\"\n\
+             [plugins.\"aoe.web\"]\n\
+             enabled = true\n",
+        )
+        .unwrap();
+
+        // These are all valid map-key entries, not struct fields, so
+        // serde_ignored produces zero paths and the probe is clean.
+        let warning = collect_startup_config_warnings("");
+        assert!(
+            warning.is_none(),
+            "documented map-key sections must not produce a warning, got: {warning:?}"
+        );
+    }
+
+    /// #3228: even inside a user-defined map entry, a struct-field typo does
+    /// flag. This guards against a future "just skip everything under
+    /// `agents.*`" regression that would swallow the intended catch.
+    #[test]
+    #[serial_test::serial]
+    fn test_collect_startup_config_warnings_flags_typo_inside_map_entry() {
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        // `agents.<name>.status_map` is a real field; the typo below is not.
+        fs::write(
+            dir.join("config.toml"),
+            "[agents.claude]\nstatus_maap = { foo = \"bar\" }\n",
+        )
+        .unwrap();
+
+        let warning = collect_startup_config_warnings("").expect("expected a warning");
+        assert!(
+            warning.contains("agents.claude.status_maap"),
+            "typo inside a map entry should still flag, got: {warning}"
+        );
+    }
+
+    /// #3228: unrecognized keys in a profile config are reported the same way.
+    /// The probe merges overrides onto a default `Config` to sidestep the
+    /// `#[serde(flatten)]` catch-all on `ProfileConfig` (which would otherwise
+    /// swallow every unknown key as valid JSON).
+    #[test]
+    #[serial_test::serial]
+    fn test_collect_startup_config_warnings_flags_unknown_key_in_profile() {
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        let profile_dir = dir.join("profiles").join("default");
+        fs::create_dir_all(&profile_dir).unwrap();
+        fs::write(
+            profile_dir.join("config.toml"),
+            "[sandbox]\nprivildged = true\n",
+        )
+        .unwrap();
+
+        let warning =
+            collect_startup_config_warnings("default").expect("expected a profile warning");
+        assert!(warning.contains("Unrecognized keys in profile config 'default'"));
+        assert!(warning.contains("sandbox.privildged"));
     }
 
     fn release_dir_in(root: impl AsRef<Path>) -> PathBuf {
@@ -1167,10 +1481,10 @@ mod tests {
         let unknown_dir = dir.join("profiles").join("does-not-exist");
         assert!(!unknown_dir.exists());
 
-        let cfg = crate::session::profile_config::load_profile_config("does-not-exist")
+        let cfg = crate::session::config::profile_config::load_profile_config("does-not-exist")
             .expect("loading config for an unknown profile must succeed with defaults");
         assert!(
-            !crate::session::profile_config::profile_has_overrides(&cfg),
+            !crate::session::config::profile_config::profile_has_overrides(&cfg),
             "unknown profile must load to defaults",
         );
         assert!(

@@ -284,13 +284,31 @@ test.describe("Diff comments (#928)", () => {
     await expect(page.getByPlaceholder(/Leave a comment \(markdown supported\)/)).toHaveCount(0);
   });
 
-  test("send button disabled when worker not running", async ({ page }) => {
+  // A dormant session (worker auto-stopped for inactivity, `acp_worker_state:
+  // "absent"`) is still sendable: the diff-comments handler runs the same
+  // auto-wake as a plain composer prompt, so the send respawns the worker
+  // instead of sinking. The old gate blocked this, leaving a dead Send button
+  // on every idle session.
+  test("send still works when the worker is absent (dormant session auto-wakes)", async ({ page }) => {
     await setup(page, { structuredView: true, acpWorkerState: "absent" });
+    let posted = false;
+    await page.route("**/api/sessions/*/acp/prompt/diff-comments", (r) => {
+      posted = true;
+      return r.fulfill({ json: {} });
+    });
     await openSessionAndFile(page);
     await startSingleLineComment(page, 3);
     await page.getByPlaceholder(/Leave a comment \(markdown supported\)/).fill("nit");
     await page.getByRole("button", { name: "Save" }).click();
-    const send = page.getByRole("button", { name: /^Send$/ }).first();
-    await expect(send).toBeDisabled();
+    await page
+      .getByRole("button", { name: /^Send$/ })
+      .first()
+      .click();
+    await expect(page.getByText("Send diff comments")).toBeVisible();
+    await page
+      .getByRole("button", { name: /^Send$/ })
+      .last()
+      .click();
+    await expect.poll(() => posted).toBe(true);
   });
 });

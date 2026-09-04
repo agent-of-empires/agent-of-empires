@@ -47,7 +47,7 @@ export function makeLiveFrame(opts: { rows?: number; history?: number; window?: 
 
 export async function mockTerminalApis(
   page: Page,
-  opts: { liveHistory?: number; delayLiveWindowShrinkMs?: number } = {},
+  opts: { liveHistory?: number; delayLiveWindowShrinkMs?: number; tool?: string } = {},
 ): Promise<MockHandle> {
   const liveSockets: Array<{ send: (data: string) => void }> = [];
   const handle: MockHandle = {
@@ -85,7 +85,7 @@ export async function mockTerminalApis(
             title: "pinch-test",
             project_path: "/tmp/pinch-test",
             group_path: "/tmp",
-            tool: "claude",
+            tool: opts.tool ?? "claude",
             status: "Running",
             yolo_mode: false,
             created_at: new Date().toISOString(),
@@ -152,9 +152,12 @@ export async function mockTerminalApis(
       handle.liveMessages.push(Buffer.from(msg));
       try {
         const control = JSON.parse(String(msg)) as { type?: string; rows?: number; lines?: number };
-        if (control.type === "resize" && control.rows) {
+        if (control.type === "claim_if_vacant") {
+          ws.send(JSON.stringify({ type: "size_owner", is_owner: true }));
+        } else if (control.type === "resize" && control.rows) {
           rows = control.rows;
           window = Math.max(window, rows);
+          ws.send(JSON.stringify({ type: "size_owner", is_owner: true }));
           reply();
         } else if (control.type === "window" && control.lines) {
           const shrinking = control.lines < window;

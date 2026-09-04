@@ -28,6 +28,8 @@ base("DirectoryBrowser: home -> projects -> repo-a -> persisted last dir", async
       mkdirSync(join(repoA, ".git"), { recursive: true });
       writeFileSync(join(repoA, ".git", "HEAD"), "ref: refs/heads/main\n");
       mkdirSync(repoB, { recursive: true });
+      // Dotfile-prefixed dir for the "Show hidden folders" toggle (#3430).
+      mkdirSync(join(home, ".hidden-proj"), { recursive: true });
     },
   });
 
@@ -52,6 +54,16 @@ base("DirectoryBrowser: home -> projects -> repo-a -> persisted last dir", async
     // the Browse tab. Wait for the projects entry to appear under home.
     const projectsEntry = page.getByRole("option").filter({ hasText: "projects" });
     await expect(projectsEntry).toBeVisible({ timeout: 10_000 });
+
+    // Hidden folders are filtered server-side until the toggle asks for
+    // them, so this also covers the `show_hidden` query param (#3430).
+    const hiddenEntry = page.getByRole("option").filter({ hasText: ".hidden-proj" });
+    await expect(hiddenEntry).toHaveCount(0);
+    const hiddenToggle = page.getByRole("checkbox", { name: "Show hidden folders" });
+    await hiddenToggle.check();
+    await expect(hiddenEntry).toBeVisible({ timeout: 10_000 });
+    await hiddenToggle.uncheck();
+    await expect(hiddenEntry).toHaveCount(0);
 
     await projectsEntry.click();
     // Inside `projects`, repo-a should carry the repo badge.

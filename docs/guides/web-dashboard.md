@@ -10,7 +10,7 @@ This page covers running the server, access modes, the security model, and PWA i
 
 - **[Dashboard & workspaces](web/dashboard.md)**: layout, status glyphs, session-creation wizard, sidebar sort/grouping, triage (pin / archive / snooze), command palette, first-run tutorial.
 - **[Terminal view](web/terminal.md)**: agent and paired terminals, reconnect behavior, WebSocket close codes, read-only mode.
-- **[Diff view](web/diff.md)**: reviewing changed files, flat / tree file list, per-session base override, inline review comments.
+- **[Diff view](web/diff.md)**: reviewing changed files, flat / tree file list, per-repo base override, inline review comments.
 - **[Settings & profiles](web/settings.md)**: settings tabs, profile picker, connected-device tracking, step-up elevation.
 
 Mobile and touch behavior is documented inline on each page.
@@ -19,7 +19,7 @@ Mobile and touch behavior is documented inline on each page.
 
 The dashboard ships in all release binaries: [GitHub Releases](https://github.com/agent-of-empires/agent-of-empires/releases), the [quick install script](../installation.md#quick-install-recommended), and Homebrew (`brew install aoe`). Just run `aoe serve`.
 
-Building from source requires the `serve` Cargo feature (and Node.js to compile the embedded frontend); see [Web Dashboard Development](../development/web-dashboard.md).
+Building from source requires the `web` Cargo feature and Node.js to compile the embedded frontend. A plain `cargo build` still ships the daemon, so `aoe serve` runs and answers the API; there is just no dashboard to open.
 
 ## Starting the server
 
@@ -57,7 +57,7 @@ aoe url --token-only  # Just the token (for scripted login)
 
 ## Remote access
 
-`--remote` is the recommended way to reach the dashboard from your phone. aoe picks a transport automatically, in this order. For the end-to-end phone setup, see [Remote Access from Your Phone](remote-phone-access.md).
+`--remote` is the recommended way to reach the dashboard from your phone. aoe picks a transport automatically, in this order.
 
 ### 1. Tailscale Funnel (preferred when available)
 
@@ -265,5 +265,3 @@ The PWA needs the server running; use `--daemon` to keep it up (`aoe serve --sto
 When you leave the PWA and come back, it reopens to the session you last had open rather than the dashboard. The last session is remembered per device (not synced across devices); if you were on the dashboard when you left, or that session no longer exists, you land on the dashboard.
 
 `Ctrl-C` on a foreground server, or `aoe serve --stop` against a daemon, both exit within ~5 seconds even with open tabs. Live clients receive a `1001` ("going away") close frame and reconnect once a fresh server is running.
-
-For build, architecture, and frontend-development details, see [Web Dashboard Development](../development/web-dashboard.md).

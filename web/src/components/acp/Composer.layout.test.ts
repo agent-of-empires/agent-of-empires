@@ -8,39 +8,40 @@ import { describe, expect, it } from "vitest";
 import { composerWrapperLayout, IOS_ACCESSORY_BAR_PX } from "./Composer";
 
 describe("composerWrapperLayout (#1143)", () => {
-  it("uses pb-3 and no inline style when the soft keyboard is closed", () => {
+  it("uses just the base pb-3 gap and no inline style when the keyboard is closed", () => {
     const layout = composerWrapperLayout({ keyboardOpen: false });
+    // The App root no longer reserves the bottom inset, so there is nothing to
+    // cancel: no negative margin. The composer hugs the physical bottom with
+    // only the base pb-3 gap.
     expect(layout.className).toContain("pb-3");
     expect(layout.className).not.toContain("pb-0");
     expect(layout.style).toBeUndefined();
   });
 
-  it("drops to pb-0 and cancels safe-area-inset-bottom when the keyboard is open", () => {
+  it("drops to pb-0 and adds no inline style when the keyboard is open (no accessory bar)", () => {
     const layout = composerWrapperLayout({ keyboardOpen: true });
     expect(layout.className).toContain("pb-0");
     expect(layout.className).not.toContain("pb-3");
-    expect(layout.style).toEqual({
-      marginBottom: "calc(-1 * env(safe-area-inset-bottom))",
-    });
+    expect(layout.style).toBeUndefined();
   });
 
   it("ignores accessoryBarPx while the keyboard is closed", () => {
     const layout = composerWrapperLayout({ keyboardOpen: false, accessoryBarPx: IOS_ACCESSORY_BAR_PX });
+    // The accessory bar only exists while the keyboard is up, so the closed
+    // layout is unaffected by it: pb-3 in className, no inline style.
+    expect(layout.className).toContain("pb-3");
     expect(layout.style).toBeUndefined();
   });
 
   it("adds paddingBottom clearance for the iOS accessory bar when open", () => {
     const layout = composerWrapperLayout({ keyboardOpen: true, accessoryBarPx: IOS_ACCESSORY_BAR_PX });
     expect(layout.className).toContain("pb-0");
-    expect(layout.style).toEqual({
-      marginBottom: "calc(-1 * env(safe-area-inset-bottom))",
-      paddingBottom: IOS_ACCESSORY_BAR_PX,
-    });
+    expect(layout.style).toEqual({ paddingBottom: IOS_ACCESSORY_BAR_PX });
   });
 
-  it("omits paddingBottom when accessoryBarPx is zero (non-iOS-PWA)", () => {
+  it("omits the inline style when accessoryBarPx is zero (non-iOS-PWA)", () => {
     const layout = composerWrapperLayout({ keyboardOpen: true, accessoryBarPx: 0 });
-    expect(layout.style).toEqual({ marginBottom: "calc(-1 * env(safe-area-inset-bottom))" });
+    expect(layout.style).toBeUndefined();
   });
 
   it("preserves shared base classes regardless of keyboard state", () => {

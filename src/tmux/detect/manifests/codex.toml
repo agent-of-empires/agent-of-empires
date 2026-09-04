@@ -1,0 +1,171 @@
+id = "codex"
+
+# The divider a finished turn draws (`──── Worked for 1m 3s`). Everything
+# below it is the current block; a running signal above it belongs to a turn
+# that is already over.
+[markers.divider]
+line_regex = ['(?i)^\s*─*\s*worked for\b']
+absent_is_whole = true
+
+# The same line, read as a landmark rather than as a bound: with no divider on
+# screen no turn has finished, so a rule about a finished turn cannot fire.
+[markers.completed_turn]
+line_regex = ['(?i)^\s*─*\s*worked for\b']
+
+# The banner a cancelled turn leaves. A narrow pane wraps it over as many as
+# four lines, and it carries a `■` glyph the wrapped continuations lack.
+[markers.interruption]
+contains = ["conversation interrupted - tell the model what to do differently"]
+wrap = 4
+strip_prefix = "■"
+
+[markers.review_finished]
+contains = ["<< code review finished >>"]
+
+# The plan dialog's question line, which its choice rows and submit hint
+# follow.
+[markers.plan_question]
+line_regex = ['(?i)^\s*question .*unanswered']
+
+[markers.submit_hint]
+contains = ["enter to submit answer"]
+
+# A plain cursor prompt: the input line, as opposed to a numbered menu row.
+[markers.cursor_prompt]
+line_regex = ['(?i)^\s*[\x{276F}\x{203A}]\s*(?:[^\s1-9]|[1-9][^.\s])']
+
+# The last numbered choice row carrying the selection cursor.
+[markers.choice_cursor]
+line_regex = ['(?i)^\s*[\x{276F}\x{203A}]\s*[1-9]\.']
+
+# Codex's Plan-mode radio prompt: a question, its cursored choice rows and the
+# submit hint, in that order, with nothing running after the hint. The two
+# `region` clauses are what encode the ordering: the choice and the hint have
+# to lie below the question, and the running check applies only below the hint.
+[[rules]]
+id = "plan_radio_prompt"
+state = "waiting"
+priority = 980
+region = "after(plan_question)"
+visible = true
+contains = ["enter to submit answer"]
+line_regex = ['(?i)^\s*[\x{276F}\x{203A}]\s*[1-9]\.']
+not = [
+  { region = "after(submit_hint)", any = [
+    { line_regex = ['(?i)^\s*(?:•\s*)?(?:esc|ctrl\+c) to interrupt\s*$'] },
+    { line = { regex = ['(?i)^\s*(?:•\s*)?(working|thinking|processing|generating|running command|starting mcp servers)\b'], not_regex = ['(?i)^\s*\S+(?:\W+\w+){0,4}\W+(completed?|done|finished|successful|successfully|success)\b'] }, contains_any = ["esc to interrupt", "ctrl+c to interrupt"] },
+  ] },
+]
+
+# The live turn. Scoped to the current block, and the bare activity line only
+# to its last ten lines, so a long block's earlier status lines do not keep a
+# finished turn alive.
+[[rules]]
+id = "interrupt_hint"
+state = "running"
+priority = 970
+region = "after(divider)"
+visible = true
+line_regex = ['(?i)^\s*(?:•\s*)?(?:esc|ctrl\+c) to interrupt\s*$']
+
+[[rules]]
+id = "activity_with_interrupt"
+state = "running"
+priority = 970
+region = "after(divider)"
+visible = true
+line = { regex = ['(?i)^\s*(?:•\s*)?(working|thinking|processing|generating|running command|starting mcp servers)\b.*(esc|ctrl\+c) to interrupt'], not_regex = ['(?i)^\s*\S+(?:\W+\w+){0,4}\W+(completed?|done|finished|successful|successfully|success)\b'] }
+
+[[rules]]
+id = "activity_line"
+state = "running"
+priority = 970
+region = "after(divider, 10)"
+visible = true
+line = { regex = ['(?i)^\s*(?:\u{2022}\s*)?[\x{2800}-\x{28FF}]?\s*(working|thinking|processing|generating)[\s.:\x{2026}]'], not_regex = ['(?i)^\s*\S+(?:\W+\w+){0,4}\W+(completed?|done|finished|successful|successfully|success)\b'] }
+
+# Ranked below `hook_running_fresh`: `(y/n)` and `run command?` appear in
+# ordinary turn output, so on their own they are not enough to contradict a
+# `running` write from the last few seconds. Against a standing write, or with
+# no hook at all, they decide.
+[[rules]]
+extends = "approval_prompt"
+id = "approval_prompt"
+priority = 590
+contains_any = [
+  "continue?",
+  "proceed?",
+  "execute?",
+  "run command?",
+  "enter to select",
+  "esc to cancel",
+]
+
+# A cursored choice row near the bottom with nothing live below it: the menu is
+# still up and waiting. A plain cursor prompt below it means the user has
+# already moved on.
+[[rules]]
+id = "numbered_choice_prompt"
+state = "waiting"
+priority = 955
+region = "after(choice_cursor)"
+visible = true
+not = [
+  { line_regex = ['(?i)^\s*(?:•\s*)?(?:esc|ctrl\+c) to interrupt\s*$'] },
+  { line = { regex = ['(?i)^\s*(?:•\s*)?[\x{2800}-\x{28FF}]?\s*(working|thinking|processing|generating)[\s.:\x{2026}]'], not_regex = ['(?i)^\s*\S+(?:\W+\w+){0,4}\W+(completed?|done|finished|successful|successfully|success)\b'] } },
+  { line_regex = ['(?i)^\s*[\x{276F}\x{203A}]\s*(?:[^1-9\s].*)?$'] },
+]
+
+# A cancelled turn with nothing started since. The `not` clauses stand it down
+# when anything live renders below the banner, so a turn begun right after the
+# interrupt still reads Running; it outranks the hook rules because the cancel
+# fires no hook at all.
+[[rules]]
+id = "interrupted_turn"
+state = "idle"
+priority = 985
+region = "after(interruption)"
+visible = true
+not = [
+  { line_regex = ['(?i)^\s*(?:•\s*)?(?:esc|ctrl\+c) to interrupt\s*$'] },
+  { line = { regex = ['(?i)^\s*(?:•\s*)?[\x{2800}-\x{28FF}]?\s*(working|thinking|processing|generating)[\s.:\x{2026}]'], not_regex = ['(?i)^\s*\S+(?:\W+\w+){0,4}\W+(completed?|done|finished|successful|successfully|success)\b'] } },
+  { line_regex = ['(?i)^\s*[\x{276F}\x{203A}]\s*[1-9]\.'] },
+  { contains_any = ["(y/n)", "[y/n]", "approve", "allow", "continue?", "proceed?", "execute?", "run command?", "enter to select", "esc to cancel"] },
+  # Two cursor prompts below the banner means the session moved on twice.
+  { line_regex = ['(?i)^\s*[\x{276F}\x{203A}]\s*\S'], min_lines = 2 },
+]
+
+# A finished turn or review parked at its prompt, with the model footer under
+# it. These release a `running` write whose terminating hook never fired, so
+# they outrank the fresh-hook rule.
+[[rules]]
+id = "completed_turn_prompt"
+state = "idle"
+priority = 620
+region = "after(completed_turn)"
+visible = true
+line_regex = ['(?i)^\s*[\x{276F}\x{203A}]\s*\S']
+not = [
+  { line_regex = ['(?i)^\s*(?:•\s*)?(?:esc|ctrl\+c) to interrupt\s*$'] },
+  { line_regex = ['(?i)^\s*[\x{276F}\x{203A}]\s*[1-9]\.'] },
+  { contains_any = ["(y/n)", "[y/n]", "approve", "allow", "continue?", "proceed?", "execute?", "run command?", "enter to select", "esc to cancel"] },
+  # Nothing but the model footer may follow the prompt: fresh output under it
+  # means the turn moved on rather than parked.
+  { region = "after(cursor_prompt)", line = { regex = ['\S'], not_regex = ['(?i)^\s*(gpt-|o3|o4)\S*\s.*\s\u{b7}\s'] } },
+]
+
+[[rules]]
+id = "completed_review_prompt"
+state = "idle"
+priority = 620
+region = "after(review_finished)"
+visible = true
+line_regex = ['(?i)^\s*[\x{276F}\x{203A}]\s*\S']
+not = [
+  { line_regex = ['(?i)^\s*(?:•\s*)?(?:esc|ctrl\+c) to interrupt\s*$'] },
+  { line_regex = ['(?i)^\s*[\x{276F}\x{203A}]\s*[1-9]\.'] },
+  { contains_any = ["(y/n)", "[y/n]", "approve", "allow", "continue?", "proceed?", "execute?", "run command?", "enter to select", "esc to cancel"] },
+  # Nothing but the model footer may follow the prompt: fresh output under it
+  # means the turn moved on rather than parked.
+  { region = "after(cursor_prompt)", line = { regex = ['\S'], not_regex = ['(?i)^\s*(gpt-|o3|o4)\S*\s.*\s\u{b7}\s'] } },
+]

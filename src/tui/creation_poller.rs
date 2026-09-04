@@ -7,7 +7,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use crate::session::builder::{self, CreatedWorktree, InstanceParams};
-use crate::session::repo_config::{self, HookProgress, HooksConfig};
+use crate::session::config::repo_config::{self, HookProgress, HooksConfig};
 use crate::session::Instance;
 use crate::tui::dialogs::NewSessionData;
 
@@ -26,6 +26,8 @@ pub enum CreationResult {
         instance: Box<Instance>,
         /// Worktree created during build, needed for cleanup if cancelled
         created_worktree: Option<CreatedWorktreeInfo>,
+        /// Workspace worktrees created during build, needed for rollback.
+        created_workspace_worktrees: Vec<CreatedWorktreeInfo>,
         /// Whether on_launch hooks were already executed in the background
         on_launch_hooks_ran: bool,
         /// Non-fatal warnings from worktree creation (e.g. post-checkout hook
@@ -40,6 +42,7 @@ pub enum CreationResult {
 pub struct CreatedWorktreeInfo {
     pub path: String,
     pub main_repo_path: String,
+    pub owned_branch: Option<String>,
 }
 
 impl From<&CreatedWorktree> for CreatedWorktreeInfo {
@@ -47,6 +50,17 @@ impl From<&CreatedWorktree> for CreatedWorktreeInfo {
         Self {
             path: wt.path.to_string_lossy().to_string(),
             main_repo_path: wt.main_repo_path.to_string_lossy().to_string(),
+            owned_branch: wt.owned_branch.clone(),
+        }
+    }
+}
+
+impl From<&CreatedWorktreeInfo> for CreatedWorktree {
+    fn from(worktree: &CreatedWorktreeInfo) -> Self {
+        Self {
+            path: worktree.path.as_str().into(),
+            main_repo_path: worktree.main_repo_path.as_str().into(),
+            owned_branch: worktree.owned_branch.clone(),
         }
     }
 }
@@ -127,12 +141,9 @@ impl CreationPoller {
         // pick the right profile's overrides; if it's left blank they'd silently
         // fall back to the global default profile.
         instance.source_profile = profile.clone();
-        #[cfg(feature = "serve")]
         if structured {
             builder::structured::apply_structured_choice(&mut instance);
         }
-        #[cfg(not(feature = "serve"))]
-        let _ = structured;
         let created_worktree = build_result.created_worktree;
         let created_workspace_worktrees = build_result.created_workspace_worktrees;
         let warnings = build_result.warnings;
@@ -154,6 +165,7 @@ impl CreationPoller {
                         &instance,
                         created_worktree.as_ref(),
                         &created_workspace_worktrees,
+                        None,
                     );
                     return CreationResult::Error(format!("{:#}", e));
                 }
@@ -172,6 +184,7 @@ impl CreationPoller {
                             &instance,
                             created_worktree.as_ref(),
                             &created_workspace_worktrees,
+                            None,
                         );
                         return CreationResult::Error(format!("on_create hook failed: {:#}", e));
                     }
@@ -186,6 +199,7 @@ impl CreationPoller {
                     &instance,
                     created_worktree.as_ref(),
                     &created_workspace_worktrees,
+                    None,
                 );
                 return CreationResult::Error(format!("on_create hook failed: {:#}", e));
             }
@@ -238,17 +252,23 @@ impl CreationPoller {
                     &instance,
                     created_worktree.as_ref(),
                     &created_workspace_worktrees,
+                    None,
                 );
                 return CreationResult::Error(format!("{:#}", e));
             }
         }
 
         let created_worktree_info = created_worktree.as_ref().map(CreatedWorktreeInfo::from);
+        let created_workspace_worktree_info = created_workspace_worktrees
+            .iter()
+            .map(CreatedWorktreeInfo::from)
+            .collect();
 
         CreationResult::Success {
             session_id: instance.id.clone(),
             instance: Box::new(instance),
             created_worktree: created_worktree_info,
+            created_workspace_worktrees: created_workspace_worktree_info,
             on_launch_hooks_ran: has_on_launch,
             warnings,
         }
@@ -343,6 +363,7 @@ mod tests {
     /// silently produced a plain new session. Assert the seed is forwarded and
     /// applied (child id pinned, one-shot Fork intent set).
     #[test]
+    #[serial_test::serial]
     fn create_instance_forwards_fork_seed() {
         let request = CreationRequest {
             data: fork_data(ForkSeed::Terminal {

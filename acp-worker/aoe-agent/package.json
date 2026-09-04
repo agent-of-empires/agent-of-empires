@@ -1,7 +1,7 @@
 {
   "name": "aoe-agent",
   "version": "0.0.1",
-  "description": "Multi-provider ACP agent for the Agent of Empires structured view. Wraps Vercel AI SDK 6 in an ACP server.",
+  "description": "Multi-provider ACP agent for the Agent of Empires structured view. Wraps Vercel AI SDK 7 in an ACP server.",
   "type": "module",
   "main": "src/index.ts",
   "bin": {
@@ -17,11 +17,11 @@
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^1.0.0",
-    "@ai-sdk/anthropic": "^4.0.1",
-    "@ai-sdk/google": "^4.0.2",
-    "@ai-sdk/openai": "^4.0.2",
-    "@ai-sdk/openai-compatible": "^3.0.1",
-    "ai": "^7.0.4",
+    "@ai-sdk/anthropic": "^4.0.41",
+    "@ai-sdk/google": "^4.0.50",
+    "@ai-sdk/openai": "^4.0.46",
+    "@ai-sdk/openai-compatible": "^3.0.35",
+    "ai": "^7.0.77",
     "zod": "^4.4.3"
   },
   "license": "MIT"

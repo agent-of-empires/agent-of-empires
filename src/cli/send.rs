@@ -69,6 +69,21 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
         );
     }
 
+    // Wait for the pane to become ready before typing. A pane that exists
+    // is not necessarily an agent that's finished booting: a session
+    // started by an earlier, separate `aoe session start` reports
+    // `EnsureReadyOutcome::AlreadyAlive` above with no wait at all, and
+    // agents with no interposed shell (e.g. opencode) clear the pane's
+    // "running a shell" check almost immediately even though their own TUI
+    // can still take several more seconds to render and accept input. A
+    // message typed into that window is silently dropped with no error.
+    // Bounded so a genuinely busy/streaming agent doesn't block `send`
+    // forever.
+    tmux_session.wait_until_ready(
+        std::time::Duration::from_secs(5),
+        crate::agents::ready_marker(&tool),
+    );
+
     let delay = crate::agents::send_keys_enter_delay(&tool);
     tmux_session.send_keys_with_delay(&args.message, delay)?;
 

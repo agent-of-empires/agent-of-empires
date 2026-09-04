@@ -1,0 +1,45 @@
+# Rule shapes several agents share. A manifest names one with `extends` and
+# adds its own priority and whatever phrases its CLI uses; list fields
+# concatenate, so a template is a base to build on rather than a thing to copy.
+
+# The stock approval phrasings. Each agent adds its own on top: `continue?`,
+# `run command?`, `allow this tool`, and so on.
+[templates.approval_prompt]
+state = "waiting"
+region = "whole_recent"
+visible = true
+contains_any = ["(y/n)", "[y/n]", "approve", "allow"]
+
+# A braille spinner frame anywhere in the window.
+[templates.spinner]
+state = "running"
+region = "whole_recent"
+visible = true
+line_regex = ['[\x{2800}-\x{28FF}]']
+
+[templates.interrupt_hint]
+state = "running"
+region = "whole_recent"
+visible = true
+contains_any = ["esc to interrupt", "ctrl+c to interrupt"]
+
+# Parked at an input prompt: a bare `>`, or `> text` that is not a footer
+# carrying an interrupt hint. Agents with a named prompt (`pi>`, `qwen>`) add
+# it as another alternative.
+[templates.input_prompt]
+state = "waiting"
+region = "bottom_non_empty_lines(10)"
+visible = true
+any = [
+  { line_regex = ['(?i)^\s*>\s*$'] },
+  { line = { regex = ['(?i)^\s*>\s\S.{0,96}$'], not_regex = ['(?i)esc'] } },
+]
+
+# A line opening with a live activity verb, which is a status line rather than
+# narration. A completion word in the first few words means it is a report of
+# work already done.
+[templates.activity_line]
+state = "running"
+region = "bottom_non_empty_lines(10)"
+visible = true
+line = { regex = ['(?i)^\s*(analyzing|applying|building|editing|executing|fetching|generating|grepping|processing|reading|running|searching|testing|thinking|working|writing)[\s.:\x{2026}]'], not_regex = ['(?i)^\s*\w+(?:\W+\w+){0,4}\W+(completed?|done|finished|successful|successfully|success)\b'] }

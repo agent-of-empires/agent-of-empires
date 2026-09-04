@@ -1,6 +1,6 @@
 //! Shared worktree cleanup utilities used by both CLI and TUI deletion paths.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::containers::DockerContainer;
 use crate::session::Instance;
@@ -304,69 +304,41 @@ pub fn enrich_worktree_remove_error(stderr: &str, worktree_path: &Path) -> Strin
     out
 }
 
-/// Returns true if a `git worktree remove` stderr indicates the failure was
-/// caused by initialised submodules. Git refuses to remove a worktree whose
-/// checkout still has live submodule entries, even with `--force`; submodule
-/// state lives under `.git/worktrees/<name>/modules/` and orphaning it would
-/// corrupt the main repo.
+/// Returns true if a `git worktree move`/`remove` stderr indicates the failure
+/// was caused by submodules. Git refuses both whenever the worktree's admin dir
+/// still holds `modules/<sub>`, which is where a linked worktree's submodule
+/// state lives; orphaning it would corrupt the main repo. Note that the refusal
+/// keys on that admin dir alone, so `git submodule deinit` does not lift it:
+/// only removing `modules/<sub>` does.
 pub fn is_submodule_blocker(error: &str) -> bool {
     let lower = error.to_lowercase();
     lower.contains("working trees containing submodules cannot be moved or removed")
 }
 
-/// Deinitialise any submodules under `worktree_path` so `git worktree remove`
-/// will let the worktree go. Best-effort and idempotent: a no-op when the
-/// worktree has no `.gitmodules`, no initialised submodules, or git itself
-/// isn't reachable. The `-f` on `submodule deinit` is "force-deinit modified
-/// submodules"; distinct from aoe's worktree-level `force`, which means
-/// "discard uncommitted/untracked files in the worktree itself"; so applying
-/// it here doesn't conflate the two semantics.
-pub fn deinit_submodules_if_present(worktree_path: &Path) {
-    if !worktree_path.join(".gitmodules").exists() {
-        return;
-    }
-    let output = super::command::run_git(worktree_path, ["submodule", "deinit", "-f", "--all"]);
-    match output {
-        Ok(o) if o.status.success() => {
-            tracing::debug!(target: "git.worktree",
-                path = %worktree_path.display(),
-                "deinitialised submodules before worktree removal"
-            );
-        }
-        Ok(o) => {
-            tracing::debug!(target: "git.worktree",
-                path = %worktree_path.display(),
-                stderr = %String::from_utf8_lossy(&o.stderr),
-                "submodule deinit returned non-zero; continuing"
-            );
-        }
-        Err(e) => {
-            tracing::debug!(target: "git.worktree",
-                path = %worktree_path.display(),
-                error = %e,
-                "submodule deinit failed to spawn; continuing"
-            );
-        }
-    }
+/// Resolve a linked worktree's `.git` pointer to its admin dir.
+///
+/// The target is resolved against the worktree, since aoe rewrites every
+/// managed worktree's pointer to a relative path in `create_worktree` and git
+/// itself writes one under `worktree.useRelativePaths`.
+pub(crate) fn read_linked_worktree_gitdir(worktree_path: &Path) -> Option<PathBuf> {
+    let contents = std::fs::read_to_string(worktree_path.join(".git")).ok()?;
+    let raw = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("gitdir:").map(str::trim))?;
+    let path = PathBuf::from(raw);
+    Some(if path.is_absolute() {
+        path
+    } else {
+        worktree_path.join(path)
+    })
 }
 
-/// Read `.git` (file form) in a worktree to recover the linked worktree's
-/// administrative name. Returns the basename of the gitdir path, e.g.
-/// `<main_repo>/.git/worktrees/feature-foo` → `feature-foo`. None when the
-/// `.git` file is missing or doesn't carry a `gitdir:` line.
+/// Recover the linked worktree's administrative name from its `.git` pointer.
 fn read_linked_worktree_name(worktree_path: &Path) -> Option<String> {
-    let dotgit = worktree_path.join(".git");
-    let contents = std::fs::read_to_string(&dotgit).ok()?;
-    for line in contents.lines() {
-        if let Some(rest) = line.strip_prefix("gitdir:") {
-            let gitdir = Path::new(rest.trim());
-            return gitdir
-                .file_name()
-                .and_then(|s| s.to_str())
-                .map(|s| s.to_string());
-        }
-    }
-    None
+    read_linked_worktree_gitdir(worktree_path)?
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
 }
 
 /// Manual cleanup fallback for the submodule-blocker error. Removes the
@@ -578,13 +550,6 @@ pub fn remove_managed_worktree(
             errors.push(format!("Worktree: {}", e));
         }
     } else {
-        // Submodules are a normal repo state, not a destructive override;
-        // `git worktree remove` refuses to delete a worktree with live
-        // submodules even with --force, so deinit them ourselves before
-        // asking git to remove the checkout. No-op when the worktree has no
-        // .gitmodules.
-        deinit_submodules_if_present(worktree_path);
-
         match git_wt.remove_worktree(worktree_path, force) {
             Ok(()) => {
                 worktree_removed = true;
@@ -604,7 +569,9 @@ pub fn remove_managed_worktree(
                 // missing-`.git` branch above does. Checked before the
                 // permission/submodule fallbacks: those recover a live
                 // worktree, and this one is not one. See #3171.
-                if is_not_a_worktree_error(&err_str) {
+                if read_linked_worktree_gitdir(worktree_path).is_some_and(|path| !path.exists())
+                    || is_not_a_worktree_error(&err_str)
+                {
                     tracing::info!(target: "git.worktree",
                         path = %worktree_path.display(),
                         "git has no worktree entry for this path; removing the leftover directory by hand"
@@ -648,10 +615,10 @@ pub fn remove_managed_worktree(
                         errors.push(format!("Worktree: {}", e2));
                     }
                 } else if is_submodule_blocker(&err_str) {
-                    // Pre-deinit didn't fully resolve it (e.g. a broken
-                    // submodule), or the worktree carries orphaned modules
-                    // state without a live `.gitmodules`. Fall back to manual
-                    // teardown.
+                    // The only way past this refusal is removing the admin
+                    // `modules/<sub>` dir, which is what the manual teardown
+                    // does. `git submodule deinit` leaves that dir behind, so
+                    // it cannot serve as a pre-step here.
                     let manual_errors =
                         manual_submodule_worktree_cleanup(git_wt, worktree_path, main_repo);
                     if manual_errors.is_empty() {
@@ -1042,17 +1009,6 @@ mod tests {
         );
         assert!(!modules_dir.exists(), "modules dir should be removed");
         assert!(!wt.exists(), "worktree dir should be removed");
-    }
-
-    #[test]
-    fn test_deinit_submodules_if_present_is_noop_without_gitmodules() {
-        // No `.gitmodules` → function returns without spawning git. We can't
-        // observe the no-spawn directly, but the call must not panic and the
-        // directory contents must be unchanged.
-        let dir = tempfile::TempDir::new().unwrap();
-        std::fs::write(dir.path().join("placeholder"), "x").unwrap();
-        deinit_submodules_if_present(dir.path());
-        assert!(dir.path().join("placeholder").exists());
     }
 
     #[test]

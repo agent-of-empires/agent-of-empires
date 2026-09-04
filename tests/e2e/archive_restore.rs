@@ -459,12 +459,21 @@ fn test_tui_bulk_archive_group_tears_down_all_tmux_off_thread() {
         );
     }
 
-    // Groups render before ungrouped rows, so the group header is the top row;
-    // pressing up past the top clamps the cursor onto it. `z` on a selected
-    // group opens the archive-confirm dialog; `y` submits it.
-    for _ in 0..sessions.len() + 2 {
-        h.send_keys("k");
-    }
+    // Groups render before ungrouped rows, so the group header is the top row.
+    // `Home` jumps the cursor there in one keystroke; `z` on a selected group
+    // opens the archive-confirm dialog and `y` submits it.
+    //
+    // Deliberately `Home` rather than a run of `k` presses. The app coalesces
+    // printable keys arriving less than PASTE_BURST_INTER_KEY_MS apart into a
+    // paste burst (src/tui/app.rs), for Mosh clients that strip bracketed-paste
+    // markers. A burst of identical keys is exempt via `is_auto_repeat_burst`,
+    // but "kkz" is not: when a loaded CI box stalls the TUI long enough for the
+    // queued keystrokes to be read back to back, the mixed run is routed to
+    // `handle_paste`, the `z` lands in `pending_paste` instead of opening the
+    // dialog, and the wait below times out. `Home` is not a burst candidate
+    // (only `Char` and `Enter` are), and two keys can never reach
+    // PASTE_BURST_MIN_LEN, so this sequence cannot be misread as a paste.
+    h.send_keys("Home");
     h.send_keys("z");
     h.wait_for("Archive all 3 sessions");
     h.send_keys("y");

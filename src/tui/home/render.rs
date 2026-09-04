@@ -46,8 +46,10 @@ fn compose_list_title(
     sort_order: SortOrder,
 ) -> String {
     let mut suffix = String::new();
-    if group_by == GroupByMode::Project {
-        suffix.push_str(" · project");
+    match group_by {
+        GroupByMode::Project => suffix.push_str(" · project"),
+        GroupByMode::Org => suffix.push_str(" · org"),
+        GroupByMode::Manual => {}
     }
     if sort_order != SortOrder::default() {
         suffix.push_str(" · ");
@@ -102,6 +104,27 @@ impl PaneLayout {
 /// requested scroll.
 const CAPTURE_BUFFER: u16 = 20;
 
+/// Rows the compact system-health strip occupies.
+const DIAGNOSTICS_STRIP_HEIGHT: u16 = 1;
+
+const LIVE_SEND_RESIZE_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+fn live_resize_retry_due(
+    retry_at: &mut Option<Instant>,
+    resize_failed: bool,
+    now: Instant,
+) -> bool {
+    if resize_failed {
+        *retry_at = Some(now + LIVE_SEND_RESIZE_RETRY_DELAY);
+    }
+    if retry_at.is_some_and(|deadline| deadline <= now) {
+        *retry_at = None;
+        true
+    } else {
+        false
+    }
+}
+
 /// Window captured while the user is off the live edge (reading scrollback):
 /// the full scrollback in one shot, rather than a window that tracks the offset
 /// and re-anchors to the advancing live edge on every capture. Matches tmux's
@@ -111,22 +134,14 @@ const READING_CAPTURE_LINES: u16 = 2000;
 
 /// Map a tmux pane cursor onto the preview's output rect for live-send.
 ///
-/// `output` is the rect the captured pane text paints into; `visible_rows` is
-/// its height in rows; `line_count` is the parsed capture's line count (the
-/// same value the renderer feeds to `compute_scroll`); `cursor` carries the
-/// pane's `(x, y)` (counted from the top of the visible screen) plus
-/// `pane_height`. The renderer bottom-anchors the capture ONLY when it
-/// overflows `output`; a capture shorter than `output` paints from the top
-/// (`compute_scroll` returns 0). Anchor the cursor the same way so it tracks
-/// the text: a screen row maps to `output.y + (min(line_count, visible_rows) -
-/// pane_height) + cursor.y`. With the pane sized to the output area and a
-/// full-height capture the delta is zero and this is just `output.y +
-/// cursor.y`. When the pane is a row or more shorter than `output` and the
-/// capture doesn't overflow (an alt-screen prompt, or the frame after a
-/// resize), using the bare `visible_rows` here would paint the cursor a row
-/// BELOW the text the user typed (#2742); clamping to `line_count` keeps them
-/// aligned. A hidden cursor, or one that maps outside `output`, yields `None`.
-fn map_live_preview_cursor(
+/// `cursor.x`/`y` are pane relative. On a composite, add the pane origin
+/// carried by [`crate::tmux::PaneCursor::composite_pane0`]. Vertically the
+/// renderer also bottom-anchors captures that overflow `output`, so the row
+/// formula is `output.y + min(line_count, visible_rows) - pane_height + top +
+/// cursor.y`; a short capture instead anchors at the top. This keeps the
+/// cursor on the same text row for both the status-row offset (#3515) and the
+/// shorter-pane case (#2742). A hidden or out-of-bounds cursor yields `None`.
+pub(super) fn map_live_preview_cursor(
     output: Rect,
     visible_rows: usize,
     line_count: usize,
@@ -136,8 +151,11 @@ fn map_live_preview_cursor(
         return None;
     }
     let anchor = line_count.min(visible_rows) as i32;
-    let row = output.y as i32 + (anchor - cursor.pane_height as i32) + cursor.y as i32;
-    let col = output.x as i32 + cursor.x as i32;
+    let (left, top) = cursor
+        .composite_pane0
+        .map_or((0, 0), |rect| (rect.left as i32, rect.top as i32));
+    let row = output.y as i32 + (anchor - cursor.pane_height as i32) + top + cursor.y as i32;
+    let col = output.x as i32 + left + cursor.x as i32;
     if row < output.y as i32
         || row >= output.y as i32 + output.height as i32
         || col < output.x as i32
@@ -186,6 +204,42 @@ fn preview_frozen(scroll_offset: u16, has_selection: bool) -> bool {
     scroll_offset > 0 || has_selection
 }
 
+/// Grace beyond the shared tmux operation deadline before a preview worker is
+/// considered stalled. A healthy capture may spend the full deadline inside
+/// one logical multi-command sample, so restarting earlier would overlap
+/// legitimate workers and multiply tmux load.
+const WORKER_STALL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Fold one capture-worker cycle observation into a stall verdict.
+///
+/// The worker deduplicates unchanged frames, so publication cannot prove
+/// liveness. Its cycle counter advances before each deadline-bounded sample.
+/// An unchanged counter is tolerated through the operation deadline plus
+/// grace; after that the caller replaces the worker off the tmux hot path.
+fn worker_stalled_step(
+    cycles: u64,
+    prior: Option<(u64, std::time::Instant)>,
+    now: std::time::Instant,
+) -> (bool, Option<(u64, std::time::Instant)>) {
+    match prior {
+        None => (false, Some((cycles, now))),
+        Some((seen, _)) if cycles != seen => (false, Some((cycles, now))),
+        Some((seen, at)) => (
+            now.saturating_duration_since(at)
+                >= crate::tmux::TMUX_COMMAND_TIMEOUT.saturating_add(WORKER_STALL_GRACE),
+            Some((seen, at)),
+        ),
+    }
+}
+
+pub(super) fn passive_resize_invalidates_live_geometry(
+    live_target: Option<&live_send::LiveSendTarget>,
+    selected_session: Option<&str>,
+    completed_session: &str,
+) -> bool {
+    live_target == Some(&live_send::LiveSendTarget::Agent)
+        && selected_session == Some(completed_session)
+}
 /// Decide whether the cached capture window still covers the requested scroll.
 /// Returns true when the cache must be re-captured because the visible window
 /// (plus BUFFER headroom) would run past the end of the captured content.
@@ -200,59 +254,9 @@ fn scroll_exceeds_cache(cache_captured_lines: usize, height: u16, scroll_offset:
 /// could not grow it. `capture_lines_for` asks for `height + CAPTURE_BUFFER`
 /// (plus the reading depth when scrolled); a result shorter than that has hit
 /// the end of the pane's content and can never satisfy the BUFFER headroom.
-///
-/// This is the live-view counterpart of the frozen top-of-history fix
-/// (`capture_window_stale`): an alternate-screen agent (Claude Code, and any
-/// full-screen TUI) keeps no scrollback, so `tmux capture-pane` returns exactly
-/// the visible `height` and is always "short" of the headroom. Without this
-/// guard `scroll_exceeds_cache` stayed true on every frame, which both re-forked
-/// `capture-pane` on the render thread each tick and made `apply_worker_capture`
-/// reject every off-thread frame, so the whole capture worker was bypassed for
-/// full-screen agents (#1824's offload never applied to them).
-///
-/// A zero-line result is the cold-cache case (nothing captured yet), not an
-/// exhausted pane, so it is deliberately not treated as exhausted.
 fn capture_is_exhausted(cache_captured_lines: usize, requested_lines: usize) -> bool {
     cache_captured_lines > 0 && cache_captured_lines < requested_lines
 }
-
-/// Whether the cache must be re-captured this frame.
-///
-/// Live-follow (`!frozen`) keeps `scroll_exceeds_cache`'s `CAPTURE_BUFFER`
-/// headroom so a few notches of scroll pre-fetch instead of re-capturing each
-/// tick. While frozen we already hold a full-scrollback snapshot, so the
-/// headroom is dropped and the test is exact: only a viewport that genuinely
-/// runs past the captured content (`visible_rows + offset`) forces a refresh.
-/// Keeping the headroom while frozen re-forks `capture-pane` every frame at the
-/// physical top of history, where the offset is clamped to
-/// `captured_lines - visible_rows` and the extra buffer lines can never exist.
-/// `visible_rows` (the rendered body height) is what the offset is clamped
-/// against, so it, not the raw pane `height`, is the correct coverage bound.
-///
-/// Live-follow applies the same "the pane has no more lines" escape via
-/// [`capture_is_exhausted`]: an alternate-screen agent's capture is always
-/// exactly `height` (no scrollback), so the BUFFER headroom can never be met and
-/// demanding it re-forked every frame. A capture shorter than what we asked for
-/// is treated as covered, so only a genuinely undersized-but-growable window (in
-/// practice a cold cache) forces the refresh.
-fn capture_window_stale(
-    frozen: bool,
-    cache_captured_lines: usize,
-    height: u16,
-    visible_rows: usize,
-    scroll_offset: u16,
-) -> bool {
-    if frozen {
-        visible_rows.saturating_add(scroll_offset as usize) > cache_captured_lines
-    } else {
-        scroll_exceeds_cache(cache_captured_lines, height, scroll_offset)
-            && !capture_is_exhausted(
-                cache_captured_lines,
-                capture_lines_for(height, scroll_offset),
-            )
-    }
-}
-
 /// What the passive (non-live) preview sync should do this refresh for the
 /// wanted `(session_id, cols, rows)` geometry.
 #[derive(Debug, PartialEq, Eq)]
@@ -293,6 +297,51 @@ fn passive_resize_step(
     } else {
         PassiveResizeStep::Arm
     }
+}
+
+/// What the fleet reconcile should do for one session wanting `(cols, rows)`.
+/// The fleet has its own debounce (the armed fleet geometry in
+/// `reconcile_passive_fleet`), so per session this only dedups: an
+/// already-synced, declined, or already-queued geometry is not re-sent,
+/// anything else is handed to the worker.
+#[derive(Debug, PartialEq, Eq)]
+enum FleetPassiveStep {
+    Skip,
+    Queue,
+}
+
+fn fleet_passive_step(
+    want: (u16, u16),
+    synced: Option<(u16, u16)>,
+    declined: Option<(u16, u16)>,
+    queued: Option<(u16, u16)>,
+) -> FleetPassiveStep {
+    if synced == Some(want) || declined == Some(want) || queued == Some(want) {
+        FleetPassiveStep::Skip
+    } else {
+        FleetPassiveStep::Queue
+    }
+}
+
+/// How long a declined passive resize stays parked before the fleet retries
+/// it. Declines come from a live attach or an active size owner; nothing
+/// announces when those go away, so a bounded retry turns "parked until the
+/// next geometry change" into "recovers within half a minute", at one
+/// guarded worker attempt per declined session per interval.
+pub(super) const PASSIVE_DECLINE_RETRY: Duration = Duration::from_secs(30);
+
+/// Whether a pane observation contradicts an applied passive resize: taken
+/// after adoption (the shared list-panes snapshot can lag our own resize,
+/// and acting on an older one would re-SIGWINCH a pane that is already
+/// correct) and showing a window size other than the one we applied. True
+/// means another client resized the window and the synced entry must be
+/// dropped so the reconcile re-asserts the pane.
+fn passive_synced_contradicted(
+    synced: &super::PassiveSynced,
+    observed: (u16, u16),
+    observed_at: Instant,
+) -> bool {
+    observed_at > synced.adopted_at && observed != (synced.cols, synced.window_rows)
 }
 
 /// Clamp the user's preview scroll offset to what the freshly captured pane
@@ -389,6 +438,116 @@ pub(crate) fn agent_row_icon(inst: &crate::session::Instance) -> &'static str {
     } else {
         icon
     }
+}
+
+/// A view mode's contribution to a session row: the glyph, color, and any
+/// modifier describing the state of *its own* backing pane. Structured seeds
+/// from the poller-maintained `Instance.status`, Terminal from the paired
+/// terminal's liveness, Tool from the tool pane's. Everything layered on top
+/// is mode-independent and lives in [`decorate_row`].
+struct RowSeed {
+    icon: &'static str,
+    color: Color,
+    modifier: ratatui::style::Modifier,
+}
+
+/// How a view mode resolves a sunk row (archived / trashed / snoozed).
+enum SunkRow {
+    /// Structured: the agent's own resting glyph. Error and Deleting punch
+    /// through the sink mask here, because they are live delete-op states this
+    /// TUI set rather than stale pane statuses, and the seed carries
+    /// `ICON_ERROR` + `theme.error` for them. Swallowing that left a failed
+    /// Empty Trash indistinguishable from a healthy trash row.
+    /// [`agent_row_icon`] applies the same exception to the glyph.
+    AgentStatus(&'static str),
+    /// Terminal / Tool: one muted glyph, unconditionally. These seeds describe
+    /// pane liveness and carry no error affordance, so letting a delete-op
+    /// status punch through would paint a bright animated "the terminal is
+    /// alive" row inside a shelf whose whole premise is that the row is put
+    /// away, while signalling nothing about the failure.
+    Pane,
+}
+
+/// The archive/trash, snooze, urgent, and favorite overlays every view mode
+/// paints on top of its [`RowSeed`], plus the title prefix that goes with them.
+///
+/// This was three copies: the Structured and Terminal arms of
+/// `render_item_line` carried byte-identical title blocks and near-identical
+/// style blocks, and the Tool arm had silently dropped all of it, so an
+/// archived or snoozed session in Tool view kept painting its running glyph
+/// with no `z ` / `! ` prefix.
+///
+/// `sunk` says how this view resolves a sunk row; see [`SunkRow`].
+fn decorate_row(
+    inst: &crate::session::Instance,
+    in_attention: bool,
+    show_favorite: bool,
+    seed: RowSeed,
+    sunk: SunkRow,
+    theme: &Theme,
+) -> (&'static str, std::borrow::Cow<'static, str>, Style) {
+    use ratatui::style::Modifier;
+    use std::borrow::Cow;
+
+    let mut icon = seed.icon;
+    let mut style = Style::default().fg(seed.color).add_modifier(seed.modifier);
+
+    let (sunk_icon, punches_through) = match sunk {
+        SunkRow::AgentStatus(resting) => (
+            resting,
+            matches!(inst.status, Status::Error | Status::Deleting),
+        ),
+        SunkRow::Pane => (ICON_STOPPED, false),
+    };
+    if (inst.is_archived() || inst.is_trashed()) && !punches_through {
+        // Archived and trashed rows render with one uniform muted glyph
+        // regardless of underlying pane status. The pane is dead, so painting
+        // the persisted status would be misleading. The Archived section
+        // header is the sole textual cue, so no italic/dim modifier here; just
+        // a dim color.
+        icon = sunk_icon;
+        style = Style::default().fg(theme.dimmed);
+    } else if in_attention && inst.is_snoozed() {
+        // Snooze decoration is Attention-only. Outside Attention the row
+        // paints its real state (the timer keeps running; the visual
+        // treatment just doesn't surface).
+        icon = sunk_icon;
+        style = Style::default()
+            .fg(theme.dimmed)
+            .add_modifier(Modifier::ITALIC)
+            .add_modifier(Modifier::DIM);
+    } else if in_attention && inst.is_urgent() {
+        // Urgent decoration is Attention-only. The flag still persists in
+        // non-Attention modes, but the cross-tier promoter visual only makes
+        // sense when tier ordering is in effect.
+        style = Style::default()
+            .fg(theme.error)
+            .add_modifier(Modifier::BOLD)
+            .add_modifier(Modifier::RAPID_BLINK);
+    } else if show_favorite && crate::session::is_live_favorite(inst) {
+        style = style
+            .add_modifier(Modifier::BOLD)
+            .add_modifier(Modifier::UNDERLINED);
+    }
+
+    // Prefix priority: archive (no prefix) wins over snooze (`z `) wins over
+    // urgent (`! `) wins over favorite (`* `). Snooze and urgent are
+    // Attention-mode-only so users in Newest / AZ / etc. don't see decoration
+    // for state they didn't opt into managing; the favorite star also shows
+    // elsewhere, because favorites-first pins the row there too.
+    let title_text = if inst.is_archived() || inst.is_trashed() {
+        Cow::Owned(inst.title.clone())
+    } else if in_attention && inst.is_snoozed() {
+        Cow::Owned(format!("z {}", inst.title))
+    } else if in_attention && inst.is_urgent() {
+        Cow::Owned(format!("! {}", inst.title))
+    } else if show_favorite && crate::session::is_live_favorite(inst) {
+        Cow::Owned(format!("* {}", inst.title))
+    } else {
+        Cow::Owned(inst.title.clone())
+    };
+
+    (icon, title_text, style)
 }
 
 /// Append the selected row's `last_error` (in red) to a shelf placeholder's
@@ -715,6 +874,9 @@ impl HomeView {
         if let Some(ref mut diff) = self.diff_view {
             // Compute diff for selected file if not cached
             let _ = diff.get_current_diff();
+            if diff.selected_file_is_markdown() {
+                let _ = diff.get_current_file_contents();
+            }
 
             // No list/preview divider exists while the diff takeover owns
             // the screen; clear it so a stale value from the previous frame
@@ -727,7 +889,6 @@ impl HomeView {
         }
 
         // Serve view takes over the whole screen
-        #[cfg(feature = "serve")]
         if let Some(ref serve) = self.serve_view {
             self.divider_col = None;
             self.main_area_width = 0;
@@ -756,11 +917,11 @@ impl HomeView {
             .constraints(constraints)
             .split(area);
 
-        // Below STACKED_BREAKPOINT (80 cols), put the list above the preview
-        // instead of side-by-side. At 80 cols a side-by-side preview is only
-        // ~45 cols (with default list_width 35), too cramped for output;
-        // stacking gives the preview the full width.
-        let available_width = main_chunks[0].width;
+        // The diagnostics strip docks under the session-list column (see
+        // `diagnostics_dock`) so it stays narrow and the preview keeps its full
+        // height.
+        let content_area = main_chunks[0];
+        let available_width = content_area.width;
         self.main_area_width = available_width;
         // Collapsed sidebar: the list shrinks to a narrow click-to-expand
         // strip on the left and the preview takes the rest of the width
@@ -773,7 +934,7 @@ impl HomeView {
             let chunks = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Length(strip_width), Constraint::Min(0)])
-                .split(main_chunks[0]);
+                .split(content_area);
             // The full list isn't drawn, so its hit-test rects would
             // otherwise keep last frame's values and a click in the now-
             // preview area could resolve to an invisible list row (and
@@ -783,10 +944,13 @@ impl HomeView {
             self.list_area = Rect::default();
             self.list_inner_area = Rect::default();
             self.shelf_inner_area = Rect::default();
-            self.render_collapsed_strip(frame, chunks[0], theme);
+            // Preview keeps full height; the strip docks under the collapsed
+            // list column.
+            let strip_col = self.diagnostics_dock(frame, chunks[0], theme);
+            self.render_collapsed_strip(frame, strip_col, theme);
             self.render_preview(frame, chunks[1], theme, PaneLayout::Collapsed);
         } else if available_width < responsive::STACKED_BREAKPOINT {
-            let main_height = main_chunks[0].height;
+            let main_height = content_area.height;
             let list_height = responsive::stacked_list_height(main_height);
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
@@ -794,13 +958,17 @@ impl HomeView {
                     Constraint::Length(list_height),
                     Constraint::Min(responsive::STACKED_PREVIEW_MIN),
                 ])
-                .split(main_chunks[0]);
+                .split(content_area);
 
             // Stacked layout has no vertical divider; only the side-by-side
             // path exposes the resize-by-drag affordance.
             self.divider_col = None;
 
-            self.render_list(frame, chunks[0], theme, PaneLayout::Stacked);
+            // Stacked: the list is on top with the preview below, so there is no
+            // list column to dock under; the strip spans the list's width above
+            // the preview.
+            let list_rect = self.diagnostics_dock(frame, chunks[0], theme);
+            self.render_list(frame, list_rect, theme, PaneLayout::Stacked);
             self.render_preview(frame, chunks[1], theme, PaneLayout::Stacked);
         } else {
             // Side-by-side: cap list width so the preview pane keeps its
@@ -815,7 +983,7 @@ impl HomeView {
                     Constraint::Length(effective_list_width),
                     Constraint::Min(responsive::PREVIEW_MIN_WIDTH),
                 ])
-                .split(main_chunks[0]);
+                .split(content_area);
 
             // Layout chunks are contiguous, so chunks[1].x is the first
             // column of the preview block, i.e. the visible left border
@@ -823,7 +991,9 @@ impl HomeView {
             // list's y-range (matches preview's y-range in side-by-side).
             self.divider_col = Some(chunks[1].x);
 
-            self.render_list(frame, chunks[0], theme, PaneLayout::SideBySide);
+            // Strip docks under the list column; the preview keeps full height.
+            let list_rect = self.diagnostics_dock(frame, chunks[0], theme);
+            self.render_list(frame, list_rect, theme, PaneLayout::SideBySide);
             self.render_preview(frame, chunks[1], theme, PaneLayout::SideBySide);
         }
         self.render_status_bar(frame, main_chunks[1], theme);
@@ -914,6 +1084,34 @@ impl HomeView {
         );
     }
 
+    /// Dock the diagnostics strip under the session-list column: carve
+    /// `DIAGNOSTICS_STRIP_HEIGHT` rows off the bottom of `column`, render the
+    /// strip there, and return the reduced rect for the list. Returns `column`
+    /// unchanged when the strip is hidden or the column is too short to spare
+    /// the rows, so the list is never starved below one row.
+    fn diagnostics_dock(&mut self, frame: &mut Frame, column: Rect, theme: &Theme) -> Rect {
+        self.diagnostics_area = Rect::default();
+        if !self.show_diagnostics || column.height <= DIAGNOSTICS_STRIP_HEIGHT {
+            return column;
+        }
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(DIAGNOSTICS_STRIP_HEIGHT),
+            ])
+            .split(column);
+        crate::tui::components::diagnostics::render(
+            frame,
+            rows[1],
+            theme,
+            &self.metrics,
+            self.diagnostics_hovered,
+        );
+        self.diagnostics_area = rows[1];
+        rows[0]
+    }
+
     fn active_diff_area(&self, area: Rect) -> Rect {
         let Some(diff) = &self.diff_view else {
             return Rect::default();
@@ -986,7 +1184,7 @@ impl HomeView {
     fn render_list(&mut self, frame: &mut Frame, area: Rect, theme: &Theme, layout: PaneLayout) {
         self.list_area = area;
         let profile = self.active_profile_display();
-        let title = match &self.view_mode {
+        let mut title = match &self.view_mode {
             ViewMode::Structured => {
                 compose_list_title("aoe", profile, self.group_by, self.sort_order)
             }
@@ -1000,6 +1198,13 @@ impl HomeView {
                 self.sort_order,
             ),
         };
+        if !self.legacy_duplicate_reports.is_empty() {
+            // Fail-closed surface (#3459): ambiguous copies are hidden from
+            // the list, so without this marker the loss is silent.
+            let count = self.legacy_duplicate_reports.len();
+            let plural = if count == 1 { "" } else { "s" };
+            title.push_str(&format!("  \u{26a0} {count} ambiguous session{plural}"));
+        }
         let (border_color, title_color) = match self.view_mode {
             ViewMode::Structured => (theme.border, theme.title),
             ViewMode::Terminal | ViewMode::Tool(_) => {
@@ -1185,16 +1390,12 @@ impl HomeView {
         }
         frame.render_widget(Paragraph::new(lines), list_region);
 
-        // --- Divider carrying the sort indicator (between list and shelf) ---
+        // --- Divider between the workspace list and pinned shelf ---
         if let Some(dy) = divider_y {
-            let label = format!(" sort: {} ", self.sort_order.label());
-            let dw = list_region.width as usize;
-            let label_w = label.chars().count().min(dw);
-            let fill = dw.saturating_sub(label_w);
-            let divider = Line::from(vec![
-                Span::styled("─".repeat(fill), Style::default().fg(theme.border)),
-                Span::styled(label, Style::default().fg(theme.dimmed)),
-            ]);
+            let divider = Line::from(Span::styled(
+                "─".repeat(list_region.width as usize),
+                Style::default().fg(theme.border),
+            ));
             frame.render_widget(
                 Paragraph::new(divider),
                 Rect {
@@ -1322,10 +1523,7 @@ impl HomeView {
     }
 
     fn has_overlay_above_search(&self) -> bool {
-        #[cfg(feature = "serve")]
         let serve_open = self.serve_view.is_some();
-        #[cfg(not(feature = "serve"))]
-        let serve_open = false;
 
         self.show_help
             || self.new_dialog.is_some()
@@ -1402,8 +1600,7 @@ impl HomeView {
                 // rather than stale. Project view only; the registry lookup is
                 // keyed by the header label.
                 let pinned = self.group_by == GroupByMode::Project
-                    && !crate::session::is_within_archived_section(path)
-                    && !crate::session::is_within_trash_section(path)
+                    && !crate::session::is_synthetic_project_header(path)
                     && self.is_project_label_pinned(name);
                 // The top-level shelf section headers get a leading type glyph
                 // so they read as system shelves, not user groups. Project
@@ -1442,248 +1639,171 @@ impl HomeView {
             }
             Item::Session { id, .. } => {
                 if let Some(inst) = self.get_instance(id) {
-                    match self.view_mode {
-                        ViewMode::Structured => {
-                            // For Idle sessions, decay color from `fresh_idle`
-                            // toward `idle` over `idle_decay_window`. A slow
-                            // `breathe` rattle replaces the static braille
-                            // glyph while we're inside the window, matching
-                            // the animated visual language of the other
-                            // attention-worthy states (Running, Waiting,
-                            // Starting). Also serves as a redundant cue for
-                            // colorblind users / monochrome terminals.
-                            //
-                            // Archive/snooze then overrides the live spinner.
-                            // A shelved session's underlying status is noise;
-                            // an animated row reads as "still alive" and pulls
-                            // the eye away from real attention items.
-                            let idle_age = inst.idle_age();
-                            let is_fresh_idle =
-                                matches!(idle_age, Some(age) if age < self.idle_decay_window);
-                            // Dormant (idle-reaped, resumable) structured
-                            // workers get their own glyph + dim amber, taking
-                            // precedence over the raw status. Unread still
-                            // wins over dormancy below (an unseen finished turn
-                            // is the more actionable signal, matching the web
-                            // sidebar's unread-dot precedence). See #2250.
-                            let is_shown_dormant = inst.is_shown_dormant();
-                            let mut icon = if is_shown_dormant {
-                                ICON_DORMANT
-                            } else {
-                                match inst.status {
-                                    Status::Running => spinner_running(&inst.created_at),
-                                    Status::Waiting => spinner_waiting(&inst.created_at),
-                                    Status::Idle if is_fresh_idle => {
-                                        spinner_idle_fresh(&inst.created_at, inst.idle_entered_at)
-                                    }
-                                    Status::Idle => ICON_IDLE,
-                                    Status::Unknown => ICON_UNKNOWN,
-                                    Status::Stopped => ICON_STOPPED,
-                                    Status::Error => ICON_ERROR,
-                                    Status::Starting => spinner_starting(&inst.created_at),
-                                    Status::Deleting => ICON_DELETING,
-                                    Status::Creating => spinner_starting(&inst.created_at),
-                                }
-                            };
-                            // Unread paints only on resting rows
-                            // (Idle/Unknown): a live status (Running/Waiting/
-                            // Starting/...) supersedes it and keeps its own
-                            // color AND spinner. Auto-unread only ever lands
-                            // on Idle; a manual flag on a live row defers to
-                            // the live state. Archived/snoozed/urgent below
-                            // still override on top.
-                            // Sunk rows (archived/snoozed) never paint unread:
-                            // the user dismissed the row, so surfacing it as
-                            // unread contradicts that. The flag stays on disk,
-                            // so unarchiving/unsnoozing restores it. Snooze is
-                            // checked in every sort mode here (unlike the
-                            // Attention-only snooze decoration below), so a
-                            // snoozed unread row outside Attention sort still
-                            // drops the dot (#2571).
-                            let unread_resting = crate::session::unread_enabled()
-                                && inst.is_unread()
-                                && !inst.is_archived()
-                                && !inst.is_snoozed()
-                                && matches!(inst.status, Status::Idle | Status::Unknown);
-                            let color = if is_shown_dormant && !unread_resting {
-                                theme.dormant()
-                            } else {
-                                match inst.status {
-                                    Status::Running => theme.running,
-                                    Status::Waiting => theme.waiting,
-                                    Status::Idle if unread_resting => theme.unread,
-                                    Status::Idle => {
-                                        theme.idle_color_at_age(idle_age, self.idle_decay_window)
-                                    }
-                                    Status::Unknown if unread_resting => theme.unread,
-                                    Status::Unknown => theme.waiting,
-                                    Status::Stopped => theme.dimmed,
-                                    Status::Error => theme.error,
-                                    Status::Starting => theme.dimmed,
-                                    Status::Deleting => theme.waiting,
-                                    Status::Creating => theme.accent,
-                                }
-                            };
-                            let mut style = Style::default().fg(color);
-                            if unread_resting {
-                                // Make unread unmistakable: a solid dot glyph
-                                // plus bold, on top of the `theme.unread`
-                                // color set above. A plain color swap read as
-                                // too subtle (#2088 review). Sink/urgent
-                                // states below still override icon + style.
-                                icon = ICON_UNREAD;
-                                style = style.add_modifier(ratatui::style::Modifier::BOLD);
-                            }
-                            if (inst.is_archived() || inst.is_trashed())
-                                && !matches!(inst.status, Status::Error | Status::Deleting)
-                            {
-                                // Archived and trashed rows render with one
-                                // uniform muted glyph regardless of underlying
-                                // pane status. The pane is dead, so painting
-                                // the persisted Running/Waiting status
-                                // would be misleading. The Archived
-                                // section header is the sole textual
-                                // cue, so no italic/dim modifier is
-                                // applied here; just a dim color. Error and
-                                // Deleting are live delete-operation states,
-                                // not pane statuses, so they keep their real
-                                // glyph and color (see `agent_row_icon`).
-                                icon = agent_row_icon(inst);
-                                style = Style::default().fg(theme.dimmed);
-                            } else if in_attention && inst.is_snoozed() {
-                                // Snooze decoration is Attention-only.
-                                // Outside Attention the row paints its
-                                // real status (the timer keeps running;
-                                // the visual treatment just doesn't
-                                // surface).
-                                icon = agent_row_icon(inst);
-                                style = Style::default()
-                                    .fg(theme.dimmed)
-                                    .add_modifier(ratatui::style::Modifier::ITALIC)
-                                    .add_modifier(ratatui::style::Modifier::DIM);
-                            } else if in_attention && inst.is_urgent() {
-                                // Urgent decoration is Attention-only.
-                                // The flag still persists in non-
-                                // Attention modes, but the cross-tier
-                                // promoter visual only makes sense when
-                                // tier ordering is in effect.
-                                style = Style::default()
-                                    .fg(theme.error)
-                                    .add_modifier(ratatui::style::Modifier::BOLD)
-                                    .add_modifier(ratatui::style::Modifier::RAPID_BLINK);
-                            } else if show_favorite && crate::session::is_live_favorite(inst) {
-                                style = style
-                                    .add_modifier(ratatui::style::Modifier::BOLD)
-                                    .add_modifier(ratatui::style::Modifier::UNDERLINED);
-                            }
-                            // Prefix priority: archive (no prefix) wins
-                            // over snooze (`z `) wins over urgent (`! `)
-                            // wins over favorite (`* `). Snooze and urgent
-                            // are Attention-mode-only so users in Newest /
-                            // AZ / etc. don't see decoration for state they
-                            // didn't opt into managing; the favorite star
-                            // also shows elsewhere, because favorites-first
-                            // pins the row there too.
-                            let title_text = if inst.is_archived() || inst.is_trashed() {
-                                Cow::Owned(inst.title.clone())
-                            } else if in_attention && inst.is_snoozed() {
-                                Cow::Owned(format!("z {}", inst.title))
-                            } else if in_attention && inst.is_urgent() {
-                                Cow::Owned(format!("! {}", inst.title))
-                            } else if show_favorite && crate::session::is_live_favorite(inst) {
-                                Cow::Owned(format!("* {}", inst.title))
-                            } else {
-                                Cow::Owned(inst.title.clone())
-                            };
-                            (icon, title_text, style)
-                        }
-                        ViewMode::Terminal => {
-                            // For sandboxed sessions, check the appropriate terminal based on mode
-                            let terminal_mode = if inst.is_sandboxed() {
-                                self.get_terminal_mode(id)
-                            } else {
-                                TerminalMode::Host
-                            };
-                            let terminal_running = match terminal_mode {
-                                TerminalMode::Container => inst
-                                    .container_terminal_tmux_session()
-                                    .map(|s| s.exists())
-                                    .unwrap_or(false),
-                                TerminalMode::Host => inst
-                                    .terminal_tmux_session()
-                                    .map(|s| s.exists())
-                                    .unwrap_or(false),
-                            };
-                            // Unread is an Agent-view concept: it means the agent
-                            // produced output the user hasn't looked at. The
-                            // paired terminal has no such notion, so Terminal
-                            // view never paints the unread dot; the row just
-                            // tracks whether its terminal pane is live.
-                            let (mut icon, color) = if terminal_running {
-                                (spinner_running(&inst.created_at), theme.terminal_active)
-                            } else {
-                                (ICON_IDLE, theme.dimmed)
-                            };
-                            let mut style = Style::default().fg(color);
-                            if inst.is_archived() || inst.is_trashed() {
-                                // Archive/trash lifecycle override mirrors the
-                                // Agent-view path: dim color, stopped
-                                // icon, no italic/dim modifier; the
-                                // Archived section header is the cue.
-                                icon = ICON_STOPPED;
-                                style = Style::default().fg(theme.dimmed);
-                            } else if in_attention && inst.is_snoozed() {
-                                icon = ICON_STOPPED;
-                                style = Style::default()
-                                    .fg(theme.dimmed)
-                                    .add_modifier(ratatui::style::Modifier::ITALIC)
-                                    .add_modifier(ratatui::style::Modifier::DIM);
-                            } else if in_attention && inst.is_urgent() {
-                                style = Style::default()
-                                    .fg(theme.error)
-                                    .add_modifier(ratatui::style::Modifier::BOLD)
-                                    .add_modifier(ratatui::style::Modifier::RAPID_BLINK);
-                            } else if show_favorite && crate::session::is_live_favorite(inst) {
-                                style = style
-                                    .add_modifier(ratatui::style::Modifier::BOLD)
-                                    .add_modifier(ratatui::style::Modifier::UNDERLINED);
-                            }
-                            let title_text = if inst.is_archived() || inst.is_trashed() {
-                                Cow::Owned(inst.title.clone())
-                            } else if in_attention && inst.is_snoozed() {
-                                Cow::Owned(format!("z {}", inst.title))
-                            } else if in_attention && inst.is_urgent() {
-                                Cow::Owned(format!("! {}", inst.title))
-                            } else if show_favorite && crate::session::is_live_favorite(inst) {
-                                Cow::Owned(format!("* {}", inst.title))
-                            } else {
-                                Cow::Owned(inst.title.clone())
-                            };
-                            (icon, title_text, style)
-                        }
-                        ViewMode::Tool(ref tool_name) => {
-                            let tool_session =
-                                crate::tmux::ToolSession::new(&inst.id, &inst.title, tool_name);
-                            let tool_running =
-                                tool_session.exists() && !tool_session.is_pane_dead();
-                            let (icon, color) = if tool_running {
-                                (spinner_running(&inst.created_at), theme.terminal_active)
-                            } else {
-                                (ICON_IDLE, theme.dimmed)
-                            };
-                            let mut style = Style::default().fg(color);
-                            let title_text =
-                                if show_favorite && crate::session::is_live_favorite(inst) {
-                                    style = style
-                                        .add_modifier(ratatui::style::Modifier::BOLD)
-                                        .add_modifier(ratatui::style::Modifier::UNDERLINED);
-                                    Cow::Owned(format!("* {}", inst.title))
+                    // Each view mode contributes only the live-state glyph
+                    // and color for its own backing pane; every overlay on top
+                    // of that (archive/trash, snooze, urgent, favorite) is
+                    // mode-independent and belongs to `decorate_row`.
+                    let (seed, sunk) =
+                        match self.view_mode {
+                            ViewMode::Structured => {
+                                // For Idle sessions, decay color from `fresh_idle`
+                                // toward `idle` over `idle_decay_window`. A slow
+                                // `breathe` rattle replaces the static braille
+                                // glyph while we're inside the window, matching
+                                // the animated visual language of the other
+                                // attention-worthy states (Running, Waiting,
+                                // Starting). Also serves as a redundant cue for
+                                // colorblind users / monochrome terminals.
+                                let idle_age = inst.idle_age();
+                                let is_fresh_idle =
+                                    matches!(idle_age, Some(age) if age < self.idle_decay_window);
+                                // Dormant (idle-reaped, resumable) structured
+                                // workers get their own glyph + dim amber, taking
+                                // precedence over the raw status. Unread still
+                                // wins over dormancy below (an unseen finished turn
+                                // is the more actionable signal, matching the web
+                                // sidebar's unread-dot precedence). See #2250.
+                                let is_shown_dormant = inst.is_shown_dormant();
+                                let mut icon = if is_shown_dormant {
+                                    ICON_DORMANT
                                 } else {
-                                    Cow::Owned(inst.title.clone())
+                                    match inst.status {
+                                        Status::Running => spinner_running(&inst.created_at),
+                                        Status::Waiting => spinner_waiting(&inst.created_at),
+                                        Status::Idle if is_fresh_idle => spinner_idle_fresh(
+                                            &inst.created_at,
+                                            inst.idle_entered_at,
+                                        ),
+                                        Status::Idle => ICON_IDLE,
+                                        Status::Unknown => ICON_UNKNOWN,
+                                        Status::Stopped => ICON_STOPPED,
+                                        Status::Error => ICON_ERROR,
+                                        Status::Starting => spinner_starting(&inst.created_at),
+                                        Status::Deleting => ICON_DELETING,
+                                        Status::Creating => spinner_starting(&inst.created_at),
+                                    }
                                 };
-                            (icon, title_text, style)
-                        }
-                    }
+                                // Unread paints only on resting rows
+                                // (Idle/Unknown): a live status (Running/Waiting/
+                                // Starting/...) supersedes it and keeps its own
+                                // color AND spinner. Auto-unread only ever lands
+                                // on Idle; a manual flag on a live row defers to
+                                // the live state. Sunk rows (archived/snoozed)
+                                // never paint unread: the user dismissed the row,
+                                // so surfacing it as unread contradicts that. The
+                                // flag stays on disk, so unarchiving/unsnoozing
+                                // restores it. Snooze is checked in every sort
+                                // mode here (unlike the Attention-only snooze
+                                // decoration in `decorate_row`), so a snoozed
+                                // unread row outside Attention sort still drops
+                                // the dot (#2571).
+                                let unread_resting = crate::session::unread_enabled()
+                                    && inst.is_unread()
+                                    && !inst.is_archived()
+                                    && !inst.is_snoozed()
+                                    && matches!(inst.status, Status::Idle | Status::Unknown);
+                                let color = if is_shown_dormant && !unread_resting {
+                                    theme.dormant()
+                                } else {
+                                    match inst.status {
+                                        Status::Running => theme.running,
+                                        Status::Waiting => theme.waiting,
+                                        Status::Idle if unread_resting => theme.unread,
+                                        Status::Idle => theme
+                                            .idle_color_at_age(idle_age, self.idle_decay_window),
+                                        Status::Unknown if unread_resting => theme.unread,
+                                        Status::Unknown => theme.waiting,
+                                        Status::Stopped => theme.dimmed,
+                                        Status::Error => theme.error,
+                                        Status::Starting => theme.dimmed,
+                                        Status::Deleting => theme.waiting,
+                                        Status::Creating => theme.accent,
+                                    }
+                                };
+                                let mut modifier = ratatui::style::Modifier::empty();
+                                if unread_resting {
+                                    // Make unread unmistakable: a solid dot glyph
+                                    // plus bold, on top of the `theme.unread`
+                                    // color set above. A plain color swap read as
+                                    // too subtle (#2088 review).
+                                    icon = ICON_UNREAD;
+                                    modifier = ratatui::style::Modifier::BOLD;
+                                }
+                                (
+                                    RowSeed {
+                                        icon,
+                                        color,
+                                        modifier,
+                                    },
+                                    SunkRow::AgentStatus(agent_row_icon(inst)),
+                                )
+                            }
+                            ViewMode::Terminal => {
+                                // For sandboxed sessions, check the appropriate terminal based on mode
+                                let terminal_mode = if inst.is_sandboxed() {
+                                    self.get_terminal_mode(id)
+                                } else {
+                                    TerminalMode::Host
+                                };
+                                let terminal_running =
+                                    match terminal_mode {
+                                        TerminalMode::Container => {
+                                            let name = crate::tmux::ContainerTerminalSession::
+                                        resolve_name_for_display(&inst.id, &inst.title);
+                                            crate::tmux::session_exists_for_display(&name)
+                                        }
+                                        TerminalMode::Host => {
+                                            let name = crate::tmux::TerminalSession::
+                                        resolve_name_for_display(&inst.id, &inst.title);
+                                            crate::tmux::session_exists_for_display(&name)
+                                        }
+                                    };
+                                // Unread is an Agent-view concept: it means the agent
+                                // produced output the user hasn't looked at. The
+                                // paired terminal has no such notion, so Terminal
+                                // view never paints the unread dot; the row just
+                                // tracks whether its terminal pane is live.
+                                let (icon, color) = if terminal_running {
+                                    (spinner_running(&inst.created_at), theme.terminal_active)
+                                } else {
+                                    (ICON_IDLE, theme.dimmed)
+                                };
+                                (
+                                    RowSeed {
+                                        icon,
+                                        color,
+                                        modifier: ratatui::style::Modifier::empty(),
+                                    },
+                                    SunkRow::Pane,
+                                )
+                            }
+                            ViewMode::Tool(ref tool_name) => {
+                                let tool_session = crate::tmux::ToolSession::for_display(
+                                    &inst.id,
+                                    &inst.title,
+                                    tool_name,
+                                );
+                                let tool_running = crate::tmux::session_exists_for_display(
+                                    tool_session.session_name(),
+                                ) && !crate::tmux::pane_dead_for_display(
+                                    tool_session.session_name(),
+                                );
+                                let (icon, color) = if tool_running {
+                                    (spinner_running(&inst.created_at), theme.terminal_active)
+                                } else {
+                                    (ICON_IDLE, theme.dimmed)
+                                };
+                                (
+                                    RowSeed {
+                                        icon,
+                                        color,
+                                        modifier: ratatui::style::Modifier::empty(),
+                                    },
+                                    SunkRow::Pane,
+                                )
+                            }
+                        };
+                    decorate_row(inst, in_attention, show_favorite, seed, sunk, theme)
                 } else {
                     (
                         "?",
@@ -1878,73 +1998,22 @@ impl HomeView {
         if !targets_this_pane || width == 0 || height == 0 {
             return;
         }
+        let now = Instant::now();
+        let resize_failed = self
+            .live_send_worker
+            .as_ref()
+            .is_some_and(live_send::LiveSendWorker::take_resize_failed);
+        if live_resize_retry_due(&mut self.live_send_resize_retry_at, resize_failed, now) {
+            self.live_send_last_resize = None;
+        }
         let next = (width, height);
         if self.live_send_last_resize != Some(next) {
             if let Some(worker) = &self.live_send_worker {
                 worker.resize(width, height);
+                self.live_send_resize_retry_at = None;
             }
             self.live_send_last_resize = Some(next);
         }
-    }
-
-    /// Shared core for the four `refresh_*_preview_cache_if_needed` methods.
-    /// They all run the same needs-refresh gate (session id / dimensions /
-    /// scroll-exceeds / 250ms timer) and the same capture, cache-update, and
-    /// scroll-clamp body; they differ only in which cache field they target,
-    /// where the capture comes from, and whether live-send forces a refresh.
-    ///
-    /// `select` is called twice: once for the gate, once to write the result.
-    /// `capture` runs between those two borrows so it can take a shared `&self`
-    /// to reach `get_instance`. It returns `None` to leave the cache untouched:
-    /// the agent uses that for its live-send preserve-last-good kill switch
-    /// (#1501); the terminal/tool wrappers use it when the instance has gone
-    /// away, matching the original "only write inside `if let Some(inst)`".
-    ///
-    /// `force` bypasses the idle throttle; the agent passes `in_live` here so
-    /// every render refreshes the preview in live-send mode (see the throttle
-    /// note in `refresh_preview_cache_if_needed`), the others pass `false`.
-    fn refresh_preview_cache_core(
-        &mut self,
-        width: u16,
-        height: u16,
-        force: bool,
-        select: fn(&mut Self) -> &mut super::PreviewCache,
-        capture: impl FnOnce(&Self, &str, usize) -> Option<String>,
-    ) {
-        const PREVIEW_REFRESH_MS: u128 = 250;
-        let Some(id) = self.selected_session.clone() else {
-            return;
-        };
-        let scroll_offset = self.preview_scroll_offset;
-        let frozen = self.preview_is_frozen();
-        let visible_rows = self.preview_visible_rows;
-
-        let cache = select(self);
-        let needs_refresh = force
-            || cache.session_id.as_ref() != Some(&id)
-            || cache.dimensions != (width, height)
-            || capture_window_stale(frozen, cache.captured_lines, height, visible_rows, scroll_offset)
-            // While frozen (reading scrollback or holding a selection) the idle
-            // poll must not re-capture: a fresh bottom-anchored snapshot would
-            // shift the held content out from under the reader or the drag.
-            // Session change, resize, and the reading grow still refresh.
-            || (!frozen && cache.last_refresh.elapsed().as_millis() > PREVIEW_REFRESH_MS);
-        if !needs_refresh {
-            return;
-        }
-
-        let capture_lines = capture_lines_for(height, scroll_offset);
-        let Some(content) = capture(self, id.as_str(), capture_lines) else {
-            return;
-        };
-
-        let captured_lines = select(self).store_capture(content, id, (width, height));
-
-        self.preview_scroll_offset = clamp_scroll_to_capture(
-            self.preview_scroll_offset,
-            captured_lines,
-            self.preview_visible_rows,
-        );
     }
 
     /// tmux session name backing the pane the preview currently shows, as a
@@ -1955,7 +2024,9 @@ impl HomeView {
         let id = self.selected_session.as_ref()?;
         let inst = self.get_instance(id)?;
         let name = match &self.view_mode {
-            ViewMode::Structured => crate::tmux::Session::resolve_name(&inst.id, &inst.title),
+            ViewMode::Structured => {
+                crate::tmux::Session::resolve_name_for_display(&inst.id, &inst.title)
+            }
             ViewMode::Terminal => {
                 let mode = if inst.is_sandboxed() {
                     self.get_terminal_mode(id)
@@ -1963,21 +2034,41 @@ impl HomeView {
                     TerminalMode::Host
                 };
                 match mode {
-                    TerminalMode::Host => {
-                        crate::tmux::TerminalSession::resolve_name(&inst.id, &inst.title)
-                    }
+                    TerminalMode::Host => crate::tmux::TerminalSession::resolve_name_for_display(
+                        &inst.id,
+                        &inst.title,
+                    ),
                     TerminalMode::Container => {
-                        crate::tmux::ContainerTerminalSession::resolve_name(&inst.id, &inst.title)
+                        crate::tmux::ContainerTerminalSession::resolve_name_for_display(
+                            &inst.id,
+                            &inst.title,
+                        )
                     }
                 }
             }
-            ViewMode::Tool(tool) => crate::tmux::ToolSession::new(&inst.id, &inst.title, tool)
-                .session_name()
-                .to_string(),
+            ViewMode::Tool(tool) => {
+                crate::tmux::ToolSession::for_display(&inst.id, &inst.title, tool)
+                    .session_name()
+                    .to_string()
+            }
         };
         Some(name)
     }
 
+    /// Observe worker progress without relying on changed-frame publication.
+    /// A stalled worker is replaced only after its shared tmux operation
+    /// deadline and grace have elapsed, so a legitimate slow sample is never
+    /// overlapped by another worker.
+    fn preview_worker_stalled_at(&mut self, now: std::time::Instant) -> bool {
+        let Some(worker) = self.preview_capture_worker.as_ref() else {
+            self.preview_worker_pulse = None;
+            return false;
+        };
+        let (stalled, observation) =
+            worker_stalled_step(worker.cycles(), self.preview_worker_pulse, now);
+        self.preview_worker_pulse = observation;
+        stalled
+    }
     /// Point the off-thread capture worker at `desired` (the displayed
     /// pane's tmux session), then retune its cadence to live-send vs. idle.
     /// One long-lived worker is spawned lazily on first use and retargeted
@@ -1986,6 +2077,11 @@ impl HomeView {
     /// frame. This is what keeps the worker tracking whatever the user is
     /// looking at instead of only the agent during live-send.
     pub(super) fn sync_preview_capture_worker(&mut self, desired: Option<String>) {
+        if desired.is_some() && self.preview_worker_stalled_at(std::time::Instant::now()) {
+            self.preview_capture_worker = None;
+            self.preview_capture_target = None;
+            self.preview_worker_pulse = None;
+        }
         // Don't spawn the worker until there's actually something to show.
         if desired.is_none() && self.preview_capture_worker.is_none() {
             self.preview_capture_target = None;
@@ -1993,17 +2089,53 @@ impl HomeView {
         }
         if self.preview_capture_worker.is_none() {
             let worker = live_send::LiveCaptureWorker::spawn(self.preview_wake.clone());
-            // The worker spawns VT-enabled; hand it the real `[tmux] vt_live`
-            // value (cached on the view, refreshed with the config) before it
-            // can arm a channel.
-            worker.set_vt_enabled(self.vt_live_enabled);
+            // Shell terminals use capture-pane's authoritative cell snapshot.
+            // Their prompt repaint can transiently expose a PROMPT_EOL_MARK to
+            // a pipe-pane seed, producing a visible false frame before the
+            // grid reconciles. The capture path is slower but has no seed
+            // handoff, and live input still uses the existing send-keys path.
+            worker.set_vt_enabled(
+                self.vt_live_enabled && !matches!(self.view_mode, ViewMode::Terminal),
+            );
+            worker.set_clipboard_capture_enabled(self.agent_clipboard_forward);
             self.preview_capture_worker = Some(worker);
         }
         if self.preview_capture_target != desired {
             if let Some(worker) = self.preview_capture_worker.as_ref() {
                 worker.set_target(desired.clone().unwrap_or_default());
             }
+            let terminal_mode = if matches!(&self.view_mode, ViewMode::Terminal) {
+                self.selected_session
+                    .as_ref()
+                    .and_then(|id| self.get_instance(id).map(|inst| (id, inst)))
+                    .map(|(id, inst)| {
+                        if inst.is_sandboxed() {
+                            self.get_terminal_mode(id)
+                        } else {
+                            TerminalMode::Host
+                        }
+                    })
+                    .unwrap_or(TerminalMode::Host)
+            } else {
+                TerminalMode::Host
+            };
+            let cache = match &self.view_mode {
+                ViewMode::Structured => &mut self.preview_cache,
+                ViewMode::Tool(_) => &mut self.tool_preview_cache,
+                ViewMode::Terminal => match terminal_mode {
+                    TerminalMode::Container => &mut self.container_terminal_preview_cache,
+                    TerminalMode::Host => &mut self.terminal_preview_cache,
+                },
+            };
+            if cache.capture_target.as_deref() != desired.as_deref() {
+                *cache = super::PreviewCache::default();
+            } else {
+                cache.cursor = None;
+            }
             self.preview_capture_target = desired;
+            // A new target starts a fresh heartbeat window; progress from the
+            // previous pane must not mask a stall on this one.
+            self.preview_worker_pulse = None;
             // New pane under the pointer: drop the hover dedup cell so a
             // stationary pointer still reports its cell to the new agent.
             self.hover_forward_cell = None;
@@ -2025,16 +2157,134 @@ impl HomeView {
         if let Some(worker) = self.preview_capture_worker.as_ref() {
             worker.set_live(live);
             worker.set_forward_empty(forward_empty);
+            worker.set_vt_enabled(self.vt_live_enabled && !forward_empty);
+            worker.set_clipboard_capture_enabled(self.agent_clipboard_forward);
         }
     }
 
-    /// If the capture worker has fresh content, store it into `select`'s
-    /// cache and report `true` so the caller skips the synchronous fork.
-    /// Returns `false` when the worker has nothing new (cold start, or an
-    /// idle/unchanged pane), leaving the caller's `refresh_preview_cache_core`
-    /// to populate the cache once via the fork gate. Steady state across
-    /// every view goes through here, so `tmux capture-pane` stays off the
-    /// render thread.
+    /// Apply the capture worker's newest frame to `select`'s cache. The
+    /// worker is the ONLY capture source: when it has nothing new (cold
+    /// start, retarget, unchanged pane), the cache keeps its last-good
+    /// content and this returns without writing, so paint never forks a
+    /// capture.
+    ///
+    /// The frame is consumed atomically: content, cursor, line budget, and
+    /// target generation travel together, so a frame can never be split
+    /// across a retarget or budget change.
+    fn apply_worker_capture(
+        &mut self,
+        width: u16,
+        height: u16,
+        select: fn(&mut Self) -> &mut super::PreviewCache,
+    ) {
+        let Some(id) = self.selected_session.clone() else {
+            return;
+        };
+        // Drop a cache that documents a DIFFERENT pane than the one now
+        // displayed. Without this a quiet or dead new target would keep
+        // painting the previous instance's bytes forever: only worker frames
+        // write the cache now, and a target that never produces one has no
+        // correction. The removed synchronous gate overwrote within one
+        // frame on a session change, frozen or not, so this mirrors it.
+        {
+            let cache = select(self);
+            if cache.session_id.as_deref() != Some(id.as_str()) && !cache.content.is_empty() {
+                *cache = super::PreviewCache::default();
+            }
+        }
+        let scroll_offset = self.preview_scroll_offset;
+        let frozen = self.preview_is_frozen();
+        let capture_lines = capture_lines_for(height, scroll_offset);
+        // Whether the HELD snapshot covers the current read. Computed before
+        // the worker borrow so the cache stays reachable through `select`.
+        let visible_rows = self.preview_visible_rows;
+        let held_covers = {
+            let cache = select(self);
+            visible_rows.saturating_add(scroll_offset as usize) <= cache.captured_lines
+        };
+        let Some(worker) = self.preview_capture_worker.as_ref() else {
+            return;
+        };
+        // Publish the budget BEFORE the frozen gate: the reading-depth branch
+        // of `capture_lines_for` exists precisely for frozen scrollback reads,
+        // so the worker must see it even though no frame applies yet.
+        worker.set_capture_lines(capture_lines);
+        let Some(frame) = worker.take_latest() else {
+            return;
+        };
+        // A frame captured before the last retarget must never land under the
+        // new view (the worker re-checks too; this closes the same race from
+        // the consumer side).
+        if !worker.frame_is_current(&frame) {
+            return;
+        }
+        // Empty-frame policy may change while the worker blocks in tmux.
+        // Revalidate on the paint thread immediately before applying: a
+        // frame captured outside live-send must not blank an agent/tool pane
+        // if live-send began before the capture returned (#1501). Restore it
+        // so it can clear the stale preview once live-send exits.
+        if frame.content.is_empty() && !worker.should_forward_empty() {
+            worker.restore_latest(frame);
+            return;
+        }
+        if frozen {
+            // While frozen, a routine fresh frame would shift the held
+            // content out from under the reader, so apply ONLY when the HELD
+            // snapshot cannot cover the read (the removed synchronous path's
+            // single-grow-on-read-begin trigger) AND this frame actually
+            // extends coverage, or was captured at the full requested budget
+            // yet still falls short (the pane simply ends there). Anything
+            // else goes back into the mailbox: the worker's content dedup
+            // would never republish it, and once unfrozen it is exactly what
+            // the preview must show.
+            let incoming_lines = frame.content.lines().count();
+            let grows = !held_covers
+                && (!scroll_exceeds_cache(incoming_lines, height, scroll_offset)
+                    || (frame.budget >= capture_lines && incoming_lines > 0));
+            if !grows {
+                worker.restore_latest(frame);
+                return;
+            }
+        }
+        // All reject/restore paths are complete. Move the owned mailbox frame
+        // into the cache without copying its content.
+        let frame_budget = frame.budget;
+        let content_is_empty = frame.content.is_empty();
+        let captured_lines = select(self).store_capture(
+            frame.content,
+            id,
+            frame.target,
+            frame.generation,
+            (width, height),
+            frame.cursor,
+        );
+
+        // An EMPTY frame always applies: terminal / container panes forward
+        // empties precisely so a cleared shell drops its stale text (#1501's
+        // counterpart outside the agent kill switch), and there is nothing to
+        // clamp an offset against anyway.
+        //
+        // Otherwise: `set_capture_lines` is async, so this frame may carry a
+        // capture produced under a smaller line budget (the user just
+        // scrolled back or the pane grew). If it doesn't cover the requested
+        // window, skip clamping against the undersized capture (it would snap
+        // the preview toward the live edge); the worker republishes at the
+        // new budget and the next adequate frame clamps properly. There is NO
+        // synchronous catch-up anymore.
+        //
+        // An *exhausted* capture (fewer lines than requested because the pane
+        // simply has no more, e.g. an alternate-screen agent with no scrollback)
+        // is not undersized: apply it so scroll state tracks the real pane.
+        if !content_is_empty
+            && scroll_exceeds_cache(captured_lines, height, scroll_offset)
+            && !capture_is_exhausted(captured_lines, frame_budget)
+        {
+            return;
+        }
+        self.preview_scroll_offset =
+            clamp_scroll_to_capture(scroll_offset, captured_lines, self.preview_visible_rows);
+    }
+
     /// Whether the preview holds its captured snapshot instead of following
     /// live output. Decision lives in the pure [`preview_frozen`] helper so it
     /// is unit-tested away from a live `HomeView`.
@@ -2042,52 +2292,207 @@ impl HomeView {
         preview_frozen(self.preview_scroll_offset, self.preview_selection.is_some())
     }
 
-    fn apply_worker_capture(
+    /// Adopt passive-resize completions into the per-session bookkeeping.
+    /// Applied geometry becomes the synced dedup (and clears the live-send
+    /// dedup when the resize raced live entry, see
+    /// `passive_resize_invalidates_live_geometry`); declined geometry is
+    /// parked so the fleet reconcile stops retrying it until the wanted
+    /// geometry changes.
+    fn adopt_passive_resize_completions(&mut self) {
+        for done in crate::tmux::take_passive_resize_dones() {
+            self.passive_pane_queued.remove(&done.session_id);
+            let Some(window_rows) = done.applied_window_rows else {
+                self.passive_pane_declined.insert(
+                    done.session_id,
+                    ((done.cols, done.rows), std::time::Instant::now()),
+                );
+                continue;
+            };
+            let invalidates_live = passive_resize_invalidates_live_geometry(
+                self.live_send.as_ref().map(|live| &live.target),
+                self.selected_session.as_deref(),
+                &done.session_id,
+            );
+            self.passive_pane_declined.remove(&done.session_id);
+            self.passive_pane_synced.insert(
+                done.session_id.clone(),
+                super::PassiveSynced {
+                    cols: done.cols,
+                    rows: done.rows,
+                    window_rows,
+                    adopted_at: std::time::Instant::now(),
+                },
+            );
+            if self.preview_pane_pending.as_ref() == Some(&(done.session_id, done.cols, done.rows))
+            {
+                self.preview_pane_pending = None;
+            }
+            if invalidates_live {
+                self.live_send_last_resize = None;
+                self.live_send_resize_retry_at = None;
+            }
+        }
+    }
+
+    /// Drop synced entries contradicted by a newer pane snapshot: an
+    /// external `tmux attach` or the web live view resized the window after
+    /// we set it, and treating the entry as in-sync would leave the preview
+    /// clipped with no self-recovery. The reconcile then re-asserts the pane
+    /// like any other diff.
+    fn invalidate_externally_resized_panes(&mut self) {
+        let stale: Vec<String> = self
+            .passive_pane_synced
+            .iter()
+            .filter(|(id, synced)| {
+                let Some(inst) = self.get_instance(id) else {
+                    return false;
+                };
+                let name = crate::tmux::Session::resolve_name_for_display(id, &inst.title);
+                match crate::tmux::observed_window_size_from_cache(&name) {
+                    Some((observed, at)) => passive_synced_contradicted(synced, observed, at),
+                    None => false,
+                }
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in stale {
+            self.passive_pane_synced.remove(&id);
+        }
+    }
+
+    /// Keep every open session's detached agent pane pre-sized to the preview
+    /// output rect it would be shown at, so selecting a row or entering live
+    /// view lands on an already-correct pane instead of waiting out a resize
+    /// round-trip. `exclude` is the session whose per-frame sync in
+    /// `refresh_preview_cache_if_needed` owns its geometry this frame; the
+    /// live-send session is skipped because its worker owns the pane.
+    ///
+    /// The per-session target is fully predictable: `PreviewLayout::compute`
+    /// over the shared preview rect and that instance's own header height,
+    /// the same split the renderer will use when the row is selected. Work
+    /// runs on the passive-resize worker under its atomic detached/no-owner
+    /// guard. Two debounces bound the SIGWINCH cost: resizes fire only when
+    /// the same fleet geometry is wanted on two consecutive refreshes (the
+    /// fleet analogue of `passive_resize_step`'s one-frame-toast rule), and a
+    /// geometry the worker declined is not retried until the wanted fleet
+    /// geometry changes or [`PASSIVE_DECLINE_RETRY`] elapses.
+    ///
+    /// Single-TUI only: with more than one aoe TUI alive, each would treat
+    /// the other's fleet resizes as external (the observed-size invalidation
+    /// below) and re-assert its own geometry, oscillating every open pane at
+    /// snapshot cadence. The presence count already surfaced as the
+    /// "N watching" indicator gates both the fleet pass and the invalidation;
+    /// the selected-session sync stays on, matching the pre-fleet behavior
+    /// those TUIs had.
+    pub(super) fn reconcile_passive_fleet(
         &mut self,
-        width: u16,
-        height: u16,
-        select: fn(&mut Self) -> &mut super::PreviewCache,
-    ) -> bool {
-        let Some(id) = self.selected_session.clone() else {
-            return false;
-        };
-        // Frozen (reading scrollback, or a selection is in flight): don't apply
-        // the worker's live frames. Falling through leaves the held snapshot in
-        // place; `refresh_preview_cache_core` won't re-capture it either (its
-        // idle poll is gated on `!frozen`), so nothing shifts under the user.
-        if self.preview_is_frozen() {
-            return false;
+        inner: Rect,
+        compact: bool,
+        exclude: Option<&str>,
+    ) {
+        self.adopt_passive_resize_completions();
+        if self.active_tui_count > 1 {
+            return;
         }
-        let scroll_offset = self.preview_scroll_offset;
-        let capture_lines = capture_lines_for(height, scroll_offset);
-        let Some(worker) = self.preview_capture_worker.as_ref() else {
-            return false;
-        };
-        worker.set_capture_lines(capture_lines);
-        let Some(content) = worker.take_latest() else {
-            return false;
-        };
-        let captured_lines = select(self).store_capture(content, id, (width, height));
-        // `set_capture_lines` is async, so this frame may carry a capture
-        // produced under a smaller line budget (the user just scrolled back
-        // or the pane grew). If it doesn't cover the requested window, fall
-        // through so `refresh_preview_cache_core` does a one-off synchronous
-        // catch-up instead of clamping the offset against an undersized
-        // capture and snapping the preview toward the live edge.
-        //
-        // An *exhausted* capture (fewer lines than requested because the pane
-        // simply has no more, e.g. an alternate-screen agent with no scrollback)
-        // is not undersized: forwarding it to the synchronous catch-up would fork
-        // `capture-pane` on the render thread every frame and never do better, so
-        // apply it and keep the worker's off-thread capture in play.
-        if scroll_exceeds_cache(captured_lines, height, scroll_offset)
-            && !capture_is_exhausted(captured_lines, capture_lines)
-        {
-            return false;
+        self.invalidate_externally_resized_panes();
+        if inner.width == 0 || inner.height == 0 {
+            return;
         }
-        self.preview_scroll_offset =
-            clamp_scroll_to_capture(scroll_offset, captured_lines, self.preview_visible_rows);
-        true
+        // The excluded (selected) and live sessions are skipped at the firing
+        // loop below, NOT while building `wants`: the armed epoch key must be
+        // pure geometry, or moving the selection would re-arm the fleet and
+        // retry every declined session on each cursor stop.
+        let mut wants: Vec<(String, u16, u16)> = Vec::new();
+        for (id, inst) in &self.instances {
+            if inst.is_archived() || inst.is_trashed() || inst.is_structured() {
+                continue;
+            }
+            if !matches!(
+                inst.status,
+                Status::Running | Status::Waiting | Status::Idle
+            ) {
+                continue;
+            }
+            let output = preview::PreviewLayout::compute(
+                inner,
+                compact,
+                self.show_preview_info,
+                preview::agent_info_height(inst),
+            )
+            .output;
+            if output.width == 0 || output.height == 0 {
+                continue;
+            }
+            wants.push((id.clone(), output.width, output.height));
+        }
+        // Order-independent epoch key: `self.instances` is rebuilt from the
+        // `storages` HashMap on reload, so an order-only shuffle of an
+        // identical fleet must not read as a new geometry (which would clear
+        // the declines early). Sorting also makes the firing order below
+        // deterministic.
+        wants.sort_unstable();
+        if self.passive_fleet_armed.as_ref() != Some(&wants) {
+            // First sighting of this fleet geometry: arm it, let declined
+            // sessions retry once under the new epoch, and nudge the event
+            // loop so the confirming refresh isn't left to an idle heartbeat.
+            // Queued entries are dropped too: re-queueing work that is truly
+            // in flight is suppressed by the worker's tickets, while an entry
+            // orphaned by a lost completion (worker panic) would otherwise
+            // block its session at that geometry indefinitely.
+            self.passive_fleet_armed = Some(wants);
+            self.passive_pane_declined.clear();
+            self.passive_pane_queued.clear();
+            // Prune synced entries for sessions that no longer exist so the
+            // map cannot grow without bound as sessions come and go.
+            let instances = &self.instances;
+            self.passive_pane_synced
+                .retain(|id, _| instances.contains_key(id));
+            self.preview_wake.notify_one();
+            return;
+        }
+        let live_session = self.live_send.as_ref().map(|live| live.session_id.clone());
+        let selected = self.selected_session.clone();
+        for (id, cols, rows) in wants {
+            if Some(id.as_str()) == exclude || Some(id.as_str()) == live_session.as_deref() {
+                continue;
+            }
+            let want = (cols, rows);
+            let synced = self.passive_pane_synced.get(&id).map(|s| (s.cols, s.rows));
+            // An expired decline reads as absent so the session is retried
+            // once its blocking attach or size owner may have gone away.
+            let declined = self
+                .passive_pane_declined
+                .get(&id)
+                .filter(|(_, at)| at.elapsed() < PASSIVE_DECLINE_RETRY)
+                .map(|(geometry, _)| *geometry);
+            match fleet_passive_step(
+                want,
+                synced,
+                declined,
+                self.passive_pane_queued.get(&id).copied(),
+            ) {
+                FleetPassiveStep::Skip => {}
+                FleetPassiveStep::Queue => {
+                    let Some(inst) = self.get_instance(&id) else {
+                        continue;
+                    };
+                    crate::tmux::queue_passive_resize(crate::tmux::PassiveResizeIntent {
+                        session_id: id.clone(),
+                        session_name: crate::tmux::Session::resolve_name_for_display(
+                            &id,
+                            &inst.title,
+                        ),
+                        cols,
+                        rows,
+                        // The viewed session (selected here in Terminal/Tool
+                        // view; the Structured selection goes through
+                        // `refresh_preview_cache_if_needed`) jumps the queue.
+                        priority: selected.as_deref() == Some(id.as_str()),
+                    });
+                    self.passive_pane_queued.insert(id, want);
+                }
+            }
+        }
     }
 
     pub(super) fn refresh_preview_cache_if_needed(&mut self, width: u16, height: u16) {
@@ -2111,20 +2516,18 @@ impl HomeView {
                 crate::tui::clipboard::copy_to_clipboard(&text);
             }
         }
-        // The off-thread `LiveCaptureWorker` (retargeted to this pane by
-        // `sync_preview_capture_worker` in `render_preview`) keeps fresh
-        // content flowing on its own thread; `apply_worker_capture` below
-        // just applies the newest it has produced. The synchronous fork via
-        // `refresh_preview_cache_core` remains only as the cold-start /
-        // worker-empty fallback (its 250ms gate still applies there). This
-        // moves the per-frame capture cost (~8.5ms on macOS, ~90% of a
-        // frame; the `tui.render` `capture_us` trace measures it) off the
-        // render thread for every view, not just agent live-send.
+        // LiveCaptureWorker is the only capture source and runs off paint.
+        // apply_worker_capture below only moves the newest mailbox frame into
+        // the cache; tui.render preview_apply_us measures that paint-side work,
+        // not tmux capture latency.
         let in_live = self.live_send.is_some();
+        // Passive completions were adopted by `reconcile_passive_fleet`
+        // earlier this frame (it runs before every preview refresh), so the
+        // live-dedup invalidation for a passive resize that raced live entry
+        // is already in place for the live sizing below.
         // While in live-send mode, keep the agent's tmux pane sized to the
         // preview's visible output area so it renders directly into view.
         self.resize_live_pane_if_target(live_send::LiveSendTarget::Agent, width, height);
-
         // Outside live-send nothing keeps the agent's pane sized to the
         // preview's output area. A full-screen agent is sized to whatever
         // terminal it was last attached from (usually the full window), so it
@@ -2138,12 +2541,20 @@ impl HomeView {
         if !in_live && width > 0 && height > 0 {
             if let Some(id) = self.selected_session.clone() {
                 let want = (id, width, height);
+                let synced = self
+                    .passive_pane_synced
+                    .get(&want.0)
+                    .map(|s| (want.0.clone(), s.cols, s.rows));
                 match passive_resize_step(
                     &want,
-                    self.preview_pane_synced.as_ref(),
+                    synced.as_ref(),
                     self.preview_pane_pending.as_ref(),
                 ) {
-                    PassiveResizeStep::InSync => self.preview_pane_pending = None,
+                    PassiveResizeStep::InSync => {
+                        crate::tmux::cancel_pending_passive_resize(&want.0);
+                        self.passive_pane_queued.remove(&want.0);
+                        self.preview_pane_pending = None;
+                    }
                     PassiveResizeStep::Arm => {
                         self.preview_pane_pending = Some(want);
                         // Nudge the event loop so the confirming refresh isn't
@@ -2157,110 +2568,37 @@ impl HomeView {
                         self.preview_wake.notify_one();
                     }
                     PassiveResizeStep::Fire => {
-                        // Only record the dedup once the pane actually exists and was
-                        // resized. If a Stopped session we're viewing is started later
-                        // without an attach in this instance to clear the dedup (e.g.
-                        // a peer or the web structured view launches it), marking it synced now
-                        // would pin the preview to the pre-start size and keep clipping
-                        // until the next geometry change. Leaving it unset (and the
-                        // pending slot armed) retries on the next refresh; `exists()`
-                        // is cache-backed, so the retry is cheap.
-                        if let Some(session) = self
-                            .get_instance(&want.0)
-                            .and_then(|inst| inst.tmux_session().ok())
-                            .filter(|s| s.exists())
-                        {
-                            // Defer to anything actually driving this session's
-                            // size: a real tmux client (this TUI's own
-                            // `switch-client` attach registers no size owner, so
-                            // without the `is_attached` check the passive resize
-                            // shrank the window the user just attached to back to
-                            // the preview dimensions, #3071), or an active size
-                            // owner (a phone/desktop live client, or this TUI's
-                            // own live-send below). The detached preview is a
-                            // passive display, so it only sizes a session nobody
-                            // else is driving and never claims the lock itself;
-                            // leaving the dedup unset retries once the client
-                            // detaches or the owner disconnects.
-                            //
-                            // `is_attached` is checked first: it is one tmux call
-                            // against `has_active_size_owner`'s two, and being
-                            // attached is the sticky state here (the skip leaves
-                            // the pending slot armed, so this block re-runs every
-                            // poll for as long as the user stays attached).
-                            if !session.is_attached() && !session.has_active_size_owner() {
-                                session.resize_window(width, height);
-                                self.preview_pane_synced = Some(want);
-                                self.preview_pane_pending = None;
-                            }
+                        // The tmux work runs on the dedicated resize worker,
+                        // never paint. It re-runs the authoritative attach,
+                        // size-owner, and existence gates before resizing. The
+                        // pending slot stays armed until completion adopts the
+                        // dedup, so a session that does not exist yet retries
+                        // once started instead of pinning stale geometry.
+                        if let Some(inst) = self.get_instance(&want.0) {
+                            crate::tmux::queue_passive_resize(crate::tmux::PassiveResizeIntent {
+                                session_id: want.0.clone(),
+                                session_name: crate::tmux::Session::resolve_name_for_display(
+                                    &want.0,
+                                    &inst.title,
+                                ),
+                                cols: want.1,
+                                rows: want.2,
+                                // The user is viewing this session; its
+                                // resize goes ahead of queued fleet work.
+                                priority: true,
+                            });
+                            self.passive_pane_queued.insert(want.0, (want.1, want.2));
                         }
                     }
                 }
             }
         }
 
-        // Apply the worker's latest capture if it has fresh content; that's
-        // the steady-state path and never forks. Only a cold start (worker
-        // just retargeted) or an idle/unchanged pane falls through to the
-        // synchronous fork below.
-        if self.apply_worker_capture(width, height, |s| &mut s.preview_cache) {
-            return;
-        }
-
-        // Cold-start / fallback capture via the fork-based path
-        // (`Session::capture_pane` via the instance helper). The
-        // 250ms gate in `refresh_preview_cache_core` keeps this from forking
-        // every frame; in steady state the worker above satisfies the render.
-        //
-        // Live vs. non-live failure semantics differ. In live mode an empty
-        // capture (which is what `Session::capture_pane` returns when
-        // the session is gone OR tmux had a transient hiccup) preserves the
-        // last-known-good capture so the preview doesn't flash blank (the
-        // kill-switch behavior introduced in #1501). The capture closure
-        // returns `None` for that case so the core leaves every cache field
-        // alone, including `session_id` and `dimensions`, which document
-        // "what's in `content`" and would lie if updated past a stale snapshot.
-        // Outside live mode the empty content surfaces as "No output
-        // available", the intended signal that the underlying session is gone.
-        self.refresh_preview_cache_core(
-            width,
-            height,
-            false,
-            |s| &mut s.preview_cache,
-            |s, id, capture_lines| {
-                let in_live = s
-                    .live_send
-                    .as_ref()
-                    .is_some_and(|st| st.target == live_send::LiveSendTarget::Agent);
-                // Only treat an empty fork capture as "preserve the existing
-                // cache" when the cache is FOR THIS SAME SESSION. If the user
-                // just switched live-send from session A to session B and B's
-                // first capture comes back empty, holding the kill-switch would
-                // leave A's content on screen under B's header. Cross-session we
-                // always overwrite, falling back to an empty body (the same
-                // "session looks gone" signal the non-live path uses).
-                let same_session = s.preview_cache.session_id.as_deref() == Some(id);
-                // Composited in BOTH modes, matching what the worker publishes.
-                // This fallback also runs on every idle refresh (the worker
-                // dedups unchanged frames, so it has nothing to hand over), so a
-                // pane-0-only capture here would clobber the worker's composite
-                // a beat after each keystroke and leave the split visible for
-                // only one frame at a time. On an unsplit window this returns
-                // the pane bytes verbatim, so nothing changes there.
-                let fork_capture = s
-                    .get_instance(id)
-                    .and_then(|inst| inst.capture_output_composited(capture_lines).ok());
-                if in_live {
-                    match fork_capture {
-                        Some(content) if !content.is_empty() => Some(content),
-                        _ if same_session => None,
-                        _ => Some(String::new()),
-                    }
-                } else {
-                    Some(fork_capture.unwrap_or_default())
-                }
-            },
-        );
+        // The capture worker is the ONLY capture source. Apply its newest
+        // frame; when it has nothing yet (cold start, retarget, unchanged
+        // pane), the cache keeps its last-good content and the frame shows
+        // that or the empty state. Paint never forks a capture fallback.
+        self.apply_worker_capture(width, height, |s| &mut s.preview_cache);
     }
 
     /// Refresh terminal preview cache if needed (for host terminals)
@@ -2270,25 +2608,9 @@ impl HomeView {
         // the visible output area so a window resize or info-header toggle
         // reflows the shell instead of waiting for a live-mode re-enter.
         self.resize_live_pane_if_target(live_send::LiveSendTarget::Terminal, width, height);
-        // Worker (retargeted to this pane in `render_preview`) drives the
-        // steady-state refresh fork-free; the core below is the cold-start /
-        // empty-worker fallback.
-        if self.apply_worker_capture(width, height, |s| &mut s.terminal_preview_cache) {
-            return;
-        }
-        self.refresh_preview_cache_core(
-            width,
-            height,
-            false,
-            |s| &mut s.terminal_preview_cache,
-            |s, id, capture_lines| {
-                s.get_instance(id).map(|inst| {
-                    inst.terminal_tmux_session()
-                        .and_then(|sess| sess.capture_window_composited(capture_lines))
-                        .unwrap_or_default()
-                })
-            },
-        );
+        // Worker-only: no synchronous fallback. A cold or unchanged worker
+        // leaves the last-good cache content on screen.
+        self.apply_worker_capture(width, height, |s| &mut s.terminal_preview_cache);
     }
 
     /// Refresh container terminal preview cache if needed
@@ -2302,22 +2624,7 @@ impl HomeView {
             width,
             height,
         );
-        if self.apply_worker_capture(width, height, |s| &mut s.container_terminal_preview_cache) {
-            return;
-        }
-        self.refresh_preview_cache_core(
-            width,
-            height,
-            false,
-            |s| &mut s.container_terminal_preview_cache,
-            |s, id, capture_lines| {
-                s.get_instance(id).map(|inst| {
-                    inst.container_terminal_tmux_session()
-                        .and_then(|sess| sess.capture_window_composited(capture_lines))
-                        .unwrap_or_default()
-                })
-            },
-        );
+        self.apply_worker_capture(width, height, |s| &mut s.container_terminal_preview_cache);
     }
 
     pub(super) fn refresh_tool_preview_cache_if_needed(
@@ -2336,22 +2643,7 @@ impl HomeView {
             width,
             height,
         );
-        if self.apply_worker_capture(width, height, |s| &mut s.tool_preview_cache) {
-            return;
-        }
-        self.refresh_preview_cache_core(
-            width,
-            height,
-            false,
-            |s| &mut s.tool_preview_cache,
-            |s, id, capture_lines| {
-                s.get_instance(id).map(|inst| {
-                    crate::tmux::ToolSession::new(&inst.id, &inst.title, tool_name)
-                        .capture_window_composited(capture_lines)
-                        .unwrap_or_default()
-                })
-            },
-        );
+        self.apply_worker_capture(width, height, |s| &mut s.tool_preview_cache);
     }
 
     /// `captured_lines` from whichever preview cache is currently on screen.
@@ -2407,11 +2699,38 @@ impl HomeView {
         }
     }
 
+    pub(super) fn active_preview_cursor(&self) -> Option<crate::tmux::PaneCursor> {
+        let cache = self.active_preview_cache();
+        let target = cache.capture_target.as_deref()?;
+        if self.preview_capture_target.as_deref() != Some(target) {
+            return None;
+        }
+        let worker = self.preview_capture_worker.as_ref()?;
+        worker
+            .capture_identity_is_current(target, cache.capture_generation)
+            .then_some(cache.cursor)
+            .flatten()
+    }
     fn active_captured_lines(&self) -> usize {
         self.active_preview_cache().captured_lines
     }
 
     fn render_preview(&mut self, frame: &mut Frame, area: Rect, theme: &Theme, layout: PaneLayout) {
+        if self.system_health_open {
+            self.preview_outer_area = area;
+            self.preview_area = area;
+            self.preview_pane_area = area;
+            self.preview_visible_rows = area.height as usize;
+            self.sync_preview_capture_worker(None);
+            crate::tui::components::diagnostics::render_system_health(
+                frame,
+                area,
+                theme,
+                &self.metrics,
+                self.system_health_scroll,
+            );
+            return;
+        }
         let compact = area.width < responsive::STACKED_BREAKPOINT;
         let (border_color, title_color) = match self.view_mode {
             ViewMode::Structured => (theme.border, theme.title),
@@ -2536,10 +2855,7 @@ impl HomeView {
             // transcript scrolls inside the embedded view); the generic
             // indicator below reads the tmux capture cache and home's
             // wheel offset, both of which are stale or empty for it.
-            #[cfg(feature = "serve")]
             let structured_mounted = self.structured_preview.is_some();
-            #[cfg(not(feature = "serve"))]
-            let structured_mounted = false;
             let scroll_indicator = if !self.show_preview_info && !structured_mounted {
                 let inner_height = area.height.saturating_sub(2);
                 let visible_height = inner_height as usize;
@@ -2652,6 +2968,23 @@ impl HomeView {
             };
         self.sync_preview_capture_worker(desired);
 
+        // Pre-size every other open session's detached pane to the preview
+        // rect it would be shown at (and adopt worker completions), in every
+        // view mode and selection state. The selected session is excluded
+        // exactly when the Structured branch below runs its own per-frame
+        // sync in `refresh_preview_cache_if_needed`.
+        let selected_owns_sync = matches!(self.view_mode, ViewMode::Structured)
+            && !selected_archived
+            && !selected_trashed
+            && !selected_stopped
+            && !selected_structured;
+        let fleet_exclude = if selected_owns_sync {
+            self.selected_session.clone()
+        } else {
+            None
+        };
+        self.reconcile_passive_fleet(inner, compact, fleet_exclude.as_deref());
+
         if selected_archived {
             self.render_archived_preview(frame, inner, theme);
             self.paint_preview_selection(frame, theme);
@@ -2675,65 +3008,62 @@ impl HomeView {
             // content: info header on top (same `i` toggle and layout as
             // the terminal previews), the streaming transcript below, and
             // the drag-select machinery pointed at the painted rows.
-            #[cfg(feature = "serve")]
-            {
-                let selected_id = self.selected_session.clone();
-                let mounted_matches = self
-                    .structured_preview
-                    .as_ref()
-                    .zip(selected_id.as_deref())
-                    .is_some_and(|(v, id)| v.session_id() == id);
-                if mounted_matches {
-                    // Take/put-back so the view's `&mut` render can't
-                    // fight the instance lookup's shared borrow of self.
-                    let mut view = self.structured_preview.take();
-                    let inst = selected_id.as_deref().and_then(|id| self.get_instance(id));
-                    let layout = preview::PreviewLayout::compute(
-                        inner,
-                        compact,
-                        self.show_preview_info,
-                        inst.map(preview::agent_info_height).unwrap_or(0),
+            let selected_id = self.selected_session.clone();
+            let mounted_matches = self
+                .structured_preview
+                .as_ref()
+                .zip(selected_id.as_deref())
+                .is_some_and(|(v, id)| v.session_id() == id);
+            if mounted_matches {
+                // Take/put-back so the view's `&mut` render can't
+                // fight the instance lookup's shared borrow of self.
+                let mut view = self.structured_preview.take();
+                let inst = selected_id.as_deref().and_then(|id| self.get_instance(id));
+                let layout = preview::PreviewLayout::compute(
+                    inner,
+                    compact,
+                    self.show_preview_info,
+                    inst.map(preview::agent_info_height).unwrap_or(0),
+                );
+                if let (Some(info_area), Some(inst)) = (layout.info, inst) {
+                    preview::Preview::render_info(
+                        frame,
+                        info_area,
+                        inst,
+                        theme,
+                        self.idle_decay_window,
                     );
-                    if let (Some(info_area), Some(inst)) = (layout.info, inst) {
-                        preview::Preview::render_info(
-                            frame,
-                            info_area,
-                            inst,
-                            theme,
-                            self.idle_decay_window,
-                        );
-                    }
-                    // No ` Output ` banner row: the transcript block has
-                    // its own titled border, so the banner slot stays a
-                    // blank separator under the header.
-                    let geometry = view
-                        .as_mut()
-                        .and_then(|v| v.render(frame, layout.output, theme));
-                    self.structured_preview = view;
-                    self.preview_pane_area = layout.output;
-                    if let Some(g) = geometry {
-                        self.preview_visible_rows = g.text_area.height as usize;
-                        self.preview_text_view = crate::tui::home::PreviewTextView {
-                            pane: g.text_area,
-                            first_line: g.first_line,
-                            total_lines: g.total_lines,
-                        };
-                    }
-                    self.paint_preview_selection(frame, theme);
-                    return;
                 }
-                if self.structured_preview_pending {
-                    // A mount is underway (or about to start): render a
-                    // quiet beat instead of the wordy "press Enter" page,
-                    // which otherwise flashes on every selection.
-                    let para = Paragraph::new(Line::from(Span::styled(
-                        "…",
-                        Style::default().fg(theme.dimmed),
-                    )))
-                    .alignment(Alignment::Center);
-                    frame.render_widget(para, inner);
-                    return;
+                // No ` Output ` banner row: the transcript block has
+                // its own titled border, so the banner slot stays a
+                // blank separator under the header.
+                let geometry = view
+                    .as_mut()
+                    .and_then(|v| v.render(frame, layout.output, theme));
+                self.structured_preview = view;
+                self.preview_pane_area = layout.output;
+                if let Some(g) = geometry {
+                    self.preview_visible_rows = g.text_area.height as usize;
+                    self.preview_text_view = crate::tui::home::PreviewTextView {
+                        pane: g.text_area,
+                        first_line: g.first_line,
+                        total_lines: g.total_lines,
+                    };
                 }
+                self.paint_preview_selection(frame, theme);
+                return;
+            }
+            if self.structured_preview_pending {
+                // A mount is underway (or about to start): render a
+                // quiet beat instead of the wordy "press Enter" page,
+                // which otherwise flashes on every selection.
+                let para = Paragraph::new(Line::from(Span::styled(
+                    "…",
+                    Style::default().fg(theme.dimmed),
+                )))
+                .alignment(Alignment::Center);
+                frame.render_widget(para, inner);
+                return;
             }
             self.render_structured_preview(frame, inner, theme);
             self.paint_preview_selection(frame, theme);
@@ -2783,7 +3113,7 @@ impl HomeView {
                     // coexist in the actual render call.
                     let cap_start = Instant::now();
                     self.refresh_preview_cache_if_needed(pane_area.width, pane_area.height);
-                    self.preview_timings.capture = cap_start.elapsed();
+                    self.preview_timings.apply = cap_start.elapsed();
                     let parse_start = Instant::now();
                     self.preview_cache.ensure_parsed();
                     self.preview_timings.parse = parse_start.elapsed();
@@ -2800,7 +3130,10 @@ impl HomeView {
                                 frame,
                                 inner,
                                 inst,
-                                CachedPreview::from_text(self.preview_cache.parsed_text.as_ref()),
+                                CachedPreview::new(
+                                    self.preview_cache.parsed_text.as_ref(),
+                                    self.preview_cache.is_pending_for(id),
+                                ),
                                 self.preview_scroll_offset,
                                 theme,
                                 self.idle_decay_window,
@@ -2890,32 +3223,42 @@ impl HomeView {
 
                     // Now borrow instance for rendering
                     if let Some(inst) = self.get_instance(&id) {
-                        let (terminal_running, preview_text) = match terminal_mode {
-                            TerminalMode::Container => {
-                                let running = inst
-                                    .container_terminal_tmux_session()
-                                    .map(|s| s.exists())
-                                    .unwrap_or(false);
-                                (
-                                    running,
-                                    self.container_terminal_preview_cache.parsed_text.as_ref(),
-                                )
-                            }
-                            TerminalMode::Host => {
-                                let running = inst
-                                    .terminal_tmux_session()
-                                    .map(|s| s.exists())
-                                    .unwrap_or(false);
-                                (running, self.terminal_preview_cache.parsed_text.as_ref())
-                            }
-                        };
+                        // Snapshot-backed like the list rows: this runs on
+                        // every frame, and the preview capture above is already
+                        // worker-driven, so a per-name `has-session` here would
+                        // be the only fork left in a steady-state frame.
+                        let (terminal_running, cache) =
+                            match terminal_mode {
+                                TerminalMode::Container => {
+                                    let name = crate::tmux::ContainerTerminalSession::
+                                    resolve_name_for_display(&inst.id, &inst.title);
+                                    (
+                                        crate::tmux::session_exists_for_display(&name),
+                                        &self.container_terminal_preview_cache,
+                                    )
+                                }
+                                TerminalMode::Host => {
+                                    let name =
+                                        crate::tmux::TerminalSession::resolve_name_for_display(
+                                            &inst.id,
+                                            &inst.title,
+                                        );
+                                    (
+                                        crate::tmux::session_exists_for_display(&name),
+                                        &self.terminal_preview_cache,
+                                    )
+                                }
+                            };
 
                         Preview::render_terminal_preview(
                             frame,
                             inner,
                             inst,
                             terminal_running,
-                            CachedPreview::from_text(preview_text),
+                            CachedPreview::new(
+                                cache.parsed_text.as_ref(),
+                                cache.is_pending_for(&id),
+                            ),
                             self.preview_scroll_offset,
                             theme,
                             compact,
@@ -2966,16 +3309,27 @@ impl HomeView {
                     self.set_preview_text_view(pane_area, total_lines);
 
                     if let Some(inst) = self.get_instance(&id) {
-                        let tool_session =
-                            crate::tmux::ToolSession::new(&inst.id, &inst.title, &tool_name);
-                        let tool_running = tool_session.exists() && !tool_session.is_pane_dead();
+                        let tool_session = crate::tmux::ToolSession::for_display(
+                            &inst.id,
+                            &inst.title,
+                            &tool_name,
+                        );
+                        // Snapshot-backed for the same reason as the rows:
+                        // this pair used to be the two remaining per-frame
+                        // forks on the render thread in Tool view.
+                        let tool_running =
+                            crate::tmux::session_exists_for_display(tool_session.session_name())
+                                && !crate::tmux::pane_dead_for_display(tool_session.session_name());
 
                         Preview::render_terminal_preview(
                             frame,
                             inner,
                             inst,
                             tool_running,
-                            CachedPreview::from_text(self.tool_preview_cache.parsed_text.as_ref()),
+                            CachedPreview::new(
+                                self.tool_preview_cache.parsed_text.as_ref(),
+                                self.tool_preview_cache.is_pending_for(&id),
+                            ),
                             self.preview_scroll_offset,
                             theme,
                             compact,
@@ -3028,7 +3382,7 @@ impl HomeView {
         if self.live_send.is_none() || self.preview_scroll_offset != 0 {
             return None;
         }
-        let cursor = self.preview_capture_worker.as_ref()?.current_cursor()?;
+        let cursor = self.active_preview_cursor()?;
         if !cursor.position_reliable {
             return None;
         }
@@ -3638,23 +3992,27 @@ impl HomeView {
         // The TUI does not own the daemon, so we probe the PID file each
         // render. Mode comes from a PID-keyed cache so we don't read the
         // serve.mode file from disk on every frame.
-        #[cfg(feature = "serve")]
-        {
-            let mode_label = crate::cli::serve::cached_serve_mode_label();
-            if crate::cli::serve::daemon_pid().is_some() {
-                let label = match mode_label {
-                    Some(m) => format!(" \u{25CF} Serving ({}) ", m),
-                    None => " \u{25CF} Serving ".to_string(),
-                };
-                groups.push((
-                    0,
-                    None,
-                    vec![Span::styled(
-                        label,
-                        Style::default().fg(theme.running).bold(),
-                    )],
-                ));
-            }
+        let mode_label = crate::cli::serve::cached_serve_mode_label();
+        if crate::cli::serve::daemon_pid().is_some() {
+            // A build without the dashboard bundle answers the API only, so
+            // the badge must not read as "the dashboard is up".
+            let what = if cfg!(feature = "web") {
+                "Serving"
+            } else {
+                "Serving API"
+            };
+            let label = match mode_label {
+                Some(m) => format!(" \u{25CF} {} ({}) ", what, m),
+                None => format!(" \u{25CF} {} ", what),
+            };
+            groups.push((
+                0,
+                None,
+                vec![Span::styled(
+                    label,
+                    Style::default().fg(theme.running).bold(),
+                )],
+            ));
         }
 
         // Other-TUI indicator: shown only when more than one `aoe` TUI is
@@ -4011,13 +4369,57 @@ impl HomeView {
 mod tests {
     use super::*;
 
+    #[test]
+    fn live_resize_failure_retries_only_after_backoff() {
+        let now = Instant::now();
+        let mut retry_at = None;
+
+        assert!(!live_resize_retry_due(&mut retry_at, true, now));
+        assert_eq!(retry_at, Some(now + LIVE_SEND_RESIZE_RETRY_DELAY));
+        assert!(!live_resize_retry_due(
+            &mut retry_at,
+            false,
+            now + LIVE_SEND_RESIZE_RETRY_DELAY - Duration::from_millis(1),
+        ));
+        assert!(live_resize_retry_due(
+            &mut retry_at,
+            false,
+            now + LIVE_SEND_RESIZE_RETRY_DELAY,
+        ));
+        assert_eq!(retry_at, None);
+    }
+
     // The preview split geometry (header / banner / output rows) is now owned
     // by `preview::PreviewLayout`; its tests live alongside it in
     // `components/preview.rs`. The render-side regression is covered end to end
     // by `preview_visible_rows_equal_output_area_with_info_shown` in
-    // `home/tests.rs`, which renders a real frame and asserts
+    // `home/tests/keys_and_nav.rs`, which renders a real frame and asserts
     // `preview_visible_rows == preview_pane_area.height`.
 
+    /// A preview worker gets the full shared tmux deadline plus grace before
+    /// replacement. The unchanged observation timestamp must not slide on each
+    /// render, or a stalled worker would remain trusted forever.
+    #[test]
+    fn worker_stall_detection_honors_deadline_and_progress() {
+        let t0 = std::time::Instant::now();
+        let timeout = crate::tmux::TMUX_COMMAND_TIMEOUT.saturating_add(WORKER_STALL_GRACE);
+        let before = t0 + timeout - std::time::Duration::from_millis(1);
+        let at = t0 + timeout;
+
+        assert_eq!(worker_stalled_step(7, None, t0), (false, Some((7, t0))));
+        assert_eq!(
+            worker_stalled_step(8, Some((7, t0)), before),
+            (false, Some((8, before)))
+        );
+        assert_eq!(
+            worker_stalled_step(7, Some((7, t0)), before),
+            (false, Some((7, t0)))
+        );
+        assert_eq!(
+            worker_stalled_step(7, Some((7, t0)), at),
+            (true, Some((7, t0)))
+        );
+    }
     fn pane_cursor(x: u16, y: u16, visible: bool, pane_height: u16) -> crate::tmux::PaneCursor {
         crate::tmux::PaneCursor {
             x,
@@ -4100,13 +4502,76 @@ mod tests {
     }
 
     #[test]
-    fn live_cursor_maps_directly_when_pane_matches_output() {
-        // Pane sized to the output area (the steady-state live-send case): the
-        // delta is zero, so cursor (x, y) maps onto output.{x,y} + (x, y). A
-        // full-height capture (line_count >= visible_rows) bottom-anchors.
+    fn fleet_passive_step_dedups_per_session() {
+        let want = (120, 40);
+        let other = (100, 30);
+        let cases = [
+            // Fresh session: hand it to the worker.
+            (None, None, None, FleetPassiveStep::Queue),
+            // Pane already matches: leave it alone.
+            (Some(want), None, None, FleetPassiveStep::Skip),
+            // The worker declined this exact geometry (attached, owned, or
+            // missing): no retry until the fleet epoch changes.
+            (None, Some(want), None, FleetPassiveStep::Skip),
+            // Already handed to the worker: wait for its completion.
+            (None, None, Some(want), FleetPassiveStep::Skip),
+            // A decline for a different geometry does not block the new want.
+            (None, Some(other), None, FleetPassiveStep::Queue),
+            // A queued different geometry is superseded (the queue keeps only
+            // the latest intent per session).
+            (Some(other), None, Some(other), FleetPassiveStep::Queue),
+        ];
+        for (synced, declined, queued, expect) in cases {
+            assert_eq!(
+                fleet_passive_step(want, synced, declined, queued),
+                expect,
+                "synced={synced:?} declined={declined:?} queued={queued:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn passive_synced_contradiction_requires_a_fresher_mismatch() {
+        let adopted_at = Instant::now();
+        let synced = crate::tui::home::PassiveSynced {
+            cols: 141,
+            rows: 43,
+            window_rows: 44,
+            adopted_at,
+        };
+        let newer = adopted_at + Duration::from_millis(1);
+        let older = adopted_at - Duration::from_millis(1);
+        assert!(passive_synced_contradicted(&synced, (200, 50), newer));
+        assert!(
+            !passive_synced_contradicted(&synced, (141, 44), newer),
+            "an observation matching the applied window size is not a contradiction"
+        );
+        assert!(
+            !passive_synced_contradicted(&synced, (200, 50), older),
+            "a snapshot that may predate our own resize must not invalidate"
+        );
+    }
+
+    #[test]
+    fn live_cursor_maps_single_and_composited_origins() {
         let output = Rect::new(40, 5, 80, 24);
-        let pos = map_live_preview_cursor(output, 24, 200, pane_cursor(3, 2, true, 24));
-        assert_eq!(pos, Some(Position::new(43, 7)));
+
+        // Steady-state single pane: the origin and anchoring delta are zero.
+        let single = map_live_preview_cursor(output, 24, 200, pane_cursor(3, 2, true, 24));
+        assert_eq!(single, Some(Position::new(43, 7)));
+
+        // A top border row makes the composite one row taller than the visible
+        // output and shifts pane 0 down. The anchoring delta clips that row;
+        // adding pane 0's origin puts its pane-relative cursor back on the text.
+        let mut split = pane_cursor(3, 2, true, 25);
+        split.composite_pane0 = Some(crate::tmux::PaneGeom {
+            left: 1,
+            top: 1,
+            width: 79,
+            height: 24,
+        });
+        let composited = map_live_preview_cursor(output, 24, 200, split);
+        assert_eq!(composited, Some(Position::new(44, 7)));
     }
 
     #[test]
@@ -4218,6 +4683,19 @@ mod tests {
     fn compose_list_title_shows_by_project_only() {
         let title = compose_list_title("aoe", None, GroupByMode::Project, SortOrder::Newest);
         assert_eq!(title, " aoe · project ");
+    }
+
+    #[test]
+    fn compose_list_title_group_by_suffix_per_mode() {
+        let cases = [
+            (GroupByMode::Manual, ""),
+            (GroupByMode::Project, " · project"),
+            (GroupByMode::Org, " · org"),
+        ];
+        for (mode, suffix) in cases {
+            let title = compose_list_title("aoe", None, mode, SortOrder::Newest);
+            assert_eq!(title, format!(" aoe{suffix} "), "{mode:?}");
+        }
     }
 
     #[test]
@@ -4436,30 +4914,6 @@ mod tests {
             capture_lines_for(u16::MAX, u16::MAX),
             u16::MAX as usize * 2 + CAPTURE_BUFFER as usize
         );
-    }
-
-    #[test]
-    fn capture_window_stale_breaks_the_fork_loop_at_history_top() {
-        // Frozen: exact coverage test, no CAPTURE_BUFFER headroom. At the top
-        // the offset is clamped to captured - visible_rows, so the viewport is
-        // exactly covered and no re-capture fires (the per-frame capture-pane
-        // fork loop). Uses visible_rows, not the raw pane height.
-        assert!(!capture_window_stale(true, 100, /*height*/ 999, 20, 80));
-        // A viewport that genuinely runs past the captured content still
-        // refreshes so a deeper read can grow the window.
-        assert!(capture_window_stale(true, 100, 999, 20, 90));
-        // Not frozen (the live edge, scroll 0): a cold cache still forces the
-        // first capture, but a warm one is covered even when it is shorter than
-        // height + CAPTURE_BUFFER, because an exhausted pane has no more lines to
-        // give. This is the live-view counterpart of the frozen fix above.
-        let height = 30u16; // capture_lines_for(30, 0) = 50
-                            // Cold cache: nothing captured yet, so the first capture must fire.
-        assert!(capture_window_stale(false, 0, height, 20, 0));
-        // Alternate-screen agent: capture is exactly `height` (no scrollback),
-        // always short of the 50-line request. Must read as covered, not stale.
-        assert!(!capture_window_stale(false, height as usize, height, 20, 0));
-        // Main-screen pane with scrollback: full height + BUFFER, covered.
-        assert!(!capture_window_stale(false, 50, height, 20, 0));
     }
 
     #[test]

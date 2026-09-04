@@ -3,8 +3,7 @@
 //! Exercises the detached `run_terminal_rename` runner against a real tmux pane
 //! and a fake `claude` one-shot shim: a still-civ-named session is renamed from
 //! its first turn (user story 1), and a manually-named session is never touched
-//! (user story 2). Runs under `serve` only because that is where the async test
-//! harness (`#[tokio::test]`) is wired; the code under test is not serve-gated.
+//! (user story 2).
 
 use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;

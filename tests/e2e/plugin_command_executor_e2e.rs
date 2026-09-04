@@ -15,13 +15,11 @@
 //!   2. Pressing the action-less `refresh` chord POSTs the invoke endpoint and
 //!      the worker receives `plugin.command.invoke` (it writes the marker).
 //!
-//! Compiled only with the default `serve` feature (the structured view and the
-//! plugin host don't exist otherwise). Run via:
+//! Run via:
 //!
 //! ```sh
 //! cargo test --features e2e-tests --test e2e -- plugin_command_executor
 //! ```
-#![cfg(feature = "serve")]
 
 use std::time::{Duration, Instant};
 

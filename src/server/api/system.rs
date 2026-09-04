@@ -4,16 +4,50 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{
+    extract::{Extension, State},
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+    Json,
+};
 use serde::{Deserialize, Serialize};
 
 use super::validate_profile_name;
 use super::AppState;
+use crate::server::auth::AuthenticatedTokenHash;
 use crate::server::auth::{handler_elevated, AuthenticatedSession, LoopbackTrusted};
-use crate::session::settings_schema::{
+use crate::session::config::settings_schema::{
     clear_path, rewrite_plugin_sections, runtime_schema, strip_local_only, validate_patch,
     validate_patch_with, PatchRejection, Scope,
 };
+
+/// Foreground state reported by one browser dashboard. This is intentionally
+/// separate from normal API traffic: background polling must not suppress a
+/// phone's push notification.
+#[derive(Deserialize)]
+pub struct DashboardPresenceBody {
+    pub active: bool,
+}
+
+/// `POST /api/presence`. Record or clear this browser's foreground presence.
+/// The device-binding header is already attached to authenticated dashboard
+/// requests. Hashing it gives each browser an ephemeral server-side key without
+/// retaining the secret itself. Older clients without that header fall back to
+/// their authenticated token owner.
+pub async fn post_dashboard_presence(
+    State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedTokenHash>,
+    headers: HeaderMap,
+    Json(body): Json<DashboardPresenceBody>,
+) -> StatusCode {
+    let client = headers
+        .get("x-aoe-device-binding")
+        .and_then(|value| value.to_str().ok())
+        .map(crate::server::push::sha256_token)
+        .unwrap_or(owner.0);
+    state.set_web_presence(client, body.active);
+    StatusCode::NO_CONTENT
+}
 
 // --- Agents ---
 
@@ -64,6 +98,12 @@ pub struct AgentInfo {
     /// or for custom agents.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub acp_args: Vec<String>,
+    /// Registry lifecycle state. Omitted while Active so the common wire
+    /// shape is unchanged; the dashboard mirrors the shape in
+    /// `web/src/lib/types.ts` (`AgentLifecycleInfo`) and renders a
+    /// deprecated badge in the wizard picker and switch-agent modal.
+    #[serde(skip_serializing_if = "crate::agents::AgentLifecycle::is_active")]
+    pub lifecycle: crate::agents::AgentLifecycle,
 }
 
 /// Resolve the acp launch command + args for a built-in agent from
@@ -93,6 +133,7 @@ fn acp_command_fields(
 fn build_custom_agent_infos(
     custom_agents: &HashMap<String, String>,
     agent_acp_cmd: &HashMap<String, String>,
+    agent_detect_as: &HashMap<String, String>,
     policy: &crate::acp::agent_policy::AgentPolicy,
 ) -> Vec<AgentInfo> {
     let mut entries: Vec<_> = custom_agents
@@ -103,6 +144,7 @@ fn build_custom_agent_infos(
                 && crate::agents::get_agent(name).is_none()
         })
         .map(|(name, _command)| AgentInfo {
+            lifecycle: crate::agents::AgentLifecycle::Active,
             kind: "custom".to_string(),
             name: name.clone(),
             binary: name.clone(),
@@ -112,7 +154,8 @@ fn build_custom_agent_infos(
             oneshot_capable: false,
             acp_capable: agent_acp_cmd
                 .get(name)
-                .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(name, cmd).is_ok()),
+                .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(name, cmd).is_ok())
+                || crate::acp::inherited_acp_base(name, agent_detect_as).is_some(),
             acp_allowed: policy.allows(name),
             // Custom agents' acp_command is never serialized here (it can hold
             // hostnames or secrets), so we don't probe its install state; the
@@ -131,9 +174,10 @@ fn build_custom_agent_infos(
 pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentInfo>> {
     let profile = state.profile.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let config = crate::session::profile_config::resolve_config_or_warn(&profile);
+        let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
         let custom_agents = config.session.custom_agents;
         let agent_acp_cmd = config.session.agent_acp_cmd;
+        let agent_detect_as = config.session.agent_detect_as;
         let tools = crate::tmux::AvailableTools::detect();
         let available = tools.available_list();
         let acp_registry = crate::acp::AgentRegistry::with_defaults();
@@ -154,6 +198,7 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
                     installed: available.iter().any(|s| s == a.name),
                     install_hint: a.install_hint.to_string(),
                     oneshot_capable: a.oneshot_flag.is_some(),
+                    lifecycle: a.lifecycle,
                     acp_capable: acp_registry.get(a.name).is_some(),
                     acp_installed: acp_command
                         .as_deref()
@@ -167,6 +212,7 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
         agents.extend(build_custom_agent_infos(
             &custom_agents,
             &agent_acp_cmd,
+            &agent_detect_as,
             &policy,
         ));
         agents
@@ -274,7 +320,7 @@ pub async fn update_settings(
         .map(|obj| {
             obj.iter()
                 .filter_map(|(section, value)| {
-                    let id = crate::session::settings_schema::section_plugin_id(section)?;
+                    let id = crate::session::config::settings_schema::section_plugin_id(section)?;
                     let keys: Vec<String> = value
                         .as_object()
                         .map(|m| m.keys().cloned().collect())
@@ -291,7 +337,7 @@ pub async fn update_settings(
     let result = tokio::task::spawn_blocking(move || {
         crate::session::update_config(|config| -> anyhow::Result<()> {
             let mut current = serde_json::to_value(&*config)?;
-            crate::session::settings_schema::merge_json(&mut current, &body);
+            crate::session::config::settings_schema::merge_json(&mut current, &body);
             *config = serde_json::from_value(current)?;
             Ok(())
         })
@@ -314,7 +360,6 @@ pub async fn update_settings(
             }
             // Tell each touched plugin's worker its settings changed (#2897),
             // after the durable write. Best-effort; config.get is the fallback.
-            #[cfg(feature = "serve")]
             if !plugin_changes.is_empty() {
                 if let Some(host) = &state.plugin_host {
                     host.emit_settings_changed(&plugin_changes).await;
@@ -400,7 +445,8 @@ pub async fn get_cityhall_bundle(
 /// per-field JSX, so a new config field appears on the web automatically. No
 /// secrets: descriptors are pure metadata (labels, widgets, validation, write
 /// policy), so this needs no elevation, only normal authentication.
-pub async fn get_settings_schema() -> Json<Vec<crate::session::settings_schema::FieldDescriptor>> {
+pub async fn get_settings_schema(
+) -> Json<Vec<crate::session::config::settings_schema::FieldDescriptor>> {
     Json(runtime_schema())
 }
 
@@ -409,10 +455,10 @@ pub async fn get_settings_schema() -> Json<Vec<crate::session::settings_schema::
 /// default for core; stored value > manifest default for plugin settings). The
 /// dashboard uses it to show where a value comes from. Pure metadata derived
 /// from the same schema the surfaces render, so only normal authentication.
-pub async fn get_settings_resolved() -> Json<Vec<crate::session::settings_schema::ResolvedSetting>>
-{
+pub async fn get_settings_resolved(
+) -> Json<Vec<crate::session::config::settings_schema::ResolvedSetting>> {
     Json(
-        tokio::task::spawn_blocking(crate::session::settings_schema::resolve_all)
+        tokio::task::spawn_blocking(crate::session::config::settings_schema::resolve_all)
             .await
             .unwrap_or_default(),
     )
@@ -610,6 +656,8 @@ pub async fn get_tips(State(_state): State<Arc<AppState>>) -> impl IntoResponse 
         let signals = crate::tips::TipSignals {
             new_session_with_selection_count: config.app_state.new_session_with_selection_count,
             used_new_from_selection: config.app_state.used_new_from_selection,
+            system_health_tip_earned: config.app_state.system_health_tip_earned,
+            used_system_health: config.app_state.used_system_health,
         };
         let seen = &config.app_state.tips_seen;
         let tips = crate::tips::eligible(crate::tips::TipSurface::Web, &signals)
@@ -1116,6 +1164,11 @@ pub struct BrowseQuery {
     pub path: String,
     pub limit: Option<usize>,
     pub filter: Option<String>,
+    /// Include dotfile-prefixed directories in the listing. Mirrors the TUI
+    /// picker's Ctrl+H toggle (`src/tui/components/dir_picker.rs`). Omitted
+    /// means false, so existing callers keep the old behavior.
+    #[serde(default)]
+    pub show_hidden: bool,
 }
 
 #[derive(Serialize)]
@@ -1207,7 +1260,7 @@ pub async fn browse_filesystem(
 
         for entry in read_dir.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') {
+            if !query.show_hidden && name.starts_with('.') {
                 continue;
             }
             let entry_path = entry.path();
@@ -1421,7 +1474,8 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
     let passphrase_enabled = state.login_manager.is_enabled();
     let auth_mode =
         crate::server::resolve_auth_mode(&state.token_manager, &state.login_manager).await;
-    let acp_cfg = crate::session::profile_config::resolve_config_or_warn(&state.profile).acp;
+    let acp_cfg =
+        crate::session::config::profile_config::resolve_config_or_warn(&state.profile).acp;
     let acp_show_tool_durations = acp_cfg.show_tool_durations;
     let acp_replay_events = acp_cfg.replay_events;
     let acp_compaction_reminder = acp_cfg.compaction_reminder;
@@ -1483,7 +1537,7 @@ pub struct UpdateStatusResponse {
 }
 
 pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<UpdateStatusResponse> {
-    let cfg = crate::session::profile_config::resolve_config_or_warn(&state.profile);
+    let cfg = crate::session::config::profile_config::resolve_config_or_warn(&state.profile);
     let current = env!("CARGO_PKG_VERSION").to_string();
     let mode = cfg.updates.update_check_mode;
 
@@ -2191,7 +2245,7 @@ mod tests {
             ("blocked", "ocp run blocked acp"),
         ]);
         let policy = crate::acp::agent_policy::AgentPolicy::for_test(true, &["oc-sp"]);
-        let entries = build_custom_agent_infos(&custom, &acp, &policy);
+        let entries = build_custom_agent_infos(&custom, &acp, &HashMap::new(), &policy);
 
         let oc_sp = entries.iter().find(|e| e.name == "oc-sp").unwrap();
         assert!(oc_sp.acp_capable && oc_sp.acp_allowed);
@@ -2204,7 +2258,7 @@ mod tests {
         assert!(!blocked.acp_allowed, "policy denies this agent");
 
         // Unrestricted leaves both true, so the default path is unchanged.
-        let entries = build_custom_agent_infos(&custom, &acp, &unrestricted());
+        let entries = build_custom_agent_infos(&custom, &acp, &HashMap::new(), &unrestricted());
         assert!(entries.iter().all(|e| e.acp_capable && e.acp_allowed));
     }
 
@@ -2212,6 +2266,7 @@ mod tests {
     fn custom_agent_entries_use_safe_placeholders() {
         let entries = build_custom_agent_infos(
             &custom_agents(&[("remote-claude", "ssh -t prod.example claude")]),
+            &HashMap::new(),
             &HashMap::new(),
             &unrestricted(),
         );
@@ -2233,6 +2288,7 @@ mod tests {
         let entries = build_custom_agent_infos(
             &custom_agents(&[("remote-agent", "ssh -t prod.example claude")]),
             &HashMap::new(),
+            &HashMap::new(),
             &unrestricted(),
         );
 
@@ -2247,6 +2303,7 @@ mod tests {
     fn serialized_custom_agent_response_contains_no_command_or_detect_as_data() {
         let entries = build_custom_agent_infos(
             &custom_agents(&[("remote-agent", "ssh -t prod.example claude")]),
+            &HashMap::new(),
             &HashMap::new(),
             &unrestricted(),
         );
@@ -2266,6 +2323,37 @@ mod tests {
     }
 
     #[test]
+    fn agent_info_lifecycle_wire_shape() {
+        // The /api/agents contract: lifecycle omitted for Active agents,
+        // full metadata for deprecated ones. Mirrored by
+        // web/src/lib/types.ts (AgentLifecycleInfo).
+        let mk = |name: &str| {
+            let def = crate::agents::get_agent(name).unwrap();
+            AgentInfo {
+                kind: "builtin".to_string(),
+                name: def.name.to_string(),
+                binary: def.binary.to_string(),
+                host_only: def.host_only,
+                installed: true,
+                install_hint: def.install_hint.to_string(),
+                oneshot_capable: def.oneshot_flag.is_some(),
+                acp_capable: false,
+                acp_installed: false,
+                acp_allowed: true,
+                acp_command: None,
+                acp_args: Vec::new(),
+                lifecycle: def.lifecycle,
+            }
+        };
+        let claude = serde_json::to_value(mk("claude")).unwrap();
+        assert!(claude.get("lifecycle").is_none(), "{claude}");
+        let gemini = serde_json::to_value(mk("gemini")).unwrap();
+        assert_eq!(gemini["lifecycle"]["state"], "deprecated", "{gemini}");
+        assert_eq!(gemini["lifecycle"]["since"], "2026-06-18");
+        assert_eq!(gemini["lifecycle"]["replacement"], "antigravity");
+    }
+
+    #[test]
     fn custom_agent_entries_filter_empty_values_and_builtin_collisions() {
         let entries = build_custom_agent_infos(
             &custom_agents(&[
@@ -2276,6 +2364,7 @@ mod tests {
                 ("claude", "ssh -t prod.example claude"),
                 ("remote-codex", "ssh -t prod.example codex"),
             ]),
+            &HashMap::new(),
             &HashMap::new(),
             &unrestricted(),
         );
@@ -2294,6 +2383,7 @@ mod tests {
                 ("middle", "middle-cmd"),
             ]),
             &HashMap::new(),
+            &HashMap::new(),
             &unrestricted(),
         );
 
@@ -2309,12 +2399,37 @@ mod tests {
             // An entry whose command is malformed must not flip capability on.
             ("broken", "ocp run \"unterminated"),
         ]);
-        let entries = build_custom_agent_infos(&custom, &acp, &unrestricted());
+        let entries = build_custom_agent_infos(&custom, &acp, &HashMap::new(), &unrestricted());
 
         let oc_sp = entries.iter().find(|e| e.name == "oc-sp").unwrap();
         assert!(oc_sp.acp_capable, "agent with a valid acp cmd is capable");
         let plain = entries.iter().find(|e| e.name == "plain").unwrap();
         assert!(!plain.acp_capable, "agent with no acp cmd is tmux-only");
+    }
+
+    #[test]
+    fn custom_agent_acp_capable_via_detect_as_inheritance() {
+        // A wrapper that inherits a registry-backed base (claude) is
+        // structured-capable through the base adapter, with no agent_acp_cmd.
+        // A wrapper inheriting a terminal-only base (cursor) stays tmux-only.
+        let custom = custom_agents(&[
+            ("lenovo-claude", "CLAUDE_CONFIG_DIR=/work claude"),
+            ("my-cursor", "agent"),
+        ]);
+        let detect_as = custom_agents(&[("lenovo-claude", "claude"), ("my-cursor", "cursor")]);
+        let entries =
+            build_custom_agent_infos(&custom, &HashMap::new(), &detect_as, &unrestricted());
+
+        let lenovo = entries.iter().find(|e| e.name == "lenovo-claude").unwrap();
+        assert!(
+            lenovo.acp_capable,
+            "wrapper inheriting claude is acp-capable via the base adapter"
+        );
+        let cursor = entries.iter().find(|e| e.name == "my-cursor").unwrap();
+        assert!(
+            !cursor.acp_capable,
+            "wrapper inheriting a terminal-only base stays tmux-only"
+        );
     }
 
     #[test]
@@ -2356,6 +2471,7 @@ mod tests {
         let entries = build_custom_agent_infos(
             &custom_agents(&[("oc-sp", "ocp run sp")]),
             &custom_agents(&[("oc-sp", "ocp run sp acp")]),
+            &HashMap::new(),
             &unrestricted(),
         );
         let value = serde_json::to_value(&entries).unwrap();

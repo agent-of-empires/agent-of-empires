@@ -33,11 +33,8 @@ const TITLE_BUDGET: usize = 20;
 // version paired with a 12-char sha is 20 chars ("1.14.0+g46c8908c1cd2") and
 // " (stale)" is 8 more. The 24 that `aoe acp ps` used truncated the marker off
 // the realistic case, which defeated the column's purpose (#1754).
-#[cfg(feature = "serve")]
 const COL_BUILD: usize = 28;
-#[cfg(feature = "serve")]
 const COL_MODEL: usize = 20;
-#[cfg(feature = "serve")]
 const COL_CWD: usize = 30;
 
 #[derive(Args)]
@@ -120,7 +117,6 @@ struct TmuxState {
 /// ACP-only columns, present only on acp-substrate rows. tmux rows carry
 /// `None`, so the default core view never renders them. These come straight
 /// off the worker registry record, so an acp orphan still carries them.
-#[cfg(feature = "serve")]
 struct AcpExtra {
     build_version: String,
     build_stale: bool,
@@ -133,8 +129,8 @@ struct AcpExtra {
 }
 
 /// An acp substrate probe. `state` is pre-normalized by
-/// [`crate::process::worker_registry::worker_state_label`] (serve-gated) so this
-/// struct carries no serve-only types and the merge stays feature-independent.
+/// [`crate::process::worker_registry::worker_state_label`], so this struct
+/// carries no ACP types and the merge stays generic.
 /// `session_id` is the full id (`== Instance.id`). `started_at` is only the AGE
 /// fallback for orphans (see `TmuxState`). `acp_extra` carries the ACP-only
 /// columns unlocked by `aoe ps --acp`.
@@ -144,7 +140,6 @@ struct AcpState {
     agent: String,
     state: &'static str,
     started_at: u64,
-    #[cfg(feature = "serve")]
     acp_extra: Option<AcpExtra>,
 }
 
@@ -163,12 +158,10 @@ struct Row {
     // Substrate-specific extras. Only `acp_extra` exists today (populated for
     // acp rows, `None` for tmux). A future `--tmux` column unlock would add a
     // parallel `tmux_extra` here and a matching `render_table_tmux`.
-    #[cfg(feature = "serve")]
     acp_extra: Option<AcpExtra>,
     // The worker's boot epoch, carried onto the row so the `--acp --json`
     // superset can serialize it without a second copy on `AcpExtra`. Read only
     // by `acp_rows_json` (acp rows), which is why tmux rows leave it 0.
-    #[cfg(feature = "serve")]
     started_at: u64,
 }
 
@@ -242,9 +235,7 @@ fn merge_rows(
             age_secs,
             agent: st.agent.clone(),
             is_orphan,
-            #[cfg(feature = "serve")]
             acp_extra: None,
-            #[cfg(feature = "serve")]
             started_at: 0,
         });
     }
@@ -274,9 +265,7 @@ fn merge_rows(
             age_secs: Some(age_secs),
             agent: st.agent,
             is_orphan,
-            #[cfg(feature = "serve")]
             acp_extra: st.acp_extra,
-            #[cfg(feature = "serve")]
             started_at: st.started_at,
         });
     }
@@ -396,7 +385,6 @@ fn render_table(rows: &[Row]) -> String {
 /// before the field existed) shows `<legacy>`; any worker whose build differs
 /// from the running daemon's is tagged `(stale)` so a not-yet-respawned worker
 /// is visible rather than silent. See #1754.
-#[cfg(feature = "serve")]
 fn render_build_cell(build_version: &str, stale: bool) -> String {
     let base = if build_version.is_empty() {
         "<legacy>"
@@ -414,7 +402,6 @@ fn render_build_cell(build_version: &str, stale: bool) -> String {
 /// mental model transfers from the default view), then the ACP-only columns
 /// BUILD, MODEL, CWD, and SOCKET appended. A future `--tmux` unlock would add a
 /// parallel `render_table_tmux` appending tmux-only columns to the same prefix.
-#[cfg(feature = "serve")]
 fn render_table_acp(rows: &[Row]) -> String {
     use std::fmt::Write;
     let mut out = String::new();
@@ -503,7 +490,6 @@ fn render_table_acp(rows: &[Row]) -> String {
 /// emitted (identical names, types, semantics) plus `substrate`, `state`,
 /// `age_secs`, and `model`. Keeping the old names means a migrating script only
 /// changes its argv and its sort, not its field access.
-#[cfg(feature = "serve")]
 #[derive(Serialize)]
 struct AcpRowJson {
     session_id: String,
@@ -527,7 +513,6 @@ struct AcpRowJson {
     model: Option<String>,
 }
 
-#[cfg(feature = "serve")]
 fn acp_rows_json(rows: &[Row]) -> Vec<AcpRowJson> {
     rows.iter()
         .filter_map(|r| {
@@ -562,7 +547,15 @@ fn load_instances(profile: &str, profile_explicit: bool) -> Vec<Instance> {
     };
     for name in &profiles {
         if let Ok(storage) = Storage::open_unwatched(name) {
-            if let Ok((instances, _)) = storage.load_with_groups() {
+            if let Ok((mut instances, _)) = storage.load_with_groups() {
+                // `load_with_groups` does not stamp the source profile (it is
+                // `#[serde(default, skip_serializing)]`), so set it here the way
+                // the serve loader does. The status poll keys the profile-scoped
+                // status-rule registry on it; without it a profile's rules would
+                // install and look up under the empty profile and never match.
+                for inst in &mut instances {
+                    inst.source_profile = name.clone();
+                }
                 out.extend(instances);
             }
         }
@@ -583,8 +576,29 @@ fn is_agent_session_name(name: &str) -> bool {
 fn collect_tmux_states(instances: &mut [Instance]) -> Vec<TmuxState> {
     use std::collections::HashSet;
 
+    // The poll below never loads config, so install the declarative status-rule
+    // registry once per distinct profile up front; otherwise a rules-having
+    // custom agent reports Idle. The registry is keyed by profile, so each
+    // install replaces only that profile's entries.
+    {
+        let mut resolved: HashSet<&str> = HashSet::new();
+        for inst in instances.iter() {
+            if resolved.insert(inst.source_profile.as_str()) {
+                crate::session::config::profile_config::resolve_config_or_warn(
+                    &inst.source_profile,
+                );
+            }
+        }
+    }
+
     crate::tmux::refresh_session_cache();
-    let meta = crate::tmux::batch_pane_metadata().unwrap_or_default();
+    let meta = match crate::tmux::batch_pane_metadata() {
+        Ok(meta) => meta,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to collect tmux pane metadata");
+            return Vec::new();
+        }
+    };
 
     let mut states = Vec::new();
     let mut known: HashSet<String> = HashSet::new();
@@ -598,7 +612,7 @@ fn collect_tmux_states(instances: &mut [Instance]) -> Vec<TmuxState> {
             &inst.id,
             &crate::tmux::Session::generate_name(&inst.id, &inst.title),
         );
-        inst.update_status_with_metadata(meta.get(&name), Some(&name));
+        inst.update_status_once(meta.get(&name), Some(&name));
         let agent = if inst.tool.is_empty() {
             meta.get(&name)
                 .and_then(|m| m.pane_current_command.clone())
@@ -636,7 +650,6 @@ fn collect_tmux_states(instances: &mut [Instance]) -> Vec<TmuxState> {
     states
 }
 
-#[cfg(feature = "serve")]
 fn acp_state_from_record(rec: crate::process::worker_registry::WorkerRecord) -> AcpState {
     use crate::process::worker_registry;
     let live = worker_registry::is_record_live(&rec);
@@ -661,7 +674,6 @@ fn acp_state_from_record(rec: crate::process::worker_registry::WorkerRecord) -> 
     }
 }
 
-#[cfg(feature = "serve")]
 fn collect_acp_states() -> Vec<AcpState> {
     crate::process::worker_registry::list()
         .unwrap_or_default()
@@ -670,18 +682,8 @@ fn collect_acp_states() -> Vec<AcpState> {
         .collect()
 }
 
-#[cfg(not(feature = "serve"))]
-fn collect_acp_states() -> Vec<AcpState> {
-    Vec::new()
-}
-
 #[tracing::instrument(target = "cli.ps", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, profile_explicit: bool, args: PsArgs) -> Result<()> {
-    #[cfg(not(feature = "serve"))]
-    if args.acp {
-        anyhow::bail!("--acp requires a build with the serve feature");
-    }
-
     let filter = if args.tmux {
         SubstrateFilter::Tmux
     } else if args.acp {
@@ -731,7 +733,6 @@ pub async fn run(profile: &str, profile_explicit: bool, args: PsArgs) -> Result<
     );
 
     if args.json {
-        #[cfg(feature = "serve")]
         if args.acp {
             super::output::print_json(&acp_rows_json(&rows))?;
             return Ok(());
@@ -740,7 +741,6 @@ pub async fn run(profile: &str, profile_explicit: bool, args: PsArgs) -> Result<
     } else if rows.is_empty() {
         println!("No running sessions.");
     } else {
-        #[cfg(feature = "serve")]
         if args.acp {
             print!("{}", render_table_acp(&rows));
             return Ok(());
@@ -786,7 +786,6 @@ mod tests {
             agent: "claude-agent-acp".to_string(),
             state,
             started_at,
-            #[cfg(feature = "serve")]
             acp_extra: Some(AcpExtra {
                 build_version: "1.9.5+gabc123".to_string(),
                 build_stale: false,
@@ -1048,9 +1047,7 @@ mod tests {
             age_secs: None,
             agent: String::new(),
             is_orphan: false,
-            #[cfg(feature = "serve")]
             acp_extra: None,
-            #[cfg(feature = "serve")]
             started_at: 0,
         };
         let cell = session_cell(&row);
@@ -1076,15 +1073,12 @@ mod tests {
             age_secs: None,
             agent: String::new(),
             is_orphan: true,
-            #[cfg(feature = "serve")]
             acp_extra: None,
-            #[cfg(feature = "serve")]
             started_at: 0,
         };
         assert_eq!(session_cell(&row), "99999999");
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn acp_table_appends_acp_columns_and_core_table_omits_them() {
         let instances = vec![inst("acp-id-1", "Structured")];
@@ -1122,7 +1116,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn acp_table_renders_orphan_row_with_absent_model_as_dash() {
         // An orphan (no matching instance) with model=None and a legacy
@@ -1155,7 +1148,6 @@ mod tests {
     /// worker registry, so its key set is the migration contract for scripts
     /// that used `aoe acp ps --json` (#3023). Driven from a real `WorkerRecord`
     /// so the record-derived values, not just the key names, are pinned.
-    #[cfg(feature = "serve")]
     #[test]
     fn acp_json_schema_carries_every_old_key_plus_the_additions() {
         use crate::process::worker_registry::WorkerRecord;
@@ -1228,7 +1220,6 @@ mod tests {
     /// Story 3: the BUILD column surfaces the worker build version, tags a
     /// build-stale worker, and renders an empty (legacy) version as
     /// `<legacy>`. See #1754.
-    #[cfg(feature = "serve")]
     #[test]
     fn render_build_cell_cases() {
         let cases = [
@@ -1242,5 +1233,28 @@ mod tests {
         for (version, stale, expected) in cases {
             assert_eq!(render_build_cell(version, stale), expected, "{version:?}");
         }
+    }
+
+    /// C1 regression guard: `load_instances` must stamp `source_profile` on
+    /// each loaded instance. The status poll keys the profile-scoped
+    /// status-rule registry on it; if it stayed empty, a profile's rules would
+    /// install and look up under the empty profile and never match in `aoe ps`.
+    #[test]
+    #[serial_test::serial]
+    fn load_instances_stamps_source_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+
+        let storage = Storage::new_unwatched("pstest").unwrap();
+        storage
+            .update(|i, _| {
+                *i = vec![Instance::new("sess", "/tmp/sess")];
+                Ok(())
+            })
+            .unwrap();
+
+        let loaded = load_instances("pstest", true);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].source_profile, "pstest");
     }
 }

@@ -7,8 +7,23 @@ use std::path::PathBuf;
 
 use crate::containers;
 use crate::session::builder;
-use crate::session::repo_config;
-use crate::session::{civilizations, GroupTree, Instance, SandboxInfo, Storage};
+use crate::session::config::repo_config;
+use crate::session::{
+    acquire_session_identity_lock, civilizations, duplicate_session_error, is_duplicate_session,
+    GroupTree, Instance, SandboxInfo, Storage,
+};
+
+/// Parse one `--repo-base <repo>=<branch>` pair. Split on the first `=` so a
+/// branch containing one still parses.
+fn parse_repo_base(raw: &str) -> Result<(String, String), String> {
+    let (repo, branch) = raw
+        .split_once('=')
+        .ok_or_else(|| format!("expected <repo>=<branch>, got '{raw}'"))?;
+    if repo.trim().is_empty() || branch.trim().is_empty() {
+        return Err(format!("expected <repo>=<branch>, got '{raw}'"));
+    }
+    Ok((repo.trim().to_string(), branch.trim().to_string()))
+}
 
 #[derive(Args)]
 pub struct AddArgs {
@@ -68,6 +83,14 @@ pub struct AddArgs {
     #[arg(long = "base-branch")]
     base_branch: Option<String>,
 
+    /// Base branch for one repo of a multi-repo workspace, as
+    /// `<repo>=<branch>` (repeatable). `<repo>` is the repo's directory name
+    /// or the path you passed to `--repo`. Outranks `--base-branch`, which
+    /// stays the base for every repo this does not name. Example:
+    /// `--base-branch develop --repo-base api=epic/checkout`.
+    #[arg(long = "repo-base", value_parser = parse_repo_base)]
+    repo_bases: Vec<(String, String)>,
+
     /// Additional repositories for multi-repo workspace (use with --worktree)
     #[arg(long = "repo", short = 'r')]
     extra_repos: Vec<PathBuf>,
@@ -114,19 +137,16 @@ pub struct AddArgs {
     /// to the terminal (raw tmux/PTY) so the CLI matches the TUI; pass this
     /// (or `--agent`) to opt into the structured rendering. Ignored for
     /// tools with no ACP adapter.
-    #[cfg(feature = "serve")]
     #[arg(long = "structured-view")]
     structured_view: bool,
 
-    /// Pick a specific ACP agent for the structured view (e.g., aoe-agent,
-    /// claude-code).
-    #[cfg(feature = "serve")]
+    /// Pick a specific ACP agent for the structured view (e.g., claude-code,
+    /// codex).
     #[arg(long = "agent")]
     agent: Option<String>,
 
-    /// Override the model used by aoe-agent (e.g., claude-opus-4-7,
+    /// Override the model used by the ACP agent (e.g., claude-opus-4-7,
     /// gpt-5, gemini-2.5-pro). Forwarded to the agent at session start.
-    #[cfg(feature = "serve")]
     #[arg(long = "model")]
     model: Option<String>,
 
@@ -140,6 +160,7 @@ pub struct AddArgs {
             "worktree_branch",
             "create_branch",
             "base_branch",
+            "repo_bases",
             "extra_repos",
             "projects",
             "no_submodules",
@@ -194,6 +215,10 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         bail!("--repo/--project requires --worktree to specify a branch\nTip: aoe add /path --project repoB -w branch-name");
     }
 
+    if !args.repo_bases.is_empty() && explicit_worktree_branch(&args).is_none() {
+        bail!("--repo-base requires --worktree to specify a branch\nTip: aoe add /path --project repoB -w branch-name --repo-base repoB=develop");
+    }
+
     let resolved_project_paths: Vec<PathBuf> = if args.projects.is_empty() {
         Vec::new()
     } else {
@@ -213,7 +238,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     // happened to run `aoe add --scratch` in, which breaks the
     // project-less contract. Fall back to the profile-only resolver.
     let config = if args.scratch {
-        crate::session::profile_config::resolve_config_or_warn(profile)
+        crate::session::config::profile_config::resolve_config_or_warn(profile)
     } else {
         repo_config::resolve_config_with_repo_or_warn(profile, &path)
     };
@@ -256,12 +281,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     // incoherent: structured fork is its own flow (ACP `session/fork`) and is
     // offered from the web dashboard, not here. Reject it here, before any
     // worktree or scratch directory is created, so the refusal leaks nothing.
-    // The structured-view flags are serve-gated, so `wants_structured` is
-    // always false on bare-core.
-    #[cfg(feature = "serve")]
     let wants_structured = args.structured_view || args.agent.is_some();
-    #[cfg(not(feature = "serve"))]
-    let wants_structured = false;
     if args.fork_from.is_some() && wants_structured {
         bail!(
             "`--fork-from` performs a terminal fork and cannot be combined with \
@@ -382,7 +402,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         let seed = crate::session::fork::terminal_fork_seed(
             &resolved_tool,
             parent_agent_session_id.as_deref(),
-            crate::session::capture::generate_claude_session_id(),
+            crate::session::capture::generate_session_uuid(),
         )
         .map_err(|denied| match denied {
             crate::session::ForkDenied::AgentCannotFork => anyhow::anyhow!(
@@ -421,16 +441,26 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 builder::resolve_base_branch(session_base, project, global_default)
             };
 
+            // An explicit `--repo-base` for a repo outranks every shared layer,
+            // so one repo can fork from develop while others fork from their
+            // own epic branches. See #3329.
+            let mut all_paths = vec![path.clone()];
+            all_paths.extend(all_extra_repos.iter().cloned());
+            let per_repo = builder::resolve_repo_base_selectors(&all_paths, &args.repo_bases)?;
+
             // The launch repo never consults the per-project layer: explicit
             // session base, then the global/profile default.
             let primary = builder::WorkspaceRepoSpec {
-                base_branch: builder::resolve_base_branch(session_base, None, global_default),
+                base_branch: per_repo
+                    .get(&path)
+                    .cloned()
+                    .or_else(|| builder::resolve_base_branch(session_base, None, global_default)),
                 path: path.clone(),
             };
             let extra_repos: Vec<builder::WorkspaceRepoSpec> = all_extra_repos
                 .iter()
                 .map(|p| builder::WorkspaceRepoSpec {
-                    base_branch: resolve_extra(p),
+                    base_branch: per_repo.get(p).cloned().or_else(|| resolve_extra(p)),
                     path: p.clone(),
                 })
                 .collect();
@@ -534,14 +564,25 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 }
 
                 println!("Creating worktree at: {}", worktree_path.display());
+                // One repo, so a `--repo-base` can only name this one. Resolved
+                // rather than ignored, so a typo'd selector fails loudly. Keyed
+                // by the repo root, not the launch path: launching from a
+                // subdirectory would otherwise only match that subdirectory's
+                // name, and the documented selector is the repo's own name.
+                let per_repo = builder::resolve_repo_base_selectors(
+                    std::slice::from_ref(&main_repo_path),
+                    &args.repo_bases,
+                )?;
                 // Single-repo sessions only have the launch repo, so fall back
                 // from the explicit session base to the global/profile default.
                 let base = if args.create_branch {
-                    builder::resolve_base_branch(
-                        args.base_branch.as_deref(),
-                        None,
-                        config.worktree.default_base_branch.as_deref(),
-                    )
+                    per_repo.get(&main_repo_path).cloned().or_else(|| {
+                        builder::resolve_base_branch(
+                            args.base_branch.as_deref(),
+                            None,
+                            config.worktree.default_base_branch.as_deref(),
+                        )
+                    })
                 } else {
                     None
                 };
@@ -587,11 +628,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     // The title was resolved before worktree creation (so a tied session could
     // seed its directory leaf from it); run the path-dependent duplicate check
     // now that `path` points at the final worktree/workspace directory.
-    if is_duplicate_session(&instances, &final_title, path.to_str().unwrap_or("")) {
-        println!(
-            "Session already exists with same title and path: {}",
-            final_title
-        );
+    if is_duplicate_session(&instances, &final_title, path.to_str().unwrap_or(""), None) {
         cleanup_partial_session(
             &path,
             worktree_info_opt.as_ref(),
@@ -600,7 +637,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             None,
             None,
         );
-        return Ok(());
+        return Err(duplicate_session_error(&final_title));
     }
 
     let mut instance = Instance::new(&final_title, path.to_str().unwrap_or(""));
@@ -685,146 +722,171 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     // structured. `--structured-view` (or `--agent`, which names a specific
     // ACP agent) opts into the structured rendering; a non-ACP tool always
     // runs in the terminal view.
-    #[cfg(feature = "serve")]
-    {
-        // `--agent` is an explicit structured-view choice: the user named a
-        // specific ACP agent, so a missing adapter is a hard error rather
-        // than a silent downgrade.
-        let user_picked_agent = args.agent.is_some();
-        let user_wants_structured = args.structured_view || user_picked_agent;
-        // The `--fork-from` + structured-view refusal is hoisted above
-        // worktree/scratch creation (see the early fork-validation block) so it
-        // leaks no resources; nothing to re-check here.
-        instance.agent_name = args.agent.clone();
-        instance.agent_model = args.model.clone();
+    // `--agent` is an explicit structured-view choice: the user named a
+    // specific ACP agent, so a missing adapter is a hard error rather
+    // than a silent downgrade.
+    let user_picked_agent = args.agent.is_some();
+    let user_wants_structured = args.structured_view || user_picked_agent;
+    // The `--fork-from` + structured-view refusal is hoisted above
+    // worktree/scratch creation (see the early fork-validation block) so it
+    // leaks no resources; nothing to re-check here.
+    instance.agent_name = args.agent.clone();
+    instance.agent_model = args.model.clone();
 
-        let registry = crate::acp::agent_registry::AgentRegistry::with_defaults();
-        let agent_name = pick_acp_agent_name(
-            &registry,
-            &config.session,
-            &instance.tool,
-            instance.agent_name.as_deref(),
-        );
-        // Capability is judged against the explicit `--agent` (or, with none,
-        // the tool itself), NOT `pick_acp_agent_name`'s aoe-agent fallback:
-        // otherwise every tool would look ACP-capable via the bundled default
-        // and `--structured-view` could never be rejected for a non-ACP tool
-        // (it would silently substitute aoe-agent). Mirrors the server create
-        // path in `src/server/api/sessions.rs`.
-        let capability_key = instance
-            .agent_name
-            .as_deref()
-            .unwrap_or(instance.tool.as_str());
-        let acp_capable = registry.get(capability_key).is_some()
+    let registry = crate::acp::agent_registry::AgentRegistry::with_defaults();
+    let agent_name = pick_acp_agent_name(
+        &registry,
+        &config.session,
+        &config.acp,
+        &instance.tool,
+        instance.agent_name.as_deref(),
+    );
+    // Capability is judged against the explicit `--agent` (or, with none,
+    // the tool itself), NOT `pick_acp_agent_name`'s default-agent fallback:
+    // otherwise every tool would look ACP-capable via that default and
+    // `--structured-view` could never be rejected for a non-ACP tool (it
+    // would silently substitute the default). Mirrors the server create
+    // path in `src/server/api/sessions/create.rs`.
+    let capability_key = instance
+        .agent_name
+        .as_deref()
+        .unwrap_or(instance.tool.as_str());
+    let acp_capable = registry.get(capability_key).is_some()
             || config.session.agent_acp_cmd.contains_key(capability_key)
-            || config.session.agent_acp_cmd.contains_key(&instance.tool);
+            || config.session.agent_acp_cmd.contains_key(&instance.tool)
+            // A custom agent inheriting a registry-backed base via
+            // `agent_detect_as` (e.g. a Claude wrapper) runs in structured view
+            // through the base adapter.
+            || crate::acp::inherited_acp_base(capability_key, &config.session.agent_detect_as)
+                .is_some()
+            || crate::acp::inherited_acp_base(&instance.tool, &config.session.agent_detect_as)
+                .is_some();
 
-        if user_picked_agent && !acp_capable {
-            bail!(
-                "agent `{agent_name}` is not ACP-capable: it has no registry entry and no \
+    if user_picked_agent && !acp_capable {
+        bail!(
+            "agent `{agent_name}` is not ACP-capable: it has no registry entry and no \
                  `[session.agent_acp_cmd]` command.\n\
                  Run `aoe acp doctor` to see configured agents, or omit --agent for a \
                  terminal-view session."
-            );
-        }
+        );
+    }
 
-        if args.structured_view && !acp_capable {
-            bail!(
-                "tool `{}` is not ACP-capable, so --structured-view has no effect.\n\
+    if args.structured_view && !acp_capable {
+        bail!(
+            "tool `{}` is not ACP-capable, so --structured-view has no effect.\n\
                  Run `aoe acp doctor` to see configured agents, or drop --structured-view \
                  for a terminal-view session.",
-                instance.tool
-            );
-        }
+            instance.tool
+        );
+    }
 
-        instance.view = if user_wants_structured && acp_capable {
-            crate::session::View::Structured
-        } else {
-            crate::session::View::Terminal
-        };
+    instance.view = if user_wants_structured && acp_capable {
+        crate::session::View::Structured
+    } else {
+        crate::session::View::Terminal
+    };
 
-        // Precondition: the structured view needs the resolved ACP adapter
-        // binary on PATH. A missing adapter would otherwise surface as a
-        // silent 404 on the first prompt. When the user explicitly named
-        // an agent (--agent) we bail; otherwise (the default path) we fall
-        // back to the terminal view with a warning so `aoe add` still
-        // succeeds on a machine without the adapter installed.
-        if instance.is_structured() {
-            let (mut spec, spec_from_registry) = match registry.get(&agent_name) {
-                Some(spec) => (spec.clone(), true),
-                None => match config.session.agent_acp_cmd.get(&agent_name) {
+    // Precondition: the structured view needs the resolved ACP adapter
+    // binary on PATH. A missing adapter would otherwise surface as a
+    // silent 404 on the first prompt. When the user explicitly named
+    // an agent (--agent) we bail; otherwise (the default path) we fall
+    // back to the terminal view with a warning so `aoe add` still
+    // succeeds on a machine without the adapter installed.
+    if instance.is_structured() {
+        let (mut spec, spec_from_registry) = match registry.get(&agent_name) {
+            Some(spec) => (spec.clone(), true),
+            None => match config.session.agent_acp_cmd.get(&agent_name) {
+                Some(cmd) => (
+                    crate::acp::AgentSpec::from_acp_cmd(&agent_name, cmd)
+                        .map_err(|e| anyhow::anyhow!(e))?,
+                    false,
+                ),
+                None => match config.session.agent_acp_cmd.get(&instance.tool) {
                     Some(cmd) => (
-                        crate::acp::AgentSpec::from_acp_cmd(&agent_name, cmd)
+                        crate::acp::AgentSpec::from_acp_cmd(&instance.tool, cmd)
                             .map_err(|e| anyhow::anyhow!(e))?,
                         false,
                     ),
-                    None => match config.session.agent_acp_cmd.get(&instance.tool) {
-                        Some(cmd) => (
-                            crate::acp::AgentSpec::from_acp_cmd(&instance.tool, cmd)
-                                .map_err(|e| anyhow::anyhow!(e))?,
-                            false,
-                        ),
+                    // A custom agent inheriting a registry-backed base runs
+                    // that base's adapter; check that binary is on PATH.
+                    // Resolve inheritance from the same keys the capability
+                    // check accepted (`capability_key` for an explicit
+                    // --agent wrapper, else the tool), so `--tool X --agent
+                    // <wrapper>` where only the wrapper inherits does not
+                    // fall through to `unreachable!`.
+                    None => match crate::acp::inherited_acp_base(
+                        capability_key,
+                        &config.session.agent_detect_as,
+                    )
+                    .or_else(|| {
+                        crate::acp::inherited_acp_base(
+                            &instance.tool,
+                            &config.session.agent_detect_as,
+                        )
+                    })
+                    .and_then(|base| registry.get(&base).cloned())
+                    {
+                        Some(spec) => (spec, true),
                         None => unreachable!("acp_capable implies a resolvable spec"),
                     },
                 },
-            };
-            // Overlay session.agent_command_override the same way the agent
-            // spawn path does, so the precondition checks the binary that
-            // will actually launch (e.g. opencode-plannotator), not the
-            // bare registry binary. See #1910.
-            if let Some(ovr) = crate::server::acp_reconciler::command_override_for_spawn(
-                &instance.tool,
-                &instance.command,
-            ) {
-                crate::acp::supervisor::apply_agent_command_override(
-                    &agent_name,
-                    spec_from_registry,
-                    &ovr,
-                    &mut spec,
-                )?;
-            }
-            if !crate::cli::acp::command_present(&spec.command) {
-                let hint = crate::acp::install_hints::install_hint_for(&spec.command)
-                    .unwrap_or("install via your package manager and re-run");
-                if user_picked_agent {
-                    bail!(
-                        "ACP adapter `{}` is not installed or not on $PATH.\n\
+            },
+        };
+        // Overlay session.agent_command_override the same way the agent
+        // spawn path does, so the precondition checks the binary that
+        // will actually launch (e.g. opencode-plannotator), not the
+        // bare registry binary. See #1910.
+        if let Some(ovr) = crate::server::acp_reconciler::command_override_for_spawn(
+            &instance.tool,
+            &instance.command,
+        ) {
+            crate::acp::supervisor::apply_agent_command_override(
+                &agent_name,
+                spec_from_registry,
+                &ovr,
+                &mut spec,
+            )?;
+        }
+        if !crate::cli::acp::command_present(&spec.command) {
+            let hint = crate::acp::install_hints::install_hint_for(&spec.command)
+                .unwrap_or("install via your package manager and re-run");
+            if user_picked_agent {
+                bail!(
+                    "ACP adapter `{}` is not installed or not on $PATH.\n\
                          Install: {}\n\
                          Or run: aoe acp doctor --fix\n\
-                         Or use the bundled fallback: rerun with `--agent aoe-agent`\n\
                          Or use the terminal view: drop --agent / --structured-view.",
-                        spec.command,
-                        hint
-                    );
-                }
-                eprintln!(
-                    "warning: ACP adapter `{}` is not installed; this session will use the \
+                    spec.command,
+                    hint
+                );
+            }
+            eprintln!(
+                "warning: ACP adapter `{}` is not installed; this session will use the \
                      terminal view. Install it ({}) or run `aoe acp doctor --fix`, then \
                      switch the session to the structured view.",
-                    spec.command, hint
-                );
-                instance.view = crate::session::View::Terminal;
-            }
+                spec.command, hint
+            );
+            instance.view = crate::session::View::Terminal;
         }
+    }
 
-        // Pin the structured-view model AFTER the adapter check above, which may
-        // have downgraded the session to terminal. Only a session that stays
-        // structured persists the per-agent default: agent_model is ACP-only, so
-        // a terminal fallback must not retain an ACP-derived default. Routed
-        // through the shared resolver so an explicit --model wins and is trimmed
-        // identically to the web create path; an explicit --model on a
-        // downgraded session is left untouched. `agent_name` is the same key the
-        // spawn resolves defaults against (see pick_agent_for_tool). Effort has
-        // no Instance field, so the spawn path resolves the default effort.
-        if instance.is_structured() {
-            let defaults = config.acp.acp_defaults_for(&agent_name);
-            instance.agent_model = crate::session::config::resolve_spawn_model_effort(
-                defaults,
-                instance.agent_model.take(),
-                None,
-            )
-            .0;
-        }
+    // Pin the structured-view model AFTER the adapter check above, which may
+    // have downgraded the session to terminal. Only a session that stays
+    // structured persists the per-agent default: agent_model is ACP-only, so
+    // a terminal fallback must not retain an ACP-derived default. Routed
+    // through the shared resolver so an explicit --model wins and is trimmed
+    // identically to the web create path; an explicit --model on a
+    // downgraded session is left untouched. `agent_name` is the same key the
+    // spawn resolves defaults against (see pick_agent_for_tool). Effort has
+    // no Instance field, so the spawn path resolves the default effort.
+    if instance.is_structured() {
+        let defaults = config.acp.acp_defaults_for(&agent_name);
+        instance.agent_model = crate::session::config::resolve_spawn_model_effort(
+            defaults,
+            instance.agent_model.take(),
+            None,
+        )
+        .0;
     }
 
     // Apply the fork seed validated earlier (before worktree/scratch creation):
@@ -1046,11 +1108,34 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         return Err(e);
     }
 
+    // Hooks and all slow preparation are complete. Serialize only the final
+    // authoritative identity check and insert so a concurrent add or rename
+    // cannot commit the same `(title, project_path)` pair.
+    let _identity_lock = match acquire_session_identity_lock() {
+        Ok(lock) => lock,
+        Err(error) => {
+            cleanup_partial_session(
+                &path,
+                instance.worktree_info.as_ref(),
+                instance.workspace_info.as_ref(),
+                args.create_branch,
+                if instance.scratch {
+                    Some(std::path::Path::new(&instance.project_path))
+                } else {
+                    None
+                },
+                instance.sandbox_info.as_ref().map(|_| instance.id.as_str()),
+            );
+            return Err(error);
+        }
+    };
+
     let persist_result = storage.update(|all_instances, groups| {
         if is_duplicate_session(
-            all_instances,
+            all_instances.iter(),
             &instance.title,
             instance.project_path.as_str(),
+            None,
         ) {
             return Ok(false);
         }
@@ -1065,10 +1150,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     match persist_result {
         Ok(true) => {}
         Ok(false) => {
-            println!(
-                "Session already exists with same title and path: {}",
-                instance.title
-            );
             cleanup_partial_session(
                 &path,
                 instance.worktree_info.as_ref(),
@@ -1081,7 +1162,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 },
                 instance.sandbox_info.as_ref().map(|_| instance.id.as_str()),
             );
-            return Ok(());
+            return Err(duplicate_session_error(&instance.title));
         }
         Err(e) => {
             cleanup_partial_session(
@@ -1099,6 +1180,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             return Err(e);
         }
     }
+    drop(_identity_lock);
 
     println!("✓ Added session: {}", final_title);
     println!("  Profile: {}", storage.profile());
@@ -1127,10 +1209,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         }
     }
 
-    #[cfg(feature = "serve")]
     let is_acp = instance.is_structured();
-    #[cfg(not(feature = "serve"))]
-    let is_acp = false;
 
     if is_acp {
         // Acp sessions aren't backed by tmux: their ACP worker is
@@ -1177,11 +1256,27 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 }
 
                 let tmux_session = crate::tmux::Session::new(&instance.id, &instance.title)?;
-                tmux_session.attach()?;
+                if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+                    tmux_session.attach()?;
+                } else {
+                    // No controlling terminal (LaunchAgent, cron, or any
+                    // other headless caller): `tmux attach-session` needs a
+                    // TTY on both ends and would fail even though the
+                    // session above started fine. Skip the attach instead
+                    // of letting that failure roll a successful launch back
+                    // to an error.
+                    println!(
+                        "(no controlling terminal; session started without attaching. \
+                         Use `aoe -p {} session attach {}` to view it.)",
+                        shell_words::quote(storage.profile()),
+                        shell_words::quote(&instance.id)
+                    );
+                }
 
-                // The poller ran throughout the attached session but the CLI
-                // never drained it, dropping the observed id on detach. Drain it
-                // now (short bound: it is almost always already queued).
+                // The poller ran throughout the attach (or the launch above,
+                // headless) but the CLI never drained it, dropping the
+                // observed id. Drain it now (short bound: it is almost
+                // always already queued).
                 let file_watch = crate::file_watch::FileWatchService::noop();
                 crate::session::sync::capture_launched_session_id_blocking(
                     &mut instance,
@@ -1214,7 +1309,10 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     } else {
         println!();
         println!("Next steps:");
-        println!("  aoe session start {}   # Start the session", final_title);
+        println!(
+            "  aoe session start {}   # Start the session",
+            shell_words::quote(&final_title)
+        );
         println!("  aoe                         # Open TUI and press Enter to attach");
     }
 
@@ -1332,23 +1430,16 @@ fn cleanup_partial_session(
     }
 }
 
-pub fn is_duplicate_session(instances: &[Instance], title: &str, path: &str) -> bool {
-    let normalized_path = path.trim_end_matches('/');
-    instances.iter().any(|inst| {
-        let existing_path = inst.project_path.trim_end_matches('/');
-        existing_path == normalized_path && inst.title == title
-    })
-}
-
 /// Sync mirror of `Supervisor::pick_agent_for_tool` so add-time
 /// precondition checks can resolve the agent without spinning up the
 /// async supervisor. Precedence: explicit override → tool-keyed
-/// registry entry → custom agent with `agent_acp_cmd` → legacy
-/// (`claude` → `claude`, else `aoe-agent`).
-#[cfg(feature = "serve")]
+/// registry entry → custom agent with `agent_acp_cmd` → custom agent
+/// inheriting a registry-backed base via `agent_detect_as` (resolves to
+/// the base key) → `claude` for the claude tool, else `acp.default_agent`.
 fn pick_acp_agent_name(
     registry: &crate::acp::agent_registry::AgentRegistry,
     session: &crate::session::config::SessionConfig,
+    acp: &crate::session::config::AcpConfig,
     tool: &str,
     explicit_override: Option<&str>,
 ) -> String {
@@ -1363,10 +1454,15 @@ fn pick_acp_agent_name(
     if session.agent_acp_cmd.contains_key(tool) {
         return tool.to_string();
     }
+    // Custom agent inheriting a registry-backed base via `agent_detect_as`
+    // resolves to the base key so the built-in adapter path serves it.
+    if let Some(base) = crate::acp::inherited_acp_base(tool, &session.agent_detect_as) {
+        return base;
+    }
     if tool == "claude" {
         "claude".into()
     } else {
-        "aoe-agent".into()
+        acp.resolved_default_agent().to_string()
     }
 }
 
@@ -1379,18 +1475,18 @@ fn pick_acp_agent_name(
 /// Precedence mirrors the inline create flow: explicit `--tool`, then
 /// `--cmd`, then the resolved config default / first available tool / claude.
 fn resolve_tool_for_add(args: &AddArgs, config: &crate::session::Config) -> Result<String> {
-    if let Some(tool) = &args.tool {
+    let tool_name = if let Some(tool) = &args.tool {
         let selection = resolve_named_tool(tool, config)?;
         if selection.is_custom() && args.cmd_override.is_some() {
             bail!("--cmd-override cannot be used with configured custom agent --tool selections");
         }
-        Ok(selection.name().to_string())
+        selection.name().to_string()
     } else if let Some(cmd) = &args.command {
         let tool_name = detect_tool(cmd)?;
         // Verify the binary that will actually launch is on PATH before
         // creating the session. A configured session.agent_command_override
         // (or custom_agents) entry replaces the built-in binary, so check the
-        // resolved command, not the built-in name, otherwise `--cmd opencode`
+        // resolved command, not the built-in name, otherwise --cmd opencode
         // falsely bails when only the override binary (e.g.
         // opencode-plannotator) is installed. See #1910.
         match override_launch_binary(&tool_name, &config.session) {
@@ -1421,14 +1517,15 @@ fn resolve_tool_for_add(args: &AddArgs, config: &crate::session::Config) -> Resu
                 }
             }
         }
-        Ok(tool_name)
+        tool_name
     } else {
-        // Use default_tool from resolved config, then first available tool, then "claude".
-        // Check custom_agents first (exact match) before resolve_tool_name (substring match),
-        // so names like "lenovo-claude" resolve as the custom agent, not built-in "claude".
+        // Use default_tool from resolved config, then first available tool,
+        // then "claude". Check custom_agents first (exact match) before
+        // resolve_tool_name (substring match), so names like "lenovo-claude"
+        // resolve as the custom agent, not built-in "claude".
         let available_tools = crate::tmux::AvailableTools::detect();
         let tools_list = available_tools.available_list();
-        Ok(config
+        config
             .session
             .default_tool
             .as_deref()
@@ -1441,8 +1538,18 @@ fn resolve_tool_for_add(args: &AddArgs, config: &crate::session::Config) -> Resu
             })
             .or_else(|| tools_list.first().map(|s| s.as_str()))
             .unwrap_or("claude")
-            .to_string())
+            .to_string()
+    };
+
+    // One post-resolution emission point covers explicit tools, --cmd with
+    // or without a command override, and configured/default detection. A
+    // custom agent has no AgentDef and therefore never receives this warning.
+    if let Some(notice) =
+        crate::agents::get_agent(&tool_name).and_then(crate::agents::AgentDef::lifecycle_notice)
+    {
+        eprintln!("Warning: {tool_name} is {notice}");
     }
+    Ok(tool_name)
 }
 
 fn detect_tool(cmd: &str) -> Result<String> {
@@ -1581,8 +1688,28 @@ fn resolve_sandbox_image(
 
 #[cfg(test)]
 mod tests {
-    use super::{override_launch_binary, resolve_sandbox_image};
+    use super::{override_launch_binary, parse_repo_base, resolve_sandbox_image};
     use crate::session::config::SessionConfig;
+
+    #[test]
+    fn parse_repo_base_splits_on_the_first_equals() {
+        let ok = [
+            ("api=develop", ("api", "develop")),
+            // A path selector, and a branch containing '=' (rare but legal).
+            ("/src/api=epic/a=b", ("/src/api", "epic/a=b")),
+            (" api = develop ", ("api", "develop")),
+        ];
+        for (raw, (repo, branch)) in ok {
+            assert_eq!(
+                parse_repo_base(raw).unwrap(),
+                (repo.to_string(), branch.to_string()),
+                "{raw:?}"
+            );
+        }
+        for raw in ["api", "=develop", "api=", "  =  "] {
+            assert!(parse_repo_base(raw).is_err(), "{raw:?} should be rejected");
+        }
+    }
 
     const HARDCODED: &str = "ghcr.io/agent-of-empires/aoe-sandbox:latest";
 

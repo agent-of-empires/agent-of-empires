@@ -3,8 +3,10 @@ name: CI
 on:
   push:
     branches: [main]
+  # No branch filter: a stacked PR targets its parent branch rather than main,
+  # and a base filter would leave every PR but the bottom of the stack with no
+  # checks at all.
   pull_request:
-    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
@@ -31,11 +33,32 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: "false"
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo clippy -- -D warnings
+      # `--all-features` so the `web`-gated dashboard tree gets linted too.
+      # The web-dist placeholder stands in for the npm bundle that build.rs
+      # would otherwise build, so this job still needs no Node setup; same
+      # trick as the rustdoc step in the docs job.
+      - name: Clippy (all features)
+        run: |
+          mkdir -p target/ci-web-dist
+          printf '<!doctype html><title>aoe clippy placeholder</title>\n' > target/ci-web-dist/index.html
+          AOE_WEB_DIST="$PWD/target/ci-web-dist" cargo clippy --all-features -- -D warnings
+      # `serve` is a deprecated alias that only turns on `web` (#3619). A
+      # `cfg(feature = "serve")` would therefore compile out under
+      # `--features web` while still working under the alias: a silent split.
+      # Gate on the source so the alias stays inert until it is removed.
+      - name: Deprecated `serve` feature-gate guard
+        run: |
+          set -euo pipefail
+          hits="$(grep -rn 'feature *= *"serve"' --include='*.rs' src/ tests/ build.rs || true)"
+          if [ -n "$hits" ]; then
+            echo "::error::cfg(feature = serve) found; the serve feature is an alias for web. Use feature = web:"
+            printf '%s\n' "$hits"
+            exit 1
+          fi
       - name: file_watch consolidation guard
         run: |
           set -euo pipefail
@@ -94,15 +117,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: "false"
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check CLI docs are up-to-date
         run: |
-          mkdir -p target/ci-web-dist
-          printf '<!doctype html><title>aoe docs placeholder</title>\n' > target/ci-web-dist/index.html
-          AOE_WEB_DIST="$PWD/target/ci-web-dist" cargo xtask gen-docs
+          cargo xtask gen-docs
           git diff --exit-code docs/cli/reference.md \
             || (echo "::error::CLI docs are out of date. Run 'cargo xtask gen-docs' and commit." && exit 1)
       - name: Check rustdoc is warning-clean
@@ -111,7 +132,7 @@ jobs:
         run: |
           mkdir -p target/ci-web-dist
           printf '<!doctype html><title>aoe docs placeholder</title>\n' > target/ci-web-dist/index.html
-          AOE_WEB_DIST="$PWD/target/ci-web-dist" cargo doc --no-deps --features serve
+          AOE_WEB_DIST="$PWD/target/ci-web-dist" cargo doc --no-deps --features web
 
   skill:
     name: Skill Check
@@ -119,7 +140,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: "false"
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -139,6 +160,20 @@ jobs:
         with:
           persist-credentials: false
       - run: scripts/verify-shared-target.sh --self-test
+
+  pr-lookup-selftest:
+    name: PR Lookup Self-Test
+    runs-on: ubuntu-latest
+    # Guards the selector nix-npm-hash.yml uses to decide which PR it edits,
+    # labels `automated` and queues for auto-merge. No toolchain: feeds
+    # candidate lists (an internal PR, a fork PR on the same branch name,
+    # both, duplicates) through the selector and asserts it picks the
+    # base-repo PR or fails closed. Runs in seconds.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: python3 .github/scripts/select-internal-pr.py --self-test
 
   nix:
     name: Nix Eval

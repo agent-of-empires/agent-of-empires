@@ -15,7 +15,6 @@ export const docsNav: NavSection[] = [
     title: "Getting Started",
     items: [
       { title: "Introduction", href: "/docs/" },
-      { title: "Features", href: "/docs/features/" },
       { title: "Installation", href: "/docs/installation/" },
       { title: "Quick Start", href: "/docs/quick-start/" },
     ],
@@ -24,6 +23,7 @@ export const docsNav: NavSection[] = [
     title: "Guides",
     items: [
       { title: "Docker Sandbox", href: "/guides/sandbox/", description: "Run AI coding agents in isolated Docker containers." },
+      { title: "Claude Code Telemetry to Otari", href: "/guides/otari-telemetry/", description: "Export Claude Code usage from host and sandbox sessions to Otari." },
       { title: "Podman", href: "/guides/podman/", description: "Use Podman as a rootless alternative to Docker for sandboxing." },
       { title: "Apple Containers", href: "/guides/apple-containers/", description: "Sandbox agents with Apple's native container framework on macOS." },
       { title: "Live Mode", href: "/guides/live-mode/", description: "Watch a session stream live and type into it from the TUI." },
@@ -51,8 +51,6 @@ export const docsNav: NavSection[] = [
       { title: "Terminal View", href: "/guides/web/terminal/", description: "A real terminal in the browser, backed by your tmux session." },
       { title: "Diff View", href: "/guides/web/diff/", description: "Review and stage git changes from the web dashboard." },
       { title: "Settings & Profiles", href: "/guides/web/settings/", description: "Manage settings and configuration profiles from the web." },
-      { title: "Remote Phone Access", href: "/guides/remote-phone-access/", description: "Expose the dashboard over HTTPS with QR pairing." },
-      { title: "Tailscale Setup", href: "/guides/tailscale/", description: "Set up Tailscale from scratch for remote access to your AOE sessions." },
     ],
   },
   {
@@ -70,7 +68,6 @@ export const docsNav: NavSection[] = [
       { title: "CLI Reference", href: "/docs/cli/reference/" },
       { title: "HTTP API Reference", href: "/docs/api/" },
       { title: "Telemetry", href: "/docs/telemetry/" },
-      { title: "GitHub Integration", href: "/docs/github-integration/" },
       { title: "Configuration", href: "/docs/guides/configuration/" },
       { title: "Plugins", href: "/docs/plugins/" },
       { title: "Plugin API Reference", href: "/docs/plugin-api/" },
@@ -82,13 +79,7 @@ export const docsNav: NavSection[] = [
       { title: "Development", href: "/docs/development/" },
       { title: "Adding a New Agent", href: "/docs/development/adding-agents/" },
       { title: "Adding a Setting", href: "/docs/development/adding-settings/" },
-      { title: "Logging", href: "/docs/development/logging/" },
-      { title: "Playwright + Vitest testing", href: "/docs/development/playwright/" },
       { title: "Releases", href: "/docs/development/releases/" },
-      {
-        title: "Web Dashboard Development",
-        href: "/docs/development/web-dashboard/",
-      },
       { title: "Writing Plugins", href: "/docs/development/writing-plugins/" },
     ],
   },
@@ -96,8 +87,6 @@ export const docsNav: NavSection[] = [
     title: "Internals (Contributor)",
     items: [
       { title: "Structured View Internals", href: "/docs/development/internals/structured-view/" },
-      { title: "Sandbox Internals", href: "/docs/development/internals/sandbox/" },
-      { title: "Session & Worktree Internals", href: "/docs/development/internals/sessions/" },
       { title: "Plugin System Internals", href: "/docs/development/internals/plugin-system/" },
     ],
   },

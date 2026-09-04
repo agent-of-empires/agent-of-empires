@@ -21,6 +21,7 @@ import { StructuredViewRoot } from "../StructuredView";
 
 afterEach(() => {
   cleanup();
+  window.localStorage.clear();
   mockKeyboard.current = { isMobile: false, keyboardOpen: false, keyboardHeight: 0 };
 });
 
@@ -42,5 +43,39 @@ describe("StructuredViewRoot (#2011)", () => {
       </StructuredViewRoot>,
     );
     expect(screen.getByTestId("structured-view-root").style.paddingBottom).toBe("");
+  });
+
+  // The stored setting is an integer px value but reaches CSS as `rem`, so a
+  // reader who raised their browser's root font size keeps scaling: absolute
+  // px would pin the transcript at the authored size and ignore that setting.
+  it("publishes both conversation font sizes as rem without dropping the keyboard reservation", () => {
+    mockKeyboard.current = { isMobile: true, keyboardOpen: true, keyboardHeight: 300 };
+    window.localStorage.setItem(
+      "aoe-web-settings",
+      JSON.stringify({ structuredMobileFontSize: 11, structuredDesktopFontSize: 18 }),
+    );
+    render(
+      <StructuredViewRoot>
+        <div>child</div>
+      </StructuredViewRoot>,
+    );
+    const root = screen.getByTestId("structured-view-root");
+    expect(root.style.getPropertyValue("--acp-conversation-font-size-mobile")).toBe("0.6875rem");
+    expect(root.style.getPropertyValue("--acp-conversation-font-size-desktop")).toBe("1.125rem");
+    // The coarse-pointer + narrow-viewport rule that picks between them lives
+    // in CSS, so the root must carry the scope class it keys off.
+    expect(root.classList.contains("acp-conversation-scope")).toBe(true);
+    expect(root.style.paddingBottom).toBe("300px");
+  });
+
+  it("publishes the 14px default as 0.875rem, matching the pre-setting text-sm base", () => {
+    render(
+      <StructuredViewRoot>
+        <div>child</div>
+      </StructuredViewRoot>,
+    );
+    const root = screen.getByTestId("structured-view-root");
+    expect(root.style.getPropertyValue("--acp-conversation-font-size-mobile")).toBe("0.875rem");
+    expect(root.style.getPropertyValue("--acp-conversation-font-size-desktop")).toBe("0.875rem");
   });
 });

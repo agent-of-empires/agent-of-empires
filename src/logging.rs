@@ -492,15 +492,10 @@ impl std::fmt::Display for LogFilterError {
 
 impl std::error::Error for LogFilterError {}
 
-/// Optional top-of-stack layer injected at subscriber init. Only the
-/// serve daemon supplies a real one (the per-session tee, see
-/// `crate::acp::session_tee`); the acp module is `serve`-gated, so without
-/// that feature the slot is the no-op `Identity` layer and callers always
-/// pass `None`.
-#[cfg(feature = "serve")]
+/// Optional top-of-stack layer injected at subscriber init. Only the daemon
+/// supplies a real one (the per-session tee, see `crate::acp::session_tee`);
+/// every other caller passes `None`.
 pub type TeeLayer = crate::acp::session_tee::SessionTeeLayer;
-#[cfg(not(feature = "serve"))]
-pub type TeeLayer = tracing_subscriber::layer::Identity;
 
 pub fn init_subscriber(target: SubscriberTarget, filter: String) -> InitResult {
     init_subscriber_with_options(target, filter, false, None)
@@ -513,7 +508,11 @@ pub fn init_subscriber(target: SubscriberTarget, filter: String) -> InitResult {
 /// `http_request{request_id=... method=GET path=...}` prefixes on every
 /// downstream event. The full default formatter is still available when
 /// the user opts in via the settings toggle.
-struct NoSpanFormat;
+///
+/// `pub(crate)` so tests elsewhere can render events exactly the way a
+/// default-configured daemon writes them, which is the only rendering in
+/// which a missing event field is actually observable.
+pub(crate) struct NoSpanFormat;
 
 impl<S, N> tracing_subscriber::fmt::FormatEvent<S, N> for NoSpanFormat
 where

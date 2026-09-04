@@ -89,3 +89,31 @@ export function wheelNotches(
   const notches = Math.max(-maxNotches, Math.min(maxNotches, raw));
   return { notches, remainder: accumPx - notches * thresholdPx };
 }
+
+/**
+ * Map a frame cursor onto its bottom-anchored content. `cursorY` already
+ * indexes the composited frame. Pure so the mapping is testable without a DOM.
+ */
+export function cursorLineIndex(lineCount: number, screenRows: number, cursorY: number): number {
+  return Math.max(0, lineCount - screenRows) + cursorY;
+}
+
+/**
+ * Map a 1-based column and 0-based row from the composited window grid into
+ * pane 0's 1-based mouse coordinates. Subtract the optional origin, then
+ * clamp to the pane rectangle; missing origin fields mean `(0, 0)`.
+ */
+export function pointerPaneCell(
+  compositeCol: number,
+  compositeRow: number,
+  pane0: { cols: number; rows: number; left?: number; top?: number } | null | undefined,
+): { col: number; row: number } {
+  const left = pane0?.left ?? 0;
+  const top = pane0?.top ?? 0;
+  const cols = pane0?.cols ?? 1;
+  const rows = pane0?.rows ?? 1;
+  return {
+    col: Math.min(cols, Math.max(1, compositeCol - left)),
+    row: Math.min(rows, Math.max(1, compositeRow - top + 1)),
+  };
+}

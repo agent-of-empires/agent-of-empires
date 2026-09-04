@@ -1,23 +1,11 @@
 // @vitest-environment jsdom
-//
-// Reducer tests for the client-side prompt-queue feature (#1031),
-// plus hook-level drain-race regression tests for #1144 (queued
-// follow-ups silently dropped on reconnect).
-//
-// While a turn is running, sendPrompt dispatches `enqueue_prompt`
-// instead of the immediate POST path. The reducer keeps the queue
-// across re-renders so the drain effect can pop heads on Stopped, and
-// the QueuedPromptsStrip can render / edit / drop entries before they
-// fire.
 
 import { act, renderHook } from "@testing-library/react";
-import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { emptyAcpState, type QueuedPrompt } from "../lib/acpTypes";
-import { AgentProfileProvider } from "../lib/agentProfileContext";
-import { reportAcpInteraction } from "../lib/api";
-import { acpHookReducer, combineQueuedPrompts, useAcpSession } from "./useAcpSession";
+import { emptyAcpState } from "../lib/acpTypes";
+import { reportAcpInteraction, type ServerQueuedPrompt } from "../lib/api";
+import { acpHookReducer, clearAcpCache, useAcpSession } from "./useAcpSession";
 
 // Spy on the telemetry ping while keeping the rest of the api module real
 // (the hook also calls setSessionArchive / setSessionSnooze through it).
@@ -26,237 +14,122 @@ vi.mock("../lib/api", async (importActual) => {
   return { ...actual, reportAcpInteraction: vi.fn() };
 });
 
-describe("acpHookReducer / queue actions", () => {
-  it("emptyAcpState starts with an empty queue", () => {
-    expect(emptyAcpState().queuedPrompts).toEqual([]);
+describe("acpHookReducer / server-queue actions", () => {
+  it("enqueue_prompt appends an optimistic pending row keyed by the caller's id", () => {
+    const s1 = acpHookReducer(emptyAcpState(), { kind: "enqueue_prompt", id: "q1", text: "first" });
+    const s2 = acpHookReducer(s1, { kind: "enqueue_prompt", id: "q2", text: "second" });
+    expect(s2.queuedPrompts.map((q) => [q.id, q.text, q.pending])).toEqual([
+      ["q1", "first", true],
+      ["q2", "second", true],
+    ]);
   });
 
-  it("enqueue_prompt appends to the end of queuedPrompts", () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
-    try {
-      const s1 = acpHookReducer(emptyAcpState(), {
-        kind: "enqueue_prompt",
-        text: "first",
-      });
-      const s2 = acpHookReducer(s1, {
-        kind: "enqueue_prompt",
-        text: "second",
-      });
-      expect(s2.queuedPrompts).toHaveLength(2);
-      expect(s2.queuedPrompts[0]?.text).toBe("first");
-      expect(s2.queuedPrompts[1]?.text).toBe("second");
-      expect(s2.queuedPrompts[0]?.queuedAt).toBe("2026-01-01T00:00:00.000Z");
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("enqueue_prompt carries attachments onto the queued row (#1833)", () => {
-    const s1 = acpHookReducer(emptyAcpState(), {
+  it("enqueue_prompt carries attachments and omits the key for a text-only send", () => {
+    const withAtt = acpHookReducer(emptyAcpState(), {
       kind: "enqueue_prompt",
+      id: "q1",
       text: "with image",
-      attachments: [
-        {
-          kind: "image",
-          mimeType: "image/png",
-          dataB64: "aA==",
-          name: "x.png",
-        },
-      ],
+      attachments: [{ kind: "image", mimeType: "image/png", dataB64: "aA==", name: "x.png" }],
     });
-    expect(s1.queuedPrompts[0]?.attachments).toHaveLength(1);
-    expect(s1.queuedPrompts[0]?.attachments?.[0]?.name).toBe("x.png");
+    expect(withAtt.queuedPrompts[0]?.attachments?.[0]?.name).toBe("x.png");
+    const textOnly = acpHookReducer(emptyAcpState(), { kind: "enqueue_prompt", id: "q1", text: "t", attachments: [] });
+    expect(textOnly.queuedPrompts[0]?.attachments).toBeUndefined();
   });
 
-  it("enqueue_prompt omits the attachments key for a text-only send", () => {
-    const s1 = acpHookReducer(emptyAcpState(), {
-      kind: "enqueue_prompt",
-      text: "text only",
-    });
-    expect(s1.queuedPrompts[0]?.attachments).toBeUndefined();
-    const s2 = acpHookReducer(emptyAcpState(), {
-      kind: "enqueue_prompt",
-      text: "empty list",
-      attachments: [],
-    });
-    expect(s2.queuedPrompts[0]?.attachments).toBeUndefined();
+  it("dequeue_prompt / edit_queued_prompt / clear_queue mutate the overlay", () => {
+    let s = acpHookReducer(emptyAcpState(), { kind: "enqueue_prompt", id: "a", text: "first" });
+    s = acpHookReducer(s, { kind: "enqueue_prompt", id: "b", text: "second" });
+    s = acpHookReducer(s, { kind: "edit_queued_prompt", id: "b", text: "second (edited)" });
+    expect(s.queuedPrompts[1]?.text).toBe("second (edited)");
+    s = acpHookReducer(s, { kind: "dequeue_prompt", id: "a" });
+    expect(s.queuedPrompts.map((q) => q.id)).toEqual(["b"]);
+    s = acpHookReducer(s, { kind: "clear_queue" });
+    expect(s.queuedPrompts).toEqual([]);
   });
 
-  it("dequeue_prompt removes the matching entry by id", () => {
-    const s1 = acpHookReducer(emptyAcpState(), {
-      kind: "enqueue_prompt",
-      text: "first",
-    });
-    const s2 = acpHookReducer(s1, {
-      kind: "enqueue_prompt",
-      text: "second",
-    });
-    const headId = s2.queuedPrompts[0]?.id;
-    expect(headId).toBeDefined();
-    const s3 = acpHookReducer(s2, {
-      kind: "dequeue_prompt",
-      id: headId!,
-    });
-    expect(s3.queuedPrompts).toHaveLength(1);
-    expect(s3.queuedPrompts[0]?.text).toBe("second");
+  it("confirm_queued_prompt clears the pending flag on the matching row", () => {
+    const s1 = acpHookReducer(emptyAcpState(), { kind: "enqueue_prompt", id: "q1", text: "x" });
+    expect(s1.queuedPrompts[0]?.pending).toBe(true);
+    const s2 = acpHookReducer(s1, { kind: "confirm_queued_prompt", id: "q1" });
+    expect(s2.queuedPrompts[0]?.pending).toBe(false);
   });
 
-  it("dequeue_prompt is a no-op for a missing id", () => {
-    const s1 = acpHookReducer(emptyAcpState(), {
-      kind: "enqueue_prompt",
-      text: "first",
+  describe("hydrate_server_queue merge", () => {
+    const serverRow = (
+      id: string,
+      seq: number,
+      text: string,
+      atts?: ServerQueuedPrompt["attachments"],
+    ): ServerQueuedPrompt => ({
+      id,
+      seq,
+      text,
+      created_at: "2026-01-01T00:00:00.000Z",
+      ...(atts ? { attachments: atts } : {}),
     });
-    const s2 = acpHookReducer(s1, {
-      kind: "dequeue_prompt",
-      id: "nope",
-    });
-    expect(s2.queuedPrompts).toHaveLength(1);
-  });
 
-  it("edit_queued_prompt updates only the targeted entry's text", () => {
-    const s1 = acpHookReducer(emptyAcpState(), {
-      kind: "enqueue_prompt",
-      text: "first",
+    it("replaces the overlay with the server snapshot, dropping a confirmed local row the server no longer has", () => {
+      const enqueued = acpHookReducer(emptyAcpState(), { kind: "enqueue_prompt", id: "old", text: "gone from server" });
+      // Confirm it (pending cleared), so a later hydrate that omits it means
+      // the server drained/removed it while we were away -> drop it locally.
+      const confirmed = acpHookReducer(enqueued, { kind: "confirm_queued_prompt", id: "old" });
+      const next = acpHookReducer(confirmed, {
+        kind: "hydrate_server_queue",
+        rows: [serverRow("a", 0, "one"), serverRow("b", 1, "two")],
+      });
+      expect(next.queuedPrompts.map((q) => q.text)).toEqual(["one", "two"]);
     });
-    const s2 = acpHookReducer(s1, {
-      kind: "enqueue_prompt",
-      text: "second",
-    });
-    const targetId = s2.queuedPrompts[1]?.id;
-    expect(targetId).toBeDefined();
-    const s3 = acpHookReducer(s2, {
-      kind: "edit_queued_prompt",
-      id: targetId!,
-      text: "second (edited)",
-    });
-    expect(s3.queuedPrompts[0]?.text).toBe("first");
-    expect(s3.queuedPrompts[1]?.text).toBe("second (edited)");
-  });
 
-  it("clear_queue drops every entry", () => {
-    const s1 = acpHookReducer(emptyAcpState(), {
-      kind: "enqueue_prompt",
-      text: "first",
+    it("keeps a still-pending optimistic row the server snapshot does not have yet", () => {
+      const local = acpHookReducer(emptyAcpState(), { kind: "enqueue_prompt", id: "inflight", text: "just typed" });
+      const next = acpHookReducer(local, { kind: "hydrate_server_queue", rows: [serverRow("a", 0, "confirmed")] });
+      expect(next.queuedPrompts.map((q) => q.text)).toEqual(["confirmed", "just typed"]);
     });
-    const s2 = acpHookReducer(s1, {
-      kind: "enqueue_prompt",
-      text: "second",
-    });
-    const s3 = acpHookReducer(s2, { kind: "clear_queue" });
-    expect(s3.queuedPrompts).toEqual([]);
-  });
 
-  it("dequeue_prompts_by_id removes only the listed ids, preserving order", () => {
-    const s1 = acpHookReducer(emptyAcpState(), {
-      kind: "enqueue_prompt",
-      text: "first",
+    it("keeps local attachment bytes for a row we queued, for the thumbnail", () => {
+      const local = acpHookReducer(emptyAcpState(), {
+        kind: "enqueue_prompt",
+        id: "q1",
+        text: "img",
+        attachments: [{ kind: "image", mimeType: "image/png", dataB64: "REALBYTES", name: "a.png" }],
+      });
+      const confirmed = acpHookReducer(local, { kind: "confirm_queued_prompt", id: "q1" });
+      const next = acpHookReducer(confirmed, {
+        kind: "hydrate_server_queue",
+        rows: [
+          serverRow("q1", 0, "img", [{ id: "att1", kind: "image", mime_type: "image/png", name: "a.png", size: 9 }]),
+        ],
+      });
+      // Local bytes win so the strip can still render the thumbnail.
+      expect(next.queuedPrompts[0]?.attachments?.[0]?.dataB64).toBe("REALBYTES");
     });
-    const s2 = acpHookReducer(s1, {
-      kind: "enqueue_prompt",
-      text: "second",
-    });
-    const s3 = acpHookReducer(s2, {
-      kind: "enqueue_prompt",
-      text: "third",
-    });
-    const firstId = s3.queuedPrompts[0]!.id;
-    const thirdId = s3.queuedPrompts[2]!.id;
-    const s4 = acpHookReducer(s3, {
-      kind: "dequeue_prompts_by_id",
-      ids: [firstId, thirdId],
-    });
-    expect(s4.queuedPrompts).toHaveLength(1);
-    expect(s4.queuedPrompts[0]?.text).toBe("second");
-  });
 
-  it("dequeue_prompts_by_id with an empty id list is a no-op", () => {
-    const s1 = acpHookReducer(emptyAcpState(), {
-      kind: "enqueue_prompt",
-      text: "first",
+    it("builds a metadata-only attachment view from server refs when we have no local bytes", () => {
+      const next = acpHookReducer(emptyAcpState(), {
+        kind: "hydrate_server_queue",
+        rows: [
+          serverRow("q1", 0, "reloaded", [
+            { id: "att1", kind: "resource", mime_type: "text/plain", name: "notes.txt", size: 12 },
+          ]),
+        ],
+      });
+      const att = next.queuedPrompts[0]?.attachments?.[0];
+      expect(att).toMatchObject({ kind: "resource", mimeType: "text/plain", name: "notes.txt", dataB64: "" });
     });
-    const s2 = acpHookReducer(s1, {
-      kind: "dequeue_prompts_by_id",
-      ids: [],
-    });
-    expect(s2).toBe(s1);
-  });
-
-  it("queue is independent of activity / turnActive state", () => {
-    // Enqueue while a turn is mid-flight (turnActive=true, activity has
-    // a user_prompt row) and ensure the queue mutation does not clobber
-    // the rest of state.
-    const base = {
-      ...emptyAcpState(),
-      activity: [
-        {
-          id: "user-1",
-          kind: "user_prompt" as const,
-          text: "original",
-          at: "2026-01-01T00:00:00Z",
-        },
-      ],
-      turnActive: true,
-    };
-    const next = acpHookReducer(base, {
-      kind: "enqueue_prompt",
-      text: "queued follow-up",
-    });
-    expect(next.activity).toEqual(base.activity);
-    expect(next.turnActive).toBe(true);
-    expect(next.queuedPrompts[0]?.text).toBe("queued follow-up");
   });
 });
 
-describe("combineQueuedPrompts (combined drain mode)", () => {
-  const mk = (id: string, text: string): QueuedPrompt => ({
-    id,
-    text,
-    queuedAt: "2026-01-01T00:00:00.000Z",
-  });
-
-  it("joins entries with a blank line", () => {
-    const out = combineQueuedPrompts([mk("a", "first"), mk("b", "second"), mk("c", "third")]);
-    expect(out).toBe("first\n\nsecond\n\nthird");
-  });
-
-  it("preserves intra-entry newlines unchanged", () => {
-    const out = combineQueuedPrompts([mk("a", "line 1\nline 2"), mk("b", "after")]);
-    expect(out).toBe("line 1\nline 2\n\nafter");
-  });
-
-  it("returns an empty string for an empty queue", () => {
-    expect(combineQueuedPrompts([])).toBe("");
-  });
-
-  it("returns a single entry unchanged for a one-item queue", () => {
-    expect(combineQueuedPrompts([mk("a", "only one")])).toBe("only one");
-  });
-
-  it("skips empty (attachment-only) entries so no stray blank lines appear (#1833)", () => {
-    expect(combineQueuedPrompts([mk("a", "before"), mk("b", ""), mk("c", "after")])).toBe("before\n\nafter");
-    expect(combineQueuedPrompts([mk("a", ""), mk("b", "")])).toBe("");
-  });
-});
-
-// Hook-level regression tests for #1144: queued prompts were silently
-// dropped when the drain effect fired during the WS reconnect window.
-// connect() awaits fetchReplay BEFORE opening the WS, and replay can
-// dispatch a Stopped frame (turnActive flips to false). Under the prior
-// optimistic-clear ordering, the drain effect would fire while status
-// was still "connecting", clear the queue, then dispatchPromptNow would
-// bail with an error banner -- queue gone, message never sent.
+// --- Hook integration: optimistic overlay + server POSTs ---
 
 interface FakeSocket {
   url: string;
-  protocols: string[] | string | undefined;
   readyState: number;
   onopen: ((ev: Event) => void) | null;
   onclose: ((ev: CloseEvent) => void) | null;
   onerror: ((ev: Event) => void) | null;
   onmessage: ((ev: MessageEvent) => void) | null;
   close: () => void;
-  send: (data: string | ArrayBufferLike | Blob | ArrayBufferView) => void;
+  send: () => void;
 }
 
 const sockets: FakeSocket[] = [];
@@ -264,8 +137,7 @@ let originalWebSocket: typeof WebSocket;
 
 class FakeWebSocket implements FakeSocket {
   url: string;
-  protocols: string[] | string | undefined;
-  readyState: number = 0;
+  readyState = 0;
   onopen: ((ev: Event) => void) | null = null;
   onclose: ((ev: CloseEvent) => void) | null = null;
   onerror: ((ev: Event) => void) | null = null;
@@ -274,20 +146,13 @@ class FakeWebSocket implements FakeSocket {
   static OPEN = 1;
   static CLOSING = 2;
   static CLOSED = 3;
-  constructor(url: string, protocols?: string | string[]) {
+  constructor(url: string) {
     this.url = url;
-    this.protocols = protocols;
     sockets.push(this);
   }
   close(): void {
     this.readyState = FakeWebSocket.CLOSED;
-    if (this.onclose) {
-      this.onclose({
-        code: 1000,
-        reason: "test close",
-        wasClean: true,
-      } as CloseEvent);
-    }
+    this.onclose?.({ code: 1000, reason: "test", wasClean: true } as CloseEvent);
   }
   send(): void {
     /* no-op */
@@ -296,44 +161,94 @@ class FakeWebSocket implements FakeSocket {
 
 async function flushAsync(): Promise<void> {
   await act(async () => {
-    for (let i = 0; i < 8; i++) {
-      await Promise.resolve();
-    }
+    for (let i = 0; i < 8; i++) await Promise.resolve();
   });
 }
 
-describe("useAcpSession drain race (#1144)", () => {
-  let promptPostCount: number;
-  let promptPostStatus: number;
-  let promptPostBody: string;
-  let promptPostBodies: string[];
-  let replayResponse: { frames: unknown[]; lost: boolean; highest_seq: number };
+/** Records every fetch so tests can assert which endpoint was hit. Maintains a
+ *  tiny in-memory server queue so GET /queue reflects prior POSTs (for the
+ *  migration + hydrate paths). */
+interface Recorded {
+  method: string;
+  url: string;
+  body: string | null;
+}
+
+describe("useAcpSession server-queue integration", () => {
+  let calls: Recorded[];
+  let serverQueue: Map<string, ServerQueuedPrompt>;
+  /** Whether the fake daemon has a turn in flight. Since Tier 3 the daemon,
+   *  not the client, decides whether a prompt is sent or parked, so the fake
+   *  has to hold that state and answer `/acp/prompt` accordingly. */
+  let serverBusy: boolean;
+
+  const queueCalls = (suffix: string) => calls.filter((c) => c.url.includes(suffix));
 
   beforeEach(() => {
     sockets.length = 0;
-    promptPostCount = 0;
-    promptPostStatus = 200;
-    promptPostBody = "simulated failure";
-    promptPostBodies = [];
+    calls = [];
+    serverQueue = new Map();
+    serverBusy = false;
+    clearAcpCache();
     vi.mocked(reportAcpInteraction).mockClear();
-    replayResponse = { frames: [], lost: false, highest_seq: 0 };
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
         const url = typeof input === "string" ? input : input.toString();
+        const method = (init?.method ?? "GET").toUpperCase();
+        const body = typeof init?.body === "string" ? init.body : null;
+        calls.push({ method, url, body });
         if (url.includes("/acp/replay")) {
-          return new Response(JSON.stringify(replayResponse), { status: 200 });
+          return new Response(JSON.stringify({ frames: [], lost: false, highest_seq: 0 }), { status: 200 });
+        }
+        // /queue endpoints. Order matters: check the item path first.
+        const queueItem = url.match(/\/queue\/([^/?]+)/);
+        if (url.includes("/queue")) {
+          if (method === "GET") {
+            const rows = [...serverQueue.values()].sort((a, b) => a.seq - b.seq);
+            return new Response(JSON.stringify(rows), { status: 200 });
+          }
+          if (method === "POST" && body) {
+            const parsed = JSON.parse(body) as { id: string; text: string; created_at?: string };
+            const row: ServerQueuedPrompt = {
+              id: parsed.id,
+              seq: serverQueue.size,
+              text: parsed.text,
+              created_at: parsed.created_at ?? "2026-01-01T00:00:00.000Z",
+            };
+            serverQueue.set(parsed.id, row);
+            return new Response(JSON.stringify(row), { status: 200 });
+          }
+          if (method === "DELETE") {
+            if (queueItem) {
+              // 404 on a row that is already gone, like the real handler: that
+              // is how the client learns the drain claimed it.
+              const rid = decodeURIComponent(queueItem[1]!);
+              if (!serverQueue.delete(rid)) return new Response("queued prompt not found", { status: 404 });
+              return new Response(null, { status: 204 });
+            }
+            serverQueue.clear();
+            return new Response(null, { status: 204 });
+          }
+          if (method === "PATCH") return new Response(null, { status: 204 });
         }
         if (url.includes("/acp/prompt")) {
-          promptPostCount += 1;
-          if (typeof init?.body === "string") {
-            promptPostBodies.push(init.body);
+          // The daemon's dispatch decision (Tier 3). Busy means it parks the
+          // prompt on its own queue and reports the row id back.
+          if (method === "POST" && serverBusy) {
+            const parsed = JSON.parse(body ?? "{}") as { prompt_id?: string; text?: string };
+            const id = parsed.prompt_id ?? `srv-${serverQueue.size}`;
+            serverQueue.set(id, {
+              id,
+              seq: serverQueue.size,
+              text: parsed.text ?? "",
+              created_at: "2026-01-01T00:00:00.000Z",
+            });
+            return new Response(JSON.stringify({ disposition: "queued", queued_id: id }), { status: 202 });
           }
-          if (promptPostStatus >= 400) {
-            return new Response(promptPostBody, { status: promptPostStatus });
-          }
-          return new Response("{}", { status: promptPostStatus });
+          return new Response(JSON.stringify({ disposition: "sent" }), { status: 202 });
         }
+        if (url.includes("/acp/cancel")) return new Response("{}", { status: 200 });
         return new Response("{}", { status: 200 });
       }),
     );
@@ -344,1337 +259,174 @@ describe("useAcpSession drain race (#1144)", () => {
   afterEach(() => {
     global.WebSocket = originalWebSocket;
     vi.unstubAllGlobals();
+    clearAcpCache();
   });
 
-  it("enqueues without POSTing when sendPrompt is called while the WS is still connecting (#1359)", async () => {
-    const { result } = renderHook(() => useAcpSession("sess-drain-1"));
+  async function openSession(id: string) {
+    const hook = renderHook(() => useAcpSession(id));
     await flushAsync();
-    expect(sockets).toHaveLength(1);
-    // WS is still in CONNECTING (FakeWebSocket starts at readyState=0).
-    // sendPrompt should not POST (drain effect is gated on status ===
-    // "open"), and per #1359 it should also not drop the message: park
-    // it in the queue so the drain effect can fire it once the socket
-    // reopens.
+    const ws = sockets[sockets.length - 1]!;
     act(() => {
-      void result.current.sendPrompt("queued before open");
+      ws.readyState = FakeWebSocket.OPEN;
+      ws.onopen?.({} as Event);
     });
     await flushAsync();
-    expect(promptPostCount).toBe(0);
-    expect(result.current.state.queuedPrompts).toHaveLength(1);
-    expect(result.current.state.queuedPrompts[0]?.text).toBe("queued before open");
-  });
+    return { ...hook, ws };
+  }
 
-  // #1888: parking a prompt because the agent is busy is the one acp
-  // interaction the daemon cannot observe (the queue is client-only), so the
-  // browser pings it for opt-in telemetry.
-  it("reports a prompt_queued telemetry interaction when a prompt parks (#1888)", async () => {
-    const { result } = renderHook(() => useAcpSession("sess-queue-ping"));
-    await flushAsync();
-    // WS still CONNECTING, so sendPrompt parks the prompt rather than POSTing.
+  it("renders the queue row the daemon reports when it parks a busy-turn prompt", async () => {
+    const { result, ws } = await openSession("sess-busy");
+    // Kick a turn so the daemon is busy; a follow-up must come back `queued`.
+    serverBusy = true;
     act(() => {
-      void result.current.sendPrompt("parked, please count me");
+      ws.onmessage?.({
+        data: JSON.stringify({ session_id: "sess-busy", seq: 1, event: { UserPromptSent: { text: "kick" } } }),
+      } as MessageEvent);
     });
     await flushAsync();
-    expect(result.current.state.queuedPrompts).toHaveLength(1);
-    expect(reportAcpInteraction).toHaveBeenCalledTimes(1);
+    expect(result.current.state.turnActive).toBe(true);
+
+    act(() => {
+      void result.current.sendPrompt("follow-up");
+    });
+    await flushAsync();
+
+    // Exactly one POST, to /acp/prompt. The client no longer decides to queue,
+    // so it must NOT also POST to /queue: the daemon already created the row
+    // and a second POST would be a duplicate.
+    const prompts = queueCalls("/acp/prompt").filter((c) => c.method === "POST");
+    expect(prompts).toHaveLength(1);
+    expect(JSON.parse(prompts[0]!.body!)).toMatchObject({ text: "follow-up" });
+    expect(queueCalls("/queue").filter((c) => c.method === "POST")).toHaveLength(0);
+    // And the row the daemon reported renders as confirmed, not pending.
+    expect(result.current.state.queuedPrompts.map((q) => q.text)).toEqual(["follow-up"]);
+    expect(result.current.state.queuedPrompts[0]?.pending).toBe(false);
     expect(reportAcpInteraction).toHaveBeenCalledWith("prompt_queued");
   });
 
-  it("does not report a prompt_queued interaction when a prompt POSTs directly (#1888)", async () => {
-    const { result } = renderHook(() => useAcpSession("sess-queue-noping"));
-    await flushAsync();
-    const ws = sockets[0]!;
-    act(() => {
-      ws.readyState = FakeWebSocket.OPEN;
-      ws.onopen?.({} as Event);
-    });
-    await flushAsync();
-    act(() => {
-      void result.current.sendPrompt("sent straight through");
-    });
-    await flushAsync();
-    expect(promptPostCount).toBe(1);
-    expect(reportAcpInteraction).not.toHaveBeenCalled();
-  });
-
-  // #3173: aoe serve --host <LAN-IP> is plain HTTP on a non-loopback host,
-  // which is not a secure context, so crypto.randomUUID is undefined there.
-  // sendPrompt must not throw building the optimistic id; it should still
-  // POST the prompt.
-  it("still POSTs when crypto.randomUUID is unavailable (insecure context, #3173)", async () => {
-    // Shadow only randomUUID on the real crypto instance; a full stub
-    // object (e.g. `{...globalThis.crypto}`) drops inherited members
-    // like getRandomValues, which would mask this test behind an
-    // unrelated getOrCreateDeviceBindingSecret failure path.
-    const originalRandomUUID = globalThis.crypto.randomUUID;
-    Object.defineProperty(globalThis.crypto, "randomUUID", { value: undefined, configurable: true });
-    try {
-      const { result } = renderHook(() => useAcpSession("sess-insecure-context"));
-      await flushAsync();
-      const ws = sockets[0]!;
-      act(() => {
-        ws.readyState = FakeWebSocket.OPEN;
-        ws.onopen?.({} as Event);
-      });
-      await flushAsync();
-      await act(async () => {
-        await result.current.sendPrompt("sent over plain http");
-      });
-      expect(promptPostCount).toBe(1);
-    } finally {
-      Object.defineProperty(globalThis.crypto, "randomUUID", {
-        value: originalRandomUUID,
-        configurable: true,
-      });
-    }
-  });
-
-  it("reports a prompt_queued interaction on the retryable-failure requeue path (#1888)", async () => {
-    // Idle-dormant wake: the worker was reaped, so sendPrompt POSTs directly
-    // to wake it. When that POST fails retryably (worker_not_ready 503), the
-    // prompt is re-queued, and that re-queue must ping telemetry too.
-    const { result } = renderHook(() => useAcpSession("sess-retry-requeue", "absent"));
-    await flushAsync();
-    const ws = sockets[0]!;
-    act(() => {
-      ws.readyState = FakeWebSocket.OPEN;
-      ws.onopen?.({} as Event);
-    });
-    await flushAsync();
-    // idle_auto_stop sets workerIdleStopped (not workerStopped), so sendPrompt
-    // takes the direct-POST wake path rather than parking up front.
-    act(() => {
-      ws.onmessage?.({
-        data: JSON.stringify({
-          session_id: "sess-retry-requeue",
-          seq: 1,
-          event: { Stopped: { reason: "idle_auto_stop" } },
-        }),
-      } as MessageEvent);
-    });
-    await flushAsync();
-    expect(result.current.state.workerIdleStopped).toBe(true);
-
-    // Force the wake POST to fail retryably.
-    promptPostStatus = 503;
-    promptPostBody = "worker_not_ready";
-    act(() => {
-      void result.current.sendPrompt("retry me");
-    });
-    await flushAsync();
-
-    expect(promptPostCount).toBe(1);
-    expect(result.current.state.queuedPrompts).toHaveLength(1);
-    expect(reportAcpInteraction).toHaveBeenCalledTimes(1);
-    expect(reportAcpInteraction).toHaveBeenCalledWith("prompt_queued");
-  });
-
-  // #2805: mid-turn is the one gate steering removes. On a steerable
-  // agent the prompt POSTs straight through and the daemon injects it
-  // into the running turn; on every other agent it still parks.
-  //
-  // A pending cancel parks even on a steerable agent. The daemon reads a
-  // prompt arriving mid-cancel as "user hit Stop and re-typed, agent is
-  // wedged" and escalates to a runner restart, so POSTing there would
-  // respawn the worker on a Stop-then-type that used to just queue.
-  //
-  // A running `/compact` parks for the same shape of reason (#3219): the
-  // turn is only summarizing context, so the adapter answers `Injected`
-  // and swallows the message into a turn that never replies to it, with no
-  // Retry pill and no re-dispatch. Parking sends it as the next turn.
-  it.each([
-    { steering: true, cancelling: false, compacting: false, expectedPosts: 2, expectedQueued: 0 },
-    { steering: false, cancelling: false, compacting: false, expectedPosts: 1, expectedQueued: 1 },
-    { steering: true, cancelling: true, compacting: false, expectedPosts: 1, expectedQueued: 1 },
-    { steering: true, cancelling: false, compacting: true, expectedPosts: 1, expectedQueued: 1 },
-  ])(
-    "mid-turn prompt with steering=$steering cancelling=$cancelling compacting=$compacting (#2805, #3219)",
-    async ({ steering, cancelling, compacting, expectedPosts, expectedQueued }) => {
-      const sessionId = `sess-steer-${String(steering)}-${String(cancelling)}-${String(compacting)}`;
-      const { result } = renderHook(() => useAcpSession(sessionId));
-      await flushAsync();
-      const ws = sockets[0]!;
-      act(() => {
-        ws.readyState = FakeWebSocket.OPEN;
-        ws.onopen?.({} as Event);
-      });
-      await flushAsync();
-
-      act(() => {
-        ws.onmessage?.({
-          data: JSON.stringify({
-            session_id: sessionId,
-            seq: 1,
-            event: {
-              PromptCapabilities: {
-                image: false,
-                audio: false,
-                embedded_context: false,
-                steering,
-              },
-            },
-          }),
-        } as MessageEvent);
-      });
-      await flushAsync();
-
-      // First prompt starts the turn.
-      act(() => {
-        void result.current.sendPrompt("start the turn");
-      });
-      await flushAsync();
-      act(() => {
-        ws.onmessage?.({
-          data: JSON.stringify({
-            session_id: sessionId,
-            seq: 2,
-            event: { UserPromptSent: { text: "start the turn" } },
-          }),
-        } as MessageEvent);
-      });
-      await flushAsync();
-      expect(result.current.state.turnActive).toBe(true);
-
-      if (cancelling) {
-        act(() => {
-          ws.onmessage?.({
-            data: JSON.stringify({
-              session_id: sessionId,
-              seq: 3,
-              event: { CancelRequested: { escalates_at: "2026-01-01T00:00:10Z" } },
-            }),
-          } as MessageEvent);
-        });
-        await flushAsync();
-        expect(result.current.state.cancelling).toBe(true);
-        // The turn is still running; only the cancel is pending.
-        expect(result.current.state.turnActive).toBe(true);
-      }
-
-      if (compacting) {
-        act(() => {
-          ws.onmessage?.({
-            data: JSON.stringify({
-              session_id: sessionId,
-              seq: 3,
-              event: "ConversationCompactionStarted",
-            }),
-          } as MessageEvent);
-        });
-        await flushAsync();
-        expect(result.current.state.compacting).toBe(true);
-        // The /compact turn is still running; it just cannot be steered.
-        expect(result.current.state.turnActive).toBe(true);
-      }
-
-      act(() => {
-        void result.current.sendPrompt("also check the tests");
-      });
-      await flushAsync();
-
-      expect(promptPostCount).toBe(expectedPosts);
-      expect(result.current.state.queuedPrompts).toHaveLength(expectedQueued);
-    },
-  );
-
-  it("drains the queue once the WS opens after an inactive-state enqueue (#1359)", async () => {
-    const { result } = renderHook(() => useAcpSession("sess-drain-resume"));
-    await flushAsync();
-    const ws = sockets[0]!;
-    // Enqueue while WS is still CONNECTING: per #1359 sendPrompt parks
-    // the entry rather than erroring.
-    act(() => {
-      void result.current.sendPrompt("parked while offline");
-    });
-    await flushAsync();
-    expect(promptPostCount).toBe(0);
-    expect(result.current.state.queuedPrompts).toHaveLength(1);
-
-    // Open the socket; the drain effect should now POST the parked
-    // entry and clear the queue.
-    act(() => {
-      ws.readyState = FakeWebSocket.OPEN;
-      ws.onopen?.({} as Event);
-    });
-    await flushAsync();
-    expect(promptPostCount).toBe(1);
-    expect(promptPostBodies[0]).toContain("parked while offline");
-    expect(result.current.state.queuedPrompts).toEqual([]);
-  });
-
-  it("enqueues when sendPrompt is called while workerStopped is true (#1359)", async () => {
-    const { result } = renderHook(() => useAcpSession("sess-stopped"));
-    await flushAsync();
-    const ws = sockets[0]!;
-    act(() => {
-      ws.readyState = FakeWebSocket.OPEN;
-      ws.onopen?.({} as Event);
-    });
-    await flushAsync();
-
-    // Push a `Stopped { reason: "user_stopped" }` frame so the reducer
-    // sets workerStopped=true. The drain effect parks on that flag, and
-    // per #1359 sendPrompt mirrors the same guard so user-typed
-    // messages also park instead of POSTing into a stopped worker.
-    act(() => {
-      ws.onmessage?.({
-        data: JSON.stringify({
-          session_id: "sess-stopped",
-          seq: 1,
-          event: { Stopped: { reason: "user_stopped" } },
-        }),
-      } as MessageEvent);
-    });
-    await flushAsync();
-    expect(result.current.state.workerStopped).toBe(true);
-
-    act(() => {
-      void result.current.sendPrompt("typed while stopped");
-    });
-    await flushAsync();
-    expect(promptPostCount).toBe(0);
-    expect(result.current.state.queuedPrompts).toHaveLength(1);
-    expect(result.current.state.queuedPrompts[0]?.text).toBe("typed while stopped");
-  });
-
-  it("a fresh prompt POSTs (wakes) instead of parking when the worker is idle-dormant (#1689)", async () => {
-    // workerState="absent": the reconciler reaped the worker for
-    // inactivity. The REST poll reads "absent" until the respawn lands.
-    const { result } = renderHook(() => useAcpSession("sess-idle-fresh", "absent"));
-    await flushAsync();
-    const ws = sockets[0]!;
-    act(() => {
-      ws.readyState = FakeWebSocket.OPEN;
-      ws.onopen?.({} as Event);
-    });
-    await flushAsync();
-
-    // Control: a plain absent worker (cold resume, no idle_auto_stop)
-    // still parks — that guard is unchanged.
-    act(() => {
-      void result.current.sendPrompt("typed during cold resume");
-    });
-    await flushAsync();
-    expect(promptPostCount).toBe(0);
-    expect(result.current.state.queuedPrompts).toHaveLength(1);
-    act(() => {
-      void result.current.removeQueuedPrompt(result.current.state.queuedPrompts[0]!.id);
-    });
-    await flushAsync();
-
-    // The daemon publishes idle_auto_stop: the worker is dormant and a
-    // prompt POST is the wake path. A freshly-typed prompt must POST
-    // directly (the server clears dormancy + respawns + delivers)
-    // rather than parking in the local queue forever — the bug.
-    act(() => {
-      ws.onmessage?.({
-        data: JSON.stringify({
-          session_id: "sess-idle-fresh",
-          seq: 1,
-          event: { Stopped: { reason: "idle_auto_stop" } },
-        }),
-      } as MessageEvent);
-    });
-    await flushAsync();
-    expect(result.current.state.workerIdleStopped).toBe(true);
-
-    act(() => {
-      void result.current.sendPrompt("wake me up");
-    });
-    await flushAsync();
-    expect(promptPostCount).toBe(1);
-    expect(promptPostBodies[0]).toContain("wake me up");
-    expect(result.current.state.queuedPrompts).toEqual([]);
-  });
-
-  it("drains a prompt parked before idle_auto_stop once dormancy lands (#1689)", async () => {
-    // The real stuck scenario: a prompt was queued while the worker was
-    // a cold-absent resume, then the reconciler reaped it to dormant.
-    // The dormancy signal must let the drain effect fire the parked
-    // prompt (the wake POST), otherwise it sits queued forever.
-    const { result } = renderHook(() => useAcpSession("sess-idle-drain", "absent"));
-    await flushAsync();
-    const ws = sockets[0]!;
-    act(() => {
-      ws.readyState = FakeWebSocket.OPEN;
-      ws.onopen?.({} as Event);
-    });
-    await flushAsync();
-
-    act(() => {
-      void result.current.sendPrompt("parked before dormancy");
-    });
-    await flushAsync();
-    expect(promptPostCount).toBe(0);
-    expect(result.current.state.queuedPrompts).toHaveLength(1);
-
-    act(() => {
-      ws.onmessage?.({
-        data: JSON.stringify({
-          session_id: "sess-idle-drain",
-          seq: 1,
-          event: { Stopped: { reason: "idle_auto_stop" } },
-        }),
-      } as MessageEvent);
-    });
-    await flushAsync();
-    expect(result.current.state.workerIdleStopped).toBe(true);
-    expect(promptPostCount).toBe(1);
-    expect(promptPostBodies[0]).toContain("parked before dormancy");
-    expect(result.current.state.queuedPrompts).toEqual([]);
-  });
-
-  it("keeps an idle-dormant prompt queued without an error banner on a worker_not_ready 503 (#1748)", async () => {
-    const { result } = renderHook(() => useAcpSession("sess-idle-503", "absent"));
-    await flushAsync();
-    const ws = sockets[0]!;
-    act(() => {
-      ws.readyState = FakeWebSocket.OPEN;
-      ws.onopen?.({} as Event);
-    });
-    await flushAsync();
-
-    // Worker reaped for inactivity: dormant.
-    act(() => {
-      ws.onmessage?.({
-        data: JSON.stringify({
-          session_id: "sess-idle-503",
-          seq: 1,
-          event: { Stopped: { reason: "idle_auto_stop" } },
-        }),
-      } as MessageEvent);
-    });
-    await flushAsync();
-    expect(result.current.state.workerIdleStopped).toBe(true);
-
-    // The wake POST goes out, but the respawn did not finish within the
-    // server's wait window, so it returns the typed retryable 503. The
-    // prompt must NOT be dropped (it re-queues) and NO error banner shows;
-    // the drain re-fires it once the worker comes online. See #1748.
-    promptPostStatus = 503;
-    promptPostBody = "worker_not_ready";
+  it("POSTs directly (no queue) when the session is idle and open", async () => {
+    const { result } = await openSession("sess-idle");
     await act(async () => {
-      await result.current.sendPrompt("wake me up");
+      await result.current.sendPrompt("send now");
     });
     await flushAsync();
-
-    expect(promptPostCount).toBe(1);
-    expect(result.current.state.queuedPrompts).toHaveLength(1);
-    expect(result.current.state.queuedPrompts[0]?.text).toBe("wake me up");
-    expect(result.current.state.lastError ?? "").not.toContain("Could not send prompt");
+    expect(queueCalls("/acp/prompt").filter((c) => c.method === "POST")).toHaveLength(1);
+    expect(queueCalls("/queue").filter((c) => c.method === "POST")).toHaveLength(0);
   });
 
-  it("removes the optimistic row on a worker_not_ready 503 but keeps the turn braked (no re-POST storm) (#3094/#3087)", async () => {
-    // The transient 503 re-queues the prompt. The optimistic transcript row
-    // must be removed (else the drain's resend duplicates it), but the turn
-    // must stay pending so the drain does not hot-loop the wake POST while the
-    // worker is still resuming. Exactly one POST goes out; the retire happens
-    // later on AcpSessionAssigned (see the next test).
-    const { result } = renderHook(() => useAcpSession("sess-idle-rollback", "absent"));
-    await flushAsync();
-    const ws = sockets[0]!;
-    act(() => {
-      ws.readyState = FakeWebSocket.OPEN;
-      ws.onopen?.({} as Event);
-    });
-    await flushAsync();
+  it("remove / edit / clear mirror to the server endpoints", async () => {
+    const { result, ws } = await openSession("sess-mut");
+    serverBusy = true;
     act(() => {
       ws.onmessage?.({
-        data: JSON.stringify({
-          session_id: "sess-idle-rollback",
-          seq: 1,
-          event: { Stopped: { reason: "idle_auto_stop" } },
-        }),
+        data: JSON.stringify({ session_id: "sess-mut", seq: 1, event: { UserPromptSent: { text: "kick" } } }),
       } as MessageEvent);
     });
     await flushAsync();
-    expect(result.current.state.workerIdleStopped).toBe(true);
+    act(() => {
+      void result.current.sendPrompt("row");
+    });
+    await flushAsync();
+    const id = result.current.state.queuedPrompts[0]!.id;
 
-    promptPostStatus = 503;
-    promptPostBody = "worker_not_ready";
+    act(() => {
+      result.current.editQueuedPrompt(id, "row edited");
+    });
+    act(() => {
+      result.current.removeQueuedPrompt(id);
+    });
+    await flushAsync();
+    expect(queueCalls(`/queue/${encodeURIComponent(id)}`).map((c) => c.method)).toEqual(["PATCH", "DELETE"]);
+    expect(result.current.state.queuedPrompts).toEqual([]);
+
+    act(() => {
+      result.current.clearQueue();
+    });
+    await flushAsync();
+    // A whole-queue clear is DELETE /queue (no id segment).
+    expect(calls.some((c) => c.method === "DELETE" && /\/queue$/.test(c.url.split("?")[0]!))).toBe(true);
+  });
+
+  it("migrates local rows to the server and hydrates from the snapshot on connect", async () => {
+    // Pre-seed a local optimistic row (as a reload would restore), then connect.
+    // The migration POSTs it to the server; the hydrate list then reflects it.
+    serverQueue.set("pre", { id: "pre", seq: 0, text: "migrated", created_at: "2026-01-01T00:00:00.000Z" });
+    const { result } = await openSession("sess-migrate");
+    await flushAsync();
+    // GET /queue ran on connect and hydrated the row.
+    expect(queueCalls("/queue").some((c) => c.method === "GET")).toBe(true);
+    expect(result.current.state.queuedPrompts.map((q) => q.text)).toEqual(["migrated"]);
+  });
+
+  // Regression tests for `sendQueuedNow`, the "Send now" affordance on a
+  // queued row. It is the one queue path that bypasses the server drain and
+  // re-POSTs the prompt itself, so it is also the one that can destroy or
+  // duplicate a prompt.
+  it("does not resend a queued row whose attachment bytes live only on the server", async () => {
+    // A row hydrated from the server (any reload, or a second device) carries
+    // attachment metadata with an empty `dataB64`: localStorage drops
+    // attachment-carrying rows and the server sends refs, not blobs.
+    serverQueue.set("img", {
+      id: "img",
+      seq: 0,
+      text: "caption",
+      created_at: "2026-01-01T00:00:00.000Z",
+      attachments: [{ id: "att1", kind: "image", mime_type: "image/png", name: "shot.png", size: 9 }],
+    });
+    const { result } = await openSession("sess-bytesless");
+    await flushAsync();
+    const row = result.current.state.queuedPrompts.find((q) => q.id === "img");
+    expect(row?.attachments?.[0]?.dataB64).toBe("");
+
+    calls.length = 0;
     await act(async () => {
-      await result.current.sendPrompt("wake me up");
+      await result.current.sendQueuedNow(row!);
     });
     await flushAsync();
 
-    // Exactly one wake POST (no storm), message parked, optimistic row gone,
-    // turn still pending (the brake).
-    expect(promptPostCount).toBe(1);
-    expect(result.current.state.queuedPrompts).toHaveLength(1);
-    expect(result.current.state.queuedPrompts[0]?.text).toBe("wake me up");
-    expect(result.current.state.activity.filter((r) => r.kind === "user_prompt")).toHaveLength(0);
-    expect(result.current.state.turnActive).toBe(true);
+    // Neither destructive step ran: the row and its server-side bytes survive
+    // for the turn-end drain, which is the only path that still has them.
+    // Previously this deleted the row, POSTed empty base64, took a 400, and
+    // lost prompt and image with nothing sent.
+    expect(calls.filter((c) => c.method === "DELETE")).toHaveLength(0);
+    expect(calls.filter((c) => c.url.includes("/acp/prompt"))).toHaveLength(0);
+    expect(serverQueue.has("img")).toBe(true);
+    expect(result.current.state.queuedPrompts.map((q) => q.id)).toContain("img");
   });
 
-  it("drains without duplicating once the respawn handshake lands (#3094/#3087)", async () => {
-    // The stuck-until-Stop bug: after the transient 503 the phantom turn kept
-    // turnActive true, wedging the drain even after the worker resumed, until
-    // the user forced a Stop. AcpSessionAssigned (the respawn handshake) now
-    // retires the phantom turn so the drain fires and delivers exactly one row
-    // (the resend + server UserPromptSent reconcile), no duplicate.
-    const { result, rerender } = renderHook(
-      ({ ws }: { ws: "absent" | "resuming" | "running" }) => useAcpSession("sess-idle-nodup", ws),
-      { initialProps: { ws: "absent" as const } },
-    );
+  it("sends a row it holds the bytes for, removing it server-side first", async () => {
+    // Text-only: no attachments at all, so nothing is missing its bytes.
+    serverQueue.set("t1", { id: "t1", seq: 0, text: "text only", created_at: "2026-01-01T00:00:00.000Z" });
+    const { result } = await openSession("sess-sendnow");
     await flushAsync();
-    const ws = sockets[0]!;
-    act(() => {
-      ws.readyState = FakeWebSocket.OPEN;
-      ws.onopen?.({} as Event);
-    });
-    await flushAsync();
-    act(() => {
-      ws.onmessage?.({
-        data: JSON.stringify({
-          session_id: "sess-idle-nodup",
-          seq: 1,
-          event: { Stopped: { reason: "idle_auto_stop" } },
-        }),
-      } as MessageEvent);
-    });
-    await flushAsync();
-    expect(result.current.state.workerIdleStopped).toBe(true);
+    const row = result.current.state.queuedPrompts[0]!;
 
-    // First wake POST returns the transient 503 (rolls back the row, re-queues,
-    // turn stays braked).
-    promptPostStatus = 503;
-    promptPostBody = "worker_not_ready";
+    calls.length = 0;
     await act(async () => {
-      await result.current.sendPrompt("resend me");
-    });
-    await flushAsync();
-    expect(result.current.state.queuedPrompts).toHaveLength(1);
-    expect(result.current.state.turnActive).toBe(true);
-
-    // Respawn handshake lands and the worker comes online (REST poll -> running).
-    // AcpSessionAssigned retires the phantom turn; the drain resends and the
-    // server echoes UserPromptSent, promoting the single optimistic row.
-    promptPostStatus = 200;
-    act(() => {
-      ws.onmessage?.({
-        data: JSON.stringify({
-          session_id: "sess-idle-nodup",
-          seq: 2,
-          event: { AcpSessionAssigned: { acp_session_id: "acp-1" } },
-        }),
-      } as MessageEvent);
-    });
-    rerender({ ws: "running" as const });
-    await flushAsync();
-    act(() => {
-      ws.onmessage?.({
-        data: JSON.stringify({
-          session_id: "sess-idle-nodup",
-          seq: 3,
-          event: { UserPromptSent: { text: "resend me" } },
-        }),
-      } as MessageEvent);
+      await result.current.sendQueuedNow(row);
     });
     await flushAsync();
 
-    expect(result.current.state.queuedPrompts).toEqual([]);
-    expect(
-      result.current.state.activity.filter((r) => r.kind === "user_prompt" && r.text === "resend me"),
-    ).toHaveLength(1);
+    // Remove first (so the drain cannot also deliver it), then send.
+    expect(calls.filter((c) => c.method === "DELETE" && c.url.includes("/queue/"))).toHaveLength(1);
+    expect(calls.filter((c) => c.method === "POST" && c.url.includes("/acp/prompt"))).toHaveLength(1);
+    expect(serverQueue.has(row.id)).toBe(false);
   });
 
-  it("still surfaces an error banner on a worker_capacity_full 503 (#1748)", async () => {
-    // Control: the capacity 503 needs operator action, so unlike
-    // worker_not_ready it must keep its banner rather than being silently
-    // swallowed as a transient.
-    const { result } = renderHook(() => useAcpSession("sess-idle-cap", "absent"));
+  it("sends nothing when the drain claimed the row first", async () => {
+    serverQueue.set("r1", { id: "r1", seq: 0, text: "raced", created_at: "2026-01-01T00:00:00.000Z" });
+    const { result } = await openSession("sess-raced");
     await flushAsync();
-    const ws = sockets[0]!;
-    act(() => {
-      ws.readyState = FakeWebSocket.OPEN;
-      ws.onopen?.({} as Event);
-    });
-    await flushAsync();
-    act(() => {
-      ws.onmessage?.({
-        data: JSON.stringify({
-          session_id: "sess-idle-cap",
-          seq: 1,
-          event: { Stopped: { reason: "idle_auto_stop" } },
-        }),
-      } as MessageEvent);
-    });
-    await flushAsync();
-    expect(result.current.state.workerIdleStopped).toBe(true);
+    const row = result.current.state.queuedPrompts[0]!;
+    // The drain retired it between the strip rendering and the tap, so the
+    // remove 404s. Sending anyway would deliver the same prompt twice.
+    serverQueue.delete(row.id);
 
-    promptPostStatus = 503;
-    promptPostBody = "worker_capacity_full (4/4)";
+    calls.length = 0;
     await act(async () => {
-      await result.current.sendPrompt("wake me up");
+      await result.current.sendQueuedNow(row);
     });
     await flushAsync();
-
-    expect(result.current.state.lastError ?? "").toContain("Could not send prompt (503)");
-  });
-
-  it("re-queues an attachment send without an error banner on a worker_not_ready 503 (#1833)", async () => {
-    // The local queue now carries attachments in memory, so a
-    // worker_not_ready 503 for an attachment send has a retry path: park
-    // it (image included) and suppress the banner, exactly like a
-    // text-only send. The drain re-fires it once the worker comes online.
-    const { result } = renderHook(() => useAcpSession("sess-idle-attach", "absent"));
-    await flushAsync();
-    const ws = sockets[0]!;
-    act(() => {
-      ws.readyState = FakeWebSocket.OPEN;
-      ws.onopen?.({} as Event);
-    });
-    await flushAsync();
-    act(() => {
-      ws.onmessage?.({
-        data: JSON.stringify({
-          session_id: "sess-idle-attach",
-          seq: 1,
-          event: { Stopped: { reason: "idle_auto_stop" } },
-        }),
-      } as MessageEvent);
-    });
-    await flushAsync();
-    expect(result.current.state.workerIdleStopped).toBe(true);
-
-    promptPostStatus = 503;
-    promptPostBody = "worker_not_ready";
-    await act(async () => {
-      await result.current.sendPrompt("wake me up", [
-        {
-          kind: "image",
-          mimeType: "image/png",
-          dataB64: "aA==",
-          name: "shot.png",
-        },
-      ]);
-    });
-    await flushAsync();
-
-    expect(result.current.state.lastError ?? "").not.toContain("Could not send prompt");
-    expect(result.current.state.queuedPrompts).toHaveLength(1);
-    expect(result.current.state.queuedPrompts[0]?.text).toBe("wake me up");
-    expect(result.current.state.queuedPrompts[0]?.attachments).toHaveLength(1);
-    expect(result.current.state.queuedPrompts[0]?.attachments?.[0]?.name).toBe("shot.png");
-  });
-
-  it("queues an attachment send mid-turn instead of dropping it (#1833)", async () => {
-    // The bug: sending an image while the agent is still producing the
-    // previous turn surfaced an error and the composer cleared the image,
-    // losing it. It must queue like text and drain on Stopped.
-    const { result } = renderHook(() => useAcpSession("sess-attach-midturn"));
-    await flushAsync();
-    const ws = sockets[0]!;
-    act(() => {
-      ws.readyState = FakeWebSocket.OPEN;
-      ws.onopen?.({} as Event);
-    });
-    await flushAsync();
-
-    // Kick a turn so turnActive flips on.
-    act(() => {
-      ws.onmessage?.({
-        data: JSON.stringify({
-          session_id: "sess-attach-midturn",
-          seq: 1,
-          event: { UserPromptSent: { text: "kicker" } },
-        }),
-      } as MessageEvent);
-    });
-    await flushAsync();
-    expect(result.current.state.turnActive).toBe(true);
-
-    // Send an image while the turn is active.
-    await act(async () => {
-      await result.current.sendPrompt("look at this", [
-        {
-          kind: "image",
-          mimeType: "image/png",
-          dataB64: "aA==",
-          name: "shot.png",
-        },
-      ]);
-    });
-    await flushAsync();
-
-    // No POST yet, no error banner, and the image is parked on the queue.
-    expect(promptPostCount).toBe(0);
-    expect(result.current.state.lastError ?? "").not.toContain("Could not send prompt");
-    expect(result.current.state.lastError ?? "").not.toContain("Attachments");
-    expect(result.current.state.queuedPrompts).toHaveLength(1);
-    expect(result.current.state.queuedPrompts[0]?.attachments).toHaveLength(1);
-
-    // End the turn: the drain fires and the POST carries the attachment.
-    act(() => {
-      ws.onmessage?.({
-        data: JSON.stringify({
-          session_id: "sess-attach-midturn",
-          seq: 2,
-          event: { Stopped: { reason: "prompt_complete" } },
-        }),
-      } as MessageEvent);
-    });
-    await flushAsync();
-    expect(promptPostCount).toBe(1);
-    const sent = JSON.parse(promptPostBodies[0]!) as {
-      text: string;
-      attachments: Array<{ name?: string; data: string }>;
-    };
-    expect(sent.text).toBe("look at this");
-    expect(sent.attachments).toHaveLength(1);
-    expect(sent.attachments[0]?.name).toBe("shot.png");
-    expect(sent.attachments[0]?.data).toBe("aA==");
-    expect(result.current.state.queuedPrompts).toEqual([]);
-  });
-
-  it("combined-mode drain merges attachments from every queued row into one POST (#1833)", async () => {
-    const { result } = renderHook(() => useAcpSession("sess-attach-combined"));
-    await flushAsync();
-    const ws = sockets[0]!;
-    act(() => {
-      ws.readyState = FakeWebSocket.OPEN;
-      ws.onopen?.({} as Event);
-    });
-    await flushAsync();
-    act(() => {
-      ws.onmessage?.({
-        data: JSON.stringify({
-          session_id: "sess-attach-combined",
-          seq: 1,
-          event: { UserPromptSent: { text: "kicker" } },
-        }),
-      } as MessageEvent);
-    });
-    await flushAsync();
-
-    act(() => {
-      void result.current.sendPrompt("first", [
-        {
-          kind: "image",
-          mimeType: "image/png",
-          dataB64: "aA==",
-          name: "a.png",
-        },
-      ]);
-    });
-    act(() => {
-      void result.current.sendPrompt("second", [
-        {
-          kind: "image",
-          mimeType: "image/png",
-          dataB64: "bB==",
-          name: "b.png",
-        },
-      ]);
-    });
-    await flushAsync();
-    expect(result.current.state.queuedPrompts).toHaveLength(2);
-
-    act(() => {
-      ws.onmessage?.({
-        data: JSON.stringify({
-          session_id: "sess-attach-combined",
-          seq: 2,
-          event: { Stopped: { reason: "prompt_complete" } },
-        }),
-      } as MessageEvent);
-    });
-    await flushAsync();
-
-    expect(promptPostCount).toBe(1);
-    const sent = JSON.parse(promptPostBodies[0]!) as {
-      text: string;
-      attachments: Array<{ name?: string }>;
-    };
-    expect(sent.text).toBe("first\n\nsecond");
-    expect(sent.attachments.map((a) => a.name)).toEqual(["a.png", "b.png"]);
-    expect(result.current.state.queuedPrompts).toEqual([]);
-  });
-
-  it("drains a queued prompt only after rate-limit auto-resume (#1722)", async () => {
-    // Worker is absent while parked on a rate limit; once the daemon
-    // auto-resumes (breadcrumb clears the banner, REST poll flips the
-    // worker to running, AcpSessionAssigned lands) the drain effect must
-    // dispatch the prompt the user queued during the wait, and not before.
-    const { result, rerender } = renderHook(
-      ({ ws }: { ws: "absent" | "resuming" | "running" }) => useAcpSession("sess-rl-resume", ws),
-      { initialProps: { ws: "absent" as const } },
-    );
-    await flushAsync();
-    const ws = sockets[0]!;
-    act(() => {
-      ws.readyState = FakeWebSocket.OPEN;
-      ws.onopen?.({} as Event);
-    });
-    await flushAsync();
-
-    // The provider reported a usage limit; the worker parks.
-    act(() => {
-      ws.onmessage?.({
-        data: JSON.stringify({
-          session_id: "sess-rl-resume",
-          seq: 1,
-          event: {
-            RateLimit: {
-              info: {
-                status: "usage limit reached",
-                resets_at: "2026-06-01T12:10:00Z",
-                kind: "rate_limit",
-              },
-            },
-          },
-        }),
-      } as MessageEvent);
-      ws.onmessage?.({
-        data: JSON.stringify({
-          session_id: "sess-rl-resume",
-          seq: 2,
-          event: { Stopped: { reason: "rate_limited" } },
-        }),
-      } as MessageEvent);
-    });
-    await flushAsync();
-    expect(result.current.state.rateLimit).not.toBeNull();
-
-    // The user queues a follow-up during the park. Worker is absent, so
-    // it must NOT POST yet.
-    act(() => {
-      void result.current.sendPrompt("run after the reset");
-    });
-    await flushAsync();
-    expect(promptPostCount).toBe(0);
-    expect(result.current.state.queuedPrompts).toHaveLength(1);
-
-    // Auto-resume fires: the breadcrumb clears the banner, the reconciler
-    // respawns the worker (REST poll -> running) and emits
-    // AcpSessionAssigned. The drain effect now dispatches the queued prompt.
-    act(() => {
-      ws.onmessage?.({
-        data: JSON.stringify({
-          session_id: "sess-rl-resume",
-          seq: 3,
-          event: {
-            RateLimitAutoResumed: { resets_at: "2026-06-01T12:10:00Z" },
-          },
-        }),
-      } as MessageEvent);
-      ws.onmessage?.({
-        data: JSON.stringify({
-          session_id: "sess-rl-resume",
-          seq: 4,
-          event: { AcpSessionAssigned: { acp_session_id: "acp-1" } },
-        }),
-      } as MessageEvent);
-    });
-    rerender({ ws: "running" as const });
-    await flushAsync();
-
-    expect(result.current.state.rateLimit).toBeNull();
-    expect(promptPostCount).toBe(1);
-    expect(promptPostBodies[0]).toContain("run after the reset");
-    expect(result.current.state.queuedPrompts).toEqual([]);
-  });
-
-  it("retires the optimistic turn when prompt POST is rejected with 4xx", async () => {
-    const { result } = renderHook(() => useAcpSession("sess-reject-4xx"));
-    await flushAsync();
-    const ws = sockets[0]!;
-    act(() => {
-      ws.readyState = FakeWebSocket.OPEN;
-      ws.onopen?.({} as Event);
-    });
-    await flushAsync();
-
-    promptPostStatus = 400;
-    await act(async () => {
-      await result.current.sendPrompt("send bad attachment", [
-        {
-          kind: "image",
-          mimeType: "image/x-xcf",
-          dataB64: "aA==",
-          name: "bad.xcf",
-        },
-      ]);
-    });
-    await flushAsync();
-
-    expect(promptPostCount).toBe(1);
-    expect(result.current.state.pendingUserPromptSeq).toBe(1);
-    expect(result.current.state.lastStoppedSeq).toBe(1);
-    expect(result.current.state.turnActive).toBe(false);
-    expect(result.current.state.lastError).toContain("Could not send prompt (400)");
-  });
-
-  it("combined-mode drain leaves the queue intact when the prompt POST fails", async () => {
-    const { result } = renderHook(() => useAcpSession("sess-drain-2"));
-    await flushAsync();
-    const ws = sockets[0]!;
-    // Open the socket so sendPrompt's status gate clears.
-    act(() => {
-      ws.readyState = FakeWebSocket.OPEN;
-      ws.onopen?.({} as Event);
-    });
-    await flushAsync();
-
-    // Mark the turn as active so subsequent sendPrompt calls enqueue.
-    act(() => {
-      ws.onmessage?.({
-        data: JSON.stringify({
-          session_id: "sess-drain-2",
-          seq: 1,
-          event: { UserPromptSent: { text: "kicker" } },
-        }),
-      } as MessageEvent);
-    });
-    await flushAsync();
-    expect(result.current.state.turnActive).toBe(true);
-
-    // Enqueue two follow-ups while the turn is active.
-    act(() => {
-      void result.current.sendPrompt("queued A");
-    });
-    act(() => {
-      void result.current.sendPrompt("queued B");
-    });
-    await flushAsync();
-    expect(result.current.state.queuedPrompts).toHaveLength(2);
-
-    // Configure the prompt POST to fail, then end the turn so the drain
-    // fires.
-    promptPostStatus = 500;
-    act(() => {
-      ws.onmessage?.({
-        data: JSON.stringify({
-          session_id: "sess-drain-2",
-          seq: 2,
-          event: { Stopped: { reason: "prompt_complete" } },
-        }),
-      } as MessageEvent);
-    });
-    await flushAsync();
-
-    // The combined POST was attempted exactly once with both entries
-    // joined, but failed; the queue MUST remain intact for the next
-    // turn-end retry.
-    expect(promptPostCount).toBe(1);
-    expect(promptPostBodies[0]).toContain("queued A");
-    expect(promptPostBodies[0]).toContain("queued B");
-    expect(result.current.state.queuedPrompts).toHaveLength(2);
-    expect(result.current.state.queuedPrompts[0]?.text).toBe("queued A");
-    expect(result.current.state.queuedPrompts[1]?.text).toBe("queued B");
-  });
-
-  it("combined-mode drain only clears the items it sent, not items enqueued during the await", async () => {
-    const { result } = renderHook(() => useAcpSession("sess-drain-3"));
-    await flushAsync();
-    const ws = sockets[0]!;
-    act(() => {
-      ws.readyState = FakeWebSocket.OPEN;
-      ws.onopen?.({} as Event);
-    });
-    await flushAsync();
-
-    // Start a turn and enqueue two follow-ups.
-    act(() => {
-      ws.onmessage?.({
-        data: JSON.stringify({
-          session_id: "sess-drain-3",
-          seq: 1,
-          event: { UserPromptSent: { text: "kicker" } },
-        }),
-      } as MessageEvent);
-    });
-    await flushAsync();
-    act(() => {
-      void result.current.sendPrompt("queued A");
-    });
-    act(() => {
-      void result.current.sendPrompt("queued B");
-    });
-    await flushAsync();
-    expect(result.current.state.queuedPrompts).toHaveLength(2);
-
-    // Make the prompt POST hang so we have a window to enqueue more
-    // entries during the await.
-    let resolvePost: ((res: Response) => void) | null = null;
-    const pendingPost = new Promise<Response>((resolve) => {
-      resolvePost = resolve;
-    });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-        const url = typeof input === "string" ? input : input.toString();
-        if (url.includes("/acp/replay")) {
-          return new Response(JSON.stringify({ frames: [], lost: false, highest_seq: 0 }), { status: 200 });
-        }
-        if (url.includes("/acp/prompt")) {
-          promptPostCount += 1;
-          if (typeof init?.body === "string") {
-            promptPostBodies.push(init.body);
-          }
-          return pendingPost;
-        }
-        return new Response("{}", { status: 200 });
-      }),
-    );
-
-    // End the turn -> drain fires, dispatchPromptNow awaits.
-    act(() => {
-      ws.onmessage?.({
-        data: JSON.stringify({
-          session_id: "sess-drain-3",
-          seq: 2,
-          event: { Stopped: { reason: "prompt_complete" } },
-        }),
-      } as MessageEvent);
-    });
-    await flushAsync();
-    expect(promptPostCount).toBe(1);
-
-    // Mid-await: a new turn would normally have to start before the
-    // user could enqueue, but the queue actions are independent. Push a
-    // new turn (UserPromptSent) so turnActive flips back to true and a
-    // sendPrompt enqueues rather than racing dispatchPromptNow.
-    act(() => {
-      ws.onmessage?.({
-        data: JSON.stringify({
-          session_id: "sess-drain-3",
-          seq: 3,
-          event: { UserPromptSent: { text: "echoed combined" } },
-        }),
-      } as MessageEvent);
-    });
-    await flushAsync();
-    act(() => {
-      void result.current.sendPrompt("queued during await");
-    });
-    await flushAsync();
-    expect(result.current.state.queuedPrompts).toHaveLength(3);
-
-    // Resolve the in-flight POST as success; only the snapshot ids
-    // should be removed -- the late entry stays.
-    act(() => {
-      resolvePost?.(new Response("{}", { status: 200 }));
-    });
-    await flushAsync();
-    expect(result.current.state.queuedPrompts).toHaveLength(1);
-    expect(result.current.state.queuedPrompts[0]?.text).toBe("queued during await");
-  });
-});
-
-// Combined-mode drain splits the queue at clear-command boundaries
-// (#1356). Without the split, queueing `/clear` between follow-ups got
-// glued into one multi-paragraph POST and the server's head-anchored
-// `is_clear_command` either misfired or missed the boundary entirely.
-// Tests pump WS frames against a claude-profile session so the structured view
-// resolves `clearAliases = ["/clear"]`; each drain pass should now POST
-// the leading sub-batch (either a standalone clear alias or the run of
-// non-clear entries up to the next alias).
-
-describe("useAcpSession drain split at clear-command boundary (#1356)", () => {
-  let promptPostCount: number;
-  let promptPostBodies: string[];
-
-  const claudeWrapper = ({ children }: { children: ReactNode }) =>
-    createElement(AgentProfileProvider, { toolKey: "claude" }, children);
-
-  beforeEach(() => {
-    sockets.length = 0;
-    promptPostCount = 0;
-    promptPostBodies = [];
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-        const url = typeof input === "string" ? input : input.toString();
-        if (url.includes("/acp/replay")) {
-          return new Response(JSON.stringify({ frames: [], lost: false, highest_seq: 0 }), { status: 200 });
-        }
-        if (url.includes("/acp/prompt")) {
-          promptPostCount += 1;
-          if (typeof init?.body === "string") {
-            promptPostBodies.push(init.body);
-          }
-          return new Response("{}", { status: 200 });
-        }
-        return new Response("{}", { status: 200 });
-      }),
-    );
-    originalWebSocket = global.WebSocket;
-    global.WebSocket = FakeWebSocket as unknown as typeof WebSocket;
-  });
-
-  afterEach(() => {
-    global.WebSocket = originalWebSocket;
-    vi.unstubAllGlobals();
-  });
-
-  function bodyTexts(): string[] {
-    return promptPostBodies.map((b) => {
-      try {
-        const parsed = JSON.parse(b) as { text?: string };
-        return parsed.text ?? "";
-      } catch {
-        return b;
-      }
-    });
-  }
-
-  async function bootSession(sessionId: string) {
-    const { result } = renderHook(() => useAcpSession(sessionId), {
-      wrapper: claudeWrapper,
-    });
-    await flushAsync();
-    const ws = sockets[sockets.length - 1]!;
-    act(() => {
-      ws.readyState = FakeWebSocket.OPEN;
-      ws.onopen?.({} as Event);
-    });
-    await flushAsync();
-    let seq = 0;
-    const nextSeq = () => {
-      seq += 1;
-      return seq;
-    };
-    // Kick a turn so subsequent sendPrompt calls enqueue.
-    act(() => {
-      ws.onmessage?.({
-        data: JSON.stringify({
-          session_id: sessionId,
-          seq: nextSeq(),
-          event: { UserPromptSent: { text: "kicker" } },
-        }),
-      } as MessageEvent);
-    });
-    await flushAsync();
-    async function pumpStopped() {
-      act(() => {
-        ws.onmessage?.({
-          data: JSON.stringify({
-            session_id: sessionId,
-            seq: nextSeq(),
-            event: { Stopped: { reason: "prompt_complete" } },
-          }),
-        } as MessageEvent);
-      });
-      await flushAsync();
-    }
-    return { result, ws, pumpStopped };
-  }
-
-  it("queue [a, /clear, b] fires three sub-batch POSTs in order", async () => {
-    const { result, pumpStopped } = await bootSession("sess-split-1");
-    act(() => {
-      void result.current.sendPrompt("a");
-    });
-    act(() => {
-      void result.current.sendPrompt("/clear");
-    });
-    act(() => {
-      void result.current.sendPrompt("b");
-    });
-    await flushAsync();
-    expect(result.current.state.queuedPrompts).toHaveLength(3);
-
-    await pumpStopped();
-    expect(promptPostCount).toBe(1);
-    expect(bodyTexts()).toEqual(["a"]);
-    expect(result.current.state.queuedPrompts.map((q) => q.text)).toEqual(["/clear", "b"]);
-
-    await pumpStopped();
-    expect(promptPostCount).toBe(2);
-    expect(bodyTexts()).toEqual(["a", "/clear"]);
-    expect(result.current.state.queuedPrompts.map((q) => q.text)).toEqual(["b"]);
-
-    await pumpStopped();
-    expect(promptPostCount).toBe(3);
-    expect(bodyTexts()).toEqual(["a", "/clear", "b"]);
-    expect(result.current.state.queuedPrompts).toEqual([]);
-  });
-
-  it("solo /clear in the queue fires standalone", async () => {
-    const { result, pumpStopped } = await bootSession("sess-split-2");
-    act(() => {
-      void result.current.sendPrompt("/clear");
-    });
-    await flushAsync();
-    expect(result.current.state.queuedPrompts).toHaveLength(1);
-
-    await pumpStopped();
-    expect(promptPostCount).toBe(1);
-    expect(bodyTexts()).toEqual(["/clear"]);
-    expect(result.current.state.queuedPrompts).toEqual([]);
-  });
-
-  it("queue [a, b, /clear] combines the leading non-clear prefix then fires /clear alone", async () => {
-    const { result, pumpStopped } = await bootSession("sess-split-3");
-    act(() => {
-      void result.current.sendPrompt("a");
-    });
-    act(() => {
-      void result.current.sendPrompt("b");
-    });
-    act(() => {
-      void result.current.sendPrompt("/clear");
-    });
-    await flushAsync();
-    expect(result.current.state.queuedPrompts).toHaveLength(3);
-
-    await pumpStopped();
-    expect(promptPostCount).toBe(1);
-    expect(bodyTexts()).toEqual(["a\n\nb"]);
-    expect(result.current.state.queuedPrompts.map((q) => q.text)).toEqual(["/clear"]);
-
-    await pumpStopped();
-    expect(promptPostCount).toBe(2);
-    expect(bodyTexts()).toEqual(["a\n\nb", "/clear"]);
-    expect(result.current.state.queuedPrompts).toEqual([]);
-  });
-
-  it("queue [/clear, /clear, a] fires each /clear standalone before the trailing prompt", async () => {
-    const { result, pumpStopped } = await bootSession("sess-split-4");
-    act(() => {
-      void result.current.sendPrompt("/clear");
-    });
-    act(() => {
-      void result.current.sendPrompt("/clear");
-    });
-    act(() => {
-      void result.current.sendPrompt("a");
-    });
-    await flushAsync();
-    expect(result.current.state.queuedPrompts).toHaveLength(3);
-
-    await pumpStopped();
-    await pumpStopped();
-    await pumpStopped();
-
-    expect(promptPostCount).toBe(3);
-    expect(bodyTexts()).toEqual(["/clear", "/clear", "a"]);
-    expect(result.current.state.queuedPrompts).toEqual([]);
-  });
-
-  it("`/clear --hard` invocation is treated as a clear-command boundary", async () => {
-    const { result, pumpStopped } = await bootSession("sess-split-5");
-    act(() => {
-      void result.current.sendPrompt("a");
-    });
-    act(() => {
-      void result.current.sendPrompt("/clear --hard");
-    });
-    act(() => {
-      void result.current.sendPrompt("b");
-    });
-    await flushAsync();
-
-    await pumpStopped();
-    await pumpStopped();
-    await pumpStopped();
-
-    expect(bodyTexts()).toEqual(["a", "/clear --hard", "b"]);
-  });
-
-  it("codex profile splits at `/new` boundaries", async () => {
-    const codexWrapper = ({ children }: { children: ReactNode }) =>
-      createElement(AgentProfileProvider, { toolKey: "codex" }, children);
-    const { result: hookResult } = renderHook(() => useAcpSession("sess-split-codex"), { wrapper: codexWrapper });
-    await flushAsync();
-    const ws = sockets[sockets.length - 1]!;
-    act(() => {
-      ws.readyState = FakeWebSocket.OPEN;
-      ws.onopen?.({} as Event);
-    });
-    await flushAsync();
-    let seq = 0;
-    const nextSeq = () => ++seq;
-    act(() => {
-      ws.onmessage?.({
-        data: JSON.stringify({
-          session_id: "sess-split-codex",
-          seq: nextSeq(),
-          event: { UserPromptSent: { text: "kicker" } },
-        }),
-      } as MessageEvent);
-    });
-    await flushAsync();
-    async function pumpStopped() {
-      act(() => {
-        ws.onmessage?.({
-          data: JSON.stringify({
-            session_id: "sess-split-codex",
-            seq: nextSeq(),
-            event: { Stopped: { reason: "prompt_complete" } },
-          }),
-        } as MessageEvent);
-      });
-      await flushAsync();
-    }
-    act(() => {
-      void hookResult.current.sendPrompt("a");
-    });
-    act(() => {
-      void hookResult.current.sendPrompt("/new");
-    });
-    act(() => {
-      void hookResult.current.sendPrompt("b");
-    });
-    await flushAsync();
-
-    await pumpStopped();
-    await pumpStopped();
-    await pumpStopped();
-
-    expect(bodyTexts()).toEqual(["a", "/new", "b"]);
-  });
-
-  it("gemini profile (no clear aliases) keeps the original single-POST combined behavior", async () => {
-    const geminiWrapper = ({ children }: { children: ReactNode }) =>
-      createElement(AgentProfileProvider, { toolKey: "gemini" }, children);
-    const { result: hookResult } = renderHook(() => useAcpSession("sess-split-gemini"), { wrapper: geminiWrapper });
-    await flushAsync();
-    const ws = sockets[sockets.length - 1]!;
-    act(() => {
-      ws.readyState = FakeWebSocket.OPEN;
-      ws.onopen?.({} as Event);
-    });
-    await flushAsync();
-    let seq = 0;
-    const nextSeq = () => ++seq;
-    act(() => {
-      ws.onmessage?.({
-        data: JSON.stringify({
-          session_id: "sess-split-gemini",
-          seq: nextSeq(),
-          event: { UserPromptSent: { text: "kicker" } },
-        }),
-      } as MessageEvent);
-    });
-    await flushAsync();
-    act(() => {
-      void hookResult.current.sendPrompt("a");
-    });
-    act(() => {
-      void hookResult.current.sendPrompt("/clear");
-    });
-    act(() => {
-      void hookResult.current.sendPrompt("b");
-    });
-    await flushAsync();
-
-    act(() => {
-      ws.onmessage?.({
-        data: JSON.stringify({
-          session_id: "sess-split-gemini",
-          seq: nextSeq(),
-          event: { Stopped: { reason: "prompt_complete" } },
-        }),
-      } as MessageEvent);
-    });
-    await flushAsync();
-
-    // Single POST with all three glued via blank-line join. `/clear` is
-    // not a gemini clear-alias so no boundary fires.
-    expect(promptPostCount).toBe(1);
-    expect(bodyTexts()).toEqual(["a\n\n/clear\n\nb"]);
-    expect(hookResult.current.state.queuedPrompts).toEqual([]);
+    expect(calls.filter((c) => c.url.includes("/acp/prompt"))).toHaveLength(0);
   });
 });

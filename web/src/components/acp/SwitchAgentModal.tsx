@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { fetchAcpAgents, fetchContextPrimer, switchAcpAgent, type AcpAgentInfo } from "../../lib/api";
+import { effectiveLifecycle } from "../../lib/agentProfiles";
 
 /**
  * Agent-switch dialog. Lists the structured view ACP registry, preselects a
@@ -232,6 +233,14 @@ export function SwitchAgentModal({ open, sessionId, currentAgent, onClose, onPre
                         <span className="block text-sm font-mono">
                           {a.name}
                           {isCurrent && <span className="ml-2 font-sans text-xs text-text-muted">(current)</span>}
+                          {effectiveLifecycle(a, a.name).state === "deprecated" && (
+                            <span
+                              className="ml-2 font-sans text-xs text-status-warning"
+                              data-testid={`switch-agent-deprecated-${a.name}`}
+                            >
+                              (deprecated)
+                            </span>
+                          )}
                         </span>
                         <span className="block text-xs text-text-muted">{a.description}</span>
                       </span>

@@ -1,23 +1,7 @@
-//! The Tier 1 plugin worker host: launch and supervise plugin workers.
+//! Launches and supervises plugin workers inside `aoe serve`.
 //!
-//! The host runs inside the `aoe serve` daemon. For each active community
-//! plugin that declares a `[runtime]`, it resolves a launch
-//! ([`crate::plugin::launch::resolve_launch`]), applies the sandbox backend
-//! ([`crate::plugin::sandbox`]), and spawns the worker as a child process that
-//! speaks newline-delimited JSON-RPC ([`crate::plugin::protocol`]) over its
-//! stdio. Each worker call is checked against the plugin's granted
-//! capabilities and dispatched to the host API
-//! ([`crate::plugin::host_api`]).
-//!
-//! Supervision is the ACP supervision model minus the persistence half: the
-//! worker is a child owned by this daemon, not a detached process. There is no
-//! socket, no on-disk runner record, and no reattach: a plugin worker is a
-//! stateless transformer over a host-owned event stream, so surviving a daemon
-//! restart would only strand it with a stale view. The daemon dies, the
-//! workers die, and a fresh daemon respawns them. What is kept from ACP:
-//! process-group reaping (a worker that forks helpers is torn down whole), a
-//! per-worker respawn budget so a crash loop does not spin, and a concurrency
-//! cap. The worker's stderr drains to `<plugin-workers>/<id>.log`.
+//! Workers are daemon-owned child process groups that speak newline-delimited
+//! JSON-RPC over stdio. They do not persist or reattach across daemon restarts.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -38,55 +22,43 @@ use crate::plugin::registry::PluginRegistry;
 use crate::plugin::sandbox::{NoSandbox, SandboxBackend};
 use crate::process::worker;
 
-/// Events kept per topic on the plugin event bus before the oldest are pruned.
 const EVENT_RETENTION_PER_TOPIC: usize = 10_000;
-/// Most workers the host runs at once. A cooperative cap, not a security one.
 const MAX_WORKERS: usize = 32;
-/// Respawn budget: at most this many restarts within [`RESPAWN_WINDOW`] before
-/// the host gives up on a crash-looping worker.
 const MAX_RESPAWNS: usize = 3;
 const RESPAWN_WINDOW: Duration = Duration::from_secs(60);
-/// Grace period between SIGTERM and SIGKILL when reaping a worker tree.
 const REAP_GRACE: Duration = Duration::from_secs(2);
 
-/// One supervised worker: the plugin it runs, its pid, and the task driving it.
 struct RunningWorker {
-    /// Identity of the supervisor task that owns this slot. A stale supervisor
-    /// (one whose worker was torn down and whose plugin was relaunched under a
-    /// new supervisor) must not mutate or remove the newer entry: every table
-    /// write it makes is gated on this id still matching. Without it, an
-    /// aborted-but-not-yet-yielded supervisor can ABA-corrupt a fresh entry,
-    /// because an uncontended `lock().await` resolves inside the same poll,
-    /// before the abort takes effect.
+    /// Gates writes from an aborted supervisor that has not yielded yet, which
+    /// could otherwise mutate its replacement's slot.
     supervisor_id: u64,
     pid: u32,
     task: tokio::task::JoinHandle<()>,
-    /// Sender into the worker's stdin, set while a worker generation is being
-    /// served. Lets the host push an unsolicited request (a notification) to the
-    /// worker, e.g. a UI action forwarded from the dashboard. `None` between
-    /// spawns. See [`PluginHost::notify_worker`].
+    /// Sender for host notifications, present only while a generation runs.
     inbound: Option<mpsc::UnboundedSender<String>>,
-    /// The UI generation this slot's live worker is stamping writes with, so
-    /// teardown from outside `spawn_once` (a reconcile tearing down a
-    /// now-inactive plugin) can retire it. `None` between spawns.
+    /// Lets teardown retire UI state from this worker generation only.
     ui_generation: Option<u64>,
 }
 
-/// All worker-lifecycle state under one mutex. Keeping `running`, the crashed
-/// tombstone set, and the supervisor-id counter in a single lock makes their
-/// transitions atomic and removes the lock-ordering hazard that separate
-/// mutexes would introduce.
+/// One lock makes lifecycle and tombstone transitions atomic.
 struct WorkerTable {
-    /// Running workers keyed by plugin id (one worker per plugin in v1).
     running: HashMap<String, RunningWorker>,
-    /// Plugins whose worker exhausted the respawn budget. Skipped by
-    /// [`PluginHost::reconcile`] so an unrelated enable/disable does not revive
-    /// a crash-looping plugin; cleared once the plugin leaves the desired set
-    /// (an explicit disable), so an off then on is a clean retry. In-memory
-    /// only: a daemon restart clears it and retries from scratch.
+    /// Crash tombstones clear after disable or daemon restart.
     crashed: HashSet<String>,
-    /// Monotonic allocator for [`RunningWorker::supervisor_id`].
     next_supervisor_id: u64,
+}
+
+/// Level and reason for a runtime-declaring plugin that boot will not launch.
+///
+/// A configured disable is DEBUG; unexpected inactive states remain WARN.
+fn inactive_launch_diagnostic(enabled: bool, granted: bool) -> (tracing::Level, &'static str) {
+    if !enabled {
+        (tracing::Level::DEBUG, "disabled")
+    } else if !granted {
+        (tracing::Level::WARN, "ungranted; awaiting reapproval")
+    } else {
+        (tracing::Level::WARN, "inactive")
+    }
 }
 
 /// The plugin worker host, owned by the daemon for its lifetime.
@@ -95,10 +67,7 @@ pub struct PluginHost {
     sandbox: Arc<dyn SandboxBackend>,
     workers_dir: PathBuf,
     state: Mutex<WorkerTable>,
-    /// Dependencies of the async session RPCs (#2897), injected at
-    /// construction so no worker can race a late binding. `None` only when
-    /// the daemon could not open the automation-policy ledger (or in test
-    /// hosts); the session methods then answer `service_unavailable`.
+    /// Missing when the automation ledger could not open or in reduced tests.
     session_rpc: Option<Arc<crate::plugin::session_api::SessionRpcDeps>>,
 }
 
@@ -217,7 +186,7 @@ impl PluginHost {
     /// launch path; the daemon calls it at startup and the web enable/disable
     /// handler calls it to recover a worker without a full restart.
     pub async fn start(self: &Arc<Self>, registry: &PluginRegistry) {
-        self.log_start_observability(registry);
+        Self::log_start_observability(registry);
         self.reconcile(registry).await;
     }
 
@@ -227,7 +196,10 @@ impl PluginHost {
     /// reason buried in `load_errors` (surfaced only in the plugin manager UI),
     /// so the daemon log shows a silent zero-launch. Boot-only: reconcile does
     /// not re-log this on every enable/disable.
-    fn log_start_observability(&self, registry: &PluginRegistry) {
+    ///
+    /// Takes the registry rather than `&self` so the level classification is
+    /// unit-testable without standing up a host.
+    fn log_start_observability(registry: &PluginRegistry) {
         for err in registry.load_errors() {
             tracing::warn!(
                 target: "plugin.host",
@@ -236,19 +208,15 @@ impl PluginHost {
         }
         for p in registry.all() {
             if p.manifest.runtime.is_some() && !p.active() {
-                let reason = if !p.enabled {
-                    "disabled"
-                } else if !p.granted {
-                    "ungranted; awaiting reapproval"
+                let (level, reason) = inactive_launch_diagnostic(p.enabled, p.granted);
+                let msg = "plugin declares a runtime but is inactive; not launching a worker";
+                // `tracing` resolves the level at the callsite, so the two
+                // levels need two macro invocations.
+                if level == tracing::Level::DEBUG {
+                    tracing::debug!(target: "plugin.host", plugin = %p.id(), reason, "{msg}");
                 } else {
-                    "inactive"
-                };
-                tracing::warn!(
-                    target: "plugin.host",
-                    plugin = %p.id(),
-                    reason,
-                    "plugin declares a runtime but is inactive; not launching a worker"
-                );
+                    tracing::warn!(target: "plugin.host", plugin = %p.id(), reason, "{msg}");
+                }
             }
         }
     }
@@ -813,6 +781,31 @@ mod tests {
     use super::*;
     use crate::plugin::host_api::PluginRpcContext;
     use serde_json::json;
+
+    /// Only the user-chosen "off" state drops out of the WARN stream; a
+    /// stale grant or any other inactive state stays a warning, because
+    /// nobody asked for it.
+    #[test]
+    fn inactive_launch_diagnostic_warns_only_on_unchosen_states() {
+        let cases = [
+            (false, false, tracing::Level::DEBUG, "disabled"),
+            (false, true, tracing::Level::DEBUG, "disabled"),
+            (
+                true,
+                false,
+                tracing::Level::WARN,
+                "ungranted; awaiting reapproval",
+            ),
+            (true, true, tracing::Level::WARN, "inactive"),
+        ];
+        for (enabled, granted, level, reason) in cases {
+            assert_eq!(
+                inactive_launch_diagnostic(enabled, granted),
+                (level, reason),
+                "enabled={enabled} granted={granted}"
+            );
+        }
+    }
 
     /// Spawn the single stdin-writer task `serve_connection` now expects, and
     /// return its sender (mirrors what `spawn_once` wires in production).

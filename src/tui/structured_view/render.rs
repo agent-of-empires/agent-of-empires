@@ -7,6 +7,8 @@
 //! deferred to the web structured view; press `o` from the transcript pane to
 //! open it for full-fidelity inspection.
 
+use std::collections::HashMap;
+
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -19,11 +21,13 @@ use aoe_plugin_api::UiSlot;
 use ansi_to_tui::IntoText;
 
 use super::input::Focus;
-use super::reducer::{AcpTranscript, ActivityRow, NoteKind, ToolCallRow};
+use super::reducer::{
+    AcpTranscript, NoteKind, PendingApproval, ToolCallRow, ToolCompletion, ToolOutcome,
+};
 use super::state::{FileIndex, StructuredViewState, ViewLayout};
-use crate::acp::approvals::ApprovalDecision;
 use crate::acp::session_paths::{relative_display_path, SessionPathRoots};
-use crate::acp::state::SessionUsage;
+use crate::acp::state::{SessionUsage, ToolOutputBlock};
+use crate::acp::transcript::{TranscriptRow, TranscriptRowKind};
 use crate::tui::plugin_ui;
 use crate::tui::styles::Theme;
 
@@ -204,7 +208,16 @@ fn render_pane_panel(frame: &mut Frame, area: Rect, theme: &Theme, state: &Struc
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-    let lines = plugin_ui::pane_lines(&state.plugin_ui, &state.session_id, theme);
+    let mut lines = plugin_ui::pane_lines(&state.plugin_ui, &state.session_id, theme);
+    // Host-wide HomePane entries (session-less) render in the same overlay,
+    // after this session's panes.
+    let home = plugin_ui::home_pane_lines(&state.plugin_ui, theme);
+    if !home.is_empty() {
+        if !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        lines.extend(home);
+    }
     if lines.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -264,16 +277,13 @@ fn render_approval_shelf(
     let Some(selected) = state.selected_approval.as_deref() else {
         return;
     };
+    // Approvals are control state; the shelf renders the selected pending
+    // request directly, since the transcript carries no approval row.
     let Some(row) = state
         .transcript
-        .rows
+        .pending_approvals
         .iter()
-        .find_map(|activity| match activity {
-            ActivityRow::Approval(row) if row.nonce == selected && row.decision.is_none() => {
-                Some(row)
-            }
-            _ => None,
-        })
+        .find(|pending| pending.nonce == selected)
     else {
         return;
     };
@@ -351,10 +361,7 @@ fn approval_actions_line(theme: &Theme, active: bool) -> Line<'static> {
     ])
 }
 
-fn approval_target(
-    row: &super::reducer::ApprovalRow,
-    path_roots: Option<&SessionPathRoots>,
-) -> String {
+fn approval_target(row: &PendingApproval, path_roots: Option<&SessionPathRoots>) -> String {
     let args = parse_args_object(&row.args);
     match row.kind.as_str() {
         "edit" | "write" | "read" | "delete" | "move" => pick_str(args.as_ref(), PATH_KEYS)
@@ -979,7 +986,7 @@ fn render_status(
             Style::default().fg(theme.running),
         ));
     }
-    if state.transcript.context_primer_pending {
+    if state.transcript.context_primer_pending() {
         spans.push(Span::styled(
             " context lost; next prompt re-primes ",
             Style::default().fg(theme.error),
@@ -1270,8 +1277,7 @@ fn agent_message_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
 
 /// Render an agent message as markdown-styled transcript lines.
 ///
-/// We parse the message with `pulldown-cmark` and map its events to
-/// ratatui `Line`s ourselves (see [`MarkdownBuilder`]). This strips the
+/// We parse the message with the shared native TUI Markdown renderer. This strips the
 /// raw `#`/`**`/backtick/fence markers and styles content with modifiers
 /// only (BOLD/ITALIC/DIM), so the output tracks the app theme rather than
 /// carrying hardcoded colors. The agent's reply is rendered as plain
@@ -1282,308 +1288,125 @@ fn render_agent_message_lines(text: &str) -> Vec<Line<'static>> {
     if text.trim().is_empty() {
         return vec![Line::from("…".to_string())];
     }
-    let body = MarkdownBuilder::render(text);
+    let body = crate::tui::markdown::render(text);
     if body.is_empty() {
         return vec![Line::from("…".to_string())];
     }
     body
 }
 
-/// Accumulates `pulldown-cmark` events into themed ratatui lines.
-///
-/// Inline emphasis pushes/pops modifiers on `mod_stack`; the union of the
-/// stack is the active style. Block elements (headings, paragraphs, code
-/// blocks) are separated by a single blank line at top level. Code-block
-/// content is emitted line-by-line with `DIM`, never the ``` fences.
-#[derive(Default)]
-struct MarkdownBuilder {
-    lines: Vec<Line<'static>>,
-    current: Vec<Span<'static>>,
-    mod_stack: Vec<Modifier>,
-    /// One entry per open list; `Some(n)` is the next ordinal of an
-    /// ordered list, `None` an unordered list.
-    list_stack: Vec<Option<u64>>,
-    in_code_block: bool,
-    /// Destination of the innermost open link, so the URL can be appended
-    /// (dimmed, in parens) after the link text on close. `None` when the
-    /// URL matches the visible text (autolinks), which would just repeat.
-    link_dest: Option<String>,
-    /// Visible text accumulated inside the open link, for the
-    /// autolink-repeat check.
-    link_text: String,
-    /// Open-table state: cells of the in-progress row; rows are flushed
-    /// pipe-separated (the TUI has no column layout pass).
-    table_row: Option<Vec<String>>,
-    in_table_head: bool,
-}
-
-impl MarkdownBuilder {
-    fn render(text: &str) -> Vec<Line<'static>> {
-        let mut builder = MarkdownBuilder::default();
-        let options =
-            pulldown_cmark::Options::ENABLE_STRIKETHROUGH | pulldown_cmark::Options::ENABLE_TABLES;
-        for event in pulldown_cmark::Parser::new_ext(text, options) {
-            builder.handle(event);
-        }
-        builder.finish()
-    }
-
-    fn active_modifier(&self) -> Modifier {
-        self.mod_stack
-            .iter()
-            .fold(Modifier::empty(), |acc, m| acc | *m)
-    }
-
-    fn push_span(&mut self, content: &str, extra: Modifier) {
-        let style = Style::default().add_modifier(self.active_modifier() | extra);
-        self.current.push(Span::styled(content.to_string(), style));
-    }
-
-    /// Flush the in-progress line, dropping it if it has no spans.
-    fn flush(&mut self) {
-        let spans = std::mem::take(&mut self.current);
-        if !spans.is_empty() {
-            self.lines.push(Line::from(spans));
-        }
-    }
-
-    /// Flush a code line, preserving blank lines inside the block.
-    fn flush_code_line(&mut self) {
-        let spans = std::mem::take(&mut self.current);
-        self.lines.push(Line::from(spans));
-    }
-
-    /// Insert a blank separator before a new top-level block.
-    fn block_break(&mut self) {
-        if self.list_stack.is_empty() && !self.lines.is_empty() {
-            self.lines.push(Line::default());
-        }
-    }
-
-    fn handle(&mut self, event: pulldown_cmark::Event) {
-        use pulldown_cmark::{Event, Tag, TagEnd};
-        match event {
-            Event::Start(Tag::Heading { .. }) => {
-                self.block_break();
-                self.mod_stack.push(Modifier::BOLD);
-            }
-            Event::End(TagEnd::Heading(_)) => {
-                self.flush();
-                self.mod_stack.pop();
-            }
-            Event::Start(Tag::Paragraph) => self.block_break(),
-            Event::End(TagEnd::Paragraph) => self.flush(),
-            Event::Start(Tag::Strong) => self.mod_stack.push(Modifier::BOLD),
-            Event::Start(Tag::Emphasis) => self.mod_stack.push(Modifier::ITALIC),
-            Event::Start(Tag::Strikethrough) => self.mod_stack.push(Modifier::CROSSED_OUT),
-            Event::End(TagEnd::Strong | TagEnd::Emphasis | TagEnd::Strikethrough) => {
-                self.mod_stack.pop();
-            }
-            Event::Start(Tag::CodeBlock(_)) => {
-                self.block_break();
-                self.in_code_block = true;
-            }
-            Event::End(TagEnd::CodeBlock) => {
-                self.flush();
-                self.in_code_block = false;
-            }
-            Event::Start(Tag::List(first)) => self.list_stack.push(first),
-            Event::End(TagEnd::List(_)) => {
-                self.list_stack.pop();
-            }
-            Event::Start(Tag::Link { dest_url, .. }) => {
-                self.link_dest = Some(dest_url.to_string());
-                self.link_text.clear();
-            }
-            Event::End(TagEnd::Link) => {
-                // Append the URL (dimmed, in parens) unless it repeats the
-                // visible text, as an autolink or `[url](url)` would.
-                if let Some(dest) = self.link_dest.take() {
-                    let text = std::mem::take(&mut self.link_text);
-                    if dest != text && !dest.is_empty() {
-                        self.push_span(&format!(" ({dest})"), Modifier::DIM);
-                    }
-                }
-            }
-            Event::Start(Tag::Table(_)) => self.block_break(),
-            Event::End(TagEnd::Table) => {
-                self.table_row = None;
-            }
-            Event::Start(Tag::TableHead) => {
-                self.in_table_head = true;
-                self.table_row = Some(Vec::new());
-            }
-            Event::End(TagEnd::TableHead) => {
-                self.flush_table_row(Modifier::BOLD);
-                self.in_table_head = false;
-            }
-            Event::Start(Tag::TableRow) => {
-                self.table_row = Some(Vec::new());
-            }
-            Event::End(TagEnd::TableRow) => {
-                self.flush_table_row(Modifier::empty());
-            }
-            Event::Start(Tag::TableCell) => {
-                if let Some(row) = self.table_row.as_mut() {
-                    row.push(String::new());
-                }
-            }
-            Event::End(TagEnd::TableCell) => {}
-            Event::Start(Tag::Item) => {
-                self.flush();
-                let depth = self.list_stack.len().saturating_sub(1);
-                let indent = "  ".repeat(depth);
-                let marker = match self.list_stack.last_mut() {
-                    Some(Some(n)) => {
-                        let m = format!("{n}. ");
-                        *n += 1;
-                        m
-                    }
-                    _ => "• ".to_string(),
-                };
-                self.current.push(Span::raw(format!("{indent}{marker}")));
-            }
-            Event::End(TagEnd::Item) => self.flush(),
-            Event::Text(text) => {
-                if let Some(row) = self.table_row.as_mut() {
-                    if let Some(cell) = row.last_mut() {
-                        cell.push_str(&text);
-                    }
-                } else if self.in_code_block {
-                    self.push_code_text(&text);
-                } else {
-                    if self.link_dest.is_some() {
-                        self.link_text.push_str(&text);
-                    }
-                    self.push_span(&text, Modifier::empty());
-                }
-            }
-            Event::Code(text) => {
-                if let Some(row) = self.table_row.as_mut() {
-                    if let Some(cell) = row.last_mut() {
-                        cell.push_str(&text);
-                    }
-                } else {
-                    if self.link_dest.is_some() {
-                        self.link_text.push_str(&text);
-                    }
-                    self.push_span(&text, Modifier::DIM);
-                }
-            }
-            // A soft break (single newline in the source) renders as a
-            // real line break, matching how Claude Code prints agent
-            // output: a reply formatted "one item per line" must not
-            // collapse into one wrapped paragraph, which is what the
-            // markdown-standard space treatment did.
-            Event::SoftBreak if !self.in_code_block => self.flush(),
-            Event::HardBreak => self.flush(),
-            Event::Rule => {
-                self.block_break();
-                self.lines.push(Line::from("───"));
-            }
-            _ => {}
-        }
-    }
-
-    /// Flush the in-progress table row as one pipe-separated line. The
-    /// TUI markdown pass is single-sweep, so cells are not column-aligned;
-    /// the head row is bolded and rows keep their reading order.
-    fn flush_table_row(&mut self, extra: Modifier) {
-        let Some(cells) = self.table_row.take() else {
-            return;
-        };
-        if cells.is_empty() {
-            return;
-        }
-        let style = Style::default().add_modifier(self.active_modifier() | extra);
-        self.lines
-            .push(Line::from(Span::styled(cells.join(" │ "), style)));
-    }
-
-    /// Split code-block text on newlines, flushing one styled line per
-    /// row so multi-line blocks render distinctly without fence markers.
-    fn push_code_text(&mut self, text: &str) {
-        let style = Style::default().add_modifier(Modifier::DIM);
-        let mut parts = text.split('\n').peekable();
-        while let Some(part) = parts.next() {
-            if !part.is_empty() {
-                self.current.push(Span::styled(part.to_string(), style));
-            }
-            if parts.peek().is_some() {
-                self.flush_code_line();
-            }
-        }
-    }
-
-    fn finish(mut self) -> Vec<Line<'static>> {
-        self.flush();
-        while self.lines.last().is_some_and(|l| l.spans.is_empty()) {
-            self.lines.pop();
-        }
-        self.lines
-    }
-}
-
-fn transcript_lines<'a>(
-    transcript: &'a AcpTranscript,
+/// Project the server-owned transcript rows to the TUI's text presentation.
+/// The daemon ships ordered [`TranscriptRow`]s; this maps each kind to lines,
+/// keeping every presentation choice client-side (markdown, per-kind tool
+/// cards, diff rendering, path shortening). Approvals are not here: they are
+/// control state rendered in the modal shelf, and the gated tool card is
+/// already one of these rows.
+fn transcript_lines(
+    transcript: &AcpTranscript,
     theme: &Theme,
     path_roots: Option<&SessionPathRoots>,
-) -> Vec<Line<'a>> {
-    let mut out: Vec<Line<'a>> = Vec::new();
-    for row in &transcript.rows {
-        match row {
-            ActivityRow::UserPrompt(text) => {
-                out.extend(user_message_lines(text, theme));
-                out.push(Line::default());
+) -> Vec<Line<'static>> {
+    let rows = &transcript.server_rows;
+    // Pair each tool call's terminal row (complete / error / stopped) with its
+    // `tool_start` so ONE card renders at the start position, the way the old
+    // single mutated-in-place row did. Last terminal wins for a reused id.
+    let mut completions: HashMap<&str, &TranscriptRow> = HashMap::new();
+    for row in rows {
+        if is_tool_terminal(row.kind) {
+            if let Some(id) = row.tool_call_id.as_deref() {
+                completions.insert(id, row);
             }
-            ActivityRow::AgentMessage(text) => {
-                out.extend(agent_message_lines(text, theme));
+        }
+    }
+
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut i = 0;
+    while i < rows.len() {
+        let row = &rows[i];
+        match row.kind {
+            TranscriptRowKind::Message => {
+                // Coalesce consecutive `message` rows sharing a `group_id` into
+                // one assistant bubble, preserving the in-place grouping the old
+                // chunk-merge gave (the server splits chunks into a row each but
+                // groups them). Advances `i` past the run.
+                let group = &row.group_id;
+                let mut text = String::new();
+                while i < rows.len()
+                    && rows[i].kind == TranscriptRowKind::Message
+                    && &rows[i].group_id == group
+                {
+                    text.push_str(&rows[i].text);
+                    i += 1;
+                }
+                out.extend(agent_message_lines(&text, theme));
                 out.push(Line::default());
+                continue;
             }
-            ActivityRow::ToolCall(tool) => {
-                out.extend(render_tool_lines(tool, theme, path_roots));
-                out.push(Line::default());
-            }
-            ActivityRow::Approval(row) => {
-                let (marker, label) = match row.decision {
-                    Some(ApprovalDecision::Allow) => ("✓", "Allowed once"),
-                    Some(ApprovalDecision::AllowAlways) => ("✓", "Always allowed"),
-                    Some(ApprovalDecision::Deny) => ("✕", "Denied"),
-                    Some(ApprovalDecision::Cancelled) => ("·", "Cancelled"),
-                    // Pending approvals live in the modal shelf below the
-                    // transcript, so they do not duplicate here.
-                    None => continue,
+            TranscriptRowKind::UserPrompt => {
+                // Text-only view; note the attachment count inline so a prompt
+                // sent from the web composer with images doesn't look empty.
+                let text = if row.attachments.is_empty() {
+                    row.text.clone()
+                } else {
+                    format!("{} [{} attachment(s)]", row.text, row.attachments.len())
                 };
-                out.push(Line::from(Span::styled(
-                    format!("{marker} {label} · {}", row.title),
-                    Style::default().fg(theme.hint),
-                )));
+                out.extend(user_message_lines(&text, theme));
                 out.push(Line::default());
             }
-            ActivityRow::ElicitationAnswer(answers) => {
-                // The user's answer is one of their turns, so it reads
-                // the same as a user prompt: highlighted, no label.
-                for answer in answers {
-                    out.extend(user_message_lines(
-                        &format!("{}: {}", answer.question, answer.answer),
-                        theme,
-                    ));
+            TranscriptRowKind::UserDiffComments => {
+                // No rich diff-comments card; the assembled markdown (exactly
+                // what the agent received) reads as a plain user prompt.
+                out.extend(user_message_lines(&row.text, theme));
+                out.push(Line::default());
+            }
+            TranscriptRowKind::ToolStart => {
+                let card = tool_card_from_rows(row, &completions);
+                out.extend(render_tool_lines(&card, theme, path_roots));
+                out.push(Line::default());
+            }
+            TranscriptRowKind::ToolComplete
+            | TranscriptRowKind::ToolError
+            | TranscriptRowKind::ToolStopped => {
+                // Rendered with their `tool_start`. The server synthesizes a
+                // start when one is missing, so a terminal row is never
+                // orphaned in a full buffer; skip it here.
+            }
+            TranscriptRowKind::ElicitationAnswered => {
+                // The user's answer is one of their turns, so it reads like a
+                // user prompt. Prefer the structured pairs; fall back to text.
+                if row.elicitation_answers.is_empty() {
+                    out.extend(user_message_lines(&row.text, theme));
+                } else {
+                    for answer in &row.elicitation_answers {
+                        out.extend(user_message_lines(
+                            &format!("{}: {}", answer.question, answer.answer),
+                            theme,
+                        ));
+                    }
                 }
                 out.push(Line::default());
             }
-            ActivityRow::Note { kind, text } => {
-                let modifier = match kind {
-                    NoteKind::Info => Modifier::DIM,
-                    NoteKind::Warning => Modifier::BOLD,
-                    NoteKind::Error => Modifier::BOLD,
+            TranscriptRowKind::EmptyOutput
+            | TranscriptRowKind::ContextReset
+            | TranscriptRowKind::SessionCleared
+            | TranscriptRowKind::Compacted
+            | TranscriptRowKind::Summary
+            | TranscriptRowKind::Notice => {
+                let kind = match row.kind {
+                    // A failed startup, a turn that died, a refused mode
+                    // switch: the user has to see these, so they read as
+                    // errors rather than as dividers.
+                    TranscriptRowKind::Notice => NoteKind::Error,
+                    TranscriptRowKind::ContextReset | TranscriptRowKind::SessionCleared => {
+                        NoteKind::Warning
+                    }
+                    _ => NoteKind::Info,
                 };
-                out.push(Line::from(Span::styled(
-                    format!("· {text}"),
-                    Style::default().add_modifier(modifier),
-                )));
+                out.push(note_line(kind, &row.text));
                 out.push(Line::default());
             }
         }
+        i += 1;
     }
     if out.is_empty() {
         out.push(Line::from(Span::styled(
@@ -1592,6 +1415,100 @@ fn transcript_lines<'a>(
         )));
     }
     out
+}
+
+fn is_tool_terminal(kind: TranscriptRowKind) -> bool {
+    matches!(
+        kind,
+        TranscriptRowKind::ToolComplete
+            | TranscriptRowKind::ToolError
+            | TranscriptRowKind::ToolStopped
+    )
+}
+
+/// A divider / notice row: `· {text}`, dimmed for info and bold for a warning
+/// boundary or an error, matching the old inline Note styling.
+fn note_line(kind: NoteKind, text: &str) -> Line<'static> {
+    let modifier = match kind {
+        NoteKind::Info => Modifier::DIM,
+        NoteKind::Warning | NoteKind::Error => Modifier::BOLD,
+    };
+    Line::from(Span::styled(
+        format!("· {text}"),
+        Style::default().add_modifier(modifier),
+    ))
+}
+
+/// Build the render-side tool card from a `tool_start` row and its paired
+/// terminal row, so `render_tool_lines` keeps its existing per-kind body.
+fn tool_card_from_rows(
+    start: &TranscriptRow,
+    completions: &HashMap<&str, &TranscriptRow>,
+) -> ToolCallRow {
+    let tool = start.tool.as_ref();
+    let completed = start
+        .tool_call_id
+        .as_deref()
+        .and_then(|id| completions.get(id))
+        .map(|term| tool_completion_from_row(term));
+    ToolCallRow {
+        name: tool
+            .map(|t| t.name.clone())
+            .unwrap_or_else(|| start.text.clone()),
+        kind: tool.map(|t| t.kind.clone()).unwrap_or_default(),
+        args: tool.map(|t| t.args_preview.clone()).unwrap_or_default(),
+        diffs: tool.map(|t| t.diffs.clone()).unwrap_or_default(),
+        completed,
+    }
+}
+
+/// Fold a terminal tool row into the render-side completion. Mirrors the old
+/// `ToolCallCompleted` arm: an async sub-agent launch reads as a background
+/// dispatch (the SDK marker body carries an internal id we must not surface);
+/// structured output blocks summarize; otherwise the row text is the body.
+/// Only a `tool_complete` is `ok`; `tool_error` / `tool_stopped` use the
+/// detail renderer.
+fn tool_completion_from_row(term: &TranscriptRow) -> ToolCompletion {
+    let content = if term.async_subagent {
+        "runs in background".to_string()
+    } else if term.output.is_empty() {
+        term.text.clone()
+    } else {
+        summarize_output_blocks(&term.output)
+    };
+    ToolCompletion {
+        outcome: match term.kind {
+            TranscriptRowKind::ToolComplete => ToolOutcome::Ok,
+            TranscriptRowKind::ToolStopped => ToolOutcome::Stopped,
+            _ => ToolOutcome::Error,
+        },
+        content,
+    }
+}
+
+/// Render a structured completion payload as a single text block for the
+/// native TUI, which can't display images/audio inline. Media variants
+/// become a `[kind mime]` placeholder; text + text-resources show their
+/// text; links/blobs show their uri. See #1818.
+fn summarize_output_blocks(blocks: &[ToolOutputBlock]) -> String {
+    blocks
+        .iter()
+        .map(|block| match block {
+            ToolOutputBlock::Text { text } => text.clone(),
+            ToolOutputBlock::Image { mime_type, .. } => format!("[image {mime_type}]"),
+            ToolOutputBlock::Audio { mime_type, .. } => format!("[audio {mime_type}]"),
+            ToolOutputBlock::ResourceLink { name, uri, .. } => format!("[link {name}: {uri}]"),
+            ToolOutputBlock::Resource {
+                uri,
+                text: Some(text),
+                ..
+            } => format!("{text}\n[resource {uri}]"),
+            ToolOutputBlock::Resource {
+                uri, text: None, ..
+            } => format!("[resource {uri}]"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Return the first `max_chars` characters of `s`, or `None` if `s`
@@ -1634,7 +1551,7 @@ fn render_tool_lines(
     if tool
         .completed
         .as_ref()
-        .is_some_and(|completion| completion.ok)
+        .is_some_and(|completion| completion.outcome == ToolOutcome::Ok)
     {
         return vec![compact_tool_line(tool, theme, path_roots)];
     }
@@ -1643,8 +1560,11 @@ fn render_tool_lines(
         "tool {} · {}",
         match tool.completed.as_ref() {
             None => "▶",
-            Some(c) if c.ok => "✓",
-            Some(_) => "✗",
+            Some(c) => match c.outcome {
+                ToolOutcome::Ok => "✓",
+                ToolOutcome::Stopped => "◼",
+                ToolOutcome::Error => "✗",
+            },
         },
         tool.name
     );
@@ -1891,6 +1811,17 @@ fn render_delete_body(
 /// Bounded preview of a tool's completion content, shared by the read
 /// and execute cards. Falls back to a status word before completion or
 /// when the agent shipped no body.
+/// What to show when a finished tool shipped no content body. A stopped call
+/// is the turn-end sweep closing an open call, not a failure, so it must not
+/// read as one.
+fn empty_output_note(completion: &ToolCompletion) -> &'static str {
+    match completion.outcome {
+        ToolOutcome::Ok => "  (no output)",
+        ToolOutcome::Stopped => "  (stopped when the turn ended)",
+        ToolOutcome::Error => "  (tool failed; press `o` for details)",
+    }
+}
+
 fn output_preview_lines(tool: &ToolCallRow) -> Vec<Line<'static>> {
     let Some(completion) = &tool.completed else {
         return vec![Line::from(Span::styled(
@@ -1899,12 +1830,7 @@ fn output_preview_lines(tool: &ToolCallRow) -> Vec<Line<'static>> {
         ))];
     };
     if completion.content.is_empty() {
-        let msg = if completion.ok {
-            "  (no output)"
-        } else {
-            "  (tool failed; press `o` for details)"
-        };
-        return vec![Line::from(msg.to_string())];
+        return vec![Line::from(empty_output_note(completion).to_string())];
     }
     let mut out = Vec::new();
     let styled = styled_output_lines(&completion.content);
@@ -1953,12 +1879,7 @@ fn render_generic_body(tool: &ToolCallRow) -> Vec<Line<'static>> {
     }
     if let Some(completion) = &tool.completed {
         if completion.content.is_empty() {
-            let msg = if completion.ok {
-                "  (no output)"
-            } else {
-                "  (tool failed; press `o` for details)"
-            };
-            lines.push(Line::from(msg.to_string()));
+            lines.push(Line::from(empty_output_note(completion).to_string()));
         } else {
             let (body, truncated) = match truncate_chars(&completion.content, 400) {
                 Some(head) => (head, true),
@@ -2426,7 +2347,11 @@ mod tests {
             args: args.into(),
             diffs: Vec::new(),
             completed: completion.map(|(ok, content)| ToolCompletion {
-                ok,
+                outcome: if ok {
+                    ToolOutcome::Ok
+                } else {
+                    ToolOutcome::Error
+                },
                 content: content.into(),
             }),
         }
@@ -2504,20 +2429,35 @@ mod tests {
         lines.iter().map(line_text).collect::<Vec<_>>().join("\n")
     }
 
+    /// Build the server's transcript rows for a sequence of events, the way
+    /// the daemon folds them before shipping over the WS transcript channel.
+    fn server_rows(events: &[crate::acp::state::Event]) -> Vec<TranscriptRow> {
+        let mut m = crate::acp::transcript::TranscriptModel::new();
+        for (i, e) in events.iter().enumerate() {
+            m.apply_event(i as u64 + 1, e);
+        }
+        m.rows().to_vec()
+    }
+
     #[test]
     fn transcript_renders_elicitation_answers_as_user_rows() {
-        use crate::acp::elicitations::ElicitationAnswer;
+        use crate::acp::approvals::Nonce;
+        use crate::acp::elicitations::{ElicitationAnswer, ElicitationOutcome};
         let mut t = AcpTranscript::new("s-1");
-        t.rows.push(ActivityRow::ElicitationAnswer(vec![
-            ElicitationAnswer {
-                question: "Proceed?".into(),
-                answer: "Yes".into(),
-            },
-            ElicitationAnswer {
-                question: "Mode".into(),
-                answer: "Fast".into(),
-            },
-        ]));
+        t.server_rows = server_rows(&[crate::acp::state::Event::ElicitationResolved {
+            nonce: Nonce("e-1".into()),
+            outcome: ElicitationOutcome::Accepted,
+            answers: vec![
+                ElicitationAnswer {
+                    question: "Proceed?".into(),
+                    answer: "Yes".into(),
+                },
+                ElicitationAnswer {
+                    question: "Mode".into(),
+                    answer: "Fast".into(),
+                },
+            ],
+        }]);
         let out = joined(&transcript_lines(&t, &Theme::default(), None));
         // Rendered as user turns: chevron gutter, no "you" label.
         assert!(out.contains("Proceed?: Yes"), "{out:?}");
@@ -2526,32 +2466,25 @@ mod tests {
     }
 
     #[test]
-    fn transcript_hides_pending_approval_and_records_resolved_without_nonce() {
-        use super::super::reducer::ApprovalRow;
-
+    fn transcript_omits_approvals_entirely() {
+        // Approvals are control state now: the transcript projection carries
+        // no approval row (the gated tool card is a server row, and the
+        // pending request lives in the modal shelf). A pending approval must
+        // not leak its title / nonce into the transcript body.
         let mut t = AcpTranscript::new("s-1");
-        t.rows.push(ActivityRow::Approval(ApprovalRow {
+        t.pending_approvals.push(PendingApproval {
             nonce: "internal-pending".into(),
             title: "Read file".into(),
             kind: "read".into(),
             args: r#"{"path":"src/lib.rs"}"#.into(),
             destructive: false,
-            decision: None,
-        }));
-        t.rows.push(ActivityRow::Approval(ApprovalRow {
-            nonce: "internal-resolved".into(),
-            title: "Edit file".into(),
-            kind: "edit".into(),
-            args: r#"{"path":"src/lib.rs"}"#.into(),
-            destructive: false,
-            decision: Some(ApprovalDecision::Allow),
-        }));
+        });
+        t.server_rows = server_rows(&[crate::acp::state::Event::AgentMessageChunk {
+            text: "working on it".into(),
+        }]);
         let out = joined(&transcript_lines(&t, &Theme::default(), None));
-        assert!(
-            !out.contains("Read file"),
-            "pending request duplicated: {out:?}"
-        );
-        assert!(out.contains("Allowed once · Edit file"), "{out:?}");
+        assert!(out.contains("working on it"), "server row missing: {out:?}");
+        assert!(!out.contains("Read file"), "approval leaked: {out:?}");
         assert!(!out.contains("internal-"), "nonce leaked: {out:?}");
     }
 
@@ -2965,14 +2898,16 @@ mod tests {
             main_repo_path: None,
             workspace_repos: Vec::new(),
         });
-        state
-            .transcript
-            .rows
-            .push(ActivityRow::UserPrompt("Hello.".into()));
-        state
-            .transcript
-            .rows
-            .push(ActivityRow::AgentMessage("What should we build?".into()));
+        state.transcript.server_rows = server_rows(&[
+            crate::acp::state::Event::UserPromptSent {
+                prompt_id: None,
+                text: "Hello.".into(),
+                attachments: Vec::new(),
+            },
+            crate::acp::state::Event::AgentMessageChunk {
+                text: "What should we build?".into(),
+            },
+        ]);
 
         let rows = render_rows(&state, 80, 20, true);
         let card_right = rows[0]

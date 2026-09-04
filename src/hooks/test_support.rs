@@ -1,7 +1,7 @@
 //! Shared test helpers for hook-base scaffolding.
 //!
 //! Used by `dir_guard`, `status_file`, `cli::extract_session_id`, and
-//! `session::container_config` tests so the override-and-reset dance lives
+//! `session::config::container_config` tests so the override-and-reset dance lives
 //! in one place. Tests using these helpers MUST also gate via
 //! `serial_test::serial(hook_base)` so the thread-local override stays
 //! consistent across parallel runs.
@@ -34,6 +34,19 @@ impl BaseGuard {
         let (g, base, tmp) = Self::fresh();
         make_correct_base(&base);
         (g, base, tmp)
+    }
+
+    /// As [`Self::fresh`] but with an explicit base path instead of the
+    /// default tempdir layout. Use for fixtures whose base must sit under a
+    /// specific parent (symlink chains, shared roots). The helper touches no
+    /// disk state, so pre-create whatever parent chain `base` requires;
+    /// whether `base` itself exists is up to the fixture, since guard entry
+    /// points verify-and-create it when absent. The override is cleared on
+    /// drop like the other constructors.
+    pub(crate) fn with_base(base: PathBuf) -> Self {
+        super::dir_guard::override_base_for_test(base);
+        super::dir_guard::reset_for_test();
+        Self
     }
 }
 

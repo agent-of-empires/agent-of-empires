@@ -13,12 +13,12 @@
 //!    (Idle/Unknown) every 5 cycles, Cold (Error) every 60 cycles, Frozen
 //!    (Stopped/Deleting) never.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 
-use crate::session::{Instance, Status};
+use crate::session::{DetectionState, Instance, Status};
 use crate::tui::worker::Worker;
 
 /// Adaptive polling intervals (in cycles). 0 = never poll.
@@ -51,7 +51,7 @@ fn polling_tier(status: Status) -> u64 {
 ///   clobbered by an unseeded snapshot.
 ///
 /// Locked by `apply_status_update_preserves_idle_entered_at_on_keep`
-/// in `src/tui/home/tests.rs` (a `#[cfg(test)]` item, so the reference
+/// in `src/tui/home/tests/status_rows_menu.rs` (a `#[cfg(test)]` item, so the reference
 /// is kept as a code-span rather than an intra-doc link that would
 /// silently degrade to literal text under `cargo doc`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -101,6 +101,12 @@ pub(crate) struct StatusUpdate {
     /// baseline, so the consumer applies this conditionally. `Some(_)` is
     /// unambiguous: apply it. See #2690.
     pub live_status_baseline: Option<Status>,
+    /// The polled clone's [`DetectionState`] after
+    /// `update_status_with_metadata` ran. `None` means the producer never
+    /// reached a detection, so the consumer keeps what the real `Instance`
+    /// holds. Dropping this is what left a proposed `Running -> Idle`
+    /// waiting on a confirming poll that could never see it (#3642).
+    pub detection: Option<DetectionState>,
 }
 
 pub(super) struct StatusPollState {
@@ -143,9 +149,19 @@ pub(super) fn poll_statuses_once(
 
     let pane_metadata = if any_pollable {
         crate::tmux::refresh_session_cache();
-        crate::tmux::batch_pane_metadata().unwrap_or_default()
+        match crate::tmux::refresh_pane_meta_cache() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                tracing::warn!(
+                    target: "session.status",
+                    %error,
+                    "skipping status refresh because tmux pane metadata is unavailable",
+                );
+                return Vec::new();
+            }
+        }
     } else {
-        HashMap::new()
+        std::sync::Arc::new(HashMap::new())
     };
 
     // Refresh container health if any sandboxed session exists and interval elapsed
@@ -165,13 +181,14 @@ pub(super) fn poll_statuses_once(
     if has_sandboxed && state.last_credential_refresh.elapsed() >= state.credential_refresh_interval
     {
         state.last_credential_refresh = Instant::now();
-        let profiles: BTreeSet<String> = instances
-            .iter()
-            .filter(|inst| inst.is_sandboxed())
-            .map(|inst| inst.effective_profile())
-            .collect();
-        for profile in profiles {
-            crate::session::container_config::refresh_agent_configs_for_profile(&profile);
+        crate::session::config::container_config::refresh_shared_agent_configs();
+        for instance in instances.iter().filter(|inst| inst.is_sandboxed()) {
+            crate::session::config::container_config::refresh_codex_agent_config_for_instance(
+                &instance.effective_profile(),
+                &instance.id,
+                &instance.tool,
+                Some(&instance.detect_as),
+            );
         }
     }
 
@@ -234,6 +251,8 @@ pub(super) fn poll_statuses_once(
                                 // usual sense; the Error tier itself sinks the row.
                                 pane_dead: false,
                                 live_status_baseline: Some(Status::Error),
+                                // No detection ran on this branch.
+                                detection: None,
                             });
                         }
                     }
@@ -281,6 +300,7 @@ pub(super) fn poll_statuses_once(
                 last_accessed_at: inst.last_accessed_at,
                 pane_dead,
                 live_status_baseline: inst.live_status_baseline,
+                detection: Some(inst.detection),
             })
         })
         .collect()
@@ -344,6 +364,7 @@ mod tests {
             last_accessed_at: None,
             pane_dead: false,
             live_status_baseline: None,
+            detection: None,
         };
         assert_eq!(update.idle_entered_at, IdleIntent::Set(ts));
     }
@@ -379,6 +400,10 @@ mod tests {
         assert_eq!(
             default.live_status_baseline, None,
             "live_status_baseline defaults to None (no baseline observed yet)"
+        );
+        assert_eq!(
+            default.detection, None,
+            "detection defaults to None (producer never detected)"
         );
     }
 

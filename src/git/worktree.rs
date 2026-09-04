@@ -48,18 +48,6 @@ fn classify_worktree_add_failure(combined: &str, branch: &str) -> GitError {
     }
 }
 
-/// Extract the worktree path from a `git branch -d`/`-D` "used by worktree"
-/// error. Git formats it as `... used by worktree at '<path>'` (single-quoted,
-/// on one line). Returns `None` when the marker or its closing quote is absent,
-/// so an unrelated error is never misread as a path.
-fn parse_worktree_in_use(stderr: &str) -> Option<PathBuf> {
-    const MARKER: &str = "used by worktree at '";
-    let start = stderr.find(MARKER)? + MARKER.len();
-    let rest = &stderr[start..];
-    let end = rest.find('\'')?;
-    Some(PathBuf::from(&rest[..end]))
-}
-
 /// Remote name used as a fallback when no candidate remote can be picked
 /// from the local refs. Real selection happens in
 /// `detect_default_branch_info`, which walks every configured remote and
@@ -67,6 +55,140 @@ fn parse_worktree_in_use(stderr: &str) -> Option<PathBuf> {
 /// constant only matters for the legacy single-remote / "no refs in repo
 /// yet" path.
 const FETCH_REMOTE: &str = "origin";
+
+/// Upper bound for local git metadata mutations that normally complete in
+/// milliseconds but could otherwise hang indefinitely on a stalled filesystem.
+const WORKTREE_MUTATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const MUTATION_OBSERVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[derive(Debug, PartialEq, Eq)]
+enum TimedMutationOutcome {
+    Applied,
+    Unchanged,
+    Indeterminate,
+}
+
+fn classify_timed_mutation(old_exists: bool, new_exists: bool) -> TimedMutationOutcome {
+    match (old_exists, new_exists) {
+        (false, true) => TimedMutationOutcome::Applied,
+        (true, false) => TimedMutationOutcome::Unchanged,
+        _ => TimedMutationOutcome::Indeterminate,
+    }
+}
+
+fn classify_ref_observations(
+    old_exists: Option<bool>,
+    new_exists: Option<bool>,
+) -> TimedMutationOutcome {
+    match (old_exists, new_exists) {
+        (Some(old_exists), Some(new_exists)) => classify_timed_mutation(old_exists, new_exists),
+        _ => TimedMutationOutcome::Indeterminate,
+    }
+}
+
+/// Parse `git worktree list --porcelain -z` and classify a timed-out move.
+///
+/// Porcelain records begin with `worktree <absolute-path>` and are separated
+/// by an empty NUL-delimited field. Paths are compared byte-for-byte: any
+/// relative path, alternate spelling, or malformed listing fails closed to an
+/// indeterminate result rather than guessing from the filesystem.
+fn classify_worktree_move_listing(
+    output: &[u8],
+    from: &Path,
+    to: &Path,
+) -> Option<TimedMutationOutcome> {
+    let from = from.as_os_str().as_encoded_bytes();
+    let to = to.as_os_str().as_encoded_bytes();
+    let mut from_registered = false;
+    let mut to_registered = false;
+    let mut at_record_start = true;
+    let mut fields = output.split(|byte| *byte == 0);
+
+    while let Some(field) = fields.next() {
+        if field.is_empty() {
+            if at_record_start {
+                return fields
+                    .all(|remaining| remaining.is_empty())
+                    .then(|| classify_timed_mutation(from_registered, to_registered));
+            }
+            at_record_start = true;
+            continue;
+        }
+
+        if at_record_start {
+            let path = field.strip_prefix(b"worktree ")?;
+            if path.is_empty() {
+                return None;
+            }
+            from_registered |= path == from;
+            to_registered |= path == to;
+            at_record_start = false;
+        }
+    }
+
+    None
+}
+
+/// Whether git will refuse to move or remove the worktree at `path` because of
+/// submodules. The refusal keys on the admin `modules` dir alone, so a worktree
+/// whose submodules were never initialised is not affected and an emptied
+/// submodule checkout still is.
+fn worktree_has_submodule_admin_state(path: &Path) -> bool {
+    super::cleanup::read_linked_worktree_gitdir(path)
+        .is_some_and(|gitdir| gitdir.join("modules").is_dir())
+}
+
+/// A populated submodule checkout inside a worktree that is about to move,
+/// paired with the git dir its pointer resolves to. That git dir lives under
+/// the main repo and does not move, so recording it before the rename is what
+/// makes the pointers repairable afterwards.
+struct SubmoduleCheckout {
+    /// Path relative to the worktree root, parents before children.
+    relative: PathBuf,
+    /// Canonical absolute path of the submodule's git dir.
+    gitdir: PathBuf,
+}
+
+fn canonicalize_move_endpoint(path: &Path) -> PathBuf {
+    path.canonicalize()
+        .or_else(|_| {
+            let parent = path.parent().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
+            })?;
+            let file_name = path.file_name().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no file name")
+            })?;
+            parent.canonicalize().map(|parent| parent.join(file_name))
+        })
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn observe_worktree_move(repo_path: &Path, from: &Path, to: &Path) -> TimedMutationOutcome {
+    match super::command::run_git_with_timeout(
+        repo_path,
+        ["worktree", "list", "--porcelain", "-z"],
+        MUTATION_OBSERVATION_TIMEOUT,
+    ) {
+        Ok(Some(output)) if output.status.success() => {
+            classify_worktree_move_listing(&output.stdout, from, to)
+                .unwrap_or(TimedMutationOutcome::Indeterminate)
+        }
+        _ => TimedMutationOutcome::Indeterminate,
+    }
+}
+
+fn observe_local_branch_ref(repo_path: &Path, branch: &str) -> Option<bool> {
+    let refname = format!("refs/heads/{branch}");
+    match super::command::run_git_with_timeout(
+        repo_path,
+        ["show-ref", "--verify", "--quiet", &refname],
+        MUTATION_OBSERVATION_TIMEOUT,
+    ) {
+        Ok(Some(output)) if output.status.success() => Some(true),
+        Ok(Some(output)) if output.status.code() == Some(1) => Some(false),
+        _ => None,
+    }
+}
 
 /// Reason recorded on every aoe-created worktree's `git worktree lock`. The
 /// lock makes `git worktree prune` skip the admin entry, so a prune run from a
@@ -287,8 +409,8 @@ impl GitWorktree {
         let timeout = std::time::Duration::from_secs(10);
         let start = std::time::Instant::now();
 
-        // run_with_timeout drains stderr with a deadline-bounded read, so a
-        // grandchild holding the pipe (credential helper) cannot block this
+        // run_with_timeout captures stderr in a temporary regular file, so a
+        // grandchild that inherits the handle cannot block this
         // past the timeout.
         match crate::process::run_with_timeout(&mut cmd, timeout) {
             Ok(Some(output)) => {
@@ -755,8 +877,7 @@ impl GitWorktree {
             };
             // Redact any credentialed remote URL before this text can reach
             // the debug log or the client (via the warnings channel below or
-            // the error message). Idempotent, so the second pass inside
-            // `classify_worktree_add_failure` is a no-op.
+            // the error message).
             let combined = sanitize_remote_credentials(&combined);
 
             // post-checkout hooks (e.g. pre-commit's hook-type=post-checkout
@@ -773,6 +894,10 @@ impl GitWorktree {
                 );
                 tracing::warn!(target: "git.worktree", "worktree create: {}", warning);
                 warnings.push(warning);
+            } else if self.worktree_path_for_branch(branch)?.is_some() {
+                // Determine ownership from locale-independent porcelain output;
+                // Git localizes the "already used by worktree" diagnostic.
+                return Err(GitError::BranchAlreadyCheckedOut(branch.to_string()));
             } else {
                 return Err(classify_worktree_add_failure(&combined, branch));
             }
@@ -868,7 +993,7 @@ impl GitWorktree {
         let path_str = path
             .to_str()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid path"))?;
-        let output = super::command::run_git(
+        let Some(output) = super::command::run_git_with_timeout(
             &self.repo_path,
             [
                 "worktree",
@@ -877,7 +1002,14 @@ impl GitWorktree {
                 WORKTREE_LOCK_REASON,
                 path_str,
             ],
-        )?;
+            WORKTREE_MUTATION_TIMEOUT,
+        )?
+        else {
+            return Err(GitError::WorktreeCommandFailed(format!(
+                "`git worktree lock` timed out after {}s",
+                WORKTREE_MUTATION_TIMEOUT.as_secs()
+            )));
+        };
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             return Err(GitError::WorktreeCommandFailed(stderr));
@@ -892,12 +1024,24 @@ impl GitWorktree {
     /// `git worktree unlock` resolves the entry from the admin side, so it
     /// still clears the lock when the checkout directory is already gone, and a
     /// non-zero exit (already unlocked, or no such worktree) is a harmless
-    /// no-op rather than an error.
+    /// no-op rather than an error. That classification is why the call goes
+    /// through the quiet helper: the routine non-zero exit belongs at DEBUG,
+    /// not in the WARN stream.
+    ///
+    /// Bounded like the mutations it precedes. `move_worktree` calls this
+    /// immediately before its own bounded `git worktree move`, and both touch
+    /// the same `.git/worktrees/<name>/` metadata, so leaving this one
+    /// unbounded would let a stalled filesystem pin every caller's locks
+    /// through the call that runs first.
     pub fn unlock_worktree(&self, path: &Path) {
         let Some(path_str) = path.to_str() else {
             return;
         };
-        let _ = super::command::run_git(&self.repo_path, ["worktree", "unlock", path_str]);
+        let _ = super::command::run_git_quiet_with_timeout(
+            &self.repo_path,
+            ["worktree", "unlock", path_str],
+            WORKTREE_MUTATION_TIMEOUT,
+        );
     }
 
     /// Convert a worktree's .git file from absolute to relative path.
@@ -1110,6 +1254,17 @@ impl GitWorktree {
             "delete_branch: invoking `git branch -d`"
         );
 
+        // Check the ref directly instead of parsing `git branch -d` stderr:
+        // Git localizes that diagnostic, so an absent branch otherwise stops
+        // being idempotent outside an English locale.
+        if !self.branch_exists(branch)? {
+            tracing::debug!(target: "git.worktree",
+                branch,
+                "delete_branch: branch already absent, treating as success"
+            );
+            return Ok(());
+        }
+
         // A trashed worktree is relocated with `git worktree move` and re-locked
         // (see WORKTREE_LOCK_REASON). If its checkout later goes missing but the
         // locked admin entry survives, `git worktree prune` skips it (prune
@@ -1136,66 +1291,86 @@ impl GitWorktree {
                 "delete_branch: `git branch -d` failed"
             );
 
-            // Branch already gone: treat as success. Git emits
-            // "error: branch '<name>' not found" in this case.
-            if stderr.contains("not found") {
+            // The ref existed at the pre-check but a peer may have deleted it
+            // before this command. Recheck the ref rather than parsing Git's
+            // localized "not found" diagnostic.
+            if !self.branch_exists(branch)? {
                 tracing::debug!(target: "git.worktree",
                     branch,
-                    "delete_branch: branch already absent, treating as success"
+                    "delete_branch: branch concurrently removed, treating as success"
                 );
                 return Ok(());
             }
 
-            // Branch still checked out by a lingering worktree entry whose
-            // checkout is gone (a relocated + locked trash worktree that prune
-            // skipped). Reap it and retry `-d` once. Git reports worktree usage
-            // before any merge-state check, so this can only surface here on the
-            // `-d`, never on the `-D` below. Gated on the checkout being absent:
-            // a worktree with a live checkout is legitimately using the branch
-            // and must NOT be force-removed behind the caller's back.
-            if !used_by_worktree_retried {
-                if let Some(path) = parse_worktree_in_use(&stderr) {
-                    if !path.exists() {
-                        used_by_worktree_retried = true;
-                        tracing::warn!(target: "git.worktree",
-                            branch,
-                            path = %path.display(),
-                            "delete_branch: branch held by a lingering worktree entry whose checkout is gone; reaping and retrying"
-                        );
-                        self.reap_worktree_entry(&path);
-                        continue;
-                    }
-                }
-            }
-
-            // If the branch has unmerged changes, try force delete.
-            if stderr.contains("not fully merged") {
-                let force_output =
-                    super::command::run_git(&self.repo_path, ["branch", "-D", branch])?;
-
-                if !force_output.status.success() {
-                    let force_stderr = String::from_utf8_lossy(&force_output.stderr);
-                    tracing::debug!(target: "git.worktree",
+            // Resolve worktree ownership from Git's stable porcelain output,
+            // not from localized stderr. A missing checkout with a retained,
+            // locked admin entry is ours to reap; a live checkout must remain
+            // untouched.
+            if let Some(path) = self.worktree_path_for_branch(branch)? {
+                if !used_by_worktree_retried && Self::checkout_confirmed_absent(path.try_exists()) {
+                    used_by_worktree_retried = true;
+                    tracing::warn!(target: "git.worktree",
                         branch,
-                        exit = ?force_output.status.code(),
-                        stderr = %force_stderr,
-                        "delete_branch: `git branch -D` (force) also failed"
+                        path = %path.display(),
+                        "delete_branch: branch held by a lingering worktree entry whose checkout is gone; reaping and retrying"
                     );
-                    return Err(GitError::WorktreeCommandFailed(format!(
-                        "git branch -D {}: {}",
-                        branch,
-                        force_stderr.trim()
-                    )));
+                    self.reap_worktree_entry(&path);
+                    continue;
                 }
-                return Ok(());
+                return Err(GitError::WorktreeCommandFailed(format!(
+                    "git branch -d {}: {}",
+                    branch,
+                    stderr.trim()
+                )));
             }
 
+            // The branch exists and no worktree owns it, so `-d` rejected an
+            // unmerged branch. Retry with the force-delete operation selected
+            // by AoE's branch cleanup contract. This avoids matching Git's
+            // localized "not fully merged" diagnostic.
+            let force_output = super::command::run_git(&self.repo_path, ["branch", "-D", branch])?;
+            if !force_output.status.success() {
+                let force_stderr = String::from_utf8_lossy(&force_output.stderr);
+                tracing::debug!(target: "git.worktree",
+                    branch,
+                    exit = ?force_output.status.code(),
+                    stderr = %force_stderr,
+                    "delete_branch: `git branch -D` (force) also failed"
+                );
+                return Err(GitError::WorktreeCommandFailed(format!(
+                    "git branch -D {}: {}",
+                    branch,
+                    force_stderr.trim()
+                )));
+            }
+            return Ok(());
+        }
+    }
+
+    /// Return the registered checkout path for the local branch, including a
+    /// stale locked entry whose checkout no longer exists.
+    fn worktree_path_for_branch(&self, branch: &str) -> Result<Option<PathBuf>> {
+        let output =
+            super::command::run_git(&self.repo_path, ["worktree", "list", "--porcelain", "-z"])?;
+        if !output.status.success() {
             return Err(GitError::WorktreeCommandFailed(format!(
-                "git branch -d {}: {}",
-                branch,
-                stderr.trim()
+                "git worktree list --porcelain: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
             )));
         }
+
+        let wanted = format!("refs/heads/{branch}");
+        let mut path = None;
+        for field in output.stdout.split(|byte| *byte == 0) {
+            if let Some(raw_path) = field.strip_prefix(b"worktree ") {
+                path = Some(PathBuf::from(
+                    String::from_utf8_lossy(raw_path).into_owned(),
+                ));
+            } else if field.strip_prefix(b"branch ") == Some(wanted.as_bytes()) {
+                return Ok(path);
+            }
+        }
+        Ok(None)
     }
 
     /// Reap the single linked-worktree admin entry that `git branch -d` named
@@ -1215,6 +1390,15 @@ impl GitWorktree {
     fn reap_worktree_entry(&self, path: &Path) {
         self.unlock_worktree(path);
         let _ = self.prune_worktrees();
+    }
+
+    /// Whether a lingering worktree admin entry may be reaped: only when its
+    /// checkout is confirmed absent. `Path::try_exists` distinguishes a real
+    /// absence (`Ok(false)`) from a `stat` failure (`Err`, e.g. EACCES / I/O),
+    /// which must NOT reap a possibly-live checkout and delete its branch,
+    /// mirroring the fail-closed rule on `branch_exists` (#2653).
+    fn checkout_confirmed_absent(probe: std::io::Result<bool>) -> bool {
+        matches!(probe, Ok(false))
     }
 
     /// Whether a local branch `refs/heads/<branch>` exists in this repo.
@@ -1242,14 +1426,32 @@ impl GitWorktree {
         // all subprocess-driven for consistent stderr / exit-code
         // semantics. The subprocess is why `Err(_)` is a real possibility
         // here even though the repo is already open.
-        match super::command::run_git(
+        let output = super::command::run_git_with_timeout(
             &self.repo_path,
             ["show-ref", "--verify", "--quiet", &refname],
-        ) {
-            Ok(output) => Ok(output.status.success()),
-            Err(e) => Err(GitError::WorktreeCommandFailed(format!(
-                "git show-ref --verify {refname}: {e}"
-            ))),
+            MUTATION_OBSERVATION_TIMEOUT,
+        )
+        .map_err(|e| {
+            GitError::WorktreeCommandFailed(format!("git show-ref --verify {refname}: {e}"))
+        })?
+        .ok_or_else(|| {
+            // Tri-state contract: a timeout is "could not determine", which
+            // must surface as Err so the caller fails closed rather than
+            // treating an unknown ref as absent.
+            GitError::WorktreeCommandFailed(format!(
+                "git show-ref --verify {refname} timed out after {}s",
+                MUTATION_OBSERVATION_TIMEOUT.as_secs()
+            ))
+        })?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            code => {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                Err(GitError::WorktreeCommandFailed(format!(
+                    "git show-ref --verify {refname} exited {code:?}: {stderr}"
+                )))
+            }
         }
     }
 
@@ -1279,6 +1481,9 @@ impl GitWorktree {
     /// relocates the checkout and updates the linked-worktree gitdir
     /// metadata. A plain filesystem rename would leave git's bookkeeping
     /// pointing at the old path, so always go through git here.
+    ///
+    /// A worktree with submodules cannot go through `git worktree move` at all
+    /// and takes `relocate_worktree_with_submodules` instead.
     pub fn move_worktree(&self, from: &Path, to: &Path) -> Result<()> {
         if !from.exists() {
             return Err(GitError::WorktreeNotFound(from.to_path_buf()));
@@ -1286,6 +1491,17 @@ impl GitWorktree {
         if to.exists() {
             return Err(GitError::WorktreeAlreadyExists(to.to_path_buf()));
         }
+        // Git refuses the move outright once the admin dir holds `modules/`,
+        // so take the manual path directly rather than spending a doomed
+        // command and its WARN on every move of a submodule worktree.
+        if worktree_has_submodule_admin_state(from) {
+            return self.relocate_worktree_with_submodules(from, to);
+        }
+        // Git reports canonical worktree paths. Resolve both spellings while
+        // the source and destination parent still exist, so a symlinked parent
+        // cannot make a completed timed-out move look indeterminate.
+        let observation_from = canonicalize_move_endpoint(from);
+        let observation_to = canonicalize_move_endpoint(to);
         let from_str = from
             .to_str()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid path"))?;
@@ -1302,13 +1518,54 @@ impl GitWorktree {
         // re-lock at the destination so the relocated checkout keeps its prune
         // protection.
         self.unlock_worktree(from);
-        let output =
-            super::command::run_git(&self.repo_path, ["worktree", "move", from_str, to_str])?;
+        let Some(output) = super::command::run_git_with_timeout(
+            &self.repo_path,
+            ["worktree", "move", from_str, to_str],
+            WORKTREE_MUTATION_TIMEOUT,
+        )?
+        else {
+            match observe_worktree_move(&self.repo_path, &observation_from, &observation_to) {
+                TimedMutationOutcome::Applied => {
+                    if let Err(e) = self.lock_worktree(to) {
+                        tracing::warn!(target: "git.worktree",
+                            to = %to.display(),
+                            error = %e,
+                            "move_worktree: could not re-lock worktree at new path"
+                        );
+                    }
+                    tracing::warn!(target: "git.worktree", to = %to.display(), "timed-out worktree move completed before termination");
+                    return Ok(());
+                }
+                TimedMutationOutcome::Unchanged
+                    if matches!(from.try_exists(), Ok(true))
+                        && matches!(to.try_exists(), Ok(false)) =>
+                {
+                    let _ = self.lock_worktree(from);
+                }
+                TimedMutationOutcome::Unchanged | TimedMutationOutcome::Indeterminate => {
+                    let _ = self.lock_worktree(from);
+                    let _ = self.lock_worktree(to);
+                    return Err(GitError::WorktreeCommandFailed(format!(
+                        "`git worktree move` timed out after {}s and its final location is indeterminate",
+                        WORKTREE_MUTATION_TIMEOUT.as_secs()
+                    )));
+                }
+            }
+            return Err(GitError::WorktreeCommandFailed(format!(
+                "`git worktree move` timed out after {}s without moving",
+                WORKTREE_MUTATION_TIMEOUT.as_secs()
+            )));
+        };
         if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            // Backstop for a layout the admin-dir probe above does not
+            // recognise, or a git that refuses on different grounds.
+            if super::cleanup::is_submodule_blocker(&stderr) {
+                return self.relocate_worktree_with_submodules(from, to);
+            }
             // Restore the lock on the unmoved source so a failed move does not
             // silently leave it unprotected.
             let _ = self.lock_worktree(from);
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             return Err(GitError::WorktreeCommandFailed(stderr));
         }
         if let Err(e) = self.lock_worktree(to) {
@@ -1317,6 +1574,226 @@ impl GitWorktree {
                 error = %e,
                 "move_worktree: could not re-lock worktree at new path"
             );
+        }
+        Ok(())
+    }
+
+    /// Relocate a worktree that `git worktree move` refuses because of
+    /// submodules, by renaming the directory and repairing git's pointers.
+    ///
+    /// Git refuses whenever the worktree's admin dir holds `modules/<sub>`,
+    /// whether or not the checkout is populated. `git submodule deinit` cannot
+    /// lift that (the admin dir survives it) and would refuse on, or with `-f`
+    /// discard, uncommitted and untracked submodule work, so the checkout is
+    /// moved as-is and the stale pointers are rewritten afterwards.
+    ///
+    /// Failure contract: an `Err` from here leaves the checkout at `from`.
+    /// Callers depend on it; `session::attach_project` only records the move in
+    /// its `Undo` once this returns `Ok`, so an `Err` after a real move would
+    /// strand the worktree at `to` with the session still pointing at `from`.
+    /// The two steps that can fail cheaply run first, while undoing them is a
+    /// single rename back. Past that point the worktree is registered at `to`
+    /// and every remaining step is reported rather than propagated.
+    fn relocate_worktree_with_submodules(&self, from: &Path, to: &Path) -> Result<()> {
+        tracing::info!(target: "git.worktree",
+            from = %from.display(),
+            to = %to.display(),
+            "move_worktree: relocating a worktree with submodules by hand"
+        );
+        // Recorded before the rename, while the pointers still resolve.
+        let checkouts = Self::populated_submodule_checkouts(from)?;
+
+        // Unlocked for the same window as the `git worktree move` path. The
+        // lock lives in the admin dir, which the rename does not touch.
+        self.unlock_worktree(from);
+
+        if let Err(e) = std::fs::rename(from, to) {
+            let _ = self.lock_worktree(from);
+            return Err(e.into());
+        }
+
+        if let Err(e) = self.repair_worktree(to) {
+            if std::fs::rename(to, from).is_err() {
+                tracing::error!(target: "git.worktree",
+                    to = %to.display(),
+                    error = %e,
+                    "move_worktree: could not repair or move back; the checkout is stranded at the new path"
+                );
+                return Err(e);
+            }
+            let _ = self.repair_worktree(from);
+            let _ = self.lock_worktree(from);
+            return Err(e);
+        }
+
+        // The worktree is registered at `to` from here on, so nothing below
+        // may propagate with `?`.
+        if let Err(e) = Self::convert_git_file_to_relative(to) {
+            tracing::warn!(target: "git.worktree",
+                to = %to.display(),
+                error = %e,
+                "move_worktree: could not restore the relative .git pointer"
+            );
+        }
+
+        let mut unrepaired = Vec::new();
+        for checkout in &checkouts {
+            if let Err(e) = Self::repoint_submodule(to, checkout) {
+                unrepaired.push(format!("{}: {e}", checkout.relative.display()));
+            }
+        }
+        if !unrepaired.is_empty() {
+            tracing::error!(target: "git.worktree",
+                to = %to.display(),
+                submodules = ?unrepaired,
+                "move_worktree: relocated the worktree but left submodule pointers stale; \
+                 `git submodule update --init --recursive` in the new path restores them"
+            );
+        }
+
+        if let Err(e) = self.lock_worktree(to) {
+            tracing::warn!(target: "git.worktree",
+                to = %to.display(),
+                error = %e,
+                "move_worktree: could not re-lock worktree at new path"
+            );
+        }
+        Ok(())
+    }
+
+    /// Re-derive git's linked-worktree bookkeeping for the checkout now at
+    /// `path`. One call fixes both sides, the worktree's own `.git` pointer and
+    /// the admin `gitdir` file naming it, even when the pointer was relative
+    /// and the move broke it.
+    fn repair_worktree(&self, path: &Path) -> Result<()> {
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid path"))?;
+        let Some(output) = super::command::run_git_with_timeout(
+            &self.repo_path,
+            ["worktree", "repair", path_str],
+            WORKTREE_MUTATION_TIMEOUT,
+        )?
+        else {
+            return Err(GitError::WorktreeCommandFailed(format!(
+                "`git worktree repair` timed out after {}s",
+                WORKTREE_MUTATION_TIMEOUT.as_secs()
+            )));
+        };
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(GitError::WorktreeCommandFailed(stderr));
+        }
+        Ok(())
+    }
+
+    /// Populated submodule checkouts under `worktree_path`, parents first.
+    ///
+    /// `submodule foreach` visits only populated checkouts, and `$displaypath`
+    /// is cumulative from the invocation directory, so a nested submodule comes
+    /// back as a plain worktree-relative path and needs no per-level path
+    /// arithmetic. Pairing each with the git dir its pointer currently resolves
+    /// to is what avoids reconstructing git's `modules/<a>/modules/<b>` nesting
+    /// by hand after the move.
+    fn populated_submodule_checkouts(worktree_path: &Path) -> Result<Vec<SubmoduleCheckout>> {
+        let Some(output) = super::command::run_git_with_timeout(
+            worktree_path,
+            [
+                "submodule",
+                "foreach",
+                "--recursive",
+                "--quiet",
+                r#"printf '%s\n' "$displaypath""#,
+            ],
+            WORKTREE_MUTATION_TIMEOUT,
+        )?
+        else {
+            return Err(GitError::WorktreeCommandFailed(format!(
+                "`git submodule foreach` timed out after {}s",
+                WORKTREE_MUTATION_TIMEOUT.as_secs()
+            )));
+        };
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(GitError::WorktreeCommandFailed(stderr));
+        }
+
+        let mut checkouts = Vec::new();
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let relative = line.trim();
+            if relative.is_empty() {
+                continue;
+            }
+            let checkout = worktree_path.join(relative);
+            let git_file = checkout.join(".git");
+            // A submodule whose `.git` is a directory carries its whole
+            // repository inside the checkout, so the rename moves it intact
+            // and there is no pointer to rewrite.
+            if !git_file.is_file() {
+                continue;
+            }
+            let Some(gitdir) = super::cleanup::read_linked_worktree_gitdir(&checkout) else {
+                continue;
+            };
+            let Ok(gitdir) = gitdir.canonicalize() else {
+                continue;
+            };
+            checkouts.push(SubmoduleCheckout {
+                relative: PathBuf::from(relative),
+                gitdir,
+            });
+        }
+        Ok(checkouts)
+    }
+
+    /// Point a moved submodule checkout and its git dir back at each other.
+    ///
+    /// Both directions go stale when the parent worktree moves and both matter:
+    /// with only the checkout's `.git` rewritten, git still resolves
+    /// `core.worktree` to the old path and every command in the parent worktree
+    /// fails with `cannot chdir`. Both are written relative, for the same
+    /// reason [`Self::convert_git_file_to_relative`] exists.
+    ///
+    /// `core.worktree` goes through `git config --file` rather than a `git
+    /// config` run from inside the submodule, because until it is fixed git
+    /// cannot enter that checkout at all: it resolves the stale value first and
+    /// exits with `cannot chdir`.
+    fn repoint_submodule(worktree_path: &Path, checkout: &SubmoduleCheckout) -> Result<()> {
+        let path = worktree_path.join(&checkout.relative);
+        // Canonical on both sides, since the recorded git dir is canonical and
+        // a relative path between mixed spellings would not resolve.
+        let canonical = path.canonicalize()?;
+        let gitdir = &checkout.gitdir;
+
+        let pointer = Self::diff_paths(gitdir, &canonical).unwrap_or_else(|| gitdir.clone());
+        std::fs::write(
+            path.join(".git"),
+            format!("gitdir: {}\n", pointer.display()),
+        )?;
+
+        let core_worktree =
+            Self::diff_paths(&canonical, gitdir).unwrap_or_else(|| canonical.clone());
+        let core_worktree = core_worktree
+            .to_str()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid path"))?;
+        let config = gitdir.join("config");
+        let config = config
+            .to_str()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid path"))?;
+        let Some(output) = super::command::run_git_with_timeout(
+            worktree_path,
+            ["config", "--file", config, "core.worktree", core_worktree],
+            WORKTREE_MUTATION_TIMEOUT,
+        )?
+        else {
+            return Err(GitError::WorktreeCommandFailed(format!(
+                "`git config core.worktree` timed out after {}s",
+                WORKTREE_MUTATION_TIMEOUT.as_secs()
+            )));
+        };
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(GitError::WorktreeCommandFailed(stderr));
         }
         Ok(())
     }
@@ -1330,7 +1807,33 @@ impl GitWorktree {
             repo = %self.repo_path.display(),
             "rename_branch: invoking `git branch -m`"
         );
-        let output = super::command::run_git(&self.repo_path, ["branch", "-m", old, new])?;
+        let Some(output) = super::command::run_git_with_timeout(
+            &self.repo_path,
+            ["branch", "-m", old, new],
+            WORKTREE_MUTATION_TIMEOUT,
+        )?
+        else {
+            let old_exists = observe_local_branch_ref(&self.repo_path, old);
+            let new_exists = observe_local_branch_ref(&self.repo_path, new);
+            match classify_ref_observations(old_exists, new_exists) {
+                TimedMutationOutcome::Applied => {
+                    tracing::warn!(target: "git.worktree", old, new, "timed-out branch rename completed before termination");
+                    return Ok(());
+                }
+                TimedMutationOutcome::Unchanged => {
+                    return Err(GitError::WorktreeCommandFailed(format!(
+                        "`git branch -m` timed out after {}s without renaming",
+                        WORKTREE_MUTATION_TIMEOUT.as_secs()
+                    )));
+                }
+                TimedMutationOutcome::Indeterminate => {
+                    return Err(GitError::WorktreeCommandFailed(format!(
+                        "`git branch -m` timed out after {}s and ref state is indeterminate",
+                        WORKTREE_MUTATION_TIMEOUT.as_secs()
+                    )));
+                }
+            }
+        };
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             return Err(GitError::WorktreeCommandFailed(stderr));
@@ -1540,6 +2043,158 @@ fn walk_worktree_stats(root: &Path) -> WorktreeWalkStats {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn timed_mutation_outcome_requires_exactly_one_observed_side() {
+        let cases = [
+            (false, true, TimedMutationOutcome::Applied),
+            (true, false, TimedMutationOutcome::Unchanged),
+            (false, false, TimedMutationOutcome::Indeterminate),
+            (true, true, TimedMutationOutcome::Indeterminate),
+        ];
+        for (old_exists, new_exists, expected) in cases {
+            assert_eq!(classify_timed_mutation(old_exists, new_exists), expected);
+        }
+    }
+
+    #[test]
+    fn ref_observations_fail_closed_when_either_probe_is_indeterminate() {
+        let cases = [
+            (Some(false), Some(true), TimedMutationOutcome::Applied),
+            (Some(true), Some(false), TimedMutationOutcome::Unchanged),
+            (
+                Some(false),
+                Some(false),
+                TimedMutationOutcome::Indeterminate,
+            ),
+            (Some(true), Some(true), TimedMutationOutcome::Indeterminate),
+            (None, Some(true), TimedMutationOutcome::Indeterminate),
+            (Some(false), None, TimedMutationOutcome::Indeterminate),
+            (None, None, TimedMutationOutcome::Indeterminate),
+        ];
+        for (old_exists, new_exists, expected) in cases {
+            assert_eq!(classify_ref_observations(old_exists, new_exists), expected);
+        }
+    }
+
+    #[test]
+    fn worktree_porcelain_classification_is_exact_and_conservative() {
+        let from = Path::new("/repo/old");
+        let to = Path::new("/repo/new");
+        let cases: &[(&[u8], Option<TimedMutationOutcome>)] = &[
+            (
+                b"worktree /repo/old\0HEAD abc\0branch refs/heads/topic\0\0",
+                Some(TimedMutationOutcome::Unchanged),
+            ),
+            (
+                b"worktree /repo/new\0HEAD abc\0branch refs/heads/topic\0\0",
+                Some(TimedMutationOutcome::Applied),
+            ),
+            (
+                b"worktree /repo/old\0HEAD abc\0\0worktree /repo/new\0HEAD abc\0\0",
+                Some(TimedMutationOutcome::Indeterminate),
+            ),
+            (
+                b"worktree /repo/other\0HEAD abc\0\0",
+                Some(TimedMutationOutcome::Indeterminate),
+            ),
+            (
+                b"worktree /repo/old-suffix\0HEAD abc\0\0",
+                Some(TimedMutationOutcome::Indeterminate),
+            ),
+            (b"HEAD abc\0worktree /repo/new\0\0", None),
+            (b"worktree /repo/new\0HEAD abc\0", None),
+        ];
+
+        for (listing, expected) in cases {
+            let actual = classify_worktree_move_listing(listing, from, to);
+            assert_eq!(
+                actual.as_ref(),
+                expected.as_ref(),
+                "listing: {:?}",
+                String::from_utf8_lossy(listing)
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn worktree_move_observation_canonicalizes_symlinked_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_parent = dir.path().join("real");
+        std::fs::create_dir(&real_parent).unwrap();
+        let linked_parent = dir.path().join("linked");
+        std::os::unix::fs::symlink(&real_parent, &linked_parent).unwrap();
+        // macOS hands out temp dirs under `/var`, itself a symlink to
+        // `/private/var`, so the expectation has to be canonical too.
+        let real_parent = real_parent.canonicalize().unwrap();
+        let from = linked_parent.join("old");
+        std::fs::create_dir(&from).unwrap();
+        let to = linked_parent.join("new");
+
+        let observed_from = canonicalize_move_endpoint(&from);
+        let observed_to = canonicalize_move_endpoint(&to);
+        assert_eq!(observed_from, real_parent.join("old"));
+        assert_eq!(observed_to, real_parent.join("new"));
+
+        let mut completed_listing = b"worktree ".to_vec();
+        completed_listing.extend_from_slice(observed_to.as_os_str().as_encoded_bytes());
+        completed_listing.extend_from_slice(b"\0HEAD abc\0branch refs/heads/topic\0\0");
+        assert_eq!(
+            classify_worktree_move_listing(&completed_listing, &observed_from, &observed_to),
+            Some(TimedMutationOutcome::Applied),
+        );
+    }
+
+    /// Every git subprocess reachable from `move_worktree` /
+    /// `edit_worktree_workdir` is bounded. The profile-move transaction runs
+    /// them while holding the app-global identity flock, both per-session
+    /// locks, and both profile storage flocks, so one unbounded call pins every
+    /// peer `aoe` process. Pins the whole set rather than one call: the gap
+    /// this closes was `unlock_worktree` sitting one line above an already
+    /// bounded `git worktree move`.
+    ///
+    /// Source-level rather than behavioural because making git itself block on
+    /// `.git` metadata is not reproducible in a unit test; the failure mode is
+    /// a future caller reaching for the unbounded helper, which this catches.
+    #[test]
+    fn every_worktree_mutation_subprocess_is_bounded() {
+        // Whitespace-normalised so rustfmt's line wrapping cannot change the
+        // result: the point is which helper is called, not how it is laid out.
+        let source = include_str!("worktree.rs");
+        let region = source
+            .split_once("impl GitWorktree {")
+            .expect("GitWorktree impl block")
+            .1
+            .split_once("\n#[cfg(test)]")
+            .expect("test module terminates the scanned region")
+            .0;
+        let flat = region.split_whitespace().collect::<Vec<_>>().join(" ");
+        let cases = [
+            ("\"worktree\", \"lock\"", "git worktree lock"),
+            ("\"worktree\", \"unlock\"", "git worktree unlock"),
+            ("\"show-ref\", \"--verify\"", "git show-ref --verify"),
+            ("\"worktree\", \"move\"", "git worktree move"),
+            ("\"branch\", \"-m\"", "git branch -m"),
+        ];
+        for (needle, label) in cases {
+            let at = flat
+                .find(needle)
+                .unwrap_or_else(|| panic!("{label} should still be issued from this module"));
+            // The helper name precedes its argument list, so scan back to the
+            // nearest `run_git*` and require one of the timed variants.
+            let call = flat[..at]
+                .rfind("run_git")
+                .map(|i| &flat[i..])
+                .unwrap_or_default();
+            assert!(
+                call.starts_with("run_git_with_timeout")
+                    || call.starts_with("run_git_quiet_with_timeout"),
+                "{label} must go through a bounded helper, found `{}`",
+                call.split('(').next().unwrap_or(call)
+            );
+        }
+    }
 
     fn run_git(path: &Path, args: &[&str]) {
         let output = std::process::Command::new("git")
@@ -3409,6 +4064,216 @@ mod tests {
         (submodule_src_dir, submodule_bare_dir, repo_dir)
     }
 
+    /// The `TempDir`s a nested-submodule fixture has to keep alive: every
+    /// `file://` URL in the chain points at one of the bare clones, so dropping
+    /// any of them breaks `git submodule update`.
+    struct NestedSubmoduleFixture {
+        _dirs: Vec<TempDir>,
+        repo_dir: TempDir,
+    }
+
+    /// Build `main -> .claude -> .claude/nested`, every level served from a
+    /// local bare `file://` clone, then branch `branch` off the main repo's
+    /// HEAD. Two levels, because a moved worktree's submodule pointers live at
+    /// `modules/.claude` and `modules/.claude/modules/nested`, at different
+    /// depths, which is where relative-path arithmetic can go wrong.
+    ///
+    /// Uses plain `git` rather than git2 throughout; each `submodule add` opts
+    /// into the `file://` transport per command, like
+    /// `build_repo_with_submodule_and_branch` does, so no process-global env is
+    /// touched (#2863).
+    fn build_repo_with_nested_submodule_and_branch(branch: &str) -> NestedSubmoduleFixture {
+        // A repo with one committed file, returned with its bare clone's URL.
+        fn seed_repo(name: &str, dirs: &mut Vec<TempDir>) -> (TempDir, String) {
+            let dir = TempDir::new().unwrap();
+            run_git(dir.path(), &["init", "-q", "."]);
+            run_git(dir.path(), &["config", "user.name", "Test"]);
+            run_git(dir.path(), &["config", "user.email", "test@example.com"]);
+            std::fs::write(dir.path().join(format!("{name}.md")), format!("{name}\n")).unwrap();
+            run_git(dir.path(), &["add", "-A"]);
+            run_git(dir.path(), &["commit", "-qm", "init"]);
+            let url = bare_clone_url(dir.path(), name, dirs);
+            (dir, url)
+        }
+
+        fn bare_clone_url(src: &Path, name: &str, dirs: &mut Vec<TempDir>) -> String {
+            let bare_parent = TempDir::new().unwrap();
+            let bare = bare_parent.path().join(format!("{name}.git"));
+            run_git(
+                bare_parent.path(),
+                &[
+                    "clone",
+                    "--bare",
+                    "-q",
+                    src.to_str().unwrap(),
+                    bare.to_str().unwrap(),
+                ],
+            );
+            let url = format!("file://{}", bare.display());
+            dirs.push(bare_parent);
+            url
+        }
+
+        fn add_submodule(repo: &Path, url: &str, path: &str) {
+            run_git(
+                repo,
+                &[
+                    "-c",
+                    "protocol.file.allow=always",
+                    "submodule",
+                    "add",
+                    "-q",
+                    url,
+                    path,
+                ],
+            );
+            run_git(repo, &["commit", "-qm", "add submodule"]);
+        }
+
+        let mut dirs = Vec::new();
+        let (inner_dir, inner_url) = seed_repo("inner", &mut dirs);
+        let (mid_dir, _) = seed_repo("mid", &mut dirs);
+        add_submodule(mid_dir.path(), &inner_url, "nested");
+        // Re-clone the mid repo now that it carries the nested submodule, so
+        // the main repo's submodule points at a commit that has it.
+        let mid_url = bare_clone_url(mid_dir.path(), "mid-with-nested", &mut dirs);
+
+        let repo_dir = TempDir::new().unwrap();
+        run_git(repo_dir.path(), &["init", "-q", "."]);
+        run_git(repo_dir.path(), &["config", "user.name", "Test"]);
+        run_git(
+            repo_dir.path(),
+            &["config", "user.email", "test@example.com"],
+        );
+        std::fs::write(repo_dir.path().join("README.md"), "main repo\n").unwrap();
+        run_git(repo_dir.path(), &["add", "-A"]);
+        run_git(repo_dir.path(), &["commit", "-qm", "init"]);
+        add_submodule(repo_dir.path(), &mid_url, ".claude");
+        run_git(repo_dir.path(), &["branch", branch]);
+
+        dirs.push(inner_dir);
+        dirs.push(mid_dir);
+        NestedSubmoduleFixture {
+            _dirs: dirs,
+            repo_dir,
+        }
+    }
+
+    /// Stdout of a successful git command, for tests that assert on it.
+    fn git_stdout(path: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} in {} failed:\nstdout: {}\nstderr: {}",
+            args,
+            path.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// #3695: `git worktree move` refuses outright once a worktree's admin dir
+    /// holds `modules/<sub>`, which broke every aoe path that relocates a
+    /// worktree (attach-project, trash relocate and restore, worktree rename)
+    /// for any repo with submodules. The move has to preserve the submodule
+    /// checkouts as they are, uncommitted and untracked files included, since
+    /// the `submodule deinit` route either refuses on them or discards them.
+    #[test]
+    fn test_move_worktree_relocates_nested_submodules_and_keeps_local_changes() {
+        let fixture = build_repo_with_nested_submodule_and_branch("test-move");
+        let repo_path = fixture.repo_dir.path().to_path_buf();
+
+        let git_wt = GitWorktree::new(repo_path.clone())
+            .unwrap()
+            .allow_submodule_file_transport();
+        let worktree_parent = TempDir::new().unwrap();
+        let from = worktree_parent.path().join("source");
+        git_wt
+            .create_worktree("test-move", &from, false, None)
+            .unwrap();
+
+        let outer = from.join(".claude");
+        let nested = outer.join("nested");
+        assert!(
+            nested.join("inner.md").is_file(),
+            "fixture must start with both submodule levels populated"
+        );
+
+        // Local work at both levels, of both kinds `submodule deinit` objects to.
+        std::fs::write(outer.join("mid.md"), "edited outer\n").unwrap();
+        std::fs::write(outer.join("scratch.txt"), "outer scratch\n").unwrap();
+        std::fs::write(nested.join("inner.md"), "edited nested\n").unwrap();
+        std::fs::write(nested.join("scratch.txt"), "nested scratch\n").unwrap();
+
+        // One level deeper than the source, so every relative pointer that the
+        // move has to rewrite actually changes.
+        let to = worktree_parent.path().join("nested-dest").join("moved");
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        git_wt.move_worktree(&from, &to).unwrap();
+
+        assert!(!from.exists(), "source should be gone after the move");
+        let moved_outer = to.join(".claude");
+        let moved_nested = moved_outer.join("nested");
+
+        for (path, expected) in [
+            (moved_outer.join("mid.md"), "edited outer\n"),
+            (moved_outer.join("scratch.txt"), "outer scratch\n"),
+            (moved_nested.join("inner.md"), "edited nested\n"),
+            (moved_nested.join("scratch.txt"), "nested scratch\n"),
+        ] {
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                expected,
+                "{} should survive the move byte for byte",
+                path.display()
+            );
+        }
+
+        // Every repository in the moved tree has to be usable, which is what
+        // fails when either pointer direction is left stale: the parent's
+        // `git status` dies with `cannot chdir` on a stale `core.worktree`.
+        git_stdout(&to, &["status", "--short"]);
+        git_stdout(&to, &["submodule", "status", "--recursive"]);
+        git_stdout(&moved_outer, &["log", "--oneline", "-1"]);
+        git_stdout(&moved_nested, &["log", "--oneline", "-1"]);
+
+        // Git's own bookkeeping, from both ends.
+        let listed = git_stdout(&repo_path, &["worktree", "list", "--porcelain"]);
+        let expected_worktree = to.canonicalize().unwrap();
+        assert!(
+            listed
+                .lines()
+                .any(|l| l.strip_prefix("worktree ").map(Path::new)
+                    == Some(expected_worktree.as_path())),
+            "the main repo should list the worktree at its new path, got:\n{listed}"
+        );
+        assert!(
+            listed.contains("locked"),
+            "the relocated worktree should be locked again, got:\n{listed}"
+        );
+    }
+
+    /// The submodule probe must not divert an ordinary worktree onto the manual
+    /// path, so a repo without submodules keeps going through
+    /// `git worktree move`.
+    #[test]
+    fn test_worktree_has_submodule_admin_state_is_false_without_submodules() {
+        let (repo_dir, _repo) = setup_test_repo();
+        let git_wt = GitWorktree::new(repo_dir.path().to_path_buf()).unwrap();
+        let worktree_parent = TempDir::new().unwrap();
+        let wt_path = worktree_parent.path().join("plain");
+        git_wt
+            .create_worktree("plain-branch", &wt_path, true, None)
+            .unwrap();
+
+        assert!(!worktree_has_submodule_admin_state(&wt_path));
+    }
+
     #[test]
     fn test_create_worktree_initializes_submodules() {
         let (_submodule_src, _submodule_bare, repo_dir) =
@@ -3984,23 +4849,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parse_worktree_in_use_extracts_quoted_path() {
-        let stderr = "error: cannot delete branch 'compact-2' used by worktree at \
-                      '/home/n/wt/compact-2/.aoe-trash/b147f0ac'";
-        assert_eq!(
-            parse_worktree_in_use(stderr),
-            Some(PathBuf::from("/home/n/wt/compact-2/.aoe-trash/b147f0ac"))
-        );
-    }
-
-    #[test]
-    fn parse_worktree_in_use_ignores_unrelated_errors() {
-        assert_eq!(parse_worktree_in_use("error: branch 'x' not found"), None);
-        // Marker present but no closing quote: must not panic or misparse.
-        assert_eq!(parse_worktree_in_use("used by worktree at 'oops"), None);
-    }
-
     /// Regression: a trashed worktree is relocated + re-locked, then its
     /// checkout goes missing while the locked admin entry survives. `git
     /// worktree prune` skips the locked entry, so the branch stays "used by
@@ -4078,6 +4926,27 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&listed.stdout).contains("locked"),
             "the live worktree must remain locked"
+        );
+    }
+
+    #[test]
+    fn checkout_confirmed_absent_only_reaps_on_confirmed_absence() {
+        use std::io::{Error, ErrorKind};
+        assert!(
+            GitWorktree::checkout_confirmed_absent(Ok(false)),
+            "confirmed-absent checkout may be reaped"
+        );
+        assert!(
+            !GitWorktree::checkout_confirmed_absent(Ok(true)),
+            "present checkout must be kept"
+        );
+        assert!(
+            !GitWorktree::checkout_confirmed_absent(Err(Error::from(ErrorKind::PermissionDenied))),
+            "stat failure must fail closed, not reap a possibly-live checkout"
+        );
+        assert!(
+            !GitWorktree::checkout_confirmed_absent(Err(Error::from(ErrorKind::Other))),
+            "any stat error must fail closed"
         );
     }
 }

@@ -1181,14 +1181,39 @@ describe("logout", () => {
 // Session mutations
 
 describe("renameSession", () => {
-  it("PATCHes the title and returns ok on 200", async () => {
+  it("returns exactly { ok: true } on a 200 with no warnings", async () => {
     fetchSpy.mockResolvedValueOnce(new Response("", { status: 200 }));
     const result = await renameSession("s1", "New Title");
+    // toEqual is exact: the warnings key must be absent when the response
+    // carries none, so callers never iterate an empty/undefined array.
     expect(result).toEqual({ ok: true });
     const [url, init] = lastCall();
     expect(url).toBe("/api/sessions/s1");
     expect(init?.method).toBe("PATCH");
     expect(bodyOf(init)).toEqual({ title: "New Title" });
+  });
+
+  it("PATCHes the title and returns successful response warnings", async () => {
+    fetchSpy.mockResolvedValueOnce(
+      jsonResponse({ warnings: ["Metadata was saved, but the live tmux session could not be rekeyed"] }),
+    );
+    const result = await renameSession("s1", "New Title");
+    expect(result).toEqual({
+      ok: true,
+      warnings: ["Metadata was saved, but the live tmux session could not be rekeyed"],
+    });
+    const [url, init] = lastCall();
+    expect(url).toBe("/api/sessions/s1");
+    expect(init?.method).toBe("PATCH");
+    expect(bodyOf(init)).toEqual({ title: "New Title" });
+  });
+
+  it("drops non-string entries from successful warnings", async () => {
+    fetchSpy.mockResolvedValueOnce(jsonResponse({ warnings: ["kept", 3, null] }));
+    await expect(renameSession("s1", "New Title")).resolves.toEqual({
+      ok: true,
+      warnings: ["kept"],
+    });
   });
 
   it("surfaces the server message on a 409", async () => {

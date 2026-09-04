@@ -27,6 +27,7 @@ export function DirectoryBrowser({ initialPath, onSelect }: Props) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
+  const [showHidden, setShowHidden] = useState(false);
   const initialized = useRef(false);
   const loadSeq = useRef(0);
   const loadedFilter = useRef("");
@@ -39,7 +40,11 @@ export function DirectoryBrowser({ initialPath, onSelect }: Props) {
   }, []);
 
   const loadPath = useCallback(
-    async (path: string, limit: number, options: { filter?: string; resetFilter?: boolean } = {}): Promise<boolean> => {
+    async (
+      path: string,
+      limit: number,
+      options: { filter?: string; resetFilter?: boolean; showHidden?: boolean } = {},
+    ): Promise<boolean> => {
       const seq = loadSeq.current + 1;
       loadSeq.current = seq;
       setLoading(true);
@@ -50,7 +55,7 @@ export function DirectoryBrowser({ initialPath, onSelect }: Props) {
         setFilter("");
       }
       try {
-        const resp = await browseFilesystem(path, limit, options.filter);
+        const resp = await browseFilesystem(path, limit, options.filter, options.showHidden ?? showHidden);
         if (seq !== loadSeq.current) return false;
         if (!resp.ok) {
           setError("Can't access this folder. It may not exist or is outside the home directory.");
@@ -72,13 +77,23 @@ export function DirectoryBrowser({ initialPath, onSelect }: Props) {
         if (seq === loadSeq.current) setLoading(false);
       }
     },
-    [clearFilterDebounce],
+    [clearFilterDebounce, showHidden],
   );
 
   const navigate = useCallback(
     async (path: string): Promise<boolean> => loadPath(path, BROWSE_PAGE_SIZE, { resetFilter: true }),
     [loadPath],
   );
+
+  // A toggle is a discrete action, unlike typing, so it reloads immediately
+  // instead of waiting out the filter debounce. Pass the new value explicitly:
+  // the `showHidden` state update has not propagated to `loadPath` yet.
+  const toggleHidden = useCallback(() => {
+    const next = !showHidden;
+    setShowHidden(next);
+    clearFilterDebounce();
+    void loadPath(currentPath, BROWSE_PAGE_SIZE, { filter: filter.trim(), showHidden: next });
+  }, [clearFilterDebounce, currentPath, filter, loadPath, showHidden]);
 
   const loadMore = useCallback(() => {
     if (loading) return;
@@ -205,6 +220,16 @@ export function DirectoryBrowser({ initialPath, onSelect }: Props) {
           placeholder="Type to filter..."
           className="w-full bg-surface-900 border border-surface-700 rounded-md px-3 py-2 text-sm font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
         />
+        <label className="mt-2 inline-flex items-center gap-2 text-xs text-text-dim cursor-pointer hover:text-text-secondary">
+          <input
+            type="checkbox"
+            checked={showHidden}
+            onChange={toggleHidden}
+            disabled={!currentPath}
+            className="accent-brand-600 cursor-pointer disabled:cursor-not-allowed disabled:opacity-50"
+          />
+          Show hidden folders
+        </label>
       </div>
 
       {/* Directory listing */}
@@ -251,9 +276,13 @@ export function DirectoryBrowser({ initialPath, onSelect }: Props) {
             {entries.length === 0 && (
               <div className="px-4 py-6 text-center">
                 <p className="text-sm text-text-dim">
-                  {filter ? "No folders match your filter" : "No visible subfolders here"}
+                  {filter
+                    ? "No folders match your filter"
+                    : showHidden
+                      ? "No subfolders here"
+                      : "No visible subfolders here"}
                 </p>
-                {!filter && (
+                {!filter && !showHidden && (
                   <p className="text-xs text-text-dim mt-1">Hidden folders (starting with .) are not shown</p>
                 )}
               </div>

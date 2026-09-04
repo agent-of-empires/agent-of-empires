@@ -21,6 +21,12 @@
 //!   `#{mouse_sgr_flag}`: when the pane is a full-screen mouse app the
 //!   client forwards the wheel to it (as input bytes) instead of widening
 //!   the capture window, since the alternate screen has no scrollback.
+//!   A composited frame also carries `"pane0"` as
+//!   `{"cols":..,"rows":..,"left":..,"top":..}`. Cursor coordinates are
+//!   translated onto the window grid before emission; clients subtract the
+//!   same origin when forwarding pointer cells. Single-pane frames serialize
+//!   `pane0` as `null`. The origin fields are optional for older clients and
+//!   default to zero for frames from older servers.
 //!   `{"type":"size_owner","is_owner":bool}`: whether this client holds
 //!     the session's size-owner lock. Only the owner resizes the shared
 //!     tmux window and may type; a non-owner renders best-effort at the
@@ -89,12 +95,8 @@ const CAPTURE_INTERVAL_FAST_MS: u64 = 50;
 /// scrolled-up window can be thousands of lines, so frames are big;
 /// at this rate a streaming agent costs at most a few frames per second.
 const CAPTURE_INTERVAL_IDLE_MS: u64 = 250;
-/// Minimum gap between samples when a vt channel drives the loop on output
-/// (the grid-change watch arm). The channel wakes us the instant the grid
-/// changes, so the cadence above is no longer the latency floor; this caps a
-/// spewing pane at ~60fps instead of letting it busy-loop the socket. Only the
-/// live-edge (small-window) path is event-driven, so this never applies while
-/// a client reads scrollback.
+/// Minimum gap between snapshot samples. This caps a spewing pane at roughly
+/// 60fps instead of continuously forking capture-pane.
 const FRAME_MIN_INTERVAL_MS: u64 = 16;
 /// Upper bound on the capture window. tmux history defaults to 2000
 /// lines per pane; this leaves headroom for raised limits without
@@ -171,6 +173,11 @@ enum LiveControlMessage {
     Window { lines: usize },
     #[serde(rename = "cadence")]
     Cadence { fast: bool },
+    /// Request the lock when it is vacant, without resizing or displacing a
+    /// live owner. Mobile startup uses this while the soft keyboard prevents a
+    /// safe grid measurement.
+    #[serde(rename = "claim_if_vacant")]
+    ClaimIfVacant,
     /// Explicit "take over" from a non-owner client: steal the size-owner
     /// lock even from a live holder (a user tap is intentional, unlike the
     /// passive flap the heartbeat guards against).
@@ -476,26 +483,19 @@ async fn handle_live_ws(
     // dispatched input (echo latency) and after cadence/window changes.
     let nudge = Arc::new(tokio::sync::Notify::new());
 
-    // Acquire the shared vt100 channel for this pane (armed once, shared with
-    // the native TUI preview and any other web viewer). `Some` => render from
-    // the in-process grid and inject input over the socket; `None` (tmux < 3.4,
-    // arm failure, non-unix, or `[tmux] vt_live` off) => fall back to the
-    // capture-pane loop and send-keys. Held for the whole connection so the
-    // channel stays alive. The setting is read per connection and gates
-    // *arming*, not *reuse*: while other holders keep a channel alive it is
-    // the pane's single input writer, so a new connection must join it (or
-    // its send-keys would race the socket); the fallback only becomes real
-    // once the last holder drops and the channel dies.
     #[cfg(unix)]
     let config = crate::session::config::Config::load_or_warn();
     #[cfg(unix)]
-    let vt = if config.tmux.vt_live {
-        crate::tmux::vt::VtChannel::acquire(&tmux_name)
-    } else {
-        crate::tmux::vt::VtChannel::reuse(&tmux_name)
-    };
-    #[cfg(unix)]
     let clipboard_forward = clipboard_forward_enabled(config.tmux.clipboard, read_only);
+    // Web terminal frames are always tmux's rendered cells. A raw observer
+    // preserves OSC 52 events without building a VT grid or seed alongside
+    // that authoritative capture.
+    #[cfg(unix)]
+    let osc52 = if clipboard_forward {
+        crate::tmux::vt::Osc52Channel::acquire(&tmux_name)
+    } else {
+        None
+    };
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
@@ -511,14 +511,12 @@ async fn handle_live_ws(
     let capture_tmux = tmux_name.clone();
     let capture_owner = owner_id.clone();
     #[cfg(unix)]
-    let capture_vt = vt.clone();
+    let capture_osc52 = osc52;
     let capture_task = tokio::spawn(async move {
-        // This connection's own change receiver: every viewer of the shared
-        // channel gets one, so a grid change wakes all of them (not just one).
         #[cfg(unix)]
-        let mut vt_rx = capture_vt.as_ref().map(|ch| ch.subscribe());
-        #[cfg(unix)]
-        let mut clipboard_rx = capture_vt.as_ref().map(|ch| ch.subscribe_clipboard());
+        let mut osc52_seen = capture_osc52
+            .as_ref()
+            .map_or(0, |source| source.clipboard_sequence());
         let mut last_published: Option<(String, Option<crate::tmux::PaneCursor>)> = None;
         // Created on the first frame after the client advertises deflate;
         // lives for the connection so the dictionary spans frames.
@@ -532,61 +530,35 @@ async fn handle_live_ws(
             let sample_started = std::time::Instant::now();
             let lines = capture_settings.window_lines.load(Ordering::Relaxed);
 
-            // Fetch one frame: from the shared vt100 grid when a channel is
-            // armed (no fork), else the legacy capture-pane fork. A
-            // position-unreliable cursor (capture path: the pane scrolled
-            // between the two probes) is treated as "no cursor"; the web frame
-            // has no `position_reliable` channel and its renderer maps the
-            // cursor row onto the content, so painting it would land wrong.
+            // Fetch tmux's authoritative rendered cells. A position-unreliable
+            // cursor is treated as "no cursor" because the web frame has no
+            // reliability channel and its renderer maps the row onto content.
             let outcome: CaptureOutcome;
             #[cfg(unix)]
             {
-                outcome = match &capture_vt {
-                    // The VT grid intentionally retains tmux's default
-                    // 2,000-line scrollback for fast live-edge snapshots.
-                    // The web protocol permits a bounded 4,000-line reading
-                    // window, though, so never let that smaller cache make
-                    // retained tmux history disappear. Deep reads take the
-                    // authoritative capture-pane path below; the normal
-                    // screen-sized live tail stays on the event-driven grid.
-                    Some(ch) if ch.is_alive() && lines <= crate::tmux::vt::SCROLLBACK_LINES => {
-                        let ch = ch.clone();
-                        match tokio::task::spawn_blocking(move || ch.sample(lines)).await {
-                            Ok((content, cursor)) => CaptureOutcome::Frame(content, cursor),
-                            Err(_) => break,
-                        }
+                let name = capture_tmux.clone();
+                outcome = match tokio::task::spawn_blocking(move || {
+                    crate::tmux::Session::from_name(&name)
+                        .capture_window_composited_with_cursor(lines)
+                })
+                .await
+                {
+                    Ok(Ok((content, cursor)))
+                        if !content.is_empty()
+                            || cursor.as_ref().is_some_and(|c| c.position_reliable) =>
+                    {
+                        CaptureOutcome::Frame(content, cursor)
                     }
-                    // No channel, or the held channel's forwarder has died (a
-                    // pipe failure, not necessarily a dead pane): fall back to
-                    // the legacy capture-pane fork rather than black-holing.
-                    // If the pane is truly gone the fork returns empty -> Dead
-                    // and the connection still closes; if only the pipe died
-                    // the pane keeps rendering, so we recover. Input mirrors
-                    // this by gating `armed` on `is_alive` below.
-                    _ => {
-                        let name = capture_tmux.clone();
-                        match tokio::task::spawn_blocking(move || {
-                            crate::tmux::Session::from_name(&name).capture_pane_with_cursor(lines)
-                        })
-                        .await
-                        {
-                            Ok(Ok((content, cursor)))
-                                if !content.is_empty()
-                                    || cursor.as_ref().is_some_and(|c| c.position_reliable) =>
-                            {
-                                CaptureOutcome::Frame(content, cursor)
-                            }
-                            Ok(Ok(_)) => CaptureOutcome::Dead,
-                            _ => break,
-                        }
-                    }
+                    Ok(Ok(_)) => CaptureOutcome::Dead,
+                    _ => break,
                 };
             }
             #[cfg(not(unix))]
             {
                 let name = capture_tmux.clone();
                 outcome = match tokio::task::spawn_blocking(move || {
-                    crate::tmux::Session::from_name(&name).capture_pane_with_cursor(lines)
+                    crate::tmux::Session::from_name(&name)
+                        .capture_window_composited_with_cursor(lines)
                 })
                 .await
                 {
@@ -650,8 +622,7 @@ async fn handle_live_ws(
                             let claimed = tokio::task::spawn_blocking(move || {
                                 let session = crate::tmux::Session::from_name(&name);
                                 if session.claim_size_owner(&who, SIZE_OWNER_TTL) {
-                                    session.resize_window(cols, rows);
-                                    true
+                                    session.resize_window_if_owner(&who, cols, rows)
                                 } else {
                                     false
                                 }
@@ -661,10 +632,6 @@ async fn handle_live_ws(
                             if claimed {
                                 capture_settings.is_owner.store(true, Ordering::Relaxed);
                                 last_heartbeat = std::time::Instant::now();
-                                #[cfg(unix)]
-                                if let Some(ch) = &capture_vt {
-                                    ch.set_grid_size(cols, rows);
-                                }
                                 let _ = capture_tx
                                     .send(Message::Text(size_owner_json(true).into()))
                                     .await;
@@ -730,15 +697,7 @@ async fn handle_live_ws(
                                 })
                                 .await
                                 .unwrap_or(false);
-                                if still_owner {
-                                    // Track the new geometry in the shared grid
-                                    // immediately so the parser doesn't wait out
-                                    // `reconcile_size` after the resize.
-                                    #[cfg(unix)]
-                                    if let Some(ch) = &capture_vt {
-                                        ch.set_grid_size(want_cols, want_rows);
-                                    }
-                                } else {
+                                if !still_owner {
                                     capture_settings.is_owner.store(false, Ordering::Relaxed);
                                     let _ = capture_tx
                                         .send(Message::Text(size_owner_json(false).into()))
@@ -753,20 +712,17 @@ async fn handle_live_ws(
                         }
                     }
                     #[cfg(unix)]
-                    if let Some(rx) = clipboard_rx.as_mut() {
-                        if rx.has_changed().unwrap_or(false) {
-                            let clipboard = rx.borrow_and_update().clone();
-                            if clipboard_forward
-                                && capture_settings.is_owner.load(Ordering::Relaxed)
-                            {
-                                if let Some(text) = clipboard {
-                                    if capture_tx
-                                        .send(Message::Text(clipboard_json(&text).into()))
-                                        .await
-                                        .is_err()
-                                    {
-                                        break;
-                                    }
+                    if let Some(source) = capture_osc52.as_ref() {
+                        source.refresh_owner_heartbeat();
+                        let clipboard = source.clipboard_after(&mut osc52_seen);
+                        if clipboard_forward && capture_settings.is_owner.load(Ordering::Relaxed) {
+                            if let Some(text) = clipboard {
+                                if capture_tx
+                                    .send(Message::Text(clipboard_json(&text).into()))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
                                 }
                             }
                         }
@@ -799,7 +755,7 @@ async fn handle_live_ws(
                     }
                 }
                 CaptureOutcome::Dead => {
-                    // Pane looks gone (dead vt channel, or an empty capture).
+                    // Pane looks gone, or capture-pane returned an empty frame.
                     // Require a few consecutive misses before declaring death so
                     // a transient tmux hiccup doesn't kill the connection.
                     dead_probes += 1;
@@ -831,42 +787,21 @@ async fn handle_live_ws(
             };
 
             // Rate cap: hold each cycle to at least FRAME_MIN so a pane spewing
-            // output (the grid-change arm fires back-to-back) is bounded to
-            // ~60fps rather than busy-looping. A nudge or grid bump that lands
-            // during this pad is retained (the watch keeps its version, the
-            // nudge keeps a permit), so the wait below returns immediately and
-            // no wake is lost.
+            // output cannot push more than roughly 60 snapshot frames per
+            // second. A nudge during this pad is retained for the next wait.
             let since = sample_started.elapsed();
             let floor = Duration::from_millis(FRAME_MIN_INTERVAL_MS);
             if since < floor {
                 tokio::time::sleep(floor - since).await;
             }
 
-            // Wait for the next reason to sample. `ms` is the ceiling (death
-            // detection, size-owner heartbeat); a nudge wakes us for typed
-            // echo; and when a vt channel drives a live-edge window it wakes us
-            // the instant the grid changes, so output latency is one socket
-            // hop, not a cadence tick. The grid arm is gated to `small_window`
-            // so a client reading scrollback keeps the big-frame throttle.
+            // Wait for the next capture. `ms` is the ceiling for death
+            // detection and size-owner heartbeat; a nudge wakes us for typed
+            // echo or a settings change.
             #[cfg(unix)]
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(ms)) => {}
                 _ = capture_nudge.notified() => {}
-                _ = async {
-                    match &mut vt_rx {
-                        // `changed()` resolves on the next grid bump, or
-                        // immediately if one happened since the last wait, so
-                        // output between waits is never missed. Err (sender
-                        // gone) can't happen while we hold the channel Arc;
-                        // park if it ever does rather than spin.
-                        Some(rx) => {
-                            if rx.changed().await.is_err() {
-                                std::future::pending::<()>().await
-                            }
-                        }
-                        None => std::future::pending::<()>().await,
-                    }
-                }, if small_window => {}
             }
             #[cfg(not(unix))]
             tokio::select! {
@@ -921,51 +856,22 @@ async fn handle_live_ws(
                             continue;
                         }
                         let send_nudge = Arc::clone(&nudge);
-                        // When a vt channel is armed, all pane input goes through
-                        // its socket (single-writer; mixing with send-keys would
-                        // interleave two writers on the pty input). Otherwise fork
-                        // send-keys as before. The browser already sends raw bytes,
-                        // so no key encoding is needed on this path.
-                        // Gate on `is_alive`, not just `is_some`: a held
-                        // channel whose forwarder has died must fall back to
-                        // send-keys, or input would be written into a dead
-                        // socket and silently dropped (capture falls back the
-                        // same way above).
-                        #[cfg(unix)]
-                        let armed = vt.as_ref().is_some_and(|ch| ch.is_alive());
-                        #[cfg(not(unix))]
-                        let armed = false;
-                        if armed {
+                        let name = tmux_name.clone();
+                        let bytes = data.to_vec();
+                        // A VT channel held by another surface remains the
+                        // pane's single input writer. Otherwise this snapshot
+                        // transport injects through tmux send-keys.
+                        let _ = tokio::task::spawn_blocking(move || {
                             #[cfg(unix)]
-                            {
-                                let name = tmux_name.clone();
-                                let bytes = data.to_vec();
-                                let _ = tokio::task::spawn_blocking(move || {
-                                    crate::tmux::vt::try_send_input(&name, &bytes);
-                                })
-                                .await;
+                            if crate::tmux::vt::try_send_input(&name, &bytes) {
+                                return;
                             }
-                        } else {
-                            let name = tmux_name.clone();
-                            let bytes = data.to_vec();
-                            // Off-runtime: send-keys forks a subprocess.
-                            let _ = tokio::task::spawn_blocking(move || {
-                                // A live channel armed by another holder (the
-                                // TUI, an older connection) is the pane's
-                                // single input writer; route through it
-                                // rather than racing it with send-keys.
-                                // Mirrors the TUI's `dispatch_via_fork`.
-                                #[cfg(unix)]
-                                if crate::tmux::vt::try_send_input(&name, &bytes) {
-                                    return;
-                                }
-                                let session = crate::tmux::Session::from_name(&name);
-                                if let Err(e) = session.send_raw_bytes(&bytes) {
-                                    warn!(target: "terminal.ws", tmux = %name, kind = "live", "send_raw_bytes failed: {}", e);
-                                }
-                            })
-                            .await;
-                        }
+                            let session = crate::tmux::Session::from_name(&name);
+                            if let Err(e) = session.send_raw_bytes(&bytes) {
+                                warn!(target: "terminal.ws", tmux = %name, kind = "live", "send_raw_bytes failed: {}", e);
+                            }
+                        })
+                        .await;
                         // Capture the echo promptly rather than waiting out
                         // the current sleep.
                         send_nudge.notify_one();
@@ -995,8 +901,7 @@ async fn handle_live_ws(
                                 let owned = tokio::task::spawn_blocking(move || {
                                     let session = crate::tmux::Session::from_name(&name);
                                     if session.claim_size_owner(&who, SIZE_OWNER_TTL) {
-                                        session.resize_window(cols, rows);
-                                        true
+                                        session.resize_window_if_owner(&who, cols, rows)
                                     } else {
                                         false
                                     }
@@ -1004,12 +909,6 @@ async fn handle_live_ws(
                                 .await
                                 .unwrap_or(false);
                                 settings.is_owner.store(owned, Ordering::Relaxed);
-                                #[cfg(unix)]
-                                if owned {
-                                    if let Some(ch) = &vt {
-                                        ch.set_grid_size(cols, rows);
-                                    }
-                                }
                                 let _ = out_tx
                                     .send(Message::Text(size_owner_json(owned).into()))
                                     .await;
@@ -1028,6 +927,28 @@ async fn handle_live_ws(
                                     nudge.notify_one();
                                 }
                             }
+                            LiveControlMessage::ClaimIfVacant => {
+                                // A keyboard-open mobile pane intentionally
+                                // postpones its first resize so it never sends
+                                // keyboard-shrunk rows to tmux. It still needs
+                                // an ownership decision before its gesture-
+                                // bound input buffer can flush. Claim only an
+                                // unheld or stale lock; unlike `claim`, this
+                                // never takes control from another viewer.
+                                let name = tmux_name.clone();
+                                let who = owner_id.clone();
+                                let owned = tokio::task::spawn_blocking(move || {
+                                    crate::tmux::Session::from_name(&name)
+                                        .claim_size_owner(&who, SIZE_OWNER_TTL)
+                                })
+                                .await
+                                .unwrap_or(false);
+                                settings.is_owner.store(owned, Ordering::Relaxed);
+                                let _ = out_tx
+                                    .send(Message::Text(size_owner_json(owned).into()))
+                                    .await;
+                                nudge.notify_one();
+                            }
                             LiveControlMessage::Claim => {
                                 // Explicit take-over: steal the lock even from
                                 // a live holder, then size the window to our
@@ -1040,9 +961,10 @@ async fn handle_live_ws(
                                     let session = crate::tmux::Session::from_name(&name);
                                     if session.steal_size_owner(&who) {
                                         if cols > 0 && rows > 0 {
-                                            session.resize_window(cols, rows);
+                                            session.resize_window_if_owner(&who, cols, rows)
+                                        } else {
+                                            true
                                         }
-                                        true
                                     } else {
                                         false
                                     }
@@ -1050,12 +972,6 @@ async fn handle_live_ws(
                                 .await
                                 .unwrap_or(false);
                                 settings.is_owner.store(owned, Ordering::Relaxed);
-                                #[cfg(unix)]
-                                if owned {
-                                    if let Some(ch) = &vt {
-                                        ch.set_grid_size(cols, rows);
-                                    }
-                                }
                                 let _ = out_tx
                                     .send(Message::Text(size_owner_json(owned).into()))
                                     .await;
@@ -1116,10 +1032,17 @@ async fn handle_live_ws(
 /// virtual scroll spacer off `history` and slices the live screen off
 /// the content's last `rows` lines, independent of cursor visibility.
 fn frame_json(content: &str, cursor: Option<&crate::tmux::PaneCursor>) -> String {
+    // The cursor is pane relative while composited content uses the window
+    // grid. Emit window-relative coordinates and carry the same origin for
+    // the client's inverse pointer mapping. Translating before emission also
+    // keeps cursor painting correct in older clients that ignore the origin;
+    // only their pointer mapping degrades. No pane rectangle means identity.
+    let pane0 = cursor.and_then(|c| c.composite_pane0);
+    let (origin_x, origin_y) = pane0.map_or((0, 0), |p| (p.left, p.top));
     let cursor_value = match cursor {
         Some(c) if c.visible => serde_json::json!({
-            "x": c.x,
-            "y": c.y,
+            "x": c.x.saturating_add(origin_x),
+            "y": c.y.saturating_add(origin_y),
         }),
         _ => serde_json::Value::Null,
     };
@@ -1135,6 +1058,14 @@ fn frame_json(content: &str, cursor: Option<&crate::tmux::PaneCursor>) -> String
         "altScreen": cursor.map(|c| c.alternate_on).unwrap_or(false),
         "mouse": cursor.map(|c| c.mouse_tracking).unwrap_or(false),
         "mouseSgr": cursor.map(|c| c.mouse_sgr).unwrap_or(false),
+        "pane0": pane0.map(|p| {
+            serde_json::json!({
+                "cols": p.width,
+                "rows": p.height,
+                "left": p.left,
+                "top": p.top,
+            })
+        }),
     })
     .to_string()
 }
@@ -1225,31 +1156,72 @@ mod tests {
 
     #[test]
     fn frame_json_includes_geometry_and_cursor() {
-        let cursor = crate::tmux::PaneCursor {
-            x: 3,
-            y: 7,
-            visible: true,
-            pane_height: 46,
-            history_size: 1200,
-            pane_width: 74,
-            alternate_on: false,
-            mouse_tracking: false,
-            mouse_sgr: false,
-            mouse_all: false,
-            position_reliable: true,
-            composite_pane0: None,
-        };
-        let json = frame_json("hello\nworld", Some(&cursor));
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["type"], "frame");
-        assert_eq!(v["content"], "hello\nworld");
-        assert_eq!(v["rows"], 46);
-        assert_eq!(v["history"], 1200);
-        assert_eq!(v["cursor"]["x"], 3);
-        assert_eq!(v["cursor"]["y"], 7);
-        assert_eq!(v["altScreen"], false);
-        assert_eq!(v["mouse"], false);
-        assert_eq!(v["mouseSgr"], false);
+        let cases = [
+            // Unsplit: `pane0` is null and the cursor is untouched.
+            (None, (3, 7), serde_json::Value::Null),
+            // Composited with pane 0 at the corner (a borderless split):
+            // identity translation, but `pane0` rides with zero origin.
+            (
+                Some(crate::tmux::PaneGeom {
+                    left: 0,
+                    top: 0,
+                    width: 37,
+                    height: 46,
+                }),
+                (3, 7),
+                serde_json::json!({
+                    "cols": 37,
+                    "rows": 46,
+                    "left": 0,
+                    "top": 0,
+                }),
+            ),
+            // Composited with pane-border-status top: move the wire cursor
+            // onto the window grid by pane 0's origin.
+            (
+                Some(crate::tmux::PaneGeom {
+                    left: 2,
+                    top: 1,
+                    width: 37,
+                    height: 46,
+                }),
+                (5, 8),
+                serde_json::json!({
+                    "cols": 37,
+                    "rows": 46,
+                    "left": 2,
+                    "top": 1,
+                }),
+            ),
+        ];
+        for (pane0, want_cursor, want_pane0) in cases {
+            let cursor = crate::tmux::PaneCursor {
+                x: 3,
+                y: 7,
+                visible: true,
+                pane_height: 46,
+                history_size: 1200,
+                pane_width: 74,
+                alternate_on: false,
+                mouse_tracking: false,
+                mouse_sgr: false,
+                mouse_all: false,
+                position_reliable: true,
+                composite_pane0: pane0,
+            };
+            let json = frame_json("hello\nworld", Some(&cursor));
+            let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(v["type"], "frame");
+            assert_eq!(v["content"], "hello\nworld");
+            assert_eq!(v["rows"], 46);
+            assert_eq!(v["history"], 1200);
+            assert_eq!(v["cursor"]["x"], want_cursor.0, "{pane0:?}");
+            assert_eq!(v["cursor"]["y"], want_cursor.1, "{pane0:?}");
+            assert_eq!(v["altScreen"], false);
+            assert_eq!(v["mouse"], false);
+            assert_eq!(v["mouseSgr"], false);
+            assert_eq!(v["pane0"], want_pane0, "{pane0:?}");
+        }
     }
 
     #[test]
@@ -1318,6 +1290,8 @@ mod tests {
         assert!(matches!(m, LiveControlMessage::Cadence { fast: false }));
         let m: LiveControlMessage = serde_json::from_str(r#"{"type":"claim"}"#).unwrap();
         assert!(matches!(m, LiveControlMessage::Claim));
+        let m: LiveControlMessage = serde_json::from_str(r#"{"type":"claim_if_vacant"}"#).unwrap();
+        assert!(matches!(m, LiveControlMessage::ClaimIfVacant));
         let m: LiveControlMessage =
             serde_json::from_str(r#"{"type":"caps","deflate":true}"#).unwrap();
         assert!(matches!(m, LiveControlMessage::Caps { deflate: true }));

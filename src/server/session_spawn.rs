@@ -33,6 +33,8 @@ pub(crate) struct StructuredSessionSpec {
     pub extra_args: String,
     pub command_override: String,
     pub extra_repo_paths: Vec<String>,
+    /// Per-repo creation bases as `(selector, base)` pairs. See #3329.
+    pub repo_base_branches: Vec<(String, String)>,
     pub scratch: bool,
     pub trust_hooks: Option<bool>,
     pub custom_instruction: Option<String>,
@@ -58,17 +60,11 @@ pub(crate) struct StructuredSessionSpec {
     /// supervisor applies it after every worker (re)spawn. Stamped by the
     /// plugin host create path after host-side classification.
     pub acp_mode_id: Option<String>,
-    #[cfg(feature = "serve")]
     pub view: crate::session::View,
-    #[cfg(feature = "serve")]
     pub agent_name: Option<String>,
-    #[cfg(feature = "serve")]
     pub agent_model: Option<String>,
-    #[cfg(feature = "serve")]
     pub agent_effort: Option<String>,
-    #[cfg(feature = "serve")]
     pub import_acp_session_id: Option<String>,
-    #[cfg(feature = "serve")]
     pub fork_seed: Option<crate::session::ForkSeed>,
 }
 
@@ -134,6 +130,7 @@ pub(crate) async fn spawn_structured_session(
             extra_args,
             command_override,
             extra_repo_paths,
+            repo_base_branches,
             scratch,
             trust_hooks,
             custom_instruction,
@@ -144,17 +141,11 @@ pub(crate) async fn spawn_structured_session(
             plugin_create_idempotency,
             pending_initial_turn,
             acp_mode_id,
-            #[cfg(feature = "serve")]
             view,
-            #[cfg(feature = "serve")]
             agent_name,
-            #[cfg(feature = "serve")]
             agent_model,
-            #[cfg(feature = "serve")]
             agent_effort,
-            #[cfg(feature = "serve")]
             import_acp_session_id,
-            #[cfg(feature = "serve")]
             fork_seed,
         } = spec;
 
@@ -217,11 +208,15 @@ pub(crate) async fn spawn_structured_session(
             extra_args,
             command_override,
             extra_repo_paths,
+            repo_base_branches: if create_new_branch {
+                repo_base_branches
+            } else {
+                // The base only matters when aoe creates the branch, the same
+                // gate `base_branch` above uses.
+                Vec::new()
+            },
             scratch,
-            #[cfg(feature = "serve")]
             fork_seed,
-            #[cfg(not(feature = "serve"))]
-            fork_seed: None,
         };
 
         let build_result = builder::build_instance(params, &title_refs, &branch_refs, &profile)?;
@@ -247,7 +242,6 @@ pub(crate) async fn spawn_structured_session(
         // Apply structured-view fields from the request body. structured_view is
         // re-validated below against real ACP capability; non-ACP tools
         // fall back to terminal view rather than erroring at spawn time.
-        #[cfg(feature = "serve")]
         let agent_effort = {
             instance.view = view;
             // #2276: importing an existing Claude session forces the
@@ -270,7 +264,7 @@ pub(crate) async fn spawn_structured_session(
                 .filter(|s| !s.is_empty())
                 .unwrap_or(instance.tool.as_str())
                 .to_string();
-            let resolved_config = crate::session::repo_config::resolve_config_with_repo_or_warn(
+            let resolved_config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
                 &instance.source_profile,
                 std::path::Path::new(&instance.project_path),
             );
@@ -318,17 +312,32 @@ pub(crate) async fn spawn_structured_session(
                     .as_deref()
                     .filter(|s| !s.is_empty())
                     .unwrap_or(instance.tool.as_str());
-                let capable = acp_registry.get(resolved).is_some()
-                    || crate::session::repo_config::resolve_config_with_repo_or_warn(
+                let resolved_session =
+                    crate::session::config::repo_config::resolve_config_with_repo_or_warn(
                         &instance.source_profile,
                         std::path::Path::new(&instance.project_path),
                     )
-                    .session
-                    .agent_acp_cmd
-                    .get(&instance.tool)
-                    .is_some_and(|cmd| {
-                        crate::acp::AgentSpec::from_acp_cmd(&instance.tool, cmd).is_ok()
-                    });
+                    .session;
+                // Check the resolved agent key AND the raw tool, the same pair
+                // `aoe add`'s precondition uses. Checking only `tool` for the
+                // `agent_acp_cmd` / inheritance legs downgraded a session that
+                // `agent_is_acp_capable` had already accepted as Structured,
+                // whenever `agent_name` differed from `tool` (a custom agent,
+                // or a wrapper inheriting a registry base), and the downgrade
+                // also cleared its pending markers.
+                let acp_capable_key = |key: &str| {
+                    acp_registry.get(key).is_some()
+                        || resolved_session
+                            .agent_acp_cmd
+                            .get(key)
+                            .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(key, cmd).is_ok())
+                        // A custom agent that inherits a registry-backed base
+                        // (e.g. a Claude wrapper) is structured-capable through
+                        // the base adapter; keep the requested Structured view.
+                        || crate::acp::inherited_acp_base(key, &resolved_session.agent_detect_as)
+                            .is_some()
+                };
+                let capable = acp_capable_key(resolved) || acp_capable_key(&instance.tool);
                 if capable {
                     instance.view = crate::session::View::Structured;
                 } else {
@@ -369,6 +378,7 @@ pub(crate) async fn spawn_structured_session(
                 &instance,
                 created_worktree.as_ref(),
                 &created_workspace_worktrees,
+                None,
             );
             return Err(anyhow::anyhow!("on_create hook failed: {e:#}"));
         }
@@ -392,10 +402,7 @@ pub(crate) async fn spawn_structured_session(
             // supervisor spawns the ACP agent on demand. Skip the tmux
             // `start()` to avoid creating an empty pane that no one will
             // attach to.
-            #[cfg(feature = "serve")]
             let skip_tmux_start = instance.is_structured();
-            #[cfg(not(feature = "serve"))]
-            let skip_tmux_start = false;
             if !skip_tmux_start {
                 instance.start()?;
             }
@@ -423,20 +430,15 @@ pub(crate) async fn spawn_structured_session(
             return Err(e);
         }
 
-        #[cfg(feature = "serve")]
-        return Ok::<(Instance, Vec<String>, Option<String>), anyhow::Error>((
+        Ok::<(Instance, Vec<String>, Option<String>), anyhow::Error>((
             instance,
             build_warnings,
             agent_effort,
-        ));
-
-        #[cfg(not(feature = "serve"))]
-        Ok::<(Instance, Vec<String>), anyhow::Error>((instance, build_warnings))
+        ))
     })
     .await;
 
     match result {
-        #[cfg(feature = "serve")]
         Ok(Ok((instance, warnings, agent_effort))) => {
             let response_instance = instance.clone();
             let acp_spawn_target = if instance.is_structured() {
@@ -460,6 +462,20 @@ pub(crate) async fn spawn_structured_session(
             };
             let mut instances = service.instances.write().await;
             crate::server::api::sessions::upsert_instance(&mut instances, instance);
+            // The row is now in both `sessions.json` (persisted above) and
+            // `instances`, so any reloader still carrying a snapshot that
+            // predates the persist must drop it rather than replace
+            // `instances` with a `fresh` the new row was never in. Bump while
+            // still holding the `instances` write lock, for the same reason
+            // the delete path does: a reloader checks the epoch under that
+            // same lock, so the insert and the bump land as one step. Without
+            // this, a `status_poll_loop` tick whose disk read started before
+            // the persist drops the session from `GET /api/sessions` until the
+            // next tick re-reads disk. See invariant 8 on
+            // `reload_state_instances_from_disk`.
+            service
+                .mutation_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             drop(instances);
 
             // Count the create for the opt-in telemetry trend counter. Bounded
@@ -596,18 +612,45 @@ pub(crate) async fn spawn_structured_session(
                 warnings,
             })
         }
-        #[cfg(not(feature = "serve"))]
-        Ok(Ok((instance, warnings))) => {
-            let response_instance = instance.clone();
-            let mut instances = service.instances.write().await;
-            instances.push(instance);
-            drop(instances);
-            Ok(SpawnOutcome {
-                instance: response_instance,
-                warnings,
-            })
-        }
         Ok(Err(e)) => Err(e),
         Err(e) => Err(anyhow::Error::new(SessionBuildPanicked(e.to_string()))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The create path must bump `mutation_epoch` while it still holds the
+    /// `instances` write lock. A reloader compares the epoch under that same
+    /// lock, so the insert and the bump have to land as one step; bumping
+    /// after `drop(instances)` reopens the window a reload can slip into and
+    /// silently drops the new session from `GET /api/sessions` for a tick.
+    ///
+    /// Source-level rather than behavioural: reaching the bump needs a real
+    /// spawn (tmux pane, worktree, agent subprocess), and the failure mode is
+    /// a future edit moving the bump out of the lock scope, which this
+    /// catches. The reload side is covered behaviourally in
+    /// `server::tests::a_reload_predating_a_create_does_not_drop_the_new_row`.
+    #[test]
+    fn the_create_bumps_the_mutation_epoch_under_the_instances_lock() {
+        // Whitespace-normalised so rustfmt's line wrapping cannot change the
+        // result: the point is the ordering, not how it is laid out.
+        let source = include_str!("session_spawn.rs");
+        let normalised: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        let lock = normalised
+            .find("let mut instances = service.instances.write().await;")
+            .expect("the create path takes the instances write lock");
+        let bump = normalised[lock..]
+            .find(".mutation_epoch .fetch_add(1, std::sync::atomic::Ordering::SeqCst);")
+            .expect("the create path bumps mutation_epoch after the upsert");
+        let unlock = normalised[lock..]
+            .find("drop(instances);")
+            .expect("the create path releases the instances write lock");
+
+        assert!(
+            bump < unlock,
+            "mutation_epoch must be bumped before drop(instances), so the insert \
+             and the bump are atomic against a concurrent reload"
+        );
     }
 }

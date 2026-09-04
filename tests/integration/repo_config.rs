@@ -37,7 +37,7 @@ default_tool = "claude"
 "#,
     );
 
-    let config = agent_of_empires::session::repo_config::load_repo_config(tmp.path())
+    let config = agent_of_empires::session::config::repo_config::load_repo_config(tmp.path())
         .unwrap()
         .unwrap();
 
@@ -51,14 +51,15 @@ default_tool = "claude"
 #[test]
 fn test_load_repo_config_empty_file() {
     let tmp = setup_repo_config("");
-    let config = agent_of_empires::session::repo_config::load_repo_config(tmp.path()).unwrap();
+    let config =
+        agent_of_empires::session::config::repo_config::load_repo_config(tmp.path()).unwrap();
     assert!(config.is_none());
 }
 
 #[test]
 fn test_load_repo_config_comments_only() {
-    let tmp = setup_repo_config(agent_of_empires::session::repo_config::INIT_TEMPLATE);
-    let config = agent_of_empires::session::repo_config::load_repo_config(tmp.path())
+    let tmp = setup_repo_config(agent_of_empires::session::config::repo_config::INIT_TEMPLATE);
+    let config = agent_of_empires::session::config::repo_config::load_repo_config(tmp.path())
         .unwrap()
         .unwrap();
     // All-commented template should parse as empty config
@@ -77,7 +78,7 @@ fn test_trust_untrust_cycle() {
     let project_path = project_dir.path();
     let hooks_hash = "test_hash_123";
 
-    use agent_of_empires::session::repo_config::{is_repo_trusted, trust_repo};
+    use agent_of_empires::session::config::repo_config::{is_repo_trusted, trust_repo};
 
     // Initially not trusted
     assert!(!is_repo_trusted(project_path, Some(hooks_hash), None).unwrap());
@@ -103,7 +104,7 @@ fn test_hook_execution_simple_echo() {
     let marker = tmp.path().join("hook_ran");
 
     let cmd = format!("touch {}", marker.display());
-    agent_of_empires::session::repo_config::execute_hooks(&[cmd], tmp.path(), &[]).unwrap();
+    agent_of_empires::session::config::repo_config::execute_hooks(&[cmd], tmp.path(), &[]).unwrap();
 
     assert!(marker.exists());
 }
@@ -111,7 +112,7 @@ fn test_hook_execution_simple_echo() {
 #[test]
 fn test_hook_execution_failure() {
     let tmp = TempDir::new().unwrap();
-    let result = agent_of_empires::session::repo_config::execute_hooks(
+    let result = agent_of_empires::session::config::repo_config::execute_hooks(
         &["exit 1".to_string()],
         tmp.path(),
         &[],
@@ -121,7 +122,7 @@ fn test_hook_execution_failure() {
 
 #[test]
 fn test_changed_hooks_invalidate_trust() {
-    use agent_of_empires::session::repo_config::{compute_hooks_hash, HooksConfig};
+    use agent_of_empires::session::config::repo_config::{compute_hooks_hash, HooksConfig};
 
     let hooks_v1 = HooksConfig {
         on_create: vec!["npm install".to_string()],
@@ -143,7 +144,9 @@ fn test_changed_hooks_invalidate_trust() {
 #[test]
 #[serial]
 fn test_hook_trust_invalidated_on_config_change() {
-    use agent_of_empires::session::repo_config::{check_repo_trust, trust_repo, TrustSurface};
+    use agent_of_empires::session::config::repo_config::{
+        check_repo_trust, trust_repo, TrustSurface,
+    };
 
     let temp_home = TempDir::new().unwrap();
     set_temp_home(temp_home.path());
@@ -195,7 +198,9 @@ on_create = ["echo setup", "echo extra"]
 #[test]
 #[serial]
 fn test_hook_re_trust_after_change() {
-    use agent_of_empires::session::repo_config::{check_repo_trust, trust_repo, TrustSurface};
+    use agent_of_empires::session::config::repo_config::{
+        check_repo_trust, trust_repo, TrustSurface,
+    };
 
     let temp_home = TempDir::new().unwrap();
     set_temp_home(temp_home.path());
@@ -262,9 +267,11 @@ mount_ssh = true
 "#,
     );
 
-    let config =
-        agent_of_empires::session::repo_config::resolve_config_with_repo("default", repo.path())
-            .unwrap();
+    let config = agent_of_empires::session::config::repo_config::resolve_config_with_repo(
+        "default",
+        repo.path(),
+    )
+    .unwrap();
 
     assert_eq!(
         config.sandbox.volume_ignores,
@@ -301,13 +308,65 @@ bare_repo_path_template = "../{branch}"
 "#,
     );
 
-    let config =
-        agent_of_empires::session::repo_config::resolve_config_with_repo("default", repo.path())
-            .unwrap();
+    let config = agent_of_empires::session::config::repo_config::resolve_config_with_repo(
+        "default",
+        repo.path(),
+    )
+    .unwrap();
 
     assert_eq!(
         config.worktree.bare_repo_path_template, "../{branch}",
         "bare_repo_path_template from repo config should override the default"
+    );
+}
+
+/// #3400: on macOS and Windows the app dir is `~/.agent-of-empires`, so a
+/// project path of `$HOME` makes `<project>/.agent-of-empires/config.toml`
+/// resolve to the user's own global config. Neither side of the repo layer may
+/// act on that file: reading it re-merges the global layer onto itself (and
+/// reports every global-only section as a rejected repo override), and saving
+/// truncates the global config to the repo-permitted subset.
+///
+/// A debug build namespaces the app dir (`.agent-of-empires-dev`), so `$HOME`
+/// alone cannot produce the collision here. Symlinking the project's
+/// `.agent-of-empires` at the app dir yields the identical resolved file, which
+/// is what both guards compare.
+#[test]
+#[serial]
+#[cfg(unix)]
+fn test_project_path_that_resolves_to_global_config_is_not_a_repo_config() {
+    use agent_of_empires::session::config::repo_config::{
+        load_repo_config, save_repo_config, RepoConfig,
+    };
+
+    let temp_home = TempDir::new().unwrap();
+    set_temp_home(temp_home.path());
+
+    let app_dir = agent_of_empires::session::get_app_dir().unwrap();
+    let global_config = app_dir.join("config.toml");
+    let global_content =
+        "[session]\ndefault_tool = \"claude\"\n\n[logging]\ndefault_level = \"debug\"\n";
+    fs::write(&global_config, global_content).unwrap();
+
+    let project = temp_home.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    std::os::unix::fs::symlink(&app_dir, project.join(".agent-of-empires")).unwrap();
+
+    assert!(
+        load_repo_config(&project).unwrap().is_none(),
+        "the global config.toml must not be loaded as a repo config layer"
+    );
+
+    let repo_config: RepoConfig = toml::from_str("[session]\ndefault_tool = \"codex\"\n").unwrap();
+    let err = save_repo_config(&project, &repo_config).unwrap_err();
+    assert!(
+        err.to_string().contains("global config.toml"),
+        "save should name the collision, got: {err}"
+    );
+    assert_eq!(
+        fs::read_to_string(&global_config).unwrap(),
+        global_content,
+        "the global config must be left byte-identical"
     );
 }
 
@@ -321,7 +380,7 @@ on_create = ["echo legacy"]
 "#,
     );
 
-    let config = agent_of_empires::session::repo_config::load_repo_config(repo.path())
+    let config = agent_of_empires::session::config::repo_config::load_repo_config(repo.path())
         .unwrap()
         .unwrap();
 
@@ -357,7 +416,7 @@ on_create = ["echo legacy"]
     )
     .unwrap();
 
-    let config = agent_of_empires::session::repo_config::load_repo_config(tmp.path())
+    let config = agent_of_empires::session::config::repo_config::load_repo_config(tmp.path())
         .unwrap()
         .unwrap();
 
@@ -366,5 +425,57 @@ on_create = ["echo legacy"]
         hooks.on_create,
         vec!["echo new"],
         "new path should take priority over legacy"
+    );
+}
+
+/// An empty project path means "this session has no project repo" (scratch
+/// sessions pass one, see `session::builder::build_instance`). It must carry no
+/// repo layer at all: `Path::new("")` joins to the *relative*
+/// `.agent-of-empires/config.toml`, which resolves against whatever directory
+/// the process happens to be running in.
+#[test]
+#[serial]
+fn test_empty_project_path_ignores_the_launch_directory() {
+    let tmp = setup_repo_config("[session]\ndefault_tool = \"codex\"\n");
+    let original_dir = std::env::current_dir().unwrap();
+    std::env::set_current_dir(tmp.path()).unwrap();
+    let loaded =
+        agent_of_empires::session::config::repo_config::load_repo_config(std::path::Path::new(""));
+    std::env::set_current_dir(original_dir).unwrap();
+
+    assert!(
+        loaded.unwrap().is_none(),
+        "an empty project path must not pick up the launch directory's repo config"
+    );
+
+    // The real callers reach the loader through `repo_config_source_path`, and
+    // its `.git` probe is relative too. From a linked worktree (whose `.git` is
+    // a file) it resolves to that worktree's main repo, which would hand the
+    // loader a non-empty path and reinstate the repo layer.
+    let main = setup_repo_config("[session]\ndefault_tool = \"codex\"\n");
+    fs::create_dir_all(main.path().join(".git/worktrees/wt")).unwrap();
+    let worktree = TempDir::new().unwrap();
+    fs::write(
+        worktree.path().join(".git"),
+        format!("gitdir: {}/.git/worktrees/wt\n", main.path().display()),
+    )
+    .unwrap();
+
+    let original_dir = std::env::current_dir().unwrap();
+    std::env::set_current_dir(worktree.path()).unwrap();
+    let source = agent_of_empires::session::config::repo_config::repo_config_source_path(
+        std::path::Path::new(""),
+    );
+    let loaded = agent_of_empires::session::config::repo_config::load_repo_config(&source);
+    std::env::set_current_dir(original_dir).unwrap();
+
+    assert_eq!(
+        source,
+        std::path::PathBuf::new(),
+        "an empty project path must not resolve to the launch worktree's main repo"
+    );
+    assert!(
+        loaded.unwrap().is_none(),
+        "an empty project path must carry no repo layer from a worktree launch dir"
     );
 }

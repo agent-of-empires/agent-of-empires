@@ -28,8 +28,8 @@ export function nextCancelAction(cancelling: boolean, alreadyRequested: boolean)
  * The intent is captured as a `(sessionId, turnSeq)` token rather than reset
  * via an effect: a new turn bumps `turnSeq` and a session switch changes
  * `sessionId`, so either one is automatically a mismatch and the first Stop of
- * the next turn or session is graceful again. `turnSeq` is the monotonic
- * per-turn prompt counter (`pendingUserPromptSeq`).
+ * the next turn or session is graceful again. `turnSeq` is `AcpState`'s
+ * monotonic `promptSeq`, bumped once per dispatched user prompt.
  */
 export function useCancelEscalation(
   sessionId: string,

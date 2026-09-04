@@ -2,8 +2,6 @@
 
 Reference documentation for git worktree commands and configuration in `aoe`.
 
-For workflow guidance, see the [Workflow Guide](workflow.md).
-
 ## CLI vs TUI Behavior
 
 | Feature | CLI | TUI |
@@ -83,9 +81,10 @@ tie_workdir_to_name = true
 
 When tied:
 
-- Renaming a session (TUI rename, web inline rename, `aoe session rename`, or `PATCH /api/sessions/{id}`) moves the worktree directory to the title's path-safe slug first, then sets the title only if the move succeeds, so the two cannot drift on a partial failure.
+- Renaming a session (TUI rename, web inline rename, `aoe session rename`, or `PATCH /api/sessions/{id}`) moves the worktree directory to the title's path-safe slug before committing the title. A failed move leaves the title unchanged. A metadata failure after a successful move is reported as a partial failure.
 - The git branch is never swept in by a title rename by default. To rename it too, check "Also rename git branch" in the TUI rename dialog, pass `--rename-branch` to `aoe session rename`, or send `rename_branch: true` to the PATCH. It stays opt-in because a branch may carry an upstream or an open PR; the TUI toggle warns when the branch tracks a remote, since the remote branch (and any open PR) won't follow the local rename.
-- The session must be stopped first. Moving the directory of a running worktree is unsafe, so a tied rename of a running session is refused with a clear message. Stop the session, or disable the setting, to relabel it freely.
+- A tied rename that relocates the worktree directory, or renames its branch, needs a stopped session: moving or re-pointing a live checkout is unsafe, so it is refused with a clear message while the session is active. Stop the session, or disable the setting, to relabel it freely.
+- A title-only rename whose slug leaves the directory unchanged moves no checkout. `PATCH /api/sessions/{id}` and `aoe session rename` accept it while the session runs unless `rename_branch: true` would change the branch. The PATCH also leaves a live structured-view worker alone. The TUI requires a stopped session for a title-changing tied rename.
 - Naming collapses into the single rename action: the standalone "edit workdir name" affordance is hidden (TUI and web) and the standalone CLI / REST workdir-name edit is rejected, since the directory now follows the title.
 
 Toggle the setting off (TUI settings, web settings, or the toml above) to relabel sessions freely while running and to edit the directory name independently of the title.
@@ -104,6 +103,17 @@ This supports only sessions whose worktree is aoe-managed (`worktree_info.manage
 | REST | `PATCH /api/sessions/{id}/worktree-name` with `{ "name": "<new-name>", "rename_branch": <bool> }` |
 
 The new directory and branch persist across reload and restart. See #1723 and #1927.
+
+### When the Directory Moves Outside aoe
+
+aoe records a worktree session's directory at creation, so relocating it from another shell leaves that record stale. aoe repairs it from `git worktree list`, matching on the session's branch: shortly after TUI startup, on a background sweep, at `aoe serve` startup, and on each CLI workdir edit. The TUI paints before that sweep lands, so a session whose directory moved can briefly show its old path. If exactly one live worktree checks out the branch, the recorded path is rewritten to it and the session keeps working. If two do, aoe leaves the path alone rather than guessing which checkout is yours.
+
+Two caveats:
+
+- aoe locks the worktrees it creates, so an out-of-band `git worktree move` needs `git worktree unlock <path>` first.
+- A plain `mv` is not recoverable on its own. It leaves git's record naming the old path, which is indistinguishable from a deleted checkout, so aoe reports the worktree as missing and changes nothing. Run `git worktree repair <new-path>` from the repo to bring git's record up to date, and aoe will then find it.
+
+Reconciliation is point-in-time, not a watcher: a directory moved while a TUI or `aoe serve` is already running stays stale for that process until it restarts. See #2002.
 
 ## Configuration
 
@@ -198,7 +208,7 @@ The session is still created when the fetch fails. The worktree branches off wha
 
 ## Bare Repos
 
-AOE auto-detects bare repos and uses `bare_repo_path_template` (default `./{branch}`) instead of `path_template`, creating worktrees as siblings within the project directory. See [Workflow](workflow.md) for the bare-repo setup.
+AOE auto-detects bare repos and uses `bare_repo_path_template` (default `./{branch}`) instead of `path_template`, creating worktrees as siblings within the project directory.
 
 ## File Locations
 

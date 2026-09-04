@@ -1,8 +1,12 @@
 //! tmux utility functions
 
-use crate::session::config::{resolve_tmux_setting, Config, TmuxSetting, TmuxSettingAction};
+use crate::session::config::{
+    resolve_tmux_setting, tmux_setting_writes, Config, TmuxOptionWrite, TmuxSetting,
+};
 use anyhow::{bail, Result};
 use std::sync::OnceLock;
+
+pub(crate) const PANE_ENV_FILE_PREFIX: &str = "aoe-pane-env-";
 
 pub fn strip_ansi(content: &str) -> String {
     let mut result = strip_osc_st(content);
@@ -129,33 +133,23 @@ pub fn append_default_shell_args(args: &mut Vec<String>, target: &str, shell: &s
 /// one call, so the three create paths (`session.rs`, `terminal_session.rs`,
 /// `tool_session.rs`) cannot drift in which managed settings they honor.
 ///
-/// The status bar is absent on purpose: it needs a resolved theme and the
-/// session's title, so it is applied after creation by
+/// Iterates the whole managed-settings table (`TmuxSetting::ALL`) and emits the
+/// writes each resolved action declares, so a new managed option is one table
+/// row rather than a helper plus an edit here. `LeaveToUser` writes nothing: a
+/// session created this instant has no session-scoped value aoe wrote to clear,
+/// so declining to write already leaves the user's own config in charge. A tmux
+/// session option outranks a global one, so unconditionally forcing values
+/// here is what silently overrode the file the user wrote and made `[tmux]
+/// mouse` look like a setting that did nothing (issue #3207).
+///
+/// The status bar row declares no creation-time writes on purpose: it needs a
+/// resolved theme and the session's title, so it is applied after creation by
 /// [`crate::tmux::status_bar::apply_all_tmux_options`], which resolves the same
-/// table.
-///
-/// `config` must be the profile-merged config for the session being created;
-/// see [`crate::session::config::resolve_tmux_setting`].
-pub fn append_tmux_setting_args(args: &mut Vec<String>, target: &str, config: &Config) {
-    append_mouse_args(
-        args,
-        target,
-        resolve_tmux_setting(TmuxSetting::Mouse, config),
-    );
-    if resolve_tmux_setting(TmuxSetting::Clipboard, config) == TmuxSettingAction::Apply {
-        append_clipboard_passthrough_args(args, target);
-    }
-}
-
-/// Append `; set-option -t <target> mouse on|off` to an in-flight tmux argument
-/// list, deciding mouse forwarding into tmux copy-mode for the new session.
-///
-/// [`TmuxSettingAction::LeaveToUser`] appends nothing: a session created this
-/// instant has no session-scoped `mouse` for aoe to clear, so declining to write
-/// one already leaves the user's `set -g mouse ...` in charge. A tmux session
-/// option outranks a global one, so unconditionally forcing `mouse on` here,
-/// which is what this did before, overrode the file the user wrote and made
-/// `[tmux] mouse` look like a setting that did nothing (issue #3207).
+/// table and, unlike creation, actively unsets stale session-scoped values on
+/// `LeaveToUser`. Resolving the row here still probes the user's tmux config
+/// (`user_has_tmux_config`, an `exists()` check over the user's tmux config
+/// paths) and discards the result; that is the cost of iterating the table
+/// uniformly.
 ///
 /// `mouse on` is what the web dashboard's two-finger scroll on mobile needs
 /// when the underlying agent uses tmux copy-mode for scrollback (the default
@@ -164,20 +158,48 @@ pub fn append_tmux_setting_args(args: &mut Vec<String>, target: &str, config: &C
 /// alternate screen and relies on alternate-scroll turning the wheel into
 /// arrow keys (it binds the arrows to scroll), so the option is harmless but
 /// unused in that mode.
-fn append_mouse_args(args: &mut Vec<String>, target: &str, action: TmuxSettingAction) {
-    let enabled = match action {
-        TmuxSettingAction::Apply => "on",
-        TmuxSettingAction::ForceOff => "off",
-        TmuxSettingAction::LeaveToUser => return,
-    };
-    args.extend([
-        ";".to_string(),
-        "set-option".to_string(),
-        "-t".to_string(),
-        target.to_string(),
-        "mouse".to_string(),
-        enabled.to_string(),
-    ]);
+///
+/// `config` must be the profile-merged config for the session being created;
+/// see [`crate::session::config::resolve_tmux_setting`].
+pub fn append_tmux_setting_args(args: &mut Vec<String>, target: &str, config: &Config) {
+    for setting in TmuxSetting::ALL {
+        let writes = tmux_setting_writes(setting, resolve_tmux_setting(setting, config));
+        append_tmux_setting_writes(args, target, writes);
+    }
+}
+
+/// Append the writes of one managed setting to an in-flight tmux argument
+/// list. Pure over the writes, so the emitted tokens are table-testable.
+fn append_tmux_setting_writes(args: &mut Vec<String>, target: &str, writes: &[TmuxOptionWrite]) {
+    for write in writes {
+        args.push(";".to_string());
+        args.push("set-option".to_string());
+        // Only the scope flags differ per variant; the `-q` guard and the
+        // option/value pushes are shared.
+        let (scope_flags, option, value, quiet) = match *write {
+            TmuxOptionWrite::Session {
+                option,
+                value,
+                quiet,
+            } => (&["-t", target][..], option, value, quiet),
+            TmuxOptionWrite::Server {
+                option,
+                value,
+                quiet,
+            } => (&["-s"][..], option, value, quiet),
+            TmuxOptionWrite::Window {
+                option,
+                value,
+                quiet,
+            } => (&["-w", "-t", target][..], option, value, quiet),
+        };
+        if quiet {
+            args.push("-q".to_string());
+        }
+        args.extend(scope_flags.iter().map(|flag| flag.to_string()));
+        args.push(option.to_string());
+        args.push(value.to_string());
+    }
 }
 
 /// Append `; set-option -t <target> window-size latest` so the tmux window
@@ -193,45 +215,6 @@ pub fn append_window_size_args(args: &mut Vec<String>, target: &str) {
         target.to_string(),
         "window-size".to_string(),
         "latest".to_string(),
-    ]);
-}
-
-/// Append the two tmux options required for OSC 52 clipboard escapes from
-/// the wrapped agent (Claude Code, OpenCode, Codex, etc.) to reach the outer
-/// terminal. Without these, "select to copy" inside the agent silently fails
-/// because tmux drops the sequence (see #897).
-///
-/// Two distinct mechanisms are covered:
-///   * `set-clipboard on` (server option): captures and forwards raw OSC 52
-///     sequences to attached terminal clients.
-///   * `allow-passthrough on` (window option, added in tmux 3.3): allows
-///     `\ePtmux;...\e\\`-wrapped escapes (the form OpenCode uses) to be
-///     unwrapped and forwarded.
-///
-/// Programs vary in which form they emit, so both are set defensively. Scope
-/// flags are explicit (`-s`, `-w`) so the call site is unambiguous and
-/// resilient to future tmux scope-inference changes; matches the convention
-/// used by `append_remain_on_exit_args` for `remain-on-exit`.
-///
-/// `-q` (silently ignore errors) keeps aoe compatible with tmux < 3.3, where
-/// `allow-passthrough` does not exist. On those versions the set-option call
-/// quietly no-ops instead of failing the whole `new-session` invocation.
-fn append_clipboard_passthrough_args(args: &mut Vec<String>, target: &str) {
-    args.extend([
-        ";".to_string(),
-        "set-option".to_string(),
-        "-q".to_string(),
-        "-s".to_string(),
-        "set-clipboard".to_string(),
-        "on".to_string(),
-        ";".to_string(),
-        "set-option".to_string(),
-        "-q".to_string(),
-        "-w".to_string(),
-        "-t".to_string(),
-        target.to_string(),
-        "allow-passthrough".to_string(),
-        "on".to_string(),
     ]);
 }
 
@@ -269,6 +252,48 @@ pub(crate) fn pane_current_command(session_name: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// The terminal title the pane's program published over OSC, for callers
+/// outside the batched poll that reads it as part of [`crate::tmux::PaneMetadata`].
+///
+/// Only `display-message`'s own trailing newline comes off, where the sibling
+/// helpers above trim: the batched read does not trim either, and a title is
+/// matched by `^`-anchored rules, so trimming here would let the same pane
+/// read one way through the poller and another through `aoe session capture`.
+pub(crate) fn pane_title(session_name: &str) -> Option<String> {
+    let target = format!("{session_name}:^.0");
+    crate::tmux::tmux_command()
+        .args(["display-message", "-t", &target, "-p", "#{pane_title}"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| strip_display_delimiter(&s).to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Drop the single newline `display-message -p` appends, and only that one.
+/// Trimming every trailing newline would also eat one the title itself
+/// carried, which is the difference between reporting a title and reporting a
+/// truncated one.
+fn strip_display_delimiter(raw: &str) -> &str {
+    raw.strip_suffix('\n').unwrap_or(raw)
+}
+
+fn pane_start_command_is_protected(session_name: &str) -> bool {
+    let target = format!("{session_name}:^.0");
+    crate::tmux::tmux_command()
+        .args([
+            "display-message",
+            "-t",
+            &target,
+            "-p",
+            "#{pane_start_command}",
+        ])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .is_some_and(|command| command.contains(PANE_ENV_FILE_PREFIX))
+}
+
 // Shells that indicate the agent is not running (the pane was restored by
 // tmux-resurrect, the agent crashed back to a prompt, or the user exited).
 const KNOWN_SHELLS: &[&str] = &[
@@ -280,10 +305,31 @@ pub(crate) fn is_shell_command(cmd: &str) -> bool {
     KNOWN_SHELLS.contains(&normalized)
 }
 
+pub(crate) fn is_pane_running_shell_command(
+    current_command: &str,
+    pane_start_command_is_protected: bool,
+) -> bool {
+    is_shell_command(current_command) && !pane_start_command_is_protected
+}
+
 pub fn is_pane_running_shell(session_name: &str) -> bool {
-    pane_current_command(session_name)
-        .map(|cmd| is_shell_command(&cmd))
-        .unwrap_or(false)
+    let Some(current_command) = pane_current_command(session_name) else {
+        return false;
+    };
+    if !is_shell_command(&current_command) {
+        return false;
+    }
+
+    // Protected pane environment values are sourced by a short-lived script
+    // executed by the user's POSIX shell. While the launch command is alive,
+    // tmux therefore reports that shell rather than the agent as the pane's
+    // current command. The script itself is the pane command, so once the agent
+    // exits the pane becomes dead instead of returning to a prompt. Do not
+    // mistake this live wrapper for a resurrected or interactive shell.
+    is_pane_running_shell_command(
+        &current_command,
+        pane_start_command_is_protected(session_name),
+    )
 }
 
 /// Returns the tmux prefix key formatted for display (e.g. "Ctrl+a", "Ctrl+b").
@@ -314,12 +360,16 @@ pub fn tmux_prefix_display() -> &'static str {
 /// `Err`. Caller is responsible for `refresh_session_cache` after a
 /// successful kill.
 pub(crate) fn kill_session_if_present(name: &str) -> Result<()> {
-    let output = crate::tmux::tmux_command()
-        .env("LC_ALL", "C")
+    let output = crate::tmux::tmux_query_command()
         .args(["kill-session", "-t", name])
         .output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        // Deliberately broader than `tmux_no_server_running`: for a kill, ANY
+        // connect failure (`error connecting`, any errno) means there is no
+        // server and thus no session to remove, so it is success. The status
+        // pollers need the narrower ENOENT-only test to keep transient glitches
+        // on the error path; here a false "absent" cannot act on a live pane.
         let absent = stderr.contains("can't find session")
             || stderr.contains("no server running")
             || stderr.contains("error connecting");
@@ -349,41 +399,283 @@ fn format_tmux_prefix(raw: &str) -> String {
 mod tests {
     use super::*;
 
-    /// #3207: session creation used to append `mouse on` for every row of this
-    /// table. The `Auto` + user-sets-mouse row and both `Disabled` rows are the
-    /// regression: a session-scoped `mouse on` outranks the user's global
-    /// `set -g mouse off`, so emitting it there overrode the config they wrote.
-    ///
-    /// `user_sets_mouse` is false both for a user with no tmux config and for a
-    /// user whose config never mentions `mouse`; those are one input here and
-    /// are told apart by `tmux_config_sets_any`, tested in `session::config`.
+    /// One tmux `set-option` write form emits exactly its tmux tokens: scope
+    /// flags, `-q` when quiet, and no target for the server scope. This pins
+    /// the emitted-args contract the table rows must keep (issue #3349).
     #[test]
-    fn test_mouse_args_follow_configured_mode() {
-        use crate::session::config::{tmux_setting_action, TmuxSettingMode};
-        let on = vec![";", "set-option", "-t", "aoe_x", "mouse", "on"];
-        let off = vec![";", "set-option", "-t", "aoe_x", "mouse", "off"];
-        // (mode, user's tmux config sets `mouse`, emitted args)
+    fn test_tmux_option_write_emission() {
+        use crate::session::config::TmuxOptionWrite;
         let cases = [
-            // Auto defers only to a user who set `mouse` themselves; everyone
-            // else gets it on, so wheel and touch scrollback work out of the box.
-            (TmuxSettingMode::Auto, true, vec![]),
-            (TmuxSettingMode::Auto, false, on.clone()),
-            // An explicit mode is applied either way; that is what makes it
-            // explicit.
-            (TmuxSettingMode::Enabled, false, on.clone()),
-            (TmuxSettingMode::Enabled, true, on),
-            (TmuxSettingMode::Disabled, false, off.clone()),
-            (TmuxSettingMode::Disabled, true, off),
+            (
+                TmuxOptionWrite::Session {
+                    option: "mouse",
+                    value: "on",
+                    quiet: false,
+                },
+                vec![";", "set-option", "-t", "aoe_x", "mouse", "on"],
+            ),
+            (
+                TmuxOptionWrite::Session {
+                    option: "mouse",
+                    value: "off",
+                    quiet: false,
+                },
+                vec![";", "set-option", "-t", "aoe_x", "mouse", "off"],
+            ),
+            (
+                // No table row uses a quiet session write today; the arm
+                // still exists, so pin its tokens like the other scopes.
+                TmuxOptionWrite::Session {
+                    option: "mouse",
+                    value: "on",
+                    quiet: true,
+                },
+                vec![";", "set-option", "-q", "-t", "aoe_x", "mouse", "on"],
+            ),
+            (
+                TmuxOptionWrite::Server {
+                    option: "set-clipboard",
+                    value: "on",
+                    quiet: true,
+                },
+                // No target: a server option must not be addressed per-session.
+                vec![";", "set-option", "-q", "-s", "set-clipboard", "on"],
+            ),
+            (
+                TmuxOptionWrite::Window {
+                    option: "allow-passthrough",
+                    value: "on",
+                    quiet: true,
+                },
+                vec![
+                    ";",
+                    "set-option",
+                    "-q",
+                    "-w",
+                    "-t",
+                    "aoe_x",
+                    "allow-passthrough",
+                    "on",
+                ],
+            ),
         ];
-        for (mode, user_sets_mouse, expected) in cases {
+        for (write, expected) in cases {
             let mut args: Vec<String> = Vec::new();
-            append_mouse_args(
-                &mut args,
-                "aoe_x",
-                tmux_setting_action(mode, user_sets_mouse),
-            );
-            assert_eq!(args, expected, "{mode:?} user_sets_mouse={user_sets_mouse}");
+            append_tmux_setting_writes(&mut args, "aoe_x", std::slice::from_ref(&write));
+            assert_eq!(args, expected, "{write:?}");
         }
+    }
+
+    /// The full (setting, action) -> writes matrix, straight from the table
+    /// through the `tmux_setting_writes` seam. Covers the user stories at the
+    /// table level (issue #3349): US1 (Clipboard/Apply declares the
+    /// passthrough writes), US2 (ForceOff rows never carry a forced-on value;
+    /// clipboard declares no "off"), US3 (every row maps through one seam, no
+    /// per-helper branch).
+    #[test]
+    fn test_tmux_setting_writes_table() {
+        use crate::session::config::{TmuxOptionWrite, TmuxSettingAction};
+        use TmuxOptionWrite::{Server, Session, Window};
+        use TmuxSettingAction::{Apply, ForceOff, LeaveToUser};
+        let mouse_on = [Session {
+            option: "mouse",
+            value: "on",
+            quiet: false,
+        }];
+        let mouse_off = [Session {
+            option: "mouse",
+            value: "off",
+            quiet: false,
+        }];
+        let clipboard = [
+            Server {
+                option: "set-clipboard",
+                value: "on",
+                quiet: true,
+            },
+            Window {
+                option: "allow-passthrough",
+                value: "on",
+                quiet: true,
+            },
+        ];
+        let cases = [
+            // The status bar is painted after creation with dynamic theme
+            // values; it declares no creation-time writes for any action.
+            (TmuxSetting::StatusBar, Apply, &[][..]),
+            (TmuxSetting::StatusBar, ForceOff, &[][..]),
+            (TmuxSetting::StatusBar, LeaveToUser, &[][..]),
+            (TmuxSetting::Mouse, Apply, &mouse_on[..]),
+            (TmuxSetting::Mouse, ForceOff, &mouse_off[..]),
+            // LeaveToUser writes nothing at creation: a fresh session has no
+            // session-scoped value aoe wrote to clear.
+            (TmuxSetting::Mouse, LeaveToUser, &[][..]),
+            (TmuxSetting::Clipboard, Apply, &clipboard[..]),
+            // No expressible "off": unsetting would reach the user's server.
+            (TmuxSetting::Clipboard, ForceOff, &[][..]),
+            (TmuxSetting::Clipboard, LeaveToUser, &[][..]),
+        ];
+        for (setting, action, expected) in cases {
+            assert_eq!(
+                tmux_setting_writes(setting, action),
+                expected,
+                "{setting:?} {action:?}"
+            );
+        }
+    }
+
+    /// The public entry point: resolving the whole table and emitting in
+    /// canonical order (mouse before clipboard). Explicit modes keep the
+    /// assertions independent of the probe's result, and the isolated HOME
+    /// keeps the probe itself away from the real user files (issue #3349,
+    /// US2: no forced-on write survives `disabled`).
+    #[test]
+    #[serial_test::serial]
+    fn test_append_tmux_setting_args_emits_rows_in_order() {
+        use crate::session::config::TmuxSettingMode::{Disabled, Enabled};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(tmp.path());
+
+        let mut config = Config::default();
+        let all_on = vec![
+            ";",
+            "set-option",
+            "-t",
+            "aoe_x",
+            "mouse",
+            "on",
+            ";",
+            "set-option",
+            "-q",
+            "-s",
+            "set-clipboard",
+            "on",
+            ";",
+            "set-option",
+            "-q",
+            "-w",
+            "-t",
+            "aoe_x",
+            "allow-passthrough",
+            "on",
+        ];
+        // (status_bar, mouse, clipboard)
+        let cases = [
+            ((Enabled, Enabled, Enabled), all_on.clone()),
+            // The status bar never contributes at creation, whatever its mode.
+            ((Disabled, Enabled, Enabled), all_on),
+            (
+                (Enabled, Disabled, Enabled),
+                vec![
+                    ";",
+                    "set-option",
+                    "-t",
+                    "aoe_x",
+                    "mouse",
+                    "off",
+                    ";",
+                    "set-option",
+                    "-q",
+                    "-s",
+                    "set-clipboard",
+                    "on",
+                    ";",
+                    "set-option",
+                    "-q",
+                    "-w",
+                    "-t",
+                    "aoe_x",
+                    "allow-passthrough",
+                    "on",
+                ],
+            ),
+            // A disabled clipboard declares no writes at all.
+            (
+                (Enabled, Disabled, Disabled),
+                vec![";", "set-option", "-t", "aoe_x", "mouse", "off"],
+            ),
+            // And a disabled clipboard with mouse on emits just the mouse.
+            (
+                (Enabled, Enabled, Disabled),
+                vec![";", "set-option", "-t", "aoe_x", "mouse", "on"],
+            ),
+        ];
+        for ((status_bar, mouse, clipboard), expected) in cases {
+            config.tmux.status_bar = status_bar;
+            config.tmux.mouse = mouse;
+            config.tmux.clipboard = clipboard;
+            let mut args: Vec<String> = Vec::new();
+            append_tmux_setting_args(&mut args, "aoe_x", &config);
+            assert_eq!(
+                args, expected,
+                "status_bar={status_bar:?} mouse={mouse:?} clipboard={clipboard:?}"
+            );
+        }
+    }
+
+    /// US1 (issue #3349): a tmux.conf that sets a prefix key but never touches
+    /// clipboard still gets aoe's `set-clipboard` passthrough under
+    /// `clipboard = "auto"`, and each option defers independently of the
+    /// others.
+    #[test]
+    #[serial_test::serial]
+    fn test_user_config_silent_on_option_still_applies_auto() {
+        use crate::session::config::{resolve_tmux_setting, TmuxSetting, TmuxSettingAction};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(tmp.path());
+        let tmux_conf = tmp.path().join(".tmux.conf");
+
+        // All `auto`: the default config.
+        let config = Config::default();
+        let mouse_on = vec![";", "set-option", "-t", "aoe_x", "mouse", "on"];
+        let clipboard = vec![
+            ";",
+            "set-option",
+            "-q",
+            "-s",
+            "set-clipboard",
+            "on",
+            ";",
+            "set-option",
+            "-q",
+            "-w",
+            "-t",
+            "aoe_x",
+            "allow-passthrough",
+            "on",
+        ];
+
+        // (a) Prefix key only: aoe still applies its mouse and clipboard writes.
+        std::fs::write(&tmux_conf, "set -g prefix C-a\n").unwrap();
+        let mut args: Vec<String> = Vec::new();
+        append_tmux_setting_args(&mut args, "aoe_x", &config);
+        let mut expected = mouse_on.clone();
+        expected.extend(clipboard.clone());
+        assert_eq!(
+            args, expected,
+            "a prefix-only tmux.conf must not defer clipboard"
+        );
+        // A config existing at all does defer the status bar (coarse by
+        // design), pinning its WhenUserHasAnyConfig wiring.
+        assert_eq!(
+            resolve_tmux_setting(TmuxSetting::StatusBar, &config),
+            TmuxSettingAction::LeaveToUser
+        );
+
+        // (b) User takes set-clipboard: only the clipboard writes defer.
+        std::fs::write(&tmux_conf, "set -g prefix C-a\nset -s set-clipboard on\n").unwrap();
+        let mut args: Vec<String> = Vec::new();
+        append_tmux_setting_args(&mut args, "aoe_x", &config);
+        assert_eq!(
+            args, mouse_on,
+            "set-clipboard must defer only the clipboard writes"
+        );
+
+        // (c) User takes mouse: only the mouse write defers.
+        std::fs::write(&tmux_conf, "set -g prefix C-a\nset -g mouse on\n").unwrap();
+        let mut args: Vec<String> = Vec::new();
+        append_tmux_setting_args(&mut args, "aoe_x", &config);
+        assert_eq!(args, clipboard, "mouse must defer only the mouse write");
     }
 
     #[test]
@@ -530,6 +822,22 @@ mod tests {
     }
 
     #[test]
+    fn test_is_pane_running_shell_command_accounts_for_protected_wrapper() {
+        let cases = [
+            ("sh", true, false),
+            ("sh", false, true),
+            ("claude", false, false),
+        ];
+        for (current_command, pane_start_command_is_protected, expected) in cases {
+            assert_eq!(
+                is_pane_running_shell_command(current_command, pane_start_command_is_protected),
+                expected,
+                "{current_command:?}, protected={pane_start_command_is_protected}"
+            );
+        }
+    }
+
+    #[test]
     fn test_format_tmux_prefix() {
         // Case is preserved: tmux returns the prefix in whatever case the user
         // wrote it, and the displayed hint should match their muscle memory.
@@ -547,32 +855,6 @@ mod tests {
         for (input, expected) in cases {
             assert_eq!(format_tmux_prefix(input), expected, "{input:?}");
         }
-    }
-
-    #[test]
-    fn test_append_clipboard_passthrough_args() {
-        let mut args: Vec<String> = vec!["new-session".into()];
-        append_clipboard_passthrough_args(&mut args, "aoe_test");
-        assert_eq!(
-            args,
-            vec![
-                "new-session",
-                ";",
-                "set-option",
-                "-q",
-                "-s",
-                "set-clipboard",
-                "on",
-                ";",
-                "set-option",
-                "-q",
-                "-w",
-                "-t",
-                "aoe_test",
-                "allow-passthrough",
-                "on",
-            ]
-        );
     }
 
     #[test]
@@ -644,6 +926,51 @@ mod tests {
         assert!(
             !exists,
             "session should be gone after kill_session_if_present"
+        );
+    }
+
+    /// `aoe session capture` reads the pane title through this helper, and the
+    /// only test that covers that path runs an agent with no `osc_title`
+    /// rules: a wrong target here would silently restore the empty title
+    /// #3625 was about.
+    #[test]
+    #[serial_test::serial]
+    fn pane_title_reads_the_panes_published_title() {
+        if !tmux_available() {
+            return;
+        }
+        let name = "aoe_test_pane_title";
+        let _ = crate::tmux::tmux_command()
+            .args(["kill-session", "-t", name])
+            .output();
+        let spawn = crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", name, "sleep", "30"])
+            .status();
+        if !spawn.map(|s| s.success()).unwrap_or(false) {
+            return;
+        }
+        let target = format!("{name}:^.0");
+        let _ = crate::tmux::tmux_command()
+            .args(["select-pane", "-t", &target, "-T", "aoe-title-probe"])
+            .output();
+        let title = pane_title(name);
+        let _ = kill_session_if_present(name);
+        assert_eq!(title.as_deref(), Some("aoe-title-probe"));
+    }
+
+    /// Only the delimiter `display-message` adds comes off. tmux 3.6 will not
+    /// store a newline in a title (`select-pane -T` refuses one and an OSC
+    /// title is sanitized), so this is locked here rather than against a live
+    /// pane, which cannot produce the input.
+    #[test]
+    fn strip_display_delimiter_removes_only_the_delimiter() {
+        assert_eq!(strip_display_delimiter("title\n"), "title");
+        assert_eq!(strip_display_delimiter("title"), "title");
+        assert_eq!(strip_display_delimiter(""), "");
+        assert_eq!(
+            strip_display_delimiter("title\n\n"),
+            "title\n",
+            "a newline the title itself carried must survive"
         );
     }
 }

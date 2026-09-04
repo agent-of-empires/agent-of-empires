@@ -53,7 +53,7 @@ pub struct Todo {
     pub completed: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
@@ -110,7 +110,7 @@ pub struct MemoryRecall {
     pub synthesized_text: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DiffPreview {
     pub path: String,
     pub old_text: Option<String>,
@@ -464,6 +464,18 @@ pub struct AcpState {
     /// commands instead of a hard-coded placeholder list.
     #[serde(default)]
     pub available_commands: Vec<AvailableCommand>,
+    /// Permission modes the agent advertised in its most recent
+    /// `ModesAvailable`. Empty until the agent announces any. Distinct from
+    /// `mode`, which is the coarse AoE-side permission posture: these are the
+    /// adapter's own modes, keyed by the id `session/set_mode` takes back.
+    /// Drives the TUI mode picker and the web mode pills. See #1403.
+    #[serde(default)]
+    pub available_modes: Vec<ModeInfo>,
+    /// Id of the currently selected entry in `available_modes`, from
+    /// `ModesAvailable` / `CurrentModeChanged`. None until the agent
+    /// announces one, and cleared with the mode list.
+    #[serde(default)]
+    pub current_mode_id: Option<String>,
     /// Most recent `AgentSwitched` snapshot. Used by the UI to render a
     /// transcript divider (e.g. "Switched claude -> codex due to
     /// rate_limit") and by the post-switch context-primer fetch. None
@@ -498,6 +510,26 @@ pub struct AcpState {
     #[serde(default)]
     pub background_agents: Vec<BackgroundAgentRecord>,
 
+    /// Whether a turn is in flight. Server-observed edges: opened by
+    /// `UserPromptSent` / `UserDiffCommentsPrompt` / `ThinkingStarted`, closed
+    /// by `Stopped`, startup error, runtime error, or rejection.
+    #[serde(default)]
+    pub turn_active: bool,
+    /// Whether the running turn is steerable (a mid-turn prompt is injected
+    /// rather than queued). Latest `PromptCapabilities.steering`.
+    #[serde(default)]
+    pub steering: bool,
+    /// A cancel has been requested for the running turn and its terminal
+    /// `Stopped` has not yet arrived. A fresh non-steered turn clears it.
+    #[serde(default)]
+    pub cancelling: bool,
+    /// A `/compact` is running (the adapter goes silent ~90-170s). Latched
+    /// between `ConversationCompactionStarted` and `ConversationCompacted` /
+    /// turn end, so a client parks a follow-up rather than steering it into a
+    /// turn that never answers.
+    #[serde(default)]
+    pub compacting: bool,
+
     pub last_seq: u64,
     pub updated_at: DateTime<Utc>,
 }
@@ -506,6 +538,15 @@ impl AcpState {
     /// Bounded ring of recent diffs. Keep the last 16 to keep state size
     /// bounded; the full diff history lives in the replay buffer.
     const MAX_RECENT_DIFFS: usize = 16;
+
+    /// A prompt getting through means the session is live, so any rate-limit
+    /// park is over. Clearing it only on `RateLimitAutoResumed` / a backend
+    /// switch left a session resumed by a plain prompt showing a stale
+    /// "Rate-limited; resets at ..." banner whose RESUME NOW button then 409'd
+    /// against the already-running worker. See #3028.
+    fn clear_rate_limit_park(&mut self) {
+        self.rate_limit = None;
+    }
 
     pub fn new(session_id: AcpSessionId, agent: AgentName, model: Option<String>) -> Self {
         Self {
@@ -523,11 +564,17 @@ impl AcpState {
             rate_limit: None,
             usage: None,
             available_commands: Vec::new(),
+            available_modes: Vec::new(),
+            current_mode_id: None,
             last_agent_switch: None,
             startup_error: None,
             config_options: Vec::new(),
             config_option_switch_failed: None,
             background_agents: Vec::new(),
+            turn_active: false,
+            steering: false,
+            cancelling: false,
+            compacting: false,
             last_seq: 0,
             updated_at: Utc::now(),
         }
@@ -550,7 +597,7 @@ pub enum StateError {
 /// assembled markdown. Field names mirror the frontend `DiffComment`
 /// type (`web/src/components/diff/comments/types.ts`) one-for-one; the
 /// server never interprets these, it only stores and replays them.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiffComment {
     pub id: String,
@@ -595,6 +642,18 @@ impl PromptAttachmentKind {
             PromptAttachmentKind::Resource => "resource",
         }
     }
+
+    /// Parse the lowercase tag written by [`Self::as_str`], for reading the kind
+    /// back out of the attachment store's TEXT column. `None` on an unknown
+    /// tag (a corrupt or forward-version row), so the caller can skip it.
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "image" => Some(PromptAttachmentKind::Image),
+            "audio" => Some(PromptAttachmentKind::Audio),
+            "resource" => Some(PromptAttachmentKind::Resource),
+            _ => None,
+        }
+    }
 }
 
 /// Replay-side view of one prompt attachment. Carries metadata only,
@@ -613,6 +672,35 @@ pub struct PromptAttachmentRef {
     /// Decoded byte length, for the UI to show a size hint without
     /// fetching the blob.
     pub size: u64,
+}
+
+/// One entry in a session's server-owned prompt queue: a follow-up the
+/// user lined up while a turn was busy. The daemon is the source of truth
+/// (persisted on the `Instance`), so the queue survives a client reload or
+/// a closed PWA and drains on turn-end with no tab open.
+///
+/// Attachments carry metadata only, exactly like [`PromptAttachmentRef`]
+/// on a live prompt: the bytes live in the event store's pending-attachment
+/// table keyed by `(session_id, prompt_id, attachment_id)` (outside the
+/// seq-keyed retention prune, since a queued prompt has no event seq yet) and
+/// are reloaded at drain time, so a queued screenshot does not bloat the
+/// session file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QueuedPromptEntry {
+    /// Client-minted stable id, unchanged across edits. Doubles as the
+    /// optimistic-echo reconcile key on the client.
+    pub id: String,
+    /// Server-assigned monotonic order; the queue drains by ascending `seq`.
+    pub seq: u64,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<PromptAttachmentRef>,
+    /// RFC3339 enqueue time, for retention and provenance.
+    pub created_at: String,
+    /// Which device enqueued it, for multi-device provenance. `None` for
+    /// rows migrated from a pre-server-queue client localStorage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_device: Option<String>,
 }
 
 /// Discriminated union of state mutations. ACP `session/update`
@@ -948,6 +1036,16 @@ pub enum Event {
         /// no migration is needed. See #1000 / #965.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<PromptAttachmentRef>,
+        /// Client-minted stable id for the prompt, echoed back so a web
+        /// client can reconcile its optimistic row against the
+        /// authoritative `UserPromptSent` by id rather than by text/seq.
+        /// `None` for prompts from surfaces that mint no id (CLI/TUI
+        /// verbs, drained queue entries) and for events persisted before
+        /// this field landed; `#[serde(default, skip_serializing_if)]`
+        /// keeps those deserialising and re-serialising unchanged, so no
+        /// migration is needed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_id: Option<String>,
     },
     /// The agent's prompt capabilities, captured from the ACP
     /// `initialize` response right after the handshake (and re-emitted
@@ -1139,6 +1237,11 @@ impl AcpState {
                     }
                     _ => self.in_flight_tool = Some(tool_call),
                 }
+                // The reasoning block produced output, so the agent is no
+                // longer thinking. Adapters routinely skip `ThinkingEnded`
+                // when they transition straight into tool calls, which would
+                // otherwise leave the spinner stuck on "thinking". See #1213.
+                self.thinking = None;
             }
             Event::ToolCallCompleted { tool_call_id, .. } => {
                 if self
@@ -1188,6 +1291,19 @@ impl AcpState {
                 }
             }
             Event::ElicitationRequested { elicitation } => {
+                // The adapter pairs the elicitation with an `AskUserQuestion`
+                // tool call, and the card is the real UI: the transcript
+                // suppresses that tool row, so drop the in-flight pointer too
+                // rather than leave a spinner on the suppressed call.
+                if let Some(tool_call_id) = elicitation.tool_call_id.as_deref() {
+                    if self
+                        .in_flight_tool
+                        .as_ref()
+                        .is_some_and(|t| t.id == tool_call_id)
+                    {
+                        self.in_flight_tool = None;
+                    }
+                }
                 self.pending_elicitations.push(elicitation)
             }
             // Lenient on the nonce: a resolved/torn-down elicitation can be
@@ -1206,6 +1322,10 @@ impl AcpState {
                 self.thinking = Some(ThinkingSignal {
                     started_at: Utc::now(),
                 });
+                // Fires repeatedly within a running turn; opens the turn but
+                // deliberately does NOT clear `cancelling` (that would drop a
+                // pending stop the moment the agent emits its next thought).
+                self.turn_active = true;
             }
             Event::ThinkingEnded => self.thinking = None,
             Event::RateLimit { info } => self.rate_limit = Some(info),
@@ -1216,12 +1336,19 @@ impl AcpState {
             Event::RateLimitAutoResumed { .. } => self.rate_limit = None,
             Event::UsageUpdated { usage } => self.usage = Some(usage),
             Event::ModeChanged { mode } => self.mode = mode,
-            // ModesAvailable + CurrentModeChanged carry the real ACP-
-            // advertised modes. The structured view's persistent state doesn't
-            // track them yet (the UI stores them in the broadcast
-            // replay), so this is just a no-op that bumps seq.
-            Event::ModesAvailable { .. } => {}
-            Event::CurrentModeChanged { .. } => {}
+            // The real ACP-advertised modes, reduced here so a client renders
+            // the picker from this state instead of re-folding the broadcast
+            // replay (Tier 1.2 / 1.3).
+            Event::ModesAvailable {
+                current_mode_id,
+                modes,
+            } => {
+                self.available_modes = modes;
+                self.current_mode_id = Some(current_mode_id);
+            }
+            Event::CurrentModeChanged { current_mode_id } => {
+                self.current_mode_id = Some(current_mode_id);
+            }
             Event::ModeSwitchFailed { .. } => {}
             Event::AvailableCommandsUpdated { commands } => {
                 self.available_commands = commands;
@@ -1260,28 +1387,67 @@ impl AcpState {
             // clients see them in the replay buffer and know the session
             // made progress.
             Event::RawAgentUpdate { .. } => {}
-            Event::PromptRuntimeError { .. } => {}
+            Event::PromptRuntimeError { .. } => {
+                // The prompt failed: the turn is over. `cancelling` clears too
+                // (nothing left to cancel), mirroring the TUI reducer.
+                self.turn_active = false;
+                self.cancelling = false;
+            }
             Event::AgentMessageChunk { .. } => {}
-            // No in-memory mutation: the turn is still active (turnActive
-            // stays true until a real `Stopped`). The reducer/UI derive the
-            // "Stopping..." state from the broadcast/replayed event. Bumps
-            // seq so the WS replay surfaces it to live clients. See #1727.
-            Event::CancelRequested { .. } => {}
-            Event::Stopped { .. } => {}
-            Event::AgentStartupError { .. } => {}
+            // A cancel was requested; the turn is still active until its real
+            // `Stopped` arrives (the UI derives the "Stopping…" label from this
+            // flag). Bumps seq so the WS replay surfaces it to live clients.
+            Event::CancelRequested { .. } => {
+                self.cancelling = true;
+            }
+            Event::Stopped { .. } => {
+                // The turn is over however it ended (completion, cancel, killed
+                // worker), so clear every in-turn phase. This is the
+                // self-healing clear for a dropped compaction marker (#3219),
+                // and for an adapter that ends a turn without completing its
+                // tool call or emitting `ThinkingEnded`, either of which would
+                // otherwise leak a spinner into the next turn (#1213).
+                self.turn_active = false;
+                self.cancelling = false;
+                self.compacting = false;
+                self.in_flight_tool = None;
+                self.thinking = None;
+            }
+            Event::AgentStartupError { .. } => {
+                self.turn_active = false;
+                self.cancelling = false;
+            }
             Event::IncompatibleAgent { detail } => {
                 self.startup_error = Some(detail);
             }
-            Event::UserPromptSent { .. } => {}
-            // Like UserPromptSent, the diff-comments prompt doesn't mutate
-            // persistent AcpState; it bumps seq so the replay buffer
-            // and on-disk store capture the user's side of the turn.
-            Event::UserDiffCommentsPrompt { .. } => {}
+            Event::UserPromptSent { .. } => {
+                // Opens a turn. A steered continuation (a mid-turn prompt the
+                // daemon injected into a running steerable turn) is not a fresh
+                // turn, so it keeps any pending cancel; a genuine fresh turn
+                // clears it. Mirrors the TUI reducer's `is_steered_continuation`.
+                let steered = self.turn_active && self.steering;
+                self.turn_active = true;
+                if !steered {
+                    self.cancelling = false;
+                }
+                self.clear_rate_limit_park();
+            }
+            // Like UserPromptSent, the diff-comments prompt opens a turn.
+            Event::UserDiffCommentsPrompt { .. } => {
+                let steered = self.turn_active && self.steering;
+                self.turn_active = true;
+                if !steered {
+                    self.cancelling = false;
+                }
+                self.clear_rate_limit_park();
+            }
             // Surfaced to the web composer via replay and read by the
             // server prompt handler from the event store; no persistent
             // AcpState field consumes it, so this arm only bumps
             // seq/updated_at like the streaming events above.
-            Event::PromptCapabilities { .. } => {}
+            Event::PromptCapabilities { steering, .. } => {
+                self.steering = steering;
+            }
             Event::AcpSessionAssigned { .. } => {
                 // A fresh agent that passed the compatibility check
                 // has come online; heal any sticky startup error so a
@@ -1298,24 +1464,30 @@ impl AcpState {
                 self.usage = None;
             }
             Event::SessionCleared => {
-                // /clear truly wipes the model's memory. Drop
-                // session-scoped capability caches and the usage
-                // snapshot so the UI doesn't keep showing stale data
-                // referencing a conversation the model has forgotten.
+                // /clear wipes the model's memory, so anything describing the
+                // forgotten conversation goes: the usage snapshot, the plan,
+                // and whatever it had pending.
                 self.usage = None;
-                self.available_commands = Vec::new();
                 self.current_plan = None;
                 self.mode = SessionMode::Default;
                 self.pending_approvals = Vec::new();
                 self.pending_elicitations = Vec::new();
+                // What the ADAPTER advertises survives: slash commands and
+                // modes are process capabilities, not conversation state, and
+                // the agent never re-advertises them after a /clear. Dropping
+                // them leaves the pickers empty for the rest of the session.
+                // See #1128.
             }
             // Transient UI phase: the clients latch it to relabel the
             // spinner and park follow-up prompts. No durable server-side
             // mirror, so nothing to mutate here; both surfaces rebuild
             // the flag from the event stream. Bumps seq so the WS replay
             // surfaces it to live clients. See #3219.
-            Event::ConversationCompactionStarted => {}
+            Event::ConversationCompactionStarted => {
+                self.compacting = true;
+            }
             Event::ConversationCompacted => {
+                self.compacting = false;
                 // /compact replaces the model's context with a summary
                 // of the prior turns. The usage snapshot for the old
                 // raw turns no longer matches what the model holds;
@@ -1339,10 +1511,14 @@ impl AcpState {
             // Bumps seq so the WS replay surfaces it to live clients.
             Event::MonitorArmed { .. } => {}
             // Rejected follow-up prompt while another prompt was in flight.
-            // No durable in-memory mutation; the reducer surfaces a Retry
-            // pill from the broadcast frame and the event_store entry
-            // carries the historical record. See #1196.
-            Event::PromptRejected { .. } => {}
+            // No turn started, so clear the busy flag an optimistic client set;
+            // `cancelling` deliberately survives (a rejection is not a turn
+            // boundary, the targeted turn is still running). The reducer also
+            // surfaces a Retry pill from the broadcast frame and the event_store
+            // entry carries the historical record. See #1196.
+            Event::PromptRejected { .. } => {
+                self.turn_active = false;
+            }
             Event::AgentSwitched { from, to, reason } => {
                 // The new backend has no knowledge of the prior agent's
                 // session state. Drop everything tied to the previous
@@ -1359,6 +1535,11 @@ impl AcpState {
                 self.pending_elicitations = Vec::new();
                 self.usage = None;
                 self.available_commands = Vec::new();
+                // Modes are adapter-scoped like commands: the new backend
+                // advertises its own set, so the old one must not linger in
+                // the picker until it does.
+                self.available_modes = Vec::new();
+                self.current_mode_id = None;
                 self.current_plan = None;
                 self.mode = SessionMode::Default;
                 // Per-adapter selectors (model, effort, etc.) belong
@@ -1488,6 +1669,121 @@ mod tests {
             AgentName("aoe-agent".into()),
             Some("claude-opus-4-7".into()),
         )
+    }
+
+    fn prompt(text: &str) -> Event {
+        Event::UserPromptSent {
+            prompt_id: None,
+            text: text.into(),
+            attachments: Vec::new(),
+        }
+    }
+
+    fn caps(steering: bool) -> Event {
+        Event::PromptCapabilities {
+            image: false,
+            audio: false,
+            embedded_context: false,
+            steering,
+        }
+    }
+
+    // The four turn flags ported from the TUI's AcpTranscript (Tier 1: the
+    // daemon reduces them once so every client renders instead of re-deriving).
+    #[test]
+    fn turn_active_tracks_prompt_and_stop_edges() {
+        let mut s = fresh_state();
+        assert!(!s.turn_active, "fresh state is idle");
+        s.apply_event(prompt("hi")).unwrap();
+        assert!(s.turn_active, "UserPromptSent opens the turn");
+        s.apply_event(Event::ThinkingStarted).unwrap();
+        assert!(s.turn_active, "thinking keeps the turn open");
+        s.apply_event(Event::Stopped {
+            reason: "end_turn".into(),
+        })
+        .unwrap();
+        assert!(!s.turn_active, "Stopped closes the turn");
+    }
+
+    #[test]
+    fn turn_active_clears_on_error_and_rejection() {
+        let cases: &[Event] = &[
+            Event::AgentStartupError {
+                message: "boom".into(),
+            },
+            Event::PromptRuntimeError {
+                message: "boom".into(),
+            },
+            Event::PromptRejected {
+                reason: "agent_busy".into(),
+                text: "hi".into(),
+            },
+        ];
+        for terminal in cases {
+            let mut s = fresh_state();
+            s.apply_event(prompt("hi")).unwrap();
+            assert!(s.turn_active);
+            s.apply_event(terminal.clone()).unwrap();
+            assert!(!s.turn_active, "{terminal:?} clears turn_active");
+        }
+    }
+
+    #[test]
+    fn steering_reflects_latest_capabilities() {
+        let mut s = fresh_state();
+        assert!(!s.steering);
+        s.apply_event(caps(true)).unwrap();
+        assert!(s.steering);
+        s.apply_event(caps(false)).unwrap();
+        assert!(
+            !s.steering,
+            "a respawn onto a non-steering adapter clears it"
+        );
+    }
+
+    #[test]
+    fn cancelling_set_on_request_cleared_on_stop_and_fresh_turn() {
+        let mut s = fresh_state();
+        s.apply_event(prompt("hi")).unwrap();
+        s.apply_event(Event::CancelRequested {
+            escalates_at: Utc::now(),
+        })
+        .unwrap();
+        assert!(s.cancelling, "CancelRequested latches");
+        s.apply_event(Event::Stopped {
+            reason: "cancelled".into(),
+        })
+        .unwrap();
+        assert!(!s.cancelling, "Stopped clears the pending cancel");
+
+        // A fresh non-steered turn clears a leaked cancel; a steered
+        // continuation keeps it (the targeted turn is still running).
+        let mut s = fresh_state();
+        s.apply_event(prompt("one")).unwrap();
+        s.apply_event(Event::CancelRequested {
+            escalates_at: Utc::now(),
+        })
+        .unwrap();
+        s.apply_event(caps(true)).unwrap(); // steerable
+        s.apply_event(prompt("steered mid-turn")).unwrap();
+        assert!(s.cancelling, "a steered continuation keeps cancelling");
+    }
+
+    #[test]
+    fn compacting_latches_between_start_and_end() {
+        let mut s = fresh_state();
+        s.apply_event(Event::ConversationCompactionStarted).unwrap();
+        assert!(s.compacting);
+        s.apply_event(Event::ConversationCompacted).unwrap();
+        assert!(!s.compacting);
+        // Also self-heals on a turn-ending Stopped (dropped completion marker).
+        s.apply_event(Event::ConversationCompactionStarted).unwrap();
+        assert!(s.compacting);
+        s.apply_event(Event::Stopped {
+            reason: "end_turn".into(),
+        })
+        .unwrap();
+        assert!(!s.compacting, "Stopped self-heals a stuck compaction");
     }
 
     #[test]
@@ -1785,6 +2081,49 @@ mod tests {
         assert!(s.available_commands[0].accepts_input);
     }
 
+    #[test]
+    fn advertised_modes_reduce_and_follow_their_adapter_scope() {
+        let mode = |id: &str| ModeInfo {
+            id: id.into(),
+            name: id.to_uppercase(),
+            description: None,
+        };
+        let mut s = fresh_state();
+        assert!(s.available_modes.is_empty() && s.current_mode_id.is_none());
+
+        s.apply_event(Event::ModesAvailable {
+            current_mode_id: "default".into(),
+            modes: vec![mode("default"), mode("plan")],
+        })
+        .unwrap();
+        assert_eq!(s.available_modes.len(), 2);
+        assert_eq!(s.current_mode_id.as_deref(), Some("default"));
+
+        s.apply_event(Event::CurrentModeChanged {
+            current_mode_id: "plan".into(),
+        })
+        .unwrap();
+        assert_eq!(s.current_mode_id.as_deref(), Some("plan"));
+        assert_eq!(s.available_modes.len(), 2, "list survives a selection");
+
+        // /clear forgets the conversation, not what the adapter advertises:
+        // the agent never re-announces its modes, so dropping them here would
+        // empty the picker for the rest of the session (#1128).
+        s.apply_event(Event::SessionCleared).unwrap();
+        assert_eq!(s.current_mode_id.as_deref(), Some("plan"));
+        assert_eq!(s.available_modes.len(), 2);
+
+        // A backend switch invalidates both: the new adapter advertises its own.
+        s.apply_event(Event::AgentSwitched {
+            from: "claude".into(),
+            to: "codex".into(),
+            reason: "rate_limit".into(),
+        })
+        .unwrap();
+        assert!(s.available_modes.is_empty());
+        assert_eq!(s.current_mode_id, None);
+    }
+
     fn sample_config_options() -> Vec<ConfigOptionDescriptor> {
         vec![
             ConfigOptionDescriptor {
@@ -1966,17 +2305,131 @@ mod tests {
         assert!(s.config_option_switch_failed.is_none());
     }
 
+    /// Three phase clears the web reducer had and this one did not, each from
+    /// a bug the clients hit. They live here now that both clients render this
+    /// state instead of folding their own.
     #[test]
-    fn session_cleared_preserves_config_options() {
+    fn phase_clears_match_the_clients_they_replaced() {
+        let tool_call = |id: &str| ToolCall {
+            id: id.into(),
+            name: "Read".into(),
+            kind: "read".into(),
+            args_preview: "{}".into(),
+            started_at: Utc::now(),
+            parent_tool_call_id: None,
+            memory_recall: None,
+            diffs: Vec::new(),
+        };
+        let elicitation = |nonce: &str, tool_call_id: Option<&str>| Elicitation {
+            nonce: Nonce(nonce.into()),
+            message: "Which one?".into(),
+            title: None,
+            description: None,
+            tool_call_id: tool_call_id.map(str::to_string),
+            questions: Vec::new(),
+            requested_at: Utc::now(),
+            resolved: None,
+        };
+
+        // #1213: adapters skip `ThinkingEnded` when they go straight into a
+        // tool call, which left the spinner stuck on "thinking".
+        let mut s = fresh_state();
+        s.apply_event(Event::ThinkingStarted).unwrap();
+        assert!(s.thinking.is_some());
+        s.apply_event(Event::ToolCallStarted {
+            tool_call: tool_call("t-1"),
+        })
+        .unwrap();
+        assert!(s.thinking.is_none(), "a tool call ends the reasoning block");
+
+        // The AskUserQuestion tool call behind an elicitation is suppressed in
+        // the transcript, so its in-flight pointer must go too.
+        let mut s = fresh_state();
+        s.apply_event(Event::ToolCallStarted {
+            tool_call: tool_call("ask-1"),
+        })
+        .unwrap();
+        assert!(s.in_flight_tool.is_some());
+        s.apply_event(Event::ElicitationRequested {
+            elicitation: elicitation("n-1", Some("ask-1")),
+        })
+        .unwrap();
+        assert!(s.in_flight_tool.is_none());
+        // An elicitation scoped to some other call leaves it alone.
+        s.apply_event(Event::ToolCallStarted {
+            tool_call: tool_call("t-2"),
+        })
+        .unwrap();
+        s.apply_event(Event::ElicitationRequested {
+            elicitation: elicitation("n-2", Some("other")),
+        })
+        .unwrap();
+        assert_eq!(
+            s.in_flight_tool.as_ref().map(|t| t.id.as_str()),
+            Some("t-2")
+        );
+
+        // #3028: a session resumed by a plain prompt kept a stale rate-limit
+        // banner whose RESUME NOW button 409'd against the running worker.
+        let mut s = fresh_state();
+        s.apply_event(Event::RateLimit {
+            info: RateLimitInfo {
+                status: "resets in an hour".into(),
+                resets_at: None,
+                kind: "usage".into(),
+            },
+        })
+        .unwrap();
+        assert!(s.rate_limit.is_some());
+        s.apply_event(prompt("go")).unwrap();
+        assert!(s.rate_limit.is_none(), "a live prompt ends the park");
+    }
+
+    #[test]
+    fn session_cleared_preserves_adapter_capabilities() {
         let mut s = fresh_state();
         s.apply_event(Event::ConfigOptionsUpdated {
             options: sample_config_options(),
         })
         .unwrap();
+        s.apply_event(Event::AvailableCommandsUpdated {
+            commands: vec![AvailableCommand {
+                name: "review".into(),
+                description: "Review".into(),
+                accepts_input: false,
+            }],
+        })
+        .unwrap();
+        s.apply_event(Event::ModesAvailable {
+            current_mode_id: "plan".into(),
+            modes: vec![ModeInfo {
+                id: "plan".into(),
+                name: "Plan".into(),
+                description: None,
+            }],
+        })
+        .unwrap();
+        s.apply_event(Event::UsageUpdated {
+            usage: SessionUsage {
+                used: 5_000,
+                size: 200_000,
+                cost: None,
+            },
+        })
+        .unwrap();
+
         s.apply_event(Event::SessionCleared).unwrap();
-        // Adapter capabilities outlive /clear; the model has forgotten
-        // the conversation but still advertises the same selectors.
+
+        // Adapter capabilities outlive /clear: the model has forgotten the
+        // conversation but the process still advertises the same selectors,
+        // commands and modes, and it never re-announces them. See #1128.
         assert_eq!(s.config_options.len(), 2);
+        assert_eq!(s.available_commands.len(), 1);
+        assert_eq!(s.available_modes.len(), 1);
+        assert_eq!(s.current_mode_id.as_deref(), Some("plan"));
+        // What described the forgotten conversation does not survive.
+        assert!(s.usage.is_none());
+        assert!(s.current_plan.is_none());
     }
 
     #[test]

@@ -49,10 +49,23 @@ mod tests {
     }
 
     #[test]
-    fn test_stop_result_success_for_session_without_tmux_or_sandbox() {
-        let instance = create_test_instance();
+    #[serial_test::serial]
+    fn test_stop_result_success_for_persisted_session_without_tmux_or_sandbox() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let profile = "stop-result-success";
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        let mut instance = create_test_instance();
+        instance.source_profile = profile.to_string();
+        let id = instance.id.clone();
+        storage
+            .update(|instances, _groups| {
+                instances.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
         let request = StopRequest {
-            session_id: instance.id.clone(),
+            session_id: id.clone(),
             instance,
         };
 
@@ -60,7 +73,11 @@ mod tests {
 
         assert!(result.success);
         assert!(result.error.is_none());
-        assert_eq!(result.session_id, request.session_id);
+        assert_eq!(result.session_id, id);
+        assert_eq!(
+            storage.load().unwrap()[0].status,
+            crate::session::Status::Stopped
+        );
     }
 
     #[test]

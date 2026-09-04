@@ -1,6 +1,6 @@
 //! Regression test for the opencode preassign nested-runtime panic.
 //!
-//! `preassign_opencode_session_id_impl` (src/session/capture.rs) builds a
+//! `preassign_opencode_session_id_impl` (src/session/capture/mod.rs) builds a
 //! current-thread Tokio runtime and `block_on`s an HTTP call to reserve the
 //! opencode `ses_` id. The CLI entrypoint is `#[tokio::main]`, so before the
 //! fix, launching an opencode session ran that `block_on` inside a live

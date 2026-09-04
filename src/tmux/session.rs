@@ -4,14 +4,14 @@ use anyhow::{bail, Result};
 use std::io::Write;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::{
     composite::{CapturedPane, PaneGeom, WindowLayout},
     probe_session_existence, refresh_session_cache,
     utils::{
         append_pane_base_index_args, append_remain_on_exit_args, append_tmux_setting_args,
-        append_window_size_args, is_pane_dead, is_pane_running_shell,
+        append_window_size_args, is_pane_dead, is_pane_running_shell, PANE_ENV_FILE_PREFIX,
     },
     SessionExistence, SESSION_PREFIX,
 };
@@ -22,6 +22,28 @@ use crate::util::now_ms;
 
 pub struct Session {
     name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaneEnvMutation {
+    Set { key: String, value: String },
+    Unset { key: String },
+}
+
+impl PaneEnvMutation {
+    pub fn set(key: String, value: String) -> Self {
+        Self::Set { key, value }
+    }
+
+    pub fn unset(key: String) -> Self {
+        Self::Unset { key }
+    }
+
+    fn key(&self) -> &str {
+        match self {
+            Self::Set { key, .. } | Self::Unset { key } => key,
+        }
+    }
 }
 
 /// tmux user options holding the cross-process size-owner lock (see
@@ -40,6 +62,7 @@ const SIZE_OWNER_HB_OPT: &str = "@aoe_size_owner_hb";
 /// consumer already falls back to.
 const VT_OWNER_OPT: &str = "@aoe_vt_owner";
 const VT_OWNER_HB_OPT: &str = "@aoe_vt_owner_hb";
+const VT_PIPE_OWNER_OPT: &str = "@aoe_vt_pipe_owner";
 
 /// How long a VT-pipe owner lock survives without a heartbeat before another
 /// process may arm over it. The holder refreshes from its sample loop (every
@@ -56,6 +79,26 @@ pub const SIZE_OWNER_TTL: Duration = Duration::from_secs(4);
 /// [`SIZE_OWNER_TTL`] so a live-but-idle owner keeps the lock while connected;
 /// the lock only frees on disconnect/crash (TTL expiry) or explicit take-over.
 pub const SIZE_OWNER_HEARTBEAT: Duration = Duration::from_millis(1500);
+
+static OWNER_HEARTBEAT_CLOCK: AtomicU64 = AtomicU64::new(0);
+
+fn next_owner_heartbeat(after: u64) -> u64 {
+    let mut current = OWNER_HEARTBEAT_CLOCK.load(Ordering::Relaxed);
+    loop {
+        let next = now_ms()
+            .max(after.saturating_add(1))
+            .max(current.saturating_add(1));
+        match OWNER_HEARTBEAT_CLOCK.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(observed) => current = observed,
+        }
+    }
+}
 
 /// The active pane's cursor, queried alongside a `capture-pane` so the
 /// live-send preview can paint a real cursor (`capture-pane` returns cell
@@ -111,22 +154,15 @@ pub struct PaneCursor {
     /// works while an agent streams. `parse` sets it `true`; only the
     /// cross-probe check downgrades it.
     pub position_reliable: bool,
-    /// Pane 0's `(width, height)` within a COMPOSITED preview, or `None` when
+    /// Pane 0's rectangle within a composited preview window, or `None` when
     /// the preview shows a single pane.
     ///
-    /// Mouse forwarding maps the hovered cell into the previewed app's
-    /// coordinate space by treating the preview rect as the pane, which holds
-    /// while the two describe the same rectangle. A composite makes the rect the
-    /// whole window, so a pointer over a neighbouring pane maps to a column past
-    /// pane 0's right edge and is reported to the agent as though its own pane
-    /// were that wide. Pane 0 is the only pane that receives input (#435, #488),
-    /// so this carries its extent and the forward clamps to it, dropping events
-    /// that land outside.
-    ///
-    /// Only the extent is needed, never the origin: tmux keeps pane 0 at the
-    /// window origin, because pane indices follow layout order and closing pane
-    /// 0 renumbers whichever pane takes that corner.
-    pub composite_pane0: Option<(u16, u16)>,
+    /// Composite content uses the window grid while the cursor and input stay
+    /// pane relative. Window chrome can give pane 0 a non-zero origin (#3515),
+    /// so full-window consumers add it to cursor coordinates and subtract it
+    /// from pointer coordinates. A cropped preview must also account for rows
+    /// removed before mapping. Input remains pinned to pane 0 (#435, #488).
+    pub composite_pane0: Option<PaneGeom>,
 }
 
 /// tmux format line every cursor probe requests, parsed by
@@ -242,15 +278,9 @@ fn parse_pane_segments(raw: &str, sentinel: &str) -> Vec<CapturedPane> {
     panes
 }
 
-/// Flag a cursor's POSITION as untrustworthy while keeping its always-valid
-/// mode flags, for the composite paths that fall through to a scrollback-bearing
-/// pane-0 capture.
-///
-/// [`Session::capture_pane_with_cursor`] earns the right to trust a position by
-/// probing twice around its capture and comparing; a single probe against
-/// content that includes scrollback has no such evidence, so the render skips
-/// painting rather than risk the row-drift bug while the wheel forward (which
-/// reads only the mode flags) keeps working.
+/// Keep mode flags from a lone cursor probe while preventing the renderer from
+/// trusting its row. This is the degraded path when tmux omits the post-capture
+/// sentinel but still returns the pane capture successfully.
 fn unreliable_position(cursor: Option<PaneCursor>) -> Option<PaneCursor> {
     cursor.map(|c| PaneCursor {
         position_reliable: false,
@@ -308,6 +338,14 @@ impl Session {
         crate::tmux::live_agent_session_name(id, &Self::generate_name(id, title))
     }
 
+    /// [`Self::resolve_name`] for **render paths**: answered from the shared
+    /// snapshot only, never refreshing. A stale snapshot yields the derived
+    /// name until the background snapshot poller refreshes it; paint must
+    /// never wait on tmux.
+    pub(crate) fn resolve_name_for_display(id: &str, title: &str) -> String {
+        crate::tmux::agent_session_name_for_display(id, &Self::generate_name(id, title))
+    }
+
     /// Purely derive the tmux session name from a session id and title, with no
     /// reference to what is live. Callers that want the session's CURRENT name
     /// want [`Self::resolve_name`].
@@ -322,6 +360,14 @@ impl Session {
 
     pub fn exists(&self) -> bool {
         crate::tmux::session_exists(&self.name)
+    }
+    pub(crate) fn exists_with_deadline(&self, deadline: &crate::tmux::TmuxCommandDeadline) -> bool {
+        let mut command = crate::tmux::tmux_command();
+        command.args(["has-session", "-t", &self.name]);
+        deadline
+            .run(&mut command)
+            .map(|output| output.status.success())
+            .unwrap_or(false)
     }
 
     /// Tri-state existence probe that distinguishes "the tmux server
@@ -350,26 +396,98 @@ impl Session {
         self.create_with_size_env(working_dir, command, size, profile, &[])
     }
 
-    /// Like [`Self::create_with_size`], but also sets `extra_env` on the new
-    /// session via `new-session -e KEY=VALUE`.
+    /// Like [`Self::create_with_size`], but also applies `extra_env` mutations
+    /// in the pane process through a protected, one-shot file.
     ///
-    /// This is the channel for values that must not appear in the pane
-    /// command's argv: `host_hooks.before_session` mints secrets, and the
-    /// shell-assignment prefix used for the static `environment` list would
-    /// publish them to `ps` for the pane's whole lifetime. The `-e` flags ride
-    /// the short-lived `tmux` client invocation instead, and the tmux server
-    /// hands the value to the pane's process environment.
+    /// Environment values and the launch command never enter tmux client argv,
+    /// pane start-command metadata, or tmux's persistent session environment.
+    /// The short pane command runs the file as a POSIX script; that script
+    /// applies shell-escaped exports and explicit unsets, then unlinks itself
+    /// before executing the requested command.
+    /// The non-secret OMP launch ID remains a tmux `-e` value so capture can
+    /// query it. Desktop/session values retain the existing tmux environment
+    /// behavior used by later panes.
     pub fn create_with_size_env(
         &self,
         working_dir: &str,
         command: Option<&str>,
         size: Option<(u16, u16)>,
         profile: &str,
-        extra_env: &[(String, String)],
+        extra_env: &[PaneEnvMutation],
+    ) -> Result<()> {
+        self.create_with_size_env_inner(working_dir, command, size, profile, extra_env, &[])
+    }
+
+    /// Create a pane whose container runtime reads target environment values
+    /// from an inherited env-file descriptor. The target keys never enter the
+    /// host pane environment.
+    pub(crate) fn create_with_size_env_and_container_env(
+        &self,
+        working_dir: &str,
+        command: Option<&str>,
+        size: Option<(u16, u16)>,
+        profile: &str,
+        extra_env: &[PaneEnvMutation],
+        container_env: &[(String, String)],
+    ) -> Result<()> {
+        self.create_with_size_env_inner(
+            working_dir,
+            command,
+            size,
+            profile,
+            extra_env,
+            container_env,
+        )
+    }
+
+    fn create_with_size_env_inner(
+        &self,
+        working_dir: &str,
+        command: Option<&str>,
+        size: Option<(u16, u16)>,
+        profile: &str,
+        extra_env: &[PaneEnvMutation],
+        container_env: &[(String, String)],
     ) -> Result<()> {
         if self.exists() {
             return Ok(());
         }
+
+        // tmux does not error when `-c <dir>` points at a missing directory;
+        // it silently falls back to the server's own `$HOME`, which for a
+        // long-running daemon/TUI process is wherever *it* was launched from,
+        // not this session's `project_path`. Callers (`Instance::start_with_size_opts`)
+        // already reload `project_path` from disk immediately before this call,
+        // so a missing directory here means the worktree/project itself is
+        // gone or not yet materialized, not a stale in-memory value. Fail
+        // loudly instead of silently spawning in the wrong place. See #3265.
+        let working_dir_path = std::path::Path::new(working_dir);
+        if !working_dir_path.is_dir() {
+            bail!(
+                "Cannot create tmux session '{}': working directory '{}' does not exist \
+                 or is not a directory (tmux would otherwise silently fall back to $HOME)",
+                self.name,
+                working_dir
+            );
+        }
+
+        // Diagnostic for #3265 ("fresh/restarted panes spawn with the wrong
+        // cwd"): log the exact `-c` value this spawn resolved to, plus its
+        // canonicalized form, so a future recurrence (if the guard above
+        // doesn't catch it, e.g. a permissions issue rather than a missing
+        // path) leaves direct evidence of what `working_dir` actually was at
+        // the moment of the `tmux new-session` call, instead of requiring a
+        // fresh repro under instrumentation.
+        tracing::debug!(target: "tmux.command",
+            session = %self.name,
+            working_dir,
+            working_dir_canonical = %working_dir_path
+                .canonicalize()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|e| format!("<canonicalize failed: {e}>")),
+            "resolved working directory for tmux new-session"
+        );
+
         let config = super::tmux_option_config(profile);
 
         // Forward the inherited host env (DISPLAY, XDG_*, DBUS, ... plus every
@@ -378,14 +496,36 @@ impl Session {
         // desktop. tmux otherwise carries only its narrow `update-environment`
         // set plus the server's frozen base env (#3075, #3262).
         let inherited_env = crate::session::environment::inherited_host_env(profile);
-        let mut env_refs: Vec<(&str, &str)> = inherited_env
+        let mut protected_env = Vec::new();
+        let mut tmux_env: Vec<(&str, &str)> = inherited_env
             .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .map(|(key, value)| (key.as_str(), value.as_str()))
             .collect();
-        // Appended last so a minted value overrides a same-keyed desktop entry.
-        env_refs.extend(extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        for mutation in extra_env {
+            let key = mutation.key();
+            if !crate::session::environment::is_valid_env_key(key) {
+                tracing::warn!(target: "session.create", "invalid pane environment key '{}'; skipping", key);
+                continue;
+            }
+            match mutation {
+                PaneEnvMutation::Set { key, value }
+                    if key == crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY =>
+                {
+                    tmux_env.push((key.as_str(), value.as_str()));
+                }
+                _ => protected_env.push(mutation.clone()),
+            }
+        }
 
-        let mut args = build_create_args(&self.name, working_dir, &env_refs, command, size);
+        let mut env_file = EphemeralEnvFile::create(&protected_env, container_env)?;
+        let wrapped_command = env_file.wrap_command(command)?;
+        let mut args = build_create_args(
+            &self.name,
+            working_dir,
+            &tmux_env,
+            Some(&wrapped_command),
+            size,
+        );
         append_remain_on_exit_args(&mut args, &self.name);
         append_pane_base_index_args(&mut args, &self.name);
         append_window_size_args(&mut args, &self.name);
@@ -393,13 +533,15 @@ impl Session {
 
         let output = crate::tmux::tmux_command().args(&args).output()?;
 
-        // Note: With -d flag, tmux new-session returns 0 even if the shell command fails.
-        // Log args at debug level for troubleshooting.
-        tracing::debug!(target: "tmux.command",
-            "tmux new-session args: {:?}",
-            args.iter()
-                .map(|a| crate::session::environment::redact_env_values(a))
-                .collect::<Vec<_>>()
+        // With -d, tmux can accept a session even when the pane command will
+        // fail. Never log the full argv: the pane command can contain legacy
+        // user-configured credentials even though current launches reject or
+        // transport them out of band.
+        tracing::debug!(
+            target: "tmux.command",
+            session = %self.name,
+            arg_count = args.len(),
+            "tmux new-session completed"
         );
 
         if !output.status.success() {
@@ -407,6 +549,16 @@ impl Session {
             bail!("Failed to create tmux session: {}", stderr);
         }
 
+        // Unlinking the channel is the pane's acknowledgement that it sourced
+        // the protected values and command. Keep parent cleanup ownership until
+        // then: tmux's detached create can return success before the wrapper
+        // runs.
+        if !env_file.wait_until_consumed(Duration::from_secs(5)) {
+            super::refresh_session_cache();
+            let _ = self.kill();
+            bail!("Pane did not consume its protected launch script");
+        }
+        env_file.disarm();
         super::refresh_session_cache();
 
         Ok(())
@@ -498,9 +650,9 @@ impl Session {
             return Ok(());
         }
 
-        let output = crate::tmux::tmux_command()
-            .args(["rename-session", "-t", &self.name, new_name])
-            .output()?;
+        let mut command = crate::tmux::tmux_command();
+        command.args(["rename-session", "-t", &self.name, new_name]);
+        let output = crate::tmux::run_tmux_command_with_timeout(&mut command)?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -588,6 +740,60 @@ impl Session {
         info.join(", ")
     }
 
+    /// Return a conservative Unix epoch millisecond watermark for the tmux
+    /// session creation time.
+    ///
+    /// `#{session_created}` has one-second precision, so migration rounds it
+    /// to the end of that second. A legacy breadcrumb from the same second is
+    /// deliberately not proof that OMP rewrote it after launch.
+    pub fn created_at_ms(&self) -> Result<u64> {
+        let output = crate::tmux::tmux_command()
+            .args([
+                "display-message",
+                "-t",
+                &self.name,
+                "-p",
+                "#{session_created}",
+            ])
+            .output()?;
+        if !output.status.success() {
+            bail!(
+                "Failed to read creation time for tmux session '{}'",
+                self.name
+            );
+        }
+        let raw = String::from_utf8_lossy(&output.stdout);
+        let seconds = raw.trim().parse::<u64>().map_err(|_| {
+            anyhow::anyhow!(
+                "tmux session '{}' reported an invalid creation time",
+                self.name
+            )
+        })?;
+        seconds
+            .checked_mul(1000)
+            .and_then(|millis| millis.checked_add(999))
+            .ok_or_else(|| anyhow::anyhow!("tmux session '{}' creation time overflowed", self.name))
+    }
+
+    /// Return the TTY device for the agent pane.
+    ///
+    /// OMP uses this device to key its terminal-session breadcrumb. Target the
+    /// first window's first pane for the same reason as [`Self::capture_pane`].
+    pub fn pane_tty(&self) -> Result<String> {
+        let target = format!("{}:^.0", self.name);
+        let output = crate::tmux::tmux_command()
+            .args(["display-message", "-t", &target, "-p", "#{pane_tty}"])
+            .output()?;
+        if !output.status.success() {
+            bail!("Failed to read pane TTY for tmux session '{}'", self.name);
+        }
+        let tty = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if tty.is_empty() {
+            bail!("tmux session '{}' reported an empty pane TTY", self.name);
+        }
+        Ok(tty)
+    }
+
     pub fn capture_pane(&self, lines: usize) -> Result<String> {
         if !self.exists() {
             return Ok(String::new());
@@ -612,6 +818,53 @@ impl Session {
             Ok(String::from_utf8_lossy(&output.stdout).to_string())
         } else {
             Ok(String::new())
+        }
+    }
+
+    /// Wait for the pane to become ready for input, or `max_wait` to elapse.
+    /// Failsafe: always returns by `max_wait`, so a caller's next action
+    /// (e.g. `send-keys`) still runs even if the pane never becomes ready,
+    /// such as an agent that is genuinely still streaming output.
+    ///
+    /// When `ready_marker` is `Some` (see `AgentDef::ready_marker`), polls
+    /// for that substring actually appearing in the captured pane content
+    /// (matched case-insensitively) -- a real, agent-specific readiness
+    /// signal.
+    ///
+    /// When `ready_marker` is `None` (no such signal is known for this
+    /// agent yet), falls back to a generic heuristic: content stops
+    /// changing across two consecutive samples. This is weaker -- a short,
+    /// static "still loading" screen can satisfy it before the agent is
+    /// actually listening -- but it is strictly better than sending
+    /// immediately, and is the same heuristic `aoe session restart`'s
+    /// wake-message send already relied on before per-agent markers
+    /// existed.
+    ///
+    /// Shared by `aoe session restart`'s post-restart wake message and `aoe
+    /// send`'s pre-send wait: both need to avoid typing into a pane whose
+    /// agent has not finished rendering yet.
+    pub fn wait_until_ready(&self, max_wait: std::time::Duration, ready_marker: Option<&str>) {
+        let poll_interval = std::time::Duration::from_millis(200);
+        let deadline = std::time::Instant::now() + max_wait;
+        let ready_marker = ready_marker.map(str::to_lowercase);
+        let mut last: Option<String> = None;
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(poll_interval);
+            let Ok(now) = self.capture_pane(5) else {
+                continue;
+            };
+            if let Some(marker) = ready_marker.as_deref() {
+                if now.to_lowercase().contains(marker) {
+                    return;
+                }
+                continue;
+            }
+            if now.trim().len() > 20 {
+                if last.as_deref() == Some(now.as_str()) {
+                    return;
+                }
+                last = Some(now);
+            }
         }
     }
 
@@ -641,25 +894,24 @@ impl Session {
     /// only. The preview's scroll offset clamps itself to the shorter capture,
     /// so this reads as "a split window doesn't scroll back" rather than
     /// misbehaving.
-    pub fn capture_window_composited(&self, lines: usize) -> Result<String> {
-        Ok(self.capture_window_composited_with_cursor(lines)?.0)
-    }
-
-    /// [`capture_window_composited`](Self::capture_window_composited) plus pane
-    /// 0's cursor, for the live preview.
+    /// Composite window capture plus pane 0's cursor, for the live preview.
     ///
-    /// Pane 0 owns the cursor because it is the pane that receives input, and
-    /// tmux puts it at the window origin, so its coordinates index the
-    /// composite untranslated. The probe targets `^.0` explicitly rather than
-    /// the window, whose format fields would resolve against whichever pane the
-    /// user happens to have selected.
-    ///
-    /// On a composite the cursor is rebased onto the window's dimensions: the
-    /// renderer anchors it by `pane_height` against the painted line count,
-    /// which is now the whole window rather than one pane.
+    /// The probe targets `^.0`, the pane that receives input, rather than the
+    /// window whose format fields resolve against whichever pane is selected.
+    /// On a composite, `pane_height`/`pane_width` are rebased to the window and
+    /// [`PaneCursor::composite_pane0`] retains pane 0's coordinate frame.
     pub fn capture_window_composited_with_cursor(
         &self,
         lines: usize,
+    ) -> Result<(String, Option<PaneCursor>)> {
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        self.capture_window_composited_with_cursor_with_deadline(lines, &deadline)
+    }
+
+    pub(crate) fn capture_window_composited_with_cursor_with_deadline(
+        &self,
+        lines: usize,
+        deadline: &crate::tmux::TmuxCommandDeadline,
     ) -> Result<(String, Option<PaneCursor>)> {
         /// Gates the window-dimensions line. A chained `display-message` can
         /// silently produce nothing while the invocation still exits 0 (the
@@ -669,40 +921,49 @@ impl Session {
         const WINDOW_SENTINEL: &str = "@@aoe-win@@";
         /// Gates the cursor line, for the same reason.
         const CURSOR_SENTINEL: &str = "@@aoe-cur@@";
-
-        if !self.exists() {
-            return Ok((String::new(), None));
-        }
+        /// Gates the post-capture cursor probe. Comparing it with the first
+        /// probe proves that the pane row still indexes the captured bytes.
+        const AFTER_CURSOR_SENTINEL: &str = "@@aoe-after-cur@@";
 
         let window = format!("{}:^", self.name);
         let pane0 = format!("{}:^.0", self.name);
-        let output = crate::tmux::tmux_command()
-            .args([
-                "display-message",
-                "-p",
-                "-t",
-                &window,
-                "-F",
-                &format!(
-                    "{WINDOW_SENTINEL} #{{window_panes}} #{{window_width}} #{{window_height}} #{{window_zoomed_flag}}"
-                ),
-                ";",
-                "display-message",
-                "-p",
-                "-t",
-                &pane0,
-                "-F",
-                &format!("{CURSOR_SENTINEL} {CURSOR_FMT}"),
-                ";",
-                "capture-pane",
-                "-t",
-                &pane0,
-                "-p",
-                "-e",
-                "-S",
-                &format!("-{}", lines),
-            ])
-            .output()?;
+        let mut command = crate::tmux::tmux_command();
+        command.args([
+            "display-message",
+            "-p",
+            "-t",
+            &window,
+            "-F",
+            &format!(
+                "{WINDOW_SENTINEL} #{{window_panes}} #{{window_width}} #{{window_height}} #{{window_zoomed_flag}}"
+            ),
+            ";",
+            "display-message",
+            "-p",
+            "-t",
+            &pane0,
+            "-F",
+            &format!("{CURSOR_SENTINEL} {CURSOR_FMT}"),
+            ";",
+            "capture-pane",
+            "-t",
+            &pane0,
+            "-p",
+            "-e",
+            // Trailing bg fills stay, matching the VT path (#3336); see
+            // capture_pane_with_cursor.
+            "-N",
+            "-S",
+            &format!("-{}", lines),
+            ";",
+            "display-message",
+            "-p",
+            "-t",
+            &pane0,
+            "-F",
+            &format!("{AFTER_CURSOR_SENTINEL} {CURSOR_FMT}"),
+        ]);
+        let output = deadline.run(&mut command)?;
 
         if !output.status.success() {
             return Ok((String::new(), None));
@@ -716,7 +977,7 @@ impl Session {
         let mut rest: &str = &raw;
         let mut dims: Option<(u16, u16, u16)> = None;
         let mut zoomed = false;
-        let mut cursor: Option<PaneCursor> = None;
+        let mut cursor_before: Option<PaneCursor> = None;
         while let Some((line, tail)) = rest.split_once('\n') {
             if let Some(fields) = line.strip_prefix(WINDOW_SENTINEL) {
                 let mut f = fields.split_whitespace();
@@ -733,19 +994,37 @@ impl Session {
                 // which keeps the composite path rather than disabling it.
                 zoomed = f.next().is_some_and(|z| z != "0");
             } else if let Some(fields) = line.strip_prefix(CURSOR_SENTINEL) {
-                cursor = PaneCursor::parse(fields.trim());
+                cursor_before = PaneCursor::parse(fields.trim());
             } else {
                 break;
             }
             rest = tail;
         }
-        let pane0_content = rest.to_string();
+        // The final sentinel follows the capture bytes. Keep the newline that
+        // terminated the pane capture, matching `capture_pane_with_cursor`,
+        // while removing only the post-capture probe.
+        let trimmed = rest.strip_suffix('\n').unwrap_or(rest);
+        let (pane0_content, cursor_after) = match trimmed.rsplit_once('\n') {
+            Some((content, line)) => match line.strip_prefix(AFTER_CURSOR_SENTINEL) {
+                Some(fields) => (format!("{content}\n"), PaneCursor::parse(fields.trim())),
+                None => (rest.to_string(), None),
+            },
+            None => match trimmed.strip_prefix(AFTER_CURSOR_SENTINEL) {
+                Some(fields) => (String::new(), PaneCursor::parse(fields.trim())),
+                None => (rest.to_string(), None),
+            },
+        };
+        let cursor = if cursor_after.is_some() {
+            merge_cursor_probes(cursor_before, cursor_after)
+        } else {
+            unreliable_position(cursor_before)
+        };
 
         let Some((count, window_width, window_height)) = dims else {
-            return Ok((pane0_content, unreliable_position(cursor)));
+            return Ok((pane0_content, cursor));
         };
         if count <= 1 || window_width == 0 || window_height == 0 {
-            return Ok((pane0_content, unreliable_position(cursor)));
+            return Ok((pane0_content, cursor));
         }
         // A zoomed pane (`C-b z`) keeps `window_panes` at its real count but
         // reports every pane at the window's full rectangle, so the panes
@@ -756,34 +1035,46 @@ impl Session {
         // in hand, scrollback included, which is what the preview showed before
         // compositing existed.
         if zoomed {
-            return Ok((pane0_content, unreliable_position(cursor)));
+            return Ok((pane0_content, cursor));
         }
 
         // Any failure in the split path (fork error, unparseable layout) falls
         // back to the pane-0 bytes already in hand, so a composite that cannot
         // be built is never worse than the old single-pane preview.
-        let Some(layout) = self.capture_window_layout(count) else {
-            return Ok((pane0_content, unreliable_position(cursor)));
+        let Some(layout) = self.capture_window_layout_with_deadline(count, deadline) else {
+            return Ok((pane0_content, cursor));
         };
-        // The composite is the visible window with no scrollback, so the row a
-        // single probe reported cannot have drifted underneath it, and the
-        // position stands.
+        // Reuse the pane-0 bytes bracketed by the cursor probes above. The
+        // layout capture happens in a second tmux invocation, so using its
+        // pane-0 copy could otherwise pair the cursor with a later screen and
+        // paint it one row high or low while the agent scrolls.
+        let pane0_rows = layout.first_pane().map(|first| {
+            crate::tmux::vt::capture_rows_padded(
+                pane0_content.as_bytes(),
+                first.width,
+                first.height,
+            )
+        });
         let cursor = cursor.map(|mut c| {
             c.pane_height = layout.window_height;
             c.pane_width = layout.window_width;
             c.history_size = 0;
             // Rebasing the frame onto the window is what the renderer needs, but
-            // it also erases the only record of how wide the input pane is, which
-            // mouse forwarding maps into. Carry pane 0's extent alongside.
-            c.composite_pane0 = layout.first_pane().map(|p| (p.width, p.height));
+            // it also erases where pane 0 sits in it, which cursor painting and
+            // mouse forwarding both need. Carry pane 0's rectangle alongside.
+            c.composite_pane0 = layout.first_pane();
             c
         });
-        Ok((layout.composite(), cursor))
+        let content = pane0_rows.as_deref().map_or_else(
+            || layout.composite(),
+            |rows| layout.composite_with_first_pane_rows(rows),
+        );
+        Ok((content, cursor))
     }
 
-    /// Second fork of [`capture_window_composited`](Self::capture_window_composited):
-    /// window dimensions plus geometry and visible capture for each of `count`
-    /// panes, chained into one `tmux` invocation.
+    /// Second fork of capture_window_composited_with_cursor: window dimensions
+    /// plus geometry and visible capture for each of count panes, chained into
+    /// one tmux invocation.
     ///
     /// Pane indices are contiguous from 0 within a window (tmux renumbers them
     /// as the layout changes, unlike window indices) and `pane-base-index` is
@@ -793,7 +1084,17 @@ impl Session {
     /// Returned rather than composited on the spot so the live preview can
     /// cache a layout across frames and re-render only pane 0 from its VT grid
     /// (see [`WindowLayout::composite_with_first_pane_rows`]).
+    #[cfg(test)]
     pub(crate) fn capture_window_layout(&self, count: u16) -> Option<WindowLayout> {
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        self.capture_window_layout_with_deadline(count, &deadline)
+    }
+
+    pub(crate) fn capture_window_layout_with_deadline(
+        &self,
+        count: u16,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> Option<WindowLayout> {
         /// Marks the start of each pane's segment in the chained output. Pane
         /// content could in principle contain this line, which would split one
         /// pane's rows in two; the cost is a single garbled preview frame, and
@@ -827,10 +1128,15 @@ impl Session {
                 target,
                 "-p".to_string(),
                 "-e".to_string(),
+                // Trailing bg fills stay, matching the VT path (#3336); see
+                // `capture_pane_with_cursor`.
+                "-N".to_string(),
             ]);
         }
 
-        let output = crate::tmux::tmux_command().args(&args).output().ok()?;
+        let mut command = crate::tmux::tmux_command();
+        command.args(&args);
+        let output = deadline.run(&mut command).ok()?;
         if !output.status.success() {
             return None;
         }
@@ -867,6 +1173,13 @@ impl Session {
             window_height,
             panes,
         })
+    }
+
+    /// Test-only convenience wrapper: production callers consume the cursor
+    /// from capture_window_composited_with_cursor directly.
+    #[cfg(test)]
+    fn capture_window_composited(&self, lines: usize) -> Result<String> {
+        Ok(self.capture_window_composited_with_cursor(lines)?.0)
     }
 
     /// Capture the pane's full scrollback (from session start) with wrapped
@@ -909,38 +1222,48 @@ impl Session {
     /// which beats painting it on the wrong row. At rest the first try
     /// agrees and the cursor never blinks.
     pub fn capture_pane_with_cursor(&self, lines: usize) -> Result<(String, Option<PaneCursor>)> {
-        if !self.exists() {
-            return Ok((String::new(), None));
-        }
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        self.capture_pane_with_cursor_with_deadline(lines, &deadline)
+    }
 
+    pub(crate) fn capture_pane_with_cursor_with_deadline(
+        &self,
+        lines: usize,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> Result<(String, Option<PaneCursor>)> {
         let target = format!("{}:^.0", self.name);
         let start = format!("-{}", lines);
         const HEADER_FMT: &str = CURSOR_FMT;
-        let output = crate::tmux::tmux_command()
-            .args([
-                "display-message",
-                "-p",
-                "-t",
-                &target,
-                "-F",
-                HEADER_FMT,
-                ";",
-                "capture-pane",
-                "-t",
-                &target,
-                "-p",
-                "-e",
-                "-S",
-                &start,
-                ";",
-                "display-message",
-                "-p",
-                "-t",
-                &target,
-                "-F",
-                HEADER_FMT,
-            ])
-            .output()?;
+        let mut command = crate::tmux::tmux_command();
+        command.args([
+            "display-message",
+            "-p",
+            "-t",
+            &target,
+            "-F",
+            HEADER_FMT,
+            ";",
+            "capture-pane",
+            "-t",
+            &target,
+            "-p",
+            "-e",
+            // Preserve trailing spaces: a bg-styled fill running to the
+            // right edge is content the VT path keeps (row_last_col),
+            // and dropping it here makes the preview flicker whenever the
+            // two capture sources alternate (#3336).
+            "-N",
+            "-S",
+            &start,
+            ";",
+            "display-message",
+            "-p",
+            "-t",
+            &target,
+            "-F",
+            HEADER_FMT,
+        ]);
+        let output = deadline.run(&mut command)?;
 
         if !output.status.success() {
             return Ok((String::new(), None));
@@ -948,8 +1271,8 @@ impl Session {
 
         let raw = String::from_utf8_lossy(&output.stdout);
         // First line: pre-capture cursor header. Last line: post-capture
-        // header. Everything between is the verbatim `capture-pane` output
-        // (same bytes the plain `capture_pane` path returns).
+        // header. Everything between is the verbatim cursor-aware preview
+        // capture output.
         let mut parts = raw.splitn(2, '\n');
         let cursor_line = parts.next().unwrap_or("");
         let rest = parts.next().unwrap_or("");
@@ -1001,6 +1324,21 @@ impl Session {
         Ok(())
     }
 
+    /// Paste `text` into the session's first pane through tmux's own paste
+    /// path, so the bracketed-paste markers are emitted only when the
+    /// receiving program actually set DECSET 2004. Hand-rolling the markers
+    /// instead (as a raw `send-keys -H` payload) delivers them to raw shells
+    /// and simple REPLs that never asked for them, which render the leftovers
+    /// as literal `00~` / `01~` text on the live-send paste path.
+    ///
+    /// See `send_via_paste_buffer` for the buffer-naming and cleanup
+    /// contract. tmux translates LF to CR in the buffer by default, matching
+    /// the raw-byte encoding this replaces.
+    pub fn paste_text(&self, text: &str) -> Result<()> {
+        let target = format!("{}:^.0", self.name);
+        Self::send_via_paste_buffer(&target, text)
+    }
+
     pub fn get_pane_pid(&self) -> Option<u32> {
         process::get_pane_pid(&self.name)
     }
@@ -1010,10 +1348,10 @@ impl Session {
         process::get_foreground_pid(pane_pid).or(Some(pane_pid))
     }
 
-    pub fn detect_status(&self, tool: &str) -> Result<Status> {
+    pub fn detect_status(&self, profile: &str, tool: &str) -> Result<Status> {
         let content = self.capture_pane(50)?;
-        Ok(super::status_detection::detect_status_from_content(
-            &content, tool,
+        Ok(super::status_detection::detect_status_from_content_in(
+            profile, &content, tool,
         ))
     }
 
@@ -1077,9 +1415,10 @@ impl Session {
         if use_paste_buffer {
             Self::send_via_paste_buffer(&target, text)?;
         } else {
+            let payload = pad_slash_command_for_autocomplete(text);
             // `--` ends option parsing so lines beginning with `-` (markdown
             // bullets, CLI flags in prompts) are not misread as tmux flags.
-            Self::tmux_send(&target, &["-l", "--", text])?;
+            Self::tmux_send(&target, &["-l", "--", &payload])?;
         }
 
         if enter_delay_ms > 0 {
@@ -1133,75 +1472,29 @@ impl Session {
         if !self.exists() {
             return;
         }
-        let _ = crate::tmux::tmux_command()
-            .args(["set-option", "-t", &self.name, "window-size", "latest"])
-            .output();
+        let mut command = crate::tmux::tmux_command();
+        command.args(["set-option", "-t", &self.name, "window-size", "latest"]);
+        let _ = crate::tmux::run_tmux_command_with_timeout(&mut command);
     }
 
-    /// Resize the session's first window so its pane's visible content area
-    /// becomes `cols` x `rows`. Best-effort: a missing session or a tmux ENOENT
-    /// is swallowed so a transient failure never blocks a render.
-    ///
-    /// Every caller (the web live view, the mobile live view, the TUI's passive
-    /// preview sync) works in pane/content geometry, not tmux window geometry:
-    /// they render the pane, not the tmux status bar. tmux `resize-window` sizes
-    /// the *window*, and vertical chrome (the status bar) shrinks the pane below
-    /// it, so a naive `resize-window -y rows` yields a `rows - chrome` pane and
-    /// the live owner loop then re-asserts forever against a target it can never
-    /// reach (#2766). We measure the chrome live and add it back, so the pane
-    /// lands at exactly `rows`. Cols need no adjustment: a single pane spans the
-    /// full window width, and the status bar is horizontal.
-    ///
-    /// Also used to keep a detached agent's pane sized to the visible preview
-    /// area: a full-screen agent is sized to whatever terminal it was last
-    /// attached from, so without this it renders taller than the preview window
-    /// and the bottom-anchored capture clips the top rows (worse when the info
-    /// header steals rows). Mirrors what live-send does through its worker.
-    ///
-    /// NOTE: tmux's `resize-window -x -y` silently flips the window-size option
-    /// to `manual`, so any later `attach-session` must call
-    /// [`reset_size_to_latest_client`](Self::reset_size_to_latest_client) first
-    /// or the window stays pinned at these preview dimensions.
-    pub fn resize_window(&self, cols: u16, rows: u16) {
-        if cols == 0 || rows == 0 || !self.exists() {
-            return;
-        }
-        // Query the same window/pane the capture streams (`:^.0`), so the
-        // measured chrome matches the pane whose height the owner loop checks.
-        let pane_target = format!("{}:^.0", self.name);
-        let window_rows = self
-            .pane_chrome_rows(&pane_target)
-            .map(|chrome| rows.saturating_add(chrome))
-            .unwrap_or(rows);
-        let window_target = format!("{}:^", self.name);
-        let _ = crate::tmux::tmux_command()
-            .args([
-                "resize-window",
-                "-t",
-                &window_target,
-                "-x",
-                &cols.to_string(),
-                "-y",
-                &window_rows.to_string(),
-            ])
-            .output();
-    }
-
-    /// Read the live vertical chrome (status-bar rows) for `pane_target` from
-    /// tmux. `None` when the geometry can't be read; callers then size the
+    /// Read the live vertical chrome (status-bar rows) for pane_target from
+    /// tmux. None when the geometry cannot be read; callers then size the
     /// window with no chrome adjustment (the pre-#2766 behavior).
-    fn pane_chrome_rows(&self, pane_target: &str) -> Option<u16> {
-        let output = crate::tmux::tmux_command()
-            .args([
-                "display-message",
-                "-p",
-                "-t",
-                pane_target,
-                "-F",
-                "#{window_height} #{pane_height}",
-            ])
-            .output()
-            .ok()?;
+    fn pane_chrome_rows_with_deadline(
+        &self,
+        pane_target: &str,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> Option<u16> {
+        let mut command = crate::tmux::tmux_command();
+        command.args([
+            "display-message",
+            "-p",
+            "-t",
+            pane_target,
+            "-F",
+            "#{window_height} #{pane_height}",
+        ]);
+        let output = deadline.run(&mut command).ok()?;
         if !output.status.success() {
             return None;
         }
@@ -1211,7 +1504,6 @@ impl Session {
         let pane_height: u16 = fields.next()?.parse().ok()?;
         Some(chrome_rows(window_height, pane_height))
     }
-
     /// Try to become the sole size owner of this session. Returns true if we
     /// hold the lock afterward.
     ///
@@ -1219,13 +1511,13 @@ impl Session {
     /// attach, the mobile capture viewer, and the TUI's preview sync), each
     /// living in a different process. The lock lives in tmux user options so
     /// every process sees the same owner and only the owner calls
-    /// [`resize_window`](Self::resize_window); non-owners render best-effort.
+    /// [`resize_window_if_owner`](Self::resize_window_if_owner); non-owners
+    /// render best-effort.
     ///
     /// Steals the lock when the current holder's heartbeat is older than
-    /// `ttl`, so a crashed or disconnected owner self-heals. The confirm-read
-    /// after the write resolves the race where two processes both observe a
-    /// vacant lock and both write: the last write wins and only its author
-    /// reads its own id back.
+    /// `ttl`, so a crashed or disconnected owner self-heals. A queue-local
+    /// compare-and-set against the observed owner pair resolves concurrent
+    /// vacant claims and refuses to overwrite a heartbeat refreshed later.
     pub fn claim_size_owner(&self, owner_id: &str, ttl: Duration) -> bool {
         self.claim_owner_at(SIZE_OWNER_OPT, SIZE_OWNER_HB_OPT, owner_id, ttl)
     }
@@ -1237,100 +1529,563 @@ impl Session {
         self.refresh_owner_at(SIZE_OWNER_OPT, SIZE_OWNER_HB_OPT, owner_id)
     }
 
-    /// The shared claim protocol behind the size- and VT-owner locks:
-    /// claimable when vacant, already ours, or stale past `ttl`; the
-    /// confirm-read after the write resolves the race where two processes
-    /// both observe a vacant lock and both write (last write wins and only
-    /// its author reads its own id back).
+    /// The shared claim protocol behind the size- and VT-owner locks. A claim
+    /// compares the exact owner pair it observed and publishes its replacement
+    /// in one tmux queue, so a stale claimant cannot overwrite a renewal or a
+    /// winner that already claimed a vacant lock.
     fn claim_owner_at(&self, opt: &str, hb_opt: &str, owner_id: &str, ttl: Duration) -> bool {
-        if !self.exists() {
-            return false;
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        self.claim_owner_at_with_deadline(opt, hb_opt, owner_id, ttl, &deadline)
+    }
+
+    fn set_owner_pair_with_deadline(
+        &self,
+        opt: &str,
+        hb_opt: &str,
+        owner_id: &str,
+        heartbeat: u64,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> bool {
+        let heartbeat = heartbeat.to_string();
+        let mut command = crate::tmux::tmux_command();
+        command.args([
+            "set-option",
+            "-t",
+            &self.name,
+            opt,
+            owner_id,
+            ";",
+            "set-option",
+            "-t",
+            &self.name,
+            hb_opt,
+            &heartbeat,
+        ]);
+        deadline
+            .run(&mut command)
+            .is_ok_and(|output| output.status.success())
+    }
+
+    fn owner_pair_condition(opt: &str, hb_opt: &str, owner: &str, heartbeat: &str) -> String {
+        let owner = Self::tmux_format_literal(owner);
+        let heartbeat = Self::tmux_format_literal(heartbeat);
+        format!("#{{&&:#{{==:#{{{opt}}},{owner}}},#{{==:#{{{hb_opt}}},{heartbeat}}}}}")
+    }
+
+    fn replace_owner_pair_if_observed_with_deadline(
+        &self,
+        opt: &str,
+        hb_opt: &str,
+        observed: (&str, &str),
+        owner_id: &str,
+        heartbeat: u64,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> std::io::Result<bool> {
+        let condition = Self::owner_pair_condition(opt, hb_opt, observed.0, observed.1);
+        let owner_id = Self::tmux_command_string_literal(owner_id);
+        let target = Self::tmux_command_string_literal(&self.name);
+        let replace = format!(
+            "set-option -t {target} {opt} {owner_id} ; set-option -t {target} {hb_opt} {heartbeat} ; display-message -p aoe-owner-replaced"
+        );
+        let mut command = crate::tmux::tmux_command();
+        command.args(["if-shell", "-t", &self.name, "-F", &condition, &replace]);
+        let output = deadline.run(&mut command)?;
+        if !output.status.success() {
+            return Err(std::io::Error::other("tmux owner replacement failed"));
         }
-        // Heartbeats are compared across processes, so this must be wall-clock
-        // (crate::util::now_ms), never a per-process monotonic clock.
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.trim() == "aoe-owner-replaced"))
+    }
+
+    fn release_owner_pair_at_with_deadline(
+        &self,
+        opt: &str,
+        hb_opt: &str,
+        owner_id: &str,
+        heartbeat: u64,
+        restore_window_size: bool,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) {
+        let condition = Self::owner_pair_condition(opt, hb_opt, owner_id, &heartbeat.to_string());
+        let target = Self::tmux_command_string_literal(&self.name);
+        let mut release =
+            format!("set-option -u -t {target} {opt} ; set-option -u -t {target} {hb_opt}");
+        if restore_window_size {
+            release.push_str(&format!(" ; set-option -t {target} window-size latest"));
+        }
+        let mut command = crate::tmux::tmux_command();
+        command.args(["if-shell", "-t", &self.name, "-F", &condition, &release]);
+        let _ = deadline.run(&mut command);
+    }
+
+    fn owner_snapshot_with_deadline(
+        &self,
+        opt: &str,
+        hb_opt: &str,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> std::io::Result<(String, String)> {
+        let format = format!("#{{{opt}}}|#{{{hb_opt}}}");
+        let mut command = crate::tmux::tmux_command();
+        command.args(["display-message", "-p", "-t", &self.name, "-F", &format]);
+        let output = deadline.run(&mut command)?;
+        if !output.status.success() {
+            return Err(std::io::Error::other("tmux owner snapshot failed"));
+        }
+        let line = String::from_utf8_lossy(&output.stdout);
+        let Some((owner, heartbeat)) = line.trim().split_once('|') else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "tmux owner snapshot is malformed",
+            ));
+        };
+        Ok((owner.to_string(), heartbeat.to_string()))
+    }
+
+    fn parse_owner_snapshot(
+        owner: &str,
+        heartbeat: &str,
+    ) -> std::io::Result<Option<(String, u64)>> {
+        if owner.is_empty() && heartbeat.is_empty() {
+            return Ok(None);
+        }
+        if owner.is_empty() || heartbeat.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "owner pair is incomplete",
+            ));
+        }
+        let heartbeat = heartbeat.parse().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "owner heartbeat is not an integer",
+            )
+        })?;
+        Ok(Some((owner.to_string(), heartbeat)))
+    }
+
+    fn claim_owner_at_with_deadline(
+        &self,
+        opt: &str,
+        hb_opt: &str,
+        owner_id: &str,
+        ttl: Duration,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> bool {
+        let (observed_owner, observed_heartbeat) =
+            match self.owner_snapshot_with_deadline(opt, hb_opt, deadline) {
+                Ok(snapshot) => snapshot,
+                Err(_) => return false,
+            };
+        let current = Self::parse_owner_snapshot(&observed_owner, &observed_heartbeat)
+            .ok()
+            .flatten();
         let now = now_ms();
-        let claimable = match self.owner_at(opt, hb_opt) {
+        let claimable = match current.as_ref() {
             None => true,
             Some((id, _)) if id == owner_id => true,
-            Some((_, hb)) => now.saturating_sub(hb) > ttl.as_millis() as u64,
+            Some((_, hb)) => now.saturating_sub(*hb) > ttl.as_millis() as u64,
         };
         if !claimable {
             return false;
         }
-        self.set_user_option(opt, owner_id);
-        self.set_user_option(hb_opt, &now.to_string());
-        matches!(self.owner_at(opt, hb_opt), Some((id, _)) if id == owner_id)
+        let heartbeat = next_owner_heartbeat(current.as_ref().map_or(0, |(_, hb)| *hb));
+        let replaced = self.replace_owner_pair_if_observed_with_deadline(
+            opt,
+            hb_opt,
+            (&observed_owner, &observed_heartbeat),
+            owner_id,
+            heartbeat,
+            deadline,
+        );
+        if matches!(replaced, Ok(true)) {
+            return true;
+        }
+
+        if matches!(
+            self.owner_at_result_with_deadline(opt, hb_opt, deadline),
+            Ok(Some((id, _))) if id == owner_id
+        ) {
+            return true;
+        }
+        if replaced.is_err() {
+            self.release_owner_pair_at_with_deadline(
+                opt, hb_opt, owner_id, heartbeat, false, deadline,
+            );
+        }
+        false
     }
 
     fn refresh_owner_at(&self, opt: &str, hb_opt: &str, owner_id: &str) -> bool {
-        match self.owner_at(opt, hb_opt) {
-            Some((id, _)) if id == owner_id => {
-                self.set_user_option(hb_opt, &now_ms().to_string());
-                true
-            }
-            _ => false,
-        }
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        self.refresh_owner_at_with_deadline(opt, hb_opt, owner_id, &deadline)
+    }
+
+    fn refresh_owner_at_with_deadline(
+        &self,
+        opt: &str,
+        hb_opt: &str,
+        owner_id: &str,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> bool {
+        let owner_id = Self::tmux_format_literal(owner_id);
+        let condition = format!("#{{==:#{{{opt}}},{owner_id}}}");
+        let target = Self::tmux_command_string_literal(&self.name);
+        let refresh = format!(
+            "set-option -t {target} {hb_opt} {} ; display-message -p aoe-owner-refreshed",
+            next_owner_heartbeat(0)
+        );
+        let mut command = crate::tmux::tmux_command();
+        command.args(["if-shell", "-t", &self.name, "-F", &condition, &refresh]);
+        deadline.run(&mut command).is_ok_and(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line.trim() == "aoe-owner-refreshed")
+        })
     }
 
     fn owner_at(&self, opt: &str, hb_opt: &str) -> Option<(String, u64)> {
-        let id = self.show_user_option(opt)?;
-        let hb = self
-            .show_user_option(hb_opt)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        Some((id, hb))
+        self.owner_at_result(opt, hb_opt).ok().flatten()
     }
 
-    /// Try to become the pane's sole `pipe-pane` owner. Same protocol as
-    /// [`claim_size_owner`](Self::claim_size_owner) over a separate option
-    /// pair; see `VT_OWNER_OPT` for why the pipe needs an owner at all.
+    fn owner_at_result(&self, opt: &str, hb_opt: &str) -> std::io::Result<Option<(String, u64)>> {
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        self.owner_at_result_with_deadline(opt, hb_opt, &deadline)
+    }
+
+    fn owner_at_result_with_deadline(
+        &self,
+        opt: &str,
+        hb_opt: &str,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> std::io::Result<Option<(String, u64)>> {
+        let (owner, heartbeat) = self.owner_snapshot_with_deadline(opt, hb_opt, deadline)?;
+        Self::parse_owner_snapshot(&owner, &heartbeat)
+    }
+
     pub fn claim_vt_owner(&self, owner_id: &str, ttl: Duration) -> bool {
-        self.claim_owner_at(VT_OWNER_OPT, VT_OWNER_HB_OPT, owner_id, ttl)
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        self.claim_vt_owner_with_deadline(owner_id, ttl, &deadline)
     }
 
-    /// Bump the VT-owner heartbeat iff we still hold the lock. Rate-limited
-    /// by the caller (the channel's sample loop), not here.
+    pub(crate) fn claim_vt_owner_with_deadline(
+        &self,
+        owner_id: &str,
+        ttl: Duration,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> bool {
+        self.claim_owner_at_with_deadline(VT_OWNER_OPT, VT_OWNER_HB_OPT, owner_id, ttl, deadline)
+    }
+
     pub fn refresh_vt_owner(&self, owner_id: &str) -> bool {
-        self.refresh_owner_at(VT_OWNER_OPT, VT_OWNER_HB_OPT, owner_id)
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        self.refresh_vt_owner_with_deadline(owner_id, &deadline)
     }
 
-    /// Release the VT-owner lock iff we hold it, so another viewer can arm
-    /// immediately instead of waiting out the TTL.
-    pub fn release_vt_owner(&self, owner_id: &str) {
-        if matches!(self.owner_at(VT_OWNER_OPT, VT_OWNER_HB_OPT), Some((id, _)) if id == owner_id) {
-            self.unset_user_option(VT_OWNER_OPT);
-            self.unset_user_option(VT_OWNER_HB_OPT);
+    pub(crate) fn refresh_vt_owner_with_deadline(
+        &self,
+        owner_id: &str,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> bool {
+        self.refresh_owner_at_with_deadline(VT_OWNER_OPT, VT_OWNER_HB_OPT, owner_id, deadline)
+    }
+
+    fn tmux_format_literal(value: &str) -> String {
+        let mut escaped = String::with_capacity(value.len());
+        for ch in value.chars() {
+            if matches!(ch, ',' | '#' | '}') {
+                escaped.push('#');
+            }
+            escaped.push(ch);
         }
+        escaped
     }
 
-    /// Force ownership to `owner_id`, even over a live holder. Used by the
+    fn tmux_command_string_literal(value: &str) -> String {
+        let mut quoted = String::with_capacity(value.len() + 2);
+        quoted.push('"');
+        for ch in value.chars() {
+            if matches!(ch, '\\' | '"' | '$') {
+                quoted.push('\\');
+            }
+            if ch == '#' {
+                quoted.push('#');
+            }
+            quoted.push(ch);
+        }
+        quoted.push('"');
+        quoted
+    }
+
+    /// Returns the applied window row count (`rows` plus status-bar chrome)
+    /// on success, so callers can later compare the observed window size
+    /// against what was actually set; `None` when the guard declined or tmux
+    /// errored.
+    fn resize_window_if_format_with_deadline(
+        &self,
+        condition: &str,
+        cols: u16,
+        rows: u16,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> Option<u16> {
+        if cols == 0 || rows == 0 {
+            return None;
+        }
+        let pane_target = format!("{}:^.0", self.name);
+        let window_rows = self
+            .pane_chrome_rows_with_deadline(&pane_target, deadline)
+            .map(|chrome| rows.saturating_add(chrome))
+            .unwrap_or(rows);
+        // if-shell -F evaluates the owner/attachment guard and inserts this
+        // branch in the same tmux command queue. No other client can replace
+        // the guarded state between the check and resize-window.
+        //
+        // Target the FIRST window (`:^`) explicitly: a bare session target
+        // resolves to the session's current window, so on a session where the
+        // user created more windows the resize would land on the wrong one
+        // while the chrome probe above and the preview capture both use the
+        // first. The observed-size reconcile also reads the first window, so
+        // resizing any other would loop forever chasing a mismatch.
+        let target = Self::tmux_command_string_literal(&format!("{}:^", self.name));
+        let resize = format!(
+            "resize-window -t {target} -x {cols} -y {window_rows} ; display-message -p aoe-resize-applied"
+        );
+        let mut command = crate::tmux::tmux_command();
+        command.args(["if-shell", "-t", &self.name, "-F", condition, &resize]);
+        deadline
+            .run(&mut command)
+            .is_ok_and(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .any(|line| line.trim() == "aoe-resize-applied")
+            })
+            .then_some(window_rows)
+    }
+
+    fn release_owner_at_with_deadline(
+        &self,
+        opt: &str,
+        hb_opt: &str,
+        owner_id: &str,
+        restore_window_size: bool,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) {
+        let owner_id = Self::tmux_format_literal(owner_id);
+        let condition = format!("#{{==:#{{{opt}}},{owner_id}}}");
+        let target = Self::tmux_command_string_literal(&self.name);
+        let mut release =
+            format!("set-option -u -t {target} {opt} ; set-option -u -t {target} {hb_opt}");
+        if restore_window_size {
+            release.push_str(&format!(" ; set-option -t {target} window-size latest"));
+        }
+        let mut command = crate::tmux::tmux_command();
+        command.args(["if-shell", "-t", &self.name, "-F", &condition, &release]);
+        let _ = deadline.run(&mut command);
+    }
+
+    pub fn release_vt_owner(&self, owner_id: &str) {
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        self.release_vt_owner_with_deadline(owner_id, &deadline);
+    }
+
+    pub(crate) fn release_vt_owner_with_deadline(
+        &self,
+        owner_id: &str,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) {
+        self.release_owner_at_with_deadline(
+            VT_OWNER_OPT,
+            VT_OWNER_HB_OPT,
+            owner_id,
+            false,
+            deadline,
+        );
+    }
+    /// Arm a pane pipe only if this exact channel generation still owns the
+    /// lease when tmux executes pipe-pane. Competing vacant-lock claimants can
+    /// both pass their confirm read; this final queue-local guard fences the
+    /// claimant that lost afterward.
+    pub(crate) fn arm_vt_pipe_if_owner_with_deadline(
+        &self,
+        owner_id: &str,
+        flags: &str,
+        pipe_command: &str,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> bool {
+        let owner_format = Self::tmux_format_literal(owner_id);
+        let condition = format!("#{{==:#{{{VT_OWNER_OPT}}},{owner_format}}}");
+        let target = Self::tmux_command_string_literal(&format!("{}:^.0", self.name));
+        let pipe_command = Self::tmux_command_string_literal(pipe_command);
+        let owner_command = Self::tmux_command_string_literal(owner_id);
+        let arm = format!(
+            "pipe-pane {flags} -t {target} {pipe_command} ; set-option -t {target} {VT_PIPE_OWNER_OPT} {owner_command} ; display-message -p aoe-pipe-armed"
+        );
+        let mut command = crate::tmux::tmux_command();
+        command.args(["if-shell", "-t", &self.name, "-F", &condition, &arm]);
+        let Ok(output) = deadline.run(&mut command) else {
+            return false;
+        };
+        let armed = output.status.success()
+            && String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line.trim() == "aoe-pipe-armed");
+        if !armed {
+            tracing::debug!(
+                session = %self.name,
+                expected_owner = owner_id,
+                status = ?output.status.code(),
+                stdout = %String::from_utf8_lossy(&output.stdout),
+                stderr = %String::from_utf8_lossy(&output.stderr),
+                "tmux pipe arm guard failed"
+            );
+        }
+        armed
+    }
+
+    /// Disable the pane pipe and release its lease iff this exact channel
+    /// generation still owns it. A stale channel may share the tmux session
+    /// name with its replacement, so an unconditional pipe-pane teardown
+    /// would kill the replacement's forwarder.
+    pub(crate) fn release_vt_pipe_owner_with_deadline(
+        &self,
+        owner_id: &str,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) {
+        let owner_format = Self::tmux_format_literal(owner_id);
+        let condition = format!(
+            "#{{||:#{{==:#{{{VT_PIPE_OWNER_OPT}}},{owner_format}}},#{{==:#{{{VT_OWNER_OPT}}},{owner_format}}}}}"
+        );
+        let clear_lease_condition = format!("#{{==:#{{{VT_OWNER_OPT}}},{owner_format}}}");
+        let target = Self::tmux_command_string_literal(&format!("{}:^.0", self.name));
+        let clear_lease = format!(
+            "set-option -u -t {target} {VT_OWNER_OPT} ; set-option -u -t {target} {VT_OWNER_HB_OPT}"
+        );
+        let release = format!(
+            "pipe-pane -t {target} ; set-option -u -t {target} {VT_PIPE_OWNER_OPT} ; if-shell -t {target} -F '{clear_lease_condition}' '{clear_lease}'"
+        );
+        let mut command = crate::tmux::tmux_command();
+        command.args(["if-shell", "-t", &self.name, "-F", &condition, &release]);
+        let _ = deadline.run(&mut command);
+    }
+
+    /// Force ownership to owner_id, even over a live holder. Used by the
     /// explicit "take over" action: a user tap is an intentional steal, not
     /// the passive flap the heartbeat guards against.
     pub fn steal_size_owner(&self, owner_id: &str) -> bool {
-        if !self.exists() {
-            return false;
-        }
-        self.set_user_option(SIZE_OWNER_OPT, owner_id);
-        self.set_user_option(SIZE_OWNER_HB_OPT, &now_ms().to_string());
-        matches!(self.size_owner(), Some((id, _)) if id == owner_id)
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        self.set_owner_pair_with_deadline(
+            SIZE_OWNER_OPT,
+            SIZE_OWNER_HB_OPT,
+            owner_id,
+            next_owner_heartbeat(0),
+            &deadline,
+        )
     }
 
-    /// Resize the window iff `owner_id` still holds the size-owner lock,
-    /// verifying ownership in the same call. Returns whether we still own it.
+    /// Resize the window iff owner_id still holds the size-owner lock at the
+    /// instant tmux executes resize-window. Returns whether the resize landed.
     ///
-    /// This is the only resize entry point loops with a cached "am I owner"
-    /// flag may use: a local flag is stale for up to a heartbeat after another
-    /// client steals the lock, and an unverified resize in that window stomps
-    /// the new owner's grid (the flap this lock exists to kill). Re-reading
-    /// the lock here closes that window; the caller demotes itself on false.
+    /// The format guard and resize run in one tmux command queue. A local
+    /// owner flag or a separate show-options result can become stale between
+    /// subprocesses when another surface takes over.
     pub fn resize_window_if_owner(&self, owner_id: &str, cols: u16, rows: u16) -> bool {
-        match self.size_owner() {
-            Some((id, _)) if id == owner_id => {
-                self.resize_window(cols, rows);
-                true
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        self.resize_window_if_owner_with_deadline(owner_id, cols, rows, &deadline)
+    }
+
+    fn resize_window_if_owner_with_deadline(
+        &self,
+        owner_id: &str,
+        cols: u16,
+        rows: u16,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> bool {
+        loop {
+            let Ok(Some((observed_owner, heartbeat))) =
+                self.owner_at_result_with_deadline(SIZE_OWNER_OPT, SIZE_OWNER_HB_OPT, deadline)
+            else {
+                return false;
+            };
+            if observed_owner != owner_id {
+                return false;
             }
-            _ => false,
+            let condition = Self::owner_pair_condition(
+                SIZE_OWNER_OPT,
+                SIZE_OWNER_HB_OPT,
+                owner_id,
+                &heartbeat.to_string(),
+            );
+            if self
+                .resize_window_if_format_with_deadline(&condition, cols, rows, deadline)
+                .is_some()
+            {
+                return true;
+            }
+
+            match self.owner_at_result_with_deadline(SIZE_OWNER_OPT, SIZE_OWNER_HB_OPT, deadline) {
+                Ok(Some((id, refreshed_heartbeat))) if id == owner_id => {
+                    if refreshed_heartbeat != heartbeat {
+                        continue;
+                    }
+                    self.release_owner_pair_at_with_deadline(
+                        SIZE_OWNER_OPT,
+                        SIZE_OWNER_HB_OPT,
+                        owner_id,
+                        refreshed_heartbeat,
+                        true,
+                        deadline,
+                    );
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    self.release_owner_pair_at_with_deadline(
+                        SIZE_OWNER_OPT,
+                        SIZE_OWNER_HB_OPT,
+                        owner_id,
+                        heartbeat,
+                        true,
+                        deadline,
+                    );
+                }
+            }
+            return false;
         }
+    }
+    /// Resize a detached pane only if the inactive owner state observed here
+    /// is unchanged when tmux executes resize-window. This fences a live owner
+    /// or terminal attach that arrives after the preliminary worker checks.
+    /// Returns the applied window row count on success, `None` when declined.
+    pub(crate) fn resize_window_if_detached_without_active_owner_after_exists_with_deadline(
+        &self,
+        cols: u16,
+        rows: u16,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> Option<u16> {
+        let owner_condition = match self.owner_at_result_with_deadline(
+            SIZE_OWNER_OPT,
+            SIZE_OWNER_HB_OPT,
+            deadline,
+        ) {
+            Ok(None) => {
+                format!("#{{&&:#{{==:#{{{SIZE_OWNER_OPT}}},}},#{{==:#{{{SIZE_OWNER_HB_OPT}}},}}}}")
+            }
+            Ok(Some((_, heartbeat)))
+                if now_ms().saturating_sub(heartbeat) <= SIZE_OWNER_TTL.as_millis() as u64 =>
+            {
+                return None;
+            }
+            Ok(Some((owner, heartbeat))) => {
+                let owner = Self::tmux_format_literal(&owner);
+                format!(
+                    "#{{&&:#{{==:#{{{SIZE_OWNER_OPT}}},{owner}}},#{{==:#{{{SIZE_OWNER_HB_OPT}}},{heartbeat}}}}}"
+                )
+            }
+            Err(_) => return None,
+        };
+        let condition = format!("#{{&&:#{{==:#{{session_attached}},0}},{owner_condition}}}");
+        self.resize_window_if_format_with_deadline(&condition, cols, rows, deadline)
     }
 
     /// Whether at least one tmux client is attached to this session, from
@@ -1343,39 +2098,57 @@ impl Session {
     /// nothing, so the passive resize shrank the window back to the preview
     /// pane's dimensions right after the attach (#3071).
     ///
-    /// Best-effort: a tmux call that fails to spawn, exits non-zero, or prints
-    /// something unparseable reports "not attached". The caller leaves its
-    /// dedup unset when it skips, so a transient glitch costs one poll
-    /// interval of a clipped preview rather than wedging the resize forever.
-    pub fn is_attached(&self) -> bool {
-        let out = crate::tmux::tmux_command()
-            .args([
-                "display-message",
-                "-t",
-                &self.name,
-                "-p",
-                "#{session_attached}",
-            ])
-            .output();
-        match out {
-            Ok(o) if o.status.success() => {
-                let s = String::from_utf8_lossy(&o.stdout);
-                s.trim().parse::<u32>().unwrap_or(0) > 0
-            }
-            _ => false,
+    /// Returns None unless tmux authoritatively reports the attached client
+    /// count. Passive resize must fail closed on timeout, non-zero exit, or
+    /// malformed output instead of treating an unknown state as detached.
+    pub fn is_attached(&self) -> Option<bool> {
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        self.is_attached_with_deadline(&deadline)
+    }
+
+    pub(crate) fn is_attached_with_deadline(
+        &self,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> Option<bool> {
+        let mut command = crate::tmux::tmux_command();
+        command.args([
+            "display-message",
+            "-t",
+            &self.name,
+            "-p",
+            "#{session_attached}",
+        ]);
+        let out = deadline.run(&mut command).ok()?;
+        if !out.status.success() {
+            return None;
         }
+        let attached = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse::<u32>()
+            .ok()?;
+        Some(attached > 0)
     }
 
     /// Whether a non-stale size owner currently holds the lock. A passive
     /// writer (the TUI's detached preview sync) checks this to defer to an
     /// active owner without claiming the lock itself.
-    pub fn has_active_size_owner(&self) -> bool {
-        match self.size_owner() {
-            Some((_, hb)) => now_ms().saturating_sub(hb) <= SIZE_OWNER_TTL.as_millis() as u64,
-            None => false,
-        }
+    pub fn has_active_size_owner(&self) -> Option<bool> {
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        self.has_active_size_owner_with_deadline(&deadline)
     }
 
+    pub(crate) fn has_active_size_owner_with_deadline(
+        &self,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> Option<bool> {
+        self.owner_at_result_with_deadline(SIZE_OWNER_OPT, SIZE_OWNER_HB_OPT, deadline)
+            .ok()
+            .map(|owner| {
+                owner.is_some_and(|(_, hb)| {
+                    now_ms().saturating_sub(hb) <= SIZE_OWNER_TTL.as_millis() as u64
+                })
+            })
+    }
     /// Read the current size owner and its last heartbeat (unix millis), if a
     /// lock is held.
     pub fn size_owner(&self) -> Option<(String, u64)> {
@@ -1386,41 +2159,55 @@ impl Session {
     /// lock is vacant so a later out-of-band `tmux attach` from a real terminal
     /// sizes the window to itself instead of staying pinned at our grid.
     pub fn release_size_owner(&self, owner_id: &str) {
-        if let Some((id, _)) = self.size_owner() {
-            if id == owner_id {
-                self.unset_user_option(SIZE_OWNER_OPT);
-                self.unset_user_option(SIZE_OWNER_HB_OPT);
-                self.reset_size_to_latest_client();
-            }
-        }
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        self.release_owner_at_with_deadline(
+            SIZE_OWNER_OPT,
+            SIZE_OWNER_HB_OPT,
+            owner_id,
+            true,
+            &deadline,
+        );
     }
 
-    fn show_user_option(&self, opt: &str) -> Option<String> {
-        let out = crate::tmux::tmux_command()
-            .args(["show-options", "-v", "-t", &self.name, opt])
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if value.is_empty() {
-            None
-        } else {
-            Some(value)
-        }
-    }
-
+    #[cfg(test)]
     fn set_user_option(&self, opt: &str, value: &str) {
-        let _ = crate::tmux::tmux_command()
-            .args(["set-option", "-t", &self.name, opt, value])
-            .output();
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        let _ = self.set_user_option_with_deadline(opt, value, &deadline);
     }
 
+    #[cfg(test)]
+    fn set_user_option_with_deadline(
+        &self,
+        opt: &str,
+        value: &str,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> bool {
+        let mut command = crate::tmux::tmux_command();
+        command.args(["set-option", "-t", &self.name, opt, value]);
+        deadline
+            .run(&mut command)
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(test)]
     fn unset_user_option(&self, opt: &str) {
-        let _ = crate::tmux::tmux_command()
-            .args(["set-option", "-u", "-t", &self.name, opt])
-            .output();
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        let _ = self.unset_user_option_with_deadline(opt, &deadline);
+    }
+
+    #[cfg(test)]
+    fn unset_user_option_with_deadline(
+        &self,
+        opt: &str,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> bool {
+        let mut command = crate::tmux::tmux_command();
+        command.args(["set-option", "-u", "-t", &self.name, opt]);
+        deadline
+            .run(&mut command)
+            .map(|output| output.status.success())
+            .unwrap_or(false)
     }
 
     /// Deliver `text` to `target` via tmux's load-buffer + paste-buffer.
@@ -1521,6 +2308,177 @@ fn raw_byte_batches(bytes: &[u8]) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// A one-shot, mode-0600 environment channel for a pane command.
+///
+/// The guard owns cleanup until the pane unlinks the file after sourcing it.
+/// A successful tmux create alone does not transfer cleanup ownership.
+struct EphemeralEnvFile {
+    path: Option<std::path::PathBuf>,
+    container_env_path: Option<std::path::PathBuf>,
+}
+
+impl EphemeralEnvFile {
+    fn create(env: &[PaneEnvMutation], container_env: &[(String, String)]) -> Result<Self> {
+        let mut channel = Self {
+            path: None,
+            container_env_path: None,
+        };
+        if !container_env.is_empty() {
+            let mut file = tempfile::Builder::new()
+                .prefix(PANE_ENV_FILE_PREFIX)
+                .tempfile()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.as_file()
+                    .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+            for (key, value) in container_env {
+                anyhow::ensure!(
+                    crate::session::environment::is_valid_env_key(key),
+                    "invalid container environment key {key:?}"
+                );
+                anyhow::ensure!(
+                    !value
+                        .bytes()
+                        .any(|byte| matches!(byte, b'\0' | b'\n' | b'\r')),
+                    "container environment value for {key} cannot be represented in an env-file"
+                );
+                writeln!(file, "{key}={value}")?;
+            }
+            file.flush()?;
+            let (_handle, path) = file.keep().map_err(|error| error.error)?;
+            channel.container_env_path = Some(path);
+        }
+
+        let mut file = tempfile::Builder::new()
+            .prefix(PANE_ENV_FILE_PREFIX)
+            .tempfile()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        for mutation in env {
+            let key = mutation.key();
+            if !crate::session::environment::is_valid_env_key(key) {
+                tracing::warn!(target: "session.create", "invalid protected environment key '{}'; skipping", key);
+                continue;
+            }
+            match mutation {
+                PaneEnvMutation::Set { key, value } => {
+                    writeln!(file, "export {}={}", key, script_shell_escape(value))?;
+                }
+                PaneEnvMutation::Unset { key } => writeln!(file, "unset {}", key)?,
+            }
+        }
+        file.flush()?;
+        let (_handle, path) = file.keep().map_err(|error| error.error)?;
+        channel.path = Some(path);
+        Ok(channel)
+    }
+
+    fn wrap_command(&self, command: Option<&str>) -> Result<String> {
+        let path = self
+            .path
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("protected environment channel already consumed"))?;
+        let launch = command.map(str::to_owned).unwrap_or_else(|| {
+            crate::session::environment::login_shell_command(
+                &crate::session::environment::user_shell(),
+            )
+        });
+        let shell = crate::session::environment::user_posix_shell();
+        let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
+        if let Some(container_env_path) = self.container_env_path.as_deref() {
+            writeln!(
+                file,
+                "exec {}<{} || exit 1",
+                crate::session::environment::CONTAINER_EXEC_ENV_FD,
+                script_shell_escape(&container_env_path.to_string_lossy())
+            )?;
+            writeln!(
+                file,
+                "rm -f -- {}",
+                script_shell_escape(&container_env_path.to_string_lossy())
+            )?;
+        }
+        writeln!(
+            file,
+            "rm -f -- {}",
+            script_shell_escape(&path.to_string_lossy())
+        )?;
+        writeln!(file, "{launch}")?;
+        file.flush()?;
+
+        // tmux hands its pane command to the user's configured shell. Keep that
+        // boundary to one short script invocation. The protected file contains
+        // both exports and the potentially large launch body, so neither
+        // secrets nor command contents enter tmux argv.
+        Ok(format!(
+            "exec {} {}",
+            crate::session::environment::shell_escape(&shell),
+            crate::session::environment::shell_escape(&path.to_string_lossy())
+        ))
+    }
+
+    fn wait_until_consumed(&self, timeout: Duration) -> bool {
+        let Some(path) = self.path.as_deref() else {
+            return true;
+        };
+        let deadline = Instant::now() + timeout;
+        loop {
+            match std::fs::symlink_metadata(path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+                Err(_) => return false,
+                Ok(_) if Instant::now() >= deadline => return false,
+                Ok(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.path = None;
+        self.container_env_path = None;
+    }
+}
+
+impl Drop for EphemeralEnvFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+        if let Some(path) = self.container_env_path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Quote one POSIX script word without changing its bytes. Unlike the
+/// single-line command formatter, literal CR and LF bytes are valid inside
+/// single quotes here and must survive environment transport.
+fn script_shell_escape(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Whether `text` should get a trailing space appended before being typed
+/// via the literal (non-paste-buffer) keystroke path in
+/// [`Session::send_keys_with_delay`]. A message that opens with `/` triggers
+/// some agents' own slash-command autocomplete dropdown (e.g. opencode); the
+/// dropdown then consumes the terminating `Enter` sent after this payload as
+/// navigation instead of submit, leaving the command typed but never
+/// delivered. A trailing space closes the dropdown as it's typed, so the
+/// following `Enter` submits normally instead. Every other message keeps its
+/// exact bytes. Pure so the padding decision is unit-testable without tmux.
+fn pad_slash_command_for_autocomplete(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.trim_start().starts_with('/') {
+        std::borrow::Cow::Owned(format!("{text} "))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
 /// Build the argument list for tmux new-session command. Shared by the
 /// agent session and the paired/container terminal sessions (their
 /// invocations are identical; only the session-name prefix differs).
@@ -1577,6 +2535,63 @@ mod tests {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+
+    /// The tmux id (`%N`) of `session_name`'s only pane. Call right after
+    /// `new-session`, before any split or extra window, so `-t <session>`
+    /// resolves unambiguously.
+    fn only_pane_id(session_name: &str) -> String {
+        let out = crate::tmux::tmux_command()
+            .args(["display-message", "-t", session_name, "-p", "#{pane_id}"])
+            .output()
+            .expect("tmux display-message");
+        let id = String::from_utf8(out.stdout)
+            .expect("utf8")
+            .trim()
+            .to_string();
+        assert!(!id.is_empty(), "no pane id for session {session_name}");
+        id
+    }
+
+    /// Block until `pane_id` reports `expected` as its current command.
+    ///
+    /// tmux runs a single-string pane command (`"sleep 30"`) through the
+    /// user's shell, so `pane_current_command` reports that shell, which
+    /// `is_shell_command` matches, until it execs into the real command.
+    /// A fixed sleep is a bet on that exec having happened. The window it
+    /// has to cover is the shell's own startup, around 100ms on an idle
+    /// machine and several times that when the suite is competing for
+    /// cores, so the bet loses under load; wait for the exec instead.
+    ///
+    /// Keyed on the pane's own id rather than the `^.0` target so the wait
+    /// never depends on the pane resolution the callers' assertions exist to
+    /// exercise: a targeting regression still fails on the assertion with its
+    /// own message instead of timing out here.
+    fn wait_for_pane_command(pane_id: &str, expected: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let current = crate::tmux::tmux_command()
+                .args([
+                    "display-message",
+                    "-t",
+                    pane_id,
+                    "-p",
+                    "#{pane_current_command}",
+                ])
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            if current == expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pane {pane_id} still reports {current:?}, expected {expected:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Create a detached session for the composite tests, applying the guards
@@ -1686,6 +2701,84 @@ mod tests {
     #[test]
     fn raw_byte_batches_empty_payload_sends_nothing() {
         assert!(raw_byte_batches(&[]).is_empty());
+    }
+
+    #[test]
+    fn pads_slash_prefixed_messages_only() {
+        let cases = [
+            ("/audit", "/audit "),
+            ("/", "/ "),
+            ("  /audit", "  /audit "),
+            ("audit", "audit"),
+            ("please run /audit", "please run /audit"),
+            ("", ""),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                pad_slash_command_for_autocomplete(input),
+                expected,
+                "input {input:?}"
+            );
+        }
+    }
+
+    /// Direct, timing-based proof that `wait_until_ready` with a known
+    /// marker actually blocks until that marker appears, rather than
+    /// returning early on a merely-static pane -- the gap in the generic
+    /// content-settle fallback (a short "still loading" screen can look
+    /// "settled" long before the agent is really listening).
+    #[test]
+    fn wait_until_ready_blocks_until_the_marker_appears() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let guard = TmuxTestSession::new("aoe_test_ready_marker");
+        let name = guard.name().to_string();
+        // A short, static "booting" line appears immediately and would
+        // satisfy the generic settle heuristic well under 700ms; the real
+        // marker text only appears after the sleep. The trailing `set-option
+        // pane-base-index 0` chain mirrors `append_pane_base_index_args` so the
+        // `^.0` capture target resolves on hosts with `pane-base-index 1` set
+        // globally (#488, #2231).
+        let status = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &name,
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "sh",
+                "-c",
+                "echo booting; sleep 0.7; echo 'ask anything...'; sleep 30",
+                ";",
+                "set-option",
+                "-t",
+                &name,
+                "pane-base-index",
+                "0",
+            ])
+            .status()
+            .expect("tmux new-session");
+        assert!(status.success());
+        refresh_session_cache();
+
+        let session = Session::from_name(&name);
+        let start = std::time::Instant::now();
+        session.wait_until_ready(std::time::Duration::from_secs(3), Some("ask anything"));
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= std::time::Duration::from_millis(600),
+            "returned before the marker could plausibly have appeared: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "should have returned promptly once the marker appeared, not idled toward the bound: {elapsed:?}"
+        );
     }
 
     #[test]
@@ -1861,6 +2954,25 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn session_created_is_conservative_epoch_millisecond_watermark() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let guard = TmuxTestSession::new("aoe_test_session_created");
+        let output = crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", guard.name()])
+            .output()
+            .expect("tmux new-session");
+        assert!(output.status.success());
+
+        let created_at_ms = Session::from_name(guard.name()).created_at_ms().unwrap();
+        assert!(created_at_ms > 0);
+        assert_eq!(created_at_ms % 1000, 999);
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn capture_with_cursor_stays_consistent_under_streaming_load() {
         if !tmux_available() {
             eprintln!("Skipping test: tmux not available");
@@ -1910,14 +3022,12 @@ mod tests {
         }
     }
 
-    #[test]
-    #[serial_test::serial]
-    fn size_owner_lock_claims_rejects_steals_and_releases() {
-        if !tmux_available() {
-            eprintln!("Skipping test: tmux not available");
-            return;
-        }
-        let guard = TmuxTestSession::new("aoe_test_owner");
+    /// Detached 80x24 session with a known pane index, plus the cache refresh
+    /// the lock paths need: the session is created behind the existence
+    /// cache's back, and a cache warmed without it turns every exists()-guarded
+    /// lock call into a false no-op.
+    fn owner_lock_session(prefix: &str) -> (TmuxTestSession, Session) {
+        let guard = TmuxTestSession::new(prefix);
         let out = crate::tmux::tmux_command()
             .args([
                 "new-session",
@@ -1929,15 +3039,29 @@ mod tests {
                 "-y",
                 "24",
                 "sleep 30",
+                ";",
+                "set-window-option",
+                "-t",
+                guard.name(),
+                "pane-base-index",
+                "0",
             ])
             .output()
             .expect("tmux new-session");
         assert!(out.status.success());
-        // The session was created behind the existence cache's back; an
-        // earlier test may have warmed the cache without it, which would
-        // make every exists()-guarded lock call a false no-op.
         refresh_session_cache();
         let session = Session::from_name(guard.name());
+        (guard, session)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn size_owner_lock_claims_rejects_steals_and_releases() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let (guard, session) = owner_lock_session("aoe_test_owner");
 
         // Vacant -> first claimer wins and is recorded.
         assert!(session.claim_size_owner("a", Duration::from_secs(10)));
@@ -1961,6 +3085,29 @@ mod tests {
             Some("c".to_string())
         );
 
+        // A claimant that observed a stale pair cannot overwrite a renewal
+        // that landed before its compare-and-set branch executes.
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        let observed = session
+            .owner_snapshot_with_deadline(SIZE_OWNER_OPT, SIZE_OWNER_HB_OPT, &deadline)
+            .expect("owner snapshot");
+        assert!(session.refresh_size_owner("c"));
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        assert!(!session
+            .replace_owner_pair_if_observed_with_deadline(
+                SIZE_OWNER_OPT,
+                SIZE_OWNER_HB_OPT,
+                (&observed.0, &observed.1),
+                "stale-claimer",
+                next_owner_heartbeat(0),
+                &deadline,
+            )
+            .expect("conditional owner replacement"));
+        assert_eq!(
+            session.size_owner().map(|(id, _)| id),
+            Some("c".to_string())
+        );
+
         // An explicit take-over steals even a fresh lock.
         assert!(session.steal_size_owner("d"));
         assert_eq!(
@@ -1968,14 +3115,228 @@ mod tests {
             Some("d".to_string())
         );
 
-        // A non-owner release is a no-op; the owner's release clears the lock.
-        session.release_size_owner("not-d");
+        let pane_size = || {
+            let output = crate::tmux::tmux_command()
+                .args([
+                    "display-message",
+                    "-p",
+                    "-t",
+                    &format!("{}:^.0", guard.name()),
+                    "#{pane_width} #{pane_height}",
+                ])
+                .output()
+                .expect("tmux pane size");
+            assert!(output.status.success());
+            let fields: Vec<u16> = String::from_utf8_lossy(&output.stdout)
+                .split_whitespace()
+                .map(|field| field.parse().expect("numeric pane dimension"))
+                .collect();
+            (fields[0], fields[1])
+        };
+
+        // One owner-pair snapshot precedes the chrome probe and queue-local
+        // guard. Reading owner and heartbeat separately would add a fourth
+        // fork, expose a torn pair, and reopen the takeover race.
+        let _ = crate::tmux::fork_probe::take();
+        {
+            let _probe = crate::tmux::fork_probe::arm();
+            assert!(session.resize_window_if_owner("d", 90, 30));
+            assert_eq!(crate::tmux::fork_probe::take(), 3);
+        }
+        assert_eq!(pane_size(), (90, 30));
+        assert!(!session.resize_window_if_owner("not-d", 91, 31));
+        assert_eq!(pane_size(), (90, 30));
+
+        // A verified owner whose authoritative resize fails must release the
+        // lock before the caller demotes itself. Zero width deterministically
+        // exercises the failure path without relying on tmux timing.
+        assert!(!session.resize_window_if_owner("d", 0, 24));
+        assert!(session.size_owner().is_none());
+        assert!(session.steal_size_owner("d"));
+
+        // A conditional release is one tmux command queue: a non-owner no-op
+        // cannot race a later takeover between a read and separate unsets.
+        let _ = crate::tmux::fork_probe::take();
+        {
+            let _probe = crate::tmux::fork_probe::arm();
+            session.release_size_owner("not-d");
+            assert_eq!(crate::tmux::fork_probe::take(), 1);
+        }
         assert_eq!(
             session.size_owner().map(|(id, _)| id),
             Some("d".to_string())
         );
-        session.release_size_owner("d");
+        {
+            let _probe = crate::tmux::fork_probe::arm();
+            session.release_size_owner("d");
+            assert_eq!(crate::tmux::fork_probe::take(), 1);
+        }
         assert!(session.size_owner().is_none());
+
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        assert!(session
+            .resize_window_if_detached_without_active_owner_after_exists_with_deadline(
+                91, 31, &deadline,
+            )
+            .is_some());
+        assert_eq!(pane_size(), (91, 31));
+        assert!(session.claim_size_owner("active", Duration::from_secs(10)));
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        assert!(session
+            .resize_window_if_detached_without_active_owner_after_exists_with_deadline(
+                92, 32, &deadline,
+            )
+            .is_none());
+        assert_eq!(pane_size(), (91, 31));
+        session.release_size_owner("active");
+
+        // The resize must land on the FIRST window even when the session's
+        // current window is a later one: preview capture, the chrome probe,
+        // and the observed-size reconcile all read `:^`, so a bare-session
+        // target (which tmux resolves to the current window) would resize the
+        // wrong window and the reconcile would loop chasing a mismatch.
+        let out = crate::tmux::tmux_command()
+            .args(["new-window", "-t", guard.name(), "sleep 30"])
+            .output()
+            .expect("tmux new-window");
+        assert!(out.status.success());
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        assert!(session
+            .resize_window_if_detached_without_active_owner_after_exists_with_deadline(
+                93, 33, &deadline,
+            )
+            .is_some());
+        assert_eq!(
+            pane_size(),
+            (93, 33),
+            "the first window must be the resize target"
+        );
+        let out = crate::tmux::tmux_command()
+            .args(["kill-window", "-t", &format!("{}:$", guard.name())])
+            .output()
+            .expect("tmux kill-window");
+        assert!(out.status.success());
+
+        // A partial owner write is unknown to passive readers, but a later
+        // claimant must repair it rather than leaving the lock wedged forever.
+        session.set_user_option(SIZE_OWNER_OPT, "partial");
+        session.unset_user_option(SIZE_OWNER_HB_OPT);
+        assert_eq!(session.has_active_size_owner(), None);
+        assert!(session.claim_size_owner("recovered", Duration::from_secs(10)));
+        assert_eq!(
+            session.size_owner().map(|(id, _)| id),
+            Some("recovered".to_string())
+        );
+        session.release_size_owner("recovered");
+
+        // Format operands escape only tmux's actual separators. Prefixing a
+        // literal brace or colon with '#' changes the operand on tmux 3.6+.
+        let literal_owner = "owner{with:literal";
+        assert!(session.claim_size_owner(literal_owner, Duration::from_secs(10)));
+        assert!(session.refresh_size_owner(literal_owner));
+        session.release_size_owner(literal_owner);
+        assert!(session.size_owner().is_none());
+    }
+    /// A guarded resize that never got to run leaves the shared budget spent.
+    /// Verification and cleanup must run on that same budget: on a fresh
+    /// deadline they read back the unchanged heartbeat and release the lock.
+    #[test]
+    #[serial_test::serial]
+    fn resize_window_if_owner_keeps_timeout_recovery_in_one_deadline() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let (_guard, session) = owner_lock_session("aoe_test_owner_resize_deadline");
+        assert!(session.steal_size_owner("owner"));
+
+        // The owner snapshot and the chrome probe behind the guarded resize.
+        const COMMANDS_BEFORE_RESIZE: i64 = 2;
+        let deadline =
+            crate::tmux::TmuxCommandDeadline::expiring_after_commands(COMMANDS_BEFORE_RESIZE);
+        assert!(!session.resize_window_if_owner_with_deadline("owner", 91, 31, &deadline));
+        assert_eq!(
+            session.size_owner().map(|(id, _)| id),
+            Some("owner".to_string())
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resize_window_if_owner_retries_same_owner_heartbeat_until_deadline() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let (guard, session) = owner_lock_session("aoe_test_owner_resize_heartbeat");
+        assert!(session.steal_size_owner("owner"));
+
+        // Every message the owner reads moves the heartbeat, so the queue-local
+        // guard never matches and each attempt loses the race to the same owner.
+        let hook = format!(
+            "set-option -F -t {} @aoe_test_show_count '#{{e|+:#{{@aoe_test_show_count}},1}}' ; set-option -F -t {} {SIZE_OWNER_HB_OPT} '#{{e|+:#{{{SIZE_OWNER_HB_OPT}}},1}}'",
+            guard.name(),
+            guard.name(),
+        );
+        let out = crate::tmux::tmux_command()
+            .args([
+                "set-option",
+                "-t",
+                guard.name(),
+                "@aoe_test_show_count",
+                "0",
+                ";",
+                "set-hook",
+                "-t",
+                guard.name(),
+                "after-display-message",
+                &hook,
+            ])
+            .output()
+            .expect("tmux heartbeat hook");
+        assert!(out.status.success());
+
+        // An attempt spends four tmux commands and displays three messages: the
+        // guarded resize prints nothing while its condition fails. Budgeting two
+        // attempts leaves the third attempt's owner read past the deadline.
+        const COMMANDS_PER_ATTEMPT: i64 = 4;
+        const MESSAGES_PER_ATTEMPT: u64 = 3;
+        const ATTEMPTS: i64 = 2;
+        let deadline = crate::tmux::TmuxCommandDeadline::expiring_after_commands(
+            COMMANDS_PER_ATTEMPT * ATTEMPTS,
+        );
+        assert!(!session.resize_window_if_owner_with_deadline("owner", 91, 31, &deadline));
+
+        let out = crate::tmux::tmux_command()
+            .args([
+                "set-hook",
+                "-u",
+                "-t",
+                guard.name(),
+                "after-display-message",
+                ";",
+                "show-options",
+                "-v",
+                "-t",
+                guard.name(),
+                "@aoe_test_show_count",
+            ])
+            .output()
+            .expect("tmux heartbeat hook count");
+        assert!(out.status.success());
+        let show_count: u64 = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("numeric hook count");
+        assert_eq!(
+            show_count,
+            MESSAGES_PER_ATTEMPT * ATTEMPTS as u64,
+            "retries did not run once per heartbeat race"
+        );
+        assert_eq!(
+            session.size_owner().map(|(id, _)| id),
+            Some("owner".to_string())
+        );
     }
 
     #[test]
@@ -1985,24 +3346,7 @@ mod tests {
             eprintln!("Skipping test: tmux not available");
             return;
         }
-        let guard = TmuxTestSession::new("aoe_test_vt_owner");
-        let out = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                guard.name(),
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sleep 30",
-            ])
-            .output()
-            .expect("tmux new-session");
-        assert!(out.status.success());
-        refresh_session_cache();
-        let session = Session::from_name(guard.name());
+        let (guard, session) = owner_lock_session("aoe_test_vt_owner");
 
         // Same claim protocol as the size owner: vacant -> first claimer
         // wins, idempotent re-claim, fresh lock rejects others, stale lock
@@ -2020,11 +3364,81 @@ mod tests {
         assert!(session.claim_size_owner("sz", Duration::from_secs(10)));
         assert!(session.refresh_vt_owner("pid-3"));
 
-        // Non-owner release is a no-op; owner release clears it.
-        session.release_vt_owner("pid-2");
-        assert!(session.refresh_vt_owner("pid-3"));
-        session.release_vt_owner("pid-3");
-        assert!(!session.refresh_vt_owner("pid-3"));
+        let pane_is_piped = || {
+            let output = crate::tmux::tmux_command()
+                .args([
+                    "display-message",
+                    "-p",
+                    "-t",
+                    &format!("{}:^.0", guard.name()),
+                    "#{pane_pipe}",
+                ])
+                .output()
+                .expect("tmux pane pipe state");
+            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "1"
+        };
+        let pipe_temp = tempfile::tempdir().expect("pipe tempdir");
+        let pipe_marker = pipe_temp.path().join("armed #$");
+        let pipe_command = format!(
+            "touch '{}' ; exec cat >/dev/null",
+            pipe_marker.to_string_lossy()
+        );
+
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        assert!(session.arm_vt_pipe_if_owner_with_deadline(
+            "pid-3",
+            "-IO",
+            &pipe_command,
+            &deadline,
+        ));
+        assert!(pane_is_piped());
+        for _ in 0..100 {
+            if pipe_marker.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(pipe_marker.exists(), "quoted pipe command must run intact");
+
+        // Model a replacement that claimed the stale lease but has not armed
+        // yet. Dropping the old generation closes its own pipe without
+        // clearing the replacement's lease.
+        session.set_user_option(VT_OWNER_OPT, "pid-4");
+        session.set_user_option(VT_OWNER_HB_OPT, &now_ms().to_string());
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        session.release_vt_pipe_owner_with_deadline("pid-3", &deadline);
+        assert!(session.refresh_vt_owner("pid-4"));
+        assert!(!pane_is_piped());
+
+        // Once pid-4 arms, the stale pid-3 generation can neither re-arm nor
+        // tear down the replacement's pipe or lease.
+        assert!(session.arm_vt_pipe_if_owner_with_deadline(
+            "pid-4",
+            "-O",
+            &pipe_command,
+            &deadline,
+        ));
+        assert!(!session.arm_vt_pipe_if_owner_with_deadline(
+            "pid-3",
+            "-O",
+            &pipe_command,
+            &deadline,
+        ));
+        session.release_vt_pipe_owner_with_deadline("pid-3", &deadline);
+        assert!(session.refresh_vt_owner("pid-4"));
+        assert!(pane_is_piped());
+
+        // A replacement that owns only the lease must release that lease
+        // without tearing down the older generation's still-live pane pipe.
+        session.set_user_option(VT_OWNER_OPT, "pid-5");
+        session.set_user_option(VT_OWNER_HB_OPT, &now_ms().to_string());
+        session.release_vt_owner_with_deadline("pid-5", &deadline);
+        assert!(!session.refresh_vt_owner("pid-5"));
+        assert!(pane_is_piped());
+
+        session.release_vt_pipe_owner_with_deadline("pid-4", &deadline);
+        assert!(!session.refresh_vt_owner("pid-4"));
+        assert!(!pane_is_piped());
         session.release_size_owner("sz");
     }
 
@@ -2083,6 +3497,24 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         let (content, cursor) = painted;
+
+        for (label, composited) in [("pane", false), ("composited window", true)] {
+            let _ = crate::tmux::fork_probe::take();
+            let probe = crate::tmux::fork_probe::arm();
+            if composited {
+                session
+                    .capture_window_composited_with_cursor(5)
+                    .expect("composited capture");
+            } else {
+                session.capture_pane_with_cursor(5).expect("pane capture");
+            }
+            drop(probe);
+            assert_eq!(
+                crate::tmux::fork_probe::take(),
+                1,
+                "{label} capture must use one operation deadline and one tmux invocation",
+            );
+        }
 
         // The capture content is the same text the plain path would return:
         // the cursor line must have been split off, not leak into the body.
@@ -2303,7 +3735,53 @@ mod tests {
         );
     }
 
-    /// #3071: `is_attached` gates the TUI's passive preview resize, so it has
+    /// #3265: tmux silently falls back to its server's `$HOME` when `-c`
+    /// points at a directory that doesn't exist, landing a fresh/restarted
+    /// pane in the daemon's launch directory instead of the session's
+    /// `project_path`. `create_with_size_env` must refuse to spawn rather
+    /// than let that happen invisibly.
+    #[test]
+    #[serial_test::serial]
+    fn test_create_with_size_env_rejects_missing_working_dir() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let guard = TmuxTestSession::new("aoe_test_missing_dir");
+        let session = super::Session::from_name(guard.name());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing_dir = tmp.path().join("does-not-exist");
+        let result = session.create_with_size(
+            missing_dir.to_str().unwrap(),
+            Some("sleep 5"),
+            None,
+            "default",
+        );
+
+        assert!(
+            result.is_err(),
+            "create_with_size_env must reject a missing working directory instead of \
+             silently falling back to tmux's own $HOME"
+        );
+        assert!(
+            !session.exists(),
+            "no tmux session should have been created"
+        );
+    }
+    #[test]
+    fn expired_deadline_stops_vt_owner_commands_immediately() {
+        let deadline = crate::tmux::TmuxCommandDeadline::with_timeout(Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(5));
+        let started = Instant::now();
+        let session = Session::from_name("aoe_test_expired_owner");
+        assert!(!session.claim_vt_owner_with_deadline("owner", Duration::from_secs(10), &deadline,));
+        session.release_vt_owner_with_deadline("owner", &deadline);
+        session.release_vt_pipe_owner_with_deadline("owner", &deadline);
+        assert!(started.elapsed() < Duration::from_millis(50));
+    }
+
+    /// #3071: is_attached gates the TUI's passive preview resize, so it has
     /// to be right in both directions. The detached half is the cheap one; the
     /// attached half needs a real tmux client, which the sibling test below
     /// gets by running one inside a second tmux session.
@@ -2333,9 +3811,10 @@ mod tests {
         assert!(output.status.success());
 
         let session = Session::from_name(guard.name());
-        assert!(
-            !session.is_attached(),
-            "Detached session should report is_attached() == false"
+        assert_eq!(
+            session.is_attached(),
+            Some(false),
+            "Detached session should report is_attached() == false",
         );
     }
 
@@ -2403,7 +3882,7 @@ mod tests {
         let session = Session::from_name(target.name());
         let mut attached = false;
         for _ in 0..40 {
-            if session.is_attached() {
+            if session.is_attached() == Some(true) {
                 attached = true;
                 break;
             }
@@ -2566,6 +4045,7 @@ mod tests {
             .output()
             .expect("tmux new-session");
         assert!(output.status.success());
+        let agent_pane = only_pane_id(&session_name);
 
         // Force base-index 1 to simulate users who have set base-index 1 in
         // their tmux.conf. With base-index 1, window 0 does not exist, so any
@@ -2583,7 +4063,7 @@ mod tests {
             .expect("tmux new-window");
         assert!(output.status.success());
 
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        wait_for_pane_command(&agent_pane, "sleep");
 
         let session = Session {
             name: session_name.clone(),
@@ -2606,7 +4086,8 @@ mod tests {
         );
     }
 
-    /// An unsplit window must composite to exactly what `capture_pane`
+    /// An unsplit window must composite to exactly what the single-pane
+    /// preview capture (`capture_pane_with_cursor`, the other `-N` transport)
     /// returns, so the overwhelmingly common case is provably unchanged.
     #[test]
     #[serial_test::serial]
@@ -2620,7 +4101,10 @@ mod tests {
         let session = start_composite_session(guard.name(), 80, 24, "sh -c 'echo ALPHA; sleep 30'");
         wait_for_pane_text(&session, "ALPHA");
 
-        let plain = session.capture_pane(10).expect("capture_pane");
+        let plain = session
+            .capture_pane_with_cursor(10)
+            .expect("capture_pane_with_cursor")
+            .0;
         let composited = session
             .capture_window_composited(10)
             .expect("capture_window_composited");
@@ -2674,6 +4158,163 @@ mod tests {
         );
     }
 
+    /// Pane 0's rectangle as tmux reports it, `(left, top, width, height)`.
+    fn pane0_tmux_geometry(session: &Session) -> (u16, u16, u16, u16) {
+        let out = crate::tmux::tmux_command()
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                &format!("{}:^.0", session.name),
+                "-F",
+                "#{pane_left} #{pane_top} #{pane_width} #{pane_height}",
+            ])
+            .output()
+            .expect("display-message");
+        assert!(out.status.success(), "display-message failed");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut fields = text.split_whitespace();
+        let left = fields.next().expect("pane_left").parse().expect("u16");
+        let top = fields.next().expect("pane_top").parse().expect("u16");
+        let width = fields.next().expect("pane_width").parse().expect("u16");
+        let height = fields.next().expect("pane_height").parse().expect("u16");
+        (left, top, width, height)
+    }
+
+    /// A top border row shifts pane 0 down. Across horizontal, vertical, and
+    /// stacked splits, verify that the carried rectangle matches tmux and the
+    /// composite paints the cursor row at `cursor.y + top`; the untranslated
+    /// row assertion keeps the test non-vacuous.
+    #[test]
+    #[serial_test::serial]
+    fn composited_cursor_and_pane0_origin_track_pane_border_offset() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        // Each layout's second-pane splits; the pane parks its cursor right
+        // after `MARKER` on its row 0 (`printf` emits no newline).
+        let layouts: [(&str, &[&[&str]]); 3] = [
+            ("aoe_test_cursor_h", &[&["split-window", "-h"]]),
+            ("aoe_test_cursor_v", &[&["split-window", "-v"]]),
+            (
+                "aoe_test_cursor_stack",
+                &[&["split-window", "-v"], &["split-window", "-v"]],
+            ),
+        ];
+        for (name, splits) in layouts {
+            let guard = TmuxTestSession::new(name);
+            let session =
+                start_composite_session(guard.name(), 80, 24, "sh -c 'printf MARKER; sleep 60'");
+            for args in splits {
+                let status = crate::tmux::tmux_command()
+                    .args(args.iter().copied().chain(["-t", session.name.as_str()]))
+                    .status()
+                    .expect("tmux split-window");
+                assert!(status.success(), "{name}: split failed");
+            }
+            let status = crate::tmux::tmux_command()
+                .args([
+                    "set-option",
+                    "-w",
+                    "-t",
+                    &session.name,
+                    "pane-border-status",
+                    "top",
+                ])
+                .status()
+                .expect("tmux set-option");
+            assert!(status.success(), "{name}: set-option failed");
+            wait_for_composite_text(&session, "MARKER");
+
+            let (content, cursor) = session
+                .capture_window_composited_with_cursor(20)
+                .expect("capture_window_composited_with_cursor");
+            let cursor = cursor.unwrap_or_else(|| panic!("{name}: composited cursor missing"));
+            let rect = cursor
+                .composite_pane0
+                .unwrap_or_else(|| panic!("{name}: composite_pane0 missing"));
+            assert_eq!(
+                (rect.left, rect.top, rect.width, rect.height),
+                pane0_tmux_geometry(&session),
+                "{name}: carried rectangle must match tmux"
+            );
+            assert_eq!(rect.top, 1, "{name}: border status must shift pane 0");
+
+            // The untranslated index (cursor.y alone) must NOT land on the
+            // marker row, or the assertion below proves nothing.
+            let lines: Vec<&str> = content.lines().collect();
+            assert!(
+                !lines[cursor.y as usize].contains("MARKER"),
+                "{name}: marker unexpectedly at untranslated row {}",
+                cursor.y
+            );
+            let painted = lines
+                .get(cursor.y as usize + rect.top as usize)
+                .unwrap_or_else(|| panic!("{name}: translated row out of range"));
+            assert!(
+                painted.contains("MARKER"),
+                "{name}: cursor row {} painted {:?}, expected MARKER at +{}",
+                cursor.y,
+                painted,
+                rect.top
+            );
+        }
+    }
+
+    /// A full-screen TUI (opencode's dimmed modal backdrop, its empty home
+    /// screen) paints its background as full-width runs of bg-styled spaces.
+    /// `capture-pane` trims trailing spaces by default, styled or not, while
+    /// the VT path keeps styled trailing blanks as content (`row_last_col`).
+    /// The preview alternates between the two sources, so a fill dropped by
+    /// one and kept by the other flickers at the idle-poll cadence (#3336).
+    /// Every preview-feeding capture must therefore preserve the fill.
+    #[test]
+    #[serial_test::serial]
+    fn preview_captures_preserve_trailing_bg_fill() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let guard = TmuxTestSession::new("aoe_test_bg_fill");
+        // Row 0: a 40-column run of bg-styled spaces, opencode's backdrop
+        // pattern. Row 1: text so the wait helper has a needle that survives
+        // the trim either way.
+        let session = start_composite_session(
+            guard.name(),
+            40,
+            8,
+            "sh -c 'printf \"\\033[44m%40s\\033[0m\\nALPHA\\n\" \"\"; sleep 30'",
+        );
+        wait_for_pane_text(&session, "ALPHA");
+
+        let fill = format!("\u{1b}[44m{}", " ".repeat(40));
+        let (with_cursor, _) = session
+            .capture_pane_with_cursor(10)
+            .expect("capture_pane_with_cursor");
+        assert!(
+            with_cursor.contains(fill.as_str()),
+            "capture_pane_with_cursor dropped the styled fill:\n{with_cursor:?}"
+        );
+
+        let composited = session
+            .capture_window_composited(10)
+            .expect("capture_window_composited");
+        assert!(
+            composited.contains(fill.as_str()),
+            "capture_window_composited dropped the styled fill:\n{composited:?}"
+        );
+
+        let layout = session.capture_window_layout(1).expect("layout");
+        let rows = layout.panes[0].rows.join("\n");
+        assert!(
+            rows.contains(fill.as_str()),
+            "capture_window_layout dropped the styled fill:\n{rows:?}"
+        );
+    }
+
     /// `C-b z` keeps `window_panes` at its real count while reporting every pane
     /// at the window's FULL rectangle, so the rectangles overlap and the
     /// compositor's tiling assumption breaks. Compositing that painted pane 0 at
@@ -2683,7 +4324,7 @@ mod tests {
     /// so, since nothing self-heals a zoom.
     ///
     /// Zoomed must therefore be treated as unsplit, byte-for-byte identical to
-    /// the plain capture.
+    /// the single-pane preview capture.
     #[test]
     #[serial_test::serial]
     fn a_zoomed_pane_falls_back_to_the_plain_capture() {
@@ -2741,7 +4382,10 @@ mod tests {
         );
         assert_eq!(
             zoomed,
-            session.capture_pane(10).expect("plain capture"),
+            session
+                .capture_pane_with_cursor(10)
+                .expect("capture_pane_with_cursor")
+                .0,
             "zoomed must be byte-identical to the pane-0 capture"
         );
 
@@ -2801,8 +4445,10 @@ mod tests {
     }
 
     /// The live path caches a layout and re-renders only pane 0 from its VT
-    /// grid, so the layout must come back with pane 0 first, at the window
-    /// origin, and with rectangles that tile the real window.
+    /// grid, so the layout must come back with pane 0 first and with
+    /// rectangles that tile the real window. This split sets no
+    /// border-status option, so pane 0 additionally sits at the window
+    /// origin here.
     #[test]
     #[serial_test::serial]
     fn captured_layout_puts_pane_zero_first_at_the_origin() {
@@ -2853,7 +4499,7 @@ mod tests {
         assert_eq!(
             (first.left, first.top),
             (0, 0),
-            "pane 0 must sit at the window origin for the cursor math to hold"
+            "pane 0 must sit at the origin in this split; a border-status row would shift it"
         );
         // Pane 0 is the agent's, even though pane 1 is the active one.
         assert!(
@@ -2898,7 +4544,10 @@ mod tests {
         let (content, cursor) = session
             .capture_window_composited_with_cursor(20)
             .expect("composited capture");
-        let plain = session.capture_pane(20).expect("capture_pane");
+        let plain = session
+            .capture_pane_with_cursor(20)
+            .expect("capture_pane_with_cursor")
+            .0;
         assert_eq!(
             content, plain,
             "unsplit window must still pass pane bytes through untouched"
@@ -2909,6 +4558,10 @@ mod tests {
         );
         let cursor = cursor.expect("a cursor for a live pane");
         assert_eq!(cursor.pane_width, 80, "cursor carries the pane geometry");
+        assert!(
+            cursor.position_reliable,
+            "an unchanged single-pane capture must keep its cursor"
+        );
 
         // Now split, and the cursor must be rebased onto the window so the
         // renderer's `pane_height` anchoring still lines up with the composite.
@@ -3008,6 +4661,7 @@ mod tests {
             .output()
             .expect("tmux new-session");
         assert!(output.status.success());
+        let agent_pane = only_pane_id(&session_name);
 
         // Force base-index 1 to simulate users who have set base-index 1 in
         // their tmux.conf. With base-index 1, window 0 does not exist, so any
@@ -3025,7 +4679,7 @@ mod tests {
             .expect("tmux new-window");
         assert!(output.status.success());
 
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        wait_for_pane_command(&agent_pane, "sleep");
 
         // Should be false: first window runs 'sleep', not a shell.
         // Would incorrectly return true if the active second window (sh) were checked.
@@ -3074,6 +4728,7 @@ mod tests {
             .output()
             .expect("tmux new-session");
         assert!(output.status.success());
+        let agent_pane = only_pane_id(&session_name);
 
         // Split the window -- this creates a new pane running a shell
         let output = crate::tmux::tmux_command()
@@ -3089,7 +4744,7 @@ mod tests {
             .expect("tmux select-pane");
         assert!(output.status.success());
 
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        wait_for_pane_command(&agent_pane, "sleep");
 
         // The agent pane (pane 0) is still alive
         assert!(
@@ -3146,6 +4801,7 @@ mod tests {
             .output()
             .expect("tmux new-session");
         assert!(output.status.success());
+        let agent_pane = only_pane_id(&session_name);
 
         // Simulate a user with pane-base-index 1 globally by setting it on the
         // window -- but aoe has already pinned pane-base-index 0 on the session,
@@ -3161,7 +4817,7 @@ mod tests {
             .expect("tmux split-window");
         assert!(output.status.success());
 
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        wait_for_pane_command(&agent_pane, "sleep");
 
         assert!(
             !is_pane_dead(&session_name),
@@ -3210,49 +4866,242 @@ mod tests {
     }
 
     #[test]
-    fn test_build_create_args_env_emits_e_flags_before_command() {
+    fn test_build_create_args_keeps_only_non_secret_launch_id_in_tmux_env() {
         let args = build_create_args(
             "s",
             "/tmp/work",
-            &[("HOME", "/Users/me"), ("SHELL", "/bin/zsh")],
-            Some("'/bin/zsh' -l"),
+            &[(
+                crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY,
+                "non-secret-generation",
+            )],
+            Some("omp"),
             None,
         );
-        // Each pair becomes an adjacent `-e KEY=VAL`.
-        let e_idx = args.iter().position(|a| a == "-e").unwrap();
-        assert_eq!(args[e_idx + 1], "HOME=/Users/me");
-        assert_eq!(args[e_idx + 3], "SHELL=/bin/zsh");
-        // Env flags precede the trailing command.
-        assert!(e_idx < args.iter().position(|a| a == "'/bin/zsh' -l").unwrap());
-        // `-c` still precedes the env flags.
-        assert!(args.iter().position(|a| a == "-c").unwrap() < e_idx);
+        let e_idx = args.iter().position(|arg| arg == "-e").unwrap();
+        assert_eq!(
+            args[e_idx + 1],
+            format!(
+                "{}=non-secret-generation",
+                crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY
+            )
+        );
     }
 
-    /// `create_with_size_env` appends the caller's `extra_env` after the
-    /// forwarded desktop env precisely so a `host_hooks.before_session` value
-    /// overrides a same-keyed desktop entry. Arg construction must preserve that
-    /// order rather than dedupe or reorder, or the intent is lost before tmux
-    /// ever sees it.
     #[test]
-    fn test_build_create_args_preserves_duplicate_key_order() {
-        let args = build_create_args(
-            "s",
-            "/tmp/work",
+    fn test_protected_env_file_keeps_secret_out_of_pane_argv_and_rejects_invalid_keys() {
+        let secret = "literal-secret-value";
+        let file = EphemeralEnvFile::create(
             &[
-                ("CLAUDE_CONFIG_DIR", "/desktop"),
-                ("CLAUDE_CONFIG_DIR", "/minted"),
+                PaneEnvMutation::set("GOOD_TOKEN".to_string(), "stale-profile-value".to_string()),
+                PaneEnvMutation::set("GOOD_TOKEN".to_string(), secret.to_string()),
+                PaneEnvMutation::set("X; touch /tmp/injected; #".to_string(), "bad".to_string()),
             ],
-            Some("claude"),
-            None,
+            &[],
+        )
+        .unwrap();
+        let path = file.path.as_ref().unwrap().clone();
+        let wrapper = file.wrap_command(Some("omp --help")).unwrap();
+        let args = build_create_args("s", "/tmp/work", &[], Some(&wrapper), None);
+        assert!(wrapper.starts_with(&format!(
+            "exec {} ",
+            crate::session::environment::shell_escape(
+                &crate::session::environment::user_posix_shell()
+            )
+        )));
+
+        assert!(!wrapper.contains(secret));
+        assert!(!wrapper.contains("stale-profile-value"));
+        assert!(!args.iter().any(|arg| arg.contains(secret)));
+        assert!(!wrapper.contains("touch /tmp/injected"));
+        assert!(wrapper.contains(&path.to_string_lossy().to_string()));
+        let contents = std::fs::read_to_string(&path).unwrap();
+
+        assert!(contents.find("rm -f").unwrap() < contents.find("omp --help").unwrap());
+        assert!(contents.contains("export GOOD_TOKEN='literal-secret-value'"));
+        let stale = contents
+            .find("export GOOD_TOKEN='stale-profile-value'")
+            .unwrap();
+        let minted = contents
+            .find("export GOOD_TOKEN='literal-secret-value'")
+            .unwrap();
+        assert!(stale < minted, "later minted export must win when sourced");
+        assert!(!contents.contains("touch /tmp/injected"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        drop(file);
+        assert!(!path.exists(), "failure guard must clean up the channel");
+    }
+
+    #[test]
+    fn test_protected_env_file_preserves_multiline_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("multiline");
+        let value = "line one\nline two\r\nquote ' intact";
+        let stale_output = temp.path().join("unset");
+        let mut file = EphemeralEnvFile::create(
+            &[
+                PaneEnvMutation::set("MULTILINE_SECRET".to_string(), value.to_string()),
+                PaneEnvMutation::unset("AOE_TEST_STALE".to_string()),
+            ],
+            &[],
+        )
+        .unwrap();
+        let command = format!(
+            "printf '%s' \"$MULTILINE_SECRET\" > {}; printf '%s' \"${{AOE_TEST_STALE+x}}\" > {}",
+            script_shell_escape(&output.to_string_lossy()),
+            script_shell_escape(&stale_output.to_string_lossy())
         );
-        let values: Vec<&String> = args
-            .iter()
-            .filter(|a| a.starts_with("CLAUDE_CONFIG_DIR="))
-            .collect();
+        let wrapper = file.wrap_command(Some(&command)).unwrap();
+        let status = std::process::Command::new("sh")
+            .args(["-c", &wrapper])
+            .env("AOE_TEST_STALE", "inherited")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(std::fs::read(&output).unwrap(), value.as_bytes());
+        assert_eq!(std::fs::read_to_string(stale_output).unwrap(), "");
+        assert!(file.wait_until_consumed(Duration::ZERO));
+        file.disarm();
+    }
+
+    /// `#[serial]` because the assertion reads the inherited PATH, and every
+    /// test that scrubs PATH process-globally carries that same default-key
+    /// annotation: `crate::acp::node`, `crate::acp::acp_client`, and
+    /// `crate::update::install`. Not an `EnvGuard` lock: none of them takes
+    /// `test_support::ENV_LOCK`.
+    #[test]
+    #[serial_test::serial]
+    fn test_container_env_file_does_not_mutate_host_process_environment() {
+        let temp = tempfile::tempdir().unwrap();
+        let host_output = temp.path().join("host-env");
+        let payload_output = temp.path().join("container-env");
+        let target_env = vec![
+            ("PATH".to_string(), "/repo-controlled/bin".to_string()),
+            (
+                "DOCKER_HOST".to_string(),
+                "tcp://repo-controlled.example".to_string(),
+            ),
+            ("TOKEN".to_string(), "secret-value".to_string()),
+        ];
+        let mut file = EphemeralEnvFile::create(&[], &target_env).unwrap();
+        let script_path = file.path.as_ref().unwrap().clone();
+        let payload_path = file.container_env_path.as_ref().unwrap().clone();
+        let command = format!(
+            "printf '%s\\n%s' \"$PATH\" \"${{DOCKER_HOST-unset}}\" > {}; \
+             cat {} > {}",
+            script_shell_escape(&host_output.to_string_lossy()),
+            crate::session::environment::CONTAINER_EXEC_ENV_PATH,
+            script_shell_escape(&payload_output.to_string_lossy()),
+        );
+        let wrapper = file.wrap_command(Some(&command)).unwrap();
+        let script = std::fs::read_to_string(&script_path).unwrap();
+
+        assert!(!script.contains("/repo-controlled/bin"));
+        assert!(!script.contains("tcp://repo-controlled.example"));
+        assert!(!wrapper.contains("secret-value"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&payload_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
+        // The PATH is asserted back below to prove the env file did not mutate
+        // the host process environment, so it has to be a value this host can
+        // actually resolve `cat` on.
+        // `var_os`, not `var`: a PATH entry need not be UTF-8, and `var`
+        // returns `Err(VarError::NotUnicode)` for one that isn't, which the
+        // `unwrap_or_default` below would turn into an empty PATH rather than
+        // a failure.
+        let host_path = std::env::var_os("PATH").unwrap_or_default();
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", &wrapper])
+            .env("PATH", &host_path)
+            .env_remove("DOCKER_HOST")
+            .env_remove("BASH_ENV")
+            .env_remove("ENV")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        // Compared as bytes for the same reason: a non-UTF-8 PATH survives the
+        // round trip through the shell but not through `read_to_string`.
+        let mut expected = host_path.as_encoded_bytes().to_vec();
+        expected.extend_from_slice(b"\nunset");
+        // Rendered lossily in the message only: `assert_eq!` on `Vec<u8>`
+        // prints decimal byte arrays, which is unreadable for a whole PATH.
+        let actual = std::fs::read(host_output).unwrap();
         assert_eq!(
-            values,
-            vec!["CLAUDE_CONFIG_DIR=/desktop", "CLAUDE_CONFIG_DIR=/minted"],
-            "both -e flags must survive, minted last"
+            actual,
+            expected,
+            "env file mutated the host environment: {:?} != {:?}",
+            String::from_utf8_lossy(&actual),
+            String::from_utf8_lossy(&expected),
+        );
+        assert_eq!(
+            std::fs::read_to_string(payload_output).unwrap(),
+            "PATH=/repo-controlled/bin\n\
+             DOCKER_HOST=tcp://repo-controlled.example\n\
+             TOKEN=secret-value\n"
+        );
+        assert!(file.wait_until_consumed(Duration::ZERO));
+        assert!(!payload_path.exists());
+        file.disarm();
+
+        assert!(EphemeralEnvFile::create(
+            &[],
+            &[("MULTILINE".to_string(), "line one\nline two".to_string())],
+        )
+        .is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_protected_env_is_consumed_before_create_returns() {
+        if !tmux_available() {
+            return;
+        }
+        let guard = TmuxTestSession::new("aoe_test_protected_env");
+        let session = Session::from_name(guard.name());
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("value");
+        let command = format!(
+            "printf '%s' \"$AOE_TEST_PROTECTED_VALUE\" > {}; sleep 30",
+            crate::session::environment::shell_escape(&output.to_string_lossy())
+        );
+
+        session
+            .create_with_size_env(
+                "/tmp",
+                Some(&command),
+                Some((80, 24)),
+                "default",
+                &[PaneEnvMutation::set(
+                    "AOE_TEST_PROTECTED_VALUE".to_string(),
+                    "secret value".to_string(),
+                )],
+            )
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !output.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read_to_string(output).unwrap(), "secret value");
+        assert!(
+            !session.is_pane_running_shell(),
+            "live protected-environment wrapper must not look like an exited agent"
         );
     }
 

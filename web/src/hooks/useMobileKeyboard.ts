@@ -13,10 +13,6 @@ import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 // iOS 26 Safari / Android Chrome, where `100dvh` shrinks natively and
 // the flex layout already accounts for it.
 //
-// measure() also snaps back any stray layout-viewport scroll: iOS
-// scrolls the page to reveal a focused input even under overflow:hidden
-// roots, and nothing else ever scrolls the layout viewport.
-//
 // The PTY-era machinery (debounced keyboardOcclusion, the
 // stableViewportHeight root pin) is gone: every mobile terminal surface
 // renders the capture-snapshot live view now, so no PTY needs shielding
@@ -94,17 +90,6 @@ export function useMobileKeyboard() {
       parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--safe-area-bottom")) || 0;
 
     const measure = () => {
-      // iOS scrolls the layout viewport to reveal a focused input even
-      // though the app root is overflow:hidden (the xterm helper
-      // textarea rides the terminal cursor near the bottom of the pane,
-      // so opening the keyboard shoves the whole app up by roughly the
-      // keyboard height and it never comes back). The app never scrolls
-      // the layout viewport itself, so any non-zero scroll here is
-      // WebKit's doing; snap it back so occlusion padding stays the only
-      // thing that moves the terminal.
-      if (window.scrollY !== 0 || document.documentElement.scrollTop !== 0) {
-        window.scrollTo(0, 0);
-      }
       const currentVvH = vv.height;
 
       if (currentVvH > fullHeightRef.current - 50) {
@@ -175,10 +160,6 @@ export function useMobileKeyboard() {
     vv.addEventListener("scroll", handleViewportChange);
     document.addEventListener("focusin", handleFocusIn);
     window.addEventListener("orientationchange", handleOrientationChange);
-    // WebKit's focus-driven layout-viewport scroll does not always move
-    // the visual viewport relative to the layout viewport, so the vv
-    // "scroll" listener alone can miss it; the window scroll event is
-    // the reliable signal for the snap-back in measure().
     window.addEventListener("scroll", handleViewportChange);
     return () => {
       cancelAnimationFrame(rafRef.current);

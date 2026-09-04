@@ -90,6 +90,13 @@ pub struct PromptRequest {
     /// verb) keep working unchanged.
     #[serde(default)]
     pub attachments: Vec<PromptAttachmentUpload>,
+    /// Optional client-minted stable id for this prompt, threaded into the
+    /// emitted `Event::UserPromptSent` so a client can reconcile its
+    /// optimistic transcript row by id. Accepts either `prompt_id` or the
+    /// shorter `id` key; `#[serde(default)]` keeps clients that send neither
+    /// (today's behavior) working unchanged.
+    #[serde(default, alias = "id")]
+    pub prompt_id: Option<String>,
 }
 
 /// `POST /api/sessions/{id}/acp/prompt/diff-comments` body.
@@ -178,6 +185,13 @@ pub struct ReplayQuery {
     /// `has_more` is true. Forward `since`/`limit` paging is unaffected.
     #[serde(default)]
     pub before: Option<u64>,
+    /// Optional projection selector. Omitted (the default) returns the raw
+    /// `frames` shape every existing client relies on. `view=rows` folds the
+    /// SAME selected page through `TranscriptModel` and returns the built
+    /// `TranscriptRow[]` in `rows` instead of `frames`, with the same pagination
+    /// metadata.
+    #[serde(default)]
+    pub view: Option<String>,
 }
 
 /// `GET /api/sessions/{id}/acp/replay` response.
@@ -210,6 +224,16 @@ pub struct ReplayResponse {
     /// this is set. Always false for an unbounded (`limit`-less) reply.
     #[serde(default)]
     pub has_more: bool,
+    /// Present only when the request passed `view=rows`: the selected page
+    /// of events folded through `TranscriptModel`, in place of the raw
+    /// `frames`. `frames` is empty in that case. Absent (skipped) for the
+    /// default projection, so the frames response byte-shape is unchanged
+    /// for clients that do not pass `view=rows`. Per-page folding cannot see
+    /// context from earlier pages, so a page whose `tool_start` sits in an
+    /// older page relies on `TranscriptModel`'s synth-on-missing-start (its
+    /// intended, already-implemented behavior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<Vec<crate::acp::transcript::TranscriptRow>>,
 }
 
 /// `GET /api/sessions/{id}/acp/files` response. Workspace file
@@ -258,9 +282,10 @@ pub struct ContextPrimerResponse {
 /// `POST /api/sessions/{id}/acp/switch-agent` body.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SwitchAgentRequest {
-    /// Registry key of the target ACP agent (e.g. `"codex"`,
-    /// `"opencode"`). Must exist in the structured view agent registry; an
-    /// unknown name returns 400.
+    /// Registry key or configured custom ACP agent name (e.g.
+    /// `"codex"`, `"opencode"`, `"my-custom-bridge"`). Must be a built-in
+    /// registry agent or a custom agent with a valid `agent_acp_cmd`; an
+    /// unknown or unconfigured name returns 400.
     pub target: String,
     /// Optional model override forwarded to the new agent. None falls
     /// back to the instance's existing `agent_model`.
@@ -307,6 +332,21 @@ mod tests {
         let req: PromptRequest = serde_json::from_str(r#"{"text":"hello"}"#).unwrap();
         assert_eq!(req.text, "hello");
         assert!(req.attachments.is_empty());
+    }
+
+    #[test]
+    fn prompt_request_accepts_prompt_id_and_id_alias() {
+        // Absent -> None (today's behavior); either `prompt_id` or the short
+        // `id` key populates it.
+        let cases: [(&str, Option<&str>); 3] = [
+            (r#"{"text":"hi"}"#, None),
+            (r#"{"text":"hi","prompt_id":"cmp-1"}"#, Some("cmp-1")),
+            (r#"{"text":"hi","id":"cmp-2"}"#, Some("cmp-2")),
+        ];
+        for (json, expect) in cases {
+            let req: PromptRequest = serde_json::from_str(json).unwrap();
+            assert_eq!(req.prompt_id.as_deref(), expect, "{json}");
+        }
     }
 
     #[test]

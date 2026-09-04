@@ -49,6 +49,53 @@ fn test_esc_cancels() {
 }
 
 #[test]
+fn test_deprecated_tool_badge_remains_visible_on_tool_rows() {
+    use ratatui::{backend::TestBackend, Terminal};
+
+    let mut cases = [
+        (
+            "single-tool read-only",
+            NewSessionDialog::new_with_tools(vec!["gemini"], TEST_PATH.to_string()),
+            100,
+        ),
+        (
+            "constrained configured",
+            NewSessionDialog::new_with_tools(
+                vec!["claude", "codex", "gemini"],
+                TEST_PATH.to_string(),
+            ),
+            64,
+        ),
+    ];
+    cases[1].1.tool_index = 2;
+    cases[1].1.focused_field = 2;
+    cases[1].1.command_override = Input::new("custom-wrapper".to_string());
+    cases[1].1.extra_args = Input::new("--model long --verbose".to_string());
+
+    let theme = crate::tui::styles::Theme::default();
+    for (name, dialog, width) in &mut cases {
+        let mut terminal = Terminal::new(TestBackend::new(*width, 40)).expect("terminal");
+        terminal
+            .draw(|frame| dialog.render(frame, frame.area(), &theme))
+            .expect("render");
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            content.contains("⚠ deprecated"),
+            "{name} gemini row must carry the deprecation suffix; got: {content}"
+        );
+        if *name == "constrained configured" {
+            assert!(content.contains("(configured) Ctrl+P"), "{content}");
+        }
+    }
+}
+
+#[test]
 fn test_enter_submits_with_empty_title_for_builder() {
     let mut dialog = single_tool_dialog();
     let result = dialog.handle_key(key(KeyCode::Enter));
@@ -437,6 +484,7 @@ fn test_backspace_on_empty_field() {
 }
 
 #[test]
+#[serial_test::serial]
 fn test_tool_selection_left_right() {
     let mut dialog = multi_tool_dialog();
     dialog.focused_field = 2; // tool field (single profile: path=0, title=1, tool=2)
@@ -453,6 +501,7 @@ fn test_tool_selection_left_right() {
 }
 
 #[test]
+#[serial_test::serial]
 fn test_tool_selection_left_right_three_tools() {
     let mut dialog = NewSessionDialog::new_with_tools(
         vec!["claude", "opencode", "codex"],
@@ -477,6 +526,7 @@ fn test_tool_selection_left_right_three_tools() {
 }
 
 #[test]
+#[serial_test::serial]
 fn test_tool_selection_space() {
     let mut dialog = multi_tool_dialog();
     dialog.focused_field = 2; // tool field
@@ -507,6 +557,7 @@ fn test_tool_selection_ignored_single_tool() {
 }
 
 #[test]
+#[serial_test::serial]
 fn test_submit_with_selected_tool() {
     let mut dialog = multi_tool_dialog();
     dialog.focused_field = 2; // tool field
@@ -1097,6 +1148,7 @@ fn test_confirm_create_failure_shows_error() {
 // --- Profile picker tests ---
 
 #[test]
+#[serial_test::serial]
 fn test_profile_cycling() {
     let mut dialog = single_tool_dialog();
     dialog.available_profiles = vec![
@@ -1313,10 +1365,9 @@ environment = ["THING=$REPO_THING"]
 
     dialog.path = Input::new(repo.path().to_string_lossy().to_string());
     // Field order (no profile picker, single tool): path 0, title 1, then
-    // the Structured row only when the serve build makes claude
-    // ACP-capable (reload_config_defaults recomputed it), then yolo,
-    // worktree, sandbox. Derive the offset so both feature builds target
-    // the sandbox row.
+    // the Structured row when claude is ACP-capable
+    // (reload_config_defaults recomputed it), then yolo, worktree,
+    // sandbox. Derive the offset so this targets the sandbox row.
     dialog.focused_field = 4 + usize::from(dialog.structured_capable);
     let result = dialog.handle_key(ctrl_key(KeyCode::Char('p')));
 
@@ -1366,6 +1417,7 @@ fn test_env_list_edit_submits_session_override() {
 // --- Sandbox config mode tests ---
 
 #[test]
+#[serial_test::serial]
 fn test_ctrl_p_on_sandbox_enters_config_mode() {
     let mut dialog = multi_tool_dialog();
     dialog.docker_available = true;
@@ -1569,6 +1621,7 @@ fn click_on_path_field_just_moves_focus() {
 }
 
 #[test]
+#[serial_test::serial]
 fn click_on_tool_cycles_when_multi_tool() {
     let mut dialog = multi_tool_dialog();
     // Multi-tool, no-profile layout: path=0, title=1, tool=2.

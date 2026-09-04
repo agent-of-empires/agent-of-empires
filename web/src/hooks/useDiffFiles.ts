@@ -19,7 +19,7 @@ interface UseDiffFilesResult {
 
 export function useDiffFiles(sessionId: string | null, enabled: boolean): UseDiffFilesResult {
   const [files, setFiles] = useState<RichDiffFile[]>([]);
-  const [perRepoBases, setPerRepoBases] = useState<RepoBase[]>([{ base_branch: "main" }]);
+  const [perRepoBases, setPerRepoBases] = useState<RepoBase[]>([{ base_branch: "main", repo_path: "" }]);
   const [warning, setWarning] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [revision, setRevision] = useState(0);
@@ -41,7 +41,16 @@ export function useDiffFiles(sessionId: string | null, enabled: boolean): UseDif
     // Drop stale responses: another fetch started, or session changed mid-flight
     if (reqId !== requestIdRef.current || capturedSessionId !== sessionId) return;
     if (resp) {
-      const fingerprint = JSON.stringify(resp.files);
+      // The bases and the warning are part of the fingerprint, not just the
+      // file list: changing a repo's diff base can leave the file list
+      // identical (two empty diffs, most obviously), and keying on files alone
+      // meant the refetch after a base change never applied the new base, so
+      // the picker kept showing the old one. See #3329.
+      const fingerprint = JSON.stringify({
+        files: resp.files,
+        per_repo_bases: resp.per_repo_bases,
+        warning: resp.warning ?? null,
+      });
       if (fingerprint !== lastFingerprintRef.current) {
         lastFingerprintRef.current = fingerprint;
         setFiles(resp.files);

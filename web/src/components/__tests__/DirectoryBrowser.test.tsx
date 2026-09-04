@@ -41,8 +41,8 @@ describe("DirectoryBrowser", () => {
     render(<DirectoryBrowser initialPath="/missing" onSelect={vi.fn()} />);
 
     await expect(screen.findByRole("option", { name: /project/i })).resolves.toBeTruthy();
-    expect(browseFilesystem).toHaveBeenNthCalledWith(1, "/missing", 100, undefined);
-    expect(browseFilesystem).toHaveBeenNthCalledWith(2, "/home/user", 100, undefined);
+    expect(browseFilesystem).toHaveBeenNthCalledWith(1, "/missing", 100, undefined, false);
+    expect(browseFilesystem).toHaveBeenNthCalledWith(2, "/home/user", 100, undefined, false);
   });
 
   it("ignores stale browse responses after a newer navigation finishes", async () => {
@@ -64,7 +64,7 @@ describe("DirectoryBrowser", () => {
     fireEvent.click(screen.getByRole("button", { name: "user" }));
 
     await waitFor(() => {
-      expect(browseFilesystem).toHaveBeenCalledWith("/home/user", 100, undefined);
+      expect(browseFilesystem).toHaveBeenCalledWith("/home/user", 100, undefined, false);
     });
 
     expect(resolveSlow).toBeDefined();
@@ -107,8 +107,42 @@ describe("DirectoryBrowser", () => {
     });
 
     await waitFor(() => {
-      expect(browseFilesystem).toHaveBeenCalledWith("/home/user", 100, "z");
+      expect(browseFilesystem).toHaveBeenCalledWith("/home/user", 100, "z", false);
     });
     await expect(screen.findByRole("option", { name: /z-project/i })).resolves.toBeTruthy();
+  });
+
+  it("requests hidden folders when the toggle is on, keeping the filter and resetting pagination", async () => {
+    getHomePath.mockResolvedValue("/home/user");
+    const firstPage = Array.from({ length: 100 }, (_, i) => dir(`project-${i + 1}`));
+    browseFilesystem.mockImplementation(
+      async (_path: string, _limit: number, _filter?: string, showHidden?: boolean) => {
+        if (showHidden) return response([dir(".hidden-proj", "/home/user/.hidden-proj")]);
+        return { entries: firstPage, has_more: true, ok: true };
+      },
+    );
+
+    render(<DirectoryBrowser onSelect={vi.fn()} />);
+
+    await screen.findByRole("option", { name: "project-1" });
+    // Page past the first 100 so the toggle has an expanded limit to reset.
+    fireEvent.click(screen.getByRole("button", { name: /load 100 more/i }));
+    await waitFor(() => {
+      expect(browseFilesystem).toHaveBeenCalledWith("/home/user", 200, "", false);
+    });
+
+    fireEvent.change(screen.getByPlaceholderText("Type to filter..."), {
+      target: { value: "proj" },
+    });
+    await waitFor(() => {
+      expect(browseFilesystem).toHaveBeenCalledWith("/home/user", 100, "proj", false);
+    });
+
+    fireEvent.click(screen.getByRole("checkbox", { name: /show hidden folders/i }));
+
+    await waitFor(() => {
+      expect(browseFilesystem).toHaveBeenLastCalledWith("/home/user", 100, "proj", true);
+    });
+    await expect(screen.findByRole("option", { name: /\.hidden-proj/ })).resolves.toBeTruthy();
   });
 });

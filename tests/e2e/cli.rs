@@ -41,6 +41,67 @@ fn test_cli_add_and_list() {
     );
 }
 
+/// #3224: repeating `aoe add` for the same title and path must report a
+/// conflict instead of exiting successfully while silently retaining the
+/// first session's command override.
+#[test]
+#[parallel]
+fn test_cli_add_duplicate_errors_and_preserves_original_command() {
+    let h = TuiTestHarness::new("cli_add_duplicate");
+    let project = h.project_path();
+    let project = project.to_str().unwrap();
+
+    let first = h.run_cli(&[
+        "add",
+        project,
+        "--title",
+        "Duplicate Session",
+        "--cmd-override",
+        "echo OLD",
+    ]);
+    assert!(
+        first.status.success(),
+        "initial aoe add failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    let duplicate = h.run_cli(&[
+        "add",
+        project,
+        "--title",
+        "Duplicate Session",
+        "--cmd-override",
+        "echo NEW",
+    ]);
+    assert!(
+        !duplicate.status.success(),
+        "duplicate aoe add must return a non-zero status"
+    );
+    assert_eq!(
+        duplicate.status.code(),
+        Some(1),
+        "duplicate aoe add should use the CLI's ordinary error exit status"
+    );
+    let stderr = String::from_utf8_lossy(&duplicate.stderr);
+    assert!(
+        stderr.contains("Session already exists with same title and path")
+            && stderr.contains("different title"),
+        "duplicate error should identify the collision and offer remediation.\nstderr: {stderr}"
+    );
+
+    let sessions = read_sessions_json(&h);
+    let sessions = sessions.as_array().expect("sessions array");
+    assert_eq!(
+        sessions.len(),
+        1,
+        "duplicate add must not create a second row"
+    );
+    assert_eq!(
+        sessions[0]["command"], "echo OLD",
+        "duplicate add must preserve the original command override"
+    );
+}
+
 /// Regression test for #848: `aoe add` "Next steps" hint should reference
 /// the actual binary name (`aoe`), not the long project name.
 #[test]
@@ -1142,6 +1203,106 @@ fn test_cli_session_capture_plain() {
     );
 }
 
+/// #3625: `aoe session capture` ran the agent's manifest directly, so a
+/// profile's own `[[agents.<name>.status_rules]]` never got a say and the CLI
+/// could report a different status than the dashboard for the same pane. The
+/// tool has to be manifest-backed for the regression to bite, since that is
+/// the branch that skipped the rules.
+#[test]
+#[parallel]
+fn test_cli_session_capture_honors_configured_status_rules() {
+    require_tmux!();
+
+    let mut h = TuiTestHarness::new("cli_capture_rules");
+    h.install_path_command("opencode");
+
+    let dir = h.home_path().join("fake-bin");
+    std::fs::create_dir_all(&dir).expect("create fake-bin dir");
+    let agent = dir.join("fake-rules-agent");
+    // The pane text the configured rule matches. No opencode manifest rule
+    // reads it as Waiting, so a Waiting verdict can only come from the rule.
+    std::fs::write(&agent, "#!/bin/sh\necho 'deploy to prod?'\nsleep 60\n")
+        .expect("write fake agent script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake agent script");
+    }
+
+    let config_path = crate::harness::app_dir_in(h.home_path()).join("config.toml");
+    let seeded = std::fs::read_to_string(&config_path).expect("read seeded config");
+    std::fs::write(
+        &config_path,
+        format!(
+            "{seeded}\n\n[[agents.opencode.status_rules]]\n\
+             status = \"waiting\"\ncontains = \"deploy to prod?\"\n"
+        ),
+    )
+    .expect("write status rules config");
+
+    let project = h.project_path();
+    let add_output = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "-t",
+        "CaptureRules",
+        "--tool",
+        "opencode",
+        "--cmd-override",
+        agent.to_str().unwrap(),
+    ]);
+    assert!(
+        add_output.status.success(),
+        "aoe add failed: {}",
+        String::from_utf8_lossy(&add_output.stderr)
+    );
+
+    let sessions = read_sessions_json(&h);
+    let session_id = sessions[0]["id"]
+        .as_str()
+        .expect("session should have id")
+        .to_string();
+
+    let start_output = h.run_cli(&["session", "start", &session_id]);
+    assert!(
+        start_output.status.success(),
+        "aoe session start failed: {}",
+        String::from_utf8_lossy(&start_output.stderr)
+    );
+
+    // The rule can only match once the pane has painted, so poll the CLI
+    // itself rather than sleeping on a guess.
+    let mut json = serde_json::Value::Null;
+    for _ in 0..50 {
+        let out = h.run_cli(&["session", "capture", &session_id, "--json"]);
+        if out.status.success() {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&stdout) {
+                json = parsed;
+                if json["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("deploy to prod?"))
+                {
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    assert!(
+        json["content"]
+            .as_str()
+            .is_some_and(|c| c.contains("deploy to prod?")),
+        "fake agent never painted into the pane; capture was: {json}"
+    );
+    assert_eq!(
+        json["status"], "waiting",
+        "a configured status rule must decide what `aoe session capture` reports (#3625)"
+    );
+}
+
 /// Renaming a session via CLI should rename the tmux session, not kill it.
 /// Regression test for https://github.com/agent-of-empires/agent-of-empires/issues/431
 #[test]
@@ -1827,4 +1988,458 @@ fn test_cli_stop_trap_redirects() {
             "aoe {argv:?} should redirect to killall and session stop, got:\n{stderr}"
         );
     }
+}
+
+/// Fake agent that prints a substantial startup banner, sleeps to simulate a
+/// slow-booting TUI, then prints opencode's real input-ready placeholder
+/// text and reads exactly one line, echoing it back in a greppable form.
+fn install_slow_boot_agent(h: &TuiTestHarness) -> std::path::PathBuf {
+    let dir = h.home_path().join("fake-bin");
+    std::fs::create_dir_all(&dir).expect("create fake-bin dir");
+    let script_path = dir.join("fake-slow-agent");
+    let script = "#!/bin/sh\n\
+echo '=== Fake Agent booting ==='\n\
+echo 'Loading modules...'\n\
+sleep 1\n\
+echo '==========================='\n\
+echo 'Ask anything...'\n\
+read -r line\n\
+echo \"GOT:[$line]\"\n\
+sleep 60\n";
+    std::fs::write(&script_path, script).expect("write fake agent script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake agent script");
+    }
+    script_path
+}
+
+/// `aoe send` right after `aoe session start` -- the sequence a headless
+/// dispatcher with no controlling terminal must use, since it cannot rely on
+/// `aoe add --launch`'s own attach -- must not race the agent's own boot: it
+/// waits for a real per-agent readiness marker (`Session::wait_until_ready`,
+/// `AgentDef::ready_marker`) before typing, instead of typing into a
+/// still-booting pane whenever `ensure_pane_ready` reports `AlreadyAlive` (a
+/// pane that already exists gets no wait at all otherwise). `--tool
+/// opencode` exercises the real registered marker ("ask anything") rather
+/// than the generic content-settle fallback. This test proves end-to-end
+/// delivery still works; the deterministic proof that the wait actually
+/// blocks until the marker appears (not just until the pane looks quiet)
+/// lives in `wait_until_ready_blocks_until_the_marker_appears` in
+/// `src/tmux/session.rs`, since canonical tty input buffering alone would
+/// let a message typed before boot survive to `read -r` here regardless.
+#[test]
+#[parallel]
+fn test_cli_send_waits_for_slow_boot_before_typing() {
+    require_tmux!();
+
+    let mut h = TuiTestHarness::new("cli_send_settle_wait");
+    // Install an `opencode` shim so `is_agent_available` passes (the test
+    // uses `--tool opencode` which triggers the built-in tool check).
+    h.install_path_command("opencode");
+    let fake_agent = install_slow_boot_agent(&h);
+    let project = h.project_path();
+
+    let add_output = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "-t",
+        "SlowBootSend",
+        "--tool",
+        "opencode",
+        "--cmd-override",
+        fake_agent.to_str().unwrap(),
+    ]);
+    assert!(
+        add_output.status.success(),
+        "aoe add failed: {}",
+        String::from_utf8_lossy(&add_output.stderr)
+    );
+
+    let sessions = read_sessions_json(&h);
+    let session_id = sessions[0]["id"]
+        .as_str()
+        .expect("session should have id")
+        .to_string();
+
+    let start_output = h.run_cli(&["session", "start", &session_id]);
+    assert!(
+        start_output.status.success(),
+        "aoe session start failed: {}",
+        String::from_utf8_lossy(&start_output.stderr)
+    );
+
+    // Send immediately: `aoe session start` returns as soon as the tmux pane
+    // exists, well before the fake agent's 1s boot delay elapses, exactly
+    // mirroring a headless dispatcher that has no controlling terminal to
+    // attach with and so cannot use `aoe add --launch`'s readiness instead.
+    let send_output = h.run_cli(&["send", &session_id, "hello there"]);
+    assert!(
+        send_output.status.success(),
+        "aoe send failed: {}",
+        String::from_utf8_lossy(&send_output.stderr)
+    );
+
+    // Poll the pane for the echoed line: it only appears once the fake
+    // agent's `read -r line` has actually returned, proving the message was
+    // delivered end to end rather than lost during boot.
+    let sock = h.home_path().join("tmux.sock");
+    let truncated_id = &session_id[..8.min(session_id.len())];
+    let tmux_name = format!(
+        "{}SlowBootSend_{}",
+        agent_of_empires::tmux::SESSION_PREFIX,
+        truncated_id
+    );
+    let mut content = String::new();
+    for _ in 0..50 {
+        let out = Command::new("tmux")
+            .arg("-S")
+            .arg(&sock)
+            .args(["capture-pane", "-t", &format!("{tmux_name}:^.0"), "-p"])
+            .output();
+        if let Ok(out) = out {
+            content = String::from_utf8_lossy(&out.stdout).to_string();
+            if content.contains("GOT:[hello there]") {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert!(
+        content.contains("GOT:[hello there]"),
+        "expected the fake agent to echo the sent message; pane content:\n{content}"
+    );
+
+    let _ = Command::new("tmux")
+        .arg("-S")
+        .arg(&sock)
+        .args(["kill-session", "-t", &tmux_name])
+        .output();
+}
+
+/// #3350: the `aoe list --state` contract a scripted consumer relies on.
+/// A trashed session must report `state: "trashed"` with a `trashed_at`
+/// stamp, must be excluded by `--state=live`, and the resulting empty
+/// listing must still be `[]` on the `--json` path rather than the
+/// human "No sessions found" line, which a `jq` consumer cannot parse.
+#[test]
+#[parallel]
+fn test_cli_list_state_filter_and_json_shape() {
+    let h = TuiTestHarness::new("cli_list_state");
+    let project = h.project_path();
+
+    let add = h.run_cli(&["add", project.to_str().unwrap(), "-t", "State Probe"]);
+    assert!(
+        add.status.success(),
+        "aoe add failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    let live: serde_json::Value =
+        serde_json::from_slice(&h.run_cli(&["list", "--json", "--state=live"]).stdout)
+            .expect("list --json --state=live must emit JSON");
+    assert_eq!(live[0]["state"], "live");
+    assert!(live[0].get("trashed_at").is_none());
+
+    let rm = h.run_cli(&["rm", "State Probe"]);
+    assert!(
+        rm.status.success(),
+        "aoe rm failed: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+
+    let all: serde_json::Value = serde_json::from_slice(&h.run_cli(&["list", "--json"]).stdout)
+        .expect("list --json must emit JSON");
+    assert_eq!(all[0]["state"], "trashed");
+    assert!(all[0]["trashed_at"].is_string());
+
+    let out = h.run_cli(&["list", "--json", "--state=live"]);
+    let empty: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "list --json with no matching rows must emit `[]`, got {:?} ({e})",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    assert_eq!(empty, serde_json::json!([]));
+
+    let trashed: serde_json::Value =
+        serde_json::from_slice(&h.run_cli(&["list", "--json", "--state=trashed"]).stdout)
+            .expect("list --json --state=trashed must emit JSON");
+    // Assert the row's state, not just its title: with a single-row fixture a
+    // title-only check would still pass if `--state=trashed` were ignored and
+    // the live row returned instead. The state field pins the filter contract.
+    assert_eq!(trashed[0]["title"], "State Probe");
+    assert_eq!(trashed[0]["state"], "trashed");
+    assert!(trashed[0]["trashed_at"].is_string());
+}
+
+/// Companion to `test_cli_list_state_filter_and_json_shape` for the lookup
+/// path: a consumer that already holds the id should not have to fall back to
+/// a full `aoe list --json` to learn whether that session is still around.
+#[test]
+#[parallel]
+fn test_cli_session_show_json_carries_state() {
+    let h = TuiTestHarness::new("cli_show_state");
+    let project = h.project_path();
+
+    let add = h.run_cli(&["add", project.to_str().unwrap(), "-t", "Show Probe"]);
+    assert!(
+        add.status.success(),
+        "aoe add failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    let live: serde_json::Value = serde_json::from_slice(
+        &h.run_cli(&["session", "show", "Show Probe", "--json"])
+            .stdout,
+    )
+    .expect("session show --json must emit JSON");
+    assert_eq!(live["state"], "live");
+    assert!(live.get("trashed_at").is_none());
+    assert!(live.get("archived_at").is_none());
+
+    let rm = h.run_cli(&["rm", "Show Probe"]);
+    assert!(
+        rm.status.success(),
+        "aoe rm failed: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+
+    let trashed: serde_json::Value = serde_json::from_slice(
+        &h.run_cli(&["session", "show", "Show Probe", "--json"])
+            .stdout,
+    )
+    .expect("session show --json must emit JSON for a trashed row");
+    assert_eq!(trashed["state"], "trashed");
+    assert!(trashed["trashed_at"].is_string());
+}
+
+/// The archived half of the same contract, and the precedence between the two
+/// states: `trash()` deliberately keeps `archived_at`, so a row that was
+/// archived first must still report `trashed`.
+#[test]
+#[parallel]
+fn test_cli_session_show_json_reports_archived_and_precedence() {
+    let h = TuiTestHarness::new("cli_show_archived");
+    let project = h.project_path();
+
+    let add = h.run_cli(&["add", project.to_str().unwrap(), "-t", "Archive Probe"]);
+    assert!(
+        add.status.success(),
+        "aoe add failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    let archive = h.run_cli(&["session", "archive", "Archive Probe"]);
+    assert!(
+        archive.status.success(),
+        "aoe session archive failed: {}",
+        String::from_utf8_lossy(&archive.stderr)
+    );
+
+    let archived: serde_json::Value = serde_json::from_slice(
+        &h.run_cli(&["session", "show", "Archive Probe", "--json"])
+            .stdout,
+    )
+    .expect("session show --json must emit JSON for an archived row");
+    assert_eq!(archived["state"], "archived");
+    assert!(archived["archived_at"].is_string());
+    assert!(archived.get("trashed_at").is_none());
+
+    let rm = h.run_cli(&["rm", "Archive Probe"]);
+    assert!(
+        rm.status.success(),
+        "aoe rm failed: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+
+    let both: serde_json::Value = serde_json::from_slice(
+        &h.run_cli(&["session", "show", "Archive Probe", "--json"])
+            .stdout,
+    )
+    .expect("session show --json must emit JSON for an archived, trashed row");
+    assert_eq!(
+        both["state"], "trashed",
+        "trashed outranks archived, and archived_at survives the trash"
+    );
+    assert!(both["trashed_at"].is_string());
+    assert!(both["archived_at"].is_string());
+}
+
+/// #3267 regression guard at the wiring level: `aoe acp doctor` must run
+/// its version-gate probe on configured agents, so an adapter that is
+/// present but below-floor reads `[!! ]` with remediation instead of
+/// `[OK]`. Deleting the probe call from the listing loop fails here even
+/// though every unit-level decision test stays green.
+#[test]
+#[parallel]
+fn test_cli_acp_doctor_flags_below_floor_adapter() {
+    let mut h = TuiTestHarness::new("cli_acp_doctor_below_floor");
+    let bin = h.home_path().join("fixture-bin");
+    std::fs::create_dir_all(&bin).expect("create fixture bin dir");
+    let script = bin.join("claude-agent-acp");
+    std::fs::write(&script, "#!/bin/sh\necho 0.37.0\n").expect("write fixture script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("make fixture executable");
+    }
+    h.add_path_dir(&bin);
+
+    let out = h.run_cli(&["acp", "doctor"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("[!! ] claude"), "{stdout}");
+    assert!(stdout.contains("installed 0.37.0; requires >="), "{stdout}");
+    assert!(
+        stdout.contains("npm install -g @agentclientprotocol/claude-agent-acp@latest"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("[OK] claude"), "{stdout}");
+}
+
+/// Seed the pinned-bundle location `bundled_adapter_bin` resolves, with
+/// a fixture reporting `version`.
+fn seed_bundled_fixture(h: &TuiTestHarness, version: &str) {
+    let bin = h.home_path().join(
+        ".config/agent-of-empires-dev/acp-worker/adapters/claude-agent-acp/node_modules/.bin",
+    );
+    std::fs::create_dir_all(&bin).expect("create bundle bin dir");
+    let script = bin.join("claude-agent-acp");
+    std::fs::write(&script, format!("#!/bin/sh\necho {version}\n")).expect("write bundle fixture");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("make bundle fixture executable");
+    }
+}
+
+/// A floor-COMPLIANT pinned bundled copy silences a stale PATH copy,
+/// because spawn switches to the bundle below-floor. This is the only
+/// end-to-end view of `bundled_copy_installed` +
+/// `bundled_copy_meets_floor`: unit tests inject that flag directly.
+#[test]
+#[parallel]
+fn test_cli_acp_doctor_compliant_bundle_silences_stale_path() {
+    let mut h = TuiTestHarness::new("cli_acp_doctor_bundle_ok");
+    let bin = h.home_path().join("fixture-bin");
+    std::fs::create_dir_all(&bin).expect("create fixture bin dir");
+    let script = bin.join("claude-agent-acp");
+    std::fs::write(&script, "#!/bin/sh\necho 0.37.0\n").expect("write path fixture");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("make path fixture executable");
+    }
+    h.add_path_dir(&bin);
+    seed_bundled_fixture(&h, "0.65.0");
+
+    let out = h.run_cli(&["acp", "doctor"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("[OK] claude"), "{stdout}");
+    assert!(!stdout.contains("[!! ] claude"), "{stdout}");
+}
+
+/// The mirror case: an installed but STALE pinned copy (below today's
+/// floor) must not silence the listing, since spawn picks it over the
+/// stale PATH copy and validate() rejects its handshake.
+#[test]
+#[parallel]
+fn test_cli_acp_doctor_stale_bundle_keeps_flagging() {
+    let mut h = TuiTestHarness::new("cli_acp_doctor_bundle_stale");
+    let bin = h.home_path().join("fixture-bin");
+    std::fs::create_dir_all(&bin).expect("create fixture bin dir");
+    let script = bin.join("claude-agent-acp");
+    std::fs::write(&script, "#!/bin/sh\necho 0.37.0\n").expect("write path fixture");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("make path fixture executable");
+    }
+    h.add_path_dir(&bin);
+    seed_bundled_fixture(&h, "0.44.0");
+
+    let out = h.run_cli(&["acp", "doctor"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("[!! ] claude"), "{stdout}");
+    assert!(!stdout.contains("[OK] claude"), "{stdout}");
+}
+
+/// Bundle-ONLY installs (nothing on PATH) are invisible to the PATH
+/// probe, so the pinned copy itself decides the verdict: compliant
+/// reads `[OK]`, stale reads `[!! ]` naming the bundled version. This
+/// is the stranded-pin cell after a floor bump.
+#[test]
+#[parallel]
+fn test_cli_acp_doctor_bundle_only_judged_by_pinned_copy() {
+    // (bundled fixture version, expected mark)
+    let cases = [("0.65.0", "[OK] claude"), ("0.44.0", "[!! ] claude")];
+    for (bundle_version, expected_mark) in cases {
+        let mut h = TuiTestHarness::new("cli_acp_doctor_bundle_only");
+        // The host PATH must not decide this cell: a global adapter
+        // would route the listing through the PATH-present branch.
+        // Scrubbing it leaves only the pinned copy visible, which is
+        // exactly the bundle-only state under test; every invocation
+        // here uses absolute paths, so nothing else needs PATH.
+        h.set_env("PATH", "");
+        seed_bundled_fixture(&h, bundle_version);
+
+        let out = h.run_cli(&["acp", "doctor"]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains(expected_mark), "{bundle_version}: {stdout}");
+    }
+}
+
+/// #3415: the snooze half of the four-timestamp set. `aoe session snooze`
+/// is the only CLI producer of the marker, so this exercises the real path:
+/// a live row omits both new keys, and after a snooze both surfaces carry
+/// `snoozed_until` while staying `state: "live"` with no `pinned_at` (pin
+/// has no CLI producer, it is set from the web sidebar).
+#[test]
+#[parallel]
+fn test_cli_snoozed_row_exposes_snoozed_until() {
+    let h = TuiTestHarness::new("cli_show_snoozed");
+    let project = h.project_path();
+
+    let add = h.run_cli(&["add", project.to_str().unwrap(), "-t", "Snooze Probe"]);
+    assert!(
+        add.status.success(),
+        "aoe add failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    let live: serde_json::Value = serde_json::from_slice(
+        &h.run_cli(&["session", "show", "Snooze Probe", "--json"])
+            .stdout,
+    )
+    .expect("session show --json must emit JSON");
+    assert!(live.get("snoozed_until").is_none());
+    assert!(live.get("pinned_at").is_none());
+
+    let snooze = h.run_cli(&["session", "snooze", "Snooze Probe", "--minutes", "5"]);
+    assert!(
+        snooze.status.success(),
+        "aoe session snooze failed: {}",
+        String::from_utf8_lossy(&snooze.stderr)
+    );
+
+    let listed: serde_json::Value = serde_json::from_slice(&h.run_cli(&["list", "--json"]).stdout)
+        .expect("list --json must emit JSON");
+    assert_eq!(listed[0]["state"], "live");
+    assert!(listed[0]["snoozed_until"].is_string());
+    assert!(listed[0].get("pinned_at").is_none());
+
+    let shown: serde_json::Value = serde_json::from_slice(
+        &h.run_cli(&["session", "show", "Snooze Probe", "--json"])
+            .stdout,
+    )
+    .expect("session show --json must emit JSON for a snoozed row");
+    assert_eq!(shown["state"], "live");
+    assert!(shown["snoozed_until"].is_string());
+    assert!(shown.get("pinned_at").is_none());
 }
