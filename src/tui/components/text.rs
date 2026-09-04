@@ -1,5 +1,58 @@
 //! Small shared text helpers for TUI rendering.
 
+/// One rendered row resolved into display columns.
+///
+/// Built by painting the line into a scratch buffer, because that is the only
+/// way to get ratatui's own idea of which cell each grapheme lands in: a wide
+/// grapheme occupies two cells, and the second carries an empty symbol.
+pub(crate) struct LineColumns {
+    /// The row's visible text, concatenated left to right.
+    pub(crate) text: String,
+    /// Column each byte of `text` belongs to, plus a trailing entry for the
+    /// end of the row. A continuation cell contributes no byte, which is what
+    /// makes an exclusive end offset resolve past both halves of a wide
+    /// grapheme.
+    column_of: Vec<u16>,
+}
+
+impl LineColumns {
+    /// Column holding the grapheme that starts at `byte`. `byte` must be a
+    /// char boundary of `text` or its length.
+    pub(crate) fn column_at(&self, byte: usize) -> u16 {
+        self.column_of
+            .get(byte)
+            .copied()
+            .unwrap_or_else(|| self.column_of.last().copied().unwrap_or(0))
+    }
+
+    /// The text painted between `from` and `to_excl` display columns.
+    pub(crate) fn slice(&self, from: u16, to_excl: u16) -> String {
+        let mut out = String::new();
+        for (offset, ch) in self.text.char_indices() {
+            let col = self.column_at(offset);
+            if col >= from && col < to_excl {
+                out.push(ch);
+            }
+        }
+        out
+    }
+}
+
+/// Resolve `line` into display columns at `width`.
+pub(crate) fn line_columns(line: &ratatui::text::Line, width: u16) -> LineColumns {
+    let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, width.max(1), 1));
+    buf.set_line(0, 0, line, width.max(1));
+    let mut text = String::with_capacity(width as usize);
+    let mut column_of = Vec::with_capacity(width as usize);
+    for col in 0..width {
+        let symbol = buf[(col, 0)].symbol();
+        column_of.resize(column_of.len() + symbol.len(), col);
+        text.push_str(symbol);
+    }
+    column_of.push(width);
+    LineColumns { text, column_of }
+}
+
 /// Truncate `text` to `max_width` display cells, appending `…` if
 /// anything was dropped. Width-aware (wide glyphs count their real cell
 /// width), so a truncated string never paints past its budget. Returns

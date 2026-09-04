@@ -180,6 +180,39 @@ impl HomeView {
             .is_some_and(|deadline| std::time::Instant::now() < deadline)
     }
 
+    /// Show `text` in the status bar for a few seconds. For feedback on an
+    /// action the user just took, where an acknowledgement would be noise.
+    /// Matches the Ctrl+C hint's window so the two read as the same kind of
+    /// thing.
+    pub(in crate::tui) fn flash_status(&mut self, text: impl Into<String>) {
+        self.status_flash = Some((
+            text.into(),
+            std::time::Instant::now() + std::time::Duration::from_secs(3),
+        ));
+    }
+
+    /// The flash text while it is still within its window.
+    pub(in crate::tui) fn status_flash_text(&self) -> Option<&str> {
+        self.status_flash
+            .as_ref()
+            .filter(|(_, deadline)| std::time::Instant::now() < *deadline)
+            .map(|(text, _)| text.as_str())
+    }
+
+    /// Drop a flash whose window has closed, reporting whether anything
+    /// changed so the caller can schedule the one repaint that clears it.
+    pub(in crate::tui) fn expire_status_flash(&mut self) -> bool {
+        if self
+            .status_flash
+            .as_ref()
+            .is_some_and(|(_, deadline)| std::time::Instant::now() >= *deadline)
+        {
+            self.status_flash = None;
+            return true;
+        }
+        false
+    }
+
     pub fn has_dialog(&self) -> bool {
         let serve_open = self.serve_view.is_some();
 

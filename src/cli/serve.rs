@@ -153,9 +153,10 @@ pub struct ServeArgs {
     pub passphrase: Option<String>,
 
     /// Open the dashboard URL in the default browser once the server is ready.
-    /// Ignored in a build with no dashboard bundle, and under --daemon,
-    /// --remote, SSH (SSH_CONNECTION/SSH_TTY), or when no display server is
-    /// reachable on Linux/BSD.
+    /// Ignored in a build with no dashboard bundle, under --daemon or --remote,
+    /// and whenever no browser the user could see is reachable (see
+    /// `tui::open_url`): over SSH without a forwarded display, or on Linux/BSD
+    /// with no display server. `BROWSER` overrides the check.
     #[arg(long)]
     pub open: bool,
 

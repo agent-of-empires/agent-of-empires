@@ -10,7 +10,7 @@ pub(crate) mod hover;
 mod list_picker;
 pub(crate) mod preview;
 pub(crate) mod scroll;
-mod text;
+pub(crate) mod text;
 mod text_input;
 mod tool_config;
 

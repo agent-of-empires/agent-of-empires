@@ -41,7 +41,7 @@ aoe web dashboard running at:
 
 Open it in any browser. The token is set as a cookie on first visit, so you don't need to keep it in the URL.
 
-`--open` is suppressed with `--daemon` or `--remote`, over SSH (`SSH_CONNECTION` / `SSH_TTY` set), and on Linux/BSD with no `DISPLAY` / `WAYLAND_DISPLAY`.
+`--open` is suppressed with `--daemon` or `--remote`, and whenever no browser you could see is reachable: over SSH without a forwarded `DISPLAY`, and on Linux/BSD with no display server. Setting `BROWSER` overrides the check, so a script that forwards the URL somewhere useful keeps working. The preview's link handling uses the same rules.
 
 ### Retrieving the live URL
 

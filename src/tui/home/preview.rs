@@ -38,7 +38,7 @@ impl PreviewTextView {
 
     /// Absolute parsed-text index of the line painted on screen row
     /// `row`, clamped into the pane and the scrollback.
-    fn abs_line_at_row(self, row: u16) -> usize {
+    pub(in crate::tui) fn abs_line_at_row(self, row: u16) -> usize {
         let pane = self.pane;
         let max_y = pane.bottom().saturating_sub(1);
         let cy = row.clamp(pane.y, max_y);
@@ -197,6 +197,12 @@ pub(in crate::tui) struct PreviewCache {
     /// wake-ups or unrelated key events. With it, the parse happens
     /// at most once per actual content change.
     pub(in crate::tui) parsed_text: Option<ratatui::text::Text<'static>>,
+    /// OSC 8 targets the previewed pane has advertised, refreshed alongside
+    /// `parsed_text`. They are held here rather than in the text because
+    /// neither the vt100 grid nor a ratatui cell can carry a hyperlink;
+    /// `crate::tui::links` re-anchors each one to the row that shows its text,
+    /// and finds plain URLs in the rows themselves.
+    pub(in crate::tui) links: Vec<crate::tmux::osc8::PaneLink>,
 }
 
 impl PreviewCache {
@@ -211,13 +217,76 @@ impl PreviewCache {
     pub(in crate::tui) fn ensure_parsed(&mut self) {
         if self.content.is_empty() {
             self.parsed_text = None;
+            self.links.clear();
             return;
         }
         if self.parsed_text.is_none() {
             self.parsed_text = Some(crate::tui::components::preview::parse_output_text(
                 &self.content,
             ));
+            self.links = self.collect_links();
         }
+    }
+
+    /// Collect the previewed pane's hyperlinks from whichever transport is
+    /// feeding it. The VT grid drops OSC 8 during parsing, so its channel taps
+    /// the raw stream instead; the capture fallback still has the sequences in
+    /// `content`, which `parse_output_text` is about to strip.
+    fn collect_links(&self) -> Vec<crate::tmux::osc8::PaneLink> {
+        let mut links = self
+            .capture_target
+            .as_deref()
+            .map(crate::tmux::pane_links)
+            .unwrap_or_default();
+        let from_channel = links.len();
+        // The channel caps its own table; the capture path has no such bound,
+        // and a scrollback dense with links would otherwise cost a linear
+        // dedupe per link and a search per link on every visible row.
+        // Keyed on the whole link, not the target: two texts pointing at one
+        // URL are two separate runs on screen, and dropping the second would
+        // leave it unclickable.
+        let mut seen: std::collections::HashSet<(&str, &str)> = links
+            .iter()
+            .map(|l| (l.text.as_str(), l.uri.as_str()))
+            .collect();
+        let found = crate::tmux::osc8::extract_links(self.content.as_bytes());
+        let mut fresh = Vec::new();
+        for link in &found {
+            if links.len() + fresh.len() >= crate::tmux::osc8::MAX_PANE_LINKS {
+                break;
+            }
+            if seen.insert((&link.text, &link.uri)) {
+                fresh.push(link.clone());
+            }
+        }
+        links.extend(fresh);
+        // A frame that advertises a hyperlink but yields none means the pane
+        // and the scanner disagree, which is otherwise a silent failure.
+        if links.is_empty() {
+            if crate::tmux::osc8::has_hyperlink(self.content.as_bytes()) {
+                tracing::debug!(
+                    target: "tui.preview_links",
+                    pane = self.capture_target.as_deref().unwrap_or("<none>"),
+                    bytes = self.content.len(),
+                    "preview: frame carries OSC 8 but no link parsed"
+                );
+            }
+            return links;
+        }
+        // Otherwise leave a trace of what was collected and which transport
+        // supplied it, so a link that fails to resolve on the row can be told
+        // apart from one that was never recorded.
+        {
+            tracing::debug!(
+                target: "tui.preview_links",
+                pane = self.capture_target.as_deref().unwrap_or("<none>"),
+                from_channel,
+                from_content = links.len() - from_channel,
+                texts = ?links.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(),
+                "preview: collected pane hyperlinks"
+            );
+        }
+        links
     }
 
     /// Store a fresh capture, invalidating the parsed cache and stamping
@@ -242,7 +311,7 @@ impl PreviewCache {
         self.captured_lines = content.lines().count();
         self.content = content;
         // Invalidate the cached parse; the next `ensure_parsed` re-runs
-        // `ansi-to-tui`.
+        // `ansi-to-tui` and re-collects the pane's hyperlinks.
         self.parsed_text = None;
         self.session_id = Some(session_id);
         self.capture_target = Some(capture_target);

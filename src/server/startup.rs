@@ -1045,26 +1045,14 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Best-effort launch of `url` in the user's default browser. Suppressed
-/// in environments where opening a browser is not useful: SSH sessions
-/// (the user is on another host) and Linux/BSD without a display server.
-/// Failures are logged but never propagate; the server keeps running.
+/// Best-effort launch of `url` in the user's default browser. Goes through the
+/// same seam as every other open, so the reachability rules are decided in one
+/// place: this used to carry its own copy that refused every SSH session and
+/// ignored `BROWSER`, which disagreed with the preview's link handling on the
+/// same host. Failures are logged but never propagate; the server keeps running.
 pub(super) fn maybe_open_browser(url: &str) {
-    if std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some() {
-        tracing::info!(target: "http.middleware", "--open ignored: running over SSH");
-        return;
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
-    {
-        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
-            tracing::info!(target: "http.middleware", "--open ignored: no DISPLAY or WAYLAND_DISPLAY set");
-            return;
-        }
-    }
-
-    if let Err(e) = webbrowser::open(url) {
-        tracing::warn!(target: "http.middleware", "--open: failed to launch browser: {e}");
+    if let Err(e) = crate::tui::open_url::open_url(url) {
+        tracing::info!(target: "http.middleware", "--open skipped: {e}");
     }
 }
 

@@ -56,6 +56,7 @@ mod permission_response_e2e;
 mod pi_pinned_session_id_e2e;
 mod plugin_command_executor_e2e;
 mod plugins;
+mod preview_hyperlink_e2e;
 mod profile_lazy_creation;
 mod profile_picker;
 mod project_registry;

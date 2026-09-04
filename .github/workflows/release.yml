@@ -168,8 +168,16 @@ jobs:
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/aoe dist/${{ matrix.name }}
+          # Ship the license texts beside the binary. aoe is MIT, and
+          # src/tui/hyperlink.rs carries Apache-2.0 derived code whose
+          # section 4(a) requires that recipients get a copy of that license,
+          # which a bare binary did not provide. `scripts/install.sh` moves the binary
+          # out by name, so the extra files are inert for installers.
+          cp LICENSE THIRD_PARTY_NOTICES.md dist/
+          cp -R licenses dist/licenses
           cd dist
-          tar -czvf ${{ matrix.name }}.tar.gz ${{ matrix.name }}
+          tar -czvf ${{ matrix.name }}.tar.gz \
+            ${{ matrix.name }} LICENSE THIRD_PARTY_NOTICES.md licenses
           # shasum is a perl script that ships in macOS by default and is
           # provided on Linux by perl-Digest-SHA (installed above for the
           # manylinux jobs). Using shasum keeps the command identical on

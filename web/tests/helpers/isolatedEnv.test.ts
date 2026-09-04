@@ -93,7 +93,11 @@ const INHERITED_BY_CONTRACT = new Set([
   // spec runs a fake agent shim.
   "CLAUDE_CODE_USE_VERTEX",
   // Terminal, desktop, and remote-session hints the daemon forwards into the
-  // sessions it creates.
+  // sessions it creates. `open_url` reads BROWSER and WSL_DISTRO_NAME to
+  // decide whether a browser could reach the user at all; both are hints
+  // about the machine the spec runs on, not state the daemon resolves
+  // anything from, and `AOE_OPEN_URL_TO` is already dropped above.
+  "BROWSER",
   "DISPLAY",
   "DO_NOT_TRACK",
   "MOSH_CONNECTION",
@@ -103,6 +107,7 @@ const INHERITED_BY_CONTRACT = new Set([
   "SSH_TTY",
   "USER",
   "WAYLAND_DISPLAY",
+  "WSL_DISTRO_NAME",
   // Host executables the daemon runs on the user's behalf: `user_shell()`
   // wraps pane commands in `$SHELL` so rc files load, and the TUI opens
   // `$EDITOR`. Inherited on purpose, so a spec exercises the same programs

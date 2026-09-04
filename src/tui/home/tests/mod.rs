@@ -33,6 +33,7 @@ mod permission_response_dialog;
 mod pickers_groups_sort;
 mod post_create_attach_mode;
 mod preview_drag_select;
+mod preview_links;
 mod profile_duplicate_reconciliation;
 mod render_and_save;
 mod right_click_context_menu;

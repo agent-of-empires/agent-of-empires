@@ -8,7 +8,10 @@ edition = "2021"
 rust-version = "1.85"
 authors = ["Agent of Empires Contributors"]
 description = "Terminal session manager for AI coding agents"
-license = "MIT"
+# MIT throughout, except the OSC 8 emission state machine in
+# src/tui/hyperlink.rs, which is derived from herdr under Apache-2.0.
+# See THIRD_PARTY_NOTICES.md.
+license = "MIT AND Apache-2.0"
 repository = "https://github.com/agent-of-empires/agent-of-empires"
 keywords = ["tmux", "tui", "ai", "claude", "terminal"]
 categories = ["command-line-utilities", "development-tools"]

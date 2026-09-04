@@ -352,14 +352,6 @@ pub struct UiSnapshot {
     pub revisions: BTreeMap<String, BTreeMap<String, u64>>,
 }
 
-/// Only `http`/`https` URLs may be opened from a plugin's UI state; a plugin
-/// must not smuggle `javascript:`/`file:`/`data:` through an href. Mirrors the
-/// web `isExternalHttpUrl`.
-fn is_http_url(u: &str) -> bool {
-    let u = u.to_ascii_lowercase();
-    u.starts_with("http://") || u.starts_with("https://")
-}
-
 /// Append one `(href, label)` link to `out` when `href` is a fresh, safe
 /// http/https URL. Label is the badge's tooltip or text, else the href.
 fn push_link(
@@ -371,7 +363,7 @@ fn push_link(
     let Some(href) = href.and_then(Value::as_str) else {
         return;
     };
-    if !is_http_url(href) || !seen.insert(href.to_string()) {
+    if !crate::util::is_http_url(href) || !seen.insert(href.to_string()) {
         return;
     }
     let label = label
@@ -631,7 +623,7 @@ impl UiStore {
             return Err(UiError::BadRequest("notification body too long".into()));
         }
         if let Some(href) = &href {
-            if !is_http_url(href) {
+            if !crate::util::is_http_url(href) {
                 return Err(UiError::BadRequest(
                     "notification href must be http/https".into(),
                 ));

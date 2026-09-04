@@ -575,6 +575,11 @@ pub fn format_scroll_indicator(
 ///
 /// Visible at the module level so `PreviewCache::ensure_parsed` can
 /// call it from `src/tui/home/preview.rs` to drive the cache.
+///
+/// OSC 8 is stripped rather than carried: `ansi-to-tui` drops the visible text
+/// around an ST-terminated OSC (#1181), and a ratatui cell has no attribute to
+/// hold a hyperlink target anyway. The targets are kept beside the text in
+/// `PreviewCache::links` and re-anchored by `crate::tui::links`.
 pub fn parse_output_text(content: &str) -> Text<'static> {
     let cleaned = crate::tmux::utils::strip_osc_st(content);
     cleaned.into_text().unwrap_or_else(|_| Text::from(cleaned))

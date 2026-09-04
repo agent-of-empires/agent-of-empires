@@ -10,7 +10,7 @@
 //! previews. The channel tears down (disables the pipe, stops the forwarder)
 //! when the last `Arc` drops. Unix-only; the whole module is `#[cfg(unix)]`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 
+use crate::tmux::osc8::{Osc8Scanner, PaneLink};
 use crate::tmux::PaneCursor;
 
 /// Largest base64 payload an OSC 52 sequence may carry before the scanner
@@ -584,11 +585,18 @@ fn refresh_commits_geometry(result: VtRefreshResult) -> bool {
     result == VtRefreshResult::Refreshed
 }
 
+/// The channel state one seed writes into. Bundled because they always travel
+/// together and are the same four handles the reader thread holds.
+struct SeedSink<'a> {
+    parser: &'a Mutex<vt100::Parser>,
+    app_cursor: &'a AtomicBool,
+    grid_gen: &'a AtomicU64,
+    links: &'a Mutex<VecDeque<PaneLink>>,
+}
+
 fn seed_parser(
     target: &str,
-    parser: &Mutex<vt100::Parser>,
-    app_cursor: &AtomicBool,
-    grid_gen: &AtomicU64,
+    sink: SeedSink<'_>,
     size: (u16, u16),
     deadline: &crate::tmux::TmuxCommandDeadline,
     chunk_guard: Option<(&AtomicU64, &AtomicU64, u64)>,
@@ -597,10 +605,11 @@ fn seed_parser(
     let Some(stream) = capture_seed_stream(target, rows, deadline) else {
         return VtRefreshResult::Failed;
     };
+    record_seed_links(sink.links, &stream);
     swap_seeded_parser(
-        parser,
-        app_cursor,
-        grid_gen,
+        sink.parser,
+        sink.app_cursor,
+        sink.grid_gen,
         None,
         &stream,
         size,
@@ -960,7 +969,7 @@ fn push_color_params(params: &mut Vec<String>, color: vt100::Color, bg: bool) {
 }
 
 /// Whether a cell carries any non-default styling (intensity, italic,
-/// underline, inverse, or a non-default fg/bg colour). A blank-but-styled cell
+/// underline, inverse, or a non-default fg/bg color). A blank-but-styled cell
 /// is still visible: a background fill that runs to the edge of a row (a status
 /// bar, a selection) has no glyph yet must be drawn.
 fn cell_has_style(cell: &vt100::Cell) -> bool {
@@ -1004,14 +1013,14 @@ fn cell_sgr(cell: &vt100::Cell) -> String {
     }
 }
 
-/// Serialise one visible grid row to ANSI by walking its cells directly:
+/// Serialize one visible grid row to ANSI by walking its cells directly:
 /// explicit SGR plus a literal character (or a space for a blank cell). vt100's
 /// own `rows_formatted` encodes runs of blank cells as cursor-movement
 /// (`ESC [ n C`) and erase-char (`ESC [ n X`) sequences. `ansi_to_tui`, the
 /// downstream consumer that turns this string into a ratatui `Text`, ignores
 /// cursor movement, so every gap of padding collapsed and aligned TUIs rendered
 /// with their spaces stripped (#2433 regression). Emitting literal spaces keeps
-/// the column layout intact while preserving colour and intensity.
+/// the column layout intact while preserving color and intensity.
 fn row_to_ansi(screen: &vt100::Screen, row: u16, cols: u16) -> String {
     let last = row_last_col(screen, row, cols);
     row_to_ansi_upto(screen, row, last)
@@ -1021,7 +1030,7 @@ fn row_to_ansi(screen: &vt100::Screen, row: u16, cols: u16) -> String {
 /// *unstyled* blank cells remain. Mirrors `capture-pane`'s trailing-space trim
 /// so a row never carries a full width of padding into ratatui's wrapper. A
 /// trailing blank that carries styling (a background fill running to the edge)
-/// counts as content: it is drawn as a coloured space, exactly as a mid-row
+/// counts as content: it is drawn as a colored space, exactly as a mid-row
 /// styled blank already is.
 ///
 /// The count is in display COLUMNS, not cells, so a trailing wide glyph
@@ -1043,7 +1052,7 @@ fn row_last_col(screen: &vt100::Screen, row: u16, cols: u16) -> u16 {
     last
 }
 
-/// Serialise columns `0..last` of `row`. Split out of [`row_to_ansi`] so the
+/// Serialize columns `0..last` of `row`. Split out of [`row_to_ansi`] so the
 /// pane compositor can ask for a row rendered to its pane's full width rather
 /// than to the trim point.
 fn row_to_ansi_upto(screen: &vt100::Screen, row: u16, last: u16) -> String {
@@ -1088,7 +1097,7 @@ fn row_to_ansi_upto(screen: &vt100::Screen, row: u16, last: u16) -> String {
 /// width: a trimmed row would let the next pane's first column slide left into
 /// the gap. Going through a `vt100::Parser` rather than splitting the bytes on
 /// newlines is what makes that safe, because a row's escape sequences are
-/// resolved into cells before they are re-serialised, so no SGR state can leak
+/// resolved into cells before they are re-serialized, so no SGR state can leak
 /// across a pane boundary into its neighbour.
 pub(crate) fn capture_rows_padded(raw: &[u8], cols: u16, rows: u16) -> Vec<String> {
     let cols = cols.max(1);
@@ -1113,7 +1122,7 @@ pub(crate) fn capture_rows_padded(raw: &[u8], cols: u16, rows: u16) -> Vec<Strin
             let mut out = row_to_ansi_upto(screen, row, last);
             if last < cols {
                 // Reset before padding so a styled final cell (a background
-                // fill) does not bleed its colour across the gap.
+                // fill) does not bleed its color across the gap.
                 out.push_str("\x1b[0m");
                 out.extend(std::iter::repeat_n(' ', (cols - last) as usize));
             }
@@ -1208,6 +1217,48 @@ struct ReaderCtx {
     /// from `chunk_seq`: re-seeds bump this too, and the debounce's
     /// first-chunk special case must not see seed bumps.
     grid_gen: Arc<AtomicU64>,
+    /// OSC 8 hyperlinks seen in the stream (see [`VtChannel::links`]).
+    links: Arc<Mutex<VecDeque<PaneLink>>>,
+}
+
+/// Fold newly scanned links into a channel's table, newest last. A repeat of a
+/// target already held moves to the end rather than duplicating, so a prompt
+/// that reprints the same link does not evict the rest of the table.
+fn record_links(slot: &Mutex<VecDeque<PaneLink>>, found: Vec<PaneLink>) {
+    if found.is_empty() {
+        return;
+    }
+    let Ok(mut table) = slot.lock() else {
+        return;
+    };
+    for link in found {
+        table.retain(|held| *held != link);
+        table.push_back(link);
+        while table.len() > crate::tmux::osc8::MAX_PANE_LINKS {
+            table.pop_front();
+        }
+    }
+}
+
+/// Fold a `capture-pane -e` seed's hyperlinks into a channel's table.
+///
+/// The seed bytes are replayed into a fresh parser rather than passing through
+/// `run_reader`, so without this a link already on screen when the channel arms
+/// would lose its target until the pane reprinted it. Reseeds run this too,
+/// which keeps a link that is still on screen recorded no matter how long ago
+/// its sequence left the stream. Recorded even when the swap loses its race:
+/// the pane advertised the link either way.
+fn record_seed_links(slot: &Mutex<VecDeque<PaneLink>>, stream: &[u8]) {
+    record_links(slot, crate::tmux::osc8::extract_links(stream));
+}
+
+/// Hyperlinks `session`'s pane has advertised via OSC 8, oldest first. Empty
+/// when no channel is armed; the capture fallback carries the sequences in the
+/// frame text instead, so the TUI reads those straight off the content.
+pub(crate) fn pane_links(session: &str) -> Vec<PaneLink> {
+    lookup(session)
+        .and_then(|c| c.links.lock().ok().map(|t| t.iter().cloned().collect()))
+        .unwrap_or_default()
 }
 
 fn stop_and_wake_reader(stop: &AtomicBool, sock_path: &std::path::Path) {
@@ -1234,6 +1285,7 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
     let _ = conn.set_read_timeout(Some(Duration::from_millis(200)));
     let mut buf = [0u8; 8192];
     let mut osc52 = Osc52Scanner::new();
+    let mut osc8 = Osc8Scanner::new();
     while !ctx.stop.load(Ordering::Relaxed) {
         match conn.read(&mut buf) {
             Ok(0) => break,
@@ -1251,6 +1303,12 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
                         *guard = Some(text.clone());
                     }
                 }
+                // The parser drops OSC 8 the same way, and a vt100 cell has
+                // nowhere to keep a target, so this tap is the only record of
+                // what the pane's hyperlinks point at (#3735). Runs on
+                // pre-seed chunks too: the seed snapshot can carry the link
+                // text onto the grid without the sequence that wrapped it.
+                record_links(&ctx.links, osc8.feed(&buf[..n]));
                 // Claim every read before waiting on the parser. An
                 // authoritative seed that captured this output must then see
                 // the changed sequence and return Busy instead of installing a
@@ -1338,6 +1396,9 @@ pub(crate) struct VtChannel {
     /// Latest decoded OSC 52 clipboard write from the pane, filled by the
     /// reader thread, drained by [`Self::take_clipboard`].
     clipboard: Arc<Mutex<Option<String>>>,
+    /// OSC 8 hyperlinks the reader thread has seen, oldest first and capped at
+    /// `MAX_LINKS`. Read through [`pane_links`].
+    links: Arc<Mutex<VecDeque<PaneLink>>>,
     /// Number of chunks the reader has parsed. `0` means none yet, so
     /// `chunk_timing` reports `None` and the caller leaves pacing untouched.
     chunk_seq: Arc<AtomicU64>,
@@ -1499,6 +1560,7 @@ impl VtChannel {
         let app_cursor = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(false));
         let clipboard: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let links: Arc<Mutex<VecDeque<PaneLink>>> = Arc::new(Mutex::new(VecDeque::new()));
         // Bind the socket inside an owner-only (0700) directory so other users
         // on a shared host cannot connect to the pane channel and capture
         // keystrokes or spoof rendered output (mirrors the worker-dir
@@ -1544,6 +1606,7 @@ impl VtChannel {
                 alive: alive.clone(),
                 wakeup: wakeup.clone(),
                 clipboard: clipboard.clone(),
+                links: links.clone(),
                 chunk_seq: chunk_seq.clone(),
                 settled_chunk_seq: settled_chunk_seq.clone(),
                 last_chunk_ms: last_chunk_ms.clone(),
@@ -1598,9 +1661,12 @@ impl VtChannel {
         let expected_chunk_seq = chunk_seq.load(Ordering::Acquire);
         if seed_parser(
             &target,
-            &parser,
-            &app_cursor,
-            &grid_gen,
+            SeedSink {
+                parser: &parser,
+                app_cursor: &app_cursor,
+                grid_gen: &grid_gen,
+                links: &links,
+            },
             (cols, rows),
             deadline,
             Some((&chunk_seq, &settled_chunk_seq, expected_chunk_seq)),
@@ -1631,6 +1697,7 @@ impl VtChannel {
             alive,
             wakeup,
             clipboard,
+            links,
             chunk_seq,
             settled_chunk_seq,
             last_chunk_ms,
@@ -1768,6 +1835,7 @@ impl VtChannel {
         let Some(stream) = capture_seed_stream(&self.target, rows, deadline) else {
             return VtRefreshResult::Failed;
         };
+        record_seed_links(&self.links, &stream);
         let result = swap_seeded_parser(
             &self.parser,
             &self.app_cursor,
@@ -1796,7 +1864,7 @@ impl VtChannel {
             deadline,
         )
     }
-    /// Serialise up to max_lines of (scrollback + screen) to per-row ANSI,
+    /// Serialize up to max_lines of (scrollback + screen) to per-row ANSI,
     /// plus the authoritative cursor (with history_size set to the full
     /// scrollback depth). `max_lines` mirrors the capture path's window: both
     /// the TUI scroll and the web's virtual scroll spacer need real history
@@ -2302,7 +2370,7 @@ mod tests {
         // write "B". The 10 cells in between are *default* (never written), so
         // vt100's `rows_formatted` skips them with `ESC[10C` (cursor forward).
         // `ansi_to_tui` ignores cursor movement, so the gap collapsed to "AB"
-        // and aligned UIs lost their spacing (#2433). The literal serialiser
+        // and aligned UIs lost their spacing (#2433). The literal serializer
         // must emit those columns as real spaces.
         let mut p = vt100::Parser::new(2, 20, 0);
         p.process(b"A\x1b[12GB");
@@ -2355,7 +2423,7 @@ mod tests {
 
     #[test]
     fn capture_rows_padded_resets_style_before_padding() {
-        // A row ending in a background fill must not bleed that colour across
+        // A row ending in a background fill must not bleed that color across
         // the border into the pane beside it.
         let rows = capture_rows_padded(b"\x1b[41mred", 8, 1);
         assert_eq!(visible_width(&rows[0]), 8);
@@ -2458,9 +2526,12 @@ mod tests {
         assert_eq!(
             seed_parser(
                 "aoe_test_missing_seed",
-                &parser,
-                &app_cursor,
-                &grid_gen,
+                SeedSink {
+                    parser: &parser,
+                    app_cursor: &app_cursor,
+                    grid_gen: &grid_gen,
+                    links: &Mutex::new(VecDeque::new()),
+                },
                 (80, 24),
                 &deadline,
                 None,
@@ -2724,6 +2795,7 @@ mod tests {
             alive: alive.clone(),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
+            links: Arc::new(Mutex::new(VecDeque::new())),
             chunk_seq: Arc::new(AtomicU64::new(0)),
             settled_chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
@@ -2981,6 +3053,7 @@ mod tests {
             alive: Arc::new(AtomicBool::new(false)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
+            links: Arc::new(Mutex::new(VecDeque::new())),
             chunk_seq: Arc::new(AtomicU64::new(0)),
             settled_chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
@@ -3030,6 +3103,7 @@ mod tests {
             alive: Arc::new(AtomicBool::new(false)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
+            links: Arc::new(Mutex::new(VecDeque::new())),
             chunk_seq: chunk_seq.clone(),
             settled_chunk_seq: settled_chunk_seq.clone(),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
@@ -3099,7 +3173,7 @@ mod tests {
     #[test]
     fn grid_content_preserves_color() {
         // SGR 31 (red fg) on "X" must round-trip as an SGR escape, not a bare
-        // cursor move, so colour survives into the preview.
+        // cursor move, so color survives into the preview.
         let mut p = vt100::Parser::new(2, 20, 0);
         p.process(b"\x1b[31mX\x1b[0m");
         let (content, _) = grid_content(&mut p, 2, 20, 2);
@@ -3115,7 +3189,7 @@ mod tests {
         // "Hi" then a blue background erased to the end of the line (`ESC[K`
         // with a bg set): cols 2..10 carry a bgcolor but no glyph, like a status
         // bar or selection that runs to the right edge. They must survive as
-        // coloured spaces, not be trimmed as if blank.
+        // colored spaces, not be trimmed as if blank.
         let mut p = vt100::Parser::new(2, 10, 0);
         p.process(b"Hi\x1b[44m\x1b[K");
         let (content, _) = grid_content(&mut p, 2, 10, 2);
@@ -3157,6 +3231,7 @@ mod tests {
             alive: alive.clone(),
             wakeup: wakeup_slot.clone(),
             clipboard: Arc::new(Mutex::new(None)),
+            links: Arc::new(Mutex::new(VecDeque::new())),
             chunk_seq: Arc::new(AtomicU64::new(0)),
             settled_chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
@@ -3315,6 +3390,7 @@ mod tests {
             alive: alive.clone(),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: clipboard.clone(),
+            links: Arc::new(Mutex::new(VecDeque::new())),
             chunk_seq: Arc::new(AtomicU64::new(0)),
             settled_chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
@@ -3350,6 +3426,228 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         drop(conn);
         let _ = reader.join();
+    }
+
+    #[test]
+    fn reader_records_osc8_targets_the_grid_drops() {
+        use std::io::Write;
+
+        // vt100 routes OSC 8 to its unhandled-sequence hook and keeps nothing,
+        // so the link text reaches the grid with no target attached (#3735).
+        // The reader's tap is what preserves it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("s.sock");
+        let listener = UnixListener::bind(&sock).expect("bind");
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        let stop = Arc::new(AtomicBool::new(false));
+        let links: Arc<Mutex<VecDeque<PaneLink>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let ctx = ReaderCtx {
+            parser: parser.clone(),
+            stop: stop.clone(),
+            seeded: Arc::new(AtomicBool::new(true)),
+            stream: Arc::new(Mutex::new(None)),
+            app_cursor: Arc::new(AtomicBool::new(false)),
+            alive: Arc::new(AtomicBool::new(false)),
+            wakeup: Arc::new(Mutex::new(None)),
+            clipboard: Arc::new(Mutex::new(None)),
+            links: links.clone(),
+            chunk_seq: Arc::new(AtomicU64::new(0)),
+            settled_chunk_seq: Arc::new(AtomicU64::new(0)),
+            last_chunk_ms: Arc::new(AtomicU64::new(0)),
+            prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
+            grid_gen: Arc::new(AtomicU64::new(0)),
+        };
+        let reader = std::thread::spawn(move || run_reader(listener, ctx));
+        let mut conn = UnixStream::connect(&sock).expect("connect");
+        conn.write_all(b"see \x1b]8;;https://example.com/repo\x1b\\the repo\x1b]8;;\x1b\\ now")
+            .expect("write pane output");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let recorded = loop {
+            let held: Vec<PaneLink> = links.lock().unwrap().iter().cloned().collect();
+            if !held.is_empty() || Instant::now() >= deadline {
+                break held;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(
+            recorded,
+            vec![PaneLink {
+                text: "the repo".to_string(),
+                uri: "https://example.com/repo".to_string(),
+            }]
+        );
+        assert!(
+            parser
+                .lock()
+                .unwrap()
+                .screen()
+                .contents()
+                .contains("see the repo now"),
+            "the grid keeps the visible text and none of the sequence"
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        drop(conn);
+        let _ = reader.join();
+    }
+
+    /// tmux only learned to re-emit OSC 8 from `capture-pane -e` in 3.4 (its
+    /// CHANGES lists "Add support for OSC 8 hyperlinks" under 3.3a -> 3.4), and
+    /// aoe supports older tmux on the capture fallback. Skip rather than fail
+    /// there: the test is about aoe's handling of what tmux gives it.
+    fn tmux_reemits_hyperlinks() -> bool {
+        let Ok(out) = crate::tmux::tmux_command().arg("-V").output() else {
+            return false;
+        };
+        if !out.status.success() {
+            return false;
+        }
+        // Its own threshold, not `parse_tmux_pipe_support`'s: that encodes when
+        // `pipe-pane -IO` became usable, and the two matching today is a
+        // coincidence a future tmux requirement would silently break.
+        const TMUX_OSC8_MIN: (u32, u32) = (3, 4);
+        tmux_version(&String::from_utf8_lossy(out.stdout.as_slice())) >= TMUX_OSC8_MIN
+    }
+
+    /// `(major, minor)` parsed out of a `tmux -V` line, `(0, 0)` if unreadable.
+    fn tmux_version(version: &str) -> (u32, u32) {
+        let digits: String = version
+            .chars()
+            .skip_while(|c| !c.is_ascii_digit())
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        let mut parts = digits.split('.');
+        (
+            parts.next().and_then(|p| p.parse().ok()).unwrap_or(0),
+            parts.next().and_then(|p| p.parse().ok()).unwrap_or(0),
+        )
+    }
+
+    /// The seed and the capture fallback both read `capture-pane -e`, and the
+    /// whole fix rests on tmux re-emitting a stored hyperlink there. Assert it
+    /// against a real tmux rather than a hand-built fixture, so a change in how
+    /// tmux serializes hyperlinks fails here instead of silently making every
+    /// preview link inert.
+    #[test]
+    #[serial_test::serial]
+    fn real_tmux_capture_carries_hyperlinks_into_the_link_table() {
+        if !tmux_reemits_hyperlinks() {
+            eprintln!("Skipping test: tmux missing or older than 3.4 (no OSC 8)");
+            return;
+        }
+        let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_osc8_seed");
+        // Two shapes that serialize differently: one with text after the link
+        // on the same row, one where the link ends the row.
+        let script = concat!(
+            r"printf 'A: \033]8;;https://example.com/mid\033\\mid link\033]8;;\033\\ after\n'; ",
+            r"printf 'B: \033]8;;https://example.com/eol\033\\eol link\033]8;;\033\\\n'; ",
+            "sleep 30",
+        );
+        let out = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                guard.name(),
+                "-x",
+                "80",
+                "-y",
+                "24",
+                script,
+            ])
+            .output()
+            .expect("tmux new-session");
+        assert!(out.status.success());
+        // Let the pane paint before capturing it.
+        let target = format!("{}:^.0", guard.name());
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        let mut stream = Vec::new();
+        for _ in 0..50 {
+            stream = capture_seed_stream(&target, 24, &deadline).unwrap_or_default();
+            if !crate::tmux::osc8::extract_links(&stream).is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let slot = Mutex::new(VecDeque::new());
+        record_seed_links(&slot, &stream);
+        let held: Vec<PaneLink> = slot.lock().unwrap().iter().cloned().collect();
+        assert_eq!(
+            held,
+            vec![
+                PaneLink {
+                    text: "mid link".to_string(),
+                    uri: "https://example.com/mid".to_string(),
+                },
+                PaneLink {
+                    text: "eol link".to_string(),
+                    uri: "https://example.com/eol".to_string(),
+                },
+            ],
+            "capture-pane -e must round-trip both hyperlink shapes"
+        );
+    }
+
+    #[test]
+    fn seed_records_links_already_on_screen() {
+        // `capture-pane -e` replays into a fresh parser without passing through
+        // `run_reader`, so a link printed before the channel armed would
+        // otherwise stay targetless until the pane reprinted it.
+        let slot = Mutex::new(VecDeque::new());
+        record_seed_links(
+            &slot,
+            b"\x1b[32msee \x1b]8;;https://example.com/repo\x1b\\the repo\x1b]8;;\x1b\\ now\x1b[0m",
+        );
+        assert_eq!(
+            slot.lock().unwrap().iter().cloned().collect::<Vec<_>>(),
+            vec![PaneLink {
+                text: "the repo".to_string(),
+                uri: "https://example.com/repo".to_string(),
+            }]
+        );
+        // A reseed of the same screen re-records rather than duplicating, so a
+        // link that stays on screen survives every healing pass.
+        record_seed_links(
+            &slot,
+            b"\x1b]8;;https://example.com/repo\x1b\\the repo\x1b]8;;\x1b\\",
+        );
+        assert_eq!(slot.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn record_links_dedupes_and_caps() {
+        let slot = Mutex::new(VecDeque::new());
+        let link = |n: usize| PaneLink {
+            text: format!("link {n}"),
+            uri: format!("https://example.com/{n}"),
+        };
+        // A reprint moves the link to the newest slot instead of duplicating.
+        record_links(&slot, vec![link(0), link(1), link(0)]);
+        assert_eq!(
+            slot.lock()
+                .unwrap()
+                .iter()
+                .map(|l| l.uri.clone())
+                .collect::<Vec<_>>(),
+            vec!["https://example.com/1", "https://example.com/0"]
+        );
+        record_links(
+            &slot,
+            (2..crate::tmux::osc8::MAX_PANE_LINKS + 8)
+                .map(link)
+                .collect(),
+        );
+        let held = slot.lock().unwrap();
+        assert_eq!(held.len(), crate::tmux::osc8::MAX_PANE_LINKS);
+        assert_eq!(
+            held.back().unwrap().uri,
+            format!(
+                "https://example.com/{}",
+                crate::tmux::osc8::MAX_PANE_LINKS + 7
+            )
+        );
     }
 
     #[test]
@@ -3450,6 +3748,7 @@ mod tests {
             alive: Arc::new(AtomicBool::new(false)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
+            links: Arc::new(Mutex::new(VecDeque::new())),
             chunk_seq,
             settled_chunk_seq: settled_chunk_seq.clone(),
             last_chunk_ms: last_chunk_ms.clone(),
@@ -3570,6 +3869,7 @@ mod tests {
             alive: Arc::new(AtomicBool::new(false)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: clipboard.clone(),
+            links: Arc::new(Mutex::new(VecDeque::new())),
             chunk_seq: chunk_seq.clone(),
             settled_chunk_seq: settled_chunk_seq.clone(),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
