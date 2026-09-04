@@ -1076,6 +1076,10 @@ pub enum Event {
         image: bool,
         audio: bool,
         embedded_context: bool,
+        /// Latest ACP initialize result for session/load. Missing on events
+        /// written before this field existed, which means unknown.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        load_session: Option<bool>,
         /// Whether the agent accepts `_session/steering`, so a prompt
         /// sent mid-turn is injected into the running turn instead of
         /// being parked in the composer's client-side queue. Gated on
@@ -1701,8 +1705,30 @@ mod tests {
             image: false,
             audio: false,
             embedded_context: false,
+            load_session: None,
             steering,
         }
+    }
+
+    #[test]
+    fn prompt_capabilities_accept_legacy_events_without_load_session() {
+        let event: Event = serde_json::from_value(serde_json::json!({
+            "PromptCapabilities": {
+                "image": false,
+                "audio": false,
+                "embedded_context": false,
+                "steering": false
+            }
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            event,
+            Event::PromptCapabilities {
+                load_session: None,
+                ..
+            }
+        ));
     }
 
     // The four turn flags ported from the TUI's AcpTranscript (Tier 1: the

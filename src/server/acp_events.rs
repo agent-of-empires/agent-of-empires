@@ -327,7 +327,11 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
 
         let status_intent = derive_acp_status(frame.event.as_ref());
         let acp_change = derive_acp_session_change(frame.event.as_ref());
-        if status_intent.is_none() && acp_change.is_none() {
+        let load_session_capability = match frame.event.as_ref() {
+            crate::acp::state::Event::PromptCapabilities { load_session, .. } => *load_session,
+            _ => None,
+        };
+        if status_intent.is_none() && acp_change.is_none() && load_session_capability.is_none() {
             continue;
         }
 
@@ -340,6 +344,9 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             };
             if !inst.is_structured() {
                 continue;
+            }
+            if let Some(capable) = load_session_capability {
+                inst.acp_load_session_capable = Some(capable);
             }
 
             // Snapshotting around the call is exactly "the transition
@@ -1268,6 +1275,66 @@ mod tests {
         assert!(!row(&terminal_id).unread);
     }
 
+    #[tokio::test]
+    async fn acp_event_listener_tracks_load_session_capability_updates() {
+        let mut inst = Instance::new("acp-session", "/tmp/acp");
+        inst.view = crate::session::View::Structured;
+        inst.acp_session_id = Some("same-acp-id".to_string());
+        let id = inst.id.clone();
+        let state = test_support::build_test_app_state(vec![inst]);
+        let listener = tokio::spawn(acp_event_listener(state.clone()));
+
+        for _ in 0..500 {
+            if state.acp_events_tx.receiver_count() > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(state.acp_events_tx.receiver_count() > 0);
+
+        for (seq, capable) in [(1, true), (2, false)] {
+            state
+                .acp_events_tx
+                .send(AcpBroadcastFrame {
+                    session_id: id.clone(),
+                    seq,
+                    event: Arc::new(crate::acp::Event::PromptCapabilities {
+                        image: false,
+                        audio: false,
+                        embedded_context: false,
+                        load_session: Some(capable),
+                        steering: false,
+                    }),
+                })
+                .expect("listener is subscribed");
+
+            for _ in 0..500 {
+                if state
+                    .instances
+                    .read()
+                    .await
+                    .iter()
+                    .find(|inst| inst.id == id)
+                    .is_some_and(|inst| inst.acp_load_session_capable == Some(capable))
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            assert!(
+                state
+                    .instances
+                    .read()
+                    .await
+                    .iter()
+                    .find(|inst| inst.id == id)
+                    .is_some_and(|inst| inst.acp_load_session_capable == Some(capable)),
+                "capability update {capable} was not applied"
+            );
+        }
+
+        listener.abort();
+    }
     /// End to end over `acp_event_listener` itself, the path that actually
     /// closes #3181. The predicate table and the TUI ownership tests all pass
     /// even if the snapshot is taken *after* `apply_status_intent`, the persist

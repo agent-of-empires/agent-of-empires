@@ -455,6 +455,20 @@ mod context_resume_tests {
             }
         );
 
+        structured.acp_load_session_capable = Some(false);
+        assert_eq!(
+            context_resume_for(&structured),
+            ContextResumeAvailability::Unavailable {
+                reason: ContextResumeUnavailableReason::AgentUnsupported,
+            }
+        );
+
+        structured.acp_load_session_capable = Some(true);
+        assert_eq!(
+            context_resume_for(&structured),
+            ContextResumeAvailability::Available
+        );
+
         structured.fork_pending = Some("opaque-parent".to_string());
         assert_eq!(
             context_resume_for(&structured),

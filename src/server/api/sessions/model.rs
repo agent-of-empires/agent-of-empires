@@ -572,13 +572,19 @@ pub(super) fn context_resume_for(inst: &Instance) -> ContextResumeAvailability {
             ContextResumeAvailability::Unavailable {
                 reason: ContextResumeUnavailableReason::ForkPending,
             }
-        } else if inst.acp_session_id.is_some() {
-            ContextResumeAvailability::Indeterminate {
-                reason: ContextResumeIndeterminateReason::AgentHandshakeRequired,
-            }
-        } else {
+        } else if inst.acp_session_id.is_none() {
             ContextResumeAvailability::Unavailable {
                 reason: ContextResumeUnavailableReason::NoTarget,
+            }
+        } else {
+            match inst.acp_load_session_capable {
+                Some(true) => ContextResumeAvailability::Available,
+                Some(false) => ContextResumeAvailability::Unavailable {
+                    reason: ContextResumeUnavailableReason::AgentUnsupported,
+                },
+                None => ContextResumeAvailability::Indeterminate {
+                    reason: ContextResumeIndeterminateReason::AgentHandshakeRequired,
+                },
             }
         };
     }

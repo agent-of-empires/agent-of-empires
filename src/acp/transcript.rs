@@ -1771,6 +1771,7 @@ mod tests {
                 image: false,
                 audio: false,
                 embedded_context: false,
+                load_session: None,
                 steering: true,
             },
             prompt("read src/acp"),

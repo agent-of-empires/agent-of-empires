@@ -183,6 +183,24 @@ fn structured_fork_mints_distinct_child_id_and_preserves_parent() {
     );
     let _parent_session_id = parse_session_id(&String::from_utf8_lossy(&add.stdout));
     let parent_acp_id = wait_for_acp_id(&h, "ForkParent", Duration::from_secs(45));
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let parent_context_resume = rt.block_on(async {
+        reqwest::get(format!("http://127.0.0.1:{port}/api/sessions"))
+            .await
+            .expect("GET /api/sessions")
+            .json::<serde_json::Value>()
+            .await
+            .expect("decode sessions response")["sessions"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["title"] == "ForkParent"))
+            .map(|row| row["context_resume"].clone())
+            .expect("ForkParent context_resume")
+    });
+    assert_eq!(
+        parent_context_resume,
+        serde_json::json!({ "state": "available" }),
+        "the negotiated loadSession capability must reach GET /api/sessions"
+    );
 
     // Fork: request a STRUCTURED fork through the REST create endpoint. The CLI
     // `--fork-from` only builds a terminal seed; the structured path is the
@@ -191,7 +209,6 @@ fn structured_fork_mints_distinct_child_id_and_preserves_parent() {
     // caller means no token is required.
     let project_str = project.to_str().unwrap().to_string();
     let parent_acp_for_post = parent_acp_id.clone();
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let post: Result<(), String> = rt.block_on(async move {
         let base = format!("http://127.0.0.1:{port}");
         let client = reqwest::Client::builder()
