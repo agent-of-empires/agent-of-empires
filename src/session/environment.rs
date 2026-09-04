@@ -175,18 +175,6 @@ pub(crate) fn login_flag_shell_case_pattern() -> String {
     LOGIN_FLAG_SHELLS.join("|")
 }
 
-/// Every shell basename this codebase recognizes, as one POSIX `case` pattern,
-/// whether or not `-l` applies to it.
-pub(crate) fn known_shell_case_pattern() -> String {
-    let mut names: Vec<&str> = Vec::with_capacity(LOGIN_FLAG_SHELLS.len() + NON_POSIX_SHELLS.len());
-    for name in LOGIN_FLAG_SHELLS.iter().chain(NON_POSIX_SHELLS) {
-        if !names.contains(name) {
-            names.push(name);
-        }
-    }
-    names.join("|")
-}
-
 /// Build the tmux pane command that launches `shell` as a login+interactive
 /// shell, so it sources the user's profile and rc files (`~/.zprofile`,
 /// `~/.zshrc`, oh-my-zsh, Homebrew/nvm PATH setup) exactly as a native
