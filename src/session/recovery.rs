@@ -1,9 +1,9 @@
 //! Startup auto-recovery for AI agent sessions.
 //!
-//! After a system reboot, tmux loses all its sessions. AoE sessions whose
-//! agent supports `--resume <sid>` (claude, opencode, codex, gemini, vibe,
-//! pi, hermes, kiro, qwen, copilot) can be transparently recreated by replaying
-//! the resume cascade in `start_with_resume_fallback`. This module centralises
+//! After a system reboot, tmux loses all its sessions. AoE sessions with a
+//! stored conversation ID and a non-`Unsupported` resume strategy can be
+//! transparently recreated by replaying the resume cascade in
+//! `start_with_resume_fallback`. This module centralises
 //! the candidate selection and the cross-process exclusion needed to make
 //! that safe when both the TUI (`aoe`) and the daemon (`aoe serve`) are
 //! running.
@@ -49,10 +49,8 @@
 
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
-#[cfg(feature = "serve")]
 use std::sync::Arc;
 use std::time::Duration;
-#[cfg(feature = "serve")]
 use std::time::Instant;
 
 use anyhow::Result;
@@ -131,7 +129,10 @@ pub fn is_recovery_candidate(inst: &Instance) -> bool {
         && !inst.is_trashed()
         && inst.status != super::Status::Stopped
         && inst.agent_session_id != inst.resume_probe_failed_sid
-        && should_attempt_resume(inst.agent_session_id.as_deref(), &inst.tool)
+        && should_attempt_resume(
+            inst.agent_session_id.as_deref(),
+            inst.capture_agent_name().unwrap_or(&inst.tool),
+        )
 }
 
 /// Minimum `agent_session_id` length before it is trusted as a process-argv
@@ -143,7 +144,10 @@ const ORPHAN_SCAN_MIN_SID_LEN: usize = 8;
 
 /// True when aoe injects `AOE_INSTANCE_ID` into this agent's environment. Gated
 /// on the same hook presence as `status_hook_env_prefix`, so it tracks exactly
-/// the agents whose live process carries the anchored env marker.
+/// the agents whose live process carries the anchored env marker. Callers pass
+/// the resolved built-in for the same reason that prefix does: a wrapper's own
+/// name resolves to no agent, so reading it raw denies a marker the launch line
+/// did put there.
 fn agent_injects_instance_id_env(tool: &str) -> bool {
     crate::agents::get_agent(tool)
         .is_some_and(|a| a.hook_config.is_some() || a.sidecar_hooks.is_some())
@@ -164,7 +168,8 @@ pub fn orphan_needles(inst: &Instance) -> (String, Option<String>) {
     } else {
         format!("{}={}", crate::tmux::env::AOE_INSTANCE_ID_KEY, inst.id)
     };
-    let cmdline = if agent_injects_instance_id_env(&inst.tool) {
+    let cmdline = if agent_injects_instance_id_env(inst.capture_agent_name().unwrap_or(&inst.tool))
+    {
         None
     } else {
         inst.agent_session_id
@@ -213,10 +218,8 @@ pub fn orphaned_agents_alive(insts: &[Instance]) -> Vec<bool> {
 /// Callers on an async runtime must invoke this inside `spawn_blocking`: it
 /// walks the process table and would otherwise stall the executor.
 ///
-/// The TUI path scans in a batch via [`orphaned_agents_alive`], so this
-/// single-instance convenience is compiled only where it is actually used: the
-/// serve-gated daemon Phase B re-check and the unit tests.
-#[cfg(any(feature = "serve", test))]
+/// The TUI path scans in a batch via [`orphaned_agents_alive`]; this
+/// single-instance convenience serves the daemon's Phase B re-check.
 pub fn orphaned_agent_process_alive(inst: &Instance) -> bool {
     orphaned_agents_alive(std::slice::from_ref(inst))
         .first()
@@ -350,14 +353,12 @@ pub const STARTUP_RECOVERY_CONCURRENCY: usize = 3;
 /// confirmed-Dead pane, so the typical bound holds; if production telemetry
 /// shows the absolute case occurring, raise this to 11s rather than relying
 /// on early abort.
-#[cfg(feature = "serve")]
 pub const RECENTLY_RESTARTED_TTL: Duration = Duration::from_secs(8);
 
 /// Periodic GC interval for `recently_restarted`. Long-running daemons may
 /// accumulate thousands of entries over a session if they never GC; the TTL
 /// check on read filters but does not remove. Sweeping every 60s keeps the
 /// map bounded by `O(recoveries_in_last_60s)` rather than total uptime.
-#[cfg(feature = "serve")]
 pub const RECENTLY_RESTARTED_GC_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Shared `recently_restarted` map: instance id → time of last successful
@@ -365,11 +366,9 @@ pub const RECENTLY_RESTARTED_GC_INTERVAL: Duration = Duration::from_secs(60);
 /// `Status::Error` transition while a freshly-restarted agent is still
 /// settling. Entries older than `RECENTLY_RESTARTED_TTL` are ignored on read
 /// and removed by the GC task.
-#[cfg(feature = "serve")]
 pub type RecentlyRestarted = Arc<std::sync::RwLock<std::collections::HashMap<String, Instant>>>;
 
 /// Construct an empty `recently_restarted` map.
-#[cfg(feature = "serve")]
 pub fn new_recently_restarted() -> RecentlyRestarted {
     Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()))
 }
@@ -381,7 +380,6 @@ pub fn new_recently_restarted() -> RecentlyRestarted {
 /// (after the pane scrape, before the decision) cannot combine stale
 /// pane-missing metadata with a cleared mark and re-emit the phantom
 /// `Status::Error` the suppression is there to prevent.
-#[cfg(feature = "serve")]
 pub fn snapshot_recently_restarted(map: &RecentlyRestarted) -> std::collections::HashSet<String> {
     let guard = match map.read() {
         Ok(g) => g,
@@ -394,7 +392,6 @@ pub fn snapshot_recently_restarted(map: &RecentlyRestarted) -> std::collections:
         .collect()
 }
 
-#[cfg(feature = "serve")]
 pub fn mark_recently_restarted(map: &RecentlyRestarted, id: &str) {
     if let Ok(mut guard) = map.write() {
         guard.insert(id.to_string(), Instant::now());
@@ -404,7 +401,6 @@ pub fn mark_recently_restarted(map: &RecentlyRestarted, id: &str) {
 /// Inverse of `mark_recently_restarted`. Called when a pre-marked
 /// candidate turns out not to need recovery (post-lock re-check fails),
 /// to avoid suppressing the real status for the full TTL.
-#[cfg(feature = "serve")]
 pub fn unmark_recently_restarted(map: &RecentlyRestarted, id: &str) {
     if let Ok(mut guard) = map.write() {
         guard.remove(id);
@@ -415,7 +411,6 @@ pub fn unmark_recently_restarted(map: &RecentlyRestarted, id: &str) {
 /// avoids a tight read-vs-GC race where a reader observes an entry just
 /// before GC removes it; with 2x, a reader that saw the entry at age T has
 /// at least T more time before GC reaps it.
-#[cfg(feature = "serve")]
 pub fn gc_recently_restarted(map: &RecentlyRestarted) {
     let cutoff = RECENTLY_RESTARTED_TTL * 2;
     if let Ok(mut guard) = map.write() {
@@ -432,11 +427,9 @@ pub fn gc_recently_restarted(map: &RecentlyRestarted) {
 /// `STARTUP_RECOVERY_CONCURRENCY` semaphore queue past the TTL does not age
 /// out of suppression and trip a phantom `Status::Error` before its worker
 /// even begins.
-#[cfg(feature = "serve")]
 pub type RecoveryPending = Arc<std::sync::RwLock<std::collections::HashSet<String>>>;
 
 /// Construct an empty `recovery_pending` set.
-#[cfg(feature = "serve")]
 pub fn new_recovery_pending() -> RecoveryPending {
     Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()))
 }
@@ -444,7 +437,6 @@ pub fn new_recovery_pending() -> RecoveryPending {
 /// Seed the pending set with every scheduled candidate id. Called by Phase A
 /// alongside the initial `mark_recently_restarted` so the refresher has the
 /// full work set before the cascade (and the refresher) start.
-#[cfg(feature = "serve")]
 pub fn seed_recovery_pending(pending: &RecoveryPending, ids: impl IntoIterator<Item = String>) {
     if let Ok(mut guard) = pending.write() {
         guard.extend(ids);
@@ -463,7 +455,6 @@ pub fn seed_recovery_pending(pending: &RecoveryPending, ids: impl IntoIterator<I
 /// never re-stamped) or it blocks until this read releases (its later unmark
 /// strictly succeeds this stamp). No mark-after-unmark resurrection is
 /// possible. See [`drain_recovery_pending`].
-#[cfg(feature = "serve")]
 pub fn refresh_recovery_pending(
     pending: &RecoveryPending,
     recently_restarted: &RecentlyRestarted,
@@ -485,7 +476,6 @@ pub fn refresh_recovery_pending(
 /// stops re-stamping it, *then* clear its suppression mark. The ordering
 /// (`W(pending)` before unmarking `recently_restarted`) is what makes the
 /// unmark stick against a racing refresher; see [`refresh_recovery_pending`].
-#[cfg(feature = "serve")]
 pub fn drain_recovery_pending(
     pending: &RecoveryPending,
     recently_restarted: &RecentlyRestarted,
@@ -542,7 +532,7 @@ fn stamp_recovery_error(inst: &mut Instance, e: &anyhow::Error) {
 fn format_recovery_last_error(e: &anyhow::Error) -> String {
     if let Some(t) = e
         .chain()
-        .find_map(|c| c.downcast_ref::<super::repo_config::HookTimeout>())
+        .find_map(|c| c.downcast_ref::<super::config::repo_config::HookTimeout>())
     {
         format!(
             "on_launch hook timed out after {}s: {}",
@@ -609,7 +599,6 @@ impl Drop for HookTimeoutScope {
 mod tests {
     use super::*;
 
-    #[cfg(feature = "serve")]
     #[test]
     fn snapshot_recently_restarted_includes_fresh_excludes_missing() {
         let map = new_recently_restarted();
@@ -619,7 +608,6 @@ mod tests {
         assert!(!snap.contains("other"));
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn snapshot_recently_restarted_excludes_expired() {
         let map = new_recently_restarted();
@@ -634,7 +622,6 @@ mod tests {
         assert!(snap.contains("fresh"));
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn recently_restarted_gc_removes_stale_entries() {
         let map = new_recently_restarted();
@@ -658,7 +645,6 @@ mod tests {
     /// pending set and leaves `recently_restarted` clear. Without the drain,
     /// the refresher would re-stamp the id forever and suppress its real
     /// status for the rest of the cascade.
-    #[cfg(feature = "serve")]
     #[test]
     fn refresher_does_not_resurrect_drained_worker_mark() {
         let recently = new_recently_restarted();
@@ -699,7 +685,6 @@ mod tests {
 
     /// The refresher keeps a still-queued candidate marked while a *different*
     /// candidate finishes. Draining one id must not stop refreshing the rest.
-    #[cfg(feature = "serve")]
     #[test]
     fn refresher_keeps_remaining_candidates_after_partial_drain() {
         let recently = new_recently_restarted();
@@ -735,7 +720,6 @@ mod tests {
     /// This fails if [`drain_recovery_pending`] is reordered to unmark before
     /// taking `W(pending)`: the premature unmark would race ahead of the
     /// stamp and the id would be resurrected.
-    #[cfg(feature = "serve")]
     #[test]
     fn refresher_mark_loses_to_concurrent_drain_under_lock_overlap() {
         use std::thread;
@@ -778,6 +762,38 @@ mod tests {
             !recently.read().unwrap().contains_key("x"),
             "the worker's unmark must win over the refresher's last mark; \
              no mark-after-unmark resurrection",
+        );
+    }
+
+    /// A wrapper declared through `agent_detect_as` now carries a real
+    /// conversation id, so both recovery predicates have to resolve it: the
+    /// resume gate keeps a crashed wrapper pane recoverable, and the orphan
+    /// scan must not fall back to the sid needle for an agent whose launch
+    /// line already carries `AOE_INSTANCE_ID` (#3006).
+    #[test]
+    fn wrapper_recovery_resolves_its_detect_as_base() {
+        const PROFILE: &str = "wrapper-recovery-test";
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(PROFILE);
+        let mut config = crate::session::Config::default();
+        config
+            .session
+            .agent_detect_as
+            .insert("claude-personal".to_string(), "claude".to_string());
+        crate::tmux::status_rules::install_from_config(PROFILE, &config);
+
+        let mut inst = Instance::new("wrapper", "/tmp/test");
+        inst.source_profile = PROFILE.to_string();
+        inst.tool = "claude-personal".to_string();
+        inst.agent_session_id = Some("44444444-4444-4444-8444-444444444444".into());
+
+        assert!(
+            is_recovery_candidate(&inst),
+            "a wrapper holding a claude conversation must stay recoverable"
+        );
+        assert_eq!(
+            orphan_needles(&inst).1,
+            None,
+            "a wrapper injects AOE_INSTANCE_ID, so the sid must not double as a needle"
         );
     }
 
@@ -1074,7 +1090,7 @@ mod tests {
     /// today. AC #3 of #1889 specifies the exact `last_error` text.
     #[test]
     fn format_recovery_last_error_renders_hook_timeout_with_on_launch_prefix() {
-        let err = anyhow::Error::new(super::super::repo_config::HookTimeout {
+        let err = anyhow::Error::new(super::super::config::repo_config::HookTimeout {
             cmd: "sleep 60".to_string(),
             timeout_secs: 30,
         });
@@ -1088,7 +1104,7 @@ mod tests {
     fn stamp_recovery_error_sets_error_status_and_operator_fields() {
         let mut inst = Instance::new("timeout", "/tmp/test");
         let before = std::time::Instant::now();
-        let err = anyhow::Error::new(super::super::repo_config::HookTimeout {
+        let err = anyhow::Error::new(super::super::config::repo_config::HookTimeout {
             cmd: "sleep 60".to_string(),
             timeout_secs: 30,
         });
@@ -1124,7 +1140,7 @@ mod tests {
     /// the timeout-shaped message.
     #[test]
     fn format_recovery_last_error_walks_chain_through_context() {
-        let err = anyhow::Error::new(super::super::repo_config::HookTimeout {
+        let err = anyhow::Error::new(super::super::config::repo_config::HookTimeout {
             cmd: "echo hi && sleep 60".to_string(),
             timeout_secs: 12,
         })

@@ -37,25 +37,19 @@ mod platform {
 pub(crate) mod metrics;
 
 /// Protocol-agnostic plumbing for supervised worker subprocesses, lifted
-/// out of `src/acp/` so the future plugin host can reuse it. Serve-gated
-/// because its only consumer today is the serve-gated `acp` module.
-#[cfg(feature = "serve")]
+/// out of `src/acp/` so the future plugin host can reuse it.
 pub mod worker;
 
 /// On-disk registry of detached ACP worker subprocesses (pid, socket path,
 /// build version, `stored_acp_session_id`). Colocated here with the
 /// protocol-agnostic `worker` substrate it builds on, so the plugin host can
 /// reuse that substrate directly. Dependency direction is one-way: consumers
-/// point down to `process`, never to each other. Serve-gated to match its
-/// consumers.
-#[cfg(feature = "serve")]
+/// point down to `process`, never to each other.
 pub mod worker_registry;
 
 /// The `aoe __acp-runner` shim: owns a detached ACP agent subprocess and
 /// outlives `aoe serve`. Colocated with `worker_registry` and the
-/// protocol-agnostic `worker` substrate they build on; serve-gated to match
-/// its consumers.
-#[cfg(feature = "serve")]
+/// protocol-agnostic `worker` substrate they build on.
 pub mod runner;
 
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -365,7 +359,6 @@ pub fn get_foreground_pid(shell_pid: u32) -> Option<u32> {
 /// `caffeinate -w <daemon_pid>` watches the daemon PID; the Linux `cat` sees
 /// EOF on the stdin pipe the daemon held), and init then reaps it. The
 /// `server` status loop is the only consumer.
-#[cfg(feature = "serve")]
 pub trait SleepInhibit: Send {
     /// Acquire the assertion by spawning and retaining the backing child.
     fn acquire(&mut self) -> anyhow::Result<()>;
@@ -380,7 +373,6 @@ pub trait SleepInhibit: Send {
 /// Build the platform sleep inhibitor: `caffeinate -i -w <daemon_pid>` on
 /// macOS, `systemd-inhibit --what=idle:sleep ... cat` on Linux, and a no-op
 /// on every other platform.
-#[cfg(feature = "serve")]
 pub fn sleep_inhibitor() -> Box<dyn SleepInhibit> {
     #[cfg(target_os = "macos")]
     {
@@ -400,10 +392,10 @@ pub fn sleep_inhibitor() -> Box<dyn SleepInhibit> {
 
 /// Sleep inhibitor for platforms with no supported backend: acquire and release
 /// are no-ops, and `is_held_alive` reports held to avoid pointless respawns.
-#[cfg(all(feature = "serve", not(any(target_os = "linux", target_os = "macos"))))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 struct NoopInhibitor;
 
-#[cfg(all(feature = "serve", not(any(target_os = "linux", target_os = "macos"))))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 impl SleepInhibit for NoopInhibitor {
     fn acquire(&mut self) -> anyhow::Result<()> {
         Ok(())
@@ -425,11 +417,11 @@ impl SleepInhibit for NoopInhibitor {
 /// builds a fresh inhibitor on every reacquire, so a per-instance guard could
 /// not remember across rebuilds; the backends read it to report the dead
 /// backend as held, which stops the reconciler respawning a doomed child.
-#[cfg(all(feature = "serve", any(target_os = "linux", target_os = "macos")))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 static SLEEP_INHIBIT_UNAVAILABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-#[cfg(all(feature = "serve", any(target_os = "linux", target_os = "macos")))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn sleep_inhibit_unavailable() -> bool {
     SLEEP_INHIBIT_UNAVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -443,7 +435,6 @@ fn sleep_inhibit_unavailable() -> bool {
 /// no logind), and false on platforms with only `NoopInhibitor`. The latch is
 /// monotonic and never resets for the daemon's lifetime, so this stays false
 /// until restart even if the missing tool is later installed.
-#[cfg(feature = "serve")]
 pub(crate) fn sleep_inhibit_backend_available() -> bool {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
@@ -458,7 +449,7 @@ pub(crate) fn sleep_inhibit_backend_available() -> bool {
 /// Latch the sleep-inhibit backend unavailable and warn exactly once. Shared
 /// by the platform backends so the warn-once policy lives in one place while
 /// each backend keeps only its own spawn and liveness mechanics.
-#[cfg(all(feature = "serve", any(target_os = "linux", target_os = "macos")))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn latch_sleep_inhibit_unavailable(reason: &str) {
     if !SLEEP_INHIBIT_UNAVAILABLE.swap(true, std::sync::atomic::Ordering::Relaxed) {
         tracing::warn!(target: "process.sleep_inhibit", "{reason}");
@@ -469,7 +460,7 @@ fn latch_sleep_inhibit_unavailable(reason: &str) {
 /// still holding the assertion. Shared by both platform backends because the
 /// exit-code discrimination is policy (like the warn-once latch), not per-OS
 /// mechanics, so the two copies cannot drift; only `exit_reason` differs.
-#[cfg(all(feature = "serve", any(target_os = "linux", target_os = "macos")))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn sleep_inhibit_child_held_alive(child: &mut Option<Child>, exit_reason: &str) -> bool {
     if sleep_inhibit_unavailable() {
         return true;

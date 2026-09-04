@@ -841,9 +841,8 @@ async fn handle_terminal_event(
                 return Ok(false);
             }
             // Double-submit lock, not a dispatch decision: this covers only the
-            // window between our POST and its response. Whether the prompt can
-            // be sent at all is the daemon's call (Tier 3), made in the POST
-            // below. See `docs/development/server-owned-prompt-dispatch.md`.
+            // window between our POST and its response. The daemon decides
+            // whether to send, steer, or queue the prompt.
             if state.in_flight {
                 state.set_composer_text(&text);
                 return Ok(false);

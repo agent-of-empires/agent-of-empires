@@ -1,16 +1,16 @@
 //! `aoe mcp` CLI: inspect the effective MCP server set (#1996).
 //!
 //! Mirrors the read model the web and TUI surfaces render, so a user can debug
-//! "which MCP servers will my agent reach, and where did each come from" without
-//! a serve build. Top-level (not under the serve-gated `aoe acp` group) and
-//! always compiled, because inspecting config is useful before any session runs.
+//! "which MCP servers will my agent reach, and where did each come from".
+//! Top-level rather than under the `aoe acp` group, because inspecting config
+//! is useful before any session runs.
 //! Every value is redacted: command/args/url identify a server, env and header
 //! VALUES are reduced to names.
 
 use anyhow::Result;
 use clap::Subcommand;
 
-use crate::session::mcp_model::{resolve_surface, McpSurfaceView};
+use crate::session::mcp::mcp_model::{resolve_surface, McpSurfaceView};
 
 #[derive(Subcommand, Debug)]
 pub enum McpCommands {
@@ -39,7 +39,7 @@ pub async fn run(profile: &str, command: McpCommands) -> Result<()> {
 
 fn list(profile: &str, args: McpListArgs) -> Result<()> {
     let agent = args.agent.unwrap_or_else(|| {
-        crate::session::profile_config::resolve_config_or_warn(profile)
+        crate::session::config::profile_config::resolve_config_or_warn(profile)
             .session
             .default_tool
             .unwrap_or_else(|| "claude".to_string())
@@ -121,7 +121,7 @@ fn print_table(agent: &str, view: &McpSurfaceView) {
     }
 }
 
-fn transport_detail(r: &crate::session::mcp_model::RedactedMcpServer) -> String {
+fn transport_detail(r: &crate::session::mcp::mcp_model::RedactedMcpServer) -> String {
     let mut s = match (&r.command, &r.url) {
         (Some(command), _) => {
             let mut d = format!("{} ({})", command, r.transport);

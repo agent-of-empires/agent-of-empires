@@ -309,6 +309,28 @@ const KIMI: AgentProfile = {
   specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
 };
 
+// PrimeIntellect Prime Agent via native `prime-agent --mode acp`. Its
+// `_meta` extensions ride a reverse-domain envelope, but tool-call parent
+// linkage is undocumented, so specialised cards and indentation stay off.
+// One ACP session per process is an upstream limit. Mirrors the Rust
+// PRIME_AGENT profile.
+const PRIME_AGENT: AgentProfile = {
+  key: "prime-agent",
+  subagentToolNames: [],
+  capabilities: {
+    todos: false,
+    skills: false,
+    wakeup: false,
+    subagents: false,
+    legacyModeFallback: false,
+    heartbeatKeepalives: false,
+  },
+  parentMetaNamespaces: [],
+  mcpPrefixes: ["mcp__"],
+  aliases: {},
+  specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
+};
+
 const AOE_AGENT: AgentProfile = {
   ...CLAUDE,
   key: "aoe-agent",
@@ -344,6 +366,7 @@ const PROFILES: Record<string, AgentProfile> = {
   pi: PI,
   omp: OMP,
   kimi: KIMI,
+  "prime-agent": PRIME_AGENT,
   "aoe-agent": AOE_AGENT,
 };
 

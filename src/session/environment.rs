@@ -117,10 +117,11 @@ fn passthrough_denyreason(key: &str) -> Option<&'static str> {
 ///
 /// `profile` selects the config layer, so a profile override wins over global.
 pub(crate) fn inherited_host_env(profile: &str) -> Vec<(String, String)> {
-    let passthrough =
-        super::profile_config::resolve_config_or_warn(&super::config::effective_profile(profile))
-            .session
-            .inherit_host_environment;
+    let passthrough = super::config::profile_config::resolve_config_or_warn(
+        &super::config::effective_profile(profile),
+    )
+    .session
+    .inherit_host_environment;
     let vars = std::env::vars_os()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)));
     inherited_host_env_from(vars, passthrough)
@@ -243,13 +244,13 @@ pub(crate) fn session_host_env_pairs(
     sandbox_info: &SandboxInfo,
 ) -> Vec<(String, String)> {
     let resolved_profile = super::config::effective_profile(profile);
-    let trusted = super::profile_config::resolve_config_or_warn(&resolved_profile)
+    let trusted = super::config::profile_config::resolve_config_or_warn(&resolved_profile)
         .sandbox
         .environment;
     let entries = match sandbox_info.extra_env.as_deref() {
         None => trusted,
         Some(extra) => {
-            let repo_aware = super::repo_config::resolve_config_with_repo_or_warn(
+            let repo_aware = super::config::repo_config::resolve_config_with_repo_or_warn(
                 &resolved_profile,
                 project_path,
             )
@@ -673,7 +674,7 @@ pub(crate) fn resolved_sandbox_config(
     project_path: &std::path::Path,
 ) -> super::config::SandboxConfig {
     let resolved = super::config::effective_profile(profile);
-    super::repo_config::resolve_config_with_repo_or_warn(&resolved, project_path).sandbox
+    super::config::repo_config::resolve_config_with_repo_or_warn(&resolved, project_path).sandbox
 }
 
 /// Resolve the complete environment inherited by an in-container agent.

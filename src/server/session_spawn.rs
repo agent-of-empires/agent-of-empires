@@ -60,17 +60,11 @@ pub(crate) struct StructuredSessionSpec {
     /// supervisor applies it after every worker (re)spawn. Stamped by the
     /// plugin host create path after host-side classification.
     pub acp_mode_id: Option<String>,
-    #[cfg(feature = "serve")]
     pub view: crate::session::View,
-    #[cfg(feature = "serve")]
     pub agent_name: Option<String>,
-    #[cfg(feature = "serve")]
     pub agent_model: Option<String>,
-    #[cfg(feature = "serve")]
     pub agent_effort: Option<String>,
-    #[cfg(feature = "serve")]
     pub import_acp_session_id: Option<String>,
-    #[cfg(feature = "serve")]
     pub fork_seed: Option<crate::session::ForkSeed>,
 }
 
@@ -147,17 +141,11 @@ pub(crate) async fn spawn_structured_session(
             plugin_create_idempotency,
             pending_initial_turn,
             acp_mode_id,
-            #[cfg(feature = "serve")]
             view,
-            #[cfg(feature = "serve")]
             agent_name,
-            #[cfg(feature = "serve")]
             agent_model,
-            #[cfg(feature = "serve")]
             agent_effort,
-            #[cfg(feature = "serve")]
             import_acp_session_id,
-            #[cfg(feature = "serve")]
             fork_seed,
         } = spec;
 
@@ -228,10 +216,7 @@ pub(crate) async fn spawn_structured_session(
                 Vec::new()
             },
             scratch,
-            #[cfg(feature = "serve")]
             fork_seed,
-            #[cfg(not(feature = "serve"))]
-            fork_seed: None,
         };
 
         let build_result = builder::build_instance(params, &title_refs, &branch_refs, &profile)?;
@@ -257,7 +242,6 @@ pub(crate) async fn spawn_structured_session(
         // Apply structured-view fields from the request body. structured_view is
         // re-validated below against real ACP capability; non-ACP tools
         // fall back to terminal view rather than erroring at spawn time.
-        #[cfg(feature = "serve")]
         let agent_effort = {
             instance.view = view;
             // #2276: importing an existing Claude session forces the
@@ -280,7 +264,7 @@ pub(crate) async fn spawn_structured_session(
                 .filter(|s| !s.is_empty())
                 .unwrap_or(instance.tool.as_str())
                 .to_string();
-            let resolved_config = crate::session::repo_config::resolve_config_with_repo_or_warn(
+            let resolved_config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
                 &instance.source_profile,
                 std::path::Path::new(&instance.project_path),
             );
@@ -329,7 +313,7 @@ pub(crate) async fn spawn_structured_session(
                     .filter(|s| !s.is_empty())
                     .unwrap_or(instance.tool.as_str());
                 let resolved_session =
-                    crate::session::repo_config::resolve_config_with_repo_or_warn(
+                    crate::session::config::repo_config::resolve_config_with_repo_or_warn(
                         &instance.source_profile,
                         std::path::Path::new(&instance.project_path),
                     )
@@ -418,10 +402,7 @@ pub(crate) async fn spawn_structured_session(
             // supervisor spawns the ACP agent on demand. Skip the tmux
             // `start()` to avoid creating an empty pane that no one will
             // attach to.
-            #[cfg(feature = "serve")]
             let skip_tmux_start = instance.is_structured();
-            #[cfg(not(feature = "serve"))]
-            let skip_tmux_start = false;
             if !skip_tmux_start {
                 instance.start()?;
             }
@@ -449,20 +430,15 @@ pub(crate) async fn spawn_structured_session(
             return Err(e);
         }
 
-        #[cfg(feature = "serve")]
-        return Ok::<(Instance, Vec<String>, Option<String>), anyhow::Error>((
+        Ok::<(Instance, Vec<String>, Option<String>), anyhow::Error>((
             instance,
             build_warnings,
             agent_effort,
-        ));
-
-        #[cfg(not(feature = "serve"))]
-        Ok::<(Instance, Vec<String>), anyhow::Error>((instance, build_warnings))
+        ))
     })
     .await;
 
     match result {
-        #[cfg(feature = "serve")]
         Ok(Ok((instance, warnings, agent_effort))) => {
             let response_instance = instance.clone();
             let acp_spawn_target = if instance.is_structured() {
@@ -631,17 +607,6 @@ pub(crate) async fn spawn_structured_session(
                 });
             }
 
-            Ok(SpawnOutcome {
-                instance: response_instance,
-                warnings,
-            })
-        }
-        #[cfg(not(feature = "serve"))]
-        Ok(Ok((instance, warnings))) => {
-            let response_instance = instance.clone();
-            let mut instances = service.instances.write().await;
-            instances.push(instance);
-            drop(instances);
             Ok(SpawnOutcome {
                 instance: response_instance,
                 warnings,

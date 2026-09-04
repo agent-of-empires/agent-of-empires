@@ -1,7 +1,7 @@
 // Token rotation grace window: after the daemon rotates, the previous
 // token must keep working for the grace period, the new token must work
 // immediately, and the previous token must be rejected once grace
-// expires. Covers `src/server/mod.rs` TokenManager rotate + validate.
+// expires. Covers `src/server/token.rs` TokenManager rotate + validate.
 //
 // Driven by debug-build env overrides AOE_TEST_TOKEN_LIFETIME_SECS and
 // AOE_TEST_TOKEN_GRACE_SECS. The harness sets these via the

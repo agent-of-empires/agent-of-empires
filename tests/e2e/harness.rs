@@ -11,7 +11,6 @@
 //! convert it to a GIF via `agg`. Recordings are saved to
 //! `target/e2e-recordings/`. Both `asciinema` and `agg` must be on `$PATH`.
 
-#[cfg(feature = "serve")]
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -122,7 +121,6 @@ macro_rules! require_tmux {
 }
 pub(crate) use require_tmux;
 
-#[cfg(feature = "serve")]
 pub fn node_available() -> bool {
     Command::new("node")
         .arg("--version")
@@ -134,7 +132,6 @@ pub fn node_available() -> bool {
 /// Skip the calling test if Node.js is not installed. Acp e2e tests
 /// drive the shared `web/tests/helpers/fakeAcpAgent.mjs` fake agent, which
 /// is a Node script; without Node the worker can't speak ACP.
-#[cfg(feature = "serve")]
 macro_rules! require_node {
     () => {
         if !$crate::harness::node_available() {
@@ -143,7 +140,6 @@ macro_rules! require_node {
         }
     };
 }
-#[cfg(feature = "serve")]
 pub(crate) use require_node;
 
 // ---------------------------------------------------------------------------
@@ -161,7 +157,6 @@ pub(crate) use require_node;
 /// whichever daemon lost. Remembering what we have already issued closes the
 /// in-process half of the race; the ephemeral bind still covers ports taken by
 /// unrelated processes.
-#[cfg(feature = "serve")]
 pub fn pick_free_port() -> u16 {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
@@ -185,7 +180,6 @@ pub fn pick_free_port() -> u16 {
 /// `aoe serve --daemon` returns as soon as it has spawned the child, so a
 /// successful exit doesn't prove the child bound the port; this is the
 /// real signal that the daemon is up.
-#[cfg(feature = "serve")]
 pub fn wait_for_port(port: u16, timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {

@@ -188,9 +188,8 @@ pub struct ReplayQuery {
     /// Optional projection selector. Omitted (the default) returns the raw
     /// `frames` shape every existing client relies on. `view=rows` folds the
     /// SAME selected page through `TranscriptModel` and returns the built
-    /// `TranscriptRow[]` in `rows` instead of `frames`, keeping identical
-    /// pagination metadata so the client's cursor logic is unchanged. See
-    /// `docs/development/server-owned-sv-state.md`.
+    /// `TranscriptRow[]` in `rows` instead of `frames`, with the same pagination
+    /// metadata.
     #[serde(default)]
     pub view: Option<String>,
 }
