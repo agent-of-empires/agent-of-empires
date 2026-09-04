@@ -6,7 +6,13 @@ on:
   # No branch filter: a stacked PR targets its parent branch rather than main,
   # and a base filter would leave every PR but the bottom of the stack with no
   # checks at all.
+  #
+  # `labeled` is listed so adding `ci-macos` starts a run that can see the
+  # label; the default types alone would leave the macOS job waiting for the
+  # next push. It re-runs the workflow on any label, which is rare enough to
+  # cost less than a macOS regression reaching main.
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
 
 env:
   CARGO_TERM_COLOR: always
