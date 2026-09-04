@@ -1658,6 +1658,17 @@ fn glob_roots(project_volumes: &[VolumeMount]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// True when `project_path` presents as a git worktree whose linkage is broken.
+///
+/// [`compute_volume_paths`] resolves a worktree's mounts through
+/// `find_main_repo`; when that fails it falls through to `/workspace/{basename}`,
+/// a path the session's container never mounted (#2414). Every container path
+/// derived in that state is provisional, so a caller about to act destructively
+/// on the difference between the derived set and reality must not.
+fn worktree_linkage_broken(project_path: &Path) -> bool {
+    project_path.join(".git").exists() && GitWorktree::find_main_repo(project_path).is_err()
+}
+
 /// Produce a deterministic Docker volume name for a named volume_ignores mount.
 ///
 /// Uses the full session ID as a prefix so volumes can be enumerated on deletion.
@@ -2199,9 +2210,12 @@ pub(crate) fn build_container_config(
     // expanded against the host filesystem now (#2045): a point-in-time snapshot,
     // since Docker needs concrete mount paths when the container starts.
     let mut resolved_ignore_paths: Vec<String> = Vec::new();
+    let mut glob_matched_nothing = false;
     for ignore in &sandbox_config.volume_ignores {
         if has_glob_metachars(ignore) {
-            resolved_ignore_paths.extend(expand_glob_ignore(ignore, &glob_roots));
+            let matches = expand_glob_ignore(ignore, &glob_roots);
+            glob_matched_nothing |= matches.is_empty();
+            resolved_ignore_paths.extend(matches);
         } else {
             for base_path in &volume_ignore_bases {
                 resolved_ignore_paths.push(format!("{}/{}", base_path, ignore));
@@ -2225,6 +2239,12 @@ pub(crate) fn build_container_config(
             })
         })
         .collect();
+
+    // A degraded mount resolve or a glob that matched nothing both leave the
+    // resolved set a floor rather than the whole truth, which is the difference
+    // between reclaiming a stranded volume and destroying a live cache.
+    let named_ignore_volumes_authoritative = !glob_matched_nothing
+        && !(workspace_info.is_none() && worktree_linkage_broken(project_path));
 
     // Route by strategy: anonymous volumes are the default; named volumes fix VirtioFS on macOS.
     let (anonymous_volumes, named_ignore_volumes): (Vec<String>, Vec<NamedVolumeMount>) =
@@ -2279,6 +2299,7 @@ pub(crate) fn build_container_config(
         volumes: deduped,
         anonymous_volumes,
         named_ignore_volumes,
+        named_ignore_volumes_authoritative,
         environment,
         cpu_limit: sandbox_config.cpu_limit,
         memory_limit: sandbox_config.memory_limit,
@@ -2582,6 +2603,33 @@ mod tests {
         );
         // Container path and working dir should be the same
         assert_eq!(volumes[0].container_path, working_dir);
+    }
+
+    #[test]
+    fn worktree_linkage_broken_flags_only_the_degraded_resolve() {
+        let dir = TempDir::new().unwrap();
+
+        // An orphaned worktree: a `.git` file whose gitdir points nowhere, the
+        // state a pruned admin entry leaves behind. compute_volume_paths collapses
+        // to /workspace/{basename} here (#2414), so the paths it derives are
+        // provisional and must not drive a deletion.
+        let orphaned = dir.path().join("myrepo-worktrees").join("contexec");
+        std::fs::create_dir_all(&orphaned).unwrap();
+        std::fs::write(
+            orphaned.join(".git"),
+            "gitdir: ../../does-not-exist/.git/worktrees/contexec\n",
+        )
+        .unwrap();
+        assert!(worktree_linkage_broken(&orphaned));
+
+        // A plain directory has no linkage to break, and neither does a healthy
+        // repo; both resolve to /workspace/{basename} legitimately.
+        let plain = dir.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert!(!worktree_linkage_broken(&plain));
+
+        let (_repo_dir, repo_path) = setup_regular_repo();
+        assert!(!worktree_linkage_broken(&repo_path));
     }
 
     #[test]
@@ -4192,6 +4240,71 @@ volume_ignores = ["**/bin", "**/obj", "target"]
                 .any(|p| p.contains('*') || p.contains('?')),
             "no glob metachar may reach a mount path, got: {:?}",
             config.anonymous_volumes
+        );
+    }
+
+    /// The named-volume reclaim (#3742) only runs against a resolve that establishes
+    /// the whole set. A literal entry always mounts, so it alone keeps the set
+    /// non-empty while a glob silently contributes nothing.
+    #[test]
+    #[serial_test::serial]
+    fn named_ignore_volumes_are_authoritative_only_when_every_glob_matched() {
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let build = |glob_dir_exists: bool| {
+            let project_dir = TempDir::new().unwrap();
+            if glob_dir_exists {
+                fs::create_dir_all(project_dir.path().join("src/App/bin")).unwrap();
+            }
+            let config_dir = project_dir.path().join(".agent-of-empires");
+            fs::create_dir_all(&config_dir).unwrap();
+            fs::write(
+                config_dir.join("config.toml"),
+                r#"
+[sandbox]
+volume_ignores = ["target", "**/bin"]
+volume_ignores_strategy = "named"
+"#,
+            )
+            .unwrap();
+            git2::Repository::init(project_dir.path()).unwrap();
+
+            let sandbox_info = crate::session::instance::SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: "test:latest".to_string(),
+                container_name: "test-container".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                container_workdir: None,
+            };
+            build_container_config(
+                project_dir.path().to_str().unwrap(),
+                &sandbox_info,
+                ContainerAgentSelection::new("claude", None),
+                false,
+                "test-instance-id",
+                None,
+                "",
+            )
+            .unwrap()
+        };
+
+        let matched = build(true);
+        assert!(matched.named_ignore_volumes_authoritative);
+
+        let unmatched = build(false);
+        assert!(
+            !unmatched.named_ignore_volumes.is_empty(),
+            "the literal entry must still mount, so the empty-set guard cannot be what saves this case"
+        );
+        assert!(
+            !unmatched.named_ignore_volumes_authoritative,
+            "a glob that matched nothing leaves the set a floor, so it must not drive a deletion"
         );
     }
 

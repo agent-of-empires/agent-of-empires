@@ -666,11 +666,10 @@ impl RuntimeBase {
 
     /// Remove the named ignore volumes under `prefix` that are not in `keep`.
     ///
-    /// The reconcile counterpart to [`Self::remove_named_ignore_volumes`]: a volume name
-    /// encodes its container mount path, so any path change (a worktree move, an edited
-    /// `volume_ignores`) leaves the session's previous volumes with no container that will
-    /// ever mount them again. Called with the set the next container is created with, so
-    /// those orphans are reclaimed while the still-mounted ones survive.
+    /// The reconcile counterpart to [`Self::remove_named_ignore_volumes`], called with the
+    /// set the next container is created with. See
+    /// [`DockerContainer::prune_stale_named_ignore_volumes`](crate::containers::DockerContainer::prune_stale_named_ignore_volumes)
+    /// for what strands a volume and when reclaiming one is safe.
     pub fn prune_named_ignore_volumes(&self, prefix: &str, keep: &HashSet<&str>) -> Result<()> {
         if !self.supports_named_volumes {
             return Ok(());
@@ -1530,45 +1529,50 @@ mod tests {
     }
 
     #[test]
-    fn stale_named_ignore_volumes_selects_the_ones_the_next_create_strands() {
-        // A worktree move from worktrees/905 to worktrees/rev-912 keeps the main
-        // repo's volume (its container path is unchanged) and strands the
-        // worktree's, whose name encodes the old path (#3742).
-        let listing = "\
-aoe-vi-sess1-workspace-otari-target-8ec07926d6b0
-aoe-vi-sess1-workspace-otari-worktrees-905-target-31ddd0322290
-aoe-vi-sess1-workspace-otari-worktrees-rev-912-target-873cf2685e47
-";
-        let keep = HashSet::from([
-            "aoe-vi-sess1-workspace-otari-target-8ec07926d6b0",
-            "aoe-vi-sess1-workspace-otari-worktrees-rev-912-target-873cf2685e47",
-        ]);
+    fn stale_named_ignore_volumes_selects_only_this_sessions_unkept_volumes() {
+        // The reporter's own listing (#3742): a sibling-worktree layout whose
+        // session moved from otari-worktrees/905 to otari-worktrees/rev-912.
+        const MAIN: &str = "aoe-vi-sess1-workspace-otari-target-8ec07926d6b0";
+        const PRE_MOVE: &str = "aoe-vi-sess1-workspace-otari-worktrees-905-target-31ddd0322290";
+        const POST_MOVE: &str =
+            "aoe-vi-sess1-workspace-otari-worktrees-rev-912-target-873cf2685e47";
 
-        assert_eq!(
-            stale_named_ignore_volumes(listing, "aoe-vi-sess1-", &keep),
-            vec!["aoe-vi-sess1-workspace-otari-worktrees-905-target-31ddd0322290"]
-        );
-    }
+        let moved = format!("{MAIN}\n{PRE_MOVE}\n{POST_MOVE}\n");
+        let both = format!("{MAIN}\n{PRE_MOVE}\n");
 
-    #[test]
-    fn stale_named_ignore_volumes_with_an_empty_keep_set_takes_everything() {
-        // The session-deletion sweep, expressed as a prune that keeps nothing.
-        let listing = "aoe-vi-sess1-a-1\naoe-vi-sess1-b-2\n";
-        assert_eq!(
-            stale_named_ignore_volumes(listing, "aoe-vi-sess1-", &HashSet::new()),
-            vec!["aoe-vi-sess1-a-1", "aoe-vi-sess1-b-2"]
-        );
-    }
+        let cases: [(&str, &str, HashSet<&str>, Vec<&str>); 3] = [
+            (
+                // The move leaves the main repo's mount path alone, so only the
+                // worktree's volume is stranded.
+                "a worktree move",
+                &moved,
+                HashSet::from([MAIN, POST_MOVE]),
+                vec![PRE_MOVE],
+            ),
+            (
+                // The session-deletion sweep, expressed as a prune that keeps nothing.
+                "an empty keep set",
+                &both,
+                HashSet::new(),
+                vec![MAIN, PRE_MOVE],
+            ),
+            (
+                // docker's `--filter name=` is a substring match, so the listing can
+                // carry a longer session id that this prefix must not claim.
+                "a longer session id in the listing",
+                "aoe-vi-sess1-a-1\naoe-vi-sess10-a-1\n\n",
+                HashSet::new(),
+                vec!["aoe-vi-sess1-a-1"],
+            ),
+        ];
 
-    #[test]
-    fn stale_named_ignore_volumes_ignores_another_sessions_volumes() {
-        // docker's `--filter name=` is a substring match, so the listing can carry
-        // a longer session id that must not be pruned under this one's prefix.
-        let listing = "aoe-vi-sess1-a-1\naoe-vi-sess10-a-1\n\n";
-        assert_eq!(
-            stale_named_ignore_volumes(listing, "aoe-vi-sess1-", &HashSet::new()),
-            vec!["aoe-vi-sess1-a-1"]
-        );
+        for (case, listing, keep, expected) in cases {
+            assert_eq!(
+                stale_named_ignore_volumes(listing, "aoe-vi-sess1-", &keep),
+                expected,
+                "{case}"
+            );
+        }
     }
 
     #[test]

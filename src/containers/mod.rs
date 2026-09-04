@@ -124,14 +124,19 @@ fn classify_running_probe(result: Result<bool>) -> Probe {
     }
 }
 
-/// The named ignore volumes a create is about to mount, or `None` when the config
-/// carries none and the prune must be skipped.
+/// The named ignore volumes a create is about to mount, or `None` when the prune
+/// must be skipped because the config does not establish what the session should
+/// have.
 ///
-/// Keeping the skip here, rather than as an empty keep set, is what stops an
-/// ambiguous config from reading as "every volume this session has is stale". See
-/// [`DockerContainer::prune_stale_named_ignore_volumes`].
+/// Two ways it does not. The set can be incomplete, which
+/// [`ContainerConfig::named_ignore_volumes_authoritative`] reports: a mount resolve
+/// that fell back to `/workspace/{basename}` names volumes the session never had, so
+/// every volume it does have reads as stale. The set can also be empty, which does
+/// not distinguish "this session has no caches" from a switch to the anonymous
+/// strategy. Either way the difference between the config and reality is not evidence
+/// of a stranded volume, and a cache is worth more than a prompt reclaim.
 fn named_ignore_volumes_to_keep(config: &ContainerConfig) -> Option<HashSet<&str>> {
-    if config.named_ignore_volumes.is_empty() {
+    if !config.named_ignore_volumes_authoritative || config.named_ignore_volumes.is_empty() {
         return None;
     }
     Some(
@@ -271,10 +276,8 @@ impl DockerContainer {
     ///
     /// Must be called before the create, while no container holds the volumes.
     ///
-    /// A config with no named ignore volumes prunes nothing: the empty set does not
-    /// distinguish "this session has no caches" from a glob that momentarily matched
-    /// nothing or a switch to the anonymous strategy, and the caches are worth more than
-    /// a prompt reclaim on an ambiguous signal.
+    /// Prunes nothing unless the config establishes the whole set the session should
+    /// have; see [`named_ignore_volumes_to_keep`].
     pub fn prune_stale_named_ignore_volumes(&self, session_id: &str, config: &ContainerConfig) {
         let Some(keep) = named_ignore_volumes_to_keep(config) else {
             return;
@@ -398,26 +401,58 @@ mod tests {
                     container_path: "/workspace/otari/target".to_string(),
                 },
                 NamedVolumeMount {
-                    volume_name: "aoe-vi-sess1-workspace-otari-worktrees-912-target-873cf2685e47"
-                        .to_string(),
-                    container_path: "/workspace/otari/worktrees/912/target".to_string(),
+                    volume_name:
+                        "aoe-vi-sess1-workspace-otari-worktrees-rev-912-target-873cf2685e47"
+                            .to_string(),
+                    container_path: "/workspace/otari-worktrees/rev-912/target".to_string(),
                 },
             ],
+            named_ignore_volumes_authoritative: true,
             ..Default::default()
         };
 
-        let keep = named_ignore_volumes_to_keep(&config).expect("a non-empty config prunes");
+        let keep = named_ignore_volumes_to_keep(&config).expect("an authoritative config prunes");
         assert_eq!(keep.len(), 2);
         assert!(keep.contains("aoe-vi-sess1-workspace-otari-target-8ec07926d6b0"));
-        assert!(keep.contains("aoe-vi-sess1-workspace-otari-worktrees-912-target-873cf2685e47"));
+        assert!(keep.contains("aoe-vi-sess1-workspace-otari-worktrees-rev-912-target-873cf2685e47"));
     }
 
     #[test]
-    fn no_named_ignore_volumes_skips_the_prune() {
-        // An empty set does not distinguish "no caches" from a glob that matched
-        // nothing or a switch to the anonymous strategy, so it must not be read as
-        // "every volume this session has is stale".
-        assert!(named_ignore_volumes_to_keep(&ContainerConfig::default()).is_none());
+    fn an_unestablished_volume_set_skips_the_prune() {
+        let volumes = || {
+            vec![NamedVolumeMount {
+                volume_name: "aoe-vi-sess1-workspace-otari-target-8ec07926d6b0".to_string(),
+                container_path: "/workspace/otari/target".to_string(),
+            }]
+        };
+
+        for (case, config) in [
+            (
+                // A degraded mount resolve names volumes the session never had, so
+                // every volume it does have would read as stale.
+                "not authoritative",
+                ContainerConfig {
+                    named_ignore_volumes: volumes(),
+                    named_ignore_volumes_authoritative: false,
+                    ..Default::default()
+                },
+            ),
+            (
+                // Does not distinguish "no caches" from a switch to the anonymous
+                // strategy.
+                "empty",
+                ContainerConfig {
+                    named_ignore_volumes_authoritative: true,
+                    ..Default::default()
+                },
+            ),
+            ("empty and not authoritative", ContainerConfig::default()),
+        ] {
+            assert!(
+                named_ignore_volumes_to_keep(&config).is_none(),
+                "{case} must not drive a deletion"
+            );
+        }
     }
 
     #[test]
