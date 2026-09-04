@@ -287,6 +287,32 @@ aoe add --sandbox-image my-sandbox:latest .
 > Building a custom image and using structured view? Install the agent's ACP
 > adapter in the image too, or the handshake fails.
 
+## Per-session agent stores
+
+Each sandboxed session gets its own copy of the agent's config store on the
+host, under `sandbox-v2/<instance-id>` inside the agent's config directory
+(for example `~/.claude/sandbox-v2/<id>`). The container mounts that copy at
+the agent's usual config path, so credentials, hooks and conversation history
+belong to one session and `aoe` can resume the right conversation.
+
+Sessions created before this layout shared one store per agent (for example
+`~/.claude/sandbox`). The first `aoe` start after upgrading moves them: it
+copies the shared store into a private directory for every sandboxed session,
+removes each session's stopped container so the next launch mounts the copy,
+and deletes the shared store once every session that used it has moved (the
+private copies are the data from then on). Startup prints what it is copying
+and how long it has been running. A large store copied for many sessions can take minutes; a
+session whose container is still running is skipped and moved on a later start,
+after it stops.
+
+To start without waiting, quit and set `AOE_DEFER_SANDBOX_MIGRATION=1` for that
+launch. Sessions then keep using the shared store, and the move is retried on
+the next start without the variable, or on demand with:
+
+```bash
+aoe migrate
+```
+
 ## Worktrees and Sandboxing
 
 Git worktrees need the bare repo pattern so the container can reach the repo's git directory. See [Worktrees](worktrees.md#bare-repos).
