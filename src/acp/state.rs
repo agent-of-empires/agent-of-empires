@@ -703,6 +703,15 @@ pub struct QueuedPromptEntry {
     pub origin_device: Option<String>,
 }
 
+/// Terminal park reason the reconciler publishes when rate-limit auto-resume
+/// exhausts its redelivery budget (#3688). Distinct from the agent-reported
+/// `rate_limited` so the park predicates can hold the session without
+/// treating it as a fresh adapter park (no reset schedule applies), while a
+/// manual `/acp/spawn` resume and a new prompt both still recover it. Lives
+/// beside `Event::Stopped` because both the daemon and the transcript fold
+/// read it, and `src/acp/` must not import from `src/server/`.
+pub(crate) const RATE_LIMIT_EXHAUSTED_RETRIES_REASON: &str = "rate_limit_exhausted_retries";
+
 /// Discriminated union of state mutations. ACP `session/update`
 /// notifications become specific variants; client approval taps also
 /// become variants and flow through the same path.

@@ -1138,7 +1138,8 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// next pass. The guard is released before `sink.publish`, matching every
     /// other publisher, so a SQLite write never runs under it.
     ///
-    /// Used by the reconciler's terminal-repair pass (#3190).
+    /// Used by the reconciler's terminal-repair pass (#3190) and its
+    /// rate-limit redelivery cap (#3688).
     pub fn publish_stopped_if_seq(
         &self,
         session_id: &str,

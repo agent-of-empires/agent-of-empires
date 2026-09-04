@@ -1133,19 +1133,16 @@ const RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS: i64 = 3600;
 
 /// How many times auto-resume may re-deliver the interrupted prompt for one
 /// rate-limit streak before the reconciler gives up and parks the session on
-/// a terminal `Stopped{rate_limit_exhausted_retries}` (#3688). Matches the
-/// #1945 respawn budget so both bounded-retry mechanisms stop at the same
-/// attempt count. `EventStore::rate_limit_redelivery_streak` defines what
-/// counts toward it and what resets it.
+/// a terminal `Stopped{rate_limit_exhausted_retries}` (#3688). The count is
+/// borrowed from the #1945 respawn budget, but not its shape: that one is a
+/// rate limiter (`RECONCILER_MAX_RESPAWNS_IN_WINDOW` per
+/// `RECONCILER_RESPAWN_WINDOW`, so it forgives itself), while this is a
+/// lifetime budget per streak that only an organic boundary clears.
+/// `EventStore::rate_limit_redelivery_streak` defines what counts toward it
+/// and what resets it.
 const RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES: i64 = 5;
 
-/// Terminal park reason the reconciler publishes when a rate-limit streak
-/// exhausts `RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES`. Distinct from
-/// the agent-reported `rate_limited` so the park predicates can hold the
-/// session parked without treating it as a fresh adapter park (no reset
-/// schedule applies), while the manual `/acp/spawn` resume and a new prompt
-/// both still work. See #3688.
-pub(crate) const RATE_LIMIT_EXHAUSTED_RETRIES_REASON: &str = "rate_limit_exhausted_retries";
+pub(crate) use crate::acp::state::RATE_LIMIT_EXHAUSTED_RETRIES_REASON;
 
 /// Opt-in rate-limit auto-resume pass (#1722). For structured view sessions parked
 /// on `Stopped { reason: "rate_limited" }` whose profile enabled
