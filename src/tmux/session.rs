@@ -17,6 +17,7 @@ use super::{
 };
 use crate::cli::truncate_id;
 use crate::process;
+use crate::session::environment::shell_escape_script_word;
 use crate::session::Status;
 use crate::util::now_ms;
 
@@ -2368,7 +2369,7 @@ impl EphemeralEnvFile {
             }
             match mutation {
                 PaneEnvMutation::Set { key, value } => {
-                    writeln!(file, "export {}={}", key, script_shell_escape(value))?;
+                    writeln!(file, "export {}={}", key, shell_escape_script_word(value))?;
                 }
                 PaneEnvMutation::Unset { key } => writeln!(file, "unset {}", key)?,
             }
@@ -2396,18 +2397,18 @@ impl EphemeralEnvFile {
                 file,
                 "exec {}<{} || exit 1",
                 crate::session::environment::CONTAINER_EXEC_ENV_FD,
-                script_shell_escape(&container_env_path.to_string_lossy())
+                shell_escape_script_word(&container_env_path.to_string_lossy())
             )?;
             writeln!(
                 file,
                 "rm -f -- {}",
-                script_shell_escape(&container_env_path.to_string_lossy())
+                shell_escape_script_word(&container_env_path.to_string_lossy())
             )?;
         }
         writeln!(
             file,
             "rm -f -- {}",
-            script_shell_escape(&path.to_string_lossy())
+            shell_escape_script_word(&path.to_string_lossy())
         )?;
         writeln!(file, "{launch}")?;
         file.flush()?;
@@ -2453,13 +2454,6 @@ impl Drop for EphemeralEnvFile {
             let _ = std::fs::remove_file(path);
         }
     }
-}
-
-/// Quote one POSIX script word without changing its bytes. Unlike the
-/// single-line command formatter, literal CR and LF bytes are valid inside
-/// single quotes here and must survive environment transport.
-fn script_shell_escape(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// Whether `text` should get a trailing space appended before being typed
@@ -4954,8 +4948,8 @@ mod tests {
         .unwrap();
         let command = format!(
             "printf '%s' \"$MULTILINE_SECRET\" > {}; printf '%s' \"${{AOE_TEST_STALE+x}}\" > {}",
-            script_shell_escape(&output.to_string_lossy()),
-            script_shell_escape(&stale_output.to_string_lossy())
+            shell_escape_script_word(&output.to_string_lossy()),
+            shell_escape_script_word(&stale_output.to_string_lossy())
         );
         let wrapper = file.wrap_command(Some(&command)).unwrap();
         let status = std::process::Command::new("sh")
@@ -4995,9 +4989,9 @@ mod tests {
         let command = format!(
             "printf '%s\\n%s' \"$PATH\" \"${{DOCKER_HOST-unset}}\" > {}; \
              cat {} > {}",
-            script_shell_escape(&host_output.to_string_lossy()),
+            shell_escape_script_word(&host_output.to_string_lossy()),
             crate::session::environment::CONTAINER_EXEC_ENV_PATH,
-            script_shell_escape(&payload_output.to_string_lossy()),
+            shell_escape_script_word(&payload_output.to_string_lossy()),
         );
         let wrapper = file.wrap_command(Some(&command)).unwrap();
         let script = std::fs::read_to_string(&script_path).unwrap();

@@ -199,45 +199,49 @@ impl Instance {
     pub(crate) fn capture_agent_name(&self) -> Option<&'static str> {
         self.resolved_agent().map(|a| a.name)
     }
+    /// Whether a launch fragment carries shell syntax the pane's shell would
+    /// act on, so the agent is not what the command word names.
+    fn contains_active_shell_syntax(value: &str) -> bool {
+        let mut quote = None;
+        let mut escaped = false;
+        for ch in value.chars() {
+            if matches!(ch, '\n' | '\r') {
+                return true;
+            }
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match quote {
+                Some('\'') => {
+                    if ch == '\'' {
+                        quote = None;
+                    }
+                }
+                Some('"') => match ch {
+                    '"' => quote = None,
+                    '\\' => escaped = true,
+                    '$' | '`' => return true,
+                    _ => {}
+                },
+                _ => match ch {
+                    '\'' | '"' => quote = Some(ch),
+                    '\\' => escaped = true,
+                    '|' | '&' | ';' | '<' | '>' | '(' | ')' | '#' | '`' | '$' | '*' | '?' | '['
+                    | ']' | '{' | '}' | '~' | '!' => return true,
+                    _ => {}
+                },
+            }
+        }
+        false
+    }
+
     pub(crate) fn launch_invokes_resolved_agent_directly(
         &self,
         agent: &crate::agents::AgentDef,
     ) -> bool {
+        let contains_active_shell_syntax = Self::contains_active_shell_syntax;
         let raw_command = self.get_tool_command();
-        let contains_active_shell_syntax = |value: &str| {
-            let mut quote = None;
-            let mut escaped = false;
-            for ch in value.chars() {
-                if matches!(ch, '\n' | '\r') {
-                    return true;
-                }
-                if escaped {
-                    escaped = false;
-                    continue;
-                }
-                match quote {
-                    Some('\'') => {
-                        if ch == '\'' {
-                            quote = None;
-                        }
-                    }
-                    Some('"') => match ch {
-                        '"' => quote = None,
-                        '\\' => escaped = true,
-                        '$' | '`' => return true,
-                        _ => {}
-                    },
-                    _ => match ch {
-                        '\'' | '"' => quote = Some(ch),
-                        '\\' => escaped = true,
-                        '|' | '&' | ';' | '<' | '>' | '(' | ')' | '#' | '`' | '$' | '*' | '?'
-                        | '[' | ']' | '{' | '}' | '~' | '!' => return true,
-                        _ => {}
-                    },
-                }
-            }
-            false
-        };
         let launch_extra_args = if self.command.is_empty() {
             crate::session::config::quote_model_value_in_args(&self.extra_args)
         } else {
@@ -262,6 +266,42 @@ impl Instance {
             .first()
             .is_some_and(|executable| executable == agent.binary)
             && !words.iter().any(|word| word == "--")
+    }
+
+    /// Whether a resume selector appended to this launch reaches the agent.
+    ///
+    /// [`Self::launch_invokes_resolved_agent_directly`] is the stricter test
+    /// and stays the one that authorizes capture: inferring ownership from a
+    /// store, mirroring a binary under `opencode serve`, or matching a process
+    /// by argv all need the agent's own name. Emitting a selector needs less.
+    /// A single bare token is the program the pane runs whatever it is called,
+    /// which is the wrapper shape `custom_agents` and `agent_command_override`
+    /// document, and `agent_detect_as` is the user declaring what it wraps.
+    /// Refusing it takes resume away from every renamed wrapper and each
+    /// restart silently starts a fresh conversation (#3638).
+    ///
+    /// A path-qualified token still fails: a bare one resolves through the
+    /// launch shell's `PATH`, which AoE controls, and a path escapes it.
+    pub(crate) fn launch_can_carry_resume_selector(&self, agent: &crate::agents::AgentDef) -> bool {
+        if self.launch_invokes_resolved_agent_directly(agent) {
+            return true;
+        }
+        let Some(parsed_command) = parse_launch_command(self.get_tool_command()) else {
+            return false;
+        };
+        let [token] = parsed_command.words.as_slice() else {
+            return false;
+        };
+        if token.contains('/') || token.starts_with('-') {
+            return false;
+        }
+        if Self::contains_active_shell_syntax(self.get_tool_command())
+            || Self::contains_active_shell_syntax(&self.extra_args)
+        {
+            return false;
+        }
+        shell_words::split(&self.extra_args)
+            .is_ok_and(|extra| !extra.iter().any(|word| word == "--"))
     }
 
     /// Whether this launch shape leaves Claude user hooks enabled.
@@ -324,9 +364,6 @@ impl Instance {
         crate::agents::SessionCaptureContext,
     )> {
         let agent = self.resolved_agent()?;
-        if !self.launch_invokes_resolved_agent_directly(agent) {
-            return None;
-        }
         let support = agent.session_support.as_ref()?;
         let capture = support.capture.as_ref()?;
         let context = if self.is_sandboxed() {
@@ -334,7 +371,28 @@ impl Instance {
         } else {
             capture.host
         };
-        (context != crate::agents::SessionCaptureContext::Unsupported).then_some((capture, context))
+        if context == crate::agents::SessionCaptureContext::Unsupported {
+            return None;
+        }
+        // These backends publish under this pane's own `AOE_INSTANCE_ID`, so
+        // the write proves its own attribution and a renamed wrapper cannot
+        // claim another pane's conversation. The rest infer ownership from the
+        // launch itself: OMP reads a store it routed through the launch
+        // environment, OpenCode mirrors the binary under `opencode serve`, and
+        // the managed stores match on cwd and a launch floor. Those need the
+        // agent's own binary on the command line to mean anything.
+        let self_attributing = matches!(
+            capture.backend,
+            crate::agents::SessionCaptureBackend::Claude
+                | crate::agents::SessionCaptureBackend::HookSidecar
+                | crate::agents::SessionCaptureBackend::Pi
+        );
+        let authorized = if self_attributing {
+            self.launch_can_carry_resume_selector(agent)
+        } else {
+            self.launch_invokes_resolved_agent_directly(agent)
+        };
+        authorized.then_some((capture, context))
     }
 
     pub(super) fn resolved_capture_backend(&self) -> Option<crate::agents::SessionCaptureBackend> {
@@ -346,21 +404,15 @@ impl Instance {
         let Some(agent) = self.resolved_agent() else {
             return false;
         };
-        if !self.launch_invokes_resolved_agent_directly(agent) {
+        if !self.launch_can_carry_resume_selector(agent) {
             return false;
         }
-        let Some(support) = agent.session_support.as_ref() else {
+        if agent.session_support.is_none() {
             return false;
-        };
-        let automatic = support.capture.is_some_and(|capture| {
-            let context = if self.is_sandboxed() {
-                capture.sandbox
-            } else {
-                capture.host
-            };
-            context != crate::agents::SessionCaptureContext::Unsupported
-        });
-        automatic
+        }
+        // Automatic capture in this environment, or an id the user named
+        // themselves, which stays authoritative where capture is unsupported.
+        self.resolved_session_support().is_some()
             || matches!(
                 self.resume_intent,
                 ResumeIntent::Use(_) | ResumeIntent::Fork { .. }

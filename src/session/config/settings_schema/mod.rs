@@ -32,7 +32,7 @@ pub use plugin::{
     PLUGIN_SECTION_PREFIX,
 };
 pub use policy::{strip_local_only, validate_patch, validate_patch_with, PatchRejection, Scope};
-pub use registry::{descriptor, runtime_schema, schema};
+pub use registry::{descriptor, runtime_schema, schema, section_in_schema};
 pub use resolved::{resolve, resolve_all, Candidate, ResolvedSetting, SettingSource};
 pub use validate::{validate_value, ValidationError};
 
@@ -211,6 +211,18 @@ pub enum WebWritePolicy {
     LocalOnly { reason: String },
 }
 
+/// Whether a repo config may override a field. Declared per field with
+/// `#[setting(repo = "...")]`, or inherited from the section's
+/// `#[setting_section(repo_default = "...")]`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum RepoPolicy {
+    Allow,
+    /// The default everywhere a policy is not derived, so a surface that grows
+    /// a field the schema does not describe fails closed.
+    #[default]
+    Deny,
+}
+
 /// Server-authoritative validation applied to an incoming value before it is
 /// merged. Min/max in [`WidgetKind`] is advisory UI metadata; this is the gate.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -297,7 +309,10 @@ pub struct FieldDescriptor {
     pub description: String,
     pub widget: WidgetKind,
     pub web_write: WebWritePolicy,
-    /// Whether a profile/repo may override this field. `false` means the
+    /// Repo-override policy declared on the field.
+    #[serde(skip)]
+    pub repo_policy: RepoPolicy,
+    /// Whether a profile may override this field. `false` means the
     /// value is global-only (the field is still shown, but not overridable).
     pub profile_overridable: bool,
     pub validation: ValidationKind,

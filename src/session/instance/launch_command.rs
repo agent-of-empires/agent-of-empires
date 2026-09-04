@@ -1153,6 +1153,9 @@ mod tests {
             );
         }
 
+        // A bare renamed wrapper is the program the pane runs, so the
+        // subcommand still lands in the position that reaches the agent it
+        // execs. Refusing it took resume from every renamed wrapper (#3638).
         let mut wrapper = Instance::new("wrapper", "/tmp/x");
         wrapper.tool = "codex-personal".to_string();
         wrapper.detect_as = "codex".to_string();
@@ -1161,8 +1164,22 @@ mod tests {
         wrapper.resume_intent = ResumeIntent::Use("SID".to_string());
         let mut cmd = wrapper.command.clone();
 
-        assert!(!wrapper.apply_session_flags(&mut cmd, "test").unwrap());
-        assert_eq!(cmd, "codex-personal");
+        assert!(wrapper.apply_session_flags(&mut cmd, "test").unwrap());
+        assert_eq!(cmd, "codex-personal resume SID");
+
+        // A launcher still hides the binary, so the token would reach `ssh`.
+        let mut launcher = Instance::new("launcher", "/tmp/x");
+        launcher.tool = "codex-personal".to_string();
+        launcher.detect_as = "codex".to_string();
+        launcher.command = "ssh -t host codex".to_string();
+        launcher.agent_session_id = Some("SID".to_string());
+        launcher.resume_intent = ResumeIntent::Use("SID".to_string());
+        let mut launcher_cmd = launcher.command.clone();
+
+        assert!(!launcher
+            .apply_session_flags(&mut launcher_cmd, "test")
+            .unwrap());
+        assert_eq!(launcher_cmd, "ssh -t host codex");
     }
 
     #[test]

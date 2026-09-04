@@ -1,76 +1,67 @@
-//! Remote home screen for cross-machine structured view attach.
+//! Remote home screen for cross-machine structured-session attach.
 //!
-//! Activated when `AOE_DAEMON_URL` is set at startup (or `--daemon-url`
-//! is passed on the CLI). Fetches the daemon's session list via
-//! `GET /api/sessions`, filters to structured view-mode sessions (the only
-//! kind that's meaningful to drive cross-machine; tmux PTYs can't be
-//! attached remotely without SSH'ing into the host first), and lets
-//! the user open one with Enter.
-//!
-//! Local-only operations are absent rather than disabled: a remote
-//! session can't be `tmux attach`-ed from this machine, can't run
-//! `aoe stop`, can't have its files edited locally. The web dashboard
-//! covers the long-tail of remote management; this view's only job is
-//! to be a fast lane into the structured view transcript + composer for a
-//! known remote session.
-
+//! Each session row carries its daemon-derived context-resume state.
 mod render;
 
 use std::io::Stdout;
 
+use crate::acp::client::discovery::DaemonEndpoint;
+use crate::acp::client::HttpClient;
+use crate::plugin::ui_state::UiSnapshot;
+use crate::server::api::sessions::ContextResumeAvailability;
+use crate::session::config::{resolve_theme_name, resolve_theme_palette_mode};
+use crate::tui::styles::Theme;
 use anyhow::Result;
 use crossterm::event::{Event as CrosstermEvent, EventStream, KeyCode, KeyEventKind};
 use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use serde::Deserialize;
 
-use crate::acp::client::discovery::DaemonEndpoint;
-use crate::acp::client::HttpClient;
-use crate::plugin::ui_state::UiSnapshot;
-use crate::session::config::{resolve_theme_name, resolve_theme_palette_mode};
-use crate::tui::styles::Theme;
-
-/// Subset of `/api/sessions`'s `SessionResponse` we need. `serde` skips
-/// unknown fields by default; we capture only the columns the remote
-/// picker renders, so server-side additions don't break clients.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(serde::Deserialize)]
+struct RemoteSessionWire {
+    id: String,
+    title: String,
+    project_path: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    view: crate::session::View,
+    #[serde(default)]
+    context_resume: Option<ContextResumeAvailability>,
+}
+#[derive(Debug, Clone)]
 pub struct RemoteSession {
     pub id: String,
     pub title: String,
     pub project_path: String,
-    #[serde(default)]
     pub status: String,
-    /// How the remote session renders. Defaults to `terminal` so an older
-    /// daemon's response (which omits the field) still deserialises.
-    #[serde(default)]
-    pub view: crate::session::View,
+    pub context_resume: Option<ContextResumeAvailability>,
 }
 
 pub struct RemoteHomeState {
     pub endpoint: DaemonEndpoint,
+    client: HttpClient,
     pub sessions: Vec<RemoteSession>,
     pub cursor: usize,
     pub status_text: Option<String>,
     pub last_error: Option<String>,
     pub loading: bool,
-    /// Latest plugin UI-state snapshot, fetched with the session list so the
-    /// rows can show each session's `row-column` status (#2948). Empty until
-    /// the first fetch, and after one that failed.
     pub plugin_ui: UiSnapshot,
 }
 
 impl RemoteHomeState {
-    pub fn new(endpoint: DaemonEndpoint) -> Self {
-        Self {
+    pub fn new(endpoint: DaemonEndpoint) -> Result<Self> {
+        let client = HttpClient::new(endpoint.clone())?;
+        Ok(Self {
             endpoint,
+            client,
             sessions: Vec::new(),
             cursor: 0,
             status_text: None,
             last_error: None,
             loading: true,
             plugin_ui: UiSnapshot::default(),
-        }
+        })
     }
 
     pub fn move_cursor(&mut self, delta: i32) {
@@ -148,7 +139,7 @@ async fn run(
     theme: &Theme,
     endpoint: DaemonEndpoint,
 ) -> Result<()> {
-    let mut state = RemoteHomeState::new(endpoint);
+    let mut state = RemoteHomeState::new(endpoint)?;
     refresh(&mut state).await;
     terminal.draw(|f| render::render(f, f.area(), theme, &state))?;
 
@@ -172,9 +163,6 @@ async fn run(
             KeyCode::Up | KeyCode::Char('k') => state.move_cursor(-1),
             KeyCode::Enter => {
                 if let Some(session) = state.sessions.get(state.cursor).cloned() {
-                    // Hand off to the structured view. Local-only actions
-                    // are out of scope by design; tmux PTYs, file edits,
-                    // and the like aren't reachable on this machine.
                     let endpoint = state.endpoint.clone();
                     super::structured_view::run_for_endpoint(
                         terminal,
@@ -184,10 +172,7 @@ async fn run(
                         &session.id,
                     )
                     .await?;
-                    // Use the shared helper, not `terminal.clear()`: the latter
-                    // does an `ESC[6n` cursor read that races the live
-                    // `EventStream` and can abort with "cursor position could
-                    // not be read" (see `crate::tui::clear_terminal`).
+                    // Avoid a cursor query that races the live event stream.
                     crate::tui::clear_terminal(terminal)?;
                 }
             }
@@ -198,49 +183,143 @@ async fn run(
     Ok(())
 }
 
-async fn refresh(state: &mut RemoteHomeState) {
-    state.loading = true;
-    state.last_error = None;
-    let client = match HttpClient::new(state.endpoint.clone()) {
-        Ok(c) => c,
-        Err(e) => {
-            state.loading = false;
-            state.last_error = Some(format!("http client init failed: {e}"));
-            return;
-        }
-    };
-    match client.list_sessions::<RemoteSession>().await {
+fn sessions_from_snapshot(wire_sessions: Vec<RemoteSessionWire>) -> Vec<RemoteSession> {
+    let mut sessions: Vec<_> = wire_sessions
+        .into_iter()
+        .filter(|session| session.view == crate::session::View::Structured)
+        .map(|session| RemoteSession {
+            id: session.id,
+            title: session.title,
+            project_path: session.project_path,
+            status: session.status,
+            context_resume: session.context_resume,
+        })
+        .collect();
+    sessions.sort_by(|a, b| a.title.cmp(&b.title));
+    sessions
+}
+
+fn apply_session_result(state: &mut RemoteHomeState, result: Result<Vec<RemoteSession>, String>) {
+    match result {
         Ok(sessions) => {
-            // Only structured view sessions are meaningful here: tmux sessions
-            // can't be attached from another machine without SSH.
-            let mut list: Vec<RemoteSession> = sessions
-                .into_iter()
-                .filter(|s| s.view == crate::session::View::Structured)
-                .collect();
-            list.sort_by(|a, b| a.title.cmp(&b.title));
-            if state.cursor >= list.len() {
-                state.cursor = list.len().saturating_sub(1);
+            if state.cursor >= sessions.len() {
+                state.cursor = sessions.len().saturating_sub(1);
             }
-            state.sessions = list;
+            state.sessions = sessions;
             state.status_text = Some(format!("{} session(s)", state.sessions.len()));
         }
-        Err(e) => {
-            state.last_error = Some(format!("{e}"));
+        Err(error) => {
+            state.sessions.clear();
+            state.cursor = 0;
+            state.last_error = Some(error);
             state.status_text = None;
         }
     }
-    // Plugin row-column state rides along with the list rather than on its own
-    // poll: this view has no ticker, so both refresh on open and on `r` and
-    // never disagree about how stale they are. A plugin being down must not
-    // replace the session list with an error page, so a failed fetch just
-    // clears the cells; it is logged rather than silent, so a blank plugin
-    // column is diagnosable.
-    state.plugin_ui = match client.plugin_ui_state().await {
+}
+async fn refresh(state: &mut RemoteHomeState) {
+    state.loading = true;
+    state.last_error = None;
+    let sessions = state
+        .client
+        .list_sessions::<RemoteSessionWire>()
+        .await
+        .map(sessions_from_snapshot)
+        .map_err(|error| error.to_string());
+    apply_session_result(state, sessions);
+
+    state.plugin_ui = match state.client.plugin_ui_state().await {
         Ok(snapshot) => snapshot,
-        Err(e) => {
-            tracing::debug!(target: "tui.remote_home", "plugin ui-state fetch failed: {e}");
+        Err(error) => {
+            tracing::debug!(target: "tui.remote_home", "plugin ui-state fetch failed: {error}");
             UiSnapshot::default()
         }
     };
     state.loading = false;
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::acp::client::discovery::Source;
+
+    fn session(id: &str) -> RemoteSession {
+        RemoteSession {
+            id: id.to_string(),
+            title: id.to_string(),
+            project_path: format!("/tmp/{id}"),
+            status: "Stopped".to_string(),
+            context_resume: Some(ContextResumeAvailability::Available),
+        }
+    }
+
+    fn wire(id: &str, view: crate::session::View) -> RemoteSessionWire {
+        RemoteSessionWire {
+            id: id.to_string(),
+            title: id.to_string(),
+            project_path: format!("/tmp/{id}"),
+            status: "Stopped".to_string(),
+            view,
+            context_resume: Some(ContextResumeAvailability::Available),
+        }
+    }
+
+    fn state() -> RemoteHomeState {
+        RemoteHomeState::new(DaemonEndpoint::new(
+            "http://127.0.0.1:8080".to_string(),
+            None,
+            Source::Env,
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn old_daemon_session_without_new_fields_stays_openable() {
+        let wire: RemoteSessionWire = serde_json::from_value(serde_json::json!({
+            "id": "legacy",
+            "title": "Legacy",
+            "project_path": "/tmp/legacy",
+            "view": "structured"
+        }))
+        .unwrap();
+
+        let sessions = sessions_from_snapshot(vec![wire]);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "legacy");
+        assert_eq!(sessions[0].status, "");
+        assert_eq!(sessions[0].context_resume, None);
+    }
+
+    #[test]
+    fn snapshot_failure_clears_stale_sessions() {
+        let mut state = state();
+        state.sessions = vec![session("stale")];
+        state.cursor = 4;
+        state.status_text = Some("stale status".to_string());
+
+        apply_session_result(&mut state, Err("daemon unavailable".to_string()));
+
+        assert!(state.sessions.is_empty());
+        assert_eq!(state.cursor, 0);
+        assert_eq!(state.last_error.as_deref(), Some("daemon unavailable"));
+        assert!(state.status_text.is_none());
+    }
+
+    #[test]
+    fn successful_snapshot_restores_sorted_structured_scope() {
+        let sessions = sessions_from_snapshot(vec![
+            wire("second", crate::session::View::Structured),
+            wire("terminal", crate::session::View::Terminal),
+            wire("first", crate::session::View::Structured),
+        ]);
+
+        let mut state = state();
+        apply_session_result(&mut state, Ok(sessions));
+        assert_eq!(
+            state
+                .sessions
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+    }
 }

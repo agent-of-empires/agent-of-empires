@@ -293,9 +293,13 @@ pub async fn reconcile_acp_workers(
     // the API handler shuts it down, defeating the archive semantics.
     // Expired snoozes naturally rejoin via `is_snoozed()` returning
     // false past the deadline. See #1581.
-    let raw_targets: Vec<RawTargetTuple> = {
+    //
+    // Sessions holding undelivered prompts come out of the same acquisition:
+    // a queued prompt is a user turn waiting on a worker, so it releases the
+    // redelivery-cap park below (#3688).
+    let (raw_targets, with_queued_prompts): (Vec<RawTargetTuple>, HashSet<String>) = {
         let instances = state.instances.read().await;
-        instances
+        let targets = instances
             .iter()
             .filter(|i| {
                 i.is_structured()
@@ -317,9 +321,14 @@ pub async fn reconcile_acp_workers(
                     i.command.clone(),
                 )
             })
-            .collect()
+            .collect();
+        let queued = instances
+            .iter()
+            .filter(|i| !i.queued_prompts.is_empty())
+            .map(|i| i.id.clone())
+            .collect();
+        (targets, queued)
     };
-
     let live: HashSet<&String> = raw_targets.iter().map(|t| &t.0).collect();
     attempted.retain(|id| live.contains(id));
     // Sweep budget state for sessions that no longer exist so the maps
@@ -430,6 +439,17 @@ pub async fn reconcile_acp_workers(
                     session = %id,
                     "skipping auto-resume: latest lifecycle event is Stopped{{rate_limited}}"
                 );
+                attempted.insert(id);
+                continue;
+            }
+            // #3688: the auto-resume pass parked this session after its
+            // redelivery cap. Same hold as the adapter park above, minus the
+            // resume schedule: only a manual retry or a fresh prompt un-parks.
+            // Both halves of the queued-prompt release are needed and neither
+            // works alone: `reap_rate_limit_resumes` frees the `attempted`
+            // slot (this loop never sees an id that holds one), and this test
+            // stops the same tick re-parking the session before it spawns.
+            if reason == RATE_LIMIT_EXHAUSTED_RETRIES_REASON && !with_queued_prompts.contains(&id) {
                 attempted.insert(id);
                 continue;
             }
@@ -1102,14 +1122,40 @@ const RATE_LIMIT_RESUME_INTERVAL: Duration = Duration::from_secs(15);
 /// spirit of the #1281 "no eager restart loop" fix. See #1722.
 const RATE_LIMIT_MIN_PARK_SECS: i64 = 30;
 
-/// How long auto-resume waits when the agent reported no reset time at
-/// all. Purely a retry schedule: it never lands in a `RateLimit` event's
-/// `resets_at`, so no surface presents it as a reset the agent reported,
-/// which is what #3152 is about. It does reach the `RateLimitAutoResumed`
-/// breadcrumb, where the timestamp means "when the resume fired" (already
-/// reset plus grace even in the reported case). If the limit has not
-/// cleared, the retry re-parks and the next one is another interval out.
+/// Base wait for auto-resume when the agent reported no reset time at all,
+/// doubled per redelivery already spent in this streak. Purely a retry
+/// schedule: it never lands in a `RateLimit` event's `resets_at`, so no
+/// surface presents it as a reset the agent reported, which is what #3152
+/// is about. It does reach the `RateLimitAutoResumed` breadcrumb, where the
+/// timestamp means "when the resume fired" (already reset plus grace even
+/// in the reported case).
+///
+/// Flat retries and a redelivery cap do not compose: five hourly attempts
+/// give up after five hours, and #3688 reports two sessions that only got
+/// through at ~20 redeliveries over ~19-20 hours. Doubling spends the same
+/// five redeliveries across 1h + 2h + 4h + 8h + 16h, so a week-scale quota
+/// exhaustion is still covered for 31 hours before the session parks. See
+/// #3688's second bullet.
 const RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS: i64 = 3600;
+
+/// Ceiling on the doubling above, so a streak that somehow outruns the
+/// redelivery cap cannot shift the base into overflow. The cap fires at
+/// `RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES`, so shifts past 4 are already
+/// unreachable through the normal path.
+const RATE_LIMIT_UNKNOWN_RESET_MAX_SHIFT: u32 = 4;
+
+/// How many times auto-resume may re-deliver the interrupted prompt for one
+/// rate-limit streak before the reconciler gives up and parks the session on
+/// a terminal `Stopped{rate_limit_exhausted_retries}` (#3688). The count is
+/// borrowed from the #1945 respawn budget, but not its shape: that one is a
+/// rate limiter (`RECONCILER_MAX_RESPAWNS_IN_WINDOW` per
+/// `RECONCILER_RESPAWN_WINDOW`, so it forgives itself), while this is a
+/// lifetime budget per streak that only an organic boundary clears.
+/// `EventStore::rate_limit_redelivery_streak` defines what counts toward it
+/// and what resets it.
+const RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES: i64 = 5;
+
+pub(crate) use crate::acp::state::RATE_LIMIT_EXHAUSTED_RETRIES_REASON;
 
 /// Opt-in rate-limit auto-resume pass (#1722). For structured view sessions parked
 /// on `Stopped { reason: "rate_limited" }` whose profile enabled
@@ -1154,8 +1200,13 @@ fn rate_limit_resume_at(
 /// reported reset becomes eligible for an auto-resume retry: a fixed
 /// interval after the `RateLimit` event was recorded. See
 /// `RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS` and #3152.
-fn rate_limit_unknown_reset_retry_at(recorded_at_ms: i64) -> chrono::DateTime<chrono::Utc> {
-    let retry_after = chrono::Duration::seconds(RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS);
+fn rate_limit_unknown_reset_retry_at(
+    recorded_at_ms: i64,
+    redeliveries: i64,
+) -> chrono::DateTime<chrono::Utc> {
+    let shift = redeliveries.clamp(0, i64::from(RATE_LIMIT_UNKNOWN_RESET_MAX_SHIFT)) as u32;
+    let retry_after =
+        chrono::Duration::seconds(RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS.saturating_mul(1 << shift));
     match chrono::DateTime::from_timestamp_millis(recorded_at_ms) {
         Some(recorded) => recorded + retry_after,
         None => chrono::Utc::now() + retry_after,
@@ -1167,7 +1218,7 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
     // `attempted`, no live worker). Snapshot (id, profile) under the read
     // lock so we don't hold it across awaits. Archived/snoozed/dormant
     // sessions are excluded for the same reasons as the resume snapshot.
-    let candidates: Vec<(String, String)> = {
+    let candidates: Vec<(String, String, bool)> = {
         let instances = state.instances.read().await;
         instances
             .iter()
@@ -1179,7 +1230,13 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
                     && !i.is_idle_dormant()
                     && attempted.contains(&i.id)
             })
-            .map(|i| (i.id.clone(), i.source_profile.clone()))
+            .map(|i| {
+                (
+                    i.id.clone(),
+                    i.source_profile.clone(),
+                    !i.queued_prompts.is_empty(),
+                )
+            })
             .collect()
     };
     if candidates.is_empty() {
@@ -1187,10 +1244,10 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
     }
     // Only sessions without a live worker are parked; a running worker in
     // `attempted` is the steady-state perf entry, not a park.
-    let mut parked: Vec<(String, String)> = Vec::new();
-    for (id, profile) in candidates {
+    let mut parked: Vec<(String, String, bool)> = Vec::new();
+    for (id, profile, has_queue) in candidates {
         if !state.acp_supervisor.is_running(&id).await {
-            parked.push((id, profile));
+            parked.push((id, profile, has_queue));
         }
     }
     if parked.is_empty() {
@@ -1204,7 +1261,7 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
         let mut seen = HashSet::new();
         parked
             .iter()
-            .map(|(_, p)| p.clone())
+            .map(|(_, p, _)| p.clone())
             .filter(|p| seen.insert(p.clone()))
             .collect()
     };
@@ -1223,7 +1280,7 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
         .unwrap_or_default();
 
     let now = chrono::Utc::now();
-    for (id, profile) in parked {
+    for (id, profile, has_queued_prompts) in parked {
         let enabled = cfg_by_profile.get(&profile).copied().unwrap_or(false);
         if !enabled {
             continue;
@@ -1233,31 +1290,77 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
         // read the reset time, both off-thread.
         let store = Arc::clone(&state.acp_event_store);
         let id_probe = id.clone();
-        let (is_rate_limit_parked, rate_limit) = match tokio::task::spawn_blocking(move || {
-            let parked = matches!(
-                store.latest_status_event(&id_probe),
-                Some(crate::acp::Event::Stopped { reason }) if reason == "rate_limited"
-            );
-            (parked, store.latest_rate_limit_event(&id_probe))
-        })
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(
+        let (is_rate_limit_parked, is_cap_parked, rate_limit) =
+            match tokio::task::spawn_blocking(move || {
+                let latest = store.latest_status_event(&id_probe);
+                let reason = match &latest {
+                    Some(crate::acp::Event::Stopped { reason }) => Some(reason.as_str()),
+                    _ => None,
+                };
+                (
+                    reason == Some("rate_limited"),
+                    reason == Some(RATE_LIMIT_EXHAUSTED_RETRIES_REASON),
+                    store.latest_rate_limit_event(&id_probe),
+                )
+            })
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "acp.supervisor",
+                        session = %id,
+                        error = %e,
+                        "rate-limit auto-resume probe failed"
+                    );
+                    continue;
+                }
+            };
+        if !is_rate_limit_parked {
+            // #3688: a session already parked on the cap keeps its `attempted`
+            // slot, and that slot is what holds the main resume loop off it.
+            // A prompt queued before the cap fired has no other route to a
+            // worker: the queue drain hands a workerless non-dormant session
+            // straight back to that loop. So release the slot and let this
+            // tick's resume pass respawn it under the ordinary budget; the
+            // next drain delivers. A prompt POSTed after the park never gets
+            // here, because `dispatch::decide` sends it instead of queueing.
+            if is_cap_parked && has_queued_prompts {
+                tracing::info!(
                     target: "acp.supervisor",
                     session = %id,
-                    error = %e,
-                    "rate-limit auto-resume probe failed"
+                    "rate-limit auto-resume: releasing the redelivery-cap park for a queued prompt"
                 );
-                continue;
+                attempted.remove(&id);
             }
-        };
-        if !is_rate_limit_parked {
             continue;
         }
         let Some((info, recorded_at_ms)) = rate_limit else {
             continue;
+        };
+        // Read before the schedule gate below, not just before the cap: the
+        // unreported-reset backoff widens with each redelivery already spent,
+        // so the streak is an input to *when* this session is next eligible,
+        // not only to whether it has any attempts left.
+        let streak = {
+            let store = Arc::clone(&state.acp_event_store);
+            let id_streak = id.clone();
+            match tokio::task::spawn_blocking(move || {
+                store.rate_limit_redelivery_streak(&id_streak)
+            })
+            .await
+            {
+                Ok(streak) => streak,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "acp.supervisor",
+                        session = %id,
+                        error = %e,
+                        "rate-limit redelivery streak probe failed"
+                    );
+                    continue;
+                }
+            }
         };
         // A reported reset schedules against it; an unreported one (the
         // agent never attributed a reset to the window that rejected, see
@@ -1268,7 +1371,7 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
             Some(resets_at) => {
                 rate_limit_resume_at(resets_at, recorded_at_ms, RATE_LIMIT_AUTO_RESUME_GRACE_SECS)
             }
-            None => rate_limit_unknown_reset_retry_at(recorded_at_ms),
+            None => rate_limit_unknown_reset_retry_at(recorded_at_ms, streak),
         };
         if now < resume_at {
             continue;
@@ -1282,6 +1385,65 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
         if state.acp_supervisor.is_running(&id).await {
             continue;
         }
+        // Bounded redeliveries (#3688): every earlier breadcrumb in this
+        // streak re-delivered the interrupted prompt and the turn still
+        // ended rate-limited. Past the cap, stop burning the same prompt:
+        // drop the pending continuation, publish the terminal exhausted
+        // park (which `latest_status_event` reports, so the main loop holds
+        // the session parked and this pass no longer sees
+        // `Stopped{rate_limited}`), and keep the `attempted` slot. A
+        // manual `/acp/spawn` resume or a fresh prompt still works; the
+        // streak only counts resumes since the last organic turn end, so
+        // either resets it.
+        let latest_seq = {
+            let store = Arc::clone(&state.acp_event_store);
+            let id_seq = id.clone();
+            match tokio::task::spawn_blocking(move || store.highest_seq(&id_seq)).await {
+                Ok(latest_seq) => latest_seq,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "acp.supervisor",
+                        session = %id,
+                        error = %e,
+                        "rate-limit latest-seq probe failed"
+                    );
+                    continue;
+                }
+            }
+        };
+        if streak >= RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES {
+            // Manual `/acp/spawn` holds this lock through its continuation
+            // enqueue and breadcrumb. Keeping the CAS plus clear in the same
+            // critical section means a manual resume either advances the seq
+            // first (so this park refuses) or enqueues after this old
+            // continuation was cleared.
+            //
+            // `try_lock`: `/acp/spawn` holds this across a whole sandbox
+            // ensure plus agent handshake, and this pass runs inline in the
+            // reconciler tick, so blocking would stall every other session's
+            // reconcile behind one manual resume. A contended lock is also
+            // exactly the case where this park must not fire, so treat it as
+            // a refusal; the next pass retries.
+            let instance_lock = state.instance_lock(&id).await;
+            let Ok(_guard) = instance_lock.try_lock() else {
+                continue;
+            };
+            if state.acp_supervisor.publish_stopped_if_seq(
+                &id,
+                RATE_LIMIT_EXHAUSTED_RETRIES_REASON,
+                latest_seq,
+            ) {
+                state.session_service.clear_pending_initial_turn(&id).await;
+                tracing::warn!(
+                    target: "acp.supervisor",
+                    session = %id,
+                    redeliveries = streak,
+                    max = RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES,
+                    "rate-limit auto-resume: redelivery cap reached; parking session with a terminal stop"
+                );
+            }
+            continue;
+        }
         // Eligible: queue the interrupted prompt (if any) so the respawned
         // worker continues instead of sitting idle (#3028), then publish the
         // breadcrumb (supersedes Stopped{rate_limited}) and free the
@@ -1290,7 +1452,7 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
         enqueue_rate_limit_continuation(state, &id).await;
         state
             .acp_supervisor
-            .publish_rate_limit_auto_resumed(&id, resume_at);
+            .publish_rate_limit_auto_resumed(&id, resume_at, false);
         attempted.remove(&id);
         tracing::info!(
             target: "acp.supervisor",
@@ -1971,7 +2133,8 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
 mod tests {
     use super::{
         adopt_decision, rate_limit_resume_at, rate_limit_unknown_reset_retry_at, should_auto_stop,
-        should_readopt_orphan_runner, AdoptDecision, RATE_LIMIT_MIN_PARK_SECS,
+        should_readopt_orphan_runner, AdoptDecision, RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES,
+        RATE_LIMIT_EXHAUSTED_RETRIES_REASON, RATE_LIMIT_MIN_PARK_SECS,
         RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS,
     };
     use chrono::{Duration, TimeZone, Utc};
@@ -2223,13 +2386,32 @@ mod tests {
     // #3152: the agent reported no reset at all. Auto-resume still has to
     // retry, on a policy interval measured from the park, because otherwise
     // an enabled auto-resume would never pick the session back up.
+    //
+    // #3688: and that interval doubles per redelivery already spent, because
+    // a flat hour paired with a five-redelivery cap gives up after five
+    // hours, while the issue reports sessions getting through at ~19-20.
     #[test]
-    fn unknown_reset_retries_an_interval_after_the_park() {
+    fn unknown_reset_backs_off_per_redelivery_spent() {
         let recorded_at = Utc.timestamp_opt(1_500_000, 0).unwrap();
-        assert_eq!(
-            rate_limit_unknown_reset_retry_at(recorded_at.timestamp_millis()),
-            recorded_at + Duration::seconds(RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS)
-        );
+        let at = |redeliveries| {
+            rate_limit_unknown_reset_retry_at(recorded_at.timestamp_millis(), redeliveries)
+                - recorded_at
+        };
+        let hour = Duration::seconds(RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS);
+        assert_eq!(at(0), hour, "the first park still waits the base interval");
+        assert_eq!(at(1), hour * 2);
+        assert_eq!(at(2), hour * 4);
+        assert_eq!(at(3), hour * 8);
+        assert_eq!(at(4), hour * 16);
+        // The five redeliveries the cap allows span 31 hours in total, which
+        // is what has to cover the reported ~19-20 hour recoveries.
+        let total: Duration = (0..RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES)
+            .map(at)
+            .fold(Duration::zero(), |acc, d| acc + d);
+        assert_eq!(total, hour * 31);
+        // Clamped past the cap so a streak that outruns it cannot overflow
+        // the shift.
+        assert_eq!(at(RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES + 50), hour * 16);
     }
 
     #[test]
@@ -2989,6 +3171,307 @@ mod tests {
         assert!(
             woken,
             "a dormant session with a queue must be woken so the resume pass respawns it"
+        );
+    }
+
+    // --- redelivery cap (#3688) ---
+
+    /// Seed a session parked on `Stopped { rate_limited }` whose window has
+    /// elapsed, with `redeliveries` completed resume -> redeliver -> re-park
+    /// cycles behind it, and a pending continuation to lose. Returns the
+    /// state plus the temp dirs the caller must keep alive.
+    ///
+    /// The `RateLimit` event is backdated an hour so `rate_limit_resume_at`'s
+    /// minimum-park floor has passed without the test sleeping through it.
+    async fn parked_at_streak(
+        id: &str,
+        redeliveries: usize,
+    ) -> (
+        Arc<crate::server::AppState>,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
+        use crate::acp::Event;
+        let (state, home, project) = capacity_test_state(id).await;
+        // The pass is a no-op for a profile that did not opt in, and these
+        // instances carry the default (empty) profile, so the opt-in goes in
+        // the global config the isolated HOME above now owns.
+        let app_dir = crate::session::get_app_dir().expect("isolated app dir");
+        std::fs::write(
+            app_dir.join("config.toml"),
+            "[acp]\nrate_limit_auto_resume = true\n",
+        )
+        .expect("write opt-in config");
+
+        let store = &state.acp_event_store;
+        let long_ago = (chrono::Utc::now() - chrono::Duration::hours(1)).timestamp_millis();
+        let rate_limit = || Event::RateLimit {
+            info: crate::acp::state::RateLimitInfo {
+                status: "limited".into(),
+                resets_at: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+                kind: "usage".into(),
+            },
+        };
+        let prompt = || Event::UserPromptSent {
+            text: "run the nightly task".into(),
+            attachments: Vec::new(),
+            prompt_id: None,
+        };
+        let mut seq = 0u64;
+        let mut push = |event: &Event| {
+            seq += 1;
+            store
+                .record_at(id, seq, event, long_ago)
+                .expect("seed event");
+            seq
+        };
+        push(&prompt());
+        push(&rate_limit());
+        push(&Event::Stopped {
+            reason: "rate_limited".into(),
+        });
+        for _ in 0..redeliveries {
+            push(&Event::RateLimitAutoResumed {
+                resets_at: chrono::Utc::now() - chrono::Duration::hours(1),
+                manual: false,
+            });
+            push(&prompt());
+            push(&rate_limit());
+            push(&Event::Stopped {
+                reason: "rate_limited".into(),
+            });
+        }
+        // The daemon's counter normally tracks what it published; seed it so
+        // the cap's seq CAS sees the log's newest seq as the newest
+        // allocation, as it does in a live daemon.
+        state
+            .acp_supervisor
+            .hydrate_seqs([(id.to_string(), store.highest_seq(id))]);
+        state
+            .session_service
+            .set_pending_initial_turn(id, "run the nightly task".into(), Vec::new())
+            .await;
+        (state, home, project)
+    }
+
+    async fn pending_turn(state: &Arc<crate::server::AppState>, id: &str) -> Option<String> {
+        state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|i| i.id == id)
+            .and_then(|i| i.pending_initial_turn.clone())
+    }
+
+    fn latest_stop_reason(state: &Arc<crate::server::AppState>, id: &str) -> Option<String> {
+        state
+            .acp_event_store
+            .replay_from(id, 0)
+            .into_iter()
+            .rev()
+            .find_map(|(_, e)| match e {
+                crate::acp::Event::Stopped { reason } => Some(reason),
+                _ => None,
+            })
+    }
+
+    /// #3688: a prompt POSTed while the session was still on the adapter park
+    /// lands on the server queue, because the cap has not fired yet and there
+    /// is no worker. When the cap then fires, nothing else in the daemon
+    /// delivers it: the queue drain hands a workerless non-dormant session
+    /// back to the resume pass, and the park holds its `attempted` slot to
+    /// keep that pass off it. So the park must release the slot for queued
+    /// work.
+    ///
+    /// `attempted` is seeded, which is the whole point: the cap can only fire
+    /// for a session already in it, and the resume loop skips every id it
+    /// holds. Starting from an empty set tests the state after a daemon
+    /// restart, not the one a live daemon is in when the cap fires.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cap_park_releases_attempted_for_a_prompt_already_on_the_queue() {
+        for (has_queue, expect_respawn) in [(true, true), (false, false)] {
+            let id = if has_queue {
+                "sess-3688-queued"
+            } else {
+                "sess-3688-unqueued"
+            };
+            let (state, _home, _project) = capacity_test_state(id).await;
+            let app_dir = crate::session::get_app_dir().expect("isolated app dir");
+            std::fs::write(
+                app_dir.join("config.toml"),
+                "[acp]\nrate_limit_auto_resume = true\n",
+            )
+            .expect("write opt-in config");
+            assert!(state.acp_supervisor.publish_stopped_if_seq(
+                id,
+                RATE_LIMIT_EXHAUSTED_RETRIES_REASON,
+                0,
+            ));
+            if has_queue {
+                let mut instances = state.instances.write().await;
+                let inst = instances.iter_mut().find(|i| i.id == id).unwrap();
+                inst.queued_prompts
+                    .push(crate::acp::state::QueuedPromptEntry {
+                        id: "q-1".to_string(),
+                        seq: 1,
+                        text: "typed while the session was parked".to_string(),
+                        attachments: Vec::new(),
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                        origin_device: None,
+                    });
+            }
+
+            // The state a live daemon is in: the cap parked this session and
+            // kept its slot.
+            let mut attempted: HashSet<String> = [id.to_string()].into();
+            super::reap_rate_limit_resumes(&state, &mut attempted).await;
+            assert_eq!(
+                !attempted.contains(id),
+                expect_respawn,
+                "cap park with queued prompts = {has_queue}: the slot is what \
+                 holds the resume pass off, so releasing it is the whole fix"
+            );
+
+            let mut respawn_history: HashMap<String, Vec<Instant>> = HashMap::new();
+            let mut parked: HashSet<String> = HashSet::new();
+            let mut capacity_deferred: HashSet<String> = HashSet::new();
+            run_tick(
+                &state,
+                &mut attempted,
+                &mut respawn_history,
+                &mut parked,
+                &mut capacity_deferred,
+            )
+            .await;
+            let respawned = state
+                .acp_event_store
+                .replay_from(id, 0)
+                .into_iter()
+                .any(|(_, e)| matches!(e, crate::acp::Event::AgentStartupError { .. }));
+            assert_eq!(
+                respawned, expect_respawn,
+                "cap park with queued prompts = {has_queue}: a released slot \
+                 must actually reach the spawn pass, and an empty queue must \
+                 stay parked"
+            );
+        }
+    }
+
+    /// Under the cap the pass resumes: it re-queues the interrupted prompt,
+    /// publishes the breadcrumb, and frees the `attempted` slot so the same
+    /// tick's spawn pass brings the worker back.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rate_limit_reap_resumes_below_the_cap() {
+        let id = "sess-3688-under";
+        let (state, _home, _project) =
+            parked_at_streak(id, RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES as usize - 1).await;
+        let mut attempted: HashSet<String> = [id.to_string()].into();
+
+        super::reap_rate_limit_resumes(&state, &mut attempted).await;
+
+        assert!(
+            !attempted.contains(id),
+            "an eligible session must leave `attempted` so the spawn pass picks it up"
+        );
+        assert_eq!(
+            latest_stop_reason(&state, id).as_deref(),
+            Some("rate_limited"),
+            "a resume must not publish the terminal park"
+        );
+        assert!(
+            pending_turn(&state, id).await.is_some(),
+            "the interrupted prompt stays queued for the respawned worker"
+        );
+    }
+
+    /// At the cap it parks instead: terminal stop published, continuation
+    /// dropped, `attempted` slot held so nothing respawns on a timer.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rate_limit_reap_parks_at_the_cap() {
+        let id = "sess-3688-cap";
+        let (state, _home, _project) =
+            parked_at_streak(id, RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES as usize).await;
+        let mut attempted: HashSet<String> = [id.to_string()].into();
+
+        super::reap_rate_limit_resumes(&state, &mut attempted).await;
+
+        assert_eq!(
+            latest_stop_reason(&state, id).as_deref(),
+            Some(RATE_LIMIT_EXHAUSTED_RETRIES_REASON),
+            "the cap publishes the terminal park"
+        );
+        assert!(
+            attempted.contains(id),
+            "the park keeps its `attempted` slot so the resume pass holds off"
+        );
+        assert!(
+            pending_turn(&state, id).await.is_none(),
+            "the continuation is dropped so no later drain replays the burned prompt"
+        );
+    }
+
+    /// The seq CAS is what keeps this park off a session something else just
+    /// published into. When it refuses, the continuation must survive: the
+    /// clear is what would otherwise strand a live worker with nothing to run.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rate_limit_reap_keeps_the_continuation_when_the_cas_refuses() {
+        let id = "sess-3688-cas";
+        let (state, _home, _project) =
+            parked_at_streak(id, RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES as usize).await;
+        // Stand in for a publish landing between the probe and the CAS: the
+        // counter has moved on from the log's newest seq.
+        let ahead = state.acp_event_store.highest_seq(id) + 1;
+        state.acp_supervisor.hydrate_seqs([(id.to_string(), ahead)]);
+        let mut attempted: HashSet<String> = [id.to_string()].into();
+
+        super::reap_rate_limit_resumes(&state, &mut attempted).await;
+
+        assert_eq!(
+            latest_stop_reason(&state, id).as_deref(),
+            Some("rate_limited"),
+            "a refused CAS must publish nothing"
+        );
+        assert!(
+            pending_turn(&state, id).await.is_some(),
+            "a refused park must not clear the continuation it did not publish over"
+        );
+    }
+
+    /// `/acp/spawn` holds `instance_lock` across its whole resume, including
+    /// the continuation enqueue. The cap must yield to it rather than block
+    /// the tick, and must not park a session a manual resume is reviving.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rate_limit_reap_yields_to_a_manual_resume_holding_the_instance_lock() {
+        let id = "sess-3688-lock";
+        let (state, _home, _project) =
+            parked_at_streak(id, RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES as usize).await;
+        let held = state.instance_lock(id).await;
+        let _guard = held.lock().await;
+        let mut attempted: HashSet<String> = [id.to_string()].into();
+
+        // Bounded well under the handshake a real `/acp/spawn` holds this for:
+        // blocking on the lock would hang the whole reconciler tick.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::reap_rate_limit_resumes(&state, &mut attempted),
+        )
+        .await
+        .expect("the cap must not block the tick on a contended instance_lock");
+
+        assert_eq!(
+            latest_stop_reason(&state, id).as_deref(),
+            Some("rate_limited"),
+            "a contended lock is a refusal, not a park"
+        );
+        assert!(
+            pending_turn(&state, id).await.is_some(),
+            "and the manual resume's continuation survives"
         );
     }
 }

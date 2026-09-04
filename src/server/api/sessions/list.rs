@@ -293,7 +293,6 @@ pub async fn list_sessions(
         workspace_ordering,
     })
 }
-
 // Workspace id derivation. Mirrors the client logic in `useWorkspaces.ts`:
 // a session with a branch collapses to `${repoPath}::${branch}`; a
 // branchless session gets its own workspace at `${repoPath}::__session__::${id}`.
@@ -434,6 +433,49 @@ pub async fn update_workspace_ordering(
 }
 
 #[cfg(test)]
+mod context_resume_tests {
+    use super::*;
+
+    #[test]
+    fn context_resume_projects_structured_and_terminal_states() {
+        let mut structured = Instance::new("structured", "/tmp/structured");
+        structured.view = crate::session::View::Structured;
+        assert_eq!(
+            context_resume_for(&structured),
+            ContextResumeAvailability::Unavailable {
+                reason: ContextResumeUnavailableReason::NoTarget,
+            }
+        );
+
+        structured.acp_session_id = Some("opaque-server-target".to_string());
+        assert_eq!(
+            context_resume_for(&structured),
+            ContextResumeAvailability::Indeterminate {
+                reason: ContextResumeIndeterminateReason::AgentHandshakeRequired,
+            }
+        );
+
+        structured.fork_pending = Some("opaque-parent".to_string());
+        assert_eq!(
+            context_resume_for(&structured),
+            ContextResumeAvailability::Unavailable {
+                reason: ContextResumeUnavailableReason::ForkPending,
+            }
+        );
+
+        let mut terminal = Instance::new("terminal", "/tmp/terminal");
+        terminal.tool = "claude".to_string();
+        terminal.agent_session_id = Some("terminal-context".to_string());
+        assert_eq!(
+            context_resume_for(&terminal),
+            ContextResumeAvailability::Indeterminate {
+                reason: ContextResumeIndeterminateReason::RuntimeCheckRequired,
+            }
+        );
+    }
+}
+
+#[cfg(test)]
 mod workspace_ordering_tests {
     use super::*;
     use crate::session::test_support::{isolate_app_dir_at, AppDirGuard};
@@ -485,6 +527,9 @@ mod workspace_ordering_tests {
             notify_on_idle: None,
             notify_on_error: None,
             view: crate::session::View::Terminal,
+            context_resume: ContextResumeAvailability::Unavailable {
+                reason: ContextResumeUnavailableReason::NoTarget,
+            },
             acp_worker_state: crate::acp::supervisor::AcpWorkerState::Absent,
             queued_prompts: Vec::new(),
             acp_capable: false,

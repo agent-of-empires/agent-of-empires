@@ -60,6 +60,7 @@ mod profile_lazy_creation;
 mod profile_picker;
 mod project_registry;
 mod purge_restore_race;
+mod remote_home_e2e;
 mod resume_fallback;
 mod sandbox;
 mod serve;

@@ -165,7 +165,27 @@ const NON_POSIX_SHELLS: &[&str] = &["fish", "nu", "nushell", "pwsh", "powershell
 /// Shells we can safely launch with a `-l` login flag. Others (nushell,
 /// PowerShell) are launched plain; they still source their own interactive
 /// config, and `-l` would either error or mean something different there.
-const LOGIN_FLAG_SHELLS: &[&str] = &["bash", "zsh", "sh", "ksh", "dash", "fish", "csh", "tcsh"];
+const LOGIN_FLAG_SHELLS: &[&str] = &[
+    "bash", "zsh", "sh", "ash", "ksh", "mksh", "dash", "fish", "csh", "tcsh",
+];
+
+/// The `LOGIN_FLAG_SHELLS` basenames as one POSIX `case` pattern
+/// (`bash|zsh|...`), for embedding in a generated shell script.
+pub(crate) fn login_flag_shell_case_pattern() -> String {
+    LOGIN_FLAG_SHELLS.join("|")
+}
+
+/// Every shell basename this codebase recognizes, as one POSIX `case` pattern,
+/// whether or not `-l` applies to it.
+pub(crate) fn known_shell_case_pattern() -> String {
+    let mut names: Vec<&str> = Vec::with_capacity(LOGIN_FLAG_SHELLS.len() + NON_POSIX_SHELLS.len());
+    for name in LOGIN_FLAG_SHELLS.iter().chain(NON_POSIX_SHELLS) {
+        if !names.contains(name) {
+            names.push(name);
+        }
+    }
+    names.join("|")
+}
 
 /// Build the tmux pane command that launches `shell` as a login+interactive
 /// shell, so it sources the user's profile and rc files (`~/.zprofile`,
@@ -217,6 +237,14 @@ pub(crate) fn shell_escape(val: &str) -> String {
     let val = val.replace('\n', "\\n").replace('\r', "\\r");
     let escaped = val.replace('\'', "'\\''");
     format!("'{}'", escaped)
+}
+
+/// Quote one POSIX script word without changing its bytes.
+///
+/// Unlike [`shell_escape`], literal CR and LF bytes remain inside the quoted
+/// word. Use this only when writing a script, not a single-line command.
+pub(crate) fn shell_escape_script_word(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// Resolve a session's sandbox environment entries to concrete `(KEY, VALUE)`

@@ -311,7 +311,22 @@ function renderToolCard(tool: ToolCall, result: ActivityRow | undefined, profile
     case "fetch":
       return <FetchToolCard tool={tool} result={result} />;
     case "think":
-      return <ThinkToolCard tool={tool} result={result} />;
+      // A think call's substance normally lives somewhere other than the card:
+      // in streamed child tool calls, or in a returned report. The quiet
+      // one-line ThinkToolCard is right for that. A *failed* one inverts it,
+      // the error is all there is, and that card renders no error body, so
+      // route failures to the generic card instead.
+      //
+      // aoe-agent makes this the common case rather than an edge: `task` is
+      // not in its palette, so the AI SDK answers every call with a
+      // NoSuchToolError naming the tools that do exist, which is the one
+      // message a user needs to see. A claude or opencode Task can fail too,
+      // and was equally silent before this branch. See #1904.
+      return statusFor(result) === "err" ? (
+        <GenericToolCard tool={tool} result={result} />
+      ) : (
+        <ThinkToolCard tool={tool} result={result} />
+      );
     default:
       return <GenericToolCard tool={tool} result={result} />;
   }

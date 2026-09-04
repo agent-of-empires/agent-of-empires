@@ -25,7 +25,7 @@ Copy relies on the browser Clipboard API, which only works in a secure context: 
 
 Each session can open a **paired terminal**: a host (or, for sandboxed sessions, in-container) shell rooted at the session's working directory. On desktop it shares the split with the agent terminal; on mobile it is one of the right-panel picker's views. It stays alive in the background when you switch away, preserving scrollback and focus.
 
-For sandboxed sessions, the **Container** tab launches the container user's login shell, resolved inside the container (passwd entry, then `$SHELL`, then bash, sh), so your prompt, aliases, and oh-my-zsh setup load like the Host tab.
+For sandboxed sessions, the **Container** tab launches the container user's preferred shell, resolved inside the container (passwd entry, then `$SHELL`, then bash, sh). Candidates must be regular executable files and either have a recognized shell name or be listed exactly in `/etc/shells`. Known-compatible shells run in login mode; other authorized shells run plain. Minimal images without `getent` read `/etc/passwd` directly.
 
 ## Reconnect
 

@@ -30,7 +30,9 @@ Runtime conversation changes such as `/clear`, `/new`, fork, continue, or a fres
 
 Sandbox config and conversation stores are staged under a separate directory for each AoE instance, including custom `agent_config_dir` roots. A cross-process lease guards each managed store. Two sessions in the same working directory therefore cannot claim each other's conversation.
 
-Custom agents inherit native resume only when `agent_detect_as` resolves to a built-in agent and the configured launch starts with that built-in's exact binary token. Built-in command overrides follow the same rule. Path-qualified scripts, differently named wrappers, remote launchers, comments, redirections, pipes, shell expansion, and other shell control syntax fail closed. A bare built-in token is resolved by the launch shell's `PATH`.
+Custom agents inherit native resume when `agent_detect_as` resolves to a built-in agent and the configured launch is either that built-in's own binary token or a single bare token, which is the renamed-wrapper shape. Built-in command overrides follow the same rule. Path-qualified scripts, remote launchers, comments, redirections, pipes, shell expansion, and other shell control syntax fail closed. A bare token is resolved by the launch shell's `PATH`, which is what ties it to the agent AoE resolved.
+
+Automatic capture is stricter than resume. A renamed wrapper keeps automatic capture only where the agent publishes its identity under the pane's own AoE marker, meaning Claude, Cursor, and Pi. Every other source infers ownership from the launch itself and needs the built-in's exact binary token, so a wrapped OpenCode, OMP, or managed-store agent resumes an explicitly pinned ID but captures nothing on its own.
 
 Disabling `agent_status_hooks` removes status writers only. Any authoritative identity hooks declared for native resume remain installed.
 

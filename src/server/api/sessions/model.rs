@@ -161,6 +161,7 @@ pub struct SessionResponse {
     /// pick the structured panels vs the terminal view.
     #[serde(default, skip_serializing_if = "crate::session::View::is_terminal")]
     pub view: crate::session::View,
+    pub context_resume: ContextResumeAvailability,
     /// Live structured view worker lifecycle. `absent` for tmux sessions or
     /// structured view sessions whose worker has not been spawned/attached
     /// yet; `resuming` while the reconciler is mid-spawn or mid-attach;
@@ -411,6 +412,7 @@ impl SessionResponse {
             notify_on_idle: inst.notify_on_idle,
             notify_on_error: inst.notify_on_error,
             view: inst.view,
+            context_resume: context_resume_for(inst),
             queued_prompts: {
                 let mut q = inst.queued_prompts.clone();
                 q.sort_by_key(|e| e.seq);
@@ -530,6 +532,89 @@ pub(super) fn truncate_title(s: &str, max: usize) -> String {
 // sidebar in the requested order on the first paint, with no extra
 // round-trip. The order is a list of workspace ids; ids not present
 // fall back to the client's default newest-first ordering. See #1169.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextResumeUnavailableReason {
+    AgentUnsupported,
+    SandboxUnsupported,
+    CommandUnsupported,
+    ForcedFresh,
+    InvalidTarget,
+    ForkPending,
+    PreviousFailure,
+    NoTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextResumeIndeterminateReason {
+    RuntimeCheckRequired,
+    AgentHandshakeRequired,
+}
+
+/// Whether the daemon can preserve agent context during a future authorized
+/// lifecycle transition. This is not current start eligibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ContextResumeAvailability {
+    Available,
+    Indeterminate {
+        reason: ContextResumeIndeterminateReason,
+    },
+    Unavailable {
+        reason: ContextResumeUnavailableReason,
+    },
+}
+
+pub(super) fn context_resume_for(inst: &Instance) -> ContextResumeAvailability {
+    if inst.is_structured() {
+        return if inst.fork_pending.is_some() {
+            ContextResumeAvailability::Unavailable {
+                reason: ContextResumeUnavailableReason::ForkPending,
+            }
+        } else if inst.acp_session_id.is_some() {
+            ContextResumeAvailability::Indeterminate {
+                reason: ContextResumeIndeterminateReason::AgentHandshakeRequired,
+            }
+        } else {
+            ContextResumeAvailability::Unavailable {
+                reason: ContextResumeUnavailableReason::NoTarget,
+            }
+        };
+    }
+
+    match inst.terminal_context_resume_cached() {
+        TerminalContextResume::Available => ContextResumeAvailability::Available,
+        TerminalContextResume::RuntimeCheckRequired => ContextResumeAvailability::Indeterminate {
+            reason: ContextResumeIndeterminateReason::RuntimeCheckRequired,
+        },
+        TerminalContextResume::NoTarget => ContextResumeAvailability::Unavailable {
+            reason: ContextResumeUnavailableReason::NoTarget,
+        },
+        TerminalContextResume::AgentUnsupported => ContextResumeAvailability::Unavailable {
+            reason: ContextResumeUnavailableReason::AgentUnsupported,
+        },
+        TerminalContextResume::SandboxUnsupported => ContextResumeAvailability::Unavailable {
+            reason: ContextResumeUnavailableReason::SandboxUnsupported,
+        },
+        TerminalContextResume::CommandUnsupported => ContextResumeAvailability::Unavailable {
+            reason: ContextResumeUnavailableReason::CommandUnsupported,
+        },
+        TerminalContextResume::ForcedFresh => ContextResumeAvailability::Unavailable {
+            reason: ContextResumeUnavailableReason::ForcedFresh,
+        },
+        TerminalContextResume::InvalidTarget => ContextResumeAvailability::Unavailable {
+            reason: ContextResumeUnavailableReason::InvalidTarget,
+        },
+        TerminalContextResume::ForkPending => ContextResumeAvailability::Unavailable {
+            reason: ContextResumeUnavailableReason::ForkPending,
+        },
+        TerminalContextResume::PreviousFailure => ContextResumeAvailability::Unavailable {
+            reason: ContextResumeUnavailableReason::PreviousFailure,
+        },
+    }
+}
+
 #[derive(serde::Serialize)]
 pub struct SessionsEnvelope {
     pub sessions: Vec<SessionResponse>,

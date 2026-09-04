@@ -18,6 +18,7 @@ use crate::containers::{self, DockerContainer};
 use crate::session::config::container_config;
 use crate::session::environment::{
     build_docker_env_args_with_managed_codex_home, resolved_sandbox_environment, shell_escape,
+    shell_escape_script_word,
 };
 use crate::session::poller::SessionPoller;
 use crate::tmux;
@@ -76,6 +77,31 @@ pub use status::{Status, TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR}
 pub(crate) use tmux_session::{
     duplicate_session_error, find_duplicate_session, is_duplicate_session,
 };
+/// Why a session can never resume, decided from the registry alone and
+/// before any runtime probe. `Agent` covers both an unresolved tool and one
+/// with no verified native resume contract; `Sandbox` and `Command` name the
+/// environment and the launch shape that put an otherwise capable agent out
+/// of reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeStaticUnavailable {
+    Agent,
+    Sandbox,
+    Command,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalContextResume {
+    Available,
+    RuntimeCheckRequired,
+    NoTarget,
+    AgentUnsupported,
+    SandboxUnsupported,
+    CommandUnsupported,
+    ForcedFresh,
+    InvalidTarget,
+    ForkPending,
+    PreviousFailure,
+}
 pub(crate) use types::{
     PiSidecarSource, PriorToolSession, ResumeIntent, SandboxStoreTransitionPath,
 };
