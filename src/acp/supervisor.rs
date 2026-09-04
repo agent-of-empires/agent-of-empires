@@ -505,11 +505,12 @@ pub struct SpawnRequest {
     /// session. Distinct from [`Self::agent`]: `agent` is what
     /// `pick_agent_for_tool` resolved the tool to for ACP spawning, and can
     /// differ from the tool on an explicit override, a custom agent with no
-    /// configured ACP command (falls back to `"aoe-agent"`), or the
-    /// `switch-agent` path (the tool stays fixed while `agent` becomes the new
-    /// backend). Tool-scoped `host_hooks.before_session` env (`AOE_TOOL`) uses
-    /// this field so it agrees with the terminal view rather than with
-    /// whatever ACP backend happened to serve the request.
+    /// configured ACP command (falls back to the configured
+    /// `acp.default_agent`), or the `switch-agent` path (the tool stays fixed
+    /// while `agent` becomes the new backend). Tool-scoped
+    /// `host_hooks.before_session` env (`AOE_TOOL`) uses this field so it
+    /// agrees with the terminal view rather than with whatever ACP backend
+    /// happened to serve the request.
     pub tool: String,
     pub cwd: PathBuf,
     pub additional_dirs: Vec<PathBuf>,
@@ -594,7 +595,7 @@ fn resolve_mcp_layers(
     profile: Option<&str>,
     cwd: &std::path::Path,
 ) -> Vec<agent_client_protocol::schema::v1::McpServer> {
-    use crate::session::mcp_model::{resolve_effective, summarize};
+    use crate::session::mcp::mcp_model::{resolve_effective, summarize};
 
     // One resolver for forwarding and the management surfaces (#1996): assemble
     // the trust-gated, provenance-tagged effective set, then convert only the
@@ -939,13 +940,14 @@ impl<S: BroadcastSink> Supervisor<S> {
     ///      `agent_detect_as` (e.g. a Claude wrapper); resolves to the *base*
     ///      registry key so the base agent's adapter, version gate, env
     ///      allowlist, and `AgentProfile` all apply
-    ///   5. legacy fallback: `claude` for the claude tool, otherwise
-    ///      `aoe-agent` (our bundled multi-provider agent)
+    ///   5. fallback: `claude` for the claude tool, otherwise the resolved
+    ///      `acp.default_agent` setting
     ///
     /// `profile` is the session's source profile (`""` resolves the
     /// user's default) and `project_path` is its working directory;
-    /// both are consulted for step 3 so repo-local `agent_acp_cmd`
-    /// overrides are honored.
+    /// both are consulted for steps 3 and 4 so repo-local `agent_acp_cmd`
+    /// overrides are honored; step 5 reads `acp.default_agent`, which only a
+    /// profile may override (`acp` is not repo-overridable).
     pub async fn pick_agent_for_tool(
         &self,
         tool: &str,
@@ -983,12 +985,35 @@ impl<S: BroadcastSink> Supervisor<S> {
         {
             return base;
         }
-        // Step 5: legacy fallbacks.
+        // Step 5: the claude tool keeps its own registry key; everything else
+        // falls back to the configured default agent.
         if tool == "claude" {
             "claude".into()
         } else {
-            "aoe-agent".into()
+            self.resolved_default_agent(profile, project_path).await
         }
+    }
+
+    /// The session's resolved `acp.default_agent`, or the built-in default if
+    /// the config resolve panics.
+    async fn resolved_default_agent(
+        &self,
+        profile: &str,
+        project_path: &std::path::Path,
+    ) -> String {
+        let profile = profile.to_string();
+        let project_path = project_path.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+                &profile,
+                &project_path,
+            )
+            .acp
+            .resolved_default_agent()
+            .to_string()
+        })
+        .await
+        .unwrap_or_else(|_| crate::session::config::DEFAULT_ACP_AGENT.to_string())
     }
 
     /// The registry-backed base key `tool` inherits via `agent_detect_as` in
@@ -1006,7 +1031,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         tokio::task::spawn_blocking(move || {
             crate::acp::inherited_acp_base(
                 &tool,
-                &crate::session::repo_config::resolve_config_with_repo_or_warn(
+                &crate::session::config::repo_config::resolve_config_with_repo_or_warn(
                     &profile,
                     &project_path,
                 )
@@ -1030,11 +1055,14 @@ impl<S: BroadcastSink> Supervisor<S> {
         let profile = profile.to_string();
         let project_path = project_path.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            crate::session::repo_config::resolve_config_with_repo_or_warn(&profile, &project_path)
-                .session
-                .agent_acp_cmd
-                .get(&tool)
-                .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(&tool, cmd).is_ok())
+            crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+                &profile,
+                &project_path,
+            )
+            .session
+            .agent_acp_cmd
+            .get(&tool)
+            .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(&tool, cmd).is_ok())
         })
         .await
         .unwrap_or(false)
@@ -1636,7 +1664,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         let cwd_for_cfg = cwd.clone();
         let (resolved_cfg, policy) = tokio::task::spawn_blocking(move || {
             (
-                crate::session::repo_config::resolve_config_with_repo_or_warn(
+                crate::session::config::repo_config::resolve_config_with_repo_or_warn(
                     &profile_for_cfg,
                     &cwd_for_cfg,
                 ),
@@ -1738,8 +1766,9 @@ impl<S: BroadcastSink> Supervisor<S> {
             let session_for_hook = session_id.clone();
             let tool_for_hook = tool.clone();
             let minted = tokio::task::spawn_blocking(move || {
-                let commands =
-                    crate::session::repo_config::resolve_before_session_hooks(&profile_for_hook);
+                let commands = crate::session::config::repo_config::resolve_before_session_hooks(
+                    &profile_for_hook,
+                );
                 if commands.is_empty() {
                     return Ok(Vec::new());
                 }
@@ -1756,7 +1785,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                         cwd_for_hook.to_string_lossy().to_string(),
                     ),
                 ];
-                crate::session::repo_config::run_before_session_hooks(
+                crate::session::config::repo_config::run_before_session_hooks(
                     &commands,
                     &cwd_for_hook,
                     &hook_env,
@@ -1956,7 +1985,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         // Honor the wizard's "Auto-approve" / profile `yolo_mode_default`
         // by switching the ACP session to the adapter's bypass mode. The
         // tmux path achieves the same with `--dangerously-skip-permissions`
-        // (see `apply_yolo_mode()` in `src/session/instance.rs`); structured view
+        // (see `apply_yolo_mode()` in `src/session/instance/launch_command.rs`); structured view
         // can't pass CLI flags through the ACP adapter, so we apply the
         // adapter-specific mode id through whichever ACP mode channel the
         // adapter advertised (claude: `bypassPermissions`, codex:
@@ -2005,7 +2034,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 loop {
                     // Tracks whether the connection task ended because the
                     // cancel-escalation watchdog declared the agent
-                    // unresponsive (see acp_client.rs's CANCEL_ESCALATION_GRACE)
+                    // unresponsive (see acp_client/connection.rs's CANCEL_ESCALATION_GRACE)
                     // OR because the silent-orphan watchdog detected the
                     // adapter dropped PromptResponse (see #1240). Both
                     // failure modes need the same recovery: SIGTERM the
@@ -2366,7 +2395,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                         let tool_for_hook = respawn_config.tool.clone();
                         let minted = tokio::task::spawn_blocking(move || {
                             let commands =
-                                crate::session::repo_config::resolve_before_session_hooks(
+                                crate::session::config::repo_config::resolve_before_session_hooks(
                                     &profile_for_hook,
                                 );
                             if commands.is_empty() {
@@ -2381,7 +2410,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                                     cwd_for_hook.to_string_lossy().to_string(),
                                 ),
                             ];
-                            crate::session::repo_config::run_before_session_hooks(
+                            crate::session::config::repo_config::run_before_session_hooks(
                                 &commands,
                                 &cwd_for_hook,
                                 &hook_env,
@@ -3322,6 +3351,29 @@ impl<S: BroadcastSink> Supervisor<S> {
     #[cfg(test)]
     pub(crate) async fn test_insert_worker(&self, session_id: &str) {
         let (client, _tx) = AcpClient::fake_for_test(AcpSessionId(format!("acp-{session_id}")));
+        self.test_install_worker(session_id, client).await;
+    }
+
+    /// Like `test_insert_worker`, but the fake worker's command loop records
+    /// every `ClientCmd` it receives. Lets a test count how many prompts
+    /// actually reached the agent, which is the only place a lost prompt is
+    /// visible: `send_prompt` returns Ok as soon as the command is queued.
+    #[cfg(test)]
+    pub(crate) async fn test_insert_worker_cmd_recording(
+        &self,
+        session_id: &str,
+    ) -> Arc<std::sync::Mutex<Vec<&'static str>>> {
+        let (client, _tx, cmds) =
+            AcpClient::fake_for_test_cmd_recording(AcpSessionId(format!("acp-{session_id}")));
+        self.test_install_worker(session_id, client).await;
+        cmds
+    }
+
+    /// Register `client` as this session's in-memory worker. Shared by the
+    /// `test_insert_worker*` fixtures so they differ only in which fake
+    /// client they build.
+    #[cfg(test)]
+    async fn test_install_worker(&self, session_id: &str, client: AcpClient) {
         self.workers.lock().await.insert(
             session_id.to_string(),
             WorkerHandle {
@@ -4039,7 +4091,7 @@ mod tests {
         let codex_map = [("codex".to_string(), "claude".to_string())].into();
         let cursor_map = [("claude-personal".to_string(), "cursor".to_string())].into();
         // (tool, agent, from registry, detect_as map), one row per guard.
-        let cases: [(&str, &str, &str, bool, &HashMap<String, String>); 9] = [
+        let cases = [
             // Built-in tool on its own registry spec.
             ("s-builtin", "claude", "claude", true, &detect_as),
             // A mapping whose key is itself a built-in changes nothing: the
@@ -4098,6 +4150,40 @@ mod tests {
             assert_eq!(got, None, "{label}: expected silence");
         }
     }
+
+    /// Step 5 of `pick_agent_for_tool` reads `acp.default_agent`, so the
+    /// setting actually selects the agent instead of only being displayed.
+    /// Needs HOME isolation for the config resolve.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn unregistered_tool_falls_back_to_the_configured_default_agent() {
+        let tmp = tempfile::TempDir::with_prefix_in("aoe-default-agent-", "/tmp").unwrap();
+        let _guard = crate::session::test_support::isolate_home(tmp.path());
+        let cfg_path = crate::session::get_app_dir().unwrap().join("config.toml");
+        let sup = Supervisor::new(VecSink::new());
+
+        // (configured acp.default_agent, tool, expected agent)
+        let cases = [
+            (None, "plain-tool", "claude-code"),
+            (None, "claude", "claude"),
+            // A tool with its own registry entry never reaches step 5.
+            (Some("codex"), "opencode", "opencode"),
+            (Some("codex"), "plain-tool", "codex"),
+            (Some("codex"), "claude", "claude"),
+            // A hand-edited blank value resolves to the built-in default.
+            (Some("   "), "plain-tool", "claude-code"),
+        ];
+        for (configured, tool, expected) in cases {
+            let body = match configured {
+                Some(agent) => format!("[acp]\ndefault_agent = \"{agent}\"\n"),
+                None => String::new(),
+            };
+            std::fs::write(&cfg_path, body).unwrap();
+            let got = sup.pick_agent_for_tool(tool, None, "", tmp.path()).await;
+            assert_eq!(got, expected, "default={configured:?} tool={tool}");
+        }
+    }
+
     /// `spawn_inner` would leave them green. Here a full `Supervisor::spawn`
     /// runs a detect_as wrapper against the real claude adapter with an
     /// unwritable working directory: the warning is emitted before any
@@ -4372,6 +4458,7 @@ cursor-acp-bridge = "agent acp"
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn spawn_unknown_agent_errors_cleanly() {
         let sink = VecSink::new();
         let sup = Supervisor::new(sink);
@@ -4461,6 +4548,10 @@ cursor-acp-bridge = "agent acp"
     #[serial_test::serial]
     async fn resolve_mcp_layers_merges_native_global_and_profile() {
         let tmp = tempfile::TempDir::new().unwrap();
+        // Native discovery falls back to `CLAUDE_CONFIG_DIR`, so a developer
+        // running under a wrapper that exports it would read their own config
+        // instead of the temp HOME below.
+        let _env = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
         // SAFETY: serialised by `#[serial]`; subsequent serial tests reassign
         // these env vars, which is the existing pattern in this module.
         unsafe {
@@ -4587,9 +4678,9 @@ cursor-acp-bridge = "agent acp"
         );
 
         // Trust the repo at the file's current fingerprint, then re-resolve.
-        let servers = crate::session::project_mcp::load_project_mcp_servers(&repo).unwrap();
-        let hash = crate::session::project_mcp::fingerprint(&servers);
-        crate::session::repo_config::trust_repo(&repo, None, Some(&hash)).unwrap();
+        let servers = crate::session::mcp::project_mcp::load_project_mcp_servers(&repo).unwrap();
+        let hash = crate::session::mcp::project_mcp::fingerprint(&servers);
+        crate::session::config::repo_config::trust_repo(&repo, None, Some(&hash)).unwrap();
 
         let cwd = repo.clone();
         let merged = tokio::task::spawn_blocking(move || {

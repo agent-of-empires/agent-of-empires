@@ -25,7 +25,7 @@ const QUEUE_SCRIPT = {
         // Long enough that the queued follow-up always lands before
         // turn 1 ends on slow CI runners, but well under any 10s
         // idle/watchdog window in the structured view supervisor (see
-        // `RESUME_IDLE_GRACE_DEFAULT` in src/acp/acp_client.rs).
+        // `RESUME_IDLE_GRACE_DEFAULT` in src/acp/acp_client/connection.rs).
         // Earlier rounds bounced between 600ms (raced on slow CI) and
         // 10s (hit the idle watchdog and the worker was torn down
         // before turn 2 could fire). 4s gives the spec ~3.5s of slack

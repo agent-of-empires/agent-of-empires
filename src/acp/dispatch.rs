@@ -1,13 +1,9 @@
 //! Server-owned prompt dispatch: whether an incoming prompt is sent now,
 //! steered into the running turn, or parked on the server queue.
 //!
-//! Tier 3 of the structured-view server-ownership plan
-//! (`docs/development/server-owned-prompt-dispatch.md`). The decision used to
-//! live in each client, re-derived from an event projection, and every clause
-//! of it is a fixed incident rather than a design preference. Getting it wrong
-//! does not drift a label: it wedges a session or respawns a worker. So it
-//! lives here once, as a pure function over the daemon's own control state,
-//! and the clients render what the endpoint tells them it did.
+//!
+//! This is a daemon decision because it depends on daemon control and worker
+//! state. Clients render the returned disposition.
 
 use super::state::AcpState;
 

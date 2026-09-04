@@ -7,6 +7,10 @@ export default defineConfig({
   // under tests/capture/ also spawns a real `aoe serve` and runs via
   // playwright.capture.config.ts; keep it out of the mocked suite.
   testIgnore: ["**/live/**", "**/capture/**"],
+  // Playwright specs are `.spec.ts` here; `.test.ts` is vitest (the harness
+  // helpers have their own cases). Without this, Playwright's default glob
+  // collects those too and the run dies importing vitest.
+  testMatch: "**/*.spec.ts",
   timeout: 30000,
   retries: process.env.CI ? 1 : 0,
   // Mocked specs share one `vite preview` server and otherwise touch no

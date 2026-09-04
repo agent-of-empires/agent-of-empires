@@ -1,19 +1,8 @@
-//! Host-owned store of UI state that plugin workers push over the `ui.state.*`
-//! and `ui.notify` RPCs (#2366).
+//! Host-owned store for state pushed through plugin UI RPCs.
 //!
-//! The honest model: a worker pushes *typed display state* into a slot it
-//! declared; the host stores it here and the web dashboard renders it. No
-//! plugin code runs in the dashboard and the render path never awaits a worker,
-//! so this store is read synchronously via [`UiStore::snapshot`].
-//!
-//! State is ephemeral, like the rest of the Tier 1 host: it lives in memory and
-//! dies with the daemon. A plugin's entries are cleared when its worker exits
-//! (a fresh worker repopulates them), guarded by a per-spawn *generation* so a
-//! late write from an exited worker, or an instant respawn, cannot resurrect or
-//! clobber stale state. Notifications are point-in-time events on a separate
-//! bounded ring: they survive a worker exit (a plugin that posts a notification
-//! and immediately crashes should still reach the browser) and the client
-//! toasts each one once by tracking the monotonic `seq`.
+//! State is typed and ephemeral. Generation ids prevent late writes from an old
+//! worker clobbering its replacement. Notifications use a bounded sequence ring
+//! and survive worker exit long enough for clients to display them.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,19 +12,9 @@ use aoe_plugin_api::UiSlot;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Most entries one plugin may hold in a single revision scope (one session id,
-/// or "" for global slots). Sized well above any real per-session slot count so
-/// one session's panes are never starved by another session's entries. The old
-/// flat per-plugin cap did exactly that: once a plugin touched enough sessions,
-/// early-created entries filled the bucket and later sessions' new keys were
-/// rejected forever.
+/// Per-session or global-scope limit, preventing one scope from starving others.
 const MAX_ENTRIES_PER_SCOPE: usize = 32;
-/// Absolute backstop across all of one plugin's scopes. `session_id` is not
-/// validated against real sessions in `ui.state.set`, so without a global cap a
-/// buggy plugin could fabricate unbounded session ids and stay under the
-/// per-scope cap forever. A cooperative bound (the model is honest, not
-/// adversarial), sized to keep worst-case pane-payload memory bounded (1024
-/// entries against the 64 KiB pane ceiling is roughly 64 MiB per plugin).
+/// Global backstop because UI state does not validate session ids.
 const MAX_ENTRIES_PER_PLUGIN: usize = 1024;
 /// Largest normalized payload accepted for one entry, in bytes of JSON. The
 /// pane slot gets a much larger budget than the small badge/column slots: a

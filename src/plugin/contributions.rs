@@ -1,4 +1,4 @@
-//! Normalized Tier 0 contributions from the active plugin set.
+//! Normalized contributions from the active plugin set.
 //!
 //! Each surface (themes, settings schema, keybinds, CLI) reads its slice of the
 //! manifest through one place here rather than walking `registry().active()` and

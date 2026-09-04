@@ -20,7 +20,9 @@
 //! turn in flight" and then acting is not enough because a turn can start in the
 //! gap. So the whole sequence is held under the per-session `instance_lock`, the
 //! same lock the tied-worktree rename holds across its `git worktree move` plus
-//! metadata write, and the turn probe runs inside it.
+//! metadata write, and the turn probe runs inside it. Since #3621 that takes two
+//! locks, not one: prompt submission has its own per-session authority and never
+//! takes `instance_lock`, so the barrier holds `prompt_submission` outside it.
 //!
 //! ## Why the split against the session-domain half
 //!
@@ -87,6 +89,20 @@ pub(crate) async fn attach_project(
     repo_path: &Path,
     on_existing: ExistingBranch,
 ) -> Result<(AttachOutcome, WorkerOutcome), AttachError> {
+    // `instance_lock` alone stopped being the whole barrier once prompt
+    // submission moved to its own authority (#3621): the queue drains and every
+    // prompt endpoint serialize on `prompt_submission` and never take
+    // `instance_lock`, so a reconciler tick could otherwise deliver a queued
+    // follow-up to the worker this is about to stop and retire the row as sent.
+    // Claimed first, which is the order `prompt_submission` documents, and in
+    // the admission form so an unknown id allocates neither lock.
+    let Some(_submission) = state
+        .session_service
+        .prompt_submission_for_session(id)
+        .await
+    else {
+        return Err(AttachError::NotFound);
+    };
     let inst_lock = state.instance_lock(id).await;
     // Held across the turn probe, the stop, the persist and the start. Releasing
     // it between any two of those is what would let a prompt land against a

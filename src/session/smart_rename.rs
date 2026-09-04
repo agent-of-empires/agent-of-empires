@@ -239,11 +239,11 @@ pub fn render_first_turn(user_prompt: &str, agent_prose: &str) -> String {
 }
 
 /// Project a resolved [`SessionConfig`] into the three fields the smart-rename
-/// indicator (`list_sessions` in `src/server/api/sessions.rs`) and the runtime
+/// indicator (`list_sessions` in `src/server/api/sessions/list.rs`) and the runtime
 /// gate ([`try_smart_rename`]) both consume. Shared projection so the two
 /// call sites cannot drift on which fields count: each site fetches the
 /// resolved config via
-/// [`crate::session::repo_config::resolve_config_with_repo_or_warn`] and
+/// [`crate::session::config::repo_config::resolve_config_with_repo_or_warn`] and
 /// passes `.session` through this function. Returns borrowed refs so the
 /// sidebar's per-row call does not allocate. See #2603.
 pub fn resolve_smart_rename_config(session: &SessionConfig) -> SmartRenameConfig<'_> {
@@ -625,11 +625,10 @@ pub(crate) fn title_is_auto_overwritable(inst: &crate::session::instance::Instan
 // still-default-named session: that single edge covers every input path
 // (native attach, web live-view, `aoe send`) and fires only once the pane
 // agent is idle, so the one-shot never races it for the provider API. The work
-// runs in a detached `aoe __smart-rename` child so it never blocks the poller
-// and is identical in the TUI-only and serve builds. Cross-process guards (a
-// per-session advisory lock, MAX_CONCURRENT global slot locks, and the
-// persisted `Instance.smart_rename_attempted` marker) coordinate the TUI, the
-// daemon, and sibling children, which are all separate processes.
+// runs in a detached `aoe __smart-rename` child so it never blocks the poller.
+// Cross-process guards (a per-session advisory lock, MAX_CONCURRENT global slot
+// locks, and the persisted `Instance.smart_rename_attempted` marker) coordinate
+// the TUI, the daemon, and sibling children, which are all separate processes.
 // ---------------------------------------------------------------------------
 
 /// Head/tail byte budgets for the captured first-turn transcript handed to the
@@ -659,7 +658,7 @@ pub fn maybe_spawn_terminal_smart_rename(inst: &crate::session::instance::Instan
     // child's resolve_oneshot_target, so it can retry when the container comes
     // back. The child re-checks against fresh storage anyway, so this is a
     // fork-avoidance filter, not the authority.
-    let resolved = crate::session::repo_config::resolve_config_with_repo_or_warn(
+    let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
         &inst.source_profile,
         Path::new(&inst.project_path),
     );
@@ -992,20 +991,7 @@ pub async fn run_smart_rename_now(
         .map(|i| i.is_structured());
     drop(instances);
     match structured {
-        // Structured sessions rename through the daemon, whose client lives
-        // behind the `serve` feature. A non-serve (TUI-only) build has no
-        // structured view and no daemon client, so there is nothing to do.
-        Some(true) => {
-            #[cfg(feature = "serve")]
-            {
-                rename_structured_via_daemon(session_id).await
-            }
-            #[cfg(not(feature = "serve"))]
-            {
-                let _ = session_id;
-                Ok(())
-            }
-        }
+        Some(true) => rename_structured_via_daemon(session_id).await,
         Some(false) => run_terminal_rename(profile, session_id, force).await,
         None => Ok(()),
     }
@@ -1015,7 +1001,6 @@ pub async fn run_smart_rename_now(
 /// structured session via `POST /api/sessions/{id}/smart-rename`. The endpoint
 /// already forces past the disabled-setting gate. Best-effort: no daemon, or a
 /// non-2xx response, just leaves the generated name in place.
-#[cfg(feature = "serve")]
 async fn rename_structured_via_daemon(session_id: &str) -> anyhow::Result<()> {
     use crate::acp::client::{discovery, HttpClient};
     let endpoint = match discovery::discover() {
@@ -1087,7 +1072,7 @@ pub async fn run_terminal_rename(
         return Ok(());
     }
 
-    let resolved = crate::session::repo_config::resolve_config_with_repo_or_warn(
+    let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
         profile,
         Path::new(&project_path),
     );
@@ -1173,10 +1158,8 @@ pub async fn run_terminal_rename(
     Ok(())
 }
 
-#[cfg(feature = "serve")]
 pub use serve::{should_trigger_smart_rename, try_smart_rename};
 
-#[cfg(feature = "serve")]
 mod serve {
     use super::*;
     use crate::server::AppState;
@@ -1301,7 +1284,7 @@ mod serve {
             return;
         };
 
-        let resolved = crate::session::repo_config::resolve_config_with_repo_or_warn(
+        let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
             &profile,
             Path::new(&project_path),
         );
@@ -1543,7 +1526,7 @@ mod serve {
             // differs only by a trailing slash.
             let mut existing = crate::session::Instance::new("Already owned", "/tmp/shared");
             existing.source_profile = "default".to_string();
-            let instances = vec![existing];
+            let instances = [existing];
             let cases = [
                 ("Already owned", "/tmp/shared", true),
                 // "/tmp/shared/" and "/tmp/shared" are equal after trim_end_matches('/').
@@ -2549,7 +2532,7 @@ Rewrote the getting-started section and fixed two broken links.";
     }
 
     // Regression for #2351: pins the shared helper that both `try_smart_rename`
-    // and the sidebar indicator overlay in `src/server/api/sessions.rs` route
+    // and the sidebar indicator overlay in `src/server/api/sessions/list.rs` route
     // through. The helper is verified in isolation here; call-site coverage is
     // design-level (reverting either site to bypass the helper is visible in
     // review because both explicitly name `resolve_smart_rename_config`).
@@ -2562,7 +2545,7 @@ Rewrote the getting-started section and fixed two broken links.";
     fn resolve_smart_rename_config_reads_repo_aware_config_but_not_repo_commands() {
         let home = tempfile::tempdir().expect("tempdir HOME");
         // SAFETY: serialized by `#[serial]`; matches `set_tmp_home` in
-        // `src/session/mcp_state.rs`.
+        // `src/session/mcp/mcp_state.rs`.
         unsafe {
             std::env::set_var("HOME", home.path());
             std::env::set_var("XDG_CONFIG_HOME", home.path().join(".config"));
@@ -2604,8 +2587,10 @@ claude = "repo-wrapper"
         )
         .unwrap();
 
-        let resolved =
-            crate::session::repo_config::resolve_config_with_repo_or_warn("default", repo.path());
+        let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+            "default",
+            repo.path(),
+        );
         // Pins that the repo file was actually discovered: an allowed field
         // from it lands, so the assertions below are about the boundary and
         // not about a fixture that silently never loaded.

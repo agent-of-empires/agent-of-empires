@@ -1,14 +1,5 @@
-//! Server-owned prompt-queue mirror for the TUI structured view.
-//!
-//! The prompt queue's source of truth is the daemon
-//! (`/api/sessions/{id}/queue`, see
-//! `docs/development/server-side-prompt-queue.md`): a follow-up queued behind a
-//! busy turn survives a client reload and drains server-side even with no
-//! client attached. This module is the TUI's read model of that queue, a
-//! snapshot refreshed from the daemon at the turn edge and on (re)connect, plus
-//! optimistic edits that the next refresh reconciles. The batching and
-//! `/clear`-boundary split policy that used to live here moved server-side
-//! (`session_service::queue_drain_batch`), so the TUI no longer drains locally.
+//! TUI mirror of the daemon-owned prompt queue. Snapshots refresh at turn
+//! boundaries and on reconnect; optimistic edits reconcile on the next refresh.
 
 use crate::acp::state::QueuedPromptEntry;
 

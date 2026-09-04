@@ -35,10 +35,6 @@
 //! is published; the UI renders an amber callout in the transcript so
 //! the user knows prior turns are no longer in the model's context.
 //!
-//! The bundled `aoe-agent` does not yet advertise `load_session`, so
-//! its UI transcript replays from this store on restart but the model
-//! itself starts fresh each spawn (tracked in #1005).
-//!
 //! ## Lifecycle
 //!
 //! Per-session rows are dropped on session delete and on
@@ -1679,7 +1675,7 @@ impl EventStore {
     ) -> std::collections::HashMap<String, i64> {
         // Exclude non-substantive lifecycle/metadata events so they do not
         // reset the idle clock. AcpSessionAssigned in particular is emitted
-        // on every cold-start resume (acp_client.rs), so counting it would
+        // on every cold-start resume (acp_client/update_events.rs), so counting it would
         // make a daemon restart look like fresh activity for every worker
         // and the idle-reap (#1689) would never fire across restarts. Shares
         // NON_SUBSTANTIVE_EVENT_DISCRIMINANTS with the retention prune so the
