@@ -464,7 +464,6 @@ mod tests {
                 audio: false,
                 embedded_context: false,
                 load_session: None,
-                worker_generation: None,
             },
             Event::CancelRequested {
                 escalates_at: Utc::now(),

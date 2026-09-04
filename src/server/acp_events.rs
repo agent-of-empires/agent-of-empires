@@ -327,12 +327,14 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
 
         let status_intent = derive_acp_status(frame.event.as_ref());
         let acp_change = derive_acp_session_change(frame.event.as_ref());
-        let load_session_capability = match frame.event.as_ref() {
-            crate::acp::state::Event::PromptCapabilities {
-                load_session: Some(capable),
-                worker_generation: Some(generation),
-                ..
-            } => Some((*capable, *generation)),
+        let load_session_capability = match (frame.event.as_ref(), frame.worker_generation) {
+            (
+                crate::acp::state::Event::PromptCapabilities {
+                    load_session: Some(capable),
+                    ..
+                },
+                Some(generation),
+            ) => Some((*capable, generation)),
             _ => None,
         };
         if status_intent.is_none() && acp_change.is_none() && load_session_capability.is_none() {
@@ -352,6 +354,11 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             // Check while holding the instance lock: teardown removes the worker
             // before clearing this field, so either this write happens first and
             // is cleared, or the stale generation is rejected.
+            //
+            // This awaits the supervisor's `workers` mutex with the `instances`
+            // write lock held. That ordering is only safe while `Supervisor`
+            // never reaches for `instances`; give it a path that does and this
+            // becomes a lock cycle.
             if let Some((capable, generation)) = load_session_capability {
                 if state
                     .acp_supervisor
@@ -1317,9 +1324,9 @@ mod tests {
                         audio: false,
                         embedded_context: false,
                         load_session: Some(capable),
-                        worker_generation: Some(worker_generation),
                         steering: false,
                     }),
+                    worker_generation: Some(worker_generation),
                 })
                 .expect("listener is subscribed");
         };
@@ -1370,6 +1377,7 @@ mod tests {
                 event: Arc::new(crate::acp::Event::AcpSessionAssigned {
                     acp_session_id: "replacement-acp-id".to_string(),
                 }),
+                worker_generation: None,
             })
             .expect("listener is subscribed");
         for _ in 0..500 {
@@ -1484,6 +1492,7 @@ mod tests {
                 event: Arc::new(crate::acp::Event::Stopped {
                     reason: "prompt_complete".into(),
                 }),
+                worker_generation: None,
             })
             .expect("listener is subscribed");
 

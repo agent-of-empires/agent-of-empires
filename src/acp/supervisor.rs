@@ -216,6 +216,15 @@ pub trait BroadcastSink: Send + Sync + 'static {
         self.publish(session_id, seq, event);
         true
     }
+    /// Publish an event the drain task pumped out of a worker, tagging the
+    /// broadcast frame with the generation of the worker that authored it.
+    /// The drain task is the only publisher with that provenance; every
+    /// other caller goes through `publish` and produces an untagged frame.
+    /// Default drops the tag, which is right for sinks with no broadcast
+    /// channel behind them (test fixtures): nothing downstream can read it.
+    fn publish_from_worker(&self, session_id: &str, seq: u64, event: &Event, _generation: u64) {
+        self.publish(session_id, seq, event);
+    }
     /// Drop all stored events for a session. Used by the import path to clear
     /// any partial replay from a prior failed attempt before re-seeding, run
     /// only after the worker slot is reserved so a duplicate spawn that hits
@@ -2074,14 +2083,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                     // different ACP backend via `/acp/switch-agent`. See
                     // #1281.
                     let mut rate_limited = false;
-                    while let Some(mut event) = inbound.recv().await {
-                        if let Event::PromptCapabilities {
-                            worker_generation: event_generation,
-                            ..
-                        } = &mut event
-                        {
-                            *event_generation = Some(worker_generation);
-                        }
+                    while let Some(event) = inbound.recv().await {
                         if let Event::Stopped { reason } = &event {
                             if reason == "agent_unresponsive"
                                 || reason == "prompt_orphaned"
@@ -2167,7 +2169,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                             _ => {}
                         }
                         let seq = next_seq(&next_seqs, &session_id);
-                        sink.publish(&session_id, seq, &event);
+                        sink.publish_from_worker(&session_id, seq, &event, worker_generation);
                     }
 
                     // Channel closed: the agent's connection task ended.
@@ -3720,6 +3722,10 @@ impl BroadcastSink for ChannelSink {
         let _ = self.publish_persisted(session_id, seq, event);
     }
 
+    fn publish_from_worker(&self, session_id: &str, seq: u64, event: &Event, generation: u64) {
+        self.publish_tagged(session_id, seq, event, Some(generation));
+    }
+
     fn clear_session_events(&self, session_id: &str) {
         self.event_store.delete_session(session_id);
         // The cached fold is a projection of the log we just deleted.
@@ -3727,6 +3733,53 @@ impl BroadcastSink for ChannelSink {
     }
 
     fn publish_persisted(&self, session_id: &str, seq: u64, event: &Event) -> bool {
+        self.publish_tagged(session_id, seq, event, None)
+    }
+
+    fn unresolved_approval_nonces(&self, session_id: &str) -> Vec<Nonce> {
+        self.event_store.unresolved_approval_nonces(session_id)
+    }
+
+    fn unresolved_elicitation_nonces(&self, session_id: &str) -> Vec<Nonce> {
+        self.event_store.unresolved_elicitation_nonces(session_id)
+    }
+
+    fn record_attachment(
+        &self,
+        session_id: &str,
+        seq: u64,
+        blob: &crate::acp::event_store::AttachmentBlob,
+    ) -> bool {
+        match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(|| {
+                self.event_store.record_attachment(session_id, seq, blob)
+            }),
+            _ => self.event_store.record_attachment(session_id, seq, blob),
+        }
+    }
+
+    fn delete_attachments_for_seq(&self, session_id: &str, seq: u64) {
+        match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {
+                tokio::task::block_in_place(|| {
+                    self.event_store.delete_attachments_for_seq(session_id, seq)
+                });
+            }
+            _ => self.event_store.delete_attachments_for_seq(session_id, seq),
+        }
+    }
+}
+
+impl ChannelSink {
+    /// Shared body of every `ChannelSink` publish. `worker_generation` is
+    /// `Some` only on the drain task's path.
+    fn publish_tagged(
+        &self,
+        session_id: &str,
+        seq: u64,
+        event: &Event,
+        worker_generation: Option<u64>,
+    ) -> bool {
         // A rejection the agent attached no reset to inherits the reset of
         // the last rejection recorded for this session, as long as that
         // window has not rolled over yet. The worker's own capture dies with
@@ -3816,42 +3869,10 @@ impl BroadcastSink for ChannelSink {
             session_id: session_id.to_string(),
             seq,
             event: Arc::new(event_ref.clone()),
+            worker_generation,
         };
         let _ = self.tx.send(frame);
         persisted
-    }
-
-    fn unresolved_approval_nonces(&self, session_id: &str) -> Vec<Nonce> {
-        self.event_store.unresolved_approval_nonces(session_id)
-    }
-
-    fn unresolved_elicitation_nonces(&self, session_id: &str) -> Vec<Nonce> {
-        self.event_store.unresolved_elicitation_nonces(session_id)
-    }
-
-    fn record_attachment(
-        &self,
-        session_id: &str,
-        seq: u64,
-        blob: &crate::acp::event_store::AttachmentBlob,
-    ) -> bool {
-        match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
-            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(|| {
-                self.event_store.record_attachment(session_id, seq, blob)
-            }),
-            _ => self.event_store.record_attachment(session_id, seq, blob),
-        }
-    }
-
-    fn delete_attachments_for_seq(&self, session_id: &str, seq: u64) {
-        match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
-            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {
-                tokio::task::block_in_place(|| {
-                    self.event_store.delete_attachments_for_seq(session_id, seq)
-                });
-            }
-            _ => self.event_store.delete_attachments_for_seq(session_id, seq),
-        }
     }
 }
 

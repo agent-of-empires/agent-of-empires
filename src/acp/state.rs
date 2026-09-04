@@ -1080,10 +1080,6 @@ pub enum Event {
         /// written before this field existed, which means unknown.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         load_session: Option<bool>,
-        /// In-process provenance assigned by the supervisor event pump.
-        /// Never persisted or sent to clients.
-        #[serde(skip)]
-        worker_generation: Option<u64>,
         /// Whether the agent accepts `_session/steering`, so a prompt
         /// sent mid-turn is injected into the running turn instead of
         /// being parked in the composer's client-side queue. Gated on
@@ -1710,7 +1706,6 @@ mod tests {
             audio: false,
             embedded_context: false,
             load_session: None,
-            worker_generation: None,
             steering,
         }
     }

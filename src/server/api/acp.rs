@@ -2884,6 +2884,7 @@ pub async fn acp_replay(
                 session_id: id.clone(),
                 seq,
                 event: Arc::new(event),
+                worker_generation: None,
             })
             .collect();
         (frames, None)

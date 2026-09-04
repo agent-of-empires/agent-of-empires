@@ -28,6 +28,13 @@ pub struct AcpBroadcastFrame {
     pub session_id: String,
     pub seq: u64,
     pub event: Arc<Event>,
+    /// Which installed worker produced this frame, for in-process
+    /// consumers that must reject a replaced worker's queued frames.
+    /// `None` whenever no live worker authored it: a server-side publish,
+    /// a replay off the event log, or a frame parsed from the wire. The
+    /// field is deliberately absent from both serde impls below, so
+    /// provenance never leaves this process.
+    pub worker_generation: Option<u64>,
 }
 
 impl Serialize for AcpBroadcastFrame {
@@ -60,6 +67,7 @@ impl<'de> Deserialize<'de> for AcpBroadcastFrame {
             session_id: w.session_id,
             seq: w.seq,
             event: Arc::new(w.event),
+            worker_generation: None,
         })
     }
 }
@@ -369,12 +377,17 @@ mod tests {
             session_id: "s-1".into(),
             seq: 42,
             event: Arc::new(Event::ThinkingStarted),
+            worker_generation: Some(7),
         };
         let json = serde_json::to_string(&frame).unwrap();
         let back: AcpBroadcastFrame = serde_json::from_str(&json).unwrap();
         assert_eq!(back.session_id, "s-1");
         assert_eq!(back.seq, 42);
         assert!(matches!(*back.event, Event::ThinkingStarted));
+        // Worker provenance is in-process only: it must not reach the wire,
+        // and a frame parsed back from it carries no generation to trust.
+        assert!(!json.contains("worker_generation"));
+        assert_eq!(back.worker_generation, None);
     }
 
     #[test]
