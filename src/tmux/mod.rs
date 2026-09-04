@@ -581,8 +581,8 @@ pub(crate) fn rekey_session(id: &str, old_title: &str, new_title: &str) -> anyho
     Ok(renamed)
 }
 
-/// The rename half of [`rekey_session`], split out so the title refresh runs
-/// once for every path that reports the pane moved.
+/// The rename half of [`rekey_session`]: resolves the live session for `id`
+/// and moves it to the name derived from `new_title`.
 fn rekey_session_name(id: &str, old_title: &str, new_title: &str) -> anyhow::Result<bool> {
     // Name resolution is cache-backed. Force an authoritative scan first so a
     // process-local snapshot from before another writer's rename cannot point
