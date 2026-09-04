@@ -93,7 +93,7 @@ interface Props {
   /** Structured view worker lifecycle pulled from `SessionResponse.acp_worker_state`
    *  (REST-poll-driven, ~3s cadence). Drives the `WorkerResumingBanner`
    *  while the reconciler is mid-spawn/attach. See #1088. */
-  acpWorkerState: "absent" | "resuming" | "running";
+  acpWorkerState: "absent" | "resuming" | "running" | "stopping";
   /** Session's `tool` registry key (claude / codex / opencode / gemini
    *  / etc.). Resolves the active AgentProfile that drives card
    *  dispatch and claude-specific capability gates. */
@@ -329,7 +329,7 @@ function AcpChrome({
   isSandboxed,
 }: AcpContext & {
   sessionId: string;
-  acpWorkerState: "absent" | "resuming" | "running";
+  acpWorkerState: "absent" | "resuming" | "running" | "stopping";
   acpAgent: string | null;
   showClearedTurns: boolean;
   onToggleClearedTurns: () => void;
@@ -765,6 +765,7 @@ function AcpChrome({
         !state.workerStopped &&
         !state.workerRestarting &&
         (state.lastSeq === 0 ? <SpawningBanner /> : <WorkerResumingBanner />)}
+      {acpWorkerState === "stopping" && !state.startupError && <WorkerStoppingBanner />}
       {state.nextWakeupAt &&
         !state.turnActive &&
         !state.startupError &&
@@ -1975,6 +1976,19 @@ function WorkerResumingBanner() {
         Resuming structured view worker… cached transcript still available. Queued prompts will send once the agent is
         back online.
       </span>
+    </div>
+  );
+}
+
+/** Shown while `SessionResponse.acp_worker_state === "stopping"`: the
+ *  daemon has signalled the worker but has not proven it gone. Prompts
+ *  and resumes are refused until it settles, so the composer parks
+ *  queued prompts the same way it does while resuming. See #3487. */
+export function WorkerStoppingBanner() {
+  return (
+    <div className="flex items-center gap-2 border-b border-status-warning/30 bg-status-warning/10 px-4 py-2 text-xs text-status-warning">
+      <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-status-warning" aria-hidden />
+      <span>Stopping structured view worker… waiting for the agent process to exit before anything can resume.</span>
     </div>
   );
 }

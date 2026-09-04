@@ -313,7 +313,7 @@ fn supervisor_error_response(context: &str, err: &SupervisorError) -> axum::resp
             "structured view worker already running for session",
         )
             .into_response(),
-        SupervisorError::CapacityFull { .. } => {
+        SupervisorError::CapacityFull { .. } | SupervisorError::TeardownPending(_) => {
             (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response()
         }
         // 503, not 500: the worker's connection task has ended but its

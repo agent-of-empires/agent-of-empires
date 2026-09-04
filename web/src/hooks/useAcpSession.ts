@@ -933,7 +933,7 @@ export function useAcpSession(
    *  When not `"running"`, the drain effect parks queued prompts so they
    *  don't dispatch into a worker that isn't online yet. Defaults to
    *  `"running"` so non-structured view / pre-#1088 call sites keep working. */
-  workerState: "absent" | "resuming" | "running" = "running",
+  workerState: "absent" | "resuming" | "running" | "stopping" = "running",
   /** RFC3339 archived-at, or null. `sendPrompt` clears this server-side
    *  (via PATCH /api/sessions/{id}/archive) before enqueueing so the
    *  reconciler stops skipping the session and respawns the worker.

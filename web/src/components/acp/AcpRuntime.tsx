@@ -62,7 +62,7 @@ interface Props {
   /** Live acp worker lifecycle pulled from `SessionResponse.acp_worker_state`.
    *  Threaded through to `useStructuredView` so the drain effect parks queued
    *  prompts while the reconciler is mid-resume. See #1088. */
-  acpWorkerState?: "absent" | "resuming" | "running";
+  acpWorkerState?: "absent" | "resuming" | "running" | "stopping";
   /** RFC3339 archived-at timestamp, or null. Threaded into `useStructuredView`
    *  so `sendPrompt` can auto-unarchive the session before enqueueing,
    *  matching the `touch_last_accessed` invariant the server enforces

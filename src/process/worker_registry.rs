@@ -88,6 +88,12 @@ pub struct WorkerRecord {
     /// back to the default profile, matching pre-persistence behavior.
     #[serde(default)]
     pub source_profile: Option<String>,
+    /// Lifecycle epoch the daemon minted for this runner (see
+    /// `acp::runner_lifecycle`). Together with `pid` it identifies the
+    /// exact process a lease holder may signal or clean up. Records from
+    /// older binaries default to 0, which matches on pid alone.
+    #[serde(default)]
+    pub generation: u64,
     pub started_at: u64,
     pub last_attached_at: Option<u64>,
     pub detached_at: Option<u64>,
@@ -122,10 +128,16 @@ impl WorkerRecord {
             provider_env_keys,
             stored_acp_session_id,
             source_profile,
+            generation: 0,
             started_at: now_secs(),
             last_attached_at: None,
             detached_at: None,
         }
+    }
+
+    pub fn with_generation(mut self, generation: u64) -> Self {
+        self.generation = generation;
+        self
     }
 }
 
@@ -163,18 +175,20 @@ pub fn log_path_for(session_id: &str) -> Result<PathBuf> {
 ///     the "Reconnect" button (the daemon will respawn shortly);
 ///   - signal the reconciler to clear the `attempted` set for this id
 ///     so the next 2s tick actually spawns a fresh worker.
+///
+/// The file holds the generation of the runner being restarted, so the
+/// authority it grants is bound to that runner: a marker for any other
+/// generation is stale and is discarded wherever it is observed.
 pub fn restart_marker_path(session_id: &str) -> Result<PathBuf> {
     crate::process::worker::restart_marker_path(&workers_dir()?, session_id)
 }
 
-/// Best-effort write of an empty restart-pending marker. Called by the
-/// CLI's `aoe acp restart` before deleting the registry entry. The
-/// file's existence is the signal; its contents are irrelevant.
-pub fn mark_restart_pending(session_id: &str) {
+/// Best-effort write of a restart-pending marker for `generation`.
+pub fn mark_restart_pending(session_id: &str, generation: u64) {
     let Ok(path) = restart_marker_path(session_id) else {
         return;
     };
-    let _ = std::fs::write(&path, b"");
+    let _ = std::fs::write(&path, generation.to_string());
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -182,17 +196,25 @@ pub fn mark_restart_pending(session_id: &str) {
     }
 }
 
-/// Returns `true` if the marker existed (and was deleted). Caller uses
-/// the boolean to pick the publish reason; defense-in-depth removes the
-/// file so a leaked marker doesn't poison the next spawn.
-pub fn take_restart_marker(session_id: &str) -> bool {
-    let Ok(path) = restart_marker_path(session_id) else {
-        return false;
-    };
-    match std::fs::remove_file(&path) {
-        Ok(()) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(_) => false,
+/// Generation named by the marker, without consuming it. `None` when
+/// there is no marker or it names no generation.
+pub fn peek_restart_marker(session_id: &str) -> Option<u64> {
+    let path = restart_marker_path(session_id).ok()?;
+    crate::process::worker::read_restart_marker(&path)
+}
+
+/// Consume the marker. Returns `true` only when it named `generation`,
+/// which must itself be known (non-zero); the file is removed either way
+/// so a stale marker cannot poison a later stop.
+pub fn take_restart_marker(session_id: &str, generation: u64) -> bool {
+    let found = peek_restart_marker(session_id);
+    clear_restart_marker(session_id);
+    generation != 0 && found == Some(generation)
+}
+
+pub fn clear_restart_marker(session_id: &str) {
+    if let Ok(path) = restart_marker_path(session_id) {
+        let _ = std::fs::remove_file(&path);
     }
 }
 
@@ -466,6 +488,26 @@ pub fn terminate(session_id: &str) {
         _ => {
             delete(session_id).ok();
         }
+    }
+}
+
+/// Remove the record and sockets only while they still describe the runner
+/// `(pid, generation)`; a record a replacement runner has since written is
+/// left alone. Returns whether the registry is settled for that runner.
+pub fn delete_if_owned_by(session_id: &str, pid: u32, generation: u64) -> bool {
+    let identity = crate::acp::runner_lifecycle::RunnerIdentity { pid, generation };
+    match load(session_id) {
+        Ok(Some(rec)) if !identity.matches_record(rec.pid, rec.generation) => {
+            debug!(
+                target: "acp.registry",
+                session = %session_id,
+                current_pid = rec.pid,
+                "leaving registry entry; it belongs to a replacement runner"
+            );
+            true
+        }
+        Ok(_) => delete(session_id).is_ok(),
+        Err(_) => false,
     }
 }
 
@@ -1036,6 +1078,77 @@ mod tests {
             let sock_path = socket_path_for(session_id).unwrap();
             let _listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
             assert_eq!(pid_source_for(session_id), Some(std::process::id()));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn restart_marker_authority_is_bound_to_a_generation() {
+        with_temp_home(|| {
+            assert!(!take_restart_marker("m", 7), "no marker, nothing to take");
+            mark_restart_pending("m", 7);
+            assert_eq!(peek_restart_marker("m"), Some(7));
+            assert!(
+                !take_restart_marker("m", 8),
+                "a marker for another generation grants nothing"
+            );
+            assert_eq!(peek_restart_marker("m"), None, "but it is still consumed");
+
+            mark_restart_pending("m", 7);
+            assert!(take_restart_marker("m", 7));
+            assert_eq!(peek_restart_marker("m"), None);
+
+            mark_restart_pending("m", 0);
+            assert!(
+                !take_restart_marker("m", 0),
+                "an unbound marker never authorizes a respawn"
+            );
+
+            let path = restart_marker_path("m").unwrap();
+            std::fs::write(&path, b"").unwrap();
+            assert_eq!(
+                peek_restart_marker("m"),
+                None,
+                "an empty legacy marker is unbound"
+            );
+            clear_restart_marker("m");
+            assert!(!path.exists());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn delete_if_owned_by_leaves_a_replacement_record() {
+        with_temp_home(|| {
+            let socket = workers_dir().unwrap().join("g.sock");
+            let rec = WorkerRecord::new(
+                "g".into(),
+                41,
+                socket,
+                "claude-agent-acp".into(),
+                "claude".into(),
+                PathBuf::from("/repo"),
+                None,
+                vec![],
+                vec![],
+                None,
+                None,
+            )
+            .with_generation(3);
+            save(&rec).unwrap();
+            assert!(
+                delete_if_owned_by("g", 40, 3),
+                "other pid: settled without touching"
+            );
+            assert!(load("g").unwrap().is_some());
+            assert!(
+                delete_if_owned_by("g", 41, 4),
+                "other generation: settled, kept"
+            );
+            assert!(load("g").unwrap().is_some());
+            assert!(delete_if_owned_by("g", 41, 3));
+            assert!(load("g").unwrap().is_none());
+            assert!(delete_if_owned_by("g", 41, 3), "missing record is settled");
         });
     }
 }

@@ -973,7 +973,7 @@ fn restart(session: &str) -> Result<()> {
     // instead of `user_stopped` — the UI then renders a transient
     // "Restarting…" banner instead of the persistent "Stopped +
     // Reconnect" affordance.
-    worker_registry::mark_restart_pending(session);
+    worker_registry::mark_restart_pending(session, record.generation);
     worker_registry::delete(session).ok();
     // Group-SIGTERM so the agent's node/SDK grandchildren die with the
     // runner rather than orphaning under PID 1 before respawn (#1689).

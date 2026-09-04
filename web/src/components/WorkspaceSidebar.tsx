@@ -1672,6 +1672,16 @@ export const SessionRow = memo(function SessionRow({
                       Resuming
                     </span>
                   )}
+                  {firstSession?.view === "structured" && firstSession.acp_worker_state === "stopping" && (
+                    <span
+                      title="Structured view worker is stopping; it will not resume until the process has exited"
+                      aria-label="Stopping"
+                      className="inline-flex shrink-0 items-center gap-0.5 rounded border border-amber-700/40 bg-amber-950/30 px-1 py-0 text-[10px] font-medium text-amber-300"
+                    >
+                      <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-amber-400/80" />
+                      Stopping
+                    </span>
+                  )}
                   {firstSession?.smart_rename === "pending" && (
                     <span
                       title="Will auto-name this session from your first message"

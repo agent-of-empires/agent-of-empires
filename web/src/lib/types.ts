@@ -595,7 +595,7 @@ export interface ClaudeSessionSummary {
 
 /** Live acp worker lifecycle, mirrored from
  *  `crate::acp::supervisor::AcpWorkerState`. See #1088. */
-export type AcpWorkerState = "absent" | "resuming" | "running";
+export type AcpWorkerState = "absent" | "resuming" | "running" | "stopping";
 
 // --- Settings schema (single source of truth, see #1692) ---
 //

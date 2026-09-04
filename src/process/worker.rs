@@ -309,6 +309,12 @@ pub fn restart_marker_path(dir: &Path, id: &str) -> Result<PathBuf> {
     Ok(dir.join(format!("{id}.restart")))
 }
 
+/// Generation named by a restart marker, or `None` when the file is
+/// absent or does not name one.
+pub fn read_restart_marker(path: &Path) -> Option<u64> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
 /// What a worker's own registry record looks like from its watchdog's
 /// point of view. Computed from a non-creating read of a path captured at
 /// startup; see [`inspect_record_for_runner`].

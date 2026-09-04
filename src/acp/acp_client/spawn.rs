@@ -106,6 +106,9 @@ pub struct SpawnConfig {
     /// same substitution warning the initial spawn logged, one line per
     /// launch.
     pub wrapper_substitution: Option<(String, String)>,
+    /// Lifecycle epoch stamped on the runner's registry record; the
+    /// supervisor sets it from the lease that admitted the spawn.
+    pub generation: u64,
 }
 
 /// Reject `provider_env` request entries whose key would either escape
@@ -543,6 +546,7 @@ mod tests {
             stored_acp_session_id: None,
             fork_from: None,
             seed_history_replay: false,
+            generation: 0,
             artifact_dir: None,
             sandbox_info: None,
             source_profile: None,
@@ -582,6 +586,7 @@ mod tests {
             stored_acp_session_id: None,
             fork_from: None,
             seed_history_replay: false,
+            generation: 0,
             artifact_dir: None,
             sandbox_info: None,
             source_profile: None,
