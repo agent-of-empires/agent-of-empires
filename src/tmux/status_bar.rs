@@ -2,7 +2,6 @@
 
 use anyhow::Result;
 use ratatui::style::Color;
-use unicode_width::UnicodeWidthStr;
 
 use crate::tui::styles::Theme;
 
@@ -17,11 +16,6 @@ fn color_to_tmux(color: Color) -> String {
         Color::Rgb(r, g, b) => format!("#{:02x}{:02x}{:02x}", r, g, b),
         _ => "default".to_string(),
     }
-}
-
-/// Width needed to show the session name and detach hint.
-fn status_left_width(session_name: &str, prefix: &str) -> usize {
-    format!(" {session_name} │ {prefix} d to detach ").width()
 }
 
 /// Apply aoe-styled status bar configuration to a tmux session.
@@ -81,8 +75,12 @@ pub fn apply_status_bar(
             " #[fg={accent},bold]#S#[fg={fg},nobold] \u{2502} #[fg={hint}]{prefix} d#[fg={hint}] to detach ",
         ),
     )?;
-    let status_left_length = status_left_width(session_name, prefix).to_string();
-    set_session_option(session_name, "status-left-length", &status_left_length)?;
+    // Sized past the longest name aoe generates rather than to this one: `#S`
+    // expands when tmux paints, so a session renamed after this write (smart
+    // rename is on by default) outgrows an exact fit and the hint is cut
+    // again. tmux only trims at this cap and never pads, so over-sizing is
+    // free. See #3445.
+    set_session_option(session_name, "status-left-length", "200")?;
 
     Ok(())
 }
@@ -273,13 +271,6 @@ fn get_session_option(session_name: &str, option: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::tui::styles::{builtin_theme_names, load_theme};
-
-    #[test]
-    fn test_status_left_width_fits_full_detach_hint() {
-        let longest_release_name = "aoe_12345678901234567890_12345678";
-
-        assert_eq!(status_left_width(longest_release_name, "Ctrl+b"), 56);
-    }
 
     #[test]
     fn test_get_status_returns_none_for_non_tmux() {
