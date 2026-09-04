@@ -212,11 +212,25 @@ impl EventStore {
         let bytes = json.len();
         let kind = event_kind(event);
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let conn = match self.conn.lock() {
+        let mut guard = match self.conn.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let inserted = events::insert_event(&conn, &self.schema, session_id, seq, &json, now_ms)?;
+        let conn: &mut Connection = &mut guard;
+        // Insert plus budget step share one transaction: the durable
+        // redelivery budget (#3688) must move with its event row, never
+        // behind or ahead of it. Duplicates skip the budget step — the
+        // first insert already applied it, so a replay drain
+        // re-publishing the same seq cannot double-spend.
+        let inserted = {
+            let tx = conn.transaction()?;
+            let inserted = events::insert_event(&tx, &self.schema, session_id, seq, &json, now_ms)?;
+            if inserted != 0 {
+                update_rate_limit_budget(&tx, &self.schema, session_id, seq, event);
+            }
+            tx.commit()?;
+            inserted
+        };
         if inserted == 0 {
             // Primary-key collision: same (session_id, seq) seen before.
             // Logged at trace because the cause is usually a benign retry
@@ -249,7 +263,7 @@ impl EventStore {
         // a long session would otherwise evict them and leave the composer's
         // `/` palette and the mode picker empty on reconnect. See #1049.
         events::prune_retention(
-            &conn,
+            &*conn,
             &self.schema,
             session_id,
             self.max_events_per_session,
@@ -1247,6 +1261,29 @@ impl EventStore {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
+        // The durable budget row is the count of record now that retention
+        // can prune the breadcrumbs it used to be derived from (#3688). A
+        // session that predates the row (an upgraded daemon) falls back to
+        // deriving from the log, exactly as before, so the two never
+        // disagree; the next relevant record() plants the row.
+        let budget_table = self.schema.rate_limit_budgets_table();
+        let durable: Option<i64> = conn
+            .query_row(
+                &format!("SELECT spent FROM {budget_table} WHERE session_id = ?1"),
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap_or_else(|e| {
+                warn!(
+                    target: "acp.event_store",
+                    "rate_limit budget row read for {session_id}: {e}"
+                );
+                None
+            });
+        if let Some(spent) = durable {
+            return spent;
+        }
         conn.query_row(
             "SELECT COUNT(*) FROM acp_events r
              WHERE r.session_id = ?1
@@ -1899,6 +1936,170 @@ impl EventStore {
             "deleted session events"
         );
     }
+}
+
+/// Advance the durable per-session redelivery budget for one newly-inserted
+/// event, mirroring exactly what the legacy `rate_limit_redelivery_streak`
+/// SQL derives from the log (see that method for the three rules). The row
+/// survives `prune_retention` at every supported history cap, which a
+/// breadcrumb count over the pruned transcript cannot (#3688).
+///
+/// State: `spent` is the streak the reconciler caps; `armed` records that an
+/// automatic resume fired whose redelivery has not landed yet, so the
+/// following `UserPromptSent` is known to be the re-sent prompt rather than a
+/// fresh organic one. A session with no row yet (a daemon upgraded mid-park)
+/// gets one seeded from the log on its first relevant event, so the durable
+/// count and the legacy SQL derivation never disagree.
+fn update_rate_limit_budget(
+    conn: &rusqlite::Transaction<'_>,
+    schema: &events::Schema,
+    session_id: &str,
+    seq: u64,
+    event: &Event,
+) {
+    use rusqlite::params;
+    // What this event does to the budget. Everything outside these five
+    // discriminants leaves the row untouched.
+    enum Step {
+        /// Automatic resume fired; its redelivery has not landed yet.
+        Arm,
+        /// The redelivered (or organic) prompt. Only spends when armed.
+        Spend,
+        /// Manual RESUME NOW, or a spawn that burned no prompt: keep the
+        /// spend, drop a stale arming.
+        Disarm,
+        /// Organic turn end (including the cap's own terminal park) or an
+        /// agent switch: the streak is over.
+        Reset,
+    }
+    let step = match event {
+        Event::RateLimitAutoResumed { manual: false, .. } => Step::Arm,
+        Event::RateLimitAutoResumed { manual: true, .. } => Step::Disarm,
+        Event::UserPromptSent { .. } => Step::Spend,
+        Event::AgentStartupError { .. } => Step::Disarm,
+        Event::AgentSwitched { .. } => Step::Reset,
+        Event::Stopped { reason } if reason != "rate_limited" => Step::Reset,
+        _ => return,
+    };
+    let table = schema.rate_limit_budgets_table();
+    let existing: Option<(i64, i64)> = conn
+        .query_row(
+            &format!("SELECT spent, armed FROM {table} WHERE session_id = ?1"),
+            params![session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .unwrap_or_else(|e| {
+            warn!(target: "acp.event_store", "budget row read {session_id}: {e}");
+            None
+        });
+    let (spent, armed) = match existing {
+        Some((spent, armed)) => match step {
+            Step::Arm => (spent, 1),
+            Step::Spend if armed == 1 => (spent + 1, 0),
+            Step::Spend => (spent, 0),
+            Step::Disarm => (spent, 0),
+            Step::Reset => (0, 0),
+        },
+        None => {
+            // No row yet: seed from the log so an upgraded daemon's
+            // mid-park session keeps the streak its breadcrumbs describe,
+            // then apply this event's transition on top.
+            let (spent, armed) = seed_budget_from_log(conn, schema, session_id, seq);
+            match step {
+                Step::Arm => (spent, 1),
+                Step::Spend if armed == 1 => (spent + 1, 0),
+                Step::Spend => (spent, 0),
+                Step::Disarm => (spent, 0),
+                Step::Reset => (0, 0),
+            }
+        }
+    };
+    let wrote = conn
+        .execute(
+            &format!(
+                "INSERT INTO {table} (session_id, spent, armed)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                     spent = excluded.spent,
+                     armed = excluded.armed"
+            ),
+            params![session_id, spent, armed],
+        )
+        .unwrap_or(0);
+    if wrote == 0 {
+        warn!(target: "acp.event_store", "budget row write {session_id}@{seq} failed");
+    }
+}
+
+/// Derive `(spent, armed)` for a session with no budget row by replaying the
+/// same rules the legacy SQL applies over the retained log, up to (but not
+/// including) `seq`. Used once, when an upgraded daemon first writes a
+/// relevant event to a session that already has rate-limit history.
+fn seed_budget_from_log(
+    conn: &rusqlite::Transaction<'_>,
+    schema: &events::Schema,
+    session_id: &str,
+    seq: u64,
+) -> (i64, i64) {
+    use rusqlite::params;
+    // The legacy streak: breadcrumbs after the last organic boundary whose
+    // next-of-three event is the redelivered UserPromptSent.
+    let events_table = schema.events_table();
+    let spent: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM {events_table} r
+                 WHERE r.session_id = ?1
+                   AND r.discriminant = 'RateLimitAutoResumed'
+                   AND IFNULL(
+                         json_extract(r.event_json, '$.RateLimitAutoResumed.manual'), 0) = 0
+                   AND r.seq < ?2
+                   AND r.seq > (
+                       SELECT IFNULL(MAX(seq), 0) FROM {events_table}
+                       WHERE session_id = ?1
+                         AND (discriminant = 'AgentSwitched'
+                           OR (discriminant = 'Stopped'
+                               AND json_extract(event_json, '$.Stopped.reason')
+                                   != 'rate_limited'))
+                   )
+                   AND IFNULL((
+                       SELECT n.discriminant FROM {events_table} n
+                       WHERE n.session_id = ?1
+                         AND n.seq > r.seq
+                         AND n.seq < ?2
+                         AND n.discriminant IN (
+                               'UserPromptSent', 'AgentStartupError', 'RateLimitAutoResumed')
+                       ORDER BY n.seq ASC
+                       LIMIT 1
+                   ), '') = 'UserPromptSent'"
+            ),
+            params![session_id, seq as i64],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    // Armed iff the newest relevant event before `seq` is an automatic
+    // resume breadcrumb: its redelivery is the event being applied now.
+    let armed: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT IFNULL((
+                    SELECT CASE WHEN d.discriminant = 'RateLimitAutoResumed'
+                                AND IFNULL(json_extract(d.event_json,
+                                    '$.RateLimitAutoResumed.manual'), 0) = 0
+                            THEN 1 ELSE 0 END
+                    FROM {events_table} d
+                    WHERE d.session_id = ?1 AND d.seq < ?2
+                      AND d.discriminant IN ('UserPromptSent', 'AgentStartupError',
+                                             'RateLimitAutoResumed')
+                    ORDER BY d.seq DESC LIMIT 1
+                ), 0)"
+            ),
+            params![session_id, seq as i64],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    (spent, armed)
 }
 
 /// A decoded attachment ready to persist: the storage-side counterpart
@@ -4369,6 +4570,136 @@ mod tests {
 
         // No history means no streak.
         assert_eq!(store.rate_limit_redelivery_streak("s-2"), 0);
+    }
+
+    #[test]
+    fn rate_limit_redelivery_streak_survives_small_retention() {
+        // The reported retention failure (#3693 review): with
+        // replay_events=3, one park -> resume -> redeliver -> re-park cycle
+        // already exceeds the cap, so the retained window holds exactly
+        // `UserPromptSent, RateLimit, Stopped` — no breadcrumb survives and
+        // a count over the pruned transcript returns 0 forever. The streak
+        // must stay exact because it lives outside the pruned table.
+        let (_tmp, store) = open_store(3);
+        let resumes_at = || Event::RateLimitAutoResumed {
+            resets_at: Utc::now(),
+            manual: false,
+        };
+        let stopped = |reason: &str| Event::Stopped {
+            reason: reason.into(),
+        };
+        store
+            .record("s-1", 1, &user_prompt("run the nightly task"))
+            .unwrap();
+        store.record("s-1", 2, &rate_limit_event(0)).unwrap();
+        store.record("s-1", 3, &stopped("rate_limited")).unwrap();
+        for cycle in 0..5 {
+            let base = 4 + cycle * 3;
+            store.record("s-1", base, &resumes_at()).unwrap();
+            store
+                .record("s-1", base + 1, &user_prompt("run the nightly task"))
+                .unwrap();
+            store.record("s-1", base + 2, &rate_limit_event(0)).unwrap();
+            store
+                .record("s-1", base + 19, &stopped("rate_limited"))
+                .unwrap();
+        }
+        // Five full cycles burned five redeliveries; the retained rows are
+        // only the last cycle's tail, yet the count is the whole streak.
+        assert_eq!(store.rate_limit_redelivery_streak("s-1"), 5);
+
+        // The reset rules hold under the same pruning: an organic turn end
+        // clears the row, and the next armed resume counts from zero.
+        store
+            .record("s-1", 40, &stopped("prompt_complete"))
+            .unwrap();
+        store.record("s-1", 41, &resumes_at()).unwrap();
+        assert_eq!(store.rate_limit_redelivery_streak("s-1"), 0);
+        store
+            .record("s-1", 42, &user_prompt("run the nightly task"))
+            .unwrap();
+        assert_eq!(store.rate_limit_redelivery_streak("s-1"), 1);
+    }
+
+    #[test]
+    fn rate_limit_redelivery_streak_durable_at_every_cap() {
+        // Even a one-row window cannot lose the streak: the budget row is
+        // the count of record, not a derivation over retained history.
+        let (_tmp, store) = open_store(1);
+        let resumes_at = || Event::RateLimitAutoResumed {
+            resets_at: Utc::now(),
+            manual: false,
+        };
+        let stopped = |reason: &str| Event::Stopped {
+            reason: reason.into(),
+        };
+        store
+            .record("s-1", 1, &user_prompt("run the nightly task"))
+            .unwrap();
+        for cycle in 0..5 {
+            let base = 2 + cycle * 4;
+            store.record("s-1", base, &resumes_at()).unwrap();
+            store
+                .record("s-1", base + 1, &user_prompt("run the nightly task"))
+                .unwrap();
+            store.record("s-1", base + 2, &rate_limit_event(0)).unwrap();
+            store
+                .record("s-1", base + 17, &stopped("rate_limited"))
+                .unwrap();
+        }
+        assert_eq!(store.rate_limit_redelivery_streak("s-1"), 5);
+    }
+
+    #[test]
+    fn rate_limit_redelivery_streak_seeds_from_log_for_upgraded_sessions() {
+        // A daemon upgraded mid-park has breadcrumbs on disk but no budget
+        // row. Reads derive from the log exactly as before, and the first
+        // relevant write plants a row carrying the same streak forward.
+        let (_tmp, store) = open_store(1000);
+        let resumes_at = || Event::RateLimitAutoResumed {
+            resets_at: Utc::now(),
+            manual: false,
+        };
+        let stopped = |reason: &str| Event::Stopped {
+            reason: reason.into(),
+        };
+        store
+            .record("s-1", 1, &user_prompt("run the nightly task"))
+            .unwrap();
+        store.record("s-1", 2, &rate_limit_event(0)).unwrap();
+        store.record("s-1", 3, &stopped("rate_limited")).unwrap();
+        store.record("s-1", 4, &resumes_at()).unwrap();
+        store
+            .record("s-1", 5, &user_prompt("run the nightly task"))
+            .unwrap();
+        store.record("s-1", 6, &rate_limit_event(0)).unwrap();
+        store.record("s-1", 21, &stopped("rate_limited")).unwrap();
+        // Pretend the budget row never existed: delete it directly, as if
+        // these rows were written by the previous daemon version.
+        {
+            let conn = match store.conn.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            conn.execute(
+                &format!(
+                    "DELETE FROM {} WHERE session_id = ?1",
+                    store.schema.rate_limit_budgets_table()
+                ),
+                params!["s-1"],
+            )
+            .unwrap();
+        }
+        // The read falls back to the legacy derivation over the log.
+        assert_eq!(store.rate_limit_redelivery_streak("s-1"), 1);
+        // The next relevant event plants the row, seeded from that log
+        // state (spent=1, and this resume arms the next redelivery).
+        store.record("s-1", 22, &resumes_at()).unwrap();
+        assert_eq!(store.rate_limit_redelivery_streak("s-1"), 1);
+        store
+            .record("s-1", 23, &user_prompt("run the nightly task"))
+            .unwrap();
+        assert_eq!(store.rate_limit_redelivery_streak("s-1"), 2);
     }
 
     #[test]
