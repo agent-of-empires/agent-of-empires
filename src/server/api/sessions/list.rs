@@ -182,19 +182,25 @@ pub async fn list_sessions(
             if !inst.is_structured() {
                 continue;
             }
-            resp.rate_limit_auto_resume = *auto_resume_cache
-                .entry(inst.source_profile.clone())
-                .or_insert_with(|| {
-                    crate::session::config::profile_config::resolve_config_or_warn(
-                        &inst.source_profile,
-                    )
-                    .acp
-                    .rate_limit_auto_resume
-                });
-            resp.rate_limit = state
-                .acp_event_store
-                .rate_limit_park(&inst.id)
-                .and_then(|park| park.info);
+            resp.rate_limit_auto_resume = Some(
+                *auto_resume_cache
+                    .entry(inst.source_profile.clone())
+                    .or_insert_with(|| {
+                        crate::session::config::profile_config::resolve_config_or_warn(
+                            &inst.source_profile,
+                        )
+                        .acp
+                        .rate_limit_auto_resume
+                    }),
+            );
+            // A live worker is never parked, so only workerless sessions pay
+            // for the event-store probe.
+            if resp.acp_worker_state != crate::acp::supervisor::AcpWorkerState::Running {
+                resp.rate_limit = state
+                    .acp_event_store
+                    .rate_limit_park(&inst.id)
+                    .and_then(|park| park.info);
+            }
         }
     }
 
@@ -478,6 +484,20 @@ mod context_resume_tests {
             }
         );
 
+        structured.acp_load_session_capable = Some(false);
+        assert_eq!(
+            context_resume_for(&structured),
+            ContextResumeAvailability::Unavailable {
+                reason: ContextResumeUnavailableReason::AgentUnsupported,
+            }
+        );
+
+        structured.acp_load_session_capable = Some(true);
+        assert_eq!(
+            context_resume_for(&structured),
+            ContextResumeAvailability::Available
+        );
+
         structured.fork_pending = Some("opaque-parent".to_string());
         assert_eq!(
             context_resume_for(&structured),
@@ -555,7 +575,7 @@ mod workspace_ordering_tests {
             },
             acp_worker_state: crate::acp::supervisor::AcpWorkerState::Absent,
             rate_limit: None,
-            rate_limit_auto_resume: false,
+            rate_limit_auto_resume: None,
             queued_prompts: Vec::new(),
             acp_capable: false,
             acp_session_id: None,

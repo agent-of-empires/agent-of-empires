@@ -1603,12 +1603,9 @@ impl SessionService {
         let store = Arc::clone(&self.acp_event_store);
         let id = id.to_string();
         tokio::task::spawn_blocking(move || {
-            matches!(
-                store.latest_status_event(&id),
-                Some(crate::acp::Event::Stopped { reason })
-                    if reason
-                        == crate::server::acp_reconciler::RATE_LIMIT_EXHAUSTED_RETRIES_REASON
-            )
+            store
+                .rate_limit_park(&id)
+                .is_some_and(|park| park.cap_reached)
         })
         .await
         .unwrap_or(false)

@@ -181,6 +181,18 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// True when a complete, current install of `binary` is present: the digest
 /// sidecar matches its embedded lockfile AND the binary exists. Drives both
 /// the skip-reinstall path and the upgrade-after-aoe-bump path.
+/// An in-tree adapter (one that ships sources) whose installed copy no longer
+/// matches this binary's embedded sources. Spawning it would run the old
+/// code beside a new daemon, so resolution refuses it and the install hint
+/// names the reinstall (#3553).
+pub fn installed_copy_is_stale(app_dir: &Path, binary: &str) -> bool {
+    lookup(binary).is_some_and(|adapter| {
+        !adapter.sources.is_empty()
+            && bundled_adapter_bin(app_dir, binary).is_some()
+            && !installation_is_current(app_dir, binary)
+    })
+}
+
 pub fn installation_is_current(app_dir: &Path, binary: &str) -> bool {
     let Some(adapter) = lookup(binary) else {
         return false;

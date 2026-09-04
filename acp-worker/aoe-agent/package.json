@@ -13,7 +13,7 @@
     "test": "node --experimental-strip-types --test test/*.ts"
   },
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=22.6.0"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^1.0.0",

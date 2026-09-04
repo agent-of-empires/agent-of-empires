@@ -73,7 +73,10 @@ enum Phase {
     Respawning {
         cancel: Option<String>,
     },
-    Stopping,
+    Stopping {
+        /// Teardown attempts already made under this epoch.
+        attempts: u32,
+    },
     TeardownRetry {
         identity: RunnerIdentity,
         attempts: u32,
@@ -128,9 +131,25 @@ pub trait ProcessControl: Send + Sync + 'static {
 pub struct SystemProcessControl;
 
 impl ProcessControl for SystemProcessControl {
+    /// Liveness for teardown. Differs from `worker::is_pid_alive` on `EPERM`:
+    /// a pid this daemon cannot signal belongs to another user, so it is
+    /// not our runner (a reused pid), and holding the session on it would
+    /// pin it in `stopping` until restart. pid 0 addresses the caller's own
+    /// group and is never a runner.
     fn is_alive(&self, pid: u32) -> bool {
-        // pid 0 addresses the caller's own group; never treat it as a runner.
-        pid != 0 && crate::process::worker::is_pid_alive(pid)
+        if pid == 0 {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use nix::sys::signal::kill;
+            use nix::unistd::Pid;
+            kill(Pid::from_raw(pid as i32), None).is_ok()
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
     }
 
     fn terminate_group(&self, pid: u32) {
@@ -222,7 +241,7 @@ impl LifecycleTable {
     pub fn admit(&mut self, session_id: &str, kind: ResumeKind) -> Result<Lease, AdmitError> {
         match self.entries.get(session_id).map(|e| &e.phase) {
             None => {}
-            Some(Phase::Stopping | Phase::TeardownRetry { .. }) => {
+            Some(Phase::Stopping { .. } | Phase::TeardownRetry { .. }) => {
                 return Err(AdmitError::TeardownPending)
             }
             Some(_) => return Err(AdmitError::AlreadyPresent),
@@ -252,7 +271,7 @@ impl LifecycleTable {
             _ => return Err(InstallError::Stale),
         };
         if let Some(reason) = cancel {
-            entry.phase = Phase::Stopping;
+            entry.phase = Phase::Stopping { attempts: 0 };
             return Err(InstallError::Cancelled { reason });
         }
         entry.phase = Phase::Running { identity };
@@ -305,13 +324,13 @@ impl LifecycleTable {
             }
             Phase::Running { identity } => {
                 let identity = *identity;
-                entry.phase = Phase::Stopping;
+                entry.phase = Phase::Stopping { attempts: 0 };
                 StopDecision::TearDown {
                     lease: self.lease(session_id, epoch),
                     identity,
                 }
             }
-            Phase::Stopping | Phase::TeardownRetry { .. } => StopDecision::AlreadyStopping,
+            Phase::Stopping { .. } | Phase::TeardownRetry { .. } => StopDecision::AlreadyStopping,
         }
     }
 
@@ -325,7 +344,7 @@ impl LifecycleTable {
             session_id.to_string(),
             Entry {
                 epoch,
-                phase: Phase::Stopping,
+                phase: Phase::Stopping { attempts: 0 },
             },
         );
         Some(self.lease(session_id, epoch))
@@ -336,16 +355,18 @@ impl LifecycleTable {
         let Some(entry) = self.current(lease) else {
             return;
         };
-        if !matches!(entry.phase, Phase::Stopping) {
+        let Phase::Stopping { attempts } = entry.phase else {
             return;
-        }
+        };
         match settlement {
             Settlement::Proven => {
                 self.entries.remove(&lease.session_id);
             }
             Settlement::Unproven(identity) => {
-                let attempts = 1;
-                entry.phase = Phase::TeardownRetry { identity, attempts };
+                entry.phase = Phase::TeardownRetry {
+                    identity,
+                    attempts: attempts + 1,
+                };
             }
         }
     }
@@ -386,7 +407,7 @@ impl LifecycleTable {
         ) {
             return false;
         }
-        entry.phase = Phase::Stopping;
+        entry.phase = Phase::Stopping { attempts: 0 };
         true
     }
 
@@ -408,7 +429,7 @@ impl LifecycleTable {
         let Phase::TeardownRetry { identity, attempts } = entry.phase else {
             return None;
         };
-        entry.phase = Phase::Stopping;
+        entry.phase = Phase::Stopping { attempts };
         let epoch = entry.epoch;
         Some(RetryClaim {
             lease: self.lease(session_id, epoch),
@@ -440,7 +461,7 @@ impl LifecycleTable {
             None => WorkerPhase::Absent,
             Some(Phase::Starting { .. } | Phase::Respawning { .. }) => WorkerPhase::Resuming,
             Some(Phase::Running { .. }) => WorkerPhase::Running,
-            Some(Phase::Stopping | Phase::TeardownRetry { .. }) => WorkerPhase::Stopping,
+            Some(Phase::Stopping { .. } | Phase::TeardownRetry { .. }) => WorkerPhase::Stopping,
         }
     }
 
@@ -666,7 +687,10 @@ mod tests {
             table.claim_retry(ID).is_none(),
             "a claimed retry is Stopping"
         );
-        table.settle(&claim.lease, Settlement::Proven);
+        table.settle(&claim.lease, Settlement::Unproven(identity(9, 1)));
+        let again = table.claim_retry(ID).unwrap();
+        assert_eq!(again.attempts, 3, "attempts accumulate across retries");
+        table.settle(&again.lease, Settlement::Proven);
         assert!(!table.is_owned(ID));
     }
 

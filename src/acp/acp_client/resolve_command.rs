@@ -67,6 +67,14 @@ pub fn resolve_agent_command(
 
     if let Some(path) = app_dir.and_then(|d| crate::acp::adapters::bundled_adapter_bin(d, command))
     {
+        if app_dir.is_some_and(|d| crate::acp::adapters::installed_copy_is_stale(d, command)) {
+            warn!(
+                target: "acp.adapters",
+                adapter = command,
+                "installed copy predates this aoe build; refusing it until it is reinstalled"
+            );
+            return None;
+        }
         return Some(bundled_resolution(path, app_dir));
     }
 

@@ -241,6 +241,15 @@ pub trait BroadcastSink: Send + Sync + 'static {
         self.publish(session_id, seq, event);
         true
     }
+    /// Publish an event the drain task pumped out of a worker, tagging the
+    /// broadcast frame with the generation of the worker that authored it.
+    /// The drain task is the only publisher with that provenance; every
+    /// other caller goes through `publish` and produces an untagged frame.
+    /// Default drops the tag, which is right for sinks with no broadcast
+    /// channel behind them (test fixtures): nothing downstream can read it.
+    fn publish_from_worker(&self, session_id: &str, seq: u64, event: &Event, _generation: u64) {
+        self.publish(session_id, seq, event);
+    }
     /// Drop all stored events for a session. Used by the import path to clear
     /// any partial replay from a prior failed attempt before re-seeding, run
     /// only after the worker slot is reserved so a duplicate spawn that hits
@@ -332,7 +341,6 @@ struct WorkerHandle {
     /// replacement.
     lease: Lease,
 }
-
 /// Per-session monotonically-increasing seq counter. Lives at the
 /// supervisor level (not on `WorkerHandle`) so it survives shutdown
 /// and respawn cycles, and also covers the no-worker
@@ -2183,7 +2191,9 @@ impl<S: BroadcastSink> Supervisor<S> {
                             _ => {}
                         }
                         let seq = next_seq(&next_seqs, &session_id);
-                        sink.publish(&session_id, seq, &event);
+                        // Tagged with the lease epoch so a frame queued by a
+                        // replaced worker cannot mutate runtime state (#3748).
+                        sink.publish_from_worker(&session_id, seq, &event, lease.epoch());
                     }
 
                     warn!(
@@ -3337,6 +3347,20 @@ impl<S: BroadcastSink> Supervisor<S> {
     pub async fn is_running(&self, session_id: &str) -> bool {
         lock_recover(&self.lifecycle).is_running(session_id)
     }
+    /// Whether a live event came from the worker currently installed for the
+    /// session: its lease epoch is the generation frames are tagged with.
+    /// Queued frames from a replaced worker must not mutate runtime state.
+    pub(crate) async fn is_current_worker_generation(
+        &self,
+        session_id: &str,
+        generation: u64,
+    ) -> bool {
+        self.workers
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|worker| worker.lease.epoch() == generation)
+    }
 
     /// Whether this daemon holds the session's lease in any phase,
     /// including a teardown still being proven.
@@ -3354,9 +3378,27 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// `begin_resume` and `is_running`, but no registry entry is written, so
     /// the reconciler's orphan sweep never touches it.
     #[cfg(test)]
-    pub(crate) async fn test_insert_worker(&self, session_id: &str) {
+    pub(crate) async fn test_insert_worker(&self, session_id: &str) -> u64 {
         let (client, _tx) = AcpClient::fake_for_test(AcpSessionId(format!("acp-{session_id}")));
-        self.test_install_worker(session_id, client).await;
+        self.test_install_worker(session_id, client).await
+    }
+
+    /// Replace a fixture's client under a fresh respawn epoch, as the drain
+    /// task's respawn does.
+    #[cfg(test)]
+    pub(crate) async fn test_respawn_worker(&self, session_id: &str) -> u64 {
+        let (client, _tx) = AcpClient::fake_for_test(AcpSessionId(format!("acp-{session_id}")));
+        let mut workers = self.workers.lock().await;
+        let handle = workers.get_mut(session_id).expect("test worker");
+        let (respawn, _) = lock_recover(&self.lifecycle)
+            .begin_respawn(&handle.lease)
+            .expect("fixture is running");
+        lock_recover(&self.lifecycle)
+            .install(&respawn, None)
+            .expect("fixture installs its respawn");
+        handle.client = Arc::new(client);
+        handle.lease = respawn.clone();
+        respawn.epoch()
     }
 
     /// Like `test_insert_worker`, but the fake worker's command loop records
@@ -3378,9 +3420,10 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// `test_insert_worker*` fixtures so they differ only in which fake
     /// client they build.
     #[cfg(test)]
-    async fn test_install_worker(&self, session_id: &str, client: AcpClient) {
+    async fn test_install_worker(&self, session_id: &str, client: AcpClient) -> u64 {
         self.test_install_handle(session_id, client, WorkerKind::Stdio, None)
-            .await;
+            .await
+            .epoch()
     }
 
     /// Install a fake worker under a fresh lease, the way `spawn_inner`
@@ -3611,7 +3654,15 @@ async fn tear_down_runner_from(
         );
         return Settlement::Unproven(identity);
     }
-    crate::process::worker_registry::delete_if_owned_by(session_id, pid, identity.generation);
+    if !crate::process::worker_registry::delete_if_owned_by(session_id, pid, identity.generation) {
+        warn!(
+            target: "acp.supervisor",
+            session = %session_id,
+            pid,
+            "runner exited but its registry record could not be read; retrying settlement"
+        );
+        return Settlement::Unproven(identity);
+    }
     Settlement::Proven
 }
 
@@ -3835,6 +3886,10 @@ impl BroadcastSink for ChannelSink {
         let _ = self.publish_persisted(session_id, seq, event);
     }
 
+    fn publish_from_worker(&self, session_id: &str, seq: u64, event: &Event, generation: u64) {
+        self.publish_tagged(session_id, seq, event, Some(generation));
+    }
+
     fn clear_session_events(&self, session_id: &str) {
         self.event_store.delete_session(session_id);
         // The cached fold is a projection of the log we just deleted.
@@ -3842,6 +3897,53 @@ impl BroadcastSink for ChannelSink {
     }
 
     fn publish_persisted(&self, session_id: &str, seq: u64, event: &Event) -> bool {
+        self.publish_tagged(session_id, seq, event, None)
+    }
+
+    fn unresolved_approval_nonces(&self, session_id: &str) -> Vec<Nonce> {
+        self.event_store.unresolved_approval_nonces(session_id)
+    }
+
+    fn unresolved_elicitation_nonces(&self, session_id: &str) -> Vec<Nonce> {
+        self.event_store.unresolved_elicitation_nonces(session_id)
+    }
+
+    fn record_attachment(
+        &self,
+        session_id: &str,
+        seq: u64,
+        blob: &crate::acp::event_store::AttachmentBlob,
+    ) -> bool {
+        match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(|| {
+                self.event_store.record_attachment(session_id, seq, blob)
+            }),
+            _ => self.event_store.record_attachment(session_id, seq, blob),
+        }
+    }
+
+    fn delete_attachments_for_seq(&self, session_id: &str, seq: u64) {
+        match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {
+                tokio::task::block_in_place(|| {
+                    self.event_store.delete_attachments_for_seq(session_id, seq)
+                });
+            }
+            _ => self.event_store.delete_attachments_for_seq(session_id, seq),
+        }
+    }
+}
+
+impl ChannelSink {
+    /// Shared body of every `ChannelSink` publish. `worker_generation` is
+    /// `Some` only on the drain task's path.
+    fn publish_tagged(
+        &self,
+        session_id: &str,
+        seq: u64,
+        event: &Event,
+        worker_generation: Option<u64>,
+    ) -> bool {
         // A rejection the agent attached no reset to inherits the reset of
         // the last rejection recorded for this session, as long as that
         // window has not rolled over yet. The worker's own capture dies with
@@ -3931,42 +4033,10 @@ impl BroadcastSink for ChannelSink {
             session_id: session_id.to_string(),
             seq,
             event: Arc::new(event_ref.clone()),
+            worker_generation,
         };
         let _ = self.tx.send(frame);
         persisted
-    }
-
-    fn unresolved_approval_nonces(&self, session_id: &str) -> Vec<Nonce> {
-        self.event_store.unresolved_approval_nonces(session_id)
-    }
-
-    fn unresolved_elicitation_nonces(&self, session_id: &str) -> Vec<Nonce> {
-        self.event_store.unresolved_elicitation_nonces(session_id)
-    }
-
-    fn record_attachment(
-        &self,
-        session_id: &str,
-        seq: u64,
-        blob: &crate::acp::event_store::AttachmentBlob,
-    ) -> bool {
-        match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
-            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(|| {
-                self.event_store.record_attachment(session_id, seq, blob)
-            }),
-            _ => self.event_store.record_attachment(session_id, seq, blob),
-        }
-    }
-
-    fn delete_attachments_for_seq(&self, session_id: &str, seq: u64) {
-        match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
-            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {
-                tokio::task::block_in_place(|| {
-                    self.event_store.delete_attachments_for_seq(session_id, seq)
-                });
-            }
-            _ => self.event_store.delete_attachments_for_seq(session_id, seq),
-        }
     }
 }
 
@@ -4127,6 +4197,22 @@ mod tests {
         fn unresolved_elicitation_nonces(&self, _session_id: &str) -> Vec<Nonce> {
             self.stale_elicitation_nonces.lock().unwrap().clone()
         }
+    }
+    #[tokio::test]
+    async fn respawned_worker_rejects_the_prior_generation() {
+        let sup = Supervisor::new(VecSink::new());
+        let first = sup.test_insert_worker("s-generation").await;
+        let second = sup.test_respawn_worker("s-generation").await;
+
+        assert_ne!(first, second);
+        assert!(
+            !sup.is_current_worker_generation("s-generation", first)
+                .await
+        );
+        assert!(
+            sup.is_current_worker_generation("s-generation", second)
+                .await
+        );
     }
 
     /// #3241: the allowlist gates both resolution branches, and a refusal is

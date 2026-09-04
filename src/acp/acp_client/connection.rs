@@ -838,6 +838,7 @@ pub(super) async fn run_connection_task<W, R>(
                     image: prompt_caps.image,
                     audio: prompt_caps.audio,
                     embedded_context: prompt_caps.embedded_context,
+                    load_session: Some(load_session_capable),
                     steering: steering_capable,
                 })
                 .await;
@@ -1963,7 +1964,9 @@ pub(super) async fn run_connection_task<W, R>(
                                             // the respawn opens a fresh session/new
                                             // (the transcript is preserved for replay)
                                             // instead of terminating the runner (#3560).
-                                            if is_unsupported_session_error(&e) {
+                                            if this_prompt_epoch == 1
+                                                && is_unsupported_session_error(&e)
+                                            {
                                                 warn!(
                                                     target: "acp.protocol",
                                                     session = %session_label,

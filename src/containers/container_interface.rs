@@ -109,6 +109,14 @@ pub struct ContainerConfig {
     pub anonymous_volumes: Vec<String>,
     /// Named volumes for volume_ignores when strategy = "named". Cleaned up explicitly on session delete.
     pub named_ignore_volumes: Vec<NamedVolumeMount>,
+    /// Whether these paths, `working_dir` included, follow from the project's real
+    /// layout rather than from the collapsed fallback a failed `find_main_repo` takes.
+    ///
+    /// Gates the volume reclaim in `stranded_named_ignore_volumes`, which reads a
+    /// changed `working_dir` as a move; under the fallback that change may be nothing
+    /// but the failure. Defaults to false, so a config that has not positively
+    /// established its paths never drives a deletion.
+    pub named_ignore_volumes_authoritative: bool,
     pub environment: Vec<EnvEntry>,
     pub cpu_limit: Option<String>,
     pub memory_limit: Option<String>,

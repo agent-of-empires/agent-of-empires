@@ -128,6 +128,12 @@ By default, `volume_ignores` paths are mounted as **anonymous volumes** (`volume
 
 To fix this on macOS, set `volume_ignores_strategy = "named"`. This mounts each `volume_ignores` path as a **deterministic named Docker/Podman volume** stored entirely inside the Docker VM, bypassing VirtioFS. Named volumes are explicitly removed when the session is deleted.
 
+A volume's name is derived from its mount path, so moving a session's worktree changes it. The recreated container starts from an empty cache for the paths that moved, and the volumes those paths left behind are removed the next time the session starts.
+
+Moving a worktree therefore costs the cache in both directions: move it back and the volumes from the first location are already gone, so that side rebuilds cold too.
+
+The reclaim covers the paths that moved with the worktree, and nothing else. A volume orphaned any other way is left alone, because AoE cannot tell it apart from a cache you are still using: dropping an entry from `volume_ignores`, switching back to `"anonymous"`, or attaching a repo to a multi-repo workspace all strand a volume without a move it can recognize. Neither is anything already orphaned, including the leftovers from a move the session has since restarted after, so a volume that has been sitting there stays. To find what is left over, list them with `docker volume ls -q --filter name=aoe-vi-` and remove what you recognize; `docker volume prune` skips named volumes unless you pass `-a`.
+
 ```toml
 [sandbox]
 volume_ignores = ["node_modules", ".venv", "target"]

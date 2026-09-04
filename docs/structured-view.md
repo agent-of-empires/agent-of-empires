@@ -85,7 +85,7 @@ aoe add . --agent codex --model gpt-5       # pick an ACP agent + model (implies
 `--agent` for an uninstalled adapter errors with an install hint; `--structured-view` (no `--agent`) falls back to the terminal view with a warning so the command still succeeds.
 ## Requirements
 
-- Node.js 22+ on `PATH` (the structured view spawns an ACP agent subprocess; `aoe-agent` declares `engines.node: >=22.0.0`).
+- Node.js 22+ on `PATH` (the structured view spawns an ACP agent subprocess); `aoe-agent` needs 22.6+ for `--experimental-strip-types` and declares `engines.node: >=22.6.0`.
 - For Claude Code, a `claude login` session.
 
 If Node is missing or too old, the session falls back to the terminal view with an actionable warning. Verify with `aoe acp doctor`:

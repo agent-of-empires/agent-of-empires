@@ -432,6 +432,7 @@ async fn drain_replay_into_socket(
             session_id: session_id.to_string(),
             seq,
             event: Arc::new(event),
+            worker_generation: None,
         };
         let payload = match serde_json::to_string(&frame) {
             Ok(s) => s,
@@ -1040,6 +1041,7 @@ mod tests {
                 image: false,
                 audio: false,
                 embedded_context: false,
+                load_session: None,
                 steering: true,
             },
         );
@@ -1270,6 +1272,7 @@ mod tests {
             session_id: "s".into(),
             seq: 1,
             event: Arc::new(crate::acp::Event::ThinkingStarted),
+            worker_generation: None,
         });
         // Sending to a channel with no receivers returns Err, but
         // publish() in this module deliberately discards the result.

@@ -75,7 +75,20 @@ export function useSessions() {
   // instead of waiting for the next poll. No-op if the id isn't present.
   // See #2489.
   const applySession = useCallback((session: SessionResponse) => {
-    setSessions((prev) => prev.map((s) => (s.id === session.id ? session : s)));
+    // Single-session responses omit the rate-limit fields the list poll
+    // fills in; keep the last known values so a badge or banner does not
+    // blink off until the next poll (#3514).
+    setSessions((prev) =>
+      prev.map((s) =>
+        s.id === session.id
+          ? {
+              ...session,
+              rate_limit: session.rate_limit === undefined ? s.rate_limit : session.rate_limit,
+              rate_limit_auto_resume: session.rate_limit_auto_resume ?? s.rate_limit_auto_resume,
+            }
+          : s,
+      ),
+    );
   }, []);
 
   return {

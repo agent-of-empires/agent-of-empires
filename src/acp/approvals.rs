@@ -122,9 +122,6 @@ pub struct ResolvedApproval {
     pub decision: ApprovalDecision,
     pub message: Option<String>,
     pub resolved_at: DateTime<Utc>,
-    /// The option the user picked, when the client chose one explicitly.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub option_id: Option<String>,
 }
 
 /// Heuristic for "this tool call is destructive enough that mobile UI

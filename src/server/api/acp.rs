@@ -1053,6 +1053,12 @@ pub async fn switch_acp_agent(
         )
             .into_response();
     }
+    {
+        let mut instances = state.instances.write().await;
+        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+            inst.acp_load_session_capable = None;
+        }
+    }
 
     let cwd = PathBuf::from(&instance.project_path);
     let inst_lock = state.instance_lock(&id).await;
@@ -1997,6 +2003,7 @@ pub async fn acp_enable(
     instance.resume_intent = crate::session::ResumeIntent::Default;
     instance.status = crate::session::Status::Idle;
     instance.lifecycle_generation = lifecycle_generation;
+    instance.acp_load_session_capable = None;
     {
         let mut instances = state.instances.write().await;
         if let Some(slot) = instances.iter_mut().find(|candidate| candidate.id == id) {
@@ -2005,6 +2012,7 @@ pub async fn acp_enable(
                 slot.resume_intent = crate::session::ResumeIntent::Default;
                 slot.status = crate::session::Status::Idle;
                 slot.lifecycle_generation = lifecycle_generation;
+                slot.acp_load_session_capable = None;
             }
         }
     }
@@ -2226,6 +2234,7 @@ pub async fn acp_disable(
         instance.switch_to_terminal_keep_context();
     } else {
         instance.view = crate::session::View::Terminal;
+        instance.acp_load_session_capable = None;
         // Clear the stored ACP session id: the agent's transcript is
         // tied to the structured view-mode lifecycle. If the user re-enables
         // structured view later, the agent should start a fresh session/new
@@ -2261,6 +2270,7 @@ pub async fn acp_disable(
         let mut instances = state.instances.write().await;
         if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
             slot.view = crate::session::View::Terminal;
+            slot.acp_load_session_capable = None;
             slot.acp_session_id = persist_acp_session_id.clone();
             slot.import_pending = persist_import_pending;
             if keep_context {
@@ -2758,6 +2768,7 @@ pub async fn acp_replay(
                 session_id: id.clone(),
                 seq,
                 event: Arc::new(event),
+                worker_generation: None,
             })
             .collect();
         (frames, None)
@@ -3741,6 +3752,7 @@ mod tests {
             inst.id = format!("sess-3650-acp-{which}");
             inst.view = crate::session::View::Structured;
             inst.status = crate::session::Status::Idle;
+            inst.acp_load_session_capable = Some(true);
             let id = inst.id.clone();
             let state = crate::server::test_support::build_test_app_state(vec![inst]);
 
@@ -3762,6 +3774,20 @@ mod tests {
                 .await
                 .unwrap_or_else(|_| panic!("{which} must finish once the submission releases"))
                 .unwrap_or_else(|e| panic!("{which} task must not panic: {e}"));
+            if which == "disable" {
+                assert_eq!(
+                    state
+                        .instances
+                        .read()
+                        .await
+                        .iter()
+                        .find(|inst| inst.id == id)
+                        .expect("instance")
+                        .acp_load_session_capable,
+                    None,
+                    "disabling ACP must clear runtime-only negotiated capabilities"
+                );
+            }
         }
     }
 

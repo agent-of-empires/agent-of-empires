@@ -73,6 +73,7 @@ impl Instance {
             acp_session_id: None,
             import_pending: None,
             fork_pending: None,
+            acp_load_session_capable: None,
             last_error_check: None,
             last_start_time: None,
             live_status_baseline: None,
@@ -512,6 +513,7 @@ impl Instance {
             self.resume_intent = ResumeIntent::Use(sid);
         }
         self.import_pending = None;
+        self.acp_load_session_capable = None;
         self.view = View::Terminal;
     }
 }
@@ -541,17 +543,29 @@ mod tests {
         inst.view = View::Structured;
         inst.acp_session_id = Some("sid-abc".to_string());
         inst.import_pending = Some(true);
+        inst.acp_load_session_capable = Some(true);
 
         inst.switch_to_terminal_keep_context();
 
         assert_eq!(inst.view, View::Terminal);
         assert_eq!(inst.agent_session_id.as_deref(), Some("sid-abc"));
         assert_eq!(inst.resume_intent, ResumeIntent::Use("sid-abc".to_string()));
-        // Structured-view-only ids are dropped: terminal mode reads
-        // agent_session_id, and a stale acp_session_id would wrongly drive a
-        // session/load on a later re-enable.
+        // Structured-view-only state is dropped before terminal launch.
         assert_eq!(inst.acp_session_id, None);
         assert_eq!(inst.import_pending, None);
+        assert_eq!(inst.acp_load_session_capable, None);
+    }
+
+    #[test]
+    fn acp_load_session_capability_is_runtime_only() {
+        let mut inst = Instance::new("structured", "/tmp");
+        inst.acp_load_session_capable = Some(true);
+
+        let json = serde_json::to_value(&inst).unwrap();
+        assert!(json.get("acp_load_session_capable").is_none());
+
+        let decoded: Instance = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.acp_load_session_capable, None);
     }
 
     #[test]

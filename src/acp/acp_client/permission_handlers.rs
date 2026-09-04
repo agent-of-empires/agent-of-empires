@@ -165,6 +165,7 @@ pub(super) async fn handle_permission_request(
         .collect();
     let approval = build_approval(tool_call, options);
     let nonce = approval.nonce.clone();
+    let choice_list = approval.is_choice_list();
 
     let (resolve_tx, resolve_rx) = oneshot::channel::<ApprovalResolutionMessage>();
     pending.lock().await.insert(
@@ -219,15 +220,21 @@ pub(super) async fn handle_permission_request(
             // An explicit option (a choice-list answer, #3741) wins over kind
             // matching, which would otherwise return the first option of a
             // list whose entries all share one kind.
-            let chosen = option_id
-                .and_then(|id| {
-                    request
-                        .options
-                        .iter()
-                        .find(|o| o.option_id.0.as_ref() == id)
-                        .map(|o| o.option_id.clone())
-                })
-                .or_else(|| pick_option_id(&request.options, decision));
+            let by_id = option_id.and_then(|id| {
+                request
+                    .options
+                    .iter()
+                    .find(|o| o.option_id.0.as_ref() == id)
+                    .map(|o| o.option_id.clone())
+            });
+            // A choice list answered without naming an option (a client that
+            // only knows the trio) is cancelled: kind matching would hand
+            // the agent whichever choice came first.
+            let chosen = match by_id {
+                Some(id) => Some(id),
+                None if choice_list => None,
+                None => pick_option_id(&request.options, decision),
+            };
             if let Some(option_id) = chosen {
                 // Surface the resolution to UI clients via the typed event channel.
                 let _ = event_tx

@@ -38,7 +38,6 @@ pub fn resolve(
         decision,
         message,
         resolved_at: Utc::now(),
-        option_id: None,
     });
 }
 

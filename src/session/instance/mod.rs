@@ -584,6 +584,10 @@ pub struct Instance {
     pub fork_pending: Option<String>,
 
     // Live process state and durable capture-generation guards.
+    /// Latest ACP initialize result for session/load. A daemon restart returns
+    /// this to unknown until the worker reconnects.
+    #[serde(skip)]
+    pub acp_load_session_capable: Option<bool>,
     #[serde(skip)]
     pub last_error_check: Option<std::time::Instant>,
     #[serde(skip)]
