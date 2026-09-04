@@ -19,37 +19,49 @@ pub(crate) struct AnchoredDir {
 }
 
 impl AnchoredDir {
+    /// Anchor at `path`, whose ancestors are resolved the way any other
+    /// caller resolves them and whose own leaf may not be a symlink.
+    ///
+    /// Walking the ancestors with `O_NOFOLLOW` defended nothing: a hostile
+    /// `/var` is not a threat this type can answer, while macOS reaches both
+    /// `/tmp` and the per-user temp root through a symlink, so the walk
+    /// refused every anchored read on that platform. The leaf keeps
+    /// `O_NOFOLLOW` because it is the swap an attacker controls, and so does
+    /// every component below it, which is the escape this type exists to stop.
     pub(crate) fn open(path: &Path) -> Result<Self> {
         let root = path.to_path_buf();
-        let mut fd = open(
-            if path.is_absolute() {
-                Path::new("/")
-            } else {
-                Path::new(".")
-            },
-            OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
-            Mode::empty(),
-        )?;
         for component in path.components() {
-            match component {
-                Component::RootDir | Component::CurDir => {}
-                Component::Normal(value) => {
-                    fd = openat(
-                        &fd,
-                        value,
-                        OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
-                        Mode::empty(),
-                    )
-                    .with_context(|| {
-                        format!("opening anchored directory component {}", root.display())
-                    })?;
-                }
-                _ => bail!(
+            if !matches!(
+                component,
+                Component::RootDir | Component::CurDir | Component::Normal(_)
+            ) {
+                bail!(
                     "anchored root contains a non-normal component: {}",
                     path.display()
-                ),
+                );
             }
         }
+        let resolving = OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_RDONLY;
+        let (Some(parent), Some(leaf)) = (path.parent(), path.file_name()) else {
+            // A bare root such as `/` or `.` has no leaf to guard.
+            let fd = open(path, resolving, Mode::empty())
+                .with_context(|| format!("opening anchored root {}", root.display()))?;
+            return Ok(Self { root, fd });
+        };
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        let parent_fd = open(parent, resolving, Mode::empty())
+            .with_context(|| format!("opening anchored root parent {}", parent.display()))?;
+        let fd = openat(
+            &parent_fd,
+            leaf,
+            resolving | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        )
+        .with_context(|| format!("opening anchored root {}", root.display()))?;
         Ok(Self { root, fd })
     }
 
@@ -270,8 +282,49 @@ fn normal_components(path: &Path) -> Result<Vec<std::ffi::OsString>> {
 mod tests {
     use super::*;
 
-    #[test]
+    /// A symlinked ancestor of the anchor is normal on macOS, where `/tmp`
+    /// and the per-user temp root under `/var` both resolve through one, and
+    /// it says nothing about whether the store below the anchor is safe.
+    /// Refusing it made every anchored read fail there.
     #[cfg(unix)]
+    #[test]
+    fn opens_through_a_symlinked_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real");
+        std::fs::create_dir_all(real.join("store")).unwrap();
+        std::fs::write(real.join("store/id"), b"anchored").unwrap();
+        symlink(&real, temp.path().join("via-link")).unwrap();
+
+        let anchored = AnchoredDir::open(&temp.path().join("via-link/store"))
+            .expect("an anchor reached through a symlinked ancestor must open");
+        assert_eq!(
+            anchored
+                .read_regular(Path::new("id"), 64)
+                .unwrap()
+                .as_deref(),
+            Some(&b"anchored"[..])
+        );
+    }
+
+    /// The anchor's own leaf still may not be a symlink: that is the swap an
+    /// attacker controls, unlike the system directories above it.
+    #[cfg(unix)]
+    #[test]
+    fn refuses_a_symlinked_anchor_leaf() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        symlink(&real, temp.path().join("leaf-link")).unwrap();
+
+        assert!(AnchoredDir::open(&temp.path().join("leaf-link")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn refuses_symlink_components_and_bounds_reads() {
         use std::os::unix::fs::symlink;
         let temp = tempfile::tempdir().unwrap();
