@@ -75,7 +75,12 @@ pub fn apply_status_bar(
             " #[fg={accent},bold]#S#[fg={fg},nobold] \u{2502} #[fg={hint}]{prefix} d#[fg={hint}] to detach ",
         ),
     )?;
-    set_session_option(session_name, "status-left-length", "50")?;
+    // Sized past the longest name aoe generates rather than to this one: `#S`
+    // expands when tmux paints, so a session renamed after this write (smart
+    // rename is on by default) outgrows an exact fit and the hint is cut
+    // again. tmux only trims at this cap and never pads, so over-sizing is
+    // free. See #3445.
+    set_session_option(session_name, "status-left-length", "200")?;
 
     Ok(())
 }

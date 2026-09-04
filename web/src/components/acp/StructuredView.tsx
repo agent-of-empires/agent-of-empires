@@ -718,11 +718,12 @@ function AcpChrome({
         onPrefill={recoveryHandoffPrefill}
       >
         {({ onSwitchAgent }) =>
-          status !== "open" || state.lagged || state.rateLimit || reconnecting ? (
+          status !== "open" || state.lagged || state.rateLimit || state.rateLimitRetriesExhausted || reconnecting ? (
             <SystemNotices
               status={status}
               lagged={state.lagged}
               rateLimit={state.rateLimit}
+              rateLimitRetriesExhausted={state.rateLimitRetriesExhausted}
               hasEverOpened={hasEverOpened}
               reconnecting={reconnecting}
               retryCount={retryCount}
@@ -1758,6 +1759,7 @@ export function SystemNotices({
   status,
   lagged,
   rateLimit,
+  rateLimitRetriesExhausted,
   hasEverOpened,
   reconnecting,
   retryCount,
@@ -1772,6 +1774,7 @@ export function SystemNotices({
   status: AcpContext["status"];
   lagged: boolean;
   rateLimit: AcpState["rateLimit"];
+  rateLimitRetriesExhausted: boolean;
   hasEverOpened: boolean;
   reconnecting: boolean;
   retryCount: number;
@@ -1788,7 +1791,7 @@ export function SystemNotices({
   // `maxRetries` and we're sitting on a dead WS. Surface the manual
   // affordance instead of a status line so the user has a clear path
   // back to live. See #1130.
-  const retriesExhausted = status !== "open" && hasEverOpened && !reconnecting && retryCount >= maxRetries;
+  const reconnectRetriesExhausted = status !== "open" && hasEverOpened && !reconnecting && retryCount >= maxRetries;
   if (reconnecting && status !== "open") {
     // Auto-retry banner: "Reconnecting (3/7) in 4s". Replaces the bare
     // "Reconnecting…" copy with concrete progress so the user knows
@@ -1810,7 +1813,7 @@ export function SystemNotices({
         ? "Structured view reconnecting… showing cached transcript; new messages disabled."
         : "Starting structured view worker… this can take a few seconds for new sessions.",
     });
-  } else if (status === "closed" && !retriesExhausted) {
+  } else if (status === "closed" && !reconnectRetriesExhausted) {
     messages.push({
       kind: "warn",
       text: hasEverOpened
@@ -1837,8 +1840,14 @@ export function SystemNotices({
           : `Rate-limited (${rateLimit.kind}); ${rateLimitWording(rateLimit.status)}`,
     });
   }
+  if (rateLimitRetriesExhausted) {
+    messages.push({
+      kind: "warn",
+      text: "Auto-resume stopped: the same prompt was re-sent too many times without getting through. Resume manually or send a new prompt.",
+    });
+  }
   const resumePending = rateLimitResumeState === "retrying" || rateLimitResumeState === "ok";
-  if (messages.length === 0 && !retriesExhausted) return null;
+  if (messages.length === 0 && !reconnectRetriesExhausted) return null;
   return (
     <div className="border-b border-surface-800 px-4 py-2 space-y-1">
       {messages.map((m, i) => (
@@ -1879,7 +1888,7 @@ export function SystemNotices({
       {rateLimit && rateLimitResumeState === "failed" && rateLimitResumeError && (
         <div className="pt-1 text-xs text-brand-400">Resume failed: {rateLimitResumeError}</div>
       )}
-      {retriesExhausted && (
+      {reconnectRetriesExhausted && (
         <div className="flex items-center justify-between gap-3 text-xs text-brand-400">
           <span>Connection lost. Auto-retry stopped.</span>
           <button

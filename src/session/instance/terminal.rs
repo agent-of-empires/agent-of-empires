@@ -4,22 +4,129 @@ use super::*;
 
 /// Command run inside the sandbox container for the web Container terminal tab.
 ///
-/// Resolves the container user's login shell at spawn time, inside the container,
-/// and execs it as a login shell so profile/rc files load (parity with the Host
-/// terminal tab, which launches the user's default shell as a login shell).
-/// Resolution order: the passwd entry (the authoritative login shell, what
-/// `chsh` writes and what `login(1)` reads into `$SHELL`), then the container's
-/// `$SHELL`, then bash, sh. Passwd comes first because `docker exec` never goes
-/// through `login(1)`, so `$SHELL` is usually unset or a generic image default
-/// rather than the user's configured shell. Each candidate is run through
-/// `command -v` so an unset, stale, or non-executable value falls through to the
-/// next instead of killing the pane.
+/// Resolves the container user's preferred shell at spawn time, inside the
+/// container. Known-compatible shells run in login mode so profile/rc files
+/// load; other authorized shells run plain.
+/// Resolution order: the passwd entry, `$SHELL`, bash, then sh. Each candidate
+/// is resolved and validated inside the container as a regular executable
+/// authorized shell. Passwd is read directly when `getent` is unavailable.
 ///
-/// The single-quoted body is evaluated by the container's `sh`, not the host
-/// shell tmux uses to spawn the session, so the embedded `$()` runs in the
-/// container. The host does not propagate its own `$SHELL` into the container,
-/// so this reads the container's value, not the host's.
-const CONTAINER_TERMINAL_AUTODETECT_CMD: &str = r#"sh -c 'exec "$(command -v "$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f7)" 2>/dev/null || command -v "$SHELL" 2>/dev/null || command -v bash || command -v sh)" -l'"#;
+/// The script is evaluated by the container's `/bin/sh`, not the host shell tmux
+/// uses to spawn the session, so the embedded `$()` runs in the container. The
+/// host does not propagate its own `$SHELL` into the container, so this reads the
+/// container's value, not the host's.
+///
+/// `@KNOWN_SHELLS@` and `@LOGIN_FLAG_SHELLS@` are substituted from
+/// [`crate::session::environment`] so the container tab recognizes the same
+/// shells, and makes the same login-mode call, as the host tab.
+const CONTAINER_TERMINAL_AUTODETECT_SCRIPT: &str = r#"passwd_file=$1
+shells_file=$2
+
+lookup_shell() {
+    wanted_uid=$1
+    while IFS=: read -r _ _ entry_uid _ _ _ candidate || [ -n "$candidate" ]; do
+        if [ "$entry_uid" = "$wanted_uid" ]; then
+            printf "%s\n" "$candidate"
+            return
+        fi
+    done
+}
+
+resolve_shell() {
+    candidate=$1
+    case "$candidate" in
+        ""|-*) return 1 ;;
+    esac
+
+    case "$candidate" in
+        */*) resolved=$candidate ;;
+        *) resolved=$(command -v "$candidate" 2>/dev/null) || return 1 ;;
+    esac
+    case "$resolved" in
+        /*) ;;
+        */*)
+            directory=${resolved%/*}
+            filename=${resolved##*/}
+            directory=$(CDPATH= cd "$directory" 2>/dev/null && pwd -P) || return 1
+            resolved=$directory/$filename
+            ;;
+        *) return 1 ;;
+    esac
+    [ -f "$resolved" ] && [ -x "$resolved" ] || return 1
+
+    case "${resolved##*/}" in
+        @KNOWN_SHELLS@)
+            printf "%s\n" "$resolved"
+            return
+            ;;
+    esac
+
+    if [ -r "$shells_file" ]; then
+        while IFS= read -r allowed || [ -n "$allowed" ]; do
+            case "$allowed" in
+                ""|\#*) continue ;;
+            esac
+            if [ "$resolved" = "$allowed" ]; then
+                printf "%s\n" "$resolved"
+                return
+            fi
+        done < "$shells_file"
+    fi
+    return 1
+}
+
+uid=$(id -u 2>/dev/null || true)
+if [ -z "$uid" ] && [ -r /proc/self/status ]; then
+    while read -r key _ effective _; do
+        if [ "$key" = "Uid:" ]; then
+            uid=$effective
+            break
+        fi
+    done < /proc/self/status
+fi
+
+passwd_shell=
+if [ -n "$uid" ]; then
+    if command -v getent >/dev/null 2>&1; then
+        passwd_shell=$(getent passwd "$uid" 2>/dev/null | lookup_shell "$uid")
+    fi
+    if [ -z "$passwd_shell" ] && [ -r "$passwd_file" ]; then
+        passwd_shell=$(lookup_shell "$uid" < "$passwd_file")
+    fi
+fi
+
+shell=$(resolve_shell "$passwd_shell" || resolve_shell "${SHELL-}" || resolve_shell bash || resolve_shell /bin/sh) || {
+    printf "%s\n" "No usable shell found in container" >&2
+    exit 127
+}
+export SHELL=$shell
+case "${shell##*/}" in
+    @LOGIN_FLAG_SHELLS@) exec "$shell" -l ;;
+    *) exec "$shell" ;;
+esac
+"#;
+
+fn container_terminal_autodetect_command(passwd_file: &str, shells_file: &str) -> String {
+    let script = CONTAINER_TERMINAL_AUTODETECT_SCRIPT
+        .replace(
+            "@KNOWN_SHELLS@",
+            &crate::session::environment::known_shell_case_pattern(),
+        )
+        .replace(
+            "@LOGIN_FLAG_SHELLS@",
+            &crate::session::environment::login_flag_shell_case_pattern(),
+        );
+    format!(
+        "/bin/sh -c {} aoe-container-terminal {} {}",
+        shell_escape_script_word(&script),
+        shell_escape_script_word(passwd_file),
+        shell_escape_script_word(shells_file)
+    )
+}
+
+fn container_terminal_exec_options(workdir: &str, env_args: &str) -> String {
+    format!("-w {} {}", shell_escape_script_word(workdir), env_args)
+}
 
 impl Instance {
     pub fn terminal_tmux_session(&self) -> Result<tmux::TerminalSession> {
@@ -159,9 +266,13 @@ impl Instance {
         // Get workspace path inside container (handles bare repo worktrees correctly)
         let container_workdir = self.container_workdir();
 
+        let resolver_command = container_terminal_autodetect_command("/etc/passwd", "/etc/shells");
         let cmd = container.exec_command(
-            Some(&format!("-w {} {}", container_workdir, env_part)),
-            CONTAINER_TERMINAL_AUTODETECT_CMD,
+            Some(&container_terminal_exec_options(
+                &container_workdir,
+                &env_part,
+            )),
+            &resolver_command,
         );
 
         // Values ride the protected env-file, never the host shell or runtime
@@ -214,25 +325,252 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Stdio};
+
+    fn write_executable(path: &std::path::Path, contents: &str) {
+        std::fs::write(path, contents).unwrap();
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
 
     #[test]
-    fn container_terminal_autodetect_cmd_resolves_login_shell() {
-        let cmd = CONTAINER_TERMINAL_AUTODETECT_CMD;
-        // Resolution order: passwd entry first (authoritative, since docker exec
-        // skips login(1) and so $SHELL is usually unset), then $SHELL, then
-        // bash, sh. Each candidate is guarded by `command -v` so an unset, stale,
-        // or non-executable value falls through rather than killing the pane.
-        assert!(cmd.contains("getent passwd"));
-        assert!(cmd.contains(r#"command -v "$SHELL""#));
-        assert!(cmd.contains("command -v bash"));
-        assert!(cmd.contains("command -v sh"));
-        // Passwd is resolved ahead of $SHELL.
-        assert!(cmd.find("getent passwd").unwrap() < cmd.find(r#"command -v "$SHELL""#).unwrap());
-        // Login shell so profile/rc files load, matching the Host terminal tab.
-        assert!(cmd.contains("-l"));
-        // Single-quoted body: the embedded command substitution is evaluated by
-        // the container's sh, not the host shell tmux spawns the session with.
-        assert!(cmd.starts_with("sh -c '"));
+    fn container_terminal_resolver_executes_only_usable_shells() {
+        for invalid_kind in ["non_executable", "directory", "non_shell"] {
+            let temp = tempfile::tempdir().unwrap();
+            write_executable(
+                &temp.path().join("getent"),
+                r#"#!/bin/sh
+printf 'test:x:2999:2999::/tmp:%s\n' "$PASSWD_SHELL"
+"#,
+            );
+            write_executable(&temp.path().join("id"), "#!/bin/sh\nprintf 2999\n");
+
+            let candidate = temp.path().join(invalid_kind);
+            match invalid_kind {
+                "non_executable" => std::fs::write(&candidate, "not executable").unwrap(),
+                "directory" => std::fs::create_dir(&candidate).unwrap(),
+                "non_shell" => write_executable(&candidate, "#!/bin/sh\necho WRONG_CANDIDATE\n"),
+                _ => unreachable!(),
+            }
+
+            let resolver_command =
+                container_terminal_autodetect_command("/etc/passwd", "/etc/shells");
+            let mut child = Command::new("/bin/sh")
+                .arg("-c")
+                .arg(&resolver_command)
+                .env("HOME", temp.path())
+                .env("PATH", format!("{}:/usr/bin:/bin", temp.path().display()))
+                .env("PASSWD_SHELL", &candidate)
+                .env("SHELL", "/bin/sh")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"echo RESOLVED_SHELL\nexit\n")
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+
+            assert!(
+                output.status.success(),
+                "resolver failed for {invalid_kind}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                stdout.contains("RESOLVED_SHELL"),
+                "resolver executed {invalid_kind} instead of a shell: stdout={stdout}, stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!stdout.contains("WRONG_CANDIDATE"));
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let shell = temp.path().join("fish");
+        write_executable(
+            &shell,
+            r#"#!/bin/sh
+printf 'CUSTOM_SHELL %s %s\n' "$1" "$SHELL"
+"#,
+        );
+        write_executable(
+            &temp.path().join("getent"),
+            r#"#!/bin/sh
+printf 'test:x:2999:2999::/tmp:%s\n' "$PASSWD_SHELL"
+"#,
+        );
+        write_executable(&temp.path().join("id"), "#!/bin/sh\nprintf 2999\n");
+        let resolver_command = container_terminal_autodetect_command("/etc/passwd", "/etc/shells");
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&resolver_command)
+            .env("PATH", format!("{}:/usr/bin:/bin", temp.path().display()))
+            .env("PASSWD_SHELL", &shell)
+            .env_remove("SHELL")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout.contains(&format!("CUSTOM_SHELL -l {}", shell.display())));
+    }
+    #[test]
+    fn container_terminal_resolver_reads_passwd_without_getent() {
+        for (case, passwd_ending, shells_ending) in [
+            ("terminated", "\n", "\n"),
+            ("unterminated_passwd", "", "\n"),
+            ("unterminated_shells", "\n", ""),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            write_executable(&temp.path().join("id"), "#!/bin/sh\nprintf 2999\n");
+
+            let passwd_shell = temp.path().join("custom-authorized-shell");
+            write_executable(
+                &passwd_shell,
+                "#!/bin/sh\nprintf 'PASSWD argc=%s arg1=%s shell=%s\\n' \"$#\" \"${1-}\" \"$SHELL\"\n",
+            );
+            let fallback_shell = temp.path().join("bash");
+            write_executable(&fallback_shell, "#!/bin/sh\nprintf 'WRONG_FALLBACK\\n'\n");
+
+            let passwd_file = temp.path().join("passwd");
+            std::fs::write(
+                &passwd_file,
+                format!(
+                    "test:x:2999:2999::/tmp:{}{passwd_ending}",
+                    passwd_shell.display()
+                ),
+            )
+            .unwrap();
+            let shells_file = temp.path().join("shells");
+            std::fs::write(
+                &shells_file,
+                format!("{}{shells_ending}", passwd_shell.display()),
+            )
+            .unwrap();
+
+            let resolver_command = container_terminal_autodetect_command(
+                passwd_file.to_str().unwrap(),
+                shells_file.to_str().unwrap(),
+            );
+            let output = Command::new("/bin/sh")
+                .args(["-c", &resolver_command])
+                .env_clear()
+                .env("HOME", temp.path())
+                .env("PATH", temp.path())
+                .env("SHELL", &fallback_shell)
+                .output()
+                .unwrap();
+
+            assert!(
+                output.status.success(),
+                "{case}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(output.stderr.is_empty(), "{case}");
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                format!("PASSWD argc=0 arg1= shell={}\n", passwd_shell.display()),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn container_terminal_command_preserves_runtime_boundaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_driver = r#"#!/bin/sh
+[ "$1" = exec ] || exit 90
+shift
+[ "$1" = -it ] || exit 91
+shift
+[ "$1" = -w ] || exit 92
+printf '%s' "$2" > "$ARGS_FILE"
+shift 2
+if [ "${1-}" = --env-file ]; then
+    [ "$2" = /dev/fd/9 ] || exit 93
+    shift 2
+fi
+[ "$1" = test-container ] || exit 94
+shift
+exec /usr/bin/env -i PATH="$TARGET_PATH" SHELL="$FALLBACK_SHELL" "$@"
+"#;
+        for binary in ["docker", "podman", "container"] {
+            write_executable(&temp.path().join(binary), runtime_driver);
+        }
+        write_executable(&temp.path().join("id"), "#!/bin/sh\nprintf 2999\n");
+        let fallback_shell = temp.path().join("bash");
+        write_executable(&fallback_shell, "#!/bin/sh\nprintf 'WRONG_FALLBACK\\n'\n");
+
+        let fixtures = temp.path().join("fixtures'quoted");
+        std::fs::create_dir(&fixtures).unwrap();
+        let passwd_shell = fixtures.join("custom-authorized-shell");
+        write_executable(
+            &passwd_shell,
+            "#!/bin/sh\nprintf 'RUNTIME argc=%s shell=%s\\n' \"$#\" \"$SHELL\"\n",
+        );
+        let passwd_file = fixtures.join("passwd");
+        std::fs::write(
+            &passwd_file,
+            format!("test:x:2999:2999::/tmp:{}\n", passwd_shell.display()),
+        )
+        .unwrap();
+        let shells_file = fixtures.join("shells");
+        std::fs::write(&shells_file, format!("{}\n", passwd_shell.display())).unwrap();
+        let resolver_command = container_terminal_autodetect_command(
+            passwd_file.to_str().unwrap(),
+            shells_file.to_str().unwrap(),
+        );
+
+        let injection_marker = temp.path().join("injected");
+        let workdir = format!(
+            "/workspace/project\nline\rcarriage' ; printf PWNED > {}; #",
+            injection_marker.display()
+        );
+        let options = container_terminal_exec_options(&workdir, "--env-file /dev/fd/9 ");
+
+        for (binary, runtime) in [
+            ("docker", crate::containers::ContainerRuntime::docker()),
+            ("podman", crate::containers::ContainerRuntime::podman()),
+            (
+                "container",
+                crate::containers::ContainerRuntime::apple_container(),
+            ),
+        ] {
+            let args_file = temp.path().join(format!("args-{binary}"));
+            let command = runtime.exec_command("test-container", Some(&options), &resolver_command);
+            let output = Command::new("/bin/sh")
+                .args(["-c", &command])
+                .env_clear()
+                .env("PATH", temp.path())
+                .env("ARGS_FILE", &args_file)
+                .env("TARGET_PATH", temp.path())
+                .env("FALLBACK_SHELL", &fallback_shell)
+                .output()
+                .unwrap();
+
+            assert!(
+                output.status.success(),
+                "{binary}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(std::fs::read(&args_file).unwrap(), workdir.as_bytes());
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                format!("RUNTIME argc=0 shell={}\n", passwd_shell.display()),
+                "{binary}"
+            );
+        }
+        assert!(!injection_marker.exists());
     }
 
     #[test]

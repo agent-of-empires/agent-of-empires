@@ -185,9 +185,20 @@ The setting is editable in the structured view settings (TUI and web
 dashboard) and can be overridden per profile. Resume fires once the reported
 reset time plus a fixed 15-second cushion passes, and the reset time survives
 an `aoe serve` restart. With no reported reset time, resume retries an hour
-after the park; if the limit has not cleared the session re-parks and the next
-retry is another hour out. The manual "Continue in another agent" and reconnect paths
-stay available regardless of the setting.
+after the park, and each further attempt waits twice as long as the last: 1h,
+2h, 4h, 8h, 16h. A quota that is exhausted for days is then retried on a
+schedule that matches it, instead of once an hour forever.
+
+Auto-resume re-sends the interrupted prompt each time, so it stops after five
+re-sends that all come back rate-limited. Those five span 31 hours, so a limit
+that clears overnight is still picked up. The banner then reads "Auto-resume
+stopped: the same prompt was re-sent too many times without getting through",
+and the session stays put rather than burning the same turn indefinitely. The park itself resets the count, so recovering from it starts a
+fresh five whether you use "Resume now" or send a new prompt. A completed turn
+and an agent switch reset it too, and "Resume now" retries never count against
+it. A prompt sent before auto-resume gives up does not reset anything: it
+continues on whatever is left of the five. The manual "Continue in another
+agent" and reconnect paths stay available regardless of the setting.
 
 ### Switching agents manually
 

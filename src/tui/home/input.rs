@@ -43,10 +43,9 @@ pub(super) enum SidebarSection {
 }
 
 /// Persist the user's picks from the first-run intro wizard. Theme name goes
-/// to `config.theme.name`; attach mode goes to `default_attach_mode`, which
-/// covers both Enter/double-click activation and the post-create attach.
-/// Failures are logged and swallowed: the intro should never block startup
-/// on a config write hiccup.
+/// to `config.theme.name`; attach mode goes to `default_attach_mode` for
+/// existing session activation. Failures are logged and swallowed: the intro
+/// should never block startup on a config write hiccup.
 fn apply_intro_outcome(outcome: &IntroOutcome) {
     if outcome.final_theme.is_none()
         && outcome.final_attach_mode.is_none()
