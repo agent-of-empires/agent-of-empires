@@ -117,7 +117,8 @@ pub fn plugin_field_descriptors(
                 // Plugin settings are not host-execution surfaces; the settings
                 // PATCH endpoint is already elevation-gated by the auth layer.
                 web_write: WebWritePolicy::Allow,
-                repo_policy: RepoPolicy::Unspecified,
+                // Plugin sections are not repo-overridable.
+                repo_policy: RepoPolicy::Deny,
                 // Plugin settings are global, with no profile override.
                 profile_overridable: false,
                 validation,

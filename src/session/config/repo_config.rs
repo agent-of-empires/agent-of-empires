@@ -4,8 +4,8 @@
 //! Settings that are personal/global (theme, acp, web, logging) are
 //! intentionally not overridable at the repo level. Within an overridable
 //! section, each field's `#[setting(repo = "allow" | "deny")]` attribute on its
-//! `Config` declaration is the policy; fields without one fall back to the
-//! section default (see `section_default_allows`).
+//! `Config` declaration is the policy; fields without one inherit the
+//! `repo_default` their `#[setting_section(...)]` declares.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -65,30 +65,6 @@ use crate::session::mcp::project_mcp::ProjectMcpServer;
 /// could never take effect. Wire those resolvers before making either
 /// section repo-overridable.
 const REPO_OVERRIDABLE_SECTIONS: &[&str] = &["hooks", "session", "sandbox", "worktree", "updates"];
-
-/// The repo-override default for a section when the field's schema descriptor
-/// carries no explicit `#[setting(repo = ...)]` policy (#3154).
-///
-/// `session` is default-deny: most of it is personal preference, but several
-/// fields name or build the command AoE hands to tmux (`custom_agents`,
-/// `agent_command_override`, `agent_extra_args`, `agent_acp_cmd`,
-/// `smart_rename_agent`, `smart_rename_model`) or weaken the agent's own
-/// permission gate (`yolo_mode_default`). Honoring those from a checked-out
-/// repo is arbitrary host command execution at session launch, the hazard that
-/// already keeps `host_hooks` out of [`REPO_OVERRIDABLE_SECTIONS`]. Denying by
-/// default means a field added to `SessionConfig` later stays repo-denied
-/// until someone marks it `repo = "allow"`.
-///
-/// Even `default_tool` is denied despite only naming a tool: the launch path
-/// exact-matches the user's `custom_agents` before built-ins, so a repo could
-/// select a user-defined host command (see the field's doc comment).
-///
-/// Every other overridable section is a genuine team-shared surface, so its
-/// fields default to allowed and dangerous ones opt out with `repo = "deny"`
-/// on the field (e.g. the sandbox image and mount fields).
-fn section_default_allows(section: &str) -> bool {
-    section != "session"
-}
 
 /// Repository-level configuration loaded from `.agent-of-empires/config.toml`.
 ///
@@ -481,25 +457,23 @@ fn sanitize_repo_overrides(
 
 /// Whether a repo's `.agent-of-empires/config.toml` may set this field.
 ///
-/// Global-only fields cannot be overridden by repos. Otherwise the field's
-/// `#[setting(repo = "...")]` attribute decides, falling back to section
-/// defaults.
+/// The field's `#[setting(repo = "...")]`, or the `repo_default` its section
+/// declares, is the policy; a global-only field is never repo-settable,
+/// because its value is read from the global config and an override would
+/// silently do nothing.
+///
+/// A key with no descriptor is denied whenever the section is in the settings
+/// schema: those sections describe every field a surface may touch, so an
+/// undescribed key is `#[setting(skip)]` or a typo. `hooks` has no schema
+/// section and stays open.
 pub fn repo_may_override_field(section: &str, field: &str) -> bool {
     if !REPO_OVERRIDABLE_SECTIONS.contains(&section) {
         return false;
     }
-    use super::settings_schema::RepoPolicy;
     let Some(desc) = super::settings_schema::descriptor(section, field) else {
-        return section_default_allows(section);
+        return !super::settings_schema::section_in_schema(section);
     };
-    if !desc.profile_overridable {
-        return false;
-    }
-    match desc.repo_policy {
-        RepoPolicy::Allow => true,
-        RepoPolicy::Deny => false,
-        RepoPolicy::Unspecified => section_default_allows(section),
-    }
+    desc.profile_overridable && desc.repo_policy == super::settings_schema::RepoPolicy::Allow
 }
 
 /// Convert a RepoConfig into a ProfileConfig for TUI editing.
@@ -2203,6 +2177,16 @@ mod tests {
             ("tmux", "vt_live", false),
             ("sound", "enabled", false),
             ("sound", "on_start", false),
+            // `hooks` has no `SettingsSection` derive, so its keys have no
+            // descriptors and the schema cannot speak for them.
+            ("hooks", "on_create", true),
+            ("hooks", "on_launch", true),
+            // A key the schema does describe the section of, but not itself:
+            // `#[setting(skip)]` or a typo, denied either way.
+            ("sandbox", "not_a_real_field", false),
+            ("session", "not_a_real_field", false),
+            ("worktree", "not_a_real_field", false),
+            ("updates", "not_a_real_field", false),
         ];
         for (section, field, expected) in cases {
             assert_eq!(

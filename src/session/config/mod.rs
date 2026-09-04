@@ -902,7 +902,16 @@ pub struct AppStateConfig {
 
 /// Session-related configuration defaults
 #[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
-#[setting_section(name = "session", category = "Session")]
+// `repo_default = "deny"`: most of this section is personal preference, but
+// several fields name or build the command AoE hands to tmux
+// (`custom_agents`, `agent_command_override`, `agent_extra_args`,
+// `agent_acp_cmd`, `smart_rename_agent`, `smart_rename_model`) or weaken the
+// agent's own permission gate (`yolo_mode_default`). Honoring those from a
+// checked-out repo is arbitrary host command execution at session launch, the
+// hazard that already keeps `host_hooks` out of `REPO_OVERRIDABLE_SECTIONS`.
+// Denying by default means a field added here later stays repo-denied until
+// someone marks it `repo = "allow"` (#3154).
+#[setting_section(name = "session", category = "Session", repo_default = "deny")]
 pub struct SessionConfig {
     /// Default coding tool for new sessions. If not set or the tool is
     /// unavailable, falls back to the first available tool. Repo-denied: the
