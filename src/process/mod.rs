@@ -261,39 +261,51 @@ pub fn get_pane_pid(session_name: &str) -> Option<u32> {
 }
 
 /// For a single pass over the process table, decide for each candidate `i`
-/// whether a live process belongs to it. A process belongs to candidate `i`
-/// when an environment *entry* exactly equals `env_needles[i]` (anchored, so a
-/// longer id cannot prefix-collide) **or** the command line contains
-/// `cmdline_needles[i]` (when `Some`). The two slices must have equal length;
-/// the result has one `bool` per candidate. An empty env needle never matches.
-/// Best-effort: an unreadable process table yields all `false`.
+/// whether a live process belongs to it. Every supplied signal must match:
+/// an exact environment entry, a command-line substring, and/or an executable
+/// argv token whose basename is exact. The three slices must have equal length.
+/// Empty or absent signals never match on their own. Best-effort: an unreadable
+/// process table yields all `false`.
 ///
-/// Startup recovery uses this to detect an agent session a *prior* recovery
-/// pass already resumed on a tmux server this process can no longer see, e.g.
-/// the socket's `/tmp` dir was wiped mid-crash and the old server was orphaned
-/// (#2994). Two identity signals are checked so the match survives an agent
-/// that rewrites its own argv or process title:
-/// - `AOE_INSTANCE_ID=<id>` in the agent's environment (aoe-injected for
-///   hook-enabled agents; `/proc/<pid>/environ` is immune to argv rewrites),
-/// - the `agent_session_id` in the launch command line (fallback for non-hook
-///   agents; the host `docker exec` argv carries it for sandboxed sessions).
+/// Startup recovery uses this after losing an old tmux socket. Hook-enabled
+/// agents require their exact `AOE_INSTANCE_ID=<id>` marker plus their built-in
+/// executable token. This remains stable across native conversation rotation
+/// while rejecting helpers that only inherited the environment. Non-hook
+/// agents use the session id in the command line. The host `docker exec` argv
+/// carries both forms for sandboxed sessions.
 ///
 /// Batching keeps this to one `/proc` walk (or one `ps` fork) regardless of
 /// candidate count. Callers on an async runtime must wrap it in
 /// `tokio::task::spawn_blocking`.
-pub fn processes_matching(env_needles: &[String], cmdline_needles: &[Option<String>]) -> Vec<bool> {
+pub fn processes_matching(
+    env_needles: &[String],
+    cmdline_needles: &[Option<String>],
+    executable_needles: &[Option<String>],
+) -> Vec<bool> {
     debug_assert_eq!(env_needles.len(), cmdline_needles.len());
-    let n = env_needles.len().min(cmdline_needles.len());
+    debug_assert_eq!(env_needles.len(), executable_needles.len());
+    let n = env_needles
+        .len()
+        .min(cmdline_needles.len())
+        .min(executable_needles.len());
     if n == 0 {
         return Vec::new();
     }
     #[cfg(target_os = "linux")]
     {
-        linux::processes_matching(&env_needles[..n], &cmdline_needles[..n])
+        linux::processes_matching(
+            &env_needles[..n],
+            &cmdline_needles[..n],
+            &executable_needles[..n],
+        )
     }
     #[cfg(target_os = "macos")]
     {
-        macos::processes_matching(&env_needles[..n], &cmdline_needles[..n])
+        macos::processes_matching(
+            &env_needles[..n],
+            &cmdline_needles[..n],
+            &executable_needles[..n],
+        )
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -607,7 +619,7 @@ mod tests {
 
     #[test]
     fn processes_matching_empty_input_is_empty() {
-        assert!(processes_matching(&[], &[]).is_empty());
+        assert!(processes_matching(&[], &[], &[]).is_empty());
     }
 
     #[test]
@@ -649,7 +661,7 @@ mod tests {
         // kernel necessarily populates cmdline).
         let mut flags = vec![false, false];
         for _ in 0..100 {
-            flags = processes_matching(&env, &cmd);
+            flags = processes_matching(&env, &cmd, &[None, None]);
             if flags[0] {
                 break;
             }
@@ -697,8 +709,8 @@ mod tests {
         let mut found = false;
         let mut prefix_hit = true;
         for _ in 0..100 {
-            found = processes_matching(&env, &cmd)[0];
-            prefix_hit = processes_matching(&env_prefix, &cmd)[0];
+            found = processes_matching(&env, &cmd, &[None])[0];
+            prefix_hit = processes_matching(&env_prefix, &cmd, &[None])[0];
             if found {
                 break;
             }

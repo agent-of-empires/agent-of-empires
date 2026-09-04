@@ -11,7 +11,7 @@ use crate::session::config::repo_config;
 use crate::session::config::{
     load_config, update_app_state, update_config, GroupByMode, SortOrder,
 };
-use crate::session::{list_profiles, resolve_config_or_warn, Item, Status};
+use crate::session::{list_profiles, Item, Status};
 use crate::tui::app::Action;
 use crate::tui::dialogs::ServeAction;
 use crate::tui::dialogs::{
@@ -398,7 +398,7 @@ fn resolve_hook_install_agent(
                 .get(tool_name)
                 .and_then(|detect_as| crate::agents::get_agent(detect_as))
         })
-        .filter(|agent| agent.hook_config.is_some())
+        .filter(|agent| agent.hook_config.is_some() || agent.sidecar_hooks.is_some())
 }
 
 pub(super) fn parse_hotkey(s: &str) -> Option<(KeyCode, KeyModifiers)> {
@@ -1661,15 +1661,19 @@ impl HomeView {
                         self.pending_hooks_install_data = None;
                     }
                     DialogResult::Submit(_) => {
-                        self.hooks_install_dialog = None;
-                        if let Err(e) = crate::session::config::update_app_state(|state| {
+                        match crate::session::config::update_app_state(|state| {
                             state.has_acknowledged_agent_hooks = true;
                         }) {
-                            tracing::warn!(target: "tui.input", "Failed to save config: {e}");
-                        }
-                        if let Some(data) = self.pending_hooks_install_data.take() {
-                            self.pending_dialog_click_action =
-                                self.maybe_confirm_volume_ignores_globs(data);
+                            Ok(()) => {
+                                self.hooks_install_dialog = None;
+                                if let Some(data) = self.pending_hooks_install_data.take() {
+                                    self.pending_dialog_click_action =
+                                        self.maybe_confirm_volume_ignores_globs(data);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(target: "tui.input", "Failed to save config: {e}")
+                            }
                         }
                     }
                 }
@@ -2086,16 +2090,16 @@ impl HomeView {
                     self.pending_hooks_install_data = None;
                 }
                 DialogResult::Submit(_) => {
-                    self.hooks_install_dialog = None;
-                    // Persist the acknowledgment
-                    if let Err(e) = crate::session::config::update_app_state(|state| {
+                    match crate::session::config::update_app_state(|state| {
                         state.has_acknowledged_agent_hooks = true;
                     }) {
-                        tracing::warn!(target: "tui.input", "Failed to save config: {e}");
-                    }
-                    // Resume session creation
-                    if let Some(data) = self.pending_hooks_install_data.take() {
-                        return self.maybe_confirm_volume_ignores_globs(data);
+                        Ok(()) => {
+                            self.hooks_install_dialog = None;
+                            if let Some(data) = self.pending_hooks_install_data.take() {
+                                return self.maybe_confirm_volume_ignores_globs(data);
+                            }
+                        }
+                        Err(e) => tracing::warn!(target: "tui.input", "Failed to save config: {e}"),
                     }
                 }
             }
@@ -2193,7 +2197,10 @@ impl HomeView {
                         data.tool.clone()
                     };
 
-                    let resolved_config = resolve_config_or_warn(&data.profile);
+                    let resolved_config = crate::session::resolve_config_with_repo_or_warn(
+                        &data.profile,
+                        std::path::Path::new(&data.path),
+                    );
                     if let Some(hook_agent) =
                         resolve_hook_install_agent(&tool_name, &resolved_config.session)
                     {
@@ -2204,11 +2211,15 @@ impl HomeView {
                             .map(|c| c.app_state.has_acknowledged_agent_hooks)
                             .unwrap_or(false);
 
-                        if hooks_enabled && !acknowledged {
-                            self.hooks_install_dialog = Some(HooksInstallDialog::new_for_profile(
-                                hook_agent.name,
-                                Some(&data.profile),
-                            ));
+                        if crate::agents::hook_install_required(hook_agent, hooks_enabled)
+                            && !acknowledged
+                        {
+                            self.hooks_install_dialog =
+                                Some(HooksInstallDialog::new_for_profile_resolved(
+                                    &tool_name,
+                                    hook_agent.name,
+                                    Some(&data.profile),
+                                ));
                             self.pending_hooks_install_data = Some(data);
                             return None;
                         }

@@ -182,7 +182,6 @@ describe("isolateEnv", () => {
         "AOE_GITHUB_CLONE_BASE",
         "CLAUDE_CONFIG_DIR",
         "OPENCODE_DB",
-        "VIBE_HOME",
       ]),
     );
 

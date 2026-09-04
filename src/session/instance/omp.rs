@@ -192,7 +192,7 @@ impl Instance {
     /// parseable argv. Benign arguments remain supported; store-selecting
     /// flags are interpreted by the capture resolver.
     pub(super) fn omp_capture_options(&self) -> Option<OmpCliCaptureOptions> {
-        if self.tool != "omp" || self.has_command_override() {
+        if self.resolved_capture_backend() != Some(crate::agents::SessionCaptureBackend::Omp) {
             return None;
         }
         let args = crate::session::config::quote_model_value_in_args(&self.extra_args);
@@ -440,7 +440,7 @@ impl Instance {
                 expected_prior,
             );
         }
-        if self.tool != "omp" {
+        if self.resolved_capture_backend() != Some(crate::agents::SessionCaptureBackend::Omp) {
             return true;
         }
         // No capture plan: persist a distinct sentinel so any observation still
@@ -503,7 +503,7 @@ impl Instance {
     /// Last-chance exact-pane OMP capture while the old pane still exists.
     pub(super) fn capture_omp_before_restart(&mut self, profile: &str) {
         self.reconcile_from_disk();
-        if self.tool != "omp"
+        if self.resolved_capture_backend() != Some(crate::agents::SessionCaptureBackend::Omp)
             || self.agent_session_id.is_some()
             || (self.is_sandboxed() && self.omp_capture_generation.is_none())
         {
@@ -578,6 +578,48 @@ mod tests {
         assert!(inst.omp_capture_options().is_some());
         inst.command = "omp-wrapper".to_string();
         assert!(inst.omp_capture_options().is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn omp_alias_without_capture_plan_tombstones_generation() {
+        const PROFILE: &str = "omp-alias-generation-test";
+        let _home = crate::session::test_support::isolate_app_dir();
+        let storage = crate::session::storage::Storage::new_unwatched(PROFILE).unwrap();
+        let mut inst = Instance::new("alias", "/tmp/test");
+        inst.source_profile = PROFILE.to_string();
+        inst.tool = "omp-alias".to_string();
+        inst.detect_as = "omp".to_string();
+        inst.command = "omp".to_string();
+        let persisted = inst.clone();
+        storage
+            .update(|instances, groups| {
+                *instances = vec![persisted.clone()];
+                *groups =
+                    crate::session::GroupTree::new_with_groups(instances, &[]).get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            inst.resolved_capture_backend(),
+            Some(crate::agents::SessionCaptureBackend::Omp)
+        );
+        assert!(inst.publish_omp_launch_generation(PROFILE, None, None));
+        let generation = inst
+            .omp_capture_generation
+            .as_deref()
+            .expect("OMP alias must publish a tombstone generation");
+        assert!(generation.starts_with("tombstone-"));
+        assert_eq!(
+            storage
+                .load()
+                .unwrap()
+                .into_iter()
+                .find(|row| row.id == inst.id)
+                .and_then(|row| row.omp_capture_generation),
+            Some(generation.to_string())
+        );
     }
 
     #[test]

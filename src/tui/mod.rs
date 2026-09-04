@@ -249,6 +249,8 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
                 }
             }
         }
+    } else {
+        tokio::task::spawn_blocking(migrations::run_migrations).await??;
     }
 
     // Check for tmux

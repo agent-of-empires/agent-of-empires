@@ -5,7 +5,7 @@ use super::*;
 
 impl Instance {
     /// Mutates launch-owned state. A strictly newer lifecycle generation also
-    /// imports its status timestamps and error snapshot as one unit.
+    /// imports its status timestamps, capture floor, and error snapshot as one unit.
     pub fn merge_post_start(&mut self, src: &Self) {
         if src.lifecycle_generation < self.lifecycle_generation {
             return;
@@ -19,6 +19,7 @@ impl Instance {
         self.lifecycle_generation = src.lifecycle_generation;
         self.status = src.status;
         self.sandbox_info = src.sandbox_info.clone();
+        self.capture_started_at = src.capture_started_at;
     }
 
     /// Same fields as `merge_post_start`. Resume-probe failure markers are
@@ -48,6 +49,7 @@ impl Instance {
         if generation_can_merge {
             self.omp_capture_generation = src.omp_capture_generation.clone();
             self.session_id_poller = src.session_id_poller.clone();
+            self.session_id_poller_retry_after = src.session_id_poller_retry_after;
             if sid_unchanged {
                 self.agent_session_id = src.agent_session_id.clone();
             }
@@ -105,6 +107,7 @@ impl Instance {
         self.last_error_check = previous.last_error_check;
         self.last_start_time = previous.last_start_time;
         self.session_id_poller = previous.session_id_poller.clone();
+        self.session_id_poller_retry_after = previous.session_id_poller_retry_after;
         self.retroactive_capture_excludes = previous.retroactive_capture_excludes.clone();
     }
 
@@ -488,12 +491,16 @@ mod tests {
         live.status = Status::Starting;
         live.idle_entered_at = Some(stale_idle);
         live.last_error = Some("stale pane observation".to_string());
+        let stale_floor = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        live.capture_started_at = Some(stale_floor);
 
         let mut disk = live.clone();
         disk.lifecycle_generation = 8;
         disk.status = Status::Stopped;
         disk.idle_entered_at = None;
         disk.last_error = None;
+        let launched_floor = std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000);
+        disk.capture_started_at = Some(launched_floor);
 
         live.merge_post_start(&disk);
 
@@ -501,6 +508,7 @@ mod tests {
         assert_eq!(live.status, Status::Stopped);
         assert_eq!(live.idle_entered_at, None);
         assert_eq!(live.last_error, None);
+        assert_eq!(live.capture_started_at, Some(launched_floor));
     }
 
     #[test]
@@ -510,6 +518,8 @@ mod tests {
         previous.status = Status::Starting;
         previous.idle_entered_at = Some(Utc::now());
         previous.last_error = Some("old observation".to_string());
+        let previous_floor = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        previous.capture_started_at = Some(previous_floor);
 
         previous.detection = DetectionState {
             pending: Some(Status::Idle),
@@ -521,6 +531,8 @@ mod tests {
         reloaded.status = Status::Stopped;
         reloaded.idle_entered_at = None;
         reloaded.last_error = None;
+        let committed_floor = std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000);
+        reloaded.capture_started_at = Some(committed_floor);
         // A disk load leaves every `#[serde(skip)]` field at its default.
         reloaded.detection = DetectionState::default();
         reloaded.merge_runtime_from_reload(&previous);
@@ -532,9 +544,23 @@ mod tests {
         // last_error is runtime-only: the in-memory poller value survives even a
         // newer generation, since no lifecycle writer persists last_error.
         assert_eq!(reloaded.last_error.as_deref(), Some("old observation"));
+        assert_eq!(
+            reloaded.capture_started_at,
+            Some(committed_floor),
+            "reload must retain the exact launch-owned floor from disk"
+        );
         // So is the detection bookkeeping: a reload between two poll cycles
         // must not drop a proposal awaiting its confirming poll (#3642).
         assert_eq!(reloaded.detection.pending, Some(Status::Idle));
+
+        let mut same_generation_disk = previous.clone();
+        same_generation_disk.capture_started_at = Some(committed_floor);
+        same_generation_disk.merge_runtime_from_reload(&previous);
+        assert_eq!(
+            same_generation_disk.capture_started_at,
+            Some(committed_floor),
+            "a stale same-generation runtime snapshot must not replace a committed disk floor"
+        );
 
         let mut deleting = Instance::new("deleting", "/tmp/test");
         deleting.lifecycle_generation = 3;
@@ -627,10 +653,15 @@ mod tests {
 
         stored.lifecycle_generation = 2;
         stored.status = Status::Stopped;
+        let winning_floor = std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000);
+        stored.capture_started_at = Some(winning_floor);
         working.lifecycle_generation = 1;
         working.status = Status::Starting;
+        working.capture_started_at =
+            Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000));
         stored.merge_post_start(&working);
         assert_eq!(stored.status, Status::Stopped);
+        assert_eq!(stored.capture_started_at, Some(winning_floor));
         stored.merge_from_tui(&working);
         assert_eq!(
             stored.status,

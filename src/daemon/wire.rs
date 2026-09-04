@@ -139,7 +139,7 @@ pub enum ContextResumeAvailability {
     },
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionResponse {
     pub id: String,
     pub title: String,
@@ -421,14 +421,14 @@ pub struct PlanSummary {
     pub total: u32,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceRepoSummary {
     pub name: String,
     pub source_path: String,
     pub branch: String,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CleanupDefaults {
     pub delete_worktree: bool,
     pub delete_branch: bool,
@@ -444,7 +444,7 @@ pub struct CleanupDefaults {
 // sidebar in the requested order on the first paint, with no extra
 // round-trip. The order is a list of workspace ids; ids not present
 // fall back to the client's default newest-first ordering. See #1169.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionsEnvelope {
     pub sessions: Vec<SessionResponse>,
     pub workspace_ordering: Vec<String>,

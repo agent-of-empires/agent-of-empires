@@ -120,12 +120,14 @@ impl DaemonClient {
         if let Some(authorization) = &self.authorization {
             request = request.header(AUTHORIZATION, authorization.clone());
         }
-        let request = request.build().map_err(DaemonClientError::Transport)?;
+        let request = request
+            .build()
+            .map_err(|error| self.transport_error(error))?;
         let mut response = self
             .http
             .execute(request)
             .await
-            .map_err(DaemonClientError::Transport)?;
+            .map_err(|error| self.transport_error(error))?;
 
         let status = response.status();
         if !status.is_success() {
@@ -137,7 +139,9 @@ impl DaemonClient {
             });
         }
 
-        let body = read_bounded_body(&mut response, MAX_SUCCESS_BODY_BYTES).await?;
+        let body = self
+            .read_bounded_body(&mut response, MAX_SUCCESS_BODY_BYTES)
+            .await?;
         serde_json::from_slice(&body).map_err(|error| {
             if self.authorization.is_some() {
                 DaemonClientError::AuthenticatedDecode
@@ -156,7 +160,7 @@ impl DaemonClient {
         while let Some(chunk) = response
             .chunk()
             .await
-            .map_err(DaemonClientError::Transport)?
+            .map_err(|error| self.transport_error(error))?
         {
             let remaining = MAX_ERROR_BODY_BYTES.saturating_sub(bytes.len());
             if chunk.len() > remaining {
@@ -177,37 +181,48 @@ impl DaemonClient {
         }
         Ok((body, truncated))
     }
-}
 
-async fn read_bounded_body(
-    response: &mut reqwest::Response,
-    limit: usize,
-) -> Result<Vec<u8>, DaemonClientError> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > limit as u64)
-    {
-        return Err(DaemonClientError::ResponseTooLarge { limit });
+    // An authenticated base path may itself contain credential material.
+    fn transport_error(&self, error: reqwest::Error) -> DaemonClientError {
+        let error = if self.authorization.is_some() {
+            error.without_url()
+        } else {
+            error
+        };
+        DaemonClientError::Transport(error)
     }
 
-    let capacity = response
-        .content_length()
-        .and_then(|length| usize::try_from(length).ok())
-        .unwrap_or_default()
-        .min(limit);
-    let mut bytes = Vec::with_capacity(capacity);
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(DaemonClientError::Transport)?
-    {
-        let remaining = limit.saturating_sub(bytes.len());
-        if chunk.len() > remaining {
+    async fn read_bounded_body(
+        &self,
+        response: &mut reqwest::Response,
+        limit: usize,
+    ) -> Result<Vec<u8>, DaemonClientError> {
+        if response
+            .content_length()
+            .is_some_and(|length| length > limit as u64)
+        {
             return Err(DaemonClientError::ResponseTooLarge { limit });
         }
-        bytes.extend_from_slice(&chunk);
+
+        let capacity = response
+            .content_length()
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or_default()
+            .min(limit);
+        let mut bytes = Vec::with_capacity(capacity);
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| self.transport_error(error))?
+        {
+            let remaining = limit.saturating_sub(bytes.len());
+            if chunk.len() > remaining {
+                return Err(DaemonClientError::ResponseTooLarge { limit });
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
     }
-    Ok(bytes)
 }
 
 pub(crate) fn is_loopback_url(url: &Url) -> bool {

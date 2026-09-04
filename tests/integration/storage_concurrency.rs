@@ -500,6 +500,7 @@ fn test_cross_process_lock_released_on_child_kill() -> Result<()> {
 fn test_cross_process_independent_profiles_do_not_serialise() -> Result<()> {
     let temp = setup_temp_home();
     let home = temp.path().to_path_buf();
+    agent_of_empires::migrations::run_migrations()?;
 
     let s_a = Storage::new_unwatched("profile-a")?;
     let s_b = Storage::new_unwatched("profile-b")?;

@@ -20,8 +20,6 @@ use anyhow::{Context, Result};
 use fs2::FileExt as _;
 use serde_json::Value;
 
-#[cfg(test)]
-pub(crate) use dir_guard::{clear_base_override_for_test, override_base_for_test, reset_for_test};
 pub(crate) use dir_guard::{
     ensure_instance_dir_path, hook_base_path, unlink_session_id_via_guard,
     write_session_id_via_guard,
@@ -150,7 +148,7 @@ pub(crate) fn codex_config_path_display_for_host_environment(entries: &[String])
         .unwrap_or_else(codex_config_path_display)
 }
 
-/// Home-injectable variant of [`codex_hooks_json_path_for_host_environment`]:
+/// Resolve Codex hooks under an injected home directory:
 /// resolves Codex's `hooks.json` under the given `home` directory, honoring
 /// an explicit `CODEX_HOME` in `host_env` (or the AoE process env), then
 /// falling back to `<home>/.codex/hooks.json`.
@@ -165,41 +163,6 @@ pub(crate) fn codex_hooks_json_path_in(home: &Path, host_env: &[String]) -> Path
     home.join(".codex").join("hooks.json")
 }
 
-/// Process-env variant of [`codex_hooks_json_path_in`]: resolves Codex's
-/// `hooks.json` against the live `dirs::home_dir()` so install paths
-/// outside the migration boot loop share a single call shape.
-pub(crate) fn codex_hooks_json_path_for_host_environment(entries: &[String]) -> Result<PathBuf> {
-    let home =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
-    Ok(codex_hooks_json_path_in(&home, entries))
-}
-
-/// Display-string variant of [`codex_hooks_json_path_for_host_environment`]
-/// used by the TUI consent dialog; falls back to the literal
-/// `~/.codex/hooks.json` string when the home directory cannot be resolved.
-pub(crate) fn codex_hooks_json_path_display_for_host_environment(entries: &[String]) -> String {
-    crate::session::environment::resolve_host_environment_value(entries, "CODEX_HOME")
-        .filter(|v| !v.is_empty())
-        .map(|codex_home| {
-            PathBuf::from(codex_home)
-                .join("hooks.json")
-                .display()
-                .to_string()
-        })
-        .unwrap_or_else(|| {
-            std::env::var("CODEX_HOME")
-                .ok()
-                .filter(|v| !v.is_empty())
-                .map(|codex_home| {
-                    PathBuf::from(codex_home)
-                        .join("hooks.json")
-                        .display()
-                        .to_string()
-                })
-                .unwrap_or_else(|| "~/.codex/hooks.json".to_string())
-        })
-}
-
 /// Resolve the host settings-file path for an agent whose config directory may
 /// be overridden by an environment variable (e.g. Claude's `CLAUDE_CONFIG_DIR`).
 ///
@@ -209,6 +172,7 @@ pub(crate) fn codex_hooks_json_path_display_for_host_environment(entries: &[Stri
 /// `settings_rel_path` (the env var replaces the whole `~/.claude`-style dir,
 /// matching how the agents themselves interpret it). Otherwise it falls back to
 /// the home-relative `settings_rel_path`.
+#[cfg(test)]
 pub(crate) fn agent_settings_path_for_host_environment(
     hook_cfg: &crate::agents::AgentHookConfig,
     host_env: &[String],
@@ -235,24 +199,6 @@ pub(crate) fn agent_settings_path_in(
         }
     }
     home.join(hook_cfg.settings_rel_path)
-}
-
-/// Display variant of [`agent_settings_path_for_host_environment`] for UI
-/// consent dialogs. Returns the absolute override path when a config-dir env
-/// var is set, otherwise the `~/`-relative default so the displayed path
-/// matches where hooks are actually written.
-pub(crate) fn agent_settings_path_display_for_host_environment(
-    hook_cfg: &crate::agents::AgentHookConfig,
-    host_env: &[String],
-) -> String {
-    if let Some(var) = hook_cfg.config_dir_env_var {
-        if let Some(dir) = resolve_config_dir_override(var, host_env) {
-            if let Some(file) = Path::new(hook_cfg.settings_rel_path).file_name() {
-                return PathBuf::from(dir).join(file).display().to_string();
-            }
-        }
-    }
-    format!("~/{}", hook_cfg.settings_rel_path)
 }
 
 /// Resolve a config-dir override env var, preferring an explicit value in the
@@ -442,16 +388,17 @@ fn hook_command_with_write(write: &str, base: &str, target: HookInstallTarget) -
 /// substring so hooks installed before the trailing marker was added stay
 /// detectable on uninstall.
 ///
-/// Host-variant silent-failure modes (acceptable, equivalent to a `jq`
-/// absence in the sandbox variant): `aoe` not on PATH at hook-exec time,
-/// or a stale `aoe` on PATH that predates `__extract-session-id`. Both
-/// yield no sidecar without surfacing an error; session resume falls
-/// back to the filesystem scan.
-fn hook_command_session_id(target: HookInstallTarget) -> String {
+/// Host-side absence is fail-closed: the launch prefix pins `AOE_HOOK_BIN` to
+/// the current AoE executable. If it is absent or not executable, no sidecar is
+/// written and no shared filesystem artifact substitutes for pane identity.
+fn hook_command_session_id(
+    target: HookInstallTarget,
+    field: crate::agents::HookIdentityField,
+) -> String {
     match target {
-        HookInstallTarget::Host => hook_command_session_id_host(),
+        HookInstallTarget::Host => hook_command_session_id_host(field),
         HookInstallTarget::Sandbox => {
-            hook_command_session_id_sandbox(HOOK_STATUS_BASE_IN_CONTAINER)
+            hook_command_session_id_sandbox(HOOK_STATUS_BASE_IN_CONTAINER, field)
         }
     }
 }
@@ -462,25 +409,35 @@ fn hook_command_session_id(target: HookInstallTarget) -> String {
 /// `# aoe-hooks` marker).
 #[cfg(test)]
 pub(crate) fn canonical_session_id_command(target: HookInstallTarget) -> String {
-    hook_command_session_id(target)
+    hook_command_session_id(target, crate::agents::HookIdentityField::SessionId)
 }
 
-fn hook_command_session_id_host() -> String {
+fn hook_command_session_id_host(field: crate::agents::HookIdentityField) -> String {
+    let field = match field {
+        crate::agents::HookIdentityField::SessionId => "session-id",
+        crate::agents::HookIdentityField::ConversationIdOrSessionId => {
+            "conversation-id-or-session-id"
+        }
+    };
     format!(
         "sh -c '[ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
-         command -v aoe >/dev/null 2>&1 || exit 0; \
-         aoe __extract-session-id 2>/dev/null; exit 0 # {AOE_HOOK_MARKER}'"
+         [ -n \"$AOE_HOOK_BIN\" ] || exit 0; \
+         [ -x \"$AOE_HOOK_BIN\" ] || exit 0; \
+         \"$AOE_HOOK_BIN\" __extract-session-id --field {field} 2>/dev/null; exit 0 # {AOE_HOOK_MARKER}'"
     )
 }
 
-fn hook_command_session_id_sandbox(base: &str) -> String {
-    // `jq -r` does the structural top-level extraction symmetric with the
-    // host's `serde_json` path. POSIX `case` enforces the UUID shape after
-    // jq returns, because `case` has no `{N}` quantifier we expand the
-    // 8-4-4-4-12 layout literally over the `$H` hex-class abbreviation.
-    // The `'\''` close-escape-reopen is the standard shell idiom for a
-    // literal single-quote inside a single-quoted `sh -c '...'`; in Rust
-    // source that is `'\\''`.
+fn hook_command_session_id_sandbox(base: &str, field: crate::agents::HookIdentityField) -> String {
+    let selector = match field {
+        crate::agents::HookIdentityField::SessionId => {
+            r#"if (.session_id|type)=="string" then .session_id else empty end"#
+        }
+        crate::agents::HookIdentityField::ConversationIdOrSessionId => {
+            r#"if (.conversation_id|type)=="string" then .conversation_id elif (.session_id|type)=="string" then .session_id else empty end"#
+        }
+    };
+    // jq performs structural top-level extraction like the host path. The
+    // POSIX guards then enforce the shared shell-safe session-id contract.
     format!(
         "sh -c 'unset IFS; set -f; umask 077; \
          [ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
@@ -490,9 +447,9 @@ fn hook_command_session_id_sandbox(base: &str) -> String {
          set -- $LS; M=\"$1\"; \
          case \"$M\" in drwx------|drwx------.|drwx------+|drwx------@) ;; *) exit 0 ;; esac; \
          command -v jq >/dev/null 2>&1 || exit 0; \
-         SID=$(jq -r '\\''if (.session_id|type)==\"string\" then .session_id else empty end'\\'' 2>/dev/null); \
-         H=[0-9a-fA-F]; \
-         case \"$SID\" in $H$H$H$H$H$H$H$H-$H$H$H$H-$H$H$H$H-$H$H$H$H-$H$H$H$H$H$H$H$H$H$H$H$H) ;; *) exit 0 ;; esac; \
+         SID=$(jq -r '\\''{selector}'\\'' 2>/dev/null); \
+         case \"$SID\" in \"\"|-*|*[!0-9a-zA-Z._-]*) exit 0 ;; esac; \
+         [ \"${{#SID}}\" -le 256 ] || exit 0; \
          printf \"%s\" \"$SID\" > \"$D/.session_id.$$.tmp\" 2>/dev/null && mv \"$D/.session_id.$$.tmp\" \"$D/session_id\" 2>/dev/null; \
          exit 0 # {AOE_HOOK_MARKER}'"
     )
@@ -529,7 +486,7 @@ pub(super) fn is_aoe_hook_command(cmd: &str) -> bool {
 /// Build the AoE hooks JSON structure from agent-defined events.
 ///
 /// For each event, emit one entry per active behaviour:
-/// - `event.session_id_capture` → session-id-extractor command (placed
+/// - events with an identity field emit the authoritative identity extractor
 ///   first so it gets stdin first if the agent only delivers stdin to the
 ///   leading command in a matcher block).
 /// - `event.status.is_some()` → status-writer command (does not read
@@ -550,8 +507,8 @@ fn build_aoe_hooks(
     let mut hooks_obj = serde_json::Map::new();
     for event in events.as_ref() {
         let mut commands: Vec<String> = Vec::new();
-        if event.session_id_capture {
-            commands.push(hook_command_session_id(target));
+        if let Some(field) = event.identity_field {
+            commands.push(hook_command_session_id(target, field));
         }
         if let Some(status) = event.status {
             commands.push(status_command_for_event(
@@ -613,8 +570,106 @@ fn remove_aoe_entries(matchers: &mut Vec<Value>) {
     });
 }
 
-/// Install AoE status hooks into an agent's `settings.json` file.
-///
+/// Install Cursor's version-1 flat hooks.json schema while preserving user hooks.
+pub fn install_cursor_hooks_with_events(
+    config_path: &Path,
+    target: HookInstallTarget,
+    events: &[crate::agents::ResolvedHookEvent],
+) -> Result<()> {
+    if events.is_empty() && !config_path.exists() {
+        return Ok(());
+    }
+    with_config_lock(config_path, "json.lock", || {
+        let mut config: Value = if config_path.exists() {
+            serde_json::from_str(&std::fs::read_to_string(config_path)?)
+                .with_context(|| format!("parsing Cursor hooks at {}", config_path.display()))?
+        } else {
+            serde_json::json!({})
+        };
+        let before = config.clone();
+        let root = config
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("Cursor hooks root is not a JSON object"))?;
+        root.insert("version".to_string(), Value::from(1));
+        let hooks = root
+            .entry("hooks")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("Cursor hooks key is not a JSON object"))?;
+
+        for entries in hooks.values_mut().filter_map(Value::as_array_mut) {
+            entries.retain(|entry| {
+                !entry
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_aoe_hook_command)
+            });
+        }
+        hooks.retain(|_, entries| !entries.as_array().is_some_and(Vec::is_empty));
+
+        for event in events {
+            let entries = hooks
+                .entry(event.name.clone())
+                .or_insert_with(|| Value::Array(Vec::new()))
+                .as_array_mut()
+                .ok_or_else(|| anyhow::anyhow!("Cursor hook event is not an array"))?;
+            if let Some(field) = event.identity_field {
+                entries.push(serde_json::json!({
+                    "command": hook_command_session_id(target, field)
+                }));
+            }
+            if let Some(status) = event.status {
+                entries.push(serde_json::json!({
+                    "command": status_command_for_event(status, &event.waiting_tools, target)
+                }));
+            }
+        }
+
+        if config == before {
+            return Ok(());
+        }
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        crate::session::atomic_write(
+            config_path,
+            serde_json::to_string_pretty(&config)?.as_bytes(),
+        )
+    })
+}
+
+/// Remove only AoE commands from Cursor's flat hooks.json schema.
+pub fn uninstall_cursor_hooks(config_path: &Path) -> Result<bool> {
+    if !config_path.exists() {
+        return Ok(false);
+    }
+    with_config_lock(config_path, "json.lock", || {
+        let mut config: Value = serde_json::from_str(&std::fs::read_to_string(config_path)?)
+            .with_context(|| format!("parsing Cursor hooks at {}", config_path.display()))?;
+        let before = config.clone();
+        if let Some(hooks) = config.get_mut("hooks").and_then(Value::as_object_mut) {
+            for entries in hooks.values_mut().filter_map(Value::as_array_mut) {
+                entries.retain(|entry| {
+                    !entry
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .is_some_and(is_aoe_hook_command)
+                });
+            }
+            hooks.retain(|_, entries| !entries.as_array().is_some_and(Vec::is_empty));
+        }
+        if config == before {
+            return Ok(false);
+        }
+        crate::session::atomic_write(
+            config_path,
+            serde_json::to_string_pretty(&config)?.as_bytes(),
+        )?;
+        Ok(true)
+    })
+}
+
+/// Install AoE status hooks into an agent's settings.json file.
 /// Merges AoE hook entries into the existing hooks configuration, preserving
 /// any user-defined hooks. Existing AoE hooks are replaced (idempotent).
 ///
@@ -627,6 +682,9 @@ pub fn install_hooks(
     events: impl AsRef<[crate::agents::ResolvedHookEvent]>,
     target: HookInstallTarget,
 ) -> Result<()> {
+    if events.as_ref().is_empty() && !settings_path.exists() {
+        return Ok(());
+    }
     with_config_lock(settings_path, "json.lock", || {
         let mut settings: Value = if settings_path.exists() {
             let content = std::fs::read_to_string(settings_path)?;
@@ -1588,6 +1646,9 @@ pub fn install_settl_hooks_with_events(
     target: HookInstallTarget,
     events: &[crate::agents::ResolvedHookEvent],
 ) -> Result<()> {
+    if events.is_empty() && !config_path.exists() {
+        return Ok(());
+    }
     with_config_lock(config_path, "toml.lock", || {
         let mut config: toml::Value = if config_path.exists() {
             let content = std::fs::read_to_string(config_path)?;
@@ -1711,6 +1772,9 @@ pub fn install_kimi_hooks_with_events(
     target: HookInstallTarget,
     events: &[crate::agents::ResolvedHookEvent],
 ) -> Result<()> {
+    if events.is_empty() && !config_path.exists() {
+        return Ok(());
+    }
     with_config_lock(config_path, "toml.lock", || {
         let mut config = if config_path.exists() {
             let content = std::fs::read_to_string(config_path)?;
@@ -1889,6 +1953,9 @@ pub fn install_hermes_hooks_with_events(
     target: HookInstallTarget,
     events: &[crate::agents::ResolvedHookEvent],
 ) -> Result<()> {
+    if events.is_empty() && !config_path.exists() {
+        return Ok(());
+    }
     with_config_lock(config_path, "yaml.lock", || {
         let mut config: serde_yaml::Value = if config_path.exists() {
             let content = std::fs::read_to_string(config_path)?;
@@ -2167,6 +2234,9 @@ pub fn install_kiro_hooks_with_events(
     target: HookInstallTarget,
     events: &[crate::agents::ResolvedHookEvent],
 ) -> Result<()> {
+    if events.is_empty() && !agent_config_path.exists() {
+        return Ok(());
+    }
     with_config_lock(agent_config_path, "json.lock", || {
         let mut config: serde_json::Map<String, Value> = if agent_config_path.exists() {
             let content = std::fs::read_to_string(agent_config_path)?;
@@ -2195,9 +2265,16 @@ pub fn install_kiro_hooks_with_events(
             .unwrap_or_default();
 
         for event in events {
-            let Some(status) = event.status else {
+            let mut commands = Vec::new();
+            if let Some(field) = event.identity_field {
+                commands.push(hook_command_session_id(target, field));
+            }
+            if let Some(status) = event.status {
+                commands.push(hook_command(status.as_str(), target));
+            }
+            if commands.is_empty() {
                 continue;
-            };
+            }
             let entries = hooks_obj
                 .entry(event.name.clone())
                 .or_insert_with(|| Value::Array(Vec::new()));
@@ -2205,10 +2282,14 @@ pub fn install_kiro_hooks_with_events(
                 arr.retain(|hook| {
                     !hook
                         .get("command")
-                        .and_then(|c| c.as_str())
+                        .and_then(|command| command.as_str())
                         .is_some_and(is_aoe_hook_command)
                 });
-                arr.push(serde_json::json!({ "command": hook_command(status.as_str(), target) }));
+                arr.extend(
+                    commands
+                        .into_iter()
+                        .map(|command| serde_json::json!({ "command": command })),
+                );
             }
         }
 
@@ -2521,25 +2602,6 @@ mod tests {
         let _guard = EnvGuard::set(&[("CLAUDE_CONFIG_DIR", "/tmp/claude-proc")]);
         let path = agent_settings_path_for_host_environment(claude_hook_config(), &[]).unwrap();
         assert_eq!(path, PathBuf::from("/tmp/claude-proc/settings.json"));
-    }
-
-    #[test]
-    #[serial_test::serial(shell_env)]
-    fn test_agent_settings_path_display_matches_resolution() {
-        let _guard = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
-
-        // Default: tilde-relative, matching how the path is shown elsewhere.
-        assert_eq!(
-            agent_settings_path_display_for_host_environment(claude_hook_config(), &[]),
-            "~/.claude/settings.json"
-        );
-
-        // Override: absolute path the user will actually see hooks land in.
-        let host_env = vec!["CLAUDE_CONFIG_DIR=/home/me/.claude-work".to_string()];
-        assert_eq!(
-            agent_settings_path_display_for_host_environment(claude_hook_config(), &host_env),
-            "/home/me/.claude-work/settings.json"
-        );
     }
 
     #[test]
@@ -4527,14 +4589,16 @@ hooks_auto_accept: false
                 .unwrap_or_else(|| panic!("event {} missing", event.name))
                 .as_array()
                 .unwrap();
+            let expected = 1 + usize::from(event.identity_field.is_some());
             assert_eq!(
                 entries.len(),
-                1,
-                "event {} should have one entry",
+                expected,
+                "event {} command count",
                 event.name
             );
-            let cmd = entries[0]["command"].as_str().unwrap();
-            assert!(is_aoe_hook_command(cmd));
+            assert!(entries
+                .iter()
+                .all(|entry| { entry["command"].as_str().is_some_and(is_aoe_hook_command) }));
         }
     }
 
@@ -4588,10 +4652,11 @@ hooks_auto_accept: false
         let config: Value = serde_json::from_str(&content).unwrap();
         for event in sidecar_default_events("kiro") {
             let entries = config["hooks"][event.name].as_array().unwrap();
+            let expected = 1 + usize::from(event.identity_field.is_some());
             assert_eq!(
                 entries.len(),
-                1,
-                "event {} should still have exactly one AoE entry after double install",
+                expected,
+                "event {} command count changed after double install",
                 event.name
             );
         }
@@ -4745,13 +4810,16 @@ hooks_auto_accept: false
         assert_eq!(config["name"].as_str(), Some("custom-agent"));
         for event in sidecar_default_events("kiro") {
             let entries = config["hooks"][event.name].as_array().unwrap();
+            let expected = 1 + usize::from(event.identity_field.is_some());
             assert_eq!(
                 entries.len(),
-                1,
-                "event {} should have one AoE entry",
+                expected,
+                "event {} command count",
                 event.name
             );
-            assert!(is_aoe_hook_command(entries[0]["command"].as_str().unwrap()));
+            assert!(entries
+                .iter()
+                .all(|entry| { entry["command"].as_str().is_some_and(is_aoe_hook_command) }));
         }
     }
 
@@ -4796,7 +4864,10 @@ hooks_auto_accept: false
     }
 
     fn run_session_id_hook(payload: &str, instance_id: &str, base: &Path) -> std::process::Output {
-        let cmd = hook_command_session_id_sandbox(base.to_str().unwrap());
+        let cmd = hook_command_session_id_sandbox(
+            base.to_str().unwrap(),
+            crate::agents::HookIdentityField::SessionId,
+        );
         let mut child = std::process::Command::new("sh")
             .args(["-c", &cmd])
             .env("AOE_INSTANCE_ID", instance_id)
@@ -4884,7 +4955,7 @@ hooks_auto_accept: false
         }
         let tmp = TempDir::new().unwrap();
         let nested = "11111111-2222-3333-4444-555555555555";
-        let top_level = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let top_level = "conversation_opaque.123";
         let payload =
             format!(r#"{{"context":{{"session_id":"{nested}"}},"session_id":"{top_level}"}}"#);
         let output = run_session_id_hook(&payload, "sandbox_top_wins", tmp.path());
@@ -4986,14 +5057,21 @@ hooks_auto_accept: false
 
     #[test]
     fn test_hook_command_session_id_host_invokes_aoe_subcommand() {
-        let cmd = hook_command_session_id(HookInstallTarget::Host);
-        assert!(
-            cmd.contains("aoe __extract-session-id"),
-            "host hook should invoke the Rust subcommand, got: {cmd}"
+        let cmd = hook_command_session_id(
+            HookInstallTarget::Host,
+            crate::agents::HookIdentityField::SessionId,
         );
         assert!(
-            cmd.contains("command -v aoe"),
-            "host hook should guard on `aoe` being on PATH, got: {cmd}"
+            cmd.contains(r#""$AOE_HOOK_BIN" __extract-session-id"#),
+            "host hook should invoke the pinned Rust subcommand, got: {cmd}"
+        );
+        assert!(
+            cmd.contains(r#"[ -n "$AOE_HOOK_BIN" ]"#) && cmd.contains(r#"[ -x "$AOE_HOOK_BIN" ]"#),
+            "host hook should validate the pinned executable, got: {cmd}"
+        );
+        assert!(
+            !cmd.contains("command -v aoe"),
+            "host hook must not depend on a bare aoe in PATH, got: {cmd}"
         );
         assert!(
             cmd.contains(AOE_HOOK_MARKER),
@@ -5007,7 +5085,10 @@ hooks_auto_accept: false
 
     #[test]
     fn test_hook_command_session_id_sandbox_invokes_jq_extractor() {
-        let cmd = hook_command_session_id(HookInstallTarget::Sandbox);
+        let cmd = hook_command_session_id(
+            HookInstallTarget::Sandbox,
+            crate::agents::HookIdentityField::SessionId,
+        );
         assert!(
             cmd.contains("jq -r"),
             "sandbox hook must invoke `jq -r` for structural top-level extraction, got: {cmd}"
@@ -5028,6 +5109,57 @@ hooks_auto_accept: false
             cmd.contains(AOE_HOOK_MARKER),
             "sandbox hook must carry the AoE marker, got: {cmd}"
         );
+    }
+    #[test]
+    fn test_hook_identity_field_changes_both_extractors() {
+        let host = hook_command_session_id(
+            HookInstallTarget::Host,
+            crate::agents::HookIdentityField::ConversationIdOrSessionId,
+        );
+        assert!(host.contains("--field conversation-id-or-session-id"));
+
+        let sandbox = hook_command_session_id(
+            HookInstallTarget::Sandbox,
+            crate::agents::HookIdentityField::ConversationIdOrSessionId,
+        );
+        assert!(sandbox.contains(".conversation_id"));
+        assert!(sandbox.contains(".session_id"));
+        assert!(sandbox.contains("elif"));
+    }
+
+    #[test]
+    fn cursor_hooks_use_native_flat_schema_and_preserve_user_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("hooks.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"hooks":{"beforeSubmitPrompt":[{"command":"user-hook"}]}}"#,
+        )
+        .unwrap();
+        let events = [crate::agents::ResolvedHookEvent {
+            name: "beforeSubmitPrompt".to_string(),
+            matcher: None,
+            status: Some(crate::agents::HookStatus::Running),
+            identity_field: Some(crate::agents::HookIdentityField::ConversationIdOrSessionId),
+            waiting_tools: Vec::new(),
+        }];
+
+        install_cursor_hooks_with_events(&path, HookInstallTarget::Host, &events).unwrap();
+        let value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["version"], 1);
+        let entries = value["hooks"]["beforeSubmitPrompt"].as_array().unwrap();
+        assert_eq!(entries[0]["command"], "user-hook");
+        assert_eq!(entries.len(), 3);
+        assert!(entries[1].get("hooks").is_none());
+        assert!(entries[1]["command"]
+            .as_str()
+            .unwrap()
+            .contains("__extract-session-id"));
+
+        assert!(uninstall_cursor_hooks(&path).unwrap());
+        let value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let remaining = value["hooks"]["beforeSubmitPrompt"].as_array().unwrap();
+        assert_eq!(remaining.len(), 1);
     }
 
     #[test]
@@ -5131,7 +5263,10 @@ hooks_auto_accept: false
 
     #[test]
     fn hook_command_session_id_sandbox_quotes_and_guards() {
-        let cmd = hook_command_session_id_sandbox("/tmp/aoe-hooks");
+        let cmd = hook_command_session_id_sandbox(
+            "/tmp/aoe-hooks",
+            crate::agents::HookIdentityField::SessionId,
+        );
         assert!(
             cmd.contains("case \"$AOE_INSTANCE_ID\" in *[!0-9a-zA-Z_-]*) exit 0 ;; esac"),
             "missing instance-id allowlist: {cmd}"
@@ -5161,8 +5296,19 @@ hooks_auto_accept: false
             "missing jq string-type gate: {cmd}"
         );
         assert!(
-            cmd.contains("H=[0-9a-fA-F]"),
-            "missing hex-class abbreviation for UUID case: {cmd}"
+            cmd.contains("case \"$SID\" in \"\"|-*|*[!0-9a-zA-Z._-]*) exit 0 ;; esac"),
+            "missing session-id allowlist: {cmd}"
+        );
+        // Same contract as the host extractor's `is_valid_session_id`, which
+        // refuses a leading `-` so an option-shaped id cannot be written and
+        // then rejected by the reader on the way back out.
+        assert!(
+            cmd.contains("\"\"|-*|"),
+            "sandbox extractor must refuse an option-shaped id like the host: {cmd}"
+        );
+        assert!(
+            cmd.contains("[ \"${#SID}\" -le 256 ] || exit 0"),
+            "missing session-id length guard: {cmd}"
         );
         assert!(
             cmd.contains(".session_id.$$.tmp"),

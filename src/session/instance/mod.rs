@@ -24,24 +24,15 @@ use crate::session::poller::SessionPoller;
 use crate::tmux;
 
 use crate::session::capture::{
-    capture_claude_session_id, capture_claude_session_id_in_container, capture_codex_session_id,
-    capture_copilot_session_id, capture_gemini_session_id, capture_hermes_session_id,
-    capture_kimi_session_id, capture_omp_session_id, capture_prime_agent_session_id,
-    capture_vibe_session_id, claude_poll_fn, claude_poll_fn_sandboxed, codex_poll_fn,
-    codex_poll_fn_sandboxed, copilot_poll_fn, gemini_poll_fn, gemini_poll_fn_sandboxed,
-    generate_session_uuid, hermes_poll_fn, hermes_poll_fn_sandboxed, is_valid_session_id,
-    kimi_poll_fn, omp_host_routing_environment, omp_poll_fn, omp_poll_fn_sandboxed,
-    omp_sandbox_launch_marker, opencode_poll_fn, opencode_poll_fn_sandboxed, prime_agent_poll_fn,
-    reject_omp_secret_args, resolve_omp_store_layout,
-    resolve_omp_store_layout_in_container_with_environment,
-    resolve_omp_store_layout_with_environment, try_capture_codex_session_id_in_container,
-    try_capture_gemini_session_id_in_container, try_capture_hermes_session_id_in_container,
-    try_capture_omp_session_id_in_container, try_capture_opencode_session_id,
-    try_capture_opencode_session_id_in_container, try_capture_vibe_session_id_in_container,
-    validate_omp_capture_metadata, validated_session_id, vibe_poll_fn, vibe_poll_fn_sandboxed,
-    OmpCaptureMetadata, OmpCapturePlan, OmpCliCaptureOptions, OmpStoreKind,
+    capture_omp_session_id, codex_poll_fn_sandboxed_store, gemini_poll_fn_sandboxed_store,
+    generate_session_uuid, hermes_poll_fn_sandboxed_store, is_valid_session_id,
+    kimi_poll_fn_sandboxed_store, omp_host_routing_environment, omp_poll_fn, omp_poll_fn_sandboxed,
+    omp_sandbox_launch_marker, prime_agent_poll_fn_sandboxed_store, reject_omp_secret_args,
+    resolve_omp_store_layout, resolve_omp_store_layout_in_container_with_environment,
+    resolve_omp_store_layout_with_environment, try_capture_omp_session_id_in_container,
+    validate_omp_capture_metadata, validated_session_id, OmpCaptureMetadata, OmpCapturePlan,
+    OmpCliCaptureOptions, OmpStoreKind,
 };
-
 mod accessors;
 mod container;
 mod flags;
@@ -69,17 +60,16 @@ mod status;
 mod status_update;
 mod terminal;
 #[cfg(test)]
-mod test_helpers;
+pub(crate) mod test_helpers;
 mod tmux_session;
 mod types;
 
-pub(crate) use accessors::resolved_agent_for;
 pub use flags::{is_valid_session_color, SessionBucket, SESSION_COLORS};
 pub(crate) use lifecycle::NEWER_GENERATION_BUSY_REASON;
 pub use lifecycle::{LifecycleOperation, LifecycleReservation, LifecycleReservationError};
 pub(crate) use omp::persist_omp_session_to_storage;
 pub use ready::{EnsureReadyError, EnsureReadyOutcome};
-pub(crate) use resume::{should_attempt_resume, ResumeAttemptPolicy};
+pub(crate) use resume::ResumeAttemptPolicy;
 pub(crate) use sid_persist::{persist_session_to_storage, SidPersistOutcome, SidWrite};
 pub use start::{LaunchSidOutcome, StartOutcome};
 pub(crate) use status::PassiveStatusPatch;
@@ -87,6 +77,11 @@ pub use status::{Status, TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR}
 pub(crate) use tmux_session::{
     duplicate_session_error, find_duplicate_session, is_duplicate_session,
 };
+/// Why a session can never resume, decided from the registry alone and
+/// before any runtime probe. `Agent` covers both an unresolved tool and one
+/// with no verified native resume contract; `Sandbox` and `Command` name the
+/// environment and the launch shape that put an otherwise capable agent out
+/// of reach.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResumeStaticUnavailable {
     Agent,
@@ -107,7 +102,9 @@ pub(crate) enum TerminalContextResume {
     ForkPending,
     PreviousFailure,
 }
-pub(crate) use types::{PiSidecarSource, PriorToolSession, ResumeIntent};
+pub(crate) use types::{
+    PiSidecarSource, PriorToolSession, ResumeIntent, SandboxStoreTransitionPath,
+};
 pub use types::{
     PluginCreateIdempotency, SandboxInfo, TerminalInfo, View, WorkspaceInfo, WorkspaceRepo,
     WorktreeInfo,
@@ -115,16 +112,17 @@ pub use types::{
 
 // Re-exported so each submodule can reach its siblings through `use super::*`.
 use hooks::status_hook_env_prefix;
+pub(crate) use hooks::{generic_host_config_path_for, sidecar_host_config_path_for};
 use launch_command::{
-    append_resume_flags, build_fork_flags, shell_stdin_command, splice_subcommand_or_append,
-    PreparedLaunch,
+    append_resume_flags, build_fork_flags, parse_launch_command, shell_stdin_command,
+    splice_subcommand_or_append, PreparedLaunch,
 };
 use omp::{gate_omp_launch, wrap_omp_host_launch, wrap_omp_launch};
 use pane_status::{resolve_detected_status, summarize_error_from_pane};
 use sid_persist::{override_if_distinct, persist_session_to_storage_guarded};
 use status::{UNKNOWN_ERROR_WINDOW_CONFIRMED_PRESENT, UNKNOWN_ERROR_WINDOW_NEVER_PRESENT};
 use tmux_session::tmux_env_session_name_for_instance_id;
-use types::{deserialize_session_id, is_zero_u64};
+use types::{deserialize_session_id, is_zero_u64, is_zero_u8};
 
 /// Runtime bookkeeping that one pane detection leaves for the next.
 ///
@@ -411,6 +409,12 @@ pub struct Instance {
     // Docker sandbox integration
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_info: Option<SandboxInfo>,
+    /// Filesystem generation used by this container's private agent stores.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub(crate) sandbox_store_generation: u8,
+    /// Immutable source and destination pairs while a v027 transition is pending.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) sandbox_store_transition_paths: Vec<SandboxStoreTransitionPath>,
 
     // Paired terminal session
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -579,7 +583,7 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork_pending: Option<String>,
 
-    // Runtime state (not serialized)
+    // Live process state and durable capture-generation guards.
     #[serde(skip)]
     pub last_error_check: Option<std::time::Instant>,
     #[serde(skip)]
@@ -644,20 +648,17 @@ pub struct Instance {
     #[serde(skip)]
     pending_host_env: Vec<(String, String)>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) capture_started_at: Option<std::time::SystemTime>,
+
     /// Set when this pane's launch line carried the Pi session-id extension.
     /// Runtime only: after an AoE restart the pane is still running with it,
     /// and the sidecar it wrote is what says so (see
     /// `uses_pi_session_sidecar`).
     #[serde(skip)]
     pi_extension_launched: bool,
-
-    /// Memo for `declares_agent_config_dir`. Resolving the profile config
-    /// reads several files, and the answer gates the Pi sidecar, which sits on
-    /// the per-refresh path. Runtime only, so an edit to `agent_config_dir`
-    /// lands on the next reload rather than mid-life of a session object.
     #[serde(skip)]
-    agent_config_dir_declared: std::sync::OnceLock<bool>,
-
+    identity_publisher_launched: bool,
     /// Absolute transcript path this Pi pane last published. Pi indexes
     /// sessions by their starting cwd, so this is what resumes a conversation
     /// whose managed worktree has since moved; the id alone would resolve to
@@ -669,20 +670,13 @@ pub struct Instance {
     pub last_error: Option<String>,
     #[serde(skip)]
     pub session_id_poller: Option<Arc<Mutex<SessionPoller>>>,
-
-    /// Runtime-only set of session IDs that retroactive capture must NOT
-    /// re-discover from on-disk artifacts after an explicit resume-target
-    /// invalidation. On-disk artifacts (opencode db, vibe meta.json, codex
-    /// state, etc.) can retain the old row for several minutes.
-    ///
-    /// `#[serde(skip)]` is intentional. If the daemon dies between the
-    /// explicit invalidation clearing the on-disk sid and the artifact decaying
-    /// (~5-10 min), the next launch starts with this set empty and the
-    /// freshly-spawned poller can re-import the bad sid once. The next
-    /// `start_with_resume_fallback` then re-runs the invalidation and clears it
-    /// again. Self-healing within one cycle; persisting a TTL set isn't
-    /// worth the schema cost.
+    /// Runtime backoff after managed-store ownership or lease contention.
     #[serde(skip)]
+    pub(crate) session_id_poller_retry_after: Option<std::time::Instant>,
+    /// Session IDs invalidated at a fresh-generation boundary. Persisting this
+    /// set prevents a process restart from resurrecting an abandoned ID from a
+    /// still-present upstream artifact.
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
     pub(crate) retroactive_capture_excludes: HashSet<String>,
 
     /// Cached `is_pane_dead()` reading from the most recent status_poller

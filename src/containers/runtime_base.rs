@@ -57,6 +57,8 @@ pub(crate) struct RuntimeBase {
     /// `run` does not take these modes, so a configured `sandbox.network` is
     /// skipped with a warning there rather than emitting a flag that fails.
     pub supports_network_mode: bool,
+    /// Whether `run --label key=value` and label inspection are supported.
+    pub supports_labels: bool,
     /// Case-insensitive stderr substrings that identify a "container does not
     /// exist" error for this runtime. Each runtime words it differently (Docker
     /// "No such container", Apple Container "notFound … not found"), so the
@@ -97,6 +99,7 @@ impl RuntimeBase {
         supports_named_volumes: true,
         supports_selinux_relabel: true,
         supports_network_mode: true,
+        supports_labels: true,
         not_found_markers: &["no such container"],
         // moby/moby client/errors.go connectionFailed() is the single source
         // of this message across every Docker OS variant (macOS Desktop, Linux
@@ -124,6 +127,7 @@ impl RuntimeBase {
         supports_named_volumes: false,
         supports_selinux_relabel: false,
         supports_network_mode: false,
+        supports_labels: true,
         // Apple Container surfaces a missing container with two distinct
         // wordings depending on the subcommand:
         // - `container delete`/`container logs`: `notFound: "container with
@@ -168,6 +172,7 @@ impl RuntimeBase {
         supports_named_volumes: true,
         supports_selinux_relabel: true,
         supports_network_mode: true,
+        supports_labels: true,
         not_found_markers: &["no such container"],
         // Two distinct daemon-down wordings observed in real Podman output:
         // - "connect to Podman socket" fires on Linux socket mode
@@ -431,6 +436,16 @@ impl RuntimeBase {
             "-w".to_string(),
             config.working_dir.clone(),
         ];
+
+        if self.supports_labels {
+            args.push("--label".to_string());
+            args.push("com.agent-of-empires.sandbox-store-generation=2".to_string());
+            args.push("--label".to_string());
+            args.push(format!(
+                "com.agent-of-empires.mount-fingerprint={}",
+                config.mount_fingerprint()
+            ));
+        }
 
         for vol in &config.volumes {
             if !self.supports_read_only_volumes && vol.read_only {
@@ -1568,6 +1583,21 @@ mod tests {
             !volume_args.iter().any(|a| a.contains("aoe-vi-")),
             "Apple Container must not use the volume name in -v args"
         );
+    }
+
+    #[test]
+    fn store_generation_label_is_emitted_by_supported_runtimes() {
+        let config = ContainerConfig::default();
+        for base in [
+            RuntimeBase::DOCKER,
+            RuntimeBase::PODMAN,
+            RuntimeBase::APPLE_CONTAINER,
+        ] {
+            let args = base.build_create_args("c", "image", &config);
+            assert!(args.windows(2).any(|pair| {
+                pair == ["--label", "com.agent-of-empires.sandbox-store-generation=2"]
+            }));
+        }
     }
 
     #[test]

@@ -119,7 +119,7 @@ use super::{
 /// `sessions.json` and `groups.json` and covers both: every code path that
 /// mutates them does so as a pair under the same in-process mutex, so a
 /// single sidecar is sufficient and avoids any sub-file lock-ordering rule.
-const STORAGE_LOCK_FILENAME: &str = ".storage.lock";
+pub(crate) const STORAGE_LOCK_FILENAME: &str = ".storage.lock";
 
 /// Sidecar lock file name for the global workspace-ordering file. Lives in
 /// `<app_dir>` next to `workspace-ordering.json`.
@@ -537,6 +537,29 @@ impl Drop for StorageFlock {
     }
 }
 
+fn app_dir_for_profile_dir(profile_dir: &Path) -> &Path {
+    profile_dir
+        .parent()
+        .filter(|parent| parent.file_name().is_some_and(|name| name == "profiles"))
+        .and_then(Path::parent)
+        .unwrap_or(profile_dir)
+}
+
+fn acquire_transition_flocks_for_profile_dirs(profile_dirs: &[&Path]) -> Result<Vec<StorageFlock>> {
+    let mut app_dirs: Vec<PathBuf> = profile_dirs
+        .iter()
+        .map(|dir| app_dir_for_profile_dir(dir).to_path_buf())
+        .collect();
+    app_dirs.sort();
+    app_dirs.dedup();
+    app_dirs
+        .iter()
+        .map(|dir| {
+            acquire_storage_shared_flock(dir, crate::migrations::v027_isolate_sandbox_stores::LOCK)
+        })
+        .collect()
+}
+
 #[cfg(unix)]
 fn same_filesystem_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
@@ -642,6 +665,34 @@ fn acquire_open_storage_flock(file: fs::File, path: &Path) -> Result<StorageFloc
     }
     Ok(StorageFlock { file })
 }
+fn acquire_open_storage_shared_flock(file: fs::File, path: &Path) -> Result<StorageFlock> {
+    if let Err(e) = FileExt::try_lock_shared(&file) {
+        if e.kind() != std::io::ErrorKind::WouldBlock {
+            return Err(e.into());
+        }
+        let started = Instant::now();
+        let mut warned = false;
+        loop {
+            match FileExt::try_lock_shared(&file) {
+                Ok(()) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if !warned && started.elapsed() >= FLOCK_WAIT_WARN_AFTER {
+                        tracing::warn!(
+                            target: "session.store",
+                            path = %path.display(),
+                            "storage transition flock contended for >1s; migration is active"
+                        );
+                        warned = true;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+    Ok(StorageFlock { file })
+}
+
 /// Acquire the app-wide session identity-mutation lock.
 ///
 /// Callers must take this before loading authoritative profile storage and
@@ -806,6 +857,11 @@ fn atomic_write_verified_resolved(path: &Path, content: &[u8]) -> Result<PathBuf
 pub(crate) fn acquire_storage_flock(dir: &Path, name: &str) -> Result<StorageFlock> {
     let (file, path) = open_storage_lock_file(dir, name)?;
     acquire_open_storage_flock(file, &path)
+}
+
+pub(crate) fn acquire_storage_shared_flock(dir: &Path, name: &str) -> Result<StorageFlock> {
+    let (file, path) = open_storage_lock_file(dir, name)?;
+    acquire_open_storage_shared_flock(file, &path)
 }
 
 pub struct Storage {
@@ -1225,6 +1281,10 @@ impl Storage {
                 self.sessions_path.display()
             )
         })?;
+        let _transition = acquire_storage_shared_flock(
+            app_dir_for_profile_dir(profile_dir),
+            crate::migrations::v027_isolate_sandbox_stores::LOCK,
+        )?;
         let _flock = acquire_storage_flock(profile_dir, STORAGE_LOCK_FILENAME)?;
         self.update_under_lock(f)
     }
@@ -1381,6 +1441,8 @@ impl Storage {
             .sessions_path
             .parent()
             .ok_or_else(|| anyhow!("sessions path has no parent"))?;
+        let _transition_flocks =
+            acquire_transition_flocks_for_profile_dirs(&[first_dir, second_dir])?;
         let (first_lock_file, first_lock_path) =
             open_storage_lock_file(first_dir, STORAGE_LOCK_FILENAME)?;
         let (second_lock_file, second_lock_path) =
@@ -2347,6 +2409,7 @@ where
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let first_dir = first.sessions_path.parent().unwrap();
     let second_dir = second.sessions_path.parent().unwrap();
+    let _transition_flocks = acquire_transition_flocks_for_profile_dirs(&[first_dir, second_dir])?;
     let (first_file, first_path) = open_storage_lock_file(first_dir, STORAGE_LOCK_FILENAME)?;
     let (second_file, second_path) = open_storage_lock_file(second_dir, STORAGE_LOCK_FILENAME)?;
     if same_filesystem_identity(&first_file.metadata()?, &second_file.metadata()?) {
@@ -4934,6 +4997,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn profile_move_crash_recovery_target_wins_from_each_crash_point() -> Result<()> {
         // One case per crash point #3459 requires: target write/fsync,
         // source group write/fsync, source session write/fsync. In all
@@ -5000,6 +5064,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn profile_move_crash_before_publication_source_wins() -> Result<()> {
         // Crash right after the journal is written but before any row was
         // touched: the evidence says the target never published, so the

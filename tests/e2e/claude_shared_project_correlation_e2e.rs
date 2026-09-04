@@ -1,24 +1,9 @@
-//! Full-stack e2e: two Claude sessions sharing ONE project path each correlate
-//! to their OWN Claude session UUID and never swap.
+//! Full-stack e2e: two Claude sessions sharing one project keep identities
+//! scoped to their own authoritative per-pane hook sidecars.
 //!
-//! This guards two shipped hardenings against silent regression:
-//!   * #1735, the per-instance hook sidecar fast path. `claude_poll_fn`
-//!     (`src/session/capture/mod.rs`) reads
-//!     `/tmp/aoe-hooks-<euid>/<instance_id>/session_id` first and returns it
-//!     without touching the shared `~/.claude/projects/<encoded-cwd>/` scan, so an
-//!     "empty thread" session (a UUID minted but no transcript on disk yet)
-//!     still resolves to its own id.
-//!   * #1744, the filesystem-scan exclusion. When a session has no sidecar it
-//!     falls back to the filesystem scan, and `compose_exclusion` /
-//!     `build_exclusion_set` remove every UUID a live peer already captured
-//!     (published via the peer's hidden `AOE_CAPTURED_SESSION_ID` tmux env), so
-//!     a session never adopts a co-located peer's fresher `<uuid>.jsonl`.
-//!
-//! Both variants assert POSITIVELY that each session's persisted
-//! `agent_session_id` equals ITS OWN shim UUID. The sync guard (#2708) turns a
-//! mis-pick into `None` (or a stuck launch-minted id) rather than a visible
-//! swap, so a "session A != session B" assertion would pass even on a real
-//! regression; only the positive per-session check has teeth.
+//! Variant 1 proves an empty thread resolves from its sidecar. Variant 2 proves
+//! shared transcript files are not an identity source: without a sidecar, the
+//! session retains its launch-pinned UUID while its peer resolves independently.
 //!
 //! `claude_poll_fn` runs inside whichever process owns the session's poller,
 //! and that process is the one that persists observations into `sessions.json`:
@@ -68,21 +53,13 @@ const CORRELATE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const SHIM_DEADLINE: Duration = Duration::from_secs(10);
 const SHIM_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// One session's setup: what the shim publishes, the id it publishes, and (when
-/// set) how far in the past its jsonl mtime is pinned, fixing the relative sort
-/// order of the two co-located jsonls in a filesystem scan (deterministic, no
-/// sleep).
+/// One session's authoritative sidecar and untrusted transcript fixtures.
 struct SessionSpec {
     title: &'static str,
     sidecar: bool,
     jsonl: bool,
     uuid: &'static str,
     jsonl_mtime_secs_ago: Option<u64>,
-    /// Seed this session's persisted `agent_session_id` before the poller host
-    /// loads, marking it an established peer (see `preset_agent_session_id`).
-    /// Only the peer whose id a filesystem-scan session must exclude needs this;
-    /// the session under test never sets it.
-    established_peer: bool,
 }
 
 /// Encode a project path the way `encode_claude_project_path` does: every
@@ -207,8 +184,7 @@ fn sessions_path(h: &TuiTestHarness) -> PathBuf {
     app_dir_in(h.home_path()).join("profiles/default/sessions.json")
 }
 
-/// Read sessions.json, tolerating a missing or mid-write file (returns Null):
-/// `await_correlated` polls it while the poller host is actively rewriting it.
+/// Read sessions.json while the poller host may be rewriting it.
 fn read_sessions(h: &TuiTestHarness) -> Value {
     let content = std::fs::read_to_string(sessions_path(h)).unwrap_or_default();
     serde_json::from_str(&content).unwrap_or(Value::Null)
@@ -224,19 +200,22 @@ fn agent_session_id_of(sessions: &Value, instance_id: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Wait until each session's persisted `agent_session_id` equals its own shim
-/// UUID, and stays there across two consecutive reads. The stability check
-/// rejects a mid-convergence transient and a flip-flopping regression alike.
-/// Polls every 250ms up to a 30s deadline; on timeout it panics with a full
-/// diagnostic dump.
-fn await_correlated(h: &TuiTestHarness, id_a: &str, uuid_a: &str, id_b: &str, uuid_b: &str) {
+/// Wait until both persisted identities match their expected authoritative
+/// values across two consecutive reads.
+fn await_expected_ids(
+    h: &TuiTestHarness,
+    id_a: &str,
+    expected_a: &str,
+    id_b: &str,
+    expected_b: &str,
+) {
     let deadline = Instant::now() + CORRELATE_DEADLINE;
     let mut consecutive_ok = 0;
     loop {
         let sessions = read_sessions(h);
         let a = agent_session_id_of(&sessions, id_a);
         let b = agent_session_id_of(&sessions, id_b);
-        if a.as_deref() == Some(uuid_a) && b.as_deref() == Some(uuid_b) {
+        if a.as_deref() == Some(expected_a) && b.as_deref() == Some(expected_b) {
             consecutive_ok += 1;
             if consecutive_ok >= 2 {
                 return;
@@ -256,25 +235,23 @@ fn await_correlated(h: &TuiTestHarness, id_a: &str, uuid_a: &str, id_b: &str, uu
                 .unwrap_or_default();
             let debug_log = std::fs::read_to_string(app_dir_in(h.home_path()).join("debug.log"))
                 .unwrap_or_default();
-            let dbg_lines: Vec<&str> = debug_log
+            let dbg_tail = debug_log
                 .lines()
-                .filter(|l| {
-                    l.contains("session.sync")
-                        || l.contains("session.capture")
-                        || l.contains("session.store")
+                .filter(|line| {
+                    line.contains("session.sync")
+                        || line.contains("session.capture")
+                        || line.contains("session.store")
                 })
-                .collect();
-            let dbg_tail = dbg_lines
-                .iter()
                 .rev()
                 .take(40)
+                .collect::<Vec<_>>()
+                .into_iter()
                 .rev()
-                .copied()
                 .collect::<Vec<_>>()
                 .join("\n");
             panic!(
-                "session ids never correlated within {CORRELATE_DEADLINE:?}.\n\
-                 expected: [{id_a}]={uuid_a}, [{id_b}]={uuid_b}\n\
+                "session ids did not stabilize within {CORRELATE_DEADLINE:?}.\n\
+                 expected: [{id_a}]={expected_a}, [{id_b}]={expected_b}\n\
                  observed: [{id_a}]={a:?}, [{id_b}]={b:?}\n\
                  AOE_INSTANCE_ID-missing marker: {shim_no_inst}, role-missing marker: {shim_no_role}\n\
                  tmux sessions:\n{tmux_ls}\n\
@@ -332,36 +309,6 @@ impl Drop for HookDirCleanup {
     }
 }
 
-/// Persist `uuid` as the session's `agent_session_id` in sessions.json. Used to
-/// seed an established peer: on load the poller host republishes
-/// `AOE_CAPTURED_SESSION_ID` from `agent_session_id` (`src/tui/home/lifecycle.rs`)
-/// before it starts any poller, so a co-located filesystem-scan session excludes this
-/// peer's id from its very first poll. Without this, the peer's own poller only
-/// publishes its captured id AFTER observing it, racing the filesystem-scan session; a
-/// transient double-claim then hits the #2708 collision-drop and strands both
-/// peers on their launch-minted ids. It seeds only the peer (never the session
-/// under test), so the sidecar read (#1735) and the exclusion consultation
-/// (#1744) stay the load-bearing paths.
-fn preset_agent_session_id(h: &TuiTestHarness, instance_id: &str, uuid: &str) {
-    let path = sessions_path(h);
-    let mut sessions = read_sessions(h);
-    let row = sessions
-        .as_array_mut()
-        .and_then(|a| a.iter_mut().find(|s| s["id"].as_str() == Some(instance_id)))
-        .unwrap_or_else(|| panic!("no session row with id {instance_id}"));
-    row.as_object_mut()
-        .expect("session row must be an object")
-        .insert(
-            "agent_session_id".to_string(),
-            Value::String(uuid.to_string()),
-        );
-    std::fs::write(
-        &path,
-        serde_json::to_string_pretty(&sessions).expect("reserialize sessions"),
-    )
-    .unwrap_or_else(|e| panic!("failed to write {}: {e}", path.display()));
-}
-
 /// Block until the shim for `instance_id` has recorded its uuid-map entry,
 /// proving it ran its role (wrote the sidecar and/or jsonl) before the poller
 /// host starts observing.
@@ -409,9 +356,8 @@ fn launch_session(h: &TuiTestHarness, instance_id: &str, title: &str) {
     );
 }
 
-/// Shared driver: launch two Claude sessions on the SAME project path, apply
-/// their roles, attach the native TUI as the poller host, and wait for each to
-/// correlate to its own shim UUID.
+/// Launch two Claude sessions on the same project, then verify each keeps the
+/// identity permitted by its authoritative sidecar state.
 fn run_shared_project_correlation(test_name: &str, spec_a: SessionSpec, spec_b: SessionSpec) {
     require_tmux!();
 
@@ -454,35 +400,41 @@ fn run_shared_project_correlation(test_name: &str, spec_a: SessionSpec, spec_b: 
     launch_session(&h, &id_a, spec_a.title);
     launch_session(&h, &id_b, spec_b.title);
 
-    // Ensure both shims have published their sidecar/jsonl before the poller host
-    // starts, then seed any established peer so a filesystem-scan session excludes
-    // its id from its very first poll.
     wait_for_shim(&h, &id_a);
     wait_for_shim(&h, &id_b);
-    for (id, spec) in [(&id_a, &spec_a), (&id_b, &spec_b)] {
-        if spec.established_peer {
-            preset_agent_session_id(&h, id, spec.uuid);
-        }
+
+    let launched = read_sessions(&h);
+    let expected_a = if spec_a.sidecar {
+        spec_a.uuid.to_string()
+    } else {
+        agent_session_id_of(&launched, &id_a).expect("Claude launch must pin an identity")
+    };
+    let expected_b = if spec_b.sidecar {
+        spec_b.uuid.to_string()
+    } else {
+        agent_session_id_of(&launched, &id_b).expect("Claude launch must pin an identity")
+    };
+    if !spec_a.sidecar {
+        assert_ne!(
+            expected_a, spec_a.uuid,
+            "transcript UUID must not be adopted"
+        );
+        assert_ne!(
+            expected_a, spec_b.uuid,
+            "peer transcript UUID must not be adopted"
+        );
     }
 
-    // Attach the poller host (see the module docs for why the TUI, not a daemon).
     h.spawn_tui();
     h.wait_for_ready();
 
-    await_correlated(&h, &id_a, spec_a.uuid, &id_b, spec_b.uuid);
+    await_expected_ids(&h, &id_a, &expected_a, &id_b, &expected_b);
     assert_shim_recorded(&h, &id_a, spec_a.uuid);
     assert_shim_recorded(&h, &id_b, spec_b.uuid);
 }
 
-/// Variant 1 (guards #1735, the sidecar fast path): session A is an empty
-/// thread with a sidecar but NO jsonl on disk, so the sidecar is the ONLY
-/// source of A's UUID. Session B has both a sidecar and a fresh jsonl.
-///
-/// Load-bearing: revert the sidecar read and A drops to the filesystem scan
-/// with no jsonl of its own, so it either finds nothing (and stays on its
-/// launch-minted id) or wrongly picks B's file, which the sync guard then
-/// rejects (B owns it). Either way `[A] == uuidA` fails. Determinism rests on
-/// file presence/absence, not mtime timing.
+/// An empty thread has no transcript, so only its sidecar can replace the
+/// launch-pinned UUID with the hook-reported UUID.
 #[test]
 #[parallel]
 fn claude_shared_project_correlation_variant1_sidecar_authoritative() {
@@ -494,7 +446,6 @@ fn claude_shared_project_correlation_variant1_sidecar_authoritative() {
             jsonl: false,
             uuid: UUID_A,
             jsonl_mtime_secs_ago: None,
-            established_peer: false,
         },
         SessionSpec {
             title: "shared-B",
@@ -502,29 +453,16 @@ fn claude_shared_project_correlation_variant1_sidecar_authoritative() {
             jsonl: true,
             uuid: UUID_B,
             jsonl_mtime_secs_ago: None,
-            established_peer: false,
         },
     );
 }
 
-/// Variant 2 (guards #1744, the filesystem-scan exclusion): session A has NO
-/// sidecar and an OLDER jsonl; session B has a sidecar and a strictly NEWER
-/// jsonl. Because B is seeded as an established peer, the poller host
-/// republishes B's captured UUID before any poller starts, so A's filesystem
-/// scan excludes it on the very first poll and returns A's own older jsonl.
-///
-/// Load-bearing: revert the exclusion and A's scan picks the strictly-newer B
-/// file, which the sync guard refuses to adopt (B owns it), so `[A]` stays on
-/// its launch-minted id and `[A] == uuidA` fails. Determinism rests on the
-/// explicit mtime ordering (A older, B newer) pinned via `touch -r`, never a
-/// sleep. A is only far enough back to sort before B while staying well inside
-/// the 5 minute freshness window across the roughly 30s correlation wait, so its
-/// jsonl never ages out mid-run. Only A carries the teeth here; B is the
-/// established peer, and its own correlation via the sidecar is covered by
-/// Variant 1.
+/// A session without a sidecar keeps its launch-pinned UUID even when its own
+/// and a peer's transcript files exist. The peer still resolves from its own
+/// sidecar.
 #[test]
 #[parallel]
-fn claude_shared_project_correlation_variant2_filesystem_scan_exclusion() {
+fn claude_shared_project_correlation_variant2_filesystem_scan_rejected() {
     run_shared_project_correlation(
         "claude_shared_v2",
         SessionSpec {
@@ -533,7 +471,6 @@ fn claude_shared_project_correlation_variant2_filesystem_scan_exclusion() {
             jsonl: true,
             uuid: UUID_A,
             jsonl_mtime_secs_ago: Some(60),
-            established_peer: false,
         },
         SessionSpec {
             title: "shared-B",
@@ -541,7 +478,6 @@ fn claude_shared_project_correlation_variant2_filesystem_scan_exclusion() {
             jsonl: true,
             uuid: UUID_B,
             jsonl_mtime_secs_ago: Some(20),
-            established_peer: true,
         },
     );
 }

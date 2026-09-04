@@ -48,6 +48,9 @@ impl Instance {
             worktree_info: None,
             workspace_info: None,
             sandbox_info: None,
+            sandbox_store_generation:
+                crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION,
+            sandbox_store_transition_paths: Vec::new(),
             terminal_info: None,
             agent_session_id: None,
             omp_capture_generation: None,
@@ -77,11 +80,13 @@ impl Instance {
             unknown_since: None,
             detection: DetectionState::default(),
             pending_host_env: Vec::new(),
+            capture_started_at: None,
             pi_extension_launched: false,
-            agent_config_dir_declared: std::sync::OnceLock::new(),
+            identity_publisher_launched: false,
             pi_session_path: None,
             last_error: None,
             session_id_poller: None,
+            session_id_poller_retry_after: None,
             retroactive_capture_excludes: HashSet::new(),
             pane_dead_observed: false,
             file_watch: None,
@@ -182,18 +187,283 @@ impl Instance {
     /// ([`status_hook_env_prefix`]) and skips hook install, so every hook the
     /// agent does have bails on `[ -n "$AOE_INSTANCE_ID" ]` and the session
     /// reports Idle forever with nothing logged.
-    pub(super) fn resolved_agent(&self) -> Option<&'static crate::agents::AgentDef> {
+    pub(crate) fn resolved_agent(&self) -> Option<&'static crate::agents::AgentDef> {
         resolved_agent_for(&self.source_profile, &self.tool, &self.detect_as)
     }
 
-    /// The built-in agent name whose capture and resume behavior applies to
-    /// this session. Both paths fail closed on an unknown tool, so keying them
-    /// off `tool` raw leaves a custom wrapper with no poller, no pre-minted id
-    /// and no resume flag, silently and forever (#3638).
+    /// The built-in identity used to compare capture stores and aliases.
+    ///
+    /// This is classification only. Capture and resume authorization still
+    /// goes through `resolved_session_support` or `supports_native_resume`,
+    /// which also prove the launch command and capture context.
     pub(crate) fn capture_agent_name(&self) -> Option<&'static str> {
         self.resolved_agent().map(|a| a.name)
     }
+    /// Whether a launch fragment carries shell syntax the pane's shell would
+    /// act on, so the agent is not what the command word names.
+    fn contains_active_shell_syntax(value: &str) -> bool {
+        let mut quote = None;
+        let mut escaped = false;
+        for ch in value.chars() {
+            if matches!(ch, '\n' | '\r') {
+                return true;
+            }
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match quote {
+                Some('\'') => {
+                    if ch == '\'' {
+                        quote = None;
+                    }
+                }
+                Some('"') => match ch {
+                    '"' => quote = None,
+                    '\\' => escaped = true,
+                    '$' | '`' => return true,
+                    _ => {}
+                },
+                _ => match ch {
+                    '\'' | '"' => quote = Some(ch),
+                    '\\' => escaped = true,
+                    '|' | '&' | ';' | '<' | '>' | '(' | ')' | '#' | '`' | '$' | '*' | '?' | '['
+                    | ']' | '{' | '}' | '~' | '!' => return true,
+                    _ => {}
+                },
+            }
+        }
+        false
+    }
 
+    pub(crate) fn launch_invokes_resolved_agent_directly(
+        &self,
+        agent: &crate::agents::AgentDef,
+    ) -> bool {
+        let contains_active_shell_syntax = Self::contains_active_shell_syntax;
+        let raw_command = self.get_tool_command();
+        let launch_extra_args = if self.command.is_empty() {
+            crate::session::config::quote_model_value_in_args(&self.extra_args)
+        } else {
+            self.extra_args.clone()
+        };
+        if raw_command.trim().is_empty()
+            || contains_active_shell_syntax(raw_command)
+            || contains_active_shell_syntax(&launch_extra_args)
+        {
+            return false;
+        }
+        let Some(parsed_command) = parse_launch_command(raw_command) else {
+            return false;
+        };
+        let mut words = parsed_command.words;
+        if let Ok(extra) = shell_words::split(&self.extra_args) {
+            words.extend(extra);
+        } else {
+            return false;
+        }
+        words
+            .first()
+            .is_some_and(|executable| executable == agent.binary)
+            && !words.iter().any(|word| word == "--")
+    }
+
+    /// The basename of the program this launch actually runs, which is the
+    /// token a live process carries in argv.
+    ///
+    /// A command override names it; otherwise it is the resolved agent's own
+    /// binary. Matching on this rather than on `agent.binary` is what lets the
+    /// orphan scan see a renamed wrapper, which carries the pane's
+    /// `AOE_INSTANCE_ID` because [`status_hook_env_prefix`] injects the marker
+    /// on hook presence alone.
+    pub(crate) fn launch_executable_token(&self) -> Option<String> {
+        let words = parse_launch_command(self.get_tool_command())?.words;
+        Path::new(words.first()?)
+            .file_name()?
+            .to_str()
+            .map(str::to_owned)
+    }
+
+    /// Whether a resume selector appended to this launch reaches the agent.
+    ///
+    /// [`Self::launch_invokes_resolved_agent_directly`] is the stricter test
+    /// and stays the one that authorizes capture: inferring ownership from a
+    /// store, mirroring a binary under `opencode serve`, or matching a process
+    /// by argv all need the agent's own name. Emitting a selector needs less.
+    /// A single bare token is the program the pane runs whatever it is called,
+    /// which is the wrapper shape `custom_agents` and `agent_command_override`
+    /// document, and `agent_detect_as` is the user declaring what it wraps.
+    /// Refusing it takes resume away from every renamed wrapper and each
+    /// restart silently starts a fresh conversation (#3638).
+    ///
+    /// A path-qualified token still fails: a bare one resolves through the
+    /// launch shell's `PATH`, which AoE controls, and a path escapes it.
+    pub(crate) fn launch_can_carry_resume_selector(&self, agent: &crate::agents::AgentDef) -> bool {
+        if self.launch_invokes_resolved_agent_directly(agent) {
+            return true;
+        }
+        let Some(parsed_command) = parse_launch_command(self.get_tool_command()) else {
+            return false;
+        };
+        let [token] = parsed_command.words.as_slice() else {
+            return false;
+        };
+        if token.contains('/') || token.starts_with('-') {
+            return false;
+        }
+        if Self::contains_active_shell_syntax(self.get_tool_command())
+            || Self::contains_active_shell_syntax(&self.extra_args)
+        {
+            return false;
+        }
+        shell_words::split(&self.extra_args)
+            .is_ok_and(|extra| !extra.iter().any(|word| word == "--"))
+    }
+
+    /// Whether this launch shape leaves Claude user hooks enabled.
+    ///
+    /// This is evidence for the identity publisher only. It does not change
+    /// native resume support.
+    pub(crate) fn hook_session_publisher_allowed_by_argv(&self) -> bool {
+        if !self
+            .resolved_agent()
+            .is_some_and(|agent| agent.name == "claude")
+        {
+            return true;
+        }
+        let Some(parsed_command) = parse_launch_command(self.get_tool_command()) else {
+            return false;
+        };
+        let mut words = parsed_command.words;
+        let Ok(extra) = shell_words::split(&self.extra_args) else {
+            return false;
+        };
+        words.extend(extra);
+        if words.iter().any(|word| {
+            matches!(word.as_str(), "--safe-mode" | "--bare")
+                || word.starts_with("--safe-mode=")
+                || word.starts_with("--bare=")
+        }) {
+            return false;
+        }
+
+        let mut setting_sources: Option<Option<&str>> = None;
+        let mut index = 0;
+        while index < words.len() {
+            let word = words[index].as_str();
+            if word == "--setting-sources" {
+                setting_sources = Some(
+                    words
+                        .get(index + 1)
+                        .map(String::as_str)
+                        .filter(|value| !value.starts_with('-')),
+                );
+                index += 2;
+                continue;
+            }
+            if let Some(value) = word.strip_prefix("--setting-sources=") {
+                setting_sources = Some(Some(value));
+            }
+            index += 1;
+        }
+        match setting_sources {
+            None => true,
+            Some(Some(value)) => value.split(',').any(|source| source.trim() == "user"),
+            Some(None) => false,
+        }
+    }
+
+    pub(super) fn resolved_session_support(
+        &self,
+    ) -> Option<(
+        &'static crate::agents::SessionCaptureSpec,
+        crate::agents::SessionCaptureContext,
+    )> {
+        let agent = self.resolved_agent()?;
+        let support = agent.session_support.as_ref()?;
+        let capture = support.capture.as_ref()?;
+        let context = if self.is_sandboxed() {
+            capture.sandbox
+        } else {
+            capture.host
+        };
+        if context == crate::agents::SessionCaptureContext::Unsupported {
+            return None;
+        }
+        // These backends publish under this pane's own `AOE_INSTANCE_ID`, so
+        // the write proves its own attribution and a renamed wrapper cannot
+        // claim another pane's conversation. The rest infer ownership from the
+        // launch itself: OMP reads a store it routed through the launch
+        // environment, OpenCode mirrors the binary under `opencode serve`, and
+        // the managed stores match on cwd and a launch floor. Those need the
+        // agent's own binary on the command line to mean anything.
+        let self_attributing = matches!(
+            capture.backend,
+            crate::agents::SessionCaptureBackend::Claude
+                | crate::agents::SessionCaptureBackend::HookSidecar
+                | crate::agents::SessionCaptureBackend::Pi
+        );
+        let authorized = if self_attributing {
+            self.launch_can_carry_resume_selector(agent)
+        } else {
+            self.launch_invokes_resolved_agent_directly(agent)
+        };
+        authorized.then_some((capture, context))
+    }
+
+    pub(super) fn resolved_capture_backend(&self) -> Option<crate::agents::SessionCaptureBackend> {
+        self.resolved_session_support()
+            .map(|(capture, _)| capture.backend)
+    }
+
+    pub fn supports_native_resume(&self) -> bool {
+        let Some(agent) = self.resolved_agent() else {
+            return false;
+        };
+        if !self.launch_can_carry_resume_selector(agent) {
+            return false;
+        }
+        if agent.session_support.is_none() {
+            return false;
+        }
+        // Automatic capture in this environment, or an id the user named
+        // themselves, which stays authoritative where capture is unsupported.
+        self.resolved_session_support().is_some()
+            || matches!(
+                self.resume_intent,
+                ResumeIntent::Use(_) | ResumeIntent::Fork { .. }
+            )
+    }
+
+    pub(super) fn sandbox_capture_store_dir(&self) -> Option<std::path::PathBuf> {
+        if !self.is_sandboxed() {
+            return None;
+        }
+        let home = dirs::home_dir()?;
+        let config = crate::session::config::profile_config::resolve_config_or_warn(
+            &self.effective_profile(),
+        );
+        let declared = config.session.agent_config_dir_for(&self.tool, &home);
+        let agent = self.resolved_agent()?;
+        if self.sandbox_store_generation
+            < crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION
+        {
+            return crate::session::config::container_config::legacy_sandbox_store_dir(
+                agent.name,
+                &home,
+                declared.as_deref(),
+                (self.sandbox_store_generation == 0).then_some(self.id.as_str()),
+            );
+        }
+        crate::session::config::container_config::sandbox_store_dir(
+            agent.name,
+            &home,
+            declared.as_deref(),
+            &self.id,
+        )
+        .ok()
+        .flatten()
+    }
     pub fn is_sub_session(&self) -> bool {
         self.parent_session_id.is_some()
     }
@@ -246,11 +516,9 @@ impl Instance {
     }
 }
 
-/// [`Instance::resolved_agent`] for a bare `(profile, tool)` pair, so state
-/// keyed by tool name outside an `Instance` (parked conversations, peer rows)
-/// resolves its built-in the same way the row itself would. Pass an empty
-/// `detect_as` when no stored alias exists; the live registry answers then.
-pub(crate) fn resolved_agent_for(
+/// Resolve a built-in from the instance's stored alias or its profile registry.
+/// The stored value wins; legacy rows with no value consult the live registry.
+fn resolved_agent_for(
     profile: &str,
     tool: &str,
     detect_as: &str,
@@ -550,7 +818,129 @@ mod tests {
         );
         assert_eq!(
             status_hook_env_prefix(&inst.effective_profile(), "abc123", inst.resolved_agent()),
-            format!("AOE_PROFILE='{PROFILE}' AOE_INSTANCE_ID='abc123' "),
+            format!(
+                "AOE_PROFILE='{PROFILE}' AOE_INSTANCE_ID='abc123' AOE_HOOK_BIN={} ",
+                shell_escape(&std::env::current_exe().unwrap().to_string_lossy())
+            ),
         );
+    }
+    #[test]
+    fn native_resume_requires_a_direct_local_builtin_launch() {
+        const PROFILE: &str = "resume-custom-launch-test";
+        let _registry = install_aliases(PROFILE, &[("work-claude", "claude")]);
+
+        let mut inst = Instance::new("custom", "/tmp/custom");
+        inst.source_profile = PROFILE.to_string();
+        inst.tool = "work-claude".to_string();
+
+        inst.command = "claude --model opus".to_string();
+        assert!(inst.supports_native_resume());
+
+        inst.tool = "claude".to_string();
+        assert!(inst.supports_native_resume());
+        inst.command = "ssh -t host claude".to_string();
+        assert!(!inst.supports_native_resume());
+        inst.command = "claude > /tmp/transcript".to_string();
+        assert!(!inst.supports_native_resume());
+
+        for command in [
+            "claude $BARRIER",
+            "claude ${BARRIER}",
+            "claude *",
+            "claude session-?",
+            "claude [abc]",
+            "claude {one,two}",
+            "claude ~/thread",
+        ] {
+            inst.command = command.to_string();
+            assert!(!inst.supports_native_resume(), "accepted {command:?}");
+        }
+
+        inst.command = "/opt/wrappers/claude".to_string();
+        assert!(!inst.supports_native_resume());
+
+        inst.command = "./claude".to_string();
+        assert!(!inst.supports_native_resume());
+
+        inst.command = "claude".to_string();
+        inst.extra_args = "--model opus | tee /tmp/transcript".to_string();
+        assert!(!inst.supports_native_resume());
+        inst.extra_args = "--append-system-prompt $PROMPT".to_string();
+        assert!(!inst.supports_native_resume());
+        inst.command.clear();
+        inst.extra_args = "--model sonnet[1m]".to_string();
+        assert!(inst.supports_native_resume());
+
+        inst.extra_args.clear();
+        inst.command = "claude # local note".to_string();
+        assert!(!inst.supports_native_resume());
+
+        inst.command = "claude".to_string();
+        inst.extra_args = "--model opus # local note".to_string();
+        assert!(!inst.supports_native_resume());
+
+        for value in ["claude\n", "claude\r", "claude\r\n"] {
+            inst.command = value.to_string();
+            inst.extra_args.clear();
+            assert!(!inst.supports_native_resume(), "accepted {value:?}");
+        }
+        inst.command = "claude --".to_string();
+        inst.extra_args.clear();
+        assert!(!inst.supports_native_resume());
+        inst.command = "claude".to_string();
+        inst.extra_args = "--".to_string();
+        assert!(!inst.supports_native_resume());
+
+        inst.command = "claude".to_string();
+        for value in ["--model opus\n", "--model opus\r", "--model opus\r\n"] {
+            inst.extra_args = value.to_string();
+            assert!(!inst.supports_native_resume(), "accepted {value:?}");
+        }
+    }
+
+    #[test]
+    fn capture_generation_guards_survive_serialization() {
+        let mut inst = Instance::new("claude", "/tmp/custom");
+        let floor = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(42);
+        inst.capture_started_at = Some(floor);
+        inst.retroactive_capture_excludes
+            .insert("stale-sid".to_string());
+
+        let encoded = serde_json::to_string(&inst).unwrap();
+        let decoded: Instance = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.capture_started_at, Some(floor));
+        assert!(decoded.retroactive_capture_excludes.contains("stale-sid"));
+    }
+    #[test]
+    fn claude_hook_publisher_proof_respects_hook_disabling_argv() {
+        let cases = [
+            ("", true),
+            ("--model opus", true),
+            ("--setting-sources user", true),
+            ("--setting-sources=project,user", true),
+            ("--safe-mode", false),
+            ("--bare", false),
+            ("--setting-sources project", false),
+            ("--setting-sources=user --setting-sources project", false),
+            (
+                "--setting-sources=project --setting-sources local,user",
+                true,
+            ),
+            ("--setting-sources", false),
+        ];
+        for (args, expected) in cases {
+            let mut inst = Instance::new("claude", "/tmp/x");
+            inst.tool = "claude".to_string();
+            inst.extra_args = args.to_string();
+            assert_eq!(
+                inst.hook_session_publisher_allowed_by_argv(),
+                expected,
+                "args={args:?}"
+            );
+            assert!(
+                inst.supports_native_resume(),
+                "hook-disabling argv must not disable native resume: {args:?}"
+            );
+        }
     }
 }

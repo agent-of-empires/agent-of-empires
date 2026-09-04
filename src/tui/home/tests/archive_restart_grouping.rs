@@ -520,10 +520,20 @@ fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
     let claude_home = temp.path().join(".claude");
     let _claude_config_guard =
         crate::session::test_support::EnvGuard::set(&[("CLAUDE_CONFIG_DIR", claude_home.clone())]);
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })
+    .unwrap();
     let profile = "restart-resume-failed";
     let storage = Storage::new_unwatched(profile).unwrap();
     let stale_sid = "11111111-2222-3333-4444-555555555555";
-
+    // Use an exact built-in binary so the production resume gate passes while
+    // the login-shell-safe fake rejects the stale id.
+    let _path_guard = crate::session::test_support::install_login_shell_path_command(
+        temp.path(),
+        "claude",
+        "#!/bin/sh\nexit 1\n",
+    );
     // The instance workdir is a created tempdir path, not a shared global like
     // /tmp/x: tmux new-session -c on a nonexistent dir fails outright, and a
     // pre-existing /tmp/x on a dev machine would change the launch behavior.
@@ -534,7 +544,7 @@ fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
     let mut inst = Instance::new("restart-resume-failed", &workdir_str);
     inst.source_profile = profile.to_string();
     inst.tool = "claude".to_string();
-    inst.command = "/bin/false".to_string();
+    inst.command = "claude".to_string();
     inst.agent_session_id = Some(stale_sid.to_string());
     let id = inst.id.clone();
     let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);

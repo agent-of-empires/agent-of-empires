@@ -1,5 +1,6 @@
 //! Session management module
 
+mod anchored_fs;
 pub mod artifacts;
 pub mod attach_project;
 pub mod builder;
@@ -42,6 +43,7 @@ pub mod worktree_reconcile;
 
 pub use crate::sound::SoundConfig;
 pub use crate::status_hooks::StatusHookConfig;
+pub(crate) use anchored_fs::AnchoredDir;
 pub(crate) use capture::is_valid_session_id;
 pub use config::{
     get_telemetry_settings, get_update_settings, load_config, update_app_state, update_config,
@@ -65,12 +67,14 @@ pub use groups::{
     ARCHIVED_SECTION_PATH, SCRATCH_GROUP_NAME, SCRATCH_GROUP_PATH, TRASH_SECTION_NAME,
     TRASH_SECTION_PATH,
 };
-pub(crate) use instance::ResumeAttemptPolicy;
-pub(crate) use instance::TerminalContextResume;
 pub(crate) use instance::{
     duplicate_session_error, find_duplicate_session, is_duplicate_session,
     persist_omp_session_to_storage, persist_session_to_storage, PassiveStatusPatch, ResumeIntent,
     SidWrite, NEWER_GENERATION_BUSY_REASON,
+};
+pub(crate) use instance::{
+    generic_host_config_path_for, sidecar_host_config_path_for, ResumeAttemptPolicy,
+    TerminalContextResume,
 };
 pub use instance::{
     is_valid_session_color, DetectionState, EnsureReadyError, EnsureReadyOutcome, Instance,
@@ -137,8 +141,9 @@ pub use projects::{Project, ProjectScope};
 pub use recovery::HookTimeoutScope;
 pub use scope::SessionScope;
 pub(crate) use storage::{
-    acquire_session_title_lock, atomic_write, read_file_no_follow, replace_file_no_follow,
-    resolve_symlink_chain, GroupMovePlan, StorageFlock,
+    acquire_session_title_lock, acquire_storage_flock, acquire_storage_shared_flock, atomic_write,
+    read_file_no_follow, replace_file_no_follow, resolve_symlink_chain, GroupMovePlan,
+    StorageFlock, STORAGE_LOCK_FILENAME,
 };
 pub use storage::{
     load_recent_projects, load_workspace_ordering, recent_project_entry_for, record_recent_project,

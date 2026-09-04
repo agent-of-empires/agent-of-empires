@@ -3,6 +3,49 @@
 
 use super::*;
 
+const IDENTITY_PUBLISHER_DEPENDENCY_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(2);
+
+fn identity_publisher_dependencies_available(container: &containers::DockerContainer) -> bool {
+    let check = vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        "command -v sh >/dev/null 2>&1 && command -v jq >/dev/null 2>&1".to_string(),
+    ];
+    let argv = container.build_exec_argv("", &check);
+    let Some((program, args)) = argv.split_first() else {
+        return false;
+    };
+    let mut command = std::process::Command::new(program);
+    command
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let available = matches!(
+        crate::process::run_with_timeout(
+            &mut command,
+            IDENTITY_PUBLISHER_DEPENDENCY_TIMEOUT,
+        ),
+        Ok(Some(output)) if output.status.success()
+    );
+    if !available {
+        tracing::warn!(
+            target: "hooks.install",
+            container = %container.name,
+            "sandbox identity hooks need sh and jq; install both in the custom image to enable native session identity publication"
+        );
+    }
+    available
+}
+
+fn identity_publisher_mount_matches(
+    container: &containers::DockerContainer,
+    config: &crate::containers::ContainerConfig,
+) -> Result<bool> {
+    Ok(container.mount_fingerprint_matches(config)? == Some(true))
+}
+
 impl Instance {
     /// Resolve the effective `environment` list for this session's profile,
     /// falling back to the global list when the profile has no override.
@@ -48,6 +91,15 @@ impl Instance {
             .image
             .clone();
         let container = DockerContainer::new(&self.id, &image);
+        let _transition_lock =
+            if self.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION {
+                Some(crate::session::acquire_storage_shared_flock(
+                    &crate::session::get_app_dir()?,
+                    crate::migrations::v027_isolate_sandbox_stores::LOCK,
+                )?)
+            } else {
+                None
+            };
 
         // Direct is_running()? / exists()? here rather than probe_running():
         // this function already returns Result, so `?` correctly propagates
@@ -55,15 +107,32 @@ impl Instance {
         // an actionable error rather than silently falling through to a
         // create attempt that would also fail. See #2596.
         if container.is_running()? {
+            if self.sandbox_store_generation >= container_config::CURRENT_SANDBOX_STORE_GENERATION
+                && container.sandbox_store_generation_matches()? == Some(false)
+            {
+                anyhow::bail!(
+                    "running sandbox {} uses a legacy store generation; stop it before relaunch",
+                    self.id
+                );
+            }
             // Already up: not a come-up, so don't re-mint. Fill lazily only if a
             // fresh process attached to a running container with no values yet.
             self.ensure_before_start_env(false)?;
+            if self.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION {
+                self.backfill_container_workdir(&container);
+                return Ok(container);
+            }
             container_config::refresh_agent_configs_for_instance(
                 &self.effective_profile(),
                 &self.id,
                 &self.tool,
                 Some(detect_as.as_str()),
             );
+            let config = self.build_container_config()?;
+            self.identity_publisher_launched = config.identity_publisher_installed
+                && identity_publisher_mount_matches(&container, &config)?
+                && identity_publisher_dependencies_available(&container)
+                && self.hook_session_publisher_allowed_by_argv();
             self.backfill_container_workdir(&container);
             container_config::ensure_folder_trust_config_for_active_agent(
                 &self.tool,
@@ -76,27 +145,43 @@ impl Instance {
             return Ok(container);
         }
 
+        if self.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION {
+            anyhow::bail!(
+                "sandbox store transition is pending for {}; stop all legacy sandbox peers and restart AoE before relaunching it",
+                self.id
+            );
+        }
+
         if container.exists()? {
-            // Restart of a stopped container is a come-up: refresh so a
-            // short-lived token is re-minted.
-            self.ensure_before_start_env(true)?;
-            container_config::refresh_agent_configs_for_instance(
-                &self.effective_profile(),
-                &self.id,
-                &self.tool,
-                Some(detect_as.as_str()),
-            );
-            container.start()?;
-            self.backfill_container_workdir(&container);
-            container_config::ensure_folder_trust_config_for_active_agent(
-                &self.tool,
-                Some(detect_as.as_str()),
-                &self.source_profile,
-                &self.id,
-                &self.container_workdir(),
-                self.is_yolo_mode(),
-            );
-            return Ok(container);
+            if container.sandbox_store_generation_matches()? == Some(false) {
+                container.remove(false)?;
+            } else {
+                // Restart of a stopped container is a come-up: refresh so a
+                // short-lived token is re-minted.
+                self.ensure_before_start_env(true)?;
+                container_config::refresh_agent_configs_for_instance(
+                    &self.effective_profile(),
+                    &self.id,
+                    &self.tool,
+                    Some(detect_as.as_str()),
+                );
+                let config = self.build_container_config()?;
+                container.start()?;
+                self.identity_publisher_launched = config.identity_publisher_installed
+                    && identity_publisher_mount_matches(&container, &config)?
+                    && identity_publisher_dependencies_available(&container)
+                    && self.hook_session_publisher_allowed_by_argv();
+                self.backfill_container_workdir(&container);
+                container_config::ensure_folder_trust_config_for_active_agent(
+                    &self.tool,
+                    Some(detect_as.as_str()),
+                    &self.source_profile,
+                    &self.id,
+                    &self.container_workdir(),
+                    self.is_yolo_mode(),
+                );
+                return Ok(container);
+            }
         }
 
         // Ensure image is available (always pulls to get latest)
@@ -108,6 +193,9 @@ impl Instance {
         self.ensure_before_start_env(true)?;
         let config = self.build_container_config()?;
         let container_id = container.create(&config)?;
+        self.identity_publisher_launched = config.identity_publisher_installed
+            && identity_publisher_dependencies_available(&container)
+            && self.hook_session_publisher_allowed_by_argv();
 
         if let Some(ref mut sandbox) = self.sandbox_info {
             sandbox.container_id = Some(container_id);

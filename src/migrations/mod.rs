@@ -34,13 +34,13 @@ mod v023_clear_structured_container_error;
 mod v024_backfill_detect_as;
 mod v025_reenable_confirm_delete;
 mod v026_repoint_acp_default_agent;
+pub(crate) mod v027_isolate_sandbox_stores;
 
 use anyhow::Result;
 use std::fs;
-use std::path::PathBuf;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 26;
+const CURRENT_VERSION: u32 = 27;
 const VERSION_FILE: &str = ".schema_version";
 
 struct Migration {
@@ -180,6 +180,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "repoint_acp_default_agent",
         run: v026_repoint_acp_default_agent::run,
     },
+    Migration {
+        version: 27,
+        name: "isolate_sandbox_stores",
+        run: v027_isolate_sandbox_stores::run,
+    },
 ];
 
 /// The data-schema version this build targets, i.e. the version every install
@@ -200,8 +205,13 @@ pub fn run_migrations() -> Result<()> {
     let current = get_current_version();
     debug!("Current schema version: {}", current);
 
-    if current >= CURRENT_VERSION {
-        return Ok(());
+    if current > CURRENT_VERSION {
+        anyhow::bail!(
+            "data schema version {current} is newer than this build supports ({CURRENT_VERSION}); refusing to downgrade"
+        );
+    }
+    if current == CURRENT_VERSION {
+        return v027_isolate_sandbox_stores::reconcile_pending();
     }
 
     for migration in MIGRATIONS {
@@ -228,17 +238,13 @@ pub fn run_migrations() -> Result<()> {
     Ok(())
 }
 
-/// Get the current schema version by checking all possible locations.
+/// Get the schema version from the selected app directory.
 fn get_current_version() -> u32 {
-    for dir in get_all_possible_dirs() {
-        let version_file = dir.join(VERSION_FILE);
-        if let Ok(content) = fs::read_to_string(&version_file) {
-            if let Ok(version) = content.trim().parse::<u32>() {
-                return version;
-            }
-        }
-    }
-    0
+    crate::session::get_app_dir()
+        .ok()
+        .and_then(|dir| fs::read_to_string(dir.join(VERSION_FILE)).ok())
+        .and_then(|content| content.trim().parse::<u32>().ok())
+        .unwrap_or(0)
 }
 
 /// Write the version to the current app directory.
@@ -248,25 +254,6 @@ fn set_version(version: u32) -> Result<()> {
     crate::session::atomic_write(&version_file, version.to_string().as_bytes())?;
     debug!("Updated schema version to {}", version);
     Ok(())
-}
-
-/// Returns all directories where app data might exist (for migration discovery).
-fn get_all_possible_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-
-    // Home-dotfile location: the macOS default, the pre-XDG Linux location, and
-    // the only location on Windows.
-    if let Some(home) = dirs::home_dir() {
-        dirs.push(home.join(crate::session::APP_DIR_NAME_OTHER));
-    }
-
-    // XDG location: always current on Linux, and the opt-in layout on macOS.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    if let Ok(base) = crate::session::xdg_config_base() {
-        dirs.push(base.join(crate::session::APP_DIR_NAME_XDG));
-    }
-
-    dirs
 }
 
 #[cfg(test)]
@@ -285,6 +272,20 @@ mod tests {
             );
             prev = m.version;
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn selected_app_dir_refuses_a_newer_schema() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        fs::create_dir_all(&app).unwrap();
+        fs::write(app.join(VERSION_FILE), (CURRENT_VERSION + 1).to_string()).unwrap();
+
+        let error = run_migrations().unwrap_err().to_string();
+
+        assert!(error.contains("refusing to downgrade"));
     }
 
     #[test]

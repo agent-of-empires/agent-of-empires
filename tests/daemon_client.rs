@@ -220,6 +220,26 @@ async fn daemon_client_http_contract() {
         ));
     }
 
+    let transport_secret = "transport-secret-token";
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let closer = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        drop(stream);
+    });
+    let base_url = format!("http://{address}/{transport_secret}");
+    let error = match DaemonClient::new(&base_url, Some(transport_secret))
+        .unwrap()
+        .list_sessions(None)
+        .await
+    {
+        Ok(_) => panic!("expected transport error"),
+        Err(error) => error,
+    };
+    closer.await.unwrap();
+    assert!(!error.to_string().contains(transport_secret));
+    assert!(!format!("{error:?}").contains(transport_secret));
+
     let structured = structured_success();
     let (origin, request) = serve_once(response("200 OK", &[], &structured)).await;
     let envelope = DaemonClient::new(&origin, None)

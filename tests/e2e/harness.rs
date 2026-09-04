@@ -358,6 +358,7 @@ update_check_mode = "off"
 [app_state]
 has_seen_welcome = true
 has_responded_to_telemetry = true
+has_acknowledged_agent_hooks = true
 last_seen_version = "{}"
 "#,
             env!("CARGO_PKG_VERSION")
@@ -443,6 +444,8 @@ last_seen_version = "{}"
     /// shim (the daemon -> runner -> node spawn chain does not reliably
     /// propagate process env). Also sets the runner-socket timeout high
     /// so a contended CI box doesn't trip the spawn deadline.
+    /// The generated shim embeds Node's real executable because the isolated
+    /// home cannot initialize user-scoped version-manager shims.
     pub fn install_acp_shim(&mut self, fake_acp_script: &Path) {
         self.install_acp_shim_inner(fake_acp_script, None);
     }
