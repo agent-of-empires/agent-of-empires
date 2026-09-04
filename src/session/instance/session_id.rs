@@ -791,7 +791,6 @@ impl Instance {
         // Read before acquisition: a Use intent marks an id the user pinned
         // rather than one AoE minted or captured.
         let explicitly_pinned = matches!(self.resume_intent, ResumeIntent::Use(_));
-        let invalid_explicit_target = self.terminal_resume_explicit_target_invalid();
         self.absorb_published_pi_session();
         let (mut session_id, is_existing) = self.acquire_session_id();
         // Which ResumeStrategy arm to emit. Pi diverges from `is_existing`
@@ -803,8 +802,10 @@ impl Instance {
             session_id.as_deref(),
             explicitly_pinned,
         );
-        // Apply the same deterministic constraints used by the client-context
-        // projection before emitting any resume target.
+        // Only the constraints `build_resume_flags` cannot see are applied
+        // here. It already refuses an unresolved agent, an `Unsupported`
+        // strategy and an invalid id, and says why; suppressing the sid for
+        // those would drop the launch line's only trace of the decision.
         let static_unavailable = self.terminal_resume_static_unavailable();
         if matches!(static_unavailable, Some(ResumeStaticUnavailable::Command)) {
             tracing::warn!(target: "session.store",
@@ -813,7 +814,10 @@ impl Instance {
                 "resume subcommand needs the binary's position and this command hides it behind a launcher; starting fresh"
             );
         }
-        if static_unavailable.is_some() || invalid_explicit_target {
+        if matches!(
+            static_unavailable,
+            Some(ResumeStaticUnavailable::Sandbox | ResumeStaticUnavailable::Command)
+        ) {
             session_id = None;
         }
         // A transcript the pane published outranks its id: `--session <path>`

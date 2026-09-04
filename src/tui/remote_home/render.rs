@@ -83,6 +83,11 @@ fn selected_row_style(style: Style, theme: &Theme) -> Style {
     }
 }
 
+/// The picker lists structured rows only, so the reachable values are
+/// `agent_handshake_required`, `fork_pending`, `no_target`, and absent (older
+/// daemon). The rest are terminal-only and stay unreachable here until the
+/// daemon can answer `session/load` capability for a structured row the way
+/// `structured_fork_capable` answers `session/fork`.
 fn context_resume_summary(availability: Option<ContextResumeAvailability>) -> &'static str {
     match availability {
         Some(ContextResumeAvailability::Available) => "ctx:yes",
@@ -305,7 +310,9 @@ mod tests {
                 title: format!("session {id}"),
                 project_path: format!("/tmp/{id}"),
                 status: "idle".to_string(),
-                context_resume: Some(ContextResumeAvailability::Available),
+                context_resume: Some(ContextResumeAvailability::Indeterminate {
+                    reason: ContextResumeIndeterminateReason::AgentHandshakeRequired,
+                }),
             })
             .collect();
         state.plugin_ui = serde_json::from_value(json!({

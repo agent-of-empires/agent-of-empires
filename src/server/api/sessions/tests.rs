@@ -1,20 +1,4 @@
 use super::*;
-#[derive(Deserialize)]
-struct DecodedSessionsEnvelope {
-    sessions: Vec<DecodedSession>,
-}
-
-#[derive(Deserialize)]
-struct DecodedSession {
-    id: String,
-}
-
-async fn decode_sessions_response(response: impl IntoResponse) -> DecodedSessionsEnvelope {
-    let body = axum::body::to_bytes(response.into_response().into_body(), usize::MAX)
-        .await
-        .unwrap();
-    serde_json::from_slice(&body).unwrap()
-}
 
 /// `remove_instance` is the only way a row leaves `state.instances` on the
 /// delete path, so the epoch bump has to be tied to an actual removal
@@ -689,16 +673,13 @@ async fn list_sessions_state_filter() {
         archived.clone(),
     ]);
 
-    let ids = |envelope: &DecodedSessionsEnvelope| -> Vec<String> {
+    let ids = |envelope: &SessionsEnvelope| -> Vec<String> {
         envelope.sessions.iter().map(|s| s.id.clone()).collect()
     };
 
-    let all = decode_sessions_response(
-        list_sessions(
-            axum::extract::State(state.clone()),
-            axum::extract::Query(ListSessionsQuery { state: None }),
-        )
-        .await,
+    let all = list_sessions(
+        axum::extract::State(state.clone()),
+        axum::extract::Query(ListSessionsQuery { state: None }),
     )
     .await;
     assert_eq!(
@@ -707,38 +688,29 @@ async fn list_sessions_state_filter() {
         "no param stays unfiltered (back-compat)"
     );
 
-    let live_only = decode_sessions_response(
-        list_sessions(
-            axum::extract::State(state.clone()),
-            axum::extract::Query(ListSessionsQuery {
-                state: Some(crate::session::SessionScope::Live),
-            }),
-        )
-        .await,
+    let live_only = list_sessions(
+        axum::extract::State(state.clone()),
+        axum::extract::Query(ListSessionsQuery {
+            state: Some(crate::session::SessionScope::Live),
+        }),
     )
     .await;
     assert_eq!(ids(&live_only), vec!["scope-live".to_string()]);
 
-    let trashed_only = decode_sessions_response(
-        list_sessions(
-            axum::extract::State(state.clone()),
-            axum::extract::Query(ListSessionsQuery {
-                state: Some(crate::session::SessionScope::Trashed),
-            }),
-        )
-        .await,
+    let trashed_only = list_sessions(
+        axum::extract::State(state.clone()),
+        axum::extract::Query(ListSessionsQuery {
+            state: Some(crate::session::SessionScope::Trashed),
+        }),
     )
     .await;
     assert_eq!(ids(&trashed_only), vec!["scope-trashed".to_string()]);
 
-    let explicit_all = decode_sessions_response(
-        list_sessions(
-            axum::extract::State(state),
-            axum::extract::Query(ListSessionsQuery {
-                state: Some(crate::session::SessionScope::All),
-            }),
-        )
-        .await,
+    let explicit_all = list_sessions(
+        axum::extract::State(state),
+        axum::extract::Query(ListSessionsQuery {
+            state: Some(crate::session::SessionScope::All),
+        }),
     )
     .await;
     assert_eq!(ids(&explicit_all).len(), 3);
