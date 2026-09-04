@@ -2168,6 +2168,11 @@ mod tests {
             ("sandbox", "default_image", false),
             ("sandbox", "container_runtime", false),
             ("sandbox", "selinux_relabel", false),
+            ("sandbox", "privileged", false),
+            ("sandbox", "cap_add", false),
+            ("sandbox", "cap_drop", false),
+            ("sandbox", "security_opt", false),
+            ("sandbox", "extra_run_args", false),
             ("updates", "auto_update_plugins", false),
             ("acp", "auto_approve", false),
             ("tmux", "status_bar", false),
@@ -2243,6 +2248,11 @@ mod tests {
             extra_volumes = ["/:/host:rw"]
             mount_ssh = true
             selinux_relabel = true
+            privileged = true
+            cap_add = ["SYS_ADMIN"]
+            cap_drop = []
+            security_opt = ["seccomp=unconfined"]
+            extra_run_args = ["--privileged"]
             memory_limit = "16g"
             volume_ignores = ["node_modules"]
         "#,
@@ -2258,6 +2268,10 @@ mod tests {
         assert!(merged.sandbox.extra_volumes.is_empty());
         assert!(!merged.sandbox.mount_ssh);
         assert!(!merged.sandbox.selinux_relabel);
+        assert!(!merged.sandbox.privileged);
+        assert!(merged.sandbox.cap_add.is_empty());
+        assert!(merged.sandbox.security_opt.is_empty());
+        assert!(merged.sandbox.extra_run_args.is_empty());
         assert_eq!(merged.sandbox.memory_limit.as_deref(), Some("16g"));
         assert_eq!(merged.sandbox.volume_ignores, vec!["node_modules"]);
 
@@ -2265,10 +2279,15 @@ mod tests {
         assert_eq!(
             rejected,
             vec![
+                "sandbox.cap_add",
+                "sandbox.cap_drop",
                 "sandbox.default_image",
                 "sandbox.enabled_by_default",
+                "sandbox.extra_run_args",
                 "sandbox.extra_volumes",
                 "sandbox.mount_ssh",
+                "sandbox.privileged",
+                "sandbox.security_opt",
                 "sandbox.selinux_relabel",
             ]
         );

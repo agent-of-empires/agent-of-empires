@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::containers::{ContainerConfig, EnvEntry, NamedVolumeMount, VolumeMount};
+use crate::containers::{ContainerConfig, EnvEntry, NamedVolumeMount, RunPolicy, VolumeMount};
 use crate::git::GitWorktree;
 use crate::session::config::VolumeIgnoresStrategy;
 
@@ -2286,6 +2286,13 @@ pub(crate) fn build_container_config(
         network: sanitize_network(sandbox_config.network.as_deref()),
         selinux_relabel: sandbox_config.selinux_relabel,
         identity_publisher_installed,
+        run_policy: RunPolicy {
+            privileged: sandbox_config.privileged,
+            cap_add: sandbox_config.cap_add.clone(),
+            cap_drop: sandbox_config.cap_drop.clone(),
+            security_opt: sandbox_config.security_opt.clone(),
+            extra_run_args: sandbox_config.extra_run_args.clone(),
+        },
     })
 }
 
@@ -4041,6 +4048,87 @@ mount_ssh = true
             crate::session::artifacts::CONTAINER_ARTIFACT_DIR,
             volume_pairs
         );
+    }
+
+    /// The `[sandbox]` run-policy fields flow from user config into the
+    /// ContainerConfig, and a repo config cannot set any of them (#3218, #2704).
+    #[test]
+    #[serial_test::serial]
+    fn test_build_container_config_run_policy() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        // Global config carries run policy; repo config overrides are ignored.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let app_dir = temp_home
+            .path()
+            .join(".config")
+            .join(crate::session::APP_DIR_NAME_XDG);
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let app_dir = temp_home.path().join(crate::session::APP_DIR_NAME_OTHER);
+        fs::create_dir_all(&app_dir).unwrap();
+        fs::write(
+            app_dir.join("config.toml"),
+            r#"
+[sandbox]
+cap_add = ["SYS_ADMIN"]
+cap_drop = ["ALL"]
+security_opt = ["seccomp=unconfined"]
+"#,
+        )
+        .unwrap();
+
+        let project_dir = TempDir::new().unwrap();
+        let config_dir = project_dir.path().join(".agent-of-empires");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config.toml"),
+            r#"
+[sandbox]
+privileged = true
+cap_add = ["NET_ADMIN"]
+cap_drop = []
+extra_run_args = ["--privileged"]
+"#,
+        )
+        .unwrap();
+
+        git2::Repository::init(project_dir.path()).unwrap();
+
+        let sandbox_info = crate::session::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
+
+        let project_path_str = project_dir.path().to_str().unwrap();
+        let config = build_container_config(
+            project_path_str,
+            &sandbox_info,
+            ContainerAgentSelection::new("claude", None),
+            false,
+            "test-instance-id",
+            None,
+            "",
+        )
+        .unwrap();
+
+        assert_eq!(config.run_policy.cap_add, vec!["SYS_ADMIN"]);
+        assert_eq!(config.run_policy.cap_drop, vec!["ALL"]);
+        assert_eq!(config.run_policy.security_opt, vec!["seccomp=unconfined"]);
+        assert!(
+            !config.run_policy.privileged,
+            "repo must not grant --privileged"
+        );
+        assert!(config.run_policy.extra_run_args.is_empty());
     }
 
     /// `sandbox.network` stays repo-overridable, but namespace-sharing forms

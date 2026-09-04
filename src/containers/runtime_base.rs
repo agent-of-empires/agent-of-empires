@@ -1,4 +1,4 @@
-use super::container_interface::{docker_env_args, ContainerConfig};
+use super::container_interface::{docker_env_args, ContainerConfig, RunFlag};
 use super::error::{sanitize_stderr, DockerError, Result};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -59,6 +59,8 @@ pub(crate) struct RuntimeBase {
     pub supports_network_mode: bool,
     /// Whether `run --label key=value` and label inspection are supported.
     pub supports_labels: bool,
+    /// Which Docker-style `run` flags this runtime accepts (see [`RunFlag`]).
+    pub supported_run_flags: &'static [RunFlag],
     /// Case-insensitive stderr substrings that identify a "container does not
     /// exist" error for this runtime. Each runtime words it differently (Docker
     /// "No such container", Apple Container "notFound … not found"), so the
@@ -87,6 +89,14 @@ pub(crate) struct RuntimeBase {
     pub permission_denied_markers: &'static [&'static str],
 }
 
+/// Docker-style run flags supported by Docker and Podman.
+const ALL_RUN_FLAGS: &[RunFlag] = &[
+    RunFlag::Privileged,
+    RunFlag::CapAdd,
+    RunFlag::CapDrop,
+    RunFlag::SecurityOpt,
+];
+
 impl RuntimeBase {
     pub const DOCKER: Self = Self {
         binary: "docker",
@@ -100,6 +110,7 @@ impl RuntimeBase {
         supports_selinux_relabel: true,
         supports_network_mode: true,
         supports_labels: true,
+        supported_run_flags: ALL_RUN_FLAGS,
         not_found_markers: &["no such container"],
         // moby/moby client/errors.go connectionFailed() is the single source
         // of this message across every Docker OS variant (macOS Desktop, Linux
@@ -128,6 +139,9 @@ impl RuntimeBase {
         supports_selinux_relabel: false,
         supports_network_mode: false,
         supports_labels: true,
+        // `--cap-add`/`--cap-drop` exist since container 0.12; there is no
+        // `--privileged` or `--security-opt`.
+        supported_run_flags: &[RunFlag::CapAdd, RunFlag::CapDrop],
         // Apple Container surfaces a missing container with two distinct
         // wordings depending on the subcommand:
         // - `container delete`/`container logs`: `notFound: "container with
@@ -173,6 +187,7 @@ impl RuntimeBase {
         supports_selinux_relabel: true,
         supports_network_mode: true,
         supports_labels: true,
+        supported_run_flags: ALL_RUN_FLAGS,
         not_found_markers: &["no such container"],
         // Two distinct daemon-down wordings observed in real Podman output:
         // - "connect to Podman socket" fires on Linux socket mode
@@ -552,6 +567,51 @@ impl RuntimeBase {
             args.push(mem.clone());
         }
 
+        let policy = &config.run_policy;
+        let pairs = |flag: &str, values: &[String]| -> Vec<String> {
+            values
+                .iter()
+                .flat_map(|v| [flag.to_string(), v.clone()])
+                .collect()
+        };
+        for (flag, config_key, argv) in [
+            (
+                RunFlag::Privileged,
+                "privileged",
+                Vec::from_iter(policy.privileged.then(|| "--privileged".to_string())),
+            ),
+            (
+                RunFlag::CapAdd,
+                "cap_add",
+                pairs("--cap-add", &policy.cap_add),
+            ),
+            (
+                RunFlag::CapDrop,
+                "cap_drop",
+                pairs("--cap-drop", &policy.cap_drop),
+            ),
+            (
+                RunFlag::SecurityOpt,
+                "security_opt",
+                pairs("--security-opt", &policy.security_opt),
+            ),
+        ] {
+            if argv.is_empty() {
+                continue;
+            }
+            if self.supported_run_flags.contains(&flag) {
+                args.extend(argv);
+            } else {
+                tracing::warn!(
+                    target: "containers.runtime",
+                    "ignoring sandbox.{config_key}: {} does not support it",
+                    self.name
+                );
+            }
+        }
+
+        args.extend(policy.extra_run_args.iter().cloned());
+
         args.push(image.to_string());
         args.push("sleep".to_string());
         args.push("infinity".to_string());
@@ -750,7 +810,7 @@ impl RuntimeBase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::containers::container_interface::{EnvEntry, VolumeMount};
+    use crate::containers::container_interface::{EnvEntry, RunPolicy, VolumeMount};
 
     // Real stderr captured from `<runtime> rm/delete <missing>` on 2026-07-01.
     // These pin the per-runtime not-found classification that `remove()` and
@@ -1352,6 +1412,76 @@ mod tests {
         // Apple Container doesn't support :z; the mount stays plain.
         assert!(args.contains(&"/host/path:/container/path".to_string()));
         assert!(!args.iter().any(|a| a.contains(":z")));
+    }
+
+    #[test]
+    fn test_build_create_args_run_policy_flags() {
+        let base = RuntimeBase::DOCKER;
+        let config = ContainerConfig {
+            working_dir: "/workspace/project".to_string(),
+            run_policy: RunPolicy {
+                privileged: true,
+                cap_add: vec!["SYS_ADMIN".to_string()],
+                cap_drop: vec!["NET_RAW".to_string()],
+                security_opt: vec!["seccomp=unconfined".to_string()],
+                extra_run_args: vec!["--isolation".to_string(), "chroot".to_string()],
+            },
+            ..Default::default()
+        };
+
+        let args = base.build_create_args("c", "alpine:latest", &config);
+
+        assert!(args.contains(&"--privileged".to_string()));
+        assert_eq!(arg_after(&args, "--cap-add"), Some("SYS_ADMIN"));
+        assert_eq!(arg_after(&args, "--cap-drop"), Some("NET_RAW"));
+        assert_eq!(
+            arg_after(&args, "--security-opt"),
+            Some("seccomp=unconfined")
+        );
+        let isolation = args.iter().position(|a| a == "--isolation").unwrap();
+        let image = args.iter().position(|a| a == "alpine:latest").unwrap();
+        assert_eq!(args[isolation + 1], "chroot");
+        assert_eq!(isolation + 2, image);
+    }
+
+    #[test]
+    fn test_build_create_args_run_policy_skipped_on_unsupported_runtime() {
+        let base = RuntimeBase::APPLE_CONTAINER;
+        let config = ContainerConfig {
+            working_dir: "/workspace/project".to_string(),
+            run_policy: RunPolicy {
+                privileged: true,
+                cap_add: vec!["SYS_ADMIN".to_string()],
+                cap_drop: vec!["ALL".to_string()],
+                security_opt: vec!["seccomp=unconfined".to_string()],
+                extra_run_args: vec!["--virtiofs".to_string()],
+            },
+            ..Default::default()
+        };
+
+        let args = base.build_create_args("c", "alpine:latest", &config);
+
+        for flag in ["--privileged", "--security-opt"] {
+            assert!(!args.contains(&flag.to_string()), "unexpected {flag}");
+        }
+        assert_eq!(arg_after(&args, "--cap-add"), Some("SYS_ADMIN"));
+        assert_eq!(arg_after(&args, "--cap-drop"), Some("ALL"));
+        assert!(args.contains(&"--virtiofs".to_string()));
+    }
+
+    #[test]
+    fn test_build_create_args_no_run_policy_by_default() {
+        let base = RuntimeBase::DOCKER;
+        let config = ContainerConfig {
+            working_dir: "/workspace/project".to_string(),
+            ..Default::default()
+        };
+
+        let args = base.build_create_args("c", "alpine:latest", &config);
+
+        for flag in ["--privileged", "--cap-add", "--cap-drop", "--security-opt"] {
+            assert!(!args.contains(&flag.to_string()), "unexpected {flag}");
+        }
     }
 
     #[test]

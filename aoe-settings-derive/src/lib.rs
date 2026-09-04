@@ -28,7 +28,8 @@
 //! `repo` ("allow" | "deny": repo-config override policy; defaults to the
 //!   section's `repo_default`),
 //! `validate` ("none" | "range:min[:max]" | "nonempty" | "memory_limit" |
-//!   "volume_list" | "env_list" | "port_mapping_list" | "network"),
+//!   "volume_list" | "env_list" | "port_mapping_list" | "capability_list" |
+//!   "security_opt_list" | "network"),
 //! `global_only` (flag: field is shown but not profile-overridable),
 //! `skip` (flag: exclude the field from the schema entirely).
 //! When `desc` is omitted, the field's doc comment is used.
@@ -362,6 +363,8 @@ fn build_validation(
         "volume_list" => quote!(ValidationKind::VolumeList),
         "env_list" => quote!(ValidationKind::EnvList),
         "port_mapping_list" => quote!(ValidationKind::PortMappingList),
+        "capability_list" => quote!(ValidationKind::CapabilityList),
+        "security_opt_list" => quote!(ValidationKind::SecurityOptList),
         "network" => quote!(ValidationKind::Network),
         range if range.starts_with("range:") => {
             let parts: Vec<&str> = range.trim_start_matches("range:").split(':').collect();

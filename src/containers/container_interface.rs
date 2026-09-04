@@ -83,6 +83,25 @@ pub fn docker_env_args(entries: &[EnvEntry]) -> (Vec<String>, Vec<(String, Strin
     (argv, inherit)
 }
 
+/// A Docker-style `run` flag supported by a container runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunFlag {
+    Privileged,
+    CapAdd,
+    CapDrop,
+    SecurityOpt,
+}
+
+/// Container run-policy flags mapped from `[sandbox]` settings.
+#[derive(Debug, Default, Clone)]
+pub struct RunPolicy {
+    pub privileged: bool,
+    pub cap_add: Vec<String>,
+    pub cap_drop: Vec<String>,
+    pub security_opt: Vec<String>,
+    pub extra_run_args: Vec<String>,
+}
+
 #[derive(Default)]
 pub struct ContainerConfig {
     pub working_dir: String,
@@ -104,6 +123,7 @@ pub struct ContainerConfig {
     pub selinux_relabel: bool,
     /// Runtime-only evidence that this config installed an identity publisher.
     pub identity_publisher_installed: bool,
+    pub run_policy: RunPolicy,
 }
 
 impl ContainerConfig {

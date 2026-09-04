@@ -78,6 +78,33 @@ environment = ["ANTHROPIC_API_KEY"]
 | `extra_volumes` | `[]` | Additional volume mounts |
 | `mount_ssh` | `false` | Mount `~/.ssh/` read-only into containers |
 | `default_terminal_mode` | `"host"` | Paired terminal location: `"host"` (on host machine) or `"container"` (inside Docker) |
+| `privileged` | `false` | Run the container in privileged mode (`--privileged`) |
+| `cap_add` | `[]` | Capabilities granted on top of the runtime default (`--cap-add`) |
+| `cap_drop` | `[]` | Capabilities removed from the runtime default (`--cap-drop`) |
+| `security_opt` | `[]` | Security options (`--security-opt`, e.g. `seccomp=unconfined`) |
+| `extra_run_args` | `[]` | Extra arguments passed to container run, before the image |
+
+### Run Policy
+
+Configure container privileges, capabilities, and security options:
+
+```toml
+[sandbox]
+# Privileged mode
+privileged = true
+
+# Capabilities
+cap_add = ["SYS_ADMIN"]
+cap_drop = ["NET_RAW"]
+
+# Security options
+security_opt = ["seccomp=unconfined"]
+
+# Additional arguments passed to container run
+extra_run_args = ["--device", "/dev/fuse"]
+```
+
+Docker and Podman support all run-policy options. Apple Container supports `cap_add` and `cap_drop`; `privileged` and `security_opt` are ignored with a warning. `extra_run_args` is passed through on all runtimes.
 
 ## Volume Mounts
 

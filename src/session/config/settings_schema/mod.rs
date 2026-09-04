@@ -267,6 +267,10 @@ pub enum ValidationKind {
     EnvList,
     /// Each list entry must be a `host:container` port mapping (digits only).
     PortMappingList,
+    /// Each list entry must be a Linux capability name.
+    CapabilityList,
+    /// Each list entry must be a `--security-opt` value.
+    SecurityOptList,
     /// A container network mode: empty, `none`, `bridge`, or a named network
     /// (`[a-zA-Z0-9][a-zA-Z0-9_.-]*`). `host` and other namespace-sharing
     /// forms are rejected because they defeat sandbox isolation.
