@@ -21,6 +21,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -304,6 +305,18 @@ struct WorkerHandle {
     restart_history: Vec<Instant>,
     kind: WorkerKind,
 }
+/// Install a respawned client and advance both generation views together.
+fn replace_worker_client(
+    handle: &mut WorkerHandle,
+    client: AcpClient,
+    worker_generation: &mut u64,
+    next_worker_generation: &AtomicU64,
+) {
+    let generation = next_worker_generation.fetch_add(1, Ordering::Relaxed);
+    handle.client = Arc::new(client);
+    handle.generation = generation;
+    *worker_generation = generation;
+}
 
 /// Per-session monotonically-increasing seq counter. Lives at the
 /// supervisor level (not on `WorkerHandle`) so it survives shutdown
@@ -360,7 +373,7 @@ pub struct Supervisor<S: BroadcastSink> {
     registry: Arc<Mutex<AgentRegistry>>,
     workers: Arc<Mutex<HashMap<String, WorkerHandle>>>,
     next_seqs: Arc<SeqMap>,
-    next_worker_generation: std::sync::atomic::AtomicU64,
+    next_worker_generation: Arc<AtomicU64>,
     /// Reservation map: a session_id present here means another task is
     /// mid-resume (spawn OR attach) for it. The `ResumeKind` lets the
     /// capacity check distinguish fresh spawns (which contribute to the
@@ -747,7 +760,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             registry: Arc::new(Mutex::new(AgentRegistry::with_defaults())),
             workers: Arc::new(Mutex::new(HashMap::new())),
             next_seqs: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            next_worker_generation: std::sync::atomic::AtomicU64::new(1),
+            next_worker_generation: Arc::new(AtomicU64::new(1)),
             pending_resumes: Arc::new(std::sync::Mutex::new(HashMap::new())),
             cancelled_resumes: Arc::new(std::sync::Mutex::new(HashSet::new())),
             warmed_up_agents: Arc::new(std::sync::Mutex::new(HashSet::new())),
@@ -2028,10 +2041,12 @@ impl<S: BroadcastSink> Supervisor<S> {
         let workers = Arc::clone(&self.workers);
         let next_seqs = Arc::clone(&self.next_seqs);
         let incompatible_binaries = Arc::clone(&self.incompatible_binaries);
+        let next_worker_generation = Arc::clone(&self.next_worker_generation);
         crate::task_util::spawn_supervised(
             "supervisor.drain",
             crate::task_util::PanicPolicy::Log,
             async move {
+                let mut worker_generation = worker_generation;
                 let mut inbound = initial_inbound;
                 loop {
                     // Tracks whether the connection task ended because the
@@ -2556,7 +2571,12 @@ impl<S: BroadcastSink> Supervisor<S> {
                         let Some(handle) = guard.get_mut(&session_id) else {
                             return;
                         };
-                        handle.client = Arc::new(new_client);
+                        replace_worker_client(
+                            handle,
+                            new_client,
+                            &mut worker_generation,
+                            &next_worker_generation,
+                        );
                     }
 
                     info!(
@@ -3416,6 +3436,22 @@ impl<S: BroadcastSink> Supervisor<S> {
         generation
     }
 
+    /// Replace a fixture's client as the automatic respawn path does.
+    #[cfg(test)]
+    pub(crate) async fn test_respawn_worker(&self, session_id: &str) -> u64 {
+        let (client, _tx) = AcpClient::fake_for_test(AcpSessionId(format!("acp-{session_id}")));
+        let mut workers = self.workers.lock().await;
+        let handle = workers.get_mut(session_id).expect("test worker");
+        let mut generation = handle.generation;
+        replace_worker_client(
+            handle,
+            client,
+            &mut generation,
+            &self.next_worker_generation,
+        );
+        generation
+    }
+
     /// Drop a fake in-memory worker inserted by `test_insert_worker`, freeing
     /// the capacity slot for the next reconciler tick.
     #[cfg(test)]
@@ -3976,6 +4012,22 @@ mod tests {
         fn unresolved_elicitation_nonces(&self, _session_id: &str) -> Vec<Nonce> {
             self.stale_elicitation_nonces.lock().unwrap().clone()
         }
+    }
+    #[tokio::test]
+    async fn respawned_worker_rejects_the_prior_generation() {
+        let sup = Supervisor::new(VecSink::new());
+        let first = sup.test_insert_worker("s-generation").await;
+        let second = sup.test_respawn_worker("s-generation").await;
+
+        assert_ne!(first, second);
+        assert!(
+            !sup.is_current_worker_generation("s-generation", first)
+                .await
+        );
+        assert!(
+            sup.is_current_worker_generation("s-generation", second)
+                .await
+        );
     }
 
     /// #3241: the allowlist gates both resolution branches, and a refusal is
