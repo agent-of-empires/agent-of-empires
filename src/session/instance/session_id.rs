@@ -2619,30 +2619,54 @@ pi = "~/.pi-personal"
             TerminalContextResume::AgentUnsupported
         );
 
+        let sandbox = Some(SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test-image".to_string(),
+            container_name: "test".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        });
+
+        // Copilot publishes no identity in any environment, so an
+        // automatically stored host id must not cross into a container.
+        inst.tool = "copilot".to_string();
+        inst.sandbox_info = sandbox.clone();
+        inst.resume_intent = ResumeIntent::Default;
+        for target in [None, Some(sid.clone())] {
+            inst.agent_session_id = target;
+            assert_eq!(
+                inst.terminal_context_resume_cached(),
+                TerminalContextResume::SandboxUnsupported,
+                "an automatic copilot id must start fresh in a sandbox"
+            );
+        }
+        // An explicit pin names a conversation, so it stays authoritative
+        // against this instance's own store.
+        inst.resume_intent = ResumeIntent::Use(sid.clone());
+        assert_eq!(
+            inst.terminal_context_resume_cached(),
+            TerminalContextResume::Available,
+            "a pinned copilot conversation must still be attempted"
+        );
+        let mut pinned = "copilot".to_string();
+        assert!(inst.apply_session_flags(&mut pinned, "test").unwrap());
+        assert_eq!(pinned, format!("copilot --session-id {sid}"));
+
         // kimi and prime-agent resume from the per-instance sandbox store
-        // v027 stages for them. Copilot publishes no identity anywhere, so a
-        // container still has nothing of its own to resume.
-        for tool in ["copilot"] {
+        // v027 stages for them, so the sandbox no longer suppresses them.
+        for tool in ["kimi", "prime-agent"] {
             inst.tool = tool.to_string();
-            inst.resume_intent = ResumeIntent::Default;
-            inst.sandbox_info = Some(SandboxInfo {
-                enabled: true,
-                container_id: None,
-                image: "test-image".to_string(),
-                container_name: "test".to_string(),
-                extra_env: None,
-                custom_instruction: None,
-                before_start_env: Vec::new(),
-                container_workdir: None,
-            });
-            for target in [None, Some(sid.clone())] {
-                inst.agent_session_id = target;
-                assert_eq!(
-                    inst.terminal_context_resume_cached(),
-                    TerminalContextResume::SandboxUnsupported,
-                    "{tool} must start fresh in a sandbox"
-                );
-            }
+            inst.sandbox_info = sandbox.clone();
+            inst.resume_intent = ResumeIntent::Use(sid.clone());
+            inst.agent_session_id = Some(sid.clone());
+            assert_eq!(
+                inst.terminal_context_resume_cached(),
+                TerminalContextResume::Available,
+                "{tool} has a private sandbox store to resume from"
+            );
         }
     }
 }
