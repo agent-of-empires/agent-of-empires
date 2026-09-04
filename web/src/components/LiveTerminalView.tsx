@@ -293,6 +293,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
       >
         <MobileLiveTerminal
           frame={live.state.frame}
+          liveStats={live.state.stats}
           armAgentClipboard={armAgentClipboard}
           connected={live.state.connected}
           active={active}
