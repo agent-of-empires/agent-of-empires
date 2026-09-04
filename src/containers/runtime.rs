@@ -904,10 +904,18 @@ mod tests {
         // separate elements, so the prompt is never shell-parsed.
         assert_eq!(&argv[9..], &oneshot_argv()[..]);
 
+        // `printf` sits in /usr/bin on macOS and in /bin on most Linux
+        // images. The probe is about an absolute path running without a
+        // usable PATH, not about where that path happens to be, so resolve it
+        // rather than hardcoding one layout and failing on the other.
+        let printf = ["/usr/bin/printf", "/bin/printf"]
+            .into_iter()
+            .find(|candidate| std::path::Path::new(candidate).exists())
+            .expect("an absolute printf to prove PATH independence with");
         let executable = ContainerRuntime::apple_container().build_exec_argv(
             "aoe-sandbox-test1234",
             "",
-            &["/bin/printf".to_string(), "PATH_INDEPENDENT".to_string()],
+            &[printf.to_string(), "PATH_INDEPENDENT".to_string()],
         );
         let output = std::process::Command::new(&executable[3])
             .args(&executable[4..])
@@ -915,7 +923,10 @@ mod tests {
             .env("PATH", "/definitely-missing")
             .output()
             .unwrap();
-        assert!(output.status.success());
+        assert!(
+            output.status.success(),
+            "{printf} must run with no usable PATH, got {output:?}"
+        );
         assert_eq!(output.stdout, b"PATH_INDEPENDENT");
     }
 

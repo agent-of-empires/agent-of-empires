@@ -3634,36 +3634,49 @@ mod tests {
             .expect("tmux new-session");
         assert!(output.status.success(), "Failed to create tmux session");
 
-        // Wait for printenv to run and exit
-        std::thread::sleep(std::time::Duration::from_millis(1000));
+        // Poll rather than sleep a fixed interval. On a loaded runner the
+        // pane can take longer than any one sleep to spawn, exec, and render,
+        // and the blank capture that follows reads as a failed export rather
+        // than as "not yet". `remain-on-exit on` holds the output after the
+        // process dies, so waiting past the exit never loses it.
+        let capture_pane = || {
+            let capture = tmux_command()
+                .args([
+                    "capture-pane",
+                    "-t",
+                    &format!("{}:^.0", session_name),
+                    "-p",
+                    "-S",
+                    "-10",
+                ])
+                .output()
+                .expect("capture-pane");
+            String::from_utf8_lossy(&capture.stdout).into_owned()
+        };
+        let pane_is_dead = || {
+            let dead_check = tmux_command()
+                .args(["display-message", "-t", &session_name, "-p", "#{pane_dead}"])
+                .output()
+                .expect("pane dead check");
+            String::from_utf8_lossy(&dead_check.stdout).trim() == "1"
+        };
 
-        // Capture pane output: should contain the secret value
-        let capture = tmux_command()
-            .args([
-                "capture-pane",
-                "-t",
-                &format!("{}:^.0", session_name),
-                "-p",
-                "-S",
-                "-10",
-            ])
-            .output()
-            .expect("capture-pane");
-        let pane_content = String::from_utf8_lossy(&capture.stdout);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut pane_content = capture_pane();
+        while std::time::Instant::now() < deadline
+            && !(pane_content.contains(secret_value) && pane_is_dead())
+        {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            pane_content = capture_pane();
+        }
+
         assert!(
             pane_content.contains(secret_value),
-            "Expected secret value in pane output (proves export reached exec'd process).\nPane:\n{}",
-            pane_content
+            "Expected secret value in pane output (proves export reached exec'd process).\nPane:\n{pane_content}"
         );
-
         // Pane should be dead (exec replaced the shell, printenv exited)
-        let dead_check = tmux_command()
-            .args(["display-message", "-t", &session_name, "-p", "#{pane_dead}"])
-            .output()
-            .expect("pane dead check");
-        let is_dead = String::from_utf8_lossy(&dead_check.stdout).trim().eq("1");
         assert!(
-            is_dead,
+            pane_is_dead(),
             "Pane should be dead after exec'd command exits (lifecycle preserved)"
         );
     }

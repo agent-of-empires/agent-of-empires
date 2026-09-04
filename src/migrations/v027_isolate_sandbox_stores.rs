@@ -1024,7 +1024,9 @@ fn copy_tree_from_fd(
             };
             copy_tree_from_fd(child, &target, None, &relative.join(name), overwrite_newer)?;
             if !existed || source_stat_is_newer(&stat, &target)? {
-                fs::set_permissions(&target, fs::Permissions::from_mode(stat.st_mode))?;
+                // `st_mode` is u32 on Linux and u16 on Darwin, so the cast is
+                // a no-op on one and a widening on the other.
+                fs::set_permissions(&target, fs::Permissions::from_mode(stat.st_mode as u32))?;
             }
         } else if kind == nix::libc::S_IFREG {
             let file = openat(
@@ -1065,7 +1067,7 @@ fn copy_tree_from_fd(
             }
             let mut output = options.open(&target)?;
             std::io::copy(&mut input, &mut output)?;
-            output.set_permissions(fs::Permissions::from_mode(opened.st_mode))?;
+            output.set_permissions(fs::Permissions::from_mode(opened.st_mode as u32))?;
             futimens(
                 &output,
                 &TimeSpec::new(opened.st_atime, opened.st_atime_nsec),
