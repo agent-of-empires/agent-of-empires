@@ -1122,14 +1122,27 @@ const RATE_LIMIT_RESUME_INTERVAL: Duration = Duration::from_secs(15);
 /// spirit of the #1281 "no eager restart loop" fix. See #1722.
 const RATE_LIMIT_MIN_PARK_SECS: i64 = 30;
 
-/// How long auto-resume waits when the agent reported no reset time at
-/// all. Purely a retry schedule: it never lands in a `RateLimit` event's
-/// `resets_at`, so no surface presents it as a reset the agent reported,
-/// which is what #3152 is about. It does reach the `RateLimitAutoResumed`
-/// breadcrumb, where the timestamp means "when the resume fired" (already
-/// reset plus grace even in the reported case). If the limit has not
-/// cleared, the retry re-parks and the next one is another interval out.
+/// Base wait for auto-resume when the agent reported no reset time at all,
+/// doubled per redelivery already spent in this streak. Purely a retry
+/// schedule: it never lands in a `RateLimit` event's `resets_at`, so no
+/// surface presents it as a reset the agent reported, which is what #3152
+/// is about. It does reach the `RateLimitAutoResumed` breadcrumb, where the
+/// timestamp means "when the resume fired" (already reset plus grace even
+/// in the reported case).
+///
+/// Flat retries and a redelivery cap do not compose: five hourly attempts
+/// give up after five hours, and #3688 reports two sessions that only got
+/// through at ~20 redeliveries over ~19-20 hours. Doubling spends the same
+/// five redeliveries across 1h + 2h + 4h + 8h + 16h, so a week-scale quota
+/// exhaustion is still covered for 31 hours before the session parks. See
+/// #3688's second bullet.
 const RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS: i64 = 3600;
+
+/// Ceiling on the doubling above, so a streak that somehow outruns the
+/// redelivery cap cannot shift the base into overflow. The cap fires at
+/// `RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES`, so shifts past 4 are already
+/// unreachable through the normal path.
+const RATE_LIMIT_UNKNOWN_RESET_MAX_SHIFT: u32 = 4;
 
 /// How many times auto-resume may re-deliver the interrupted prompt for one
 /// rate-limit streak before the reconciler gives up and parks the session on
@@ -1187,8 +1200,13 @@ fn rate_limit_resume_at(
 /// reported reset becomes eligible for an auto-resume retry: a fixed
 /// interval after the `RateLimit` event was recorded. See
 /// `RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS` and #3152.
-fn rate_limit_unknown_reset_retry_at(recorded_at_ms: i64) -> chrono::DateTime<chrono::Utc> {
-    let retry_after = chrono::Duration::seconds(RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS);
+fn rate_limit_unknown_reset_retry_at(
+    recorded_at_ms: i64,
+    redeliveries: i64,
+) -> chrono::DateTime<chrono::Utc> {
+    let shift = redeliveries.clamp(0, i64::from(RATE_LIMIT_UNKNOWN_RESET_MAX_SHIFT)) as u32;
+    let retry_after =
+        chrono::Duration::seconds(RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS.saturating_mul(1 << shift));
     match chrono::DateTime::from_timestamp_millis(recorded_at_ms) {
         Some(recorded) => recorded + retry_after,
         None => chrono::Utc::now() + retry_after,
@@ -1320,6 +1338,30 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
         let Some((info, recorded_at_ms)) = rate_limit else {
             continue;
         };
+        // Read before the schedule gate below, not just before the cap: the
+        // unreported-reset backoff widens with each redelivery already spent,
+        // so the streak is an input to *when* this session is next eligible,
+        // not only to whether it has any attempts left.
+        let streak = {
+            let store = Arc::clone(&state.acp_event_store);
+            let id_streak = id.clone();
+            match tokio::task::spawn_blocking(move || {
+                store.rate_limit_redelivery_streak(&id_streak)
+            })
+            .await
+            {
+                Ok(streak) => streak,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "acp.supervisor",
+                        session = %id,
+                        error = %e,
+                        "rate-limit redelivery streak probe failed"
+                    );
+                    continue;
+                }
+            }
+        };
         // A reported reset schedules against it; an unreported one (the
         // agent never attributed a reset to the window that rejected, see
         // #3152) falls back to a retry interval measured from the park.
@@ -1329,7 +1371,7 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
             Some(resets_at) => {
                 rate_limit_resume_at(resets_at, recorded_at_ms, RATE_LIMIT_AUTO_RESUME_GRACE_SECS)
             }
-            None => rate_limit_unknown_reset_retry_at(recorded_at_ms),
+            None => rate_limit_unknown_reset_retry_at(recorded_at_ms, streak),
         };
         if now < resume_at {
             continue;
@@ -1353,24 +1395,17 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
         // manual `/acp/spawn` resume or a fresh prompt still works; the
         // streak only counts resumes since the last organic turn end, so
         // either resets it.
-        let (streak, latest_seq) = {
+        let latest_seq = {
             let store = Arc::clone(&state.acp_event_store);
-            let id_streak = id.clone();
-            match tokio::task::spawn_blocking(move || {
-                (
-                    store.rate_limit_redelivery_streak(&id_streak),
-                    store.highest_seq(&id_streak),
-                )
-            })
-            .await
-            {
-                Ok((streak, latest_seq)) => (streak, latest_seq),
+            let id_seq = id.clone();
+            match tokio::task::spawn_blocking(move || store.highest_seq(&id_seq)).await {
+                Ok(latest_seq) => latest_seq,
                 Err(e) => {
                     tracing::warn!(
                         target: "acp.supervisor",
                         session = %id,
                         error = %e,
-                        "rate-limit redelivery streak probe failed"
+                        "rate-limit latest-seq probe failed"
                     );
                     continue;
                 }
@@ -2351,13 +2386,32 @@ mod tests {
     // #3152: the agent reported no reset at all. Auto-resume still has to
     // retry, on a policy interval measured from the park, because otherwise
     // an enabled auto-resume would never pick the session back up.
+    //
+    // #3688: and that interval doubles per redelivery already spent, because
+    // a flat hour paired with a five-redelivery cap gives up after five
+    // hours, while the issue reports sessions getting through at ~19-20.
     #[test]
-    fn unknown_reset_retries_an_interval_after_the_park() {
+    fn unknown_reset_backs_off_per_redelivery_spent() {
         let recorded_at = Utc.timestamp_opt(1_500_000, 0).unwrap();
-        assert_eq!(
-            rate_limit_unknown_reset_retry_at(recorded_at.timestamp_millis()),
-            recorded_at + Duration::seconds(RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS)
-        );
+        let at = |redeliveries| {
+            rate_limit_unknown_reset_retry_at(recorded_at.timestamp_millis(), redeliveries)
+                - recorded_at
+        };
+        let hour = Duration::seconds(RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS);
+        assert_eq!(at(0), hour, "the first park still waits the base interval");
+        assert_eq!(at(1), hour * 2);
+        assert_eq!(at(2), hour * 4);
+        assert_eq!(at(3), hour * 8);
+        assert_eq!(at(4), hour * 16);
+        // The five redeliveries the cap allows span 31 hours in total, which
+        // is what has to cover the reported ~19-20 hour recoveries.
+        let total: Duration = (0..RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES)
+            .map(at)
+            .fold(Duration::zero(), |acc, d| acc + d);
+        assert_eq!(total, hour * 31);
+        // Clamped past the cap so a streak that outruns it cannot overflow
+        // the shift.
+        assert_eq!(at(RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES + 50), hour * 16);
     }
 
     #[test]
