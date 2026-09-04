@@ -66,6 +66,7 @@ pub use groups::{
     TRASH_SECTION_PATH,
 };
 pub(crate) use instance::ResumeAttemptPolicy;
+pub(crate) use instance::TerminalContextResume;
 pub(crate) use instance::{
     duplicate_session_error, find_duplicate_session, is_duplicate_session,
     persist_omp_session_to_storage, persist_session_to_storage, PassiveStatusPatch, ResumeIntent,

@@ -652,6 +652,83 @@ impl Instance {
         is_existing && !takes_pinning_arm
     }
 
+    fn terminal_resume_static_unavailable(&self) -> Option<ResumeStaticUnavailable> {
+        let Some(agent) = self.resolved_agent() else {
+            return Some(ResumeStaticUnavailable::Agent);
+        };
+        if matches!(
+            agent.resume_strategy,
+            crate::agents::ResumeStrategy::Unsupported
+        ) {
+            return Some(ResumeStaticUnavailable::Agent);
+        }
+        // These agents keep session stores inside the container, where a host
+        // resume target cannot exist.
+        if self.is_sandboxed() && matches!(agent.name, "copilot" | "kimi" | "prime-agent") {
+            return Some(ResumeStaticUnavailable::Sandbox);
+        }
+        if matches!(
+            agent.resume_strategy,
+            crate::agents::ResumeStrategy::Subcommand(_)
+        ) && !self.subcommand_splice_is_safe(agent)
+        {
+            return Some(ResumeStaticUnavailable::Command);
+        }
+        None
+    }
+
+    fn terminal_resume_explicit_target_invalid(&self) -> bool {
+        matches!(
+            &self.resume_intent,
+            ResumeIntent::Use(target) if !is_valid_session_id(target)
+        )
+    }
+
+    pub(crate) fn terminal_context_resume_cached(&self) -> TerminalContextResume {
+        self.terminal_context_resume_with_runtime_source(|| {
+            self.tmux_session()
+                .map(|session| crate::tmux::cached_session_existence(session.name()))
+                .unwrap_or(crate::tmux::SessionExistence::Unknown)
+        })
+    }
+
+    fn terminal_context_resume_with_runtime_source(
+        &self,
+        runtime_source: impl FnOnce() -> crate::tmux::SessionExistence,
+    ) -> TerminalContextResume {
+        if let Some(unavailable) = self.terminal_resume_static_unavailable() {
+            return match unavailable {
+                ResumeStaticUnavailable::Agent => TerminalContextResume::AgentUnsupported,
+                ResumeStaticUnavailable::Sandbox => TerminalContextResume::SandboxUnsupported,
+                ResumeStaticUnavailable::Command => TerminalContextResume::CommandUnsupported,
+            };
+        }
+        match &self.resume_intent {
+            ResumeIntent::Cleared => TerminalContextResume::ForcedFresh,
+            ResumeIntent::Fork { .. } => TerminalContextResume::ForkPending,
+            ResumeIntent::Use(_) => {
+                if self.terminal_resume_explicit_target_invalid() {
+                    TerminalContextResume::InvalidTarget
+                } else {
+                    TerminalContextResume::Available
+                }
+            }
+            ResumeIntent::Default => {
+                if self.agent_session_id.is_some()
+                    && self.agent_session_id == self.resume_probe_failed_sid
+                {
+                    TerminalContextResume::PreviousFailure
+                } else if self.agent_session_id.is_some()
+                    || !matches!(runtime_source(), crate::tmux::SessionExistence::Absent)
+                {
+                    TerminalContextResume::RuntimeCheckRequired
+                } else {
+                    TerminalContextResume::NoTarget
+                }
+            }
+        }
+    }
+
     /// Whether a `ResumeStrategy::Subcommand` (or `ForkStrategy::CodexFork`)
     /// token can be spliced into this launch command.
     ///
@@ -711,8 +788,8 @@ impl Instance {
             // A fork is a fresh session, not an in-place resume.
             return false;
         }
-        // Read before acquisition: the `Use` intent is what marks an id the
-        // user pinned rather than one AoE minted or captured.
+        // Read before acquisition: a Use intent marks an id the user pinned
+        // rather than one AoE minted or captured.
         let explicitly_pinned = matches!(self.resume_intent, ResumeIntent::Use(_));
         self.absorb_published_pi_session();
         let (mut session_id, is_existing) = self.acquire_session_id();
@@ -725,32 +802,23 @@ impl Instance {
             session_id.as_deref(),
             explicitly_pinned,
         );
-        // Sandboxed Copilot, Kimi, and Prime Agent start fresh: their session
-        // stores live inside the container (Copilot's SQLite db, Kimi's
-        // `~/.kimi-code/session_index.jsonl`, Prime Agent's
-        // `~/.prime/agent/sessions/*.jsonl`), so a host-captured or manually
-        // pinned sid would launch `--resume <id>` against an id that does
-        // not resolve there. Capture is already host-only above; drop the sid
-        // to gate emission too.
-        if matches!(resume_tool, "copilot" | "kimi" | "prime-agent") && self.is_sandboxed() {
-            session_id = None;
+        // Only the constraints `build_resume_flags` cannot see are applied
+        // here. It already refuses an unresolved agent, an `Unsupported`
+        // strategy and an invalid id, and says why; suppressing the sid for
+        // those would drop the launch line's only trace of the decision.
+        let static_unavailable = self.terminal_resume_static_unavailable();
+        if matches!(static_unavailable, Some(ResumeStaticUnavailable::Command)) {
+            tracing::warn!(target: "session.store",
+                tool = %self.tool,
+                command = %self.command,
+                "resume subcommand needs the binary's position and this command hides it behind a launcher; starting fresh"
+            );
         }
-        // Same fail-closed rule for a subcommand-shaped resume whose splice
-        // point this command hides: a mangled launch line is worse than a
-        // fresh conversation.
-        if let Some(agent) = crate::agents::get_agent(resume_tool) {
-            if matches!(
-                agent.resume_strategy,
-                crate::agents::ResumeStrategy::Subcommand(_)
-            ) && !self.subcommand_splice_is_safe(agent)
-            {
-                tracing::warn!(target: "session.store",
-                    tool = %self.tool,
-                    command = %self.command,
-                    "resume subcommand needs the binary's position and this command hides it behind a launcher; starting fresh"
-                );
-                session_id = None;
-            }
+        if matches!(
+            static_unavailable,
+            Some(ResumeStaticUnavailable::Sandbox | ResumeStaticUnavailable::Command)
+        ) {
+            session_id = None;
         }
         // A transcript the pane published outranks its id: `--session <path>`
         // resolves the conversation wherever it was started, while
@@ -1565,6 +1633,10 @@ mod tests {
         wrapped.command = "ssh -t lenovo codex".to_string();
         wrapped.agent_session_id = Some(sid.to_string());
         wrapped.resume_intent = ResumeIntent::Use(sid.to_string());
+        assert_eq!(
+            wrapped.terminal_context_resume_cached(),
+            TerminalContextResume::CommandUnsupported
+        );
         let mut cmd = wrapped.command.clone();
         assert!(!wrapped.apply_session_flags(&mut cmd, "test"));
         assert_eq!(
@@ -1579,6 +1651,10 @@ mod tests {
         direct.command = "codex --model o3".to_string();
         direct.agent_session_id = Some(sid.to_string());
         direct.resume_intent = ResumeIntent::Use(sid.to_string());
+        assert_eq!(
+            direct.terminal_context_resume_cached(),
+            TerminalContextResume::Available
+        );
         let mut direct_cmd = direct.command.clone();
         assert!(direct.apply_session_flags(&mut direct_cmd, "test"));
         assert_eq!(direct_cmd, format!("codex resume {sid} --model o3"));
@@ -1595,6 +1671,11 @@ mod tests {
             bare.command = command.to_string();
             bare.agent_session_id = Some(sid.to_string());
             bare.resume_intent = ResumeIntent::Use(sid.to_string());
+            assert_eq!(
+                bare.terminal_context_resume_cached(),
+                TerminalContextResume::Available,
+                "{command}"
+            );
             let mut bare_cmd = bare.command.clone();
             assert!(bare.apply_session_flags(&mut bare_cmd, "test"), "{command}");
             assert_eq!(bare_cmd, format!("{command} resume {sid}"));
@@ -1610,7 +1691,11 @@ mod tests {
         const PROFILE: &str = "custom-agent-resume-test";
         let _registry = install_aliases(
             PROFILE,
-            &[("claude-personal", "claude"), ("cursor-personal", "cursor")],
+            &[
+                ("claude-personal", "claude"),
+                ("copilot-personal", "copilot"),
+                ("cursor-personal", "cursor"),
+            ],
         );
 
         let mut inst = Instance::new("wrapper", "/tmp/custom-agent-resume");
@@ -1626,6 +1711,11 @@ mod tests {
             .expect("a wrapper launch must pin the conversation it is about to start");
         assert_eq!(fresh, format!("claude-personal --session-id {sid}"));
 
+        inst.resume_intent = ResumeIntent::Use(sid.clone());
+        assert_eq!(
+            inst.terminal_context_resume_cached(),
+            TerminalContextResume::Available
+        );
         let mut restart = "claude-personal".to_string();
         assert!(inst.apply_session_flags(&mut restart, "test"));
         assert_eq!(restart, format!("claude-personal --resume {sid}"));
@@ -1637,11 +1727,38 @@ mod tests {
         unsupported.tool = "cursor-personal".to_string();
         unsupported.command = "cursor-personal".to_string();
         unsupported.resume_intent = ResumeIntent::Use(sid.clone());
+        assert_eq!(
+            unsupported.terminal_context_resume_cached(),
+            TerminalContextResume::AgentUnsupported
+        );
         let mut cursor = "cursor-personal".to_string();
         assert!(!unsupported.apply_session_flags(&mut cursor, "test"));
         assert_eq!(cursor, "cursor-personal");
-    }
 
+        // Sandboxing applies the resolved base agent's session-store rule.
+        let mut sandboxed = Instance::new("wrapper", "/tmp/custom-agent-resume");
+        sandboxed.source_profile = PROFILE.to_string();
+        sandboxed.tool = "copilot-personal".to_string();
+        sandboxed.command = "copilot-personal".to_string();
+        sandboxed.resume_intent = ResumeIntent::Use(sid);
+        sandboxed.sandbox_info = Some(SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test-image".to_string(),
+            container_name: "test".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        });
+        assert_eq!(
+            sandboxed.terminal_context_resume_cached(),
+            TerminalContextResume::SandboxUnsupported
+        );
+        let mut copilot = "copilot-personal".to_string();
+        assert!(!sandboxed.apply_session_flags(&mut copilot, "test"));
+        assert_eq!(copilot, "copilot-personal");
+    }
     #[test]
     fn apply_session_flags_returns_acquire_is_existing() {
         let mut inst = Instance::new("Test", "/tmp/test");
@@ -3468,6 +3585,97 @@ mod tests {
                 Some("kimi-stored"),
                 "invalid peer config must not license ambient-home MRU"
             );
+        }
+    }
+    #[test]
+    fn terminal_context_resume_matches_emission_constraints() {
+        let sid = "44444444-4444-4444-8444-444444444444".to_string();
+        let mut inst = Instance::new("context", "/tmp/context");
+        inst.tool = "claude".to_string();
+        assert_eq!(
+            inst.terminal_context_resume_with_runtime_source(|| {
+                crate::tmux::SessionExistence::Absent
+            }),
+            TerminalContextResume::NoTarget
+        );
+        assert_eq!(
+            inst.terminal_context_resume_with_runtime_source(|| {
+                crate::tmux::SessionExistence::Present
+            }),
+            TerminalContextResume::RuntimeCheckRequired
+        );
+        assert_eq!(
+            inst.terminal_context_resume_with_runtime_source(|| {
+                crate::tmux::SessionExistence::Unknown
+            }),
+            TerminalContextResume::RuntimeCheckRequired
+        );
+        inst.agent_session_id = Some(sid.clone());
+        assert_eq!(
+            inst.terminal_context_resume_cached(),
+            TerminalContextResume::RuntimeCheckRequired
+        );
+        inst.resume_intent = ResumeIntent::Use(sid.clone());
+        assert_eq!(
+            inst.terminal_context_resume_cached(),
+            TerminalContextResume::Available
+        );
+        inst.resume_probe_failed_sid = Some(sid.clone());
+        assert_eq!(
+            inst.terminal_context_resume_cached(),
+            TerminalContextResume::Available
+        );
+        inst.resume_intent = ResumeIntent::Default;
+        assert_eq!(
+            inst.terminal_context_resume_cached(),
+            TerminalContextResume::PreviousFailure
+        );
+        inst.resume_intent = ResumeIntent::Use("bad target".to_string());
+        assert_eq!(
+            inst.terminal_context_resume_cached(),
+            TerminalContextResume::InvalidTarget
+        );
+        let mut command = "claude".to_string();
+        assert!(!inst.apply_session_flags(&mut command, "test"));
+        assert_eq!(command, "claude");
+        inst.resume_intent = ResumeIntent::Cleared;
+        assert_eq!(
+            inst.terminal_context_resume_cached(),
+            TerminalContextResume::ForcedFresh
+        );
+        inst.resume_intent = ResumeIntent::Fork { from: sid.clone() };
+        assert_eq!(
+            inst.terminal_context_resume_cached(),
+            TerminalContextResume::ForkPending
+        );
+
+        inst.tool = "cursor".to_string();
+        assert_eq!(
+            inst.terminal_context_resume_cached(),
+            TerminalContextResume::AgentUnsupported
+        );
+
+        for tool in ["copilot", "kimi", "prime-agent"] {
+            inst.tool = tool.to_string();
+            inst.resume_intent = ResumeIntent::Default;
+            inst.sandbox_info = Some(SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: "test-image".to_string(),
+                container_name: "test".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                container_workdir: None,
+            });
+            for target in [None, Some(sid.clone())] {
+                inst.agent_session_id = target;
+                assert_eq!(
+                    inst.terminal_context_resume_cached(),
+                    TerminalContextResume::SandboxUnsupported,
+                    "{tool} must start fresh in a sandbox"
+                );
+            }
         }
     }
 }

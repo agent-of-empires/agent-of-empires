@@ -12,15 +12,16 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::daemon::{
-    CleanupDefaults, ListSessionsQuery, PlanSummary, SessionResponse, SessionsEnvelope,
-    WorkspaceRepoSummary,
+    CleanupDefaults, ContextResumeAvailability, ContextResumeIndeterminateReason,
+    ContextResumeUnavailableReason, ListSessionsQuery, PlanSummary, SessionResponse,
+    SessionsEnvelope, WorkspaceRepoSummary,
 };
 
 use crate::git::error::GitError;
 use crate::session::config::SessionConfig;
 use crate::session::{
     duplicate_session_error, is_duplicate_session, EnsureReadyError, EnsureReadyOutcome, Instance,
-    LifecycleOperation, Status, Storage,
+    LifecycleOperation, Status, Storage, TerminalContextResume,
 };
 
 use super::validate_display_label;

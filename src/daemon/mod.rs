@@ -10,7 +10,8 @@ use reqwest::{StatusCode, Url};
 use thiserror::Error;
 
 pub use wire::{
-    AcpWorkerState, CleanupDefaults, ListSessionsQuery, PlanSummary, PromptAttachmentKind,
+    AcpWorkerState, CleanupDefaults, ContextResumeAvailability, ContextResumeIndeterminateReason,
+    ContextResumeUnavailableReason, ListSessionsQuery, PlanSummary, PromptAttachmentKind,
     PromptAttachmentRef, QueuedPromptEntry, SessionResponse, SessionsEnvelope,
     WorkspaceRepoSummary,
 };

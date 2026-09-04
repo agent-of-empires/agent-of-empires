@@ -573,6 +573,17 @@ fn resolved_agent_existence(
 /// per-session title and lifecycle locks through this call; rekeying before
 /// commit can strand the pane when persistence fails.
 pub(crate) fn rekey_session(id: &str, old_title: &str, new_title: &str) -> anyhow::Result<bool> {
+    let renamed = rekey_session_name(id, old_title, new_title)?;
+    if renamed {
+        // Every `Ok(true)` path leaves the session under the new derived name.
+        status_bar::refresh_session_title(&Session::generate_name(id, new_title), new_title);
+    }
+    Ok(renamed)
+}
+
+/// The rename half of [`rekey_session`]: resolves the live session for `id`
+/// and moves it to the name derived from `new_title`.
+fn rekey_session_name(id: &str, old_title: &str, new_title: &str) -> anyhow::Result<bool> {
     // Name resolution is cache-backed. Force an authoritative scan first so a
     // process-local snapshot from before another writer's rename cannot point
     // this mutation at the old title-derived name.
@@ -1629,7 +1640,11 @@ fn session_existence_from_cache(name: &str) -> Option<SessionExistence> {
         None => SessionExistence::Unknown,
     })
 }
-
+/// Read the current session cache without refreshing it. A stale or poisoned
+/// snapshot remains unknown so async request handlers never spawn tmux.
+pub(crate) fn cached_session_existence(name: &str) -> SessionExistence {
+    session_existence_from_cache(name).unwrap_or(SessionExistence::Unknown)
+}
 /// Probe whether an aoe tmux session exists, distinguishing "confirmed
 /// absent" from "couldn't tell because the tmux server was unreachable".
 ///
@@ -2719,6 +2734,16 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn cached_session_existence_keeps_stale_snapshot_unknown() {
+        let guard = SessionCacheGuard::capture();
+        let name = format!("{P}cached_stale_abc12345");
+        guard.force_present(&[&name]);
+        guard.force_stale();
+
+        assert_eq!(cached_session_existence(&name), SessionExistence::Unknown);
+    }
+    #[test]
+    #[serial_test::serial]
     fn rekey_classification_treats_confirmed_no_server_as_absent() {
         let guard = SessionCacheGuard::capture();
         let id = "noserverdeadbeef";
@@ -3450,6 +3475,45 @@ mod tests {
         assert!(rekey_session(ID, "Fix login bug", "Final rename").unwrap());
         assert!(Session::from_name(&final_name).exists());
         drop((start_guard, peer_guard, final_guard));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rekey_session_refreshes_the_status_bar_title() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let start_name = Session::generate_name(ID, "Britons");
+        let final_name = Session::generate_name(ID, "Fix detach hint");
+        let start_guard = TmuxTestSession::from_name(start_name.clone());
+        let final_guard = TmuxTestSession::from_name(final_name.clone());
+        let created = tmux_command()
+            .args(["new-session", "-d", "-s", start_guard.name(), "sleep 60"])
+            .output()
+            .expect("tmux new-session");
+        assert!(created.status.success());
+        // Seed the option the way `apply_status_bar` does at session start.
+        let seeded = tmux_command()
+            .args(["set-option", "-t", &start_name, "@aoe_title", "Britons"])
+            .output()
+            .expect("tmux set-option @aoe_title");
+        assert!(seeded.status.success());
+        refresh_session_cache();
+
+        assert!(rekey_session(ID, "Britons", "Fix detach hint").unwrap());
+
+        // `status-right` renders `#{@aoe_title}`, so a stale value keeps the
+        // pre-rename title on the bar until the session is restarted.
+        let shown = tmux_command()
+            .args(["show-options", "-t", &final_name, "-v", "@aoe_title"])
+            .output()
+            .expect("tmux show-options @aoe_title");
+        assert_eq!(
+            String::from_utf8_lossy(&shown.stdout).trim(),
+            "Fix detach hint"
+        );
+        drop((start_guard, final_guard));
     }
 
     #[test]

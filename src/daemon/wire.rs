@@ -105,6 +105,40 @@ pub enum AcpWorkerState {
     Running,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextResumeUnavailableReason {
+    AgentUnsupported,
+    SandboxUnsupported,
+    CommandUnsupported,
+    ForcedFresh,
+    InvalidTarget,
+    ForkPending,
+    PreviousFailure,
+    NoTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextResumeIndeterminateReason {
+    RuntimeCheckRequired,
+    AgentHandshakeRequired,
+}
+
+/// Whether the daemon can preserve agent context during a future authorized
+/// lifecycle transition. This is not current start eligibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ContextResumeAvailability {
+    Available,
+    Indeterminate {
+        reason: ContextResumeIndeterminateReason,
+    },
+    Unavailable {
+        reason: ContextResumeUnavailableReason,
+    },
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct SessionResponse {
     pub id: String,
@@ -264,6 +298,10 @@ pub struct SessionResponse {
     /// pick the structured panels vs the terminal view.
     #[serde(default, skip_serializing_if = "crate::session::View::is_terminal")]
     pub view: crate::session::View,
+    /// Whether the daemon can preserve this agent's context across a future
+    /// lifecycle transition. This does not report current start eligibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_resume: Option<ContextResumeAvailability>,
     /// Live structured view worker lifecycle. `absent` for tmux sessions or
     /// structured view sessions whose worker has not been spawned/attached
     /// yet; `resuming` while the reconciler is mid-spawn or mid-attach;

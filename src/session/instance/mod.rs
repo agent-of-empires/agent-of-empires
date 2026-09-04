@@ -87,6 +87,26 @@ pub use status::{Status, TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR}
 pub(crate) use tmux_session::{
     duplicate_session_error, find_duplicate_session, is_duplicate_session,
 };
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeStaticUnavailable {
+    Agent,
+    Sandbox,
+    Command,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalContextResume {
+    Available,
+    RuntimeCheckRequired,
+    NoTarget,
+    AgentUnsupported,
+    SandboxUnsupported,
+    CommandUnsupported,
+    ForcedFresh,
+    InvalidTarget,
+    ForkPending,
+    PreviousFailure,
+}
 pub(crate) use types::{PiSidecarSource, PriorToolSession, ResumeIntent};
 pub use types::{
     PluginCreateIdempotency, SandboxInfo, TerminalInfo, View, WorkspaceInfo, WorkspaceRepo,

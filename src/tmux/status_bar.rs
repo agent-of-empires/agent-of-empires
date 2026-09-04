@@ -101,9 +101,12 @@ fn set_session_option_unset(session_name: &str, option: &str) -> Result<()> {
 }
 
 fn set_session_option(session_name: &str, option: &str, value: &str) -> Result<()> {
-    let output = crate::tmux::tmux_command()
-        .args(["set-option", "-t", session_name, option, value])
-        .output()?;
+    // Deadline-bounded like every other tmux call aoe makes: `rekey_session`
+    // reaches this from a rename the TUI and the HTTP handler both wait on, so
+    // a wedged server must not hold the rename open.
+    let mut command = crate::tmux::tmux_command();
+    command.args(["set-option", "-t", session_name, option, value]);
+    let output = crate::tmux::run_tmux_command_with_timeout(&mut command)?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -112,6 +115,18 @@ fn set_session_option(session_name: &str, option: &str, value: &str) -> Result<(
     }
 
     Ok(())
+}
+
+/// Refresh the title the status bar and `aoe tmux-status` read for a session.
+///
+/// A rename moves the session name but leaves `@aoe_title` holding the
+/// pre-rename title, and nothing re-applies the status bar to a session that
+/// is already live. Written outside the `StatusBar` setting gate on purpose:
+/// `@aoe_*` are aoe's own user options rather than tmux built-ins, so they
+/// never override a user's config, and `aoe tmux-status` serves them to users
+/// painting their own bar.
+pub(crate) fn refresh_session_title(session_name: &str, title: &str) {
+    let _ = set_session_option(session_name, "@aoe_title", title);
 }
 
 /// Apply mouse support option to a tmux session.

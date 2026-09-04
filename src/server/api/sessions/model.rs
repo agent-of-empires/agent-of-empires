@@ -115,6 +115,7 @@ impl SessionResponse {
             notify_on_idle: inst.notify_on_idle,
             notify_on_error: inst.notify_on_error,
             view: inst.view,
+            context_resume: Some(context_resume_for(inst)),
             queued_prompts: {
                 let mut q = inst.queued_prompts.clone();
                 q.sort_by_key(|e| e.seq);
@@ -226,6 +227,55 @@ pub(super) fn truncate_title(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
     out.push('…');
     out
+}
+
+pub(super) fn context_resume_for(inst: &Instance) -> ContextResumeAvailability {
+    if inst.is_structured() {
+        return if inst.fork_pending.is_some() {
+            ContextResumeAvailability::Unavailable {
+                reason: ContextResumeUnavailableReason::ForkPending,
+            }
+        } else if inst.acp_session_id.is_some() {
+            ContextResumeAvailability::Indeterminate {
+                reason: ContextResumeIndeterminateReason::AgentHandshakeRequired,
+            }
+        } else {
+            ContextResumeAvailability::Unavailable {
+                reason: ContextResumeUnavailableReason::NoTarget,
+            }
+        };
+    }
+
+    match inst.terminal_context_resume_cached() {
+        TerminalContextResume::Available => ContextResumeAvailability::Available,
+        TerminalContextResume::RuntimeCheckRequired => ContextResumeAvailability::Indeterminate {
+            reason: ContextResumeIndeterminateReason::RuntimeCheckRequired,
+        },
+        TerminalContextResume::NoTarget => ContextResumeAvailability::Unavailable {
+            reason: ContextResumeUnavailableReason::NoTarget,
+        },
+        TerminalContextResume::AgentUnsupported => ContextResumeAvailability::Unavailable {
+            reason: ContextResumeUnavailableReason::AgentUnsupported,
+        },
+        TerminalContextResume::SandboxUnsupported => ContextResumeAvailability::Unavailable {
+            reason: ContextResumeUnavailableReason::SandboxUnsupported,
+        },
+        TerminalContextResume::CommandUnsupported => ContextResumeAvailability::Unavailable {
+            reason: ContextResumeUnavailableReason::CommandUnsupported,
+        },
+        TerminalContextResume::ForcedFresh => ContextResumeAvailability::Unavailable {
+            reason: ContextResumeUnavailableReason::ForcedFresh,
+        },
+        TerminalContextResume::InvalidTarget => ContextResumeAvailability::Unavailable {
+            reason: ContextResumeUnavailableReason::InvalidTarget,
+        },
+        TerminalContextResume::ForkPending => ContextResumeAvailability::Unavailable {
+            reason: ContextResumeUnavailableReason::ForkPending,
+        },
+        TerminalContextResume::PreviousFailure => ContextResumeAvailability::Unavailable {
+            reason: ContextResumeUnavailableReason::PreviousFailure,
+        },
+    }
 }
 
 /// Process-wide built-in ACP registry, built once. Used to compute

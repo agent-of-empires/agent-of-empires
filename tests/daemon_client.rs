@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use agent_of_empires::daemon::{
-    AcpWorkerState, DaemonClient, DaemonClientError, PromptAttachmentKind,
+    AcpWorkerState, ContextResumeAvailability, ContextResumeIndeterminateReason, DaemonClient,
+    DaemonClientError, PromptAttachmentKind,
 };
 use agent_of_empires::session::SessionScope;
 use reqwest::StatusCode;
@@ -59,6 +60,10 @@ fn structured_success() -> String {
                 "delete_to_trash": true
             },
             "view": "structured",
+            "context_resume": {
+                "state": "indeterminate",
+                "reason": "agent_handshake_required"
+            },
             "acp_worker_state": "running",
             "acp_capable": true,
             "queued_prompts": [{
@@ -225,6 +230,12 @@ async fn daemon_client_http_contract() {
     request.await.unwrap();
     let session = &envelope.sessions[0];
     assert_eq!(session.view, agent_of_empires::session::View::Structured);
+    assert_eq!(
+        session.context_resume,
+        Some(ContextResumeAvailability::Indeterminate {
+            reason: ContextResumeIndeterminateReason::AgentHandshakeRequired,
+        })
+    );
     assert_eq!(session.acp_worker_state, AcpWorkerState::Running);
     assert!(session.acp_capable);
     assert!(session.acp_can_fork);
@@ -238,6 +249,7 @@ async fn daemon_client_http_contract() {
     let round_trip = serde_json::to_value(&envelope).unwrap();
     for key in [
         "view",
+        "context_resume",
         "acp_worker_state",
         "acp_capable",
         "queued_prompts",
@@ -252,6 +264,25 @@ async fn daemon_client_http_contract() {
             "missing {key}"
         );
     }
+
+    let mut unreported_context: serde_json::Value = serde_json::from_str(&structured).unwrap();
+    unreported_context["sessions"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("context_resume");
+    let (origin, request) = serve_once(response(
+        "200 OK",
+        &[],
+        &serde_json::to_string(&unreported_context).unwrap(),
+    ))
+    .await;
+    let envelope = DaemonClient::new(&origin, None)
+        .unwrap()
+        .list_sessions(None)
+        .await
+        .unwrap();
+    request.await.unwrap();
+    assert_eq!(envelope.sessions[0].context_resume, None);
 
     let oversized_success = response("200 OK", &[], &"x".repeat(16_777_217));
     let (origin, request) = serve_once(oversized_success).await;
