@@ -1514,12 +1514,39 @@ impl SessionService {
         TurnAdmissionError,
     > {
         let guard = self.admit_prompt_submission(caller, id).await?;
+        let running = self.acp_supervisor.is_running(id).await;
+        // Settled here, under the guard, rather than probed by each handler
+        // before it claims one: a reconciler park landing between a handler's
+        // probe and its admission would otherwise decide `WorkerDown` for a
+        // session nothing is going to un-park. Only a worker-less session that
+        // is not already sendable pays the query.
+        let rate_limit_exhausted =
+            !running && !idle_dormant && self.is_rate_limit_exhausted_park(id).await;
         let liveness = crate::acp::dispatch::WorkerLiveness {
-            running: self.acp_supervisor.is_running(id).await,
+            running,
             idle_dormant,
+            rate_limit_exhausted,
         };
         let dispatch = crate::acp::dispatch::decide(&self.fold_control_state(id).await, liveness);
         Ok((guard, dispatch))
+    }
+
+    /// Whether the session's newest lifecycle event is the redelivery-cap
+    /// park (#3688). Off the runtime: `latest_status_event` takes the store's
+    /// lock and scans back to the first lifecycle row.
+    async fn is_rate_limit_exhausted_park(&self, id: &str) -> bool {
+        let store = Arc::clone(&self.acp_event_store);
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || {
+            matches!(
+                store.latest_status_event(&id),
+                Some(crate::acp::Event::Stopped { reason })
+                    if reason
+                        == crate::server::acp_reconciler::RATE_LIMIT_EXHAUSTED_RETRIES_REASON
+            )
+        })
+        .await
+        .unwrap_or(false)
     }
 
     /// Drop a deleted session's submission lock, mirroring the `instance_locks`

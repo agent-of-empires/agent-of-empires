@@ -2,9 +2,10 @@
 //!
 //! Allows repos to define hooks and override session/sandbox/worktree settings.
 //! Settings that are personal/global (theme, acp, web, logging) are
-//! intentionally not overridable at the repo level, and within `session` only
-//! the fields in `REPO_ALLOWED_SESSION_FIELDS` carry over: the rest name or
-//! build the command AoE launches.
+//! intentionally not overridable at the repo level. Within an overridable
+//! section, each field's `#[setting(repo = "allow" | "deny")]` attribute on its
+//! `Config` declaration is the policy; fields without one inherit the
+//! `repo_default` their `#[setting_section(...)]` declares.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -65,64 +66,6 @@ use crate::session::mcp::project_mcp::ProjectMcpServer;
 /// section repo-overridable.
 const REPO_OVERRIDABLE_SECTIONS: &[&str] = &["hooks", "session", "sandbox", "worktree", "updates"];
 
-/// What a repo may set inside one overridable section (#3154).
-enum SectionPolicy {
-    /// Every field in the section carries over.
-    AllowAll,
-    /// Default-deny: only these fields carry over. Used where the section is
-    /// mostly personal settings with a few command-bearing ones, so a field
-    /// added later must be opted in rather than inherited.
-    AllowOnly(&'static [&'static str]),
-    /// Every field except these carries over. Used where the section is a
-    /// genuine team-shared surface with a few fields that can put attacker code
-    /// on the host.
-    DenyOnly(&'static [&'static str]),
-}
-
-/// Fields a repo may set inside the `session` section.
-///
-/// `session` is mixed-trust: most of it is personal preference, but several
-/// fields name or build the command AoE hands to tmux (`custom_agents`,
-/// `agent_command_override`, `agent_extra_args`, `agent_acp_cmd`,
-/// `smart_rename_agent`, `smart_rename_model`) or weaken the agent's own
-/// permission gate (`yolo_mode_default`). Honoring those from a checked-out
-/// repo is arbitrary host command execution at session launch, the hazard that
-/// already keeps `host_hooks` out of [`REPO_OVERRIDABLE_SECTIONS`]. Listing the
-/// safe fields instead of the dangerous ones means a field added to
-/// `SessionConfig` later stays repo-denied until someone decides otherwise.
-///
-/// `default_tool` is safe because it only names a tool the user configured
-/// (built-in or from their own global/profile `custom_agents`) and is never
-/// executed as a command; `agent_detect_as` only picks status-detection
-/// heuristics.
-const REPO_ALLOWED_SESSION_FIELDS: &[&str] = &["default_tool", "agent_detect_as"];
-
-/// Fields a repo may not set inside the `sandbox` section.
-///
-/// The rest of the section (resource limits, env passthrough, volume ignores,
-/// the custom instruction) is the point of repo-shared sandbox config and stays
-/// overridable. These four compose into the same no-prompt host compromise as
-/// the `session` launch fields: `enabled_by_default` puts a plain `aoe add`
-/// into a container the user never asked for, `default_image` chooses whose
-/// code runs in it, and `extra_volumes` / `mount_ssh` hand that code the host
-/// filesystem and the user's SSH keys.
-const REPO_DENIED_SANDBOX_FIELDS: &[&str] = &[
-    "enabled_by_default",
-    "default_image",
-    "extra_volumes",
-    "mount_ssh",
-];
-
-/// The repo-override policy for a section. Sections outside
-/// [`REPO_OVERRIDABLE_SECTIONS`] never reach here.
-fn section_policy(section: &str) -> SectionPolicy {
-    match section {
-        "session" => SectionPolicy::AllowOnly(REPO_ALLOWED_SESSION_FIELDS),
-        "sandbox" => SectionPolicy::DenyOnly(REPO_DENIED_SANDBOX_FIELDS),
-        _ => SectionPolicy::AllowAll,
-    }
-}
-
 /// Repository-level configuration loaded from `.agent-of-empires/config.toml`.
 ///
 /// Stored as a sparse override tree like [`ProfileConfig`] (#1692): section
@@ -151,6 +94,21 @@ impl RepoConfig {
     /// The overrides restricted to what a repo may set, as a JSON object.
     fn allowed_overrides(&self) -> serde_json::Value {
         serde_json::Value::Object(sanitize_repo_overrides(&self.overrides).0)
+    }
+
+    /// The overrides restricted to [`REPO_OVERRIDABLE_SECTIONS`], without the
+    /// per-field policy filter. Only for the unknown-key probe, which must see
+    /// a misspelled repo-denied field to call it a typo. Never merged.
+    fn overridable_sections(&self) -> serde_json::Value {
+        serde_json::Value::Object(
+            self.overrides
+                .iter()
+                .filter(|(section, value)| {
+                    REPO_OVERRIDABLE_SECTIONS.contains(&section.as_str()) && value.is_object()
+                })
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        )
     }
 }
 
@@ -369,10 +327,23 @@ pub fn load_repo_config(project_path: &Path) -> Result<Option<RepoConfig>> {
         );
     }
 
+    // Unknown keys sanitize cleanly and serde drops them on merge, so name
+    // them here (#3218). Before the field filter: a typo in a repo-denied
+    // field would otherwise read as a policy rejection.
+    let allowed = config.allowed_overrides();
+    let unknown = super::profile_config::overrides_ignored_keys(&config.overridable_sections());
+    if !unknown.is_empty() {
+        tracing::warn!(target: "session.store",
+            path = %config_path.display(),
+            ignored = %unknown.join(", "),
+            "Ignoring unrecognized keys in repo config"
+        );
+    }
+
     // Type-check the repo overrides by merging onto a default Config (the sparse
     // map accepts any JSON). A wrong-typed value surfaces as a load error here
     // rather than a merge-time panic; the caller degrades to profile config.
-    super::profile_config::validate_overrides_typecheck(&config.allowed_overrides())
+    super::profile_config::validate_overrides_typecheck(&allowed)
         .with_context(|| format!("Invalid override in {}", config_path.display()))?;
 
     Ok(Some(config))
@@ -446,10 +417,10 @@ pub fn merge_repo_config(config: Config, repo: &RepoConfig) -> Config {
 }
 
 /// Filter a sparse override map to what a repo may set: the repo-allowed
-/// sections, minus the per-section field policy (see [`section_policy`]). Also
-/// returns the dotted paths that were dropped, so callers can name them in a
-/// warning; the values are never reported, since a dropped command can carry
-/// secrets or terminal escape sequences.
+/// sections, minus each field's repo policy (see [`repo_may_override_field`]).
+/// Also returns the dotted paths that were dropped, so callers can name them
+/// in a warning; the values are never reported, since a dropped command can
+/// carry secrets or terminal escape sequences.
 fn sanitize_repo_overrides(
     overrides: &serde_json::Map<String, serde_json::Value>,
 ) -> (serde_json::Map<String, serde_json::Value>, Vec<String>) {
@@ -461,12 +432,8 @@ fn sanitize_repo_overrides(
             rejected.push(section.clone());
             continue;
         }
-        if matches!(section_policy(section), SectionPolicy::AllowAll) {
-            kept.insert(section.clone(), value.clone());
-            continue;
-        }
-        // A non-object section cannot be field-filtered, so it is dropped whole
-        // rather than merged unchecked.
+        // A non-object section cannot be field-filtered, so it is dropped
+        // whole rather than merged unchecked.
         let Some(fields) = value.as_object() else {
             rejected.push(section.clone());
             continue;
@@ -488,17 +455,25 @@ fn sanitize_repo_overrides(
     (kept, rejected)
 }
 
-/// Whether a repo's `.agent-of-empires/config.toml` may set this field. The
-/// TUI's Repo scope uses it so it never offers a field the merge path strips.
+/// Whether a repo's `.agent-of-empires/config.toml` may set this field.
+///
+/// The field's `#[setting(repo = "...")]`, or the `repo_default` its section
+/// declares, is the policy; a global-only field is never repo-settable,
+/// because its value is read from the global config and an override would
+/// silently do nothing.
+///
+/// A key with no descriptor is denied whenever the section is in the settings
+/// schema: those sections describe every field a surface may touch, so an
+/// undescribed key is `#[setting(skip)]` or a typo. `hooks` has no schema
+/// section and stays open.
 pub fn repo_may_override_field(section: &str, field: &str) -> bool {
     if !REPO_OVERRIDABLE_SECTIONS.contains(&section) {
         return false;
     }
-    match section_policy(section) {
-        SectionPolicy::AllowAll => true,
-        SectionPolicy::AllowOnly(allowed) => allowed.contains(&field),
-        SectionPolicy::DenyOnly(denied) => !denied.contains(&field),
-    }
+    let Some(desc) = super::settings_schema::descriptor(section, field) else {
+        return !super::settings_schema::section_in_schema(section);
+    };
+    desc.profile_overridable && desc.repo_policy == super::settings_schema::RepoPolicy::Allow
 }
 
 /// Convert a RepoConfig into a ProfileConfig for TUI editing.
@@ -1691,7 +1666,7 @@ pub const INIT_TEMPLATE: &str = r#"# Agent of Empires - Repository Configuration
 # on_destroy = ["docker-compose down"]
 
 # [session]
-# default_tool = "claude"
+# agent_detect_as = { my-agent = "claude" }
 
 # [sandbox]
 # enabled_by_default = true
@@ -2038,9 +2013,36 @@ mod tests {
             merged.session.custom_agents.is_empty(),
             "repo-declared custom_agents must be dropped on merge"
         );
-        // `default_tool` stays repo-overridable (the documented use case); it
-        // can only name a tool the user configured, never a command.
-        assert_eq!(merged.session.default_tool.as_deref(), Some("repo-agent"));
+        assert_eq!(
+            merged.session.default_tool, None,
+            "repo-declared default_tool must be dropped on merge"
+        );
+    }
+
+    #[test]
+    fn test_repo_config_cannot_select_a_user_custom_agent() {
+        // The launch path exact-matches the user's `custom_agents` before
+        // built-ins when resolving `default_tool` (cli/add.rs), so a repo
+        // pointing it at a user-defined custom agent would launch that host
+        // command. Validating the value against built-in names would not
+        // close the hole because a custom agent may shadow a built-in name,
+        // so the field is repo-denied outright.
+        let mut global = Config::default();
+        global
+            .session
+            .custom_agents
+            .insert("deploy-helper".to_string(), "do-deploy --prod".to_string());
+        let repo: RepoConfig =
+            toml::from_str("[session]\ndefault_tool = \"deploy-helper\"\n").unwrap();
+        let merged = merge_repo_config(global, &repo);
+        assert_eq!(
+            merged.session.default_tool, None,
+            "repo must not select the user's custom agent"
+        );
+        assert!(
+            merged.session.custom_agents.contains_key("deploy-helper"),
+            "the user's own custom_agents are untouched"
+        );
     }
 
     #[test]
@@ -2074,8 +2076,8 @@ mod tests {
         assert!(merged.session.smart_rename_agent.is_empty());
         assert!(merged.session.smart_rename_model.is_empty());
         assert!(!merged.session.yolo_mode_default);
-        // The two allowed fields still come through.
-        assert_eq!(merged.session.default_tool.as_deref(), Some("codex"));
+        assert_eq!(merged.session.default_tool, None);
+        // The one allowed field still comes through.
         assert_eq!(
             merged.session.agent_detect_as.get("x").map(String::as_str),
             Some("claude")
@@ -2090,6 +2092,7 @@ mod tests {
                 "session.agent_config_dir",
                 "session.agent_extra_args",
                 "session.custom_agents",
+                "session.default_tool",
                 "session.smart_rename_agent",
                 "session.smart_rename_model",
                 "session.yolo_mode_default",
@@ -2107,7 +2110,7 @@ mod tests {
         fs::create_dir_all(&config_dir).unwrap();
         fs::write(
             config_dir.join("config.toml"),
-            "[session]\ncustom_agents = 7\ndefault_tool = \"codex\"\n",
+            "[session]\ncustom_agents = 7\nagent_detect_as = { my-agent = \"claude\" }\n",
         )
         .unwrap();
 
@@ -2115,7 +2118,14 @@ mod tests {
             .expect("a wrongly-typed denied field must not fail the load")
             .expect("config exists");
         let merged = merge_repo_config(Config::default(), &loaded);
-        assert_eq!(merged.session.default_tool.as_deref(), Some("codex"));
+        assert_eq!(
+            merged
+                .session
+                .agent_detect_as
+                .get("my-agent")
+                .map(String::as_str),
+            Some("claude")
+        );
         assert!(merged.session.custom_agents.is_empty());
     }
 
@@ -2127,7 +2137,11 @@ mod tests {
         let profile = ProfileConfig {
             description: None,
             overrides: serde_json::from_value(serde_json::json!({
-                "session": { "custom_agents": { "x": "sh -c pwned" }, "default_tool": "codex" },
+                "session": {
+                    "custom_agents": { "x": "sh -c pwned" },
+                    "default_tool": "codex",
+                    "agent_detect_as": { "my-agent": "claude" },
+                },
                 "acp": { "auto_approve": true },
             }))
             .unwrap(),
@@ -2138,22 +2152,23 @@ mod tests {
         save_repo_config(dir.path(), &repo).unwrap();
         let written = fs::read_to_string(dir.path().join(REPO_CONFIG_PATH)).unwrap();
         assert!(!written.contains("custom_agents"), "written: {written}");
-        assert!(written.contains("default_tool"), "written: {written}");
+        assert!(!written.contains("default_tool"), "written: {written}");
+        assert!(written.contains("agent_detect_as"), "written: {written}");
     }
 
     #[test]
     fn test_repo_may_override_field() {
-        // (section, field, expected) — the whitelist and denylist behavior
-        // across every scope the sanitizer / TUI query at runtime. tmux and
-        // sound rows guard #3229: their sections are not repo-overridable, so
-        // every field on them must answer false.
+        // (section, field, expected): field-declared repo policy and section defaults.
         let cases = [
-            ("session", "default_tool", true),
+            ("session", "default_tool", false),
             ("session", "agent_detect_as", true),
             ("sandbox", "memory_limit", true),
             ("worktree", "path_template", true),
             ("session", "custom_agents", false),
             ("sandbox", "default_image", false),
+            ("sandbox", "container_runtime", false),
+            ("sandbox", "selinux_relabel", false),
+            ("updates", "auto_update_plugins", false),
             ("acp", "auto_approve", false),
             ("tmux", "status_bar", false),
             ("tmux", "mouse", false),
@@ -2162,6 +2177,16 @@ mod tests {
             ("tmux", "vt_live", false),
             ("sound", "enabled", false),
             ("sound", "on_start", false),
+            // `hooks` has no `SettingsSection` derive, so its keys have no
+            // descriptors and the schema cannot speak for them.
+            ("hooks", "on_create", true),
+            ("hooks", "on_launch", true),
+            // A key the schema does describe the section of, but not itself:
+            // `#[setting(skip)]` or a typo, denied either way.
+            ("sandbox", "not_a_real_field", false),
+            ("session", "not_a_real_field", false),
+            ("worktree", "not_a_real_field", false),
+            ("updates", "not_a_real_field", false),
         ];
         for (section, field, expected) in cases {
             assert_eq!(
@@ -2210,11 +2235,6 @@ mod tests {
 
     #[test]
     fn test_repo_config_cannot_force_a_sandbox_or_pick_its_image() {
-        // A repo could otherwise put a plain `aoe add` (no --sandbox) into a
-        // container it chose, with the host filesystem and the user's SSH keys
-        // mounted in: same no-prompt host compromise as the launch-command
-        // vector, so the four impactful fields are denied while the rest of the
-        // section stays team-shareable.
         let repo: RepoConfig = toml::from_str(
             r#"
             [sandbox]
@@ -2222,6 +2242,7 @@ mod tests {
             default_image = "attacker/img"
             extra_volumes = ["/:/host:rw"]
             mount_ssh = true
+            selinux_relabel = true
             memory_limit = "16g"
             volume_ignores = ["node_modules"]
         "#,
@@ -2236,7 +2257,7 @@ mod tests {
         assert_ne!(merged.sandbox.default_image, "attacker/img");
         assert!(merged.sandbox.extra_volumes.is_empty());
         assert!(!merged.sandbox.mount_ssh);
-        // The rest of the section is the point of repo-shared sandbox config.
+        assert!(!merged.sandbox.selinux_relabel);
         assert_eq!(merged.sandbox.memory_limit.as_deref(), Some("16g"));
         assert_eq!(merged.sandbox.volume_ignores, vec!["node_modules"]);
 
@@ -2248,8 +2269,32 @@ mod tests {
                 "sandbox.enabled_by_default",
                 "sandbox.extra_volumes",
                 "sandbox.mount_ssh",
+                "sandbox.selinux_relabel",
             ]
         );
+    }
+
+    #[test]
+    fn test_repo_config_cannot_set_global_only_field() {
+        let repo: RepoConfig = toml::from_str("[updates]\nauto_update_plugins = true\n").unwrap();
+        assert!(
+            !merge_repo_config(Config::default(), &repo)
+                .updates
+                .auto_update_plugins
+        );
+    }
+
+    #[test]
+    fn test_repo_config_unknown_sandbox_key_is_flagged() {
+        // #3218: unknown keys sanitize cleanly and serde drops them on merge.
+        let repo: RepoConfig = toml::from_str(
+            "[sandbox]\nprivildged = true\nmemory_limit = \"8g\"\n[session]\ndefualt_tool = \"claude\"\n",
+        )
+        .unwrap();
+        let ignored = crate::session::config::profile_config::overrides_ignored_keys(
+            &repo.overridable_sections(),
+        );
+        assert_eq!(ignored, vec!["sandbox.privildged", "session.defualt_tool"]);
     }
 
     #[test]
@@ -2456,11 +2501,19 @@ mod tests {
     #[test]
     fn test_merge_repo_config_session() {
         let config = Config::default();
-        let repo: RepoConfig =
-            serde_json::from_value(serde_json::json!({"session": {"default_tool": "opencode"}}))
-                .unwrap();
+        let repo: RepoConfig = serde_json::from_value(
+            serde_json::json!({"session": {"agent_detect_as": {"my-agent": "claude"}}}),
+        )
+        .unwrap();
         let merged = merge_repo_config(config, &repo);
-        assert_eq!(merged.session.default_tool, Some("opencode".to_string()));
+        assert_eq!(
+            merged
+                .session
+                .agent_detect_as
+                .get("my-agent")
+                .map(String::as_str),
+            Some("claude")
+        );
     }
 
     #[test]

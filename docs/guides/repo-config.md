@@ -75,13 +75,10 @@ Container hooks get the same variables (forwarded via `docker exec -e`). Status-
 
 ```toml
 [session]
-default_tool = "opencode"   # Override the default agent for this repo
 agent_detect_as = { my-agent = "claude" }
 ```
 
-Any supported agent name (run `aoe add --help` to see the list).
-
-`default_tool` and `agent_detect_as` are the only `[session]` keys a repo may set. Everything else in that section is ignored from repo config (with a warning naming the keys), because fields like `custom_agents`, `agent_command_override`, `agent_extra_args`, `agent_acp_cmd` and `yolo_mode_default` decide what command AoE launches or how much it is allowed to do: set them in your global or profile config instead.
+`agent_detect_as` is the only `[session]` key a repo may set. Everything else in that section is ignored from repo config (with a warning naming the keys), because fields like `custom_agents`, `agent_command_override`, `agent_extra_args`, `agent_acp_cmd` and `yolo_mode_default` decide what command AoE launches or how much it is allowed to do: set them in your global or profile config instead. `default_tool` is denied too: session launch prefers an exact `custom_agents` match when resolving it, so a repo could otherwise select a user-defined host command.
 
 ### Sandbox
 
@@ -97,7 +94,7 @@ auto_cleanup = true
 default_terminal_mode = "host"   # "host" or "container"
 ```
 
-`enabled_by_default`, `default_image`, `extra_volumes` and `mount_ssh` are ignored from repo config (with a warning naming the keys): together they let a repo put you in a container you did not ask for, running an image it chose, with your filesystem and SSH keys mounted in. Set them in your global or profile config, or pass `--sandbox` / `--sandbox-image` per session.
+Security-sensitive sandbox settings are ignored from repo config (with a warning naming the keys): `enabled_by_default`, `default_image`, `container_runtime`, `extra_volumes`, `mount_ssh`, and `selinux_relabel`. Set them in global or profile config instead, or pass `--sandbox` / `--sandbox-image` per session; `container_runtime` is global-only, so set it in the global config.
 
 List fields (`environment`, `volume_ignores`, `port_mappings`) accept either an array or a single string:
 
@@ -152,7 +149,7 @@ on_launch = ["npm install"]
 on_destroy = ["docker-compose down"]
 
 [session]
-default_tool = "claude"
+agent_detect_as = { my-agent = "claude" }
 
 [sandbox]
 environment = ["DATABASE_URL", "REDIS_URL", "NODE_ENV=development"]

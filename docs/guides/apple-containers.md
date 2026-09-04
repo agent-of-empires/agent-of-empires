@@ -22,14 +22,10 @@ Set the runtime in `~/.agent-of-empires/config.toml`:
 container_runtime = "apple_container"
 ```
 
-Scope it to a single profile to keep Docker as the global default:
-
-```toml
-[profiles.apple]
-sandbox.container_runtime = "apple_container"
-```
-
-Use it with `aoe add --profile apple .`. The TUI **Sandbox** toggle uses this runtime automatically, and shows an error if the `container` daemon is not running.
+The runtime is global-only: every container call resolves it from the global
+config, so a profile or repo override is ignored. The TUI **Sandbox** toggle
+uses this runtime automatically, and shows an error if the `container` daemon
+is not running.
 
 ## Apple-Container-specific gotchas
 

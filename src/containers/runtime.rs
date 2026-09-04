@@ -381,7 +381,7 @@ impl ContainerRuntime {
             }
             RuntimeKind::AppleContainer => {
                 // Apple Container has a very limited initial PATH, so we wrap
-                // the command in `sh -c` to get a proper shell environment.
+                // the command in `/bin/sh -c` to get a proper shell environment.
                 // Single-quote with escaped embedded quotes to avoid issues
                 // with double-quote metacharacters ($, `, \, !) in the command.
                 let escaped = cmd.replace('\'', "'\\''");
@@ -394,13 +394,13 @@ impl ContainerRuntime {
                         "-it",
                         opt_str,
                         name,
-                        "sh",
+                        "/bin/sh",
                         "-c",
                         &cmd_str,
                     ]
                     .join(" ")
                 } else {
-                    ["container", "exec", "-it", name, "sh", "-c", &cmd_str].join(" ")
+                    ["container", "exec", "-it", name, "/bin/sh", "-c", &cmd_str].join(" ")
                 }
             }
         }
@@ -427,7 +427,7 @@ impl ContainerRuntime {
                 // is `$0`; the command starts at `$1`.
                 let mut argv = self.base.build_exec_argv(name, workdir, &[]);
                 argv.extend([
-                    "sh".to_string(),
+                    "/bin/sh".to_string(),
                     "-c".to_string(),
                     "exec \"$@\"".to_string(),
                     "sh".to_string(),
@@ -723,6 +723,19 @@ mod tests {
         assert_eq!(cmd, "podman exec -it aoe-sandbox-test1234 claude");
     }
 
+    #[test]
+    fn apple_container_exec_command_uses_absolute_shell() {
+        let cmd = ContainerRuntime::apple_container().exec_command(
+            "aoe-sandbox-test1234",
+            None,
+            "printf ok",
+        );
+        assert_eq!(
+            cmd,
+            "container exec -it aoe-sandbox-test1234 /bin/sh -c 'printf ok'"
+        );
+    }
+
     /// A title one-shot argv: the agent, its flags, and a prompt full of shell
     /// metacharacters as ONE element.
     fn oneshot_argv() -> Vec<String> {
@@ -782,7 +795,7 @@ mod tests {
                 "-w",
                 "/workspace",
                 "aoe-sandbox-test1234",
-                "sh",
+                "/bin/sh",
                 "-c",
                 "exec \"$@\"",
                 "sh",
@@ -791,6 +804,20 @@ mod tests {
         // The shell program is a fixed literal and the command follows it as
         // separate elements, so the prompt is never shell-parsed.
         assert_eq!(&argv[9..], &oneshot_argv()[..]);
+
+        let executable = ContainerRuntime::apple_container().build_exec_argv(
+            "aoe-sandbox-test1234",
+            "",
+            &["/bin/printf".to_string(), "PATH_INDEPENDENT".to_string()],
+        );
+        let output = std::process::Command::new(&executable[3])
+            .args(&executable[4..])
+            .env_clear()
+            .env("PATH", "/definitely-missing")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"PATH_INDEPENDENT");
     }
 
     #[test]

@@ -3536,11 +3536,11 @@ impl App {
         Ok(())
     }
 
-    /// Route a freshly-created session through the user's
-    /// `default_attach_mode` setting. Shared by both creation paths
-    /// (synchronous `Action::AttachAfterCreate` and the async branch in
-    /// the main loop's `apply_creation_results` handler) so the setting
-    /// applies regardless of which one fired.
+    /// Route a freshly-created session through the configured new-session
+    /// mode. Shared by both creation paths (synchronous
+    /// `Action::AttachAfterCreate` and the async branch in the main loop's
+    /// `apply_creation_results` handler) so the mode applies regardless of
+    /// which one fired.
     ///
     /// A structured session skips the tmux modes entirely and opens its
     /// structured view (#2926): the wizard's Structured toggle is an
@@ -3562,7 +3562,7 @@ impl App {
             self.pending_structured_view_open = Some(session_id.to_string());
             return Ok(());
         }
-        let mode = self.home.default_attach_mode(session_id);
+        let mode = self.home.new_session_attach_mode(session_id);
         tracing::debug!(target: "tui.input",
             session_id = %session_id,
             mode = ?mode,
@@ -4143,13 +4143,10 @@ pub enum Action {
     /// "Reviving..." toast before `ensure_pane_ready` runs, then the home
     /// view flips into the live-send capture state for subsequent keys.
     EnterLiveSend(String),
-    /// Attach to a session that was just created via the synchronous
-    /// create path (no sandbox, no hooks, no worktree). Routes through
-    /// the same `default_attach_mode` dispatch as the async path's
-    /// `apply_creation_results` so the user's "live mode by default"
-    /// setting applies in both cases. `AttachSession` deliberately
-    /// bypasses the setting because pressing Enter on a session row is
-    /// the user's explicit ask for a tmux attach.
+    /// Open a session that was just created via the synchronous create path
+    /// (no sandbox, hooks, or worktree). This action routes through the
+    /// new-session mode, like the async path in `apply_creation_results`.
+    /// `AttachSession` is already resolved for an existing session row.
     AttachAfterCreate(String),
     /// Attach to a tool session (lazygit, yazi, etc.) for the given agent
     /// session. The tool_name indexes into Config.tools.

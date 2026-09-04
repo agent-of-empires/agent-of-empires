@@ -2159,12 +2159,14 @@
         "src/hooks/useRespawnSession.test.tsx",
         "src/components/acp/SystemNotices.test.tsx",
         "src/components/acp/RateLimitRecoverySection.test.tsx",
-        "src/components/acp/SwitchAgentModal.test.tsx"
+        "src/components/acp/SwitchAgentModal.test.tsx",
+        "src/hooks/useAcpSession.rateLimitPark.test.ts"
       ],
       "components": [
         "src/server/api/acp.rs",
         "web/src/components/acp/StructuredView.tsx",
         "web/src/components/acp/SwitchAgentModal.tsx",
+        "web/src/hooks/useAcpSession.ts",
         "web/src/hooks/useRespawnSession.ts",
         "web/src/lib/acpTypes.ts"
       ]
@@ -2554,6 +2556,13 @@
       "kind": "vitest",
       "risk": "medium",
       "specs": ["src/components/settings/__tests__/SchemaFieldPatches.test.tsx"],
+      "components": ["web/src/components/settings/SchemaSection.tsx", "web/src/components/settings/FormFields.tsx"]
+    },
+    {
+      "id": "story.settings-new-session-mode",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/settings/__tests__/NewSessionModePatch.test.tsx"],
       "components": ["web/src/components/settings/SchemaSection.tsx", "web/src/components/settings/FormFields.tsx"]
     },
     {
