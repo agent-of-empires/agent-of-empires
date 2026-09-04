@@ -1,5 +1,6 @@
 use super::container_interface::{docker_env_args, ContainerConfig};
 use super::error::{sanitize_stderr, DockerError, Result};
+use std::collections::HashSet;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -660,6 +661,17 @@ impl RuntimeBase {
     ///
     /// This is a no-op on runtimes that don't support named volumes (e.g. Apple Container).
     pub fn remove_named_ignore_volumes(&self, prefix: &str) -> Result<()> {
+        self.prune_named_ignore_volumes(prefix, &HashSet::new())
+    }
+
+    /// Remove the named ignore volumes under `prefix` that are not in `keep`.
+    ///
+    /// The reconcile counterpart to [`Self::remove_named_ignore_volumes`]: a volume name
+    /// encodes its container mount path, so any path change (a worktree move, an edited
+    /// `volume_ignores`) leaves the session's previous volumes with no container that will
+    /// ever mount them again. Called with the set the next container is created with, so
+    /// those orphans are reclaimed while the still-mounted ones survive.
+    pub fn prune_named_ignore_volumes(&self, prefix: &str, keep: &HashSet<&str>) -> Result<()> {
         if !self.supports_named_volumes {
             return Ok(());
         }
@@ -682,12 +694,7 @@ impl RuntimeBase {
         }
 
         let stdout = String::from_utf8_lossy(&list_output.stdout);
-        // Filter in Rust to exact prefix match (docker's --filter is substring-based).
-        let names: Vec<&str> = stdout
-            .lines()
-            .map(str::trim)
-            .filter(|n| !n.is_empty() && n.starts_with(prefix))
-            .collect();
+        let names = stale_named_ignore_volumes(&stdout, prefix, keep);
 
         if names.is_empty() {
             return Ok(());
@@ -745,6 +752,22 @@ impl RuntimeBase {
         command.args(&args);
         self.probe_output_with_timeout(&mut command, RUNTIME_EXEC_TIMEOUT)
     }
+}
+
+/// Pick the volumes to remove out of a `volume ls -q` listing.
+///
+/// Re-filters on the prefix in Rust because docker's `--filter name=` is a substring
+/// match, so `aoe-vi-sess1-` also lists `aoe-vi-sess10-...`.
+fn stale_named_ignore_volumes<'a>(
+    listing: &'a str,
+    prefix: &str,
+    keep: &HashSet<&str>,
+) -> Vec<&'a str> {
+    listing
+        .lines()
+        .map(str::trim)
+        .filter(|n| !n.is_empty() && n.starts_with(prefix) && !keep.contains(n))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1504,6 +1527,48 @@ mod tests {
         assert_eq!(p_indices.len(), 2);
         assert_eq!(args[p_indices[0] + 1], "3000:3000");
         assert_eq!(args[p_indices[1] + 1], "5432:5432");
+    }
+
+    #[test]
+    fn stale_named_ignore_volumes_selects_the_ones_the_next_create_strands() {
+        // A worktree move from worktrees/905 to worktrees/rev-912 keeps the main
+        // repo's volume (its container path is unchanged) and strands the
+        // worktree's, whose name encodes the old path (#3742).
+        let listing = "\
+aoe-vi-sess1-workspace-otari-target-8ec07926d6b0
+aoe-vi-sess1-workspace-otari-worktrees-905-target-31ddd0322290
+aoe-vi-sess1-workspace-otari-worktrees-rev-912-target-873cf2685e47
+";
+        let keep = HashSet::from([
+            "aoe-vi-sess1-workspace-otari-target-8ec07926d6b0",
+            "aoe-vi-sess1-workspace-otari-worktrees-rev-912-target-873cf2685e47",
+        ]);
+
+        assert_eq!(
+            stale_named_ignore_volumes(listing, "aoe-vi-sess1-", &keep),
+            vec!["aoe-vi-sess1-workspace-otari-worktrees-905-target-31ddd0322290"]
+        );
+    }
+
+    #[test]
+    fn stale_named_ignore_volumes_with_an_empty_keep_set_takes_everything() {
+        // The session-deletion sweep, expressed as a prune that keeps nothing.
+        let listing = "aoe-vi-sess1-a-1\naoe-vi-sess1-b-2\n";
+        assert_eq!(
+            stale_named_ignore_volumes(listing, "aoe-vi-sess1-", &HashSet::new()),
+            vec!["aoe-vi-sess1-a-1", "aoe-vi-sess1-b-2"]
+        );
+    }
+
+    #[test]
+    fn stale_named_ignore_volumes_ignores_another_sessions_volumes() {
+        // docker's `--filter name=` is a substring match, so the listing can carry
+        // a longer session id that must not be pruned under this one's prefix.
+        let listing = "aoe-vi-sess1-a-1\naoe-vi-sess10-a-1\n\n";
+        assert_eq!(
+            stale_named_ignore_volumes(listing, "aoe-vi-sess1-", &HashSet::new()),
+            vec!["aoe-vi-sess1-a-1"]
+        );
     }
 
     #[test]

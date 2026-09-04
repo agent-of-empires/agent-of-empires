@@ -221,8 +221,11 @@ pub fn ensure_sandbox_container_released(session_id: &str, is_sandboxed: bool) -
 /// stopped container as-is, so without this the restarted container would
 /// still mount (and `cd` into) the old path. [`DockerContainer::discard`]
 /// forces a fresh `create` with the new path on next start while preserving
-/// the session's named ignore volumes (`target/`, `node_modules/`) so the
-/// recreated container re-attaches its build caches.
+/// the session's named ignore volumes (`target/`, `node_modules/`), so the
+/// recreated container re-attaches every cache the move did not move. A named
+/// volume's name encodes its container path, so the ones the move did strand
+/// are reclaimed at that create by
+/// [`DockerContainer::prune_stale_named_ignore_volumes`] (#3742).
 ///
 /// No-op for non-sandbox sessions, and commonly a no-op
 /// ([`Teardown::AlreadyGone`]) on the sandbox path too: the rename gate

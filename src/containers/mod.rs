@@ -5,7 +5,7 @@ mod runtime;
 pub(crate) mod runtime_base;
 pub mod stats;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::cli::truncate_id;
 use crate::session::{Config, ContainerRuntimeName};
@@ -122,6 +122,25 @@ fn classify_running_probe(result: Result<bool>) -> Probe {
         Ok(false) => Probe::NotRunning,
         Err(e) => Probe::Unknown(e),
     }
+}
+
+/// The named ignore volumes a create is about to mount, or `None` when the config
+/// carries none and the prune must be skipped.
+///
+/// Keeping the skip here, rather than as an empty keep set, is what stops an
+/// ambiguous config from reading as "every volume this session has is stale". See
+/// [`DockerContainer::prune_stale_named_ignore_volumes`].
+fn named_ignore_volumes_to_keep(config: &ContainerConfig) -> Option<HashSet<&str>> {
+    if config.named_ignore_volumes.is_empty() {
+        return None;
+    }
+    Some(
+        config
+            .named_ignore_volumes
+            .iter()
+            .map(|v| v.volume_name.as_str())
+            .collect(),
+    )
 }
 
 pub struct DockerContainer {
@@ -241,6 +260,37 @@ impl DockerContainer {
         }
     }
 
+    /// Drop this session's named ignore volumes that `config` does not mount.
+    ///
+    /// A volume's name encodes its container mount path
+    /// (`aoe-vi-{session_id}-{slug}-{hash}`), so any path change leaves the previous
+    /// volumes with no container that will ever re-attach them. [`Self::discard`]
+    /// deliberately preserves the session's volumes across a container rebuild, which
+    /// keeps the caches that survive the change and strands the rest; this reclaims the
+    /// stranded ones at the next create, when the surviving set is known (#3742).
+    ///
+    /// Must be called before the create, while no container holds the volumes.
+    ///
+    /// A config with no named ignore volumes prunes nothing: the empty set does not
+    /// distinguish "this session has no caches" from a glob that momentarily matched
+    /// nothing or a switch to the anonymous strategy, and the caches are worth more than
+    /// a prompt reclaim on an ambiguous signal.
+    pub fn prune_stale_named_ignore_volumes(&self, session_id: &str, config: &ContainerConfig) {
+        let Some(keep) = named_ignore_volumes_to_keep(config) else {
+            return;
+        };
+        let prefix = format!("aoe-vi-{}-", session_id);
+        if let Err(e) = self.runtime.base.prune_named_ignore_volumes(&prefix, &keep) {
+            tracing::warn!(
+                target: "containers.runtime",
+                name = %self.name,
+                %session_id,
+                error = %e,
+                "failed to prune stale named ignore volumes"
+            );
+        }
+    }
+
     /// Force-remove this container, then sweep its named ignore volumes.
     ///
     /// Idempotent: a container that is already gone yields
@@ -262,9 +312,11 @@ impl DockerContainer {
     /// Idempotent counterpart to [`Self::teardown`]: same removal and
     /// classification, but the session-scoped named ignore volumes
     /// (`aoe-vi-{session_id}-*`, e.g. `target/`, `node_modules/`) are left
-    /// intact so the recreated container re-attaches them on next start.
-    /// Used on the worktree-move discard path where the container is dropped
-    /// to pick up a new bind mount and will be recreated immediately.
+    /// intact so the recreated container re-attaches the ones whose container
+    /// path is unchanged. Used on the worktree-move discard path where the
+    /// container is dropped to pick up a new bind mount and will be recreated
+    /// immediately. The volumes the new paths strand are reclaimed by
+    /// [`Self::prune_stale_named_ignore_volumes`] at that create.
     ///
     /// The same invariant as [`Self::teardown`] applies: callers must invoke
     /// this unconditionally and act on the returned outcome; it must never
@@ -336,6 +388,37 @@ impl DockerContainer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keep_set_is_the_configs_volume_names() {
+        let config = ContainerConfig {
+            named_ignore_volumes: vec![
+                NamedVolumeMount {
+                    volume_name: "aoe-vi-sess1-workspace-otari-target-8ec07926d6b0".to_string(),
+                    container_path: "/workspace/otari/target".to_string(),
+                },
+                NamedVolumeMount {
+                    volume_name: "aoe-vi-sess1-workspace-otari-worktrees-912-target-873cf2685e47"
+                        .to_string(),
+                    container_path: "/workspace/otari/worktrees/912/target".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let keep = named_ignore_volumes_to_keep(&config).expect("a non-empty config prunes");
+        assert_eq!(keep.len(), 2);
+        assert!(keep.contains("aoe-vi-sess1-workspace-otari-target-8ec07926d6b0"));
+        assert!(keep.contains("aoe-vi-sess1-workspace-otari-worktrees-912-target-873cf2685e47"));
+    }
+
+    #[test]
+    fn no_named_ignore_volumes_skips_the_prune() {
+        // An empty set does not distinguish "no caches" from a glob that matched
+        // nothing or a switch to the anonymous strategy, so it must not be read as
+        // "every volume this session has is stale".
+        assert!(named_ignore_volumes_to_keep(&ContainerConfig::default()).is_none());
+    }
 
     #[test]
     fn classify_ok_is_removed() {
