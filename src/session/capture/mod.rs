@@ -1394,8 +1394,19 @@ fn read_hermes_sessions_from_sqlite(
 ) -> Result<HermesSessionScan> {
     use rusqlite::{Connection, OpenFlags};
 
+    // `SQLITE_OPEN_NOFOLLOW` refuses a symlink anywhere in the path, not just
+    // at the leaf, and macOS reaches both `/tmp` and the per-user temp root
+    // through one. Resolve the directory first so the flag guards the database
+    // file itself, which is the swap that matters; the directory was already
+    // opened under `AnchoredDir`, whose own leaf is `O_NOFOLLOW`.
+    let resolved = match (db_path.parent(), db_path.file_name()) {
+        (Some(parent), Some(leaf)) => std::fs::canonicalize(parent)
+            .map(|parent| parent.join(leaf))
+            .unwrap_or_else(|_| db_path.to_path_buf()),
+        _ => db_path.to_path_buf(),
+    };
     let conn = Connection::open_with_flags(
-        db_path,
+        &resolved,
         OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
