@@ -1817,23 +1817,25 @@ enter to select · esc to cancel";
     #[test]
     fn test_claude_background_work_outlives_the_turn() {
         // A finished turn whose background work is still going: the REPL is
-        // parked and the box is free, but shells, MCP tasks or agents the
-        // agent started are still running. Captured from a live footer.
+        // parked and the box is free, but MCP tasks or agents the agent
+        // started are still running. Captured from a live footer.
         let parked = "✻ Cooked for 1m 58s\n❯ \n";
         let footer =
             |tail: &str| format!("{parked}  ⏵⏵ auto mode on (shift+tab to cycle) · PR #3600{tail}");
 
-        // The footer's shells segment is live: present while they run, gone
-        // when the last one exits, so its absence is the parked case.
+        // #3738: the footer's shell count is of live children of the pane's
+        // shell, which a user can attach to for the session's lifetime, so it
+        // is not read as the agent working. A turn that is genuinely running
+        // still is, from its own chrome, which is what the deletion must not
+        // have taken with it.
         let with_shells = footer(" · 5 shells · ← for agents");
-        assert!(claude_rule_matches("background_shell", &with_shells));
-        assert_eq!(detect_claude(&with_shells, "", None), Status::Running);
+        assert_eq!(detect_claude(&with_shells, "", None), Status::Idle);
+        assert_eq!(claude_rule(&with_shells), "completed_turn");
+        let live = format!("✻ Brewing… (17s · esc to interrupt)\n{with_shells}");
+        assert_eq!(detect_claude(&live, "", None), Status::Running);
 
-        let without = footer(" · ← for agents");
-        assert!(!claude_rule_matches("background_shell", &without));
-        assert_eq!(detect_claude(&without, "", None), Status::Idle);
-
-        // MCP tasks outliving the turn that started them.
+        // MCP tasks outliving the turn that started them. The agent dispatched
+        // these and will report back on them, so they still read as work.
         let mcp = format!("{parked}✻ Ran 3 tools · 2 MCP tasks still running\n");
         assert!(claude_rule_matches("background_mcp_task", &mcp));
         assert_eq!(detect_claude(&mcp, "", None), Status::Running);

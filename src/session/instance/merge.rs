@@ -109,6 +109,7 @@ impl Instance {
         self.session_id_poller = previous.session_id_poller.clone();
         self.session_id_poller_retry_after = previous.session_id_poller_retry_after;
         self.retroactive_capture_excludes = previous.retroactive_capture_excludes.clone();
+        self.acp_load_session_capable = previous.acp_load_session_capable;
     }
 
     /// Carry every in-process field from a pre-move live row onto the
@@ -214,6 +215,7 @@ impl Instance {
             .unwrap_or_default();
         self.agent_session_id = restored.agent_session_id;
         self.acp_session_id = restored.acp_session_id;
+        self.acp_load_session_capable = None;
         self.resume_probe_failed_sid = None;
         // A pin/clear/fork directive names an id in the old agent's namespace,
         // so it cannot survive the swap either.
@@ -520,6 +522,7 @@ mod tests {
         previous.last_error = Some("old observation".to_string());
         let previous_floor = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
         previous.capture_started_at = Some(previous_floor);
+        previous.acp_load_session_capable = Some(true);
 
         previous.detection = DetectionState {
             pending: Some(Status::Idle),
@@ -535,20 +538,22 @@ mod tests {
         reloaded.capture_started_at = Some(committed_floor);
         // A disk load leaves every `#[serde(skip)]` field at its default.
         reloaded.detection = DetectionState::default();
+        reloaded.acp_load_session_capable = None;
         reloaded.merge_runtime_from_reload(&previous);
 
         // Generation-governed fields: the strictly-newer disk snapshot wins.
         assert_eq!(reloaded.lifecycle_generation, 4);
         assert_eq!(reloaded.status, Status::Stopped);
         assert_eq!(reloaded.idle_entered_at, None);
-        // last_error is runtime-only: the in-memory poller value survives even a
-        // newer generation, since no lifecycle writer persists last_error.
+        // Runtime-only values survive a newer generation because no lifecycle
+        // writer persists them.
         assert_eq!(reloaded.last_error.as_deref(), Some("old observation"));
         assert_eq!(
             reloaded.capture_started_at,
             Some(committed_floor),
             "reload must retain the exact launch-owned floor from disk"
         );
+        assert_eq!(reloaded.acp_load_session_capable, Some(true));
         // So is the detection bookkeeping: a reload between two poll cycles
         // must not drop a proposal awaiting its confirming poll (#3642).
         assert_eq!(reloaded.detection.pending, Some(Status::Idle));
@@ -1530,6 +1535,7 @@ mod tests {
         inst.tool = "claude".to_string();
         inst.agent_session_id = Some("claude-session-123".to_string());
         inst.acp_session_id = Some("acp-claude-1".to_string());
+        inst.acp_load_session_capable = Some(true);
         inst.resume_probe_failed_sid = Some("claude-session-123".to_string());
         inst.acp_effort = Some("high".to_string());
         inst.agent_model = Some("claude-opus-4-7".to_string());
@@ -1543,6 +1549,7 @@ mod tests {
             "a Claude sid would make pi launch with --resume <foreign-sid>"
         );
         assert_eq!(inst.acp_session_id, None);
+        assert_eq!(inst.acp_load_session_capable, None);
         assert_eq!(inst.acp_effort, None);
         assert_eq!(inst.agent_model, None);
         assert_eq!(inst.agent_name, None);
@@ -1551,6 +1558,7 @@ mod tests {
 
         // pi runs and captures a sid of its own, then the user swaps back.
         inst.agent_session_id = Some("pi-session-9".to_string());
+        inst.acp_load_session_capable = Some(false);
         inst.swap_tool("claude");
         assert_eq!(
             inst.agent_session_id.as_deref(),
@@ -1558,6 +1566,7 @@ mod tests {
             "swapping back must resume the parked Claude conversation"
         );
         assert_eq!(inst.acp_session_id.as_deref(), Some("acp-claude-1"));
+        assert_eq!(inst.acp_load_session_capable, None);
         assert_eq!(
             inst.prior_tool_session_ids["pi"]
                 .agent_session_id

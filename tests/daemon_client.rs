@@ -315,132 +315,40 @@ async fn daemon_client_http_contract() {
     ));
     request.await.unwrap();
 
-    let secret = "secret-status-token";
-    let oversized = format!("{secret}{}", "x".repeat(10_000));
-    let (origin, request) = serve_once(response("503 Service Unavailable", &[], &oversized)).await;
-    let result = DaemonClient::new(&origin, Some(secret))
-        .unwrap()
-        .list_sessions(None)
-        .await;
-    let error = match result {
-        Ok(_) => panic!("expected status error"),
-        Err(error) => error,
-    };
-    let error_text = error.to_string();
-    match error {
-        DaemonClientError::Status {
-            status,
-            body,
-            truncated,
-        } => {
-            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-            assert!(truncated);
-            assert!(body.is_empty());
-            assert!(!error_text.contains(secret));
-        }
-        other => panic!("expected status error, got {other:?}"),
-    }
-    request.await.unwrap();
-
-    let escaped_cases = [
-        (
-            "secret/token",
-            r#"secret\/token"#,
-            r#"{"error":"secret\/token"}"#,
-        ),
-        (
-            r#"secret"token"#,
-            r#"secret\"token"#,
-            r#"{"error":"secret\"token"}"#,
-        ),
-        (
-            r#"secret\token"#,
-            r#"secret\\token"#,
-            r#"{"error":"secret\\token"}"#,
-        ),
-        ("secret/a/b", r#"secret\/a/b"#, r#"{"error":"secret\/a/b"}"#),
-        ("secret", r#"\u0073ecret"#, r#"{"error":"\u0073ecret"}"#),
-        ("ab", "ab", "aaaaabbbbb"),
-        (
-            "secret-status-token",
-            "secret-status-token",
-            "secret-status-tokesecret-status-tokesecret-status-tokesecret-status-tokennnn",
-        ),
-    ];
-    for (token, encoded_token, response_body) in escaped_cases {
-        let (origin, request) = serve_once(response("401 Unauthorized", &[], response_body)).await;
-        let error = match DaemonClient::new(&origin, Some(token))
-            .unwrap()
-            .list_sessions(None)
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let stalled_body = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        assert!(stream.read(&mut request).await.unwrap() > 0);
+        stream
+            .write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 1\r\nConnection: close\r\n\r\n",
+            )
             .await
-        {
-            Ok(_) => panic!("expected status error"),
-            Err(error) => error,
-        };
-        let error_text = error.to_string();
-        let error_debug = format!("{error:?}");
-        let DaemonClientError::Status { body, .. } = &error else {
-            panic!("expected status error, got {error:?}");
-        };
-        assert!(body.is_empty());
-        for exposed in [token, encoded_token] {
-            assert!(!body.contains(exposed));
-            assert!(!error_text.contains(exposed));
-            assert!(!error_debug.contains(exposed));
-        }
-        request.await.unwrap();
-    }
-
-    let marker_token = "<redacted>";
-    let (origin, request) = serve_once(response("401 Unauthorized", &[], marker_token)).await;
-    let error = match DaemonClient::new(&origin, Some(marker_token))
-        .unwrap()
-        .list_sessions(None)
-        .await
-    {
-        Ok(_) => panic!("expected status error"),
-        Err(error) => error,
-    };
-    let error_text = error.to_string();
-    let error_debug = format!("{error:?}");
-    let DaemonClientError::Status { body, .. } = &error else {
-        panic!("expected status error, got {error:?}");
-    };
-    assert!(body.is_empty());
-    for output in [body.as_str(), error_text.as_str(), error_debug.as_str()] {
-        assert!(!output.contains(marker_token));
-    }
-    request.await.unwrap();
-
-    let overlap_token = "a-super-secret/a";
-    let exposed_prefix = "a-super-secret/";
-    let mut overlap_body = "x".repeat(8 * 1024 - overlap_token.len());
-    overlap_body.push_str(overlap_token);
-    overlap_body.push_str("truncated tail");
-    let (origin, request) = serve_once(response("401 Unauthorized", &[], &overlap_body)).await;
-    let error = match DaemonClient::new(&origin, Some(overlap_token))
-        .unwrap()
-        .list_sessions(None)
-        .await
-    {
-        Ok(_) => panic!("expected status error"),
-        Err(error) => error,
-    };
-    let error_text = error.to_string();
-    let error_debug = format!("{error:?}");
-    let DaemonClientError::Status {
-        body, truncated, ..
-    } = &error
-    else {
-        panic!("expected status error, got {error:?}");
-    };
-    assert!(*truncated);
-    assert!(body.is_empty());
-    for output in [body.as_str(), error_text.as_str(), error_debug.as_str()] {
-        assert!(!output.contains(overlap_token));
-        assert!(!output.contains(exposed_prefix));
-    }
-    request.await.unwrap();
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+    let stalled_origin = format!("http://{address}");
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        DaemonClient::new(&stalled_origin, Some("secret-token"))
+            .unwrap()
+            .list_sessions(None),
+    )
+    .await
+    .expect("authenticated status must not wait for the response body")
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        DaemonClientError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            ref body,
+            truncated: false,
+        } if body.is_empty()
+    ));
+    stalled_body.abort();
+    let _ = stalled_body.await;
 
     let diagnostic = "plain unauthenticated diagnostic";
     let (origin, request) = serve_once(response("400 Bad Request", &[], diagnostic)).await;

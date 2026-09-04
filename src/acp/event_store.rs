@@ -2628,6 +2628,7 @@ mod tests {
                     image: true,
                     audio: false,
                     embedded_context: true,
+                    load_session: None,
                     steering: false,
                 },
             )
@@ -2645,6 +2646,7 @@ mod tests {
                     image: false,
                     audio: false,
                     embedded_context: false,
+                    load_session: None,
                     steering: false,
                 },
             )
@@ -4760,6 +4762,7 @@ mod tests {
                     image: true,
                     audio: false,
                     embedded_context: true,
+                    load_session: None,
                     steering: false,
                 },
             )

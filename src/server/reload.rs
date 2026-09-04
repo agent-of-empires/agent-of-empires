@@ -71,6 +71,7 @@ pub(super) fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Inst
     fresh.session_id_poller = prior.session_id_poller;
     fresh.session_id_poller_retry_after = prior.session_id_poller_retry_after;
     fresh.retroactive_capture_excludes = prior.retroactive_capture_excludes;
+    fresh.acp_load_session_capable = prior.acp_load_session_capable;
     fresh
 }
 
@@ -900,5 +901,16 @@ mod tests {
 
         let merged = merge_runtime_fields(prior, fresh);
         assert_eq!(merged.last_error, None);
+    }
+
+    #[test]
+    fn merge_runtime_fields_preserves_acp_load_session_capability() {
+        let mut prior = Instance::new("seed", "/tmp/seed");
+        prior.acp_load_session_capable = Some(true);
+
+        let fresh = Instance::new("seed", "/tmp/seed");
+        let merged = merge_runtime_fields(prior, fresh);
+
+        assert_eq!(merged.acp_load_session_capable, Some(true));
     }
 }

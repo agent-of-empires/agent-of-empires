@@ -131,6 +131,13 @@ impl DaemonClient {
 
         let status = response.status();
         if !status.is_success() {
+            if self.authorization.is_some() {
+                return Err(DaemonClientError::Status {
+                    status,
+                    body: String::new(),
+                    truncated: false,
+                });
+            }
             let (body, truncated) = self.read_error_body(&mut response).await?;
             return Err(DaemonClientError::Status {
                 status,
@@ -175,9 +182,6 @@ impl DaemonClient {
         if body.len() > MAX_ERROR_BODY_BYTES {
             truncate_utf8(&mut body, MAX_ERROR_BODY_BYTES);
             truncated = true;
-        }
-        if self.authorization.is_some() {
-            body.clear();
         }
         Ok((body, truncated))
     }

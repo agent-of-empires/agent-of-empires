@@ -94,18 +94,11 @@ region = "last_non_empty_above_prompt_box"
 visible = true
 line_regex = ['(?i)^\s*[\x{00B7}\x{2722}\x{2733}\x{2736}\x{273B}\x{273D}*\x{25CF}]\s+waiting for \d+ background agents? to finish\s*$']
 
-# Background shells the agent started and has not reaped: a build, a test run,
-# a server. The footer's count is live, dropping the segment when the last one
-# exits, so this reads a real running process rather than a banner. A shell the
-# agent leaves up for good (a dev server) does keep the session Running, which
-# is true rather than stale.
-[[rules]]
-id = "background_shell"
-state = "running"
-priority = 970
-region = "bottom_non_empty_lines(5)"
-visible = true
-line_regex = ['(?i)^\s*[\x{23F8}\x{23F5}].*\x{b7}\s*[1-9]\d*\s+shells?\s*(?:\x{b7}|$)']
+# There is deliberately no rule for the footer's `· N shells ·` segment: it
+# counts live children of the pane's shell, which a user can attach to for the
+# session's lifetime, not work the agent is doing. The two rules around this
+# one count work the agent dispatched and will report back on, which nothing
+# outside the session can inflate.
 
 # MCP tasks still running behind a finished turn. Same argument as the
 # background agents above, and the same anchoring problem: the count sits on an

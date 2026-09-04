@@ -837,6 +837,7 @@ pub(super) async fn run_connection_task<W, R>(
                     image: prompt_caps.image,
                     audio: prompt_caps.audio,
                     embedded_context: prompt_caps.embedded_context,
+                    load_session: Some(load_session_capable),
                     steering: steering_capable,
                 })
                 .await;

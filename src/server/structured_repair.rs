@@ -83,6 +83,7 @@ pub(super) fn repair_structured_rows_from_live_workers(
             inst.agent_model = record.model.clone();
         }
         inst.acp_session_id = Some(acp_session_id.clone());
+        inst.acp_load_session_capable = None;
         tracing::warn!(
             target: "server.file_watch",
             session = %inst.id,
@@ -285,6 +286,7 @@ mod tests {
             Instance::new("repair-empty-id", "/tmp/repo"),
         ];
         rows[0].id = "repair-live".to_string();
+        rows[0].acp_load_session_capable = Some(true);
         rows[1].id = "repair-existing".to_string();
         rows[1].agent_name = Some("custom-agent".to_string());
         rows[1].agent_model = Some("custom-model".to_string());
@@ -301,6 +303,7 @@ mod tests {
         assert_eq!(rows[0].agent_name.as_deref(), Some("codex"));
         assert_eq!(rows[0].agent_model.as_deref(), Some("gpt-5"));
         assert_eq!(rows[0].acp_session_id.as_deref(), Some("acp-session-1"));
+        assert_eq!(rows[0].acp_load_session_capable, None);
         assert_eq!(rows[1].view, crate::session::View::Structured);
         assert_eq!(rows[1].agent_name.as_deref(), Some("custom-agent"));
         assert_eq!(rows[1].agent_model.as_deref(), Some("custom-model"));

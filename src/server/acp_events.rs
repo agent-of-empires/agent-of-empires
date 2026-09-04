@@ -327,7 +327,17 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
 
         let status_intent = derive_acp_status(frame.event.as_ref());
         let acp_change = derive_acp_session_change(frame.event.as_ref());
-        if status_intent.is_none() && acp_change.is_none() {
+        let load_session_capability = match (frame.event.as_ref(), frame.worker_generation) {
+            (
+                crate::acp::state::Event::PromptCapabilities {
+                    load_session: Some(capable),
+                    ..
+                },
+                Some(generation),
+            ) => Some((*capable, generation)),
+            _ => None,
+        };
+        if status_intent.is_none() && acp_change.is_none() && load_session_capability.is_none() {
             continue;
         }
 
@@ -340,6 +350,23 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             };
             if !inst.is_structured() {
                 continue;
+            }
+            // Check while holding the instance lock: teardown removes the worker
+            // before clearing this field, so either this write happens first and
+            // is cleared, or the stale generation is rejected.
+            //
+            // This awaits the supervisor's `workers` mutex with the `instances`
+            // write lock held. That ordering is only safe while `Supervisor`
+            // never reaches for `instances`; give it a path that does and this
+            // becomes a lock cycle.
+            if let Some((capable, generation)) = load_session_capability {
+                if state
+                    .acp_supervisor
+                    .is_current_worker_generation(&frame.session_id, generation)
+                    .await
+                {
+                    inst.acp_load_session_capable = Some(capable);
+                }
             }
 
             // Snapshotting around the call is exactly "the transition
@@ -1268,6 +1295,149 @@ mod tests {
         assert!(!row(&terminal_id).unread);
     }
 
+    #[tokio::test]
+    async fn acp_event_listener_tracks_load_session_capability_updates() {
+        let mut inst = Instance::new("acp-session", "/tmp/acp");
+        inst.view = crate::session::View::Structured;
+        inst.acp_session_id = Some("same-acp-id".to_string());
+        let id = inst.id.clone();
+        let state = test_support::build_test_app_state(vec![inst]);
+        let first_generation = state.acp_supervisor.test_insert_worker(&id).await;
+        let listener = tokio::spawn(acp_event_listener(state.clone()));
+
+        for _ in 0..500 {
+            if state.acp_events_tx.receiver_count() > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(state.acp_events_tx.receiver_count() > 0);
+
+        let send_capability = |seq, capable, worker_generation| {
+            state
+                .acp_events_tx
+                .send(AcpBroadcastFrame {
+                    session_id: id.clone(),
+                    seq,
+                    event: Arc::new(crate::acp::Event::PromptCapabilities {
+                        image: false,
+                        audio: false,
+                        embedded_context: false,
+                        load_session: Some(capable),
+                        steering: false,
+                    }),
+                    worker_generation: Some(worker_generation),
+                })
+                .expect("listener is subscribed");
+        };
+
+        send_capability(1, true, first_generation);
+        for _ in 0..500 {
+            if state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|inst| inst.id == id)
+                .is_some_and(|inst| inst.acp_load_session_capable == Some(true))
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(
+            state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|inst| inst.id == id)
+                .is_some_and(|inst| inst.acp_load_session_capable == Some(true)),
+            "the active worker capability was not applied"
+        );
+
+        state.acp_supervisor.test_remove_worker(&id).await;
+        state
+            .instances
+            .write()
+            .await
+            .iter_mut()
+            .find(|inst| inst.id == id)
+            .expect("instance")
+            .acp_load_session_capable = None;
+        let second_generation = state.acp_supervisor.test_insert_worker(&id).await;
+        assert_ne!(first_generation, second_generation);
+
+        send_capability(2, false, first_generation);
+        state
+            .acp_events_tx
+            .send(AcpBroadcastFrame {
+                session_id: id.clone(),
+                seq: 3,
+                event: Arc::new(crate::acp::Event::AcpSessionAssigned {
+                    acp_session_id: "replacement-acp-id".to_string(),
+                }),
+                worker_generation: None,
+            })
+            .expect("listener is subscribed");
+        for _ in 0..500 {
+            if state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|inst| inst.id == id)
+                .is_some_and(|inst| inst.acp_session_id.as_deref() == Some("replacement-acp-id"))
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        let instance = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|inst| inst.id == id)
+            .cloned()
+            .expect("instance");
+        assert_eq!(
+            instance.acp_session_id.as_deref(),
+            Some("replacement-acp-id"),
+            "the sentinel event behind the stale frame was not applied"
+        );
+        assert_eq!(
+            instance.acp_load_session_capable, None,
+            "a queued event from the replaced worker must be ignored"
+        );
+
+        send_capability(4, false, second_generation);
+        for _ in 0..500 {
+            if state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|inst| inst.id == id)
+                .is_some_and(|inst| inst.acp_load_session_capable == Some(false))
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(
+            state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|inst| inst.id == id)
+                .is_some_and(|inst| inst.acp_load_session_capable == Some(false)),
+            "the replacement worker capability was not applied"
+        );
+
+        listener.abort();
+    }
     /// End to end over `acp_event_listener` itself, the path that actually
     /// closes #3181. The predicate table and the TUI ownership tests all pass
     /// even if the snapshot is taken *after* `apply_status_intent`, the persist
@@ -1322,6 +1492,7 @@ mod tests {
                 event: Arc::new(crate::acp::Event::Stopped {
                     reason: "prompt_complete".into(),
                 }),
+                worker_generation: None,
             })
             .expect("listener is subscribed");
 
