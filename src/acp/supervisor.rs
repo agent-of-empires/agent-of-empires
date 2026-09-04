@@ -1138,7 +1138,8 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// next pass. The guard is released before `sink.publish`, matching every
     /// other publisher, so a SQLite write never runs under it.
     ///
-    /// Used by the reconciler's terminal-repair pass (#3190).
+    /// Used by the reconciler's terminal-repair pass (#3190) and its
+    /// rate-limit redelivery cap (#3688).
     pub fn publish_stopped_if_seq(
         &self,
         session_id: &str,
@@ -1247,8 +1248,12 @@ impl<S: BroadcastSink> Supervisor<S> {
         &self,
         session_id: &str,
         resets_at: chrono::DateTime<chrono::Utc>,
+        manual: bool,
     ) -> u64 {
-        self.publish_next(session_id, &Event::RateLimitAutoResumed { resets_at })
+        self.publish_next(
+            session_id,
+            &Event::RateLimitAutoResumed { resets_at, manual },
+        )
     }
 
     /// Like `shutdown` but waits for the runner process to actually exit
@@ -6484,8 +6489,8 @@ cursor-acp-bridge = "agent acp"
         let sup = Supervisor::new(sink.clone());
         let resets_at = chrono::Utc::now();
 
-        let seq1 = sup.publish_rate_limit_auto_resumed("s-rl", resets_at);
-        let seq2 = sup.publish_rate_limit_auto_resumed("s-rl", resets_at);
+        let seq1 = sup.publish_rate_limit_auto_resumed("s-rl", resets_at, false);
+        let seq2 = sup.publish_rate_limit_auto_resumed("s-rl", resets_at, false);
         assert_eq!(seq1, 1);
         assert_eq!(seq2, 2, "seq must be monotonic per session");
 
@@ -6496,7 +6501,7 @@ cursor-acp-bridge = "agent acp"
             .expect("first breadcrumb frame published");
         assert!(matches!(
             &first.2,
-            Event::RateLimitAutoResumed { resets_at: ts } if *ts == resets_at
+            Event::RateLimitAutoResumed { resets_at: ts, .. } if *ts == resets_at
         ));
     }
 

@@ -1928,12 +1928,15 @@ export function useAcpSession(
       // A transient 503 means the daemon accepted the request but its worker
       // did not come online within `send_prompt`'s wait window (#1748 / #1833).
       // The prompt is not on the queue (the daemon decided to send it), so
-      // enqueue it here or it is lost.
-      if (result.kind === "retryable_failure" && state.workerIdleStopped) {
+      // enqueue it here or it is lost. Both daemon-side states that answer
+      // "sent" for a session with no worker need this: the idle-dormant wake
+      // and the rate-limit redelivery-cap park, whose banner tells the user a
+      // fresh prompt is the recovery (#3688).
+      if (result.kind === "retryable_failure" && (state.workerIdleStopped || state.rateLimitRetriesExhausted)) {
         enqueueServer(text, attachments);
       }
     },
-    [sessionId, state.workerIdleStopped, dispatchPromptNow, enqueueServer],
+    [sessionId, state.workerIdleStopped, state.rateLimitRetriesExhausted, dispatchPromptNow, enqueueServer],
   );
 
   // Server-queue hydration. The daemon owns the queue and drains it (even
@@ -2212,7 +2215,7 @@ export function useAcpSession(
     status === "open" &&
     !state.workerStopped &&
     !state.workerRestarting &&
-    (workerState === "running" || state.workerIdleStopped);
+    (workerState === "running" || state.workerIdleStopped || state.rateLimitRetriesExhausted);
 
   // True when pressing "Send now" would interrupt a running, non-steerable turn
   // rather than send immediately, so the affordance can warn before it cancels

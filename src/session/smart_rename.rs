@@ -2578,7 +2578,7 @@ claude = "my-wrapper"
             cfg_dir.join("config.toml"),
             r#"
 [session]
-default_tool = "codex"
+agent_detect_as = { my-agent = "claude" }
 smart_rename_agent = "gemini"
 
 [session.agent_command_override]
@@ -2594,7 +2594,14 @@ claude = "repo-wrapper"
         // Pins that the repo file was actually discovered: an allowed field
         // from it lands, so the assertions below are about the boundary and
         // not about a fixture that silently never loaded.
-        assert_eq!(resolved.session.default_tool.as_deref(), Some("codex"));
+        assert_eq!(
+            resolved
+                .session
+                .agent_detect_as
+                .get("my-agent")
+                .map(String::as_str),
+            Some("claude")
+        );
         let cfg = resolve_smart_rename_config(&resolved.session);
         assert_eq!(
             cfg.rename_agent, "opencode",

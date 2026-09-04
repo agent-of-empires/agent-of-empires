@@ -98,7 +98,14 @@ pub(super) fn validate_overrides_typecheck(overrides: &serde_json::Value) -> Res
 /// already-loaded `ProfileConfig` so the caller does not read+parse the
 /// profile file a second time.
 pub(crate) fn profile_config_ignored_keys(cfg: &ProfileConfig) -> Vec<String> {
-    let Ok(base) = merged_onto_default(&cfg.overrides_value()) else {
+    overrides_ignored_keys(&cfg.overrides_value())
+}
+
+/// Dotted paths of keys in a sparse override object that `Config` does not
+/// recognize. Shared by the profile probe above and the repo-config loader,
+/// whose `#[serde(flatten)]` maps absorb unknown keys the same way.
+pub(crate) fn overrides_ignored_keys(overrides: &serde_json::Value) -> Vec<String> {
+    let Ok(base) = merged_onto_default(overrides) else {
         return Vec::new();
     };
     let mut ignored = Vec::new();

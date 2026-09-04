@@ -21,6 +21,7 @@ function mount(overrides?: Partial<React.ComponentProps<typeof SystemNotices>>) 
     status: "open",
     lagged: false,
     rateLimit: null,
+    rateLimitRetriesExhausted: false,
     hasEverOpened: true,
     reconnecting: false,
     retryCount: 0,
@@ -54,6 +55,7 @@ describe("SystemNotices rate-limit handoff", () => {
       <SystemNotices
         status="open"
         lagged={false}
+        rateLimitRetriesExhausted={false}
         rateLimit={{
           status: "limited",
           resets_at: "2099-01-01T00:00:00Z",
@@ -87,6 +89,7 @@ describe("SystemNotices rate-limit handoff", () => {
       <SystemNotices
         status="open"
         lagged={false}
+        rateLimitRetriesExhausted={false}
         rateLimit={{
           status: "Internal error: You've hit your weekly limit · resets 4am (Europe/Paris)",
           resets_at: null,
@@ -239,5 +242,35 @@ describe("SystemNotices rate-limit handoff", () => {
   it("renders nothing for a healthy session", () => {
     const { container } = mount();
     expect(container.firstChild).toBeNull();
+  });
+
+  // #3688: the state a real cap park reaches. `Stopped` does not clear
+  // `rate_limit` in the server fold, so the adapter snapshot from the last
+  // rejection is still there and both recovery buttons render alongside the
+  // give-up note. Mounting without the snapshot would assert a combination
+  // the daemon never produces.
+  it("shows the auto-resume stopped note with both recovery paths still offered", () => {
+    const onSwitchAgent = vi.fn();
+    const onResumeRateLimit = vi.fn();
+    const { getByText, getByRole } = mount({
+      rateLimitRetriesExhausted: true,
+      rateLimit: { status: "limited", resets_at: "2099-01-01T00:00:00Z", kind: "usage" },
+      onSwitchAgent,
+      onResumeRateLimit,
+    });
+    expect(getByText(/Auto-resume stopped: the same prompt was re-sent too many times/i)).toBeDefined();
+    expect(getByRole("button", { name: /resume now/i })).toBeDefined();
+    expect(getByRole("button", { name: /continue in another agent/i })).toBeDefined();
+  });
+
+  // The park outlives the snapshot only after a resume clears it, and the
+  // note must survive that on its own so the banner does not vanish.
+  it("shows the note with no rate-limit snapshot, without recovery buttons", () => {
+    const { getByText, queryByRole } = mount({
+      rateLimitRetriesExhausted: true,
+      onResumeRateLimit: vi.fn(),
+    });
+    expect(getByText(/Auto-resume stopped: the same prompt was re-sent too many times/i)).toBeDefined();
+    expect(queryByRole("button", { name: /resume now/i })).toBeNull();
   });
 });

@@ -300,6 +300,14 @@ jobs:
       - name: Run Vitest with coverage
         working-directory: web
         run: npm run test:unit -- --coverage --reporter=default --reporter=junit --outputFile.junit=test-report.junit.xml
+      # The bundled aoe-agent ACP adapter is a separate npm package with its
+      # own node:test suite (transcript round-tripping, tool-kind mapping).
+      # Nothing ran it before, so both of its test files could rot unnoticed;
+      # it rides this job because Node is already set up here. Seconds to run,
+      # and it is deliberately not part of the coverage upload below.
+      - name: aoe-agent adapter tests
+        working-directory: acp-worker/aoe-agent
+        run: npm ci && npm test
       # Vitest's v8 coverage reporter emits LCOV paths relative to the
       # vitest cwd (web/), so SF: lines read "SF:src/...". Codecov
       # matches file paths against the PR diff, which uses repo-root

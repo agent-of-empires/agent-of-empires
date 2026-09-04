@@ -20,9 +20,8 @@ use crate::tui::styles::{available_themes, Theme};
 /// Fields are `Some` when the user actually visited the corresponding page;
 /// the caller writes them to config only in that case so a wizard skipped
 /// before the page never overwrites pre-existing values. `final_theme` maps
-/// to `config.theme.name`; `final_attach_mode` is written to
-/// `config.session.default_attach_mode`, which covers both the post-create
-/// and Enter/double-click paths.
+/// to `config.theme.name`; `final_attach_mode` maps to
+/// `config.session.default_attach_mode` for existing sessions.
 #[derive(Debug, Clone)]
 pub struct IntroOutcome {
     pub final_theme: Option<String>,
