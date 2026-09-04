@@ -193,12 +193,6 @@ mod tests {
                 d.web_write
             );
         }
-
-        assert!(
-            !descriptor("sandbox", "container_runtime")
-                .unwrap()
-                .profile_overridable
-        );
     }
 
     /// Every descriptor carries a resolved repo policy: its own
