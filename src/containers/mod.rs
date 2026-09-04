@@ -249,9 +249,11 @@ impl DockerContainer {
     ///
     /// Logs at `info`: this is an irreversible delete of a build cache, and a wrong one
     /// would otherwise reach the user as an unexplained cold rebuild with nothing to
-    /// attribute it to.
+    /// attribute it to. Runtimes without named volumes never reach that log, since
+    /// `named_ignore_volumes` stays populated there while the mounts render as
+    /// anonymous, so there is nothing to delete.
     pub fn remove_stale_named_ignore_volumes(&self, session_id: &str, names: &[String]) {
-        if names.is_empty() {
+        if names.is_empty() || !self.runtime.base.supports_named_volumes {
             return;
         }
         tracing::info!(

@@ -103,7 +103,9 @@ To fix this on macOS, set `volume_ignores_strategy = "named"`. This mounts each 
 
 A volume's name is derived from its mount path, so moving a session's worktree changes it. The recreated container starts from an empty cache for the paths that moved, and the volumes those paths left behind are removed the next time the session starts.
 
-The reclaim removes the volumes belonging to the paths that moved, and nothing else. A volume orphaned any other way is left alone, because AoE cannot tell it apart from a cache you are still using: dropping an entry from `volume_ignores`, switching back to `"anonymous"`, or attaching a repo to a multi-repo workspace all strand a volume without a move it can recognize. Moves that happened before this behavior existed are not reclaimed either, since the session has since started at its new path. To find what is left over, list them with `docker volume ls -q --filter name=aoe-vi-` and remove what you recognize; `docker volume prune` skips named volumes unless you pass `-a`.
+Moving a worktree therefore costs the cache in both directions: move it back and the volumes from the first location are already gone, so that side rebuilds cold too.
+
+The reclaim removes the volumes belonging to the paths that moved, and nothing else. A volume orphaned any other way is left alone, because AoE cannot tell it apart from a cache you are still using: dropping an entry from `volume_ignores`, switching back to `"anonymous"`, or attaching a repo to a multi-repo workspace all strand a volume without a move it can recognize. To find what is left over, list them with `docker volume ls -q --filter name=aoe-vi-` and remove what you recognize; `docker volume prune` skips named volumes unless you pass `-a`.
 
 ```toml
 [sandbox]

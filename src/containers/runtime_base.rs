@@ -1544,6 +1544,10 @@ mod tests {
     fn selected_named_ignore_volumes_never_reaches_outside_the_prefix() {
         // The reporter's own listing (#3742): a sibling-worktree layout whose
         // session moved from otari-worktrees/905 to otari-worktrees/rev-912.
+        // The hash suffixes are real `named_volume_for` output, kept literal on
+        // purpose: `DefaultHasher` is not stable across Rust releases, and a bump
+        // that changed it would orphan every existing named volume, so these
+        // constants are the canary for that.
         const MAIN: &str = "aoe-vi-sess1-workspace-otari-target-8ec07926d6b0";
         const PRE_MOVE: &str = "aoe-vi-sess1-workspace-otari-worktrees-905-target-31ddd0322290";
         const POST_MOVE: &str =

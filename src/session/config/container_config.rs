@@ -1098,82 +1098,79 @@ pub(crate) fn compute_volume_paths_with_resolve(
     // Legitimate git repos have a .git directory; worktrees have a .git file containing a
     // gitdir pointer. Both cases are covered by this check.
     if project_path.join(".git").exists() {
-        match GitWorktree::find_main_repo(project_path) {
-            Err(_) => {}
-            Ok(main_repo) => {
-                // Canonicalize paths for reliable comparison (handles symlinks like /tmp -> /private/tmp)
-                let main_repo_canonical = main_repo
-                    .canonicalize()
-                    .unwrap_or_else(|_| main_repo.clone());
-                let project_canonical = project_path
-                    .canonicalize()
-                    .unwrap_or_else(|_| project_path.to_path_buf());
+        if let Ok(main_repo) = GitWorktree::find_main_repo(project_path) {
+            // Canonicalize paths for reliable comparison (handles symlinks like /tmp -> /private/tmp)
+            let main_repo_canonical = main_repo
+                .canonicalize()
+                .unwrap_or_else(|_| main_repo.clone());
+            let project_canonical = project_path
+                .canonicalize()
+                .unwrap_or_else(|_| project_path.to_path_buf());
 
-                // Check if project_path is a worktree (different from the main repo root).
-                // Mount enough of the filesystem so the worktree's relative gitdir reference
-                // resolves correctly inside the container.
-                if main_repo_canonical != project_canonical {
-                    if project_canonical.starts_with(&main_repo_canonical) {
-                        // Worktree is inside the main repo (bare repo layout) --
-                        // mounting the main repo is sufficient.
-                        let name = main_repo_canonical
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "workspace".to_string());
-                        let container_base = format!("/workspace/{}", name);
-                        let relative_worktree = project_canonical
-                            .strip_prefix(&main_repo_canonical)
-                            .map(|p| p.to_path_buf())
-                            .unwrap_or_default();
-                        let working_dir = if relative_worktree.as_os_str().is_empty() {
-                            container_base.clone()
-                        } else {
-                            format!("{}/{}", container_base, relative_worktree.display())
-                        };
-
-                        return Ok((
-                            vec![VolumeMount {
-                                host_path: main_repo_canonical.to_string_lossy().to_string(),
-                                container_path: container_base,
-                                read_only: false,
-                            }],
-                            working_dir,
-                            MountResolve::Resolved,
-                        ));
+            // Check if project_path is a worktree (different from the main repo root).
+            // Mount enough of the filesystem so the worktree's relative gitdir reference
+            // resolves correctly inside the container.
+            if main_repo_canonical != project_canonical {
+                if project_canonical.starts_with(&main_repo_canonical) {
+                    // Worktree is inside the main repo (bare repo layout) --
+                    // mounting the main repo is sufficient.
+                    let name = main_repo_canonical
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "workspace".to_string());
+                    let container_base = format!("/workspace/{}", name);
+                    let relative_worktree = project_canonical
+                        .strip_prefix(&main_repo_canonical)
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_default();
+                    let working_dir = if relative_worktree.as_os_str().is_empty() {
+                        container_base.clone()
                     } else {
-                        // Worktree is a sibling of the main repo (non-bare layout).
-                        // Mount each separately under /workspace/, preserving their
-                        // relative path structure from their common ancestor. This
-                        // ensures the worktree's .git file (which contains a relative
-                        // gitdir path) resolves correctly inside the container.
-                        let common = common_ancestor(&main_repo_canonical, &project_canonical);
-                        let repo_rel = main_repo_canonical
-                            .strip_prefix(&common)
-                            .unwrap_or(&main_repo_canonical);
-                        let wt_rel = project_canonical
-                            .strip_prefix(&common)
-                            .unwrap_or(&project_canonical);
+                        format!("{}/{}", container_base, relative_worktree.display())
+                    };
 
-                        let repo_container = format!("/workspace/{}", repo_rel.display());
-                        let wt_container = format!("/workspace/{}", wt_rel.display());
+                    return Ok((
+                        vec![VolumeMount {
+                            host_path: main_repo_canonical.to_string_lossy().to_string(),
+                            container_path: container_base,
+                            read_only: false,
+                        }],
+                        working_dir,
+                        MountResolve::Resolved,
+                    ));
+                } else {
+                    // Worktree is a sibling of the main repo (non-bare layout).
+                    // Mount each separately under /workspace/, preserving their
+                    // relative path structure from their common ancestor. This
+                    // ensures the worktree's .git file (which contains a relative
+                    // gitdir path) resolves correctly inside the container.
+                    let common = common_ancestor(&main_repo_canonical, &project_canonical);
+                    let repo_rel = main_repo_canonical
+                        .strip_prefix(&common)
+                        .unwrap_or(&main_repo_canonical);
+                    let wt_rel = project_canonical
+                        .strip_prefix(&common)
+                        .unwrap_or(&project_canonical);
 
-                        return Ok((
-                            vec![
-                                VolumeMount {
-                                    host_path: main_repo_canonical.to_string_lossy().to_string(),
-                                    container_path: repo_container,
-                                    read_only: false,
-                                },
-                                VolumeMount {
-                                    host_path: project_canonical.to_string_lossy().to_string(),
-                                    container_path: wt_container.clone(),
-                                    read_only: false,
-                                },
-                            ],
-                            wt_container,
-                            MountResolve::Resolved,
-                        ));
-                    }
+                    let repo_container = format!("/workspace/{}", repo_rel.display());
+                    let wt_container = format!("/workspace/{}", wt_rel.display());
+
+                    return Ok((
+                        vec![
+                            VolumeMount {
+                                host_path: main_repo_canonical.to_string_lossy().to_string(),
+                                container_path: repo_container,
+                                read_only: false,
+                            },
+                            VolumeMount {
+                                host_path: project_canonical.to_string_lossy().to_string(),
+                                container_path: wt_container.clone(),
+                                read_only: false,
+                            },
+                        ],
+                        wt_container,
+                        MountResolve::Resolved,
+                    ));
                 }
             }
         }
