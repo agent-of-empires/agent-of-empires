@@ -128,8 +128,9 @@ pub fn set_favorites_first(on: bool) {
 
 pub use config::profile_config::{
     load_profile_config, merge_configs, resolve_config, resolve_config_or_warn,
-    save_profile_config, validate_check_interval, validate_env_format, validate_memory_limit,
-    validate_network_format, validate_port_mapping_format, validate_volume_format, ProfileConfig,
+    save_profile_config, validate_capability_format, validate_check_interval, validate_env_format,
+    validate_memory_limit, validate_network_format, validate_port_mapping_format,
+    validate_security_opt_format, validate_volume_format, ProfileConfig,
 };
 pub use config::repo_config::{
     check_repo_trust, execute_hooks, execute_hooks_in_container, load_repo_config,

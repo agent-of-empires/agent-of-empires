@@ -62,7 +62,8 @@ Pick a `widget` for the field's type:
 `select`), `min` / `max` / `step`, `multiline` / `mono`, plus:
 
 - `validate`: server-authoritative value check (`range:MIN[:MAX]`, `nonempty`,
-  `memory_limit`, `volume_list`, `env_list`, `port_mapping_list`). Add a new
+  `memory_limit`, `volume_list`, `env_list`, `port_mapping_list`,
+  `capability_list`, `security_opt_list`, `network`). Add a new
   `ValidationKind` variant (`src/session/config/settings_schema/`) and a `validate=`
   keyword (`aoe-settings-derive`) if none fits; that is what drives both the
   client UX validator and the server gate from one rule.

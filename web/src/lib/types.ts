@@ -686,6 +686,8 @@ export type SettingsValidation =
   | { rule: "volume_list" }
   | { rule: "env_list" }
   | { rule: "port_mapping_list" }
+  | { rule: "capability_list" }
+  | { rule: "security_opt_list" }
   | { rule: "network" }
   | { rule: "cron" }
   | {

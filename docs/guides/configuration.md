@@ -408,7 +408,7 @@ default_image = "ghcr.io/agent-of-empires/aoe-sandbox:latest" # container image
 environment = ["GH_TOKEN=$AOE_GH_TOKEN"]                      # env vars forwarded into the container
 ```
 
-See [Docker Sandbox](sandbox.md) for the full key reference (`cpu_limit`, `memory_limit`, `port_mappings`, `extra_volumes`, `volume_ignores`, `volume_ignores_strategy`, `auto_cleanup`, `default_terminal_mode`), the `environment` grammar, and credential handling. For env vars on host (non-sandboxed) sessions, use [Host Environment](#host-environment) instead; the two lists are disjoint.
+See [Docker Sandbox](sandbox.md) for the full key reference (`cpu_limit`, `memory_limit`, `port_mappings`, `extra_volumes`, `volume_ignores`, `volume_ignores_strategy`, `auto_cleanup`, `default_terminal_mode`, and the run-policy keys `privileged`, `cap_add`, `cap_drop`, `security_opt`, `extra_run_args`), the `environment` grammar, and credential handling. For env vars on host (non-sandboxed) sessions, use [Host Environment](#host-environment) instead; the two lists are disjoint.
 
 ## Host Hooks
 

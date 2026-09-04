@@ -251,6 +251,27 @@ pub fn validate_port_mapping_format(mapping: &str) -> Result<(), String> {
     }
 }
 
+/// Validate a Linux capability name (`sandbox.cap_add` / `sandbox.cap_drop`).
+pub fn validate_capability_format(cap: &str) -> Result<(), String> {
+    let re = regex::Regex::new(r"^[A-Z][A-Z_]+$").unwrap();
+    if re.is_match(cap) {
+        Ok(())
+    } else {
+        Err("Must be a capability name, e.g. ALL, SYS_ADMIN, CAP_NET_RAW".to_string())
+    }
+}
+
+/// Validate a `--security-opt` entry (`sandbox.security_opt`).
+pub fn validate_security_opt_format(opt: &str) -> Result<(), String> {
+    if opt.is_empty() || opt.chars().any(char::is_whitespace) || opt.starts_with('-') {
+        return Err(
+            "Must be a security option, e.g. seccomp=unconfined or no-new-privileges:true"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Validate a container network mode (`sandbox.network`). Empty (unset),
 /// `none`, `bridge`, or a named network matching Docker's network-name grammar
 /// are accepted. `host` is rejected outright because sharing the host network

@@ -6,7 +6,13 @@ on:
   # No branch filter: a stacked PR targets its parent branch rather than main,
   # and a base filter would leave every PR but the bottom of the stack with no
   # checks at all.
+  #
+  # `labeled` is listed so adding `ci-macos` starts a run that can see the
+  # label; the default types alone would leave the macOS job waiting for the
+  # next push. It re-runs the workflow on any label, which is rare enough to
+  # cost less than a macOS regression reaching main.
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
 
 env:
   CARGO_TERM_COLOR: always
@@ -220,6 +226,14 @@ jobs:
     # job can move to its own workflow with a `push` + `schedule` trigger and
     # drop the per-step conditions.
     #
+    # To run it on a pull request, add the `ci-macos` label. Every step below
+    # is gated on `not a PR, or that label`, so labelling runs this job for
+    # real and the required context reports a pass either way. Reach for it
+    # whenever a change touches `src/process/macos.rs`, a `target_os` cfg, or
+    # anything filesystem-shaped: macOS resolves `/tmp` and the per-user temp
+    # root through symlinks and its `mode_t` is 16 bits, and both have already
+    # reached main unnoticed because this suite does not run here by default.
+    #
     # Both cargo invocations share one feature set so the crate compiles once.
     # `e2e-tests` is an empty feature whose only consumer is `required-features`
     # on the `[[test]] name = "e2e"` target, so adding it to the --lib --bins
@@ -249,7 +263,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')
         with:
           # These jobs run repository-controlled build/test code after checkout
           # and never push, so the job token must not linger in .git/config
@@ -257,28 +271,28 @@ jobs:
           # release.yml.
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')
         with:
           cache-bin: "true"
           save-if: true
       - name: Install tmux
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')
         run: brew install tmux
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')
         with:
           node-version: '22'
       - name: Cargo test (macOS, lib + bins)
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')
         run: cargo test --features web,e2e-tests --lib --bins
       - name: Cargo test (macOS, acp live-daemon e2e)
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')
         run: cargo test --features web,e2e-tests --test e2e -- acp_ --test-threads=1 --nocapture
       - name: Skipped on pull requests
-        if: github.event_name == 'pull_request'
-        run: echo "macOS runs post-merge on main; see the comment on this job."
+        if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'ci-macos')
+        run: echo "macOS runs post-merge on main. Add the 'ci-macos' label to run it here."
 
   vitest:
     name: Vitest

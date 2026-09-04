@@ -2459,6 +2459,86 @@ pub struct SandboxConfig {
     )]
     pub selinux_relabel: bool,
 
+    /// Run the container with `--privileged`: full device access and all
+    /// capabilities. Needed to run a container engine (rootless podman,
+    /// dockerd) inside the sandbox.
+    #[serde(default)]
+    #[setting(
+        label = "Privileged",
+        widget = "toggle",
+        web = "local_only:grants the container full host privileges",
+        repo = "deny",
+        advanced
+    )]
+    pub privileged: bool,
+
+    /// Capabilities to add to the container (`--cap-add`), e.g. "SYS_ADMIN".
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "super::serde_helpers::string_or_vec"
+    )]
+    #[setting(
+        label = "Add Capabilities",
+        widget = "list",
+        validate = "capability_list",
+        web = "local_only:grants the container extra Linux capabilities",
+        repo = "deny",
+        advanced
+    )]
+    pub cap_add: Vec<String>,
+
+    /// Capabilities to drop from the container (`--cap-drop`), e.g. "ALL".
+    /// A write replaces rather than adds, so clearing it undoes hardening.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "super::serde_helpers::string_or_vec"
+    )]
+    #[setting(
+        label = "Drop Capabilities",
+        widget = "list",
+        validate = "capability_list",
+        web = "local_only:a write replaces the list, so it can undo hardening",
+        repo = "deny",
+        advanced
+    )]
+    pub cap_drop: Vec<String>,
+
+    /// Security options for the container (`--security-opt`), e.g.
+    /// "seccomp=unconfined" or "no-new-privileges:true".
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "super::serde_helpers::string_or_vec"
+    )]
+    #[setting(
+        label = "Security Options",
+        widget = "list",
+        validate = "security_opt_list",
+        web = "local_only:relaxes the container security profile",
+        repo = "deny",
+        advanced
+    )]
+    pub security_opt: Vec<String>,
+
+    /// Extra arguments appended verbatim to the container `run` invocation,
+    /// before the image. Unvalidated, so entries bypass `sandbox.network`'s
+    /// refusal of `host`.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "super::serde_helpers::string_or_vec"
+    )]
+    #[setting(
+        label = "Extra Run Args",
+        widget = "list",
+        web = "local_only:arbitrary container runtime argv, a host execution surface",
+        repo = "deny",
+        advanced
+    )]
+    pub extra_run_args: Vec<String>,
+
     /// Custom instruction text appended to the agent's system prompt in
     /// sandboxed sessions (Claude, Codex only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2524,6 +2604,11 @@ impl Default for SandboxConfig {
             volume_ignores_strategy: VolumeIgnoresStrategy::default(),
             mount_ssh: false,
             selinux_relabel: false,
+            privileged: false,
+            cap_add: Vec::new(),
+            cap_drop: Vec::new(),
+            security_opt: Vec::new(),
+            extra_run_args: Vec::new(),
             custom_instruction: None,
             container_runtime: ContainerRuntimeName::default(),
         }

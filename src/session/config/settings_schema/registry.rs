@@ -174,6 +174,27 @@ mod tests {
         assert!(!d.advanced);
     }
 
+    #[test]
+    fn field_declared_repo_and_write_policies() {
+        use super::super::{RepoPolicy, ValidationKind, WebWritePolicy};
+        for (field, validation) in [
+            ("privileged", ValidationKind::None),
+            ("cap_add", ValidationKind::CapabilityList),
+            ("cap_drop", ValidationKind::CapabilityList),
+            ("security_opt", ValidationKind::SecurityOptList),
+            ("extra_run_args", ValidationKind::None),
+        ] {
+            let d = descriptor("sandbox", field).unwrap_or_else(|| panic!("sandbox.{field}"));
+            assert_eq!(d.repo_policy, RepoPolicy::Deny, "sandbox.{field}");
+            assert_eq!(d.validation, validation, "sandbox.{field}");
+            assert!(
+                matches!(d.web_write, WebWritePolicy::LocalOnly { .. }),
+                "sandbox.{field} must be local_only, got {:?}",
+                d.web_write
+            );
+        }
+    }
+
     /// Every descriptor carries a resolved repo policy: its own
     /// `#[setting(repo = ...)]` where it declares one, otherwise the
     /// `repo_default` of its `#[setting_section(...)]`.

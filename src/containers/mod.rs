@@ -9,7 +9,9 @@ use std::collections::HashMap;
 
 use crate::cli::truncate_id;
 use crate::session::{Config, ContainerRuntimeName};
-pub use container_interface::{ContainerConfig, EnvEntry, NamedVolumeMount, VolumeMount};
+pub use container_interface::{
+    ContainerConfig, EnvEntry, NamedVolumeMount, RunPolicy, VolumeMount,
+};
 use error::Result;
 pub use runtime::ContainerRuntime;
 

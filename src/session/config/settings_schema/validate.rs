@@ -109,6 +109,12 @@ pub fn validate_value(kind: &ValidationKind, value: &Value) -> Result<(), Valida
         ValidationKind::PortMappingList => {
             validate_string_list(value, crate::session::validate_port_mapping_format)
         }
+        ValidationKind::CapabilityList => {
+            validate_string_list(value, crate::session::validate_capability_format)
+        }
+        ValidationKind::SecurityOptList => {
+            validate_string_list(value, crate::session::validate_security_opt_format)
+        }
         ValidationKind::Network => {
             let s = value
                 .as_str()
