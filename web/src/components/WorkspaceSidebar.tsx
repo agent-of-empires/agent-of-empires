@@ -59,7 +59,6 @@ import { SortableContext, useSortable, verticalListSortingStrategy, arrayMove } 
 import { CSS } from "@dnd-kit/utilities";
 import type {
   ContextResumeAvailability,
-  ContextResumeIndeterminateReason,
   ContextResumeUnavailableReason,
   ProjectInfo,
   RepoGroup,
@@ -463,29 +462,16 @@ const CONTEXT_RESUME_UNAVAILABLE_DETAIL: Record<ContextResumeUnavailableReason, 
   no_target: "no resume target has been captured",
 };
 
-const CONTEXT_RESUME_INDETERMINATE_DETAIL: Record<ContextResumeIndeterminateReason, string> = {
-  runtime_check_required: "a runtime check is required at launch",
-  agent_handshake_required: "the agent has not reported native resume support yet",
-};
-
 function ContextResumeBadge({ availability }: { availability: ContextResumeAvailability | undefined }) {
-  if (!availability || availability.state === "available") return null;
-  const unavailable = availability.state === "unavailable";
-  const title = unavailable
-    ? "Context resume unavailable: " + CONTEXT_RESUME_UNAVAILABLE_DETAIL[availability.reason]
-    : "Context resume not yet confirmed: " + CONTEXT_RESUME_INDETERMINATE_DETAIL[availability.reason];
+  if (availability?.state !== "unavailable") return null;
+  const detail = CONTEXT_RESUME_UNAVAILABLE_DETAIL[availability.reason];
+  const title = detail ? `Context resume unavailable: ${detail}` : "Context resume unavailable";
   return (
     <span
       title={title}
-      aria-label={title}
-      className={
-        "inline-flex shrink-0 items-center rounded border px-1 py-0 text-[10px] font-mono font-medium " +
-        (unavailable
-          ? "border-amber-700/40 bg-amber-950/30 text-amber-300"
-          : "border-surface-700/40 bg-surface-800/40 text-text-dim")
-      }
+      className="inline-flex shrink-0 items-center rounded border border-amber-700/40 bg-amber-950/30 px-1 py-0 text-[10px] font-mono font-medium text-amber-300"
     >
-      {unavailable ? "ctx:no" : "ctx:check"}
+      ctx:no
     </span>
   );
 }
