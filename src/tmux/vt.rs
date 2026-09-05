@@ -1675,14 +1675,29 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
     // single-writer. `acquire` is blocked until this flips.
     ctx.alive.store(true, Ordering::Relaxed);
     let mut conn = conn;
-    let _ = conn.set_read_timeout(Some(Duration::from_millis(200)));
+    let _ = conn.set_nonblocking(true);
     let mut buf = [0u8; 8192];
     let mut osc52 = Osc52Scanner::new();
     let mut sync = SyncOutputScanner::new();
     while !ctx.stop.load(Ordering::Relaxed) {
+        let mut fd = libc::pollfd {
+            fd: conn.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut fd, 1, 200) };
+        if ready == -1 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if ready == 0 || fd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) == 0 {
+            continue;
+        }
         // A snapshot holds this same mutex from its forwarder drain through
-        // parser replacement. A reader that has received a chunk therefore
-        // settles it before the snapshot can inspect the socket queue.
+        // parser replacement. Readiness waits outside it, but a received
+        // chunk settles before the snapshot can inspect the socket queue.
         let Ok(_snapshot) = ctx.snapshot.lock() else {
             break;
         };
@@ -3657,6 +3672,52 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         drop(conn);
         let _ = reader.join();
+    }
+
+    #[test]
+    fn idle_reader_does_not_hold_snapshot_fence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("s.sock");
+        let listener = UnixListener::bind(&sock).expect("bind");
+        let stop = Arc::new(AtomicBool::new(false));
+        let alive = Arc::new(AtomicBool::new(false));
+        let snapshot = Arc::new(Mutex::new(()));
+        let snapshot_guard = snapshot.lock().expect("hold snapshot before reader starts");
+        let ctx = ReaderCtx {
+            parser: Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0))),
+            stop: stop.clone(),
+            seeded: Arc::new(AtomicBool::new(true)),
+            snapshot: snapshot.clone(),
+            stream: Arc::new(Mutex::new(None)),
+            app_cursor: Arc::new(AtomicBool::new(false)),
+            alive: alive.clone(),
+            wakeup: Arc::new(Mutex::new(None)),
+            clipboard: Arc::new(Mutex::new(None)),
+            chunk_seq: Arc::new(AtomicU64::new(0)),
+            settled_chunk_seq: Arc::new(AtomicU64::new(0)),
+            last_chunk_ms: Arc::new(AtomicU64::new(0)),
+            prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
+            grid_gen: Arc::new(AtomicU64::new(0)),
+            signals: Arc::new(ViewerSignals::new()),
+        };
+        let reader = std::thread::spawn(move || run_reader(listener, ctx));
+        let conn = UnixStream::connect(&sock).expect("connect");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !alive.load(Ordering::Relaxed) {
+            assert!(Instant::now() < deadline, "reader never connected");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        drop(snapshot_guard);
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            snapshot.try_lock().is_ok(),
+            "an idle reader must not hold the snapshot fence while it waits for input"
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        drop(conn);
+        reader.join().expect("reader exits");
     }
 
     #[test]
