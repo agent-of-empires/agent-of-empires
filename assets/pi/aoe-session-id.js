@@ -15,6 +15,7 @@ import { dirname, join } from "node:path";
 
 export default function (pi) {
   const idTarget = process.env.AOE_PI_SESSION_ID_FILE;
+  const rootOnly = process.env.AOE_SESSION_ROOT_ONLY === "1";
 
   const writeAtomic = (target, value) => {
     let tmp;
@@ -37,12 +38,17 @@ export default function (pi) {
   pi.on("session_start", async (_event, ctx) => {
     if (!idTarget) return;
     try {
+      // Prime writes rlmDepth into every child header; depth zero owns the pane.
+      if (rootOnly && ctx?.sessionManager?.getHeader?.()?.rlmDepth > 0) return;
       const id = ctx?.sessionManager?.getSessionId?.();
       if (!id) return;
       writeAtomic(idTarget, id);
       const file = ctx?.sessionManager?.getSessionFile?.();
       if (file) {
         writeAtomic(join(dirname(idTarget), "session_path"), file);
+      }
+      if (rootOnly) {
+        writeAtomic(join(dirname(idTarget), "root_only"), "1");
       }
     } catch {
       // never block the agent

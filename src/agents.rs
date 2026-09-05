@@ -87,6 +87,21 @@ pub enum SessionCaptureBackend {
     PrimeAgent,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionIdentityPublisher {
+    Extension { root_only: bool },
+}
+
+impl SessionCaptureBackend {
+    pub(crate) const fn identity_publisher(self) -> Option<SessionIdentityPublisher> {
+        match self {
+            Self::Pi => Some(SessionIdentityPublisher::Extension { root_only: false }),
+            Self::PrimeAgent => Some(SessionIdentityPublisher::Extension { root_only: true }),
+            _ => None,
+        }
+    }
+}
+
 /// Authority available in one launch environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionCaptureContext {

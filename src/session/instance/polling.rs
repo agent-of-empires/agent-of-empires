@@ -304,7 +304,9 @@ impl Instance {
                 let Some(store) = self.sandbox_capture_store_dir() else {
                     return;
                 };
-                Box::new(prime_agent_poll_fn_sandboxed_store(
+                let preferred_sidecar = self.prime_root_sidecar_poll_fn();
+                Box::new(prime_agent_poll_fn_sandboxed(
+                    preferred_sidecar,
                     store,
                     self.container_workdir(),
                     self.id.clone(),

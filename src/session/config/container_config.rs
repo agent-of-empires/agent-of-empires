@@ -1039,26 +1039,30 @@ fn sync_managed_skills_into_sandbox(
 /// created by an older AoE keeps working. Docker cannot add a mount to a
 /// container that already exists, and reusing one is the normal path.
 pub(crate) const PI_SIDECAR_DIR_IN_CONTAINER: &str = "/root/.pi/aoe-session";
+pub(crate) const PRIME_AGENT_DIR_IN_CONTAINER: &str = "/root/.prime/agent";
+pub(crate) const PRIME_AGENT_EXTENSION_IN_CONTAINER: &str =
+    "/root/.prime/agent/extensions/aoe-session-id.js";
 
-/// Write the session-id extension where a sandboxed Pi discovers it
-/// (under the agent extension directory in the container). The supplied root
-/// is both the host directory backing PI_SIDECAR_DIR_IN_CONTAINER and the
-/// extension root. Discovery rather than an explicit extension argument lets
-/// the file survive AoE upgrades in an existing container; Pi refuses to start
-/// when an explicit extension path is missing.
+fn install_session_extension_at(root: &Path, rel: &Path) -> Result<()> {
+    let source = crate::session::instance::PI_SESSION_EXTENSION;
+    let current = crate::session::read_file_no_follow(root, rel)?;
+    if current.as_deref() != Some(source) {
+        crate::session::replace_file_no_follow(root, rel, source.as_bytes())?;
+    }
+    Ok(())
+}
+
+/// Write the session-id extension where a sandboxed Pi discovers it.
 pub(crate) fn install_pi_sandbox_extension_at(root: &Path) -> Result<()> {
     let rel = Path::new("agent")
         .join("extensions")
         .join("aoe-session-id.js");
-    let source = crate::session::instance::PI_SESSION_EXTENSION;
-    // The bind is writable from the container, so the current content counts
-    // only when it is a regular file reached without following a link, and the
-    // write below follows none either.
-    let current = crate::session::read_file_no_follow(root, &rel)?;
-    if current.as_deref() != Some(source) {
-        crate::session::replace_file_no_follow(root, &rel, source.as_bytes())?;
-    }
-    Ok(())
+    install_session_extension_at(root, &rel)
+}
+
+/// Stage the root-only identity extension inside Prime's private sandbox store.
+pub(crate) fn install_prime_sandbox_extension_at(root: &Path) -> Result<()> {
+    install_session_extension_at(root, Path::new("extensions/aoe-session-id.js"))
 }
 /// Which branch [`compute_volume_paths_with_resolve`] resolved the mounts through.
 ///

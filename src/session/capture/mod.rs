@@ -1276,6 +1276,25 @@ pub(crate) fn prime_agent_poll_fn_sandboxed_store(
     }
 }
 
+/// Prefer a validated root-only publication, falling back to the private store.
+pub(crate) fn prime_agent_poll_fn_sandboxed(
+    preferred_sidecar: Box<dyn Fn() -> Option<String> + Send + 'static>,
+    store: PathBuf,
+    container_workdir: String,
+    instance_id: String,
+    launch_time_ms: f64,
+    extra_excludes: HashSet<String>,
+) -> impl Fn() -> Option<String> + Send + 'static {
+    let fallback = prime_agent_poll_fn_sandboxed_store(
+        store,
+        container_workdir,
+        instance_id,
+        launch_time_ms,
+        extra_excludes,
+    );
+    move || preferred_sidecar().or_else(&fallback)
+}
+
 // ─── Hermes session capture ───────────────────────────────────────────────────
 
 /// One active Hermes CLI session row with its recorded project signal.
@@ -2569,7 +2588,7 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_prime_poller_only_claims_post_launch_matching_transcript() {
+    fn sandbox_prime_poller_prefers_root_publication_and_keeps_store_fallback() {
         let tmp = tempfile::tempdir().unwrap();
         let sessions = tmp.path().join("sessions");
         std::fs::create_dir(&sessions).unwrap();
@@ -2591,5 +2610,25 @@ mod tests {
             HashSet::new(),
         );
         assert_eq!(poll().as_deref(), Some("prime_fresh"));
+
+        let preferred = prime_agent_poll_fn_sandboxed(
+            Box::new(|| Some("prime_parent".to_string())),
+            tmp.path().to_path_buf(),
+            "/workspace".to_string(),
+            "current".to_string(),
+            2_000_001.0,
+            HashSet::new(),
+        );
+        assert_eq!(preferred().as_deref(), Some("prime_parent"));
+
+        let fallback = prime_agent_poll_fn_sandboxed(
+            Box::new(|| None),
+            tmp.path().to_path_buf(),
+            "/workspace".to_string(),
+            "current".to_string(),
+            2_000_001.0,
+            HashSet::new(),
+        );
+        assert_eq!(fallback().as_deref(), Some("prime_fresh"));
     }
 }

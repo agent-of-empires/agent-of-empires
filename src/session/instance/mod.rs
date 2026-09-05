@@ -27,7 +27,7 @@ use crate::session::capture::{
     capture_omp_session_id, codex_poll_fn_sandboxed_store, gemini_poll_fn_sandboxed_store,
     generate_session_uuid, hermes_poll_fn_sandboxed_store, is_valid_session_id,
     kimi_poll_fn_sandboxed_store, omp_host_routing_environment, omp_poll_fn, omp_poll_fn_sandboxed,
-    omp_sandbox_launch_marker, prime_agent_poll_fn_sandboxed_store, reject_omp_secret_args,
+    omp_sandbox_launch_marker, prime_agent_poll_fn_sandboxed, reject_omp_secret_args,
     resolve_omp_store_layout, resolve_omp_store_layout_in_container_with_environment,
     resolve_omp_store_layout_with_environment, try_capture_omp_session_id_in_container,
     validate_omp_capture_metadata, validated_session_id, OmpCaptureMetadata, OmpCapturePlan,

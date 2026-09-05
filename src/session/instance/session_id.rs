@@ -2,7 +2,70 @@
 
 use super::*;
 
-const PI_SIDECAR_MAX_BYTES: usize = 4096;
+const SESSION_SIDECAR_MAX_BYTES: usize = 4096;
+const PRIME_AGENT_HEADER_MAX_BYTES: u64 = 64 * 1024;
+
+fn read_sandbox_sidecar_file(store: &Path, instance_id: &str, leaf: &str) -> Option<Vec<u8>> {
+    crate::session::validate_instance_id(instance_id).ok()?;
+    let root = crate::session::AnchoredDir::open(store).ok()?;
+    let relative = Path::new("aoe-session").join(instance_id).join(leaf);
+    root.read_regular(&relative, SESSION_SIDECAR_MAX_BYTES)
+        .ok()?
+}
+
+fn validated_prime_root_publication(
+    store: &Path,
+    instance_id: &str,
+    expected_cwd: &str,
+) -> Option<String> {
+    use std::io::{BufRead as _, Read as _};
+
+    let marker = read_sandbox_sidecar_file(store, instance_id, "root_only")?;
+    if std::str::from_utf8(&marker).ok()?.trim() != "1" {
+        return None;
+    }
+    let id = read_sandbox_sidecar_file(store, instance_id, "session_id")?;
+    let id = std::str::from_utf8(&id).ok()?.trim();
+    let id = crate::session::capture::validated_session_id(id.to_string())?;
+    let path = read_sandbox_sidecar_file(store, instance_id, "session_path")?;
+    let path = std::str::from_utf8(&path).ok()?.trim();
+    let relative = path.strip_prefix("/root/.prime/agent/")?;
+    let mut components = Path::new(relative).components();
+    if components.next()? != std::path::Component::Normal(std::ffi::OsStr::new("sessions")) {
+        return None;
+    }
+    let file_name = match components.next()? {
+        std::path::Component::Normal(name) => name,
+        _ => return None,
+    };
+    if components.next().is_some() || Path::new(file_name).extension()?.to_str()? != "jsonl" {
+        return None;
+    }
+
+    let root = crate::session::AnchoredDir::open(store).ok()?;
+    let relative = Path::new("sessions").join(file_name);
+    let file = root.open_regular(&relative, usize::MAX).ok()??;
+    let mut header = Vec::with_capacity(4096);
+    let read = std::io::BufReader::new(file)
+        .take(PRIME_AGENT_HEADER_MAX_BYTES.saturating_add(1))
+        .read_until(b'\n', &mut header)
+        .ok()?;
+    if read == 0 || u64::try_from(read).ok()? > PRIME_AGENT_HEADER_MAX_BYTES {
+        return None;
+    }
+    let header: serde_json::Value = serde_json::from_slice(&header).ok()?;
+    let valid = header.get("type").and_then(|value| value.as_str()) == Some("session")
+        && header.get("id").and_then(|value| value.as_str()) == Some(id.as_str())
+        && header.get("rlmDepth").and_then(|value| value.as_u64()) == Some(0)
+        && header
+            .get("cwd")
+            .and_then(|value| value.as_str())
+            .is_some_and(|cwd| {
+                crate::session::capture::canonicalize_or_raw(cwd)
+                    == crate::session::capture::canonicalize_or_raw(expected_cwd)
+            });
+    valid.then_some(id)
+}
 
 impl Instance {
     /// Acquire a pre-launch session ID for the agent.
@@ -296,6 +359,13 @@ impl Instance {
             }
             return override_if_distinct(self.agent_session_id.as_deref(), authoritative);
         }
+        if backend == crate::agents::SessionCaptureBackend::PrimeAgent {
+            let authoritative = self.prime_published_root_session_id()?;
+            if self.retroactive_capture_excludes.contains(&authoritative) {
+                return None;
+            }
+            return override_if_distinct(self.agent_session_id.as_deref(), authoritative);
+        }
         if matches!(
             backend,
             crate::agents::SessionCaptureBackend::Claude
@@ -316,29 +386,42 @@ impl Instance {
         self.pi_extension_launched = true;
     }
 
-    /// The `-e <extension>` flag and sidecar env var a Pi launch needs to
-    /// publish its own conversation, or `None` when it cannot.
-    ///
-    /// The extension reports every `session_start`, so a `/new` inside the
-    /// pane is attributed to it rather than inferred from a store keyed by
-    /// cwd. Requires a binary AoE can vouch for on the host; a sandboxed pane
-    /// runs the container's pi, which is why the paths differ: the extension
-    /// and the instance dir are both bind-mounted in, so the flag and the env
-    /// var name container paths (see `container_config::pi_extension_mounts`).
-    pub(super) fn pi_extension_launch(&self) -> Option<(String, String)> {
-        if self.resolved_capture_backend() != Some(crate::agents::SessionCaptureBackend::Pi) {
-            return None;
-        }
+    /// Extension flag and sidecar environment for an identity-publishing backend.
+    pub(super) fn identity_extension_launch(&self) -> Option<(String, String)> {
+        let backend = self.resolved_capture_backend()?;
+        backend.identity_publisher()?;
         if self.is_sandboxed() {
-            let bind_dir = self.pi_config_bind_dir()?;
-            if crate::session::config::container_config::install_pi_sandbox_extension_at(&bind_dir)
-                .is_err()
-            {
-                return None;
-            }
+            let bind_dir = self.extension_config_bind_dir()?;
+            let (container_root, flag) = match backend {
+                crate::agents::SessionCaptureBackend::Pi => {
+                    crate::session::config::container_config::install_pi_sandbox_extension_at(
+                        &bind_dir,
+                    )
+                    .ok()?;
+                    (Path::new("/root/.pi"), String::new())
+                }
+                crate::agents::SessionCaptureBackend::PrimeAgent => {
+                    crate::session::config::container_config::install_prime_sandbox_extension_at(
+                        &bind_dir,
+                    )
+                    .ok()?;
+                    (
+                        Path::new(
+                            crate::session::config::container_config::PRIME_AGENT_DIR_IN_CONTAINER,
+                        ),
+                        format!(
+                            " -e {}",
+                            shell_escape(
+                                crate::session::config::container_config::PRIME_AGENT_EXTENSION_IN_CONTAINER
+                            )
+                        ),
+                    )
+                }
+                _ => return None,
+            };
             let config = self.build_container_config().ok()?;
             if !config.uses_default_container_home()
-                || !config.path_is_mounted(&bind_dir, std::path::Path::new("/root/.pi"), true)
+                || !config.path_is_mounted(&bind_dir, container_root, true)
             {
                 return None;
             }
@@ -352,16 +435,25 @@ impl Instance {
             if container_known && container.mount_fingerprint_matches(&config).ok()? != Some(true) {
                 return None;
             }
+            let sidecar_root = match backend {
+                crate::agents::SessionCaptureBackend::Pi => {
+                    crate::session::config::container_config::PI_SIDECAR_DIR_IN_CONTAINER
+                }
+                crate::agents::SessionCaptureBackend::PrimeAgent => {
+                    "/root/.prime/agent/aoe-session"
+                }
+                _ => return None,
+            };
             return Some((
-                String::new(),
+                flag,
                 format!(
                     "AOE_PI_SESSION_ID_FILE={}/{}/session_id ",
-                    crate::session::config::container_config::PI_SIDECAR_DIR_IN_CONTAINER,
-                    self.id
+                    sidecar_root, self.id
                 ),
             ));
         }
-        if super::launch_command::environment_defines_path(&self.resolved_host_environment())
+        if backend != crate::agents::SessionCaptureBackend::Pi
+            || super::launch_command::environment_defines_path(&self.resolved_host_environment())
             || !crate::agents::pi_supports_extension_flag()
         {
             return None;
@@ -388,7 +480,10 @@ impl Instance {
     /// boundary it published on. `any_age` drops the freshness window, which a
     /// final flush wants and a resume does not.
     pub(crate) fn pi_published_session_id(&self, any_age: bool) -> Option<String> {
-        match self.pi_sidecar_source()? {
+        if self.resolved_capture_backend() != Some(crate::agents::SessionCaptureBackend::Pi) {
+            return None;
+        }
+        match self.extension_sidecar_source()? {
             PiSidecarSource::HostHooks => {
                 if any_age {
                     crate::hooks::read_hook_session_id_any_age(&self.id)
@@ -397,7 +492,7 @@ impl Instance {
                 }
             }
             PiSidecarSource::SandboxDir(_) => {
-                let raw = self.read_pi_sandbox_file("session_id")?;
+                let raw = self.read_extension_sandbox_file("session_id")?;
                 let id = std::str::from_utf8(&raw).ok()?.trim();
                 uuid::Uuid::parse_str(id).ok().map(|_| id.to_string())
             }
@@ -405,66 +500,66 @@ impl Instance {
     }
 
     /// The transcript path this pane published, as the pane sees it. In a
-    /// container that is a `/root/.pi/...` path, which is what pi's argv needs;
-    /// `pi_host_view_of` maps it back for host-side checks.
+    /// container that is a /root/.pi/ path, which is what pi's argv needs;
+    /// pi_host_view_of maps it back for host-side checks.
     pub(crate) fn pi_published_session_path(&self) -> Option<String> {
-        match self.pi_sidecar_source()? {
+        if self.resolved_capture_backend() != Some(crate::agents::SessionCaptureBackend::Pi) {
+            return None;
+        }
+        self.published_extension_session_path()
+    }
+
+    fn published_extension_session_path(&self) -> Option<String> {
+        match self.extension_sidecar_source()? {
             PiSidecarSource::HostHooks => crate::hooks::read_hook_session_path(&self.id),
             PiSidecarSource::SandboxDir(_) => {
-                let raw = self.read_pi_sandbox_file("session_path")?;
+                let raw = self.read_extension_sandbox_file("session_path")?;
                 let path = std::str::from_utf8(&raw).ok()?.trim();
                 path.starts_with('/').then(|| path.to_string())
             }
         }
     }
 
-    /// Where this pane publishes, or `None` when that cannot be established.
-    ///
-    /// `None` is the fail-closed answer and never means "try the host": a
-    /// sandboxed pane whose bind-backed path will not resolve must not read
-    /// the host hook directory, or it adopts a conversation from another
-    /// namespace, which is the attribution bug this change exists to remove.
+    /// Where this Pi pane publishes, or None when that cannot be established.
     pub(crate) fn pi_sidecar_source(&self) -> Option<PiSidecarSource> {
+        (self.resolved_capture_backend() == Some(crate::agents::SessionCaptureBackend::Pi))
+            .then(|| self.extension_sidecar_source())?
+    }
+
+    fn extension_sidecar_source(&self) -> Option<PiSidecarSource> {
+        self.resolved_capture_backend()?.identity_publisher()?;
         if self.is_sandboxed() {
-            return self.pi_sandbox_sidecar().map(PiSidecarSource::SandboxDir);
+            crate::session::validate_instance_id(&self.id).ok()?;
+            return Some(PiSidecarSource::SandboxDir(
+                self.extension_config_bind_dir()?
+                    .join("aoe-session")
+                    .join(&self.id),
+            ));
         }
         Some(PiSidecarSource::HostHooks)
     }
 
-    /// Host side of the Pi config bind for this sandboxed pane.
-    fn pi_config_bind_dir(&self) -> Option<std::path::PathBuf> {
+    fn extension_config_bind_dir(&self) -> Option<std::path::PathBuf> {
         self.sandbox_capture_store_dir()
     }
 
-    /// Host directory backing this sandboxed pane's sidecar.
-    fn pi_sandbox_sidecar(&self) -> Option<std::path::PathBuf> {
-        crate::session::validate_instance_id(&self.id).ok()?;
-        Some(
-            self.pi_config_bind_dir()?
-                .join("aoe-session")
-                .join(&self.id),
-        )
+    fn read_extension_sandbox_file(&self, leaf: &str) -> Option<Vec<u8>> {
+        read_sandbox_sidecar_file(&self.extension_config_bind_dir()?, &self.id, leaf)
     }
 
-    fn read_pi_sandbox_file(&self, leaf: &str) -> Option<Vec<u8>> {
-        let root = crate::session::AnchoredDir::open(&self.pi_config_bind_dir()?).ok()?;
-        let relative = Path::new("aoe-session").join(&self.id).join(leaf);
-        root.read_regular(&relative, PI_SIDECAR_MAX_BYTES).ok()?
-    }
-
-    fn pi_sandbox_regular_exists(&self, relative: &Path) -> bool {
-        self.pi_config_bind_dir()
+    fn extension_sandbox_regular_exists(&self, relative: &Path) -> bool {
+        self.extension_config_bind_dir()
             .and_then(|root| crate::session::AnchoredDir::open(&root).ok())
             .is_some_and(|root| root.regular_exists(relative))
     }
 
-    /// A published path as the host filesystem sees it.
+    /// A published Pi path as the host filesystem sees it.
     fn pi_host_view_of(&self, published: &str) -> Option<std::path::PathBuf> {
         if !self.is_sandboxed() {
             return Some(std::path::PathBuf::from(published));
         }
         let rest = published.strip_prefix("/root/.pi/")?;
-        Some(self.pi_config_bind_dir()?.join(rest))
+        Some(self.extension_config_bind_dir()?.join(rest))
     }
 
     fn pi_resumable_transcript(&self) -> Option<String> {
@@ -477,7 +572,7 @@ impl Instance {
             .is_some_and(|uuid| uuid == id);
         let exists = if self.is_sandboxed() {
             path.strip_prefix("/root/.pi/")
-                .is_some_and(|relative| self.pi_sandbox_regular_exists(Path::new(relative)))
+                .is_some_and(|relative| self.extension_sandbox_regular_exists(Path::new(relative)))
         } else {
             self.pi_host_view_of(path)
                 .is_some_and(|host_path| host_path.is_file())
@@ -494,30 +589,53 @@ impl Instance {
         }
     }
 
+    fn prime_published_root_session_id(&self) -> Option<String> {
+        if self.resolved_capture_backend() != Some(crate::agents::SessionCaptureBackend::PrimeAgent)
+            || !self.is_sandboxed()
+        {
+            return None;
+        }
+        validated_prime_root_publication(
+            &self.extension_config_bind_dir()?,
+            &self.id,
+            &self.container_workdir(),
+        )
+    }
+
+    fn absorb_published_prime_session(&mut self) {
+        if let Some(id) = self.prime_published_root_session_id() {
+            self.agent_session_id = Some(id);
+        }
+    }
+
+    pub(crate) fn prime_root_sidecar_poll_fn(
+        &self,
+    ) -> Box<dyn Fn() -> Option<String> + Send + 'static> {
+        let Some(store) = self.extension_config_bind_dir() else {
+            return Box::new(|| None);
+        };
+        let instance_id = self.id.clone();
+        let expected_cwd = self.container_workdir();
+        Box::new(move || validated_prime_root_publication(&store, &instance_id, &expected_cwd))
+    }
+
     pub(crate) fn uses_pi_session_sidecar(&self) -> bool {
         self.resolved_capture_backend() == Some(crate::agents::SessionCaptureBackend::Pi)
             && self.pi_sidecar_source().is_some()
-            && (self.pi_extension_launched || self.pi_sidecar_exists())
+            && (self.pi_extension_launched || self.extension_sidecar_exists())
     }
 
-    /// Whether a sidecar exists for this pane, looked for where the pane
-    /// publishes: the bind-backed directory for a container, the per-instance
-    /// hook directory for a host pane.
-    ///
-    /// This is the reload path. `pi_extension_launched` is runtime state, so a
-    /// daemon or TUI that reloads a still-live session has only the file to go
-    /// on, and looking in the wrong place makes a publishing pane read as a
-    /// silent one: no poller repair, and a final flush that returns early.
-    fn pi_sidecar_exists(&self) -> bool {
-        match self.pi_sidecar_source() {
+    fn extension_sidecar_exists(&self) -> bool {
+        match self.extension_sidecar_source() {
             Some(PiSidecarSource::SandboxDir(_)) => {
                 let relative = Path::new("aoe-session").join(&self.id).join("session_id");
-                self.pi_sandbox_regular_exists(&relative)
+                self.extension_sandbox_regular_exists(&relative)
             }
             Some(PiSidecarSource::HostHooks) => crate::hooks::session_id_sidecar_exists(&self.id),
             None => false,
         }
     }
+
     pub(super) fn clear_pane_identity_sidecar(&self) {
         match self.resolved_capture_backend() {
             Some(
@@ -526,16 +644,20 @@ impl Instance {
             ) => {
                 let _ = crate::hooks::unlink_session_id_via_guard(&self.id);
             }
-            Some(crate::agents::SessionCaptureBackend::Pi) => match self.pi_sidecar_source() {
+            Some(
+                crate::agents::SessionCaptureBackend::Pi
+                | crate::agents::SessionCaptureBackend::PrimeAgent,
+            ) => match self.extension_sidecar_source() {
                 Some(PiSidecarSource::HostHooks) => {
                     let _ = crate::hooks::unlink_session_id_via_guard(&self.id);
                 }
                 Some(PiSidecarSource::SandboxDir(_)) => {
-                    if let Some(root_path) = self.pi_config_bind_dir() {
+                    if let Some(root_path) = self.extension_config_bind_dir() {
                         if let Ok(root) = crate::session::AnchoredDir::open(&root_path) {
                             let base = Path::new("aoe-session").join(&self.id);
                             let _ = root.remove_file(&base.join("session_id"));
                             let _ = root.remove_file(&base.join("session_path"));
+                            let _ = root.remove_file(&base.join("root_only"));
                         }
                     }
                 }
@@ -761,6 +883,7 @@ impl Instance {
         // rather than one AoE minted or captured.
         let explicitly_pinned = matches!(self.resume_intent, ResumeIntent::Use(_));
         self.absorb_published_pi_session();
+        self.absorb_published_prime_session();
         let (mut session_id, is_existing) = self.acquire_session_id();
         // Which ResumeStrategy arm to emit. Pi diverges from `is_existing`
         // (see `resume_flag_arm_is_existing`), so the launch flag and the
@@ -1216,6 +1339,153 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn prime_extension_root_only_keeps_parent_publication() {
+        if which::which("node").is_err() {
+            eprintln!("skipping: node not found on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut inst = Instance::new("prime-root-only", project.to_str().unwrap());
+        inst.tool = "prime-agent".to_string();
+        inst.sandbox_info = Some(SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test-image".to_string(),
+            container_name: "prime-root-only".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: Some("/workspace".to_string()),
+        });
+
+        let (launch, _, _, _) = inst.build_launch_command().unwrap();
+        let launch = launch.unwrap();
+        assert!(
+            launch.contains("/root/.prime/agent/extensions/aoe-session-id.js"),
+            "{launch}"
+        );
+        assert!(launch.contains("AOE_SESSION_ROOT_ONLY=1"));
+        assert!(!launch.contains("--session-id"));
+
+        let store = inst.sandbox_capture_store_dir().unwrap();
+        assert_eq!(
+            std::fs::read(store.join("extensions/aoe-session-id.js")).unwrap(),
+            PI_SESSION_EXTENSION.as_bytes()
+        );
+        let sessions = store.join("sessions");
+        std::fs::create_dir_all(sessions.join("children")).unwrap();
+        let parent_id = "018f47a6-7b80-7cc3-98a2-37b5f486b2a1";
+        let child_id = "018f47a6-7b80-7cc3-98a2-37b5f486b2a2";
+        std::fs::write(
+            sessions.join("parent.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "type": "session",
+                    "version": 3,
+                    "id": parent_id,
+                    "timestamp": "2026-09-05T00:00:00.000Z",
+                    "cwd": "/workspace",
+                    "rlmDepth": 0,
+                })
+            ),
+        )
+        .unwrap();
+        let child_header = format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "session",
+                "version": 3,
+                "id": child_id,
+                "timestamp": "2026-09-05T00:00:01.000Z",
+                "cwd": "/workspace",
+                "rlmDepth": 1,
+            })
+        );
+        std::fs::write(sessions.join("children/child.jsonl"), &child_header).unwrap();
+        std::fs::write(sessions.join("child.jsonl"), child_header).unwrap();
+        let sidecar = store.join("aoe-session").join(&inst.id).join("session_id");
+        let path_sidecar = sidecar.parent().unwrap().join("session_path");
+        let default_sidecar = tmp.path().join("pi-default/session_id");
+        let script = r#"
+import { readFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const extension = (await import(pathToFileURL(process.argv[1]).href)).default;
+const context = (id, path, rlmDepth) => ({
+  sessionManager: {
+    getSessionId: () => id,
+    getSessionFile: () => path,
+    getHeader: () => ({ rlmDepth }),
+  },
+});
+async function publish(target, rootOnly) {
+  process.env.AOE_PI_SESSION_ID_FILE = target;
+  if (rootOnly) process.env.AOE_SESSION_ROOT_ONLY = "1";
+  else delete process.env.AOE_SESSION_ROOT_ONLY;
+  let sessionStart;
+  extension({ on(name, handler) { if (name === "session_start") sessionStart = handler; } });
+  await sessionStart({}, context(
+    "018f47a6-7b80-7cc3-98a2-37b5f486b2a1",
+    "/root/.prime/agent/sessions/parent.jsonl",
+    0,
+  ));
+  await sessionStart({}, context(
+    "018f47a6-7b80-7cc3-98a2-37b5f486b2a2",
+    "/root/.prime/agent/sessions/children/child.jsonl",
+    1,
+  ));
+  return readFileSync(target, "utf8").trim();
+}
+const rootOnly = await publish(process.argv[2], true);
+const defaultMode = await publish(process.argv[3], false);
+process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
+"#;
+        let output = std::process::Command::new("node")
+            .args(["--input-type=module", "--eval", script])
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/pi/aoe-session-id.js"))
+            .arg(&sidecar)
+            .arg(&default_sidecar)
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let published: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(published["rootOnly"], parent_id);
+        assert_eq!(
+            published["defaultMode"], child_id,
+            "Pi default behavior changed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path_sidecar).unwrap().trim(),
+            "/root/.prime/agent/sessions/parent.jsonl"
+        );
+
+        std::fs::write(&sidecar, child_id).unwrap();
+        std::fs::write(&path_sidecar, "/root/.prime/agent/sessions/child.jsonl").unwrap();
+        assert_eq!(
+            inst.prime_published_root_session_id(),
+            None,
+            "a direct child transcript must fail root validation"
+        );
+        std::fs::write(&sidecar, parent_id).unwrap();
+        std::fs::write(&path_sidecar, "/root/.prime/agent/sessions/parent.jsonl").unwrap();
+
+        let mut restarted: Instance =
+            serde_json::from_str(&serde_json::to_string(&inst).unwrap()).unwrap();
+        let mut command = "prime-agent".to_string();
+        assert!(restarted.apply_session_flags(&mut command, "test").unwrap());
+        assert_eq!(command, format!("prime-agent --resume {parent_id}"));
+    }
+    #[test]
     fn clearing_the_conversation_drops_its_transcript_path() {
         let mut inst = Instance::new("pi-clear", "/tmp/pi-clear");
         inst.tool = "pi".to_string();
@@ -1364,10 +1634,12 @@ mod tests {
             container_workdir: None,
             before_start_env: Vec::new(),
         });
-        let dir = inst.pi_sandbox_sidecar().unwrap();
+        let PiSidecarSource::SandboxDir(dir) = inst.pi_sidecar_source().unwrap() else {
+            panic!("sandboxed Pi must publish into its config bind");
+        };
         std::fs::create_dir_all(&dir).unwrap();
         let sidecar = dir.join("session_id");
-        std::fs::write(&sidecar, vec![b'x'; PI_SIDECAR_MAX_BYTES + 1]).unwrap();
+        std::fs::write(&sidecar, vec![b'x'; SESSION_SIDECAR_MAX_BYTES + 1]).unwrap();
         assert_eq!(inst.pi_published_session_id(true), None);
 
         std::fs::remove_file(&sidecar).unwrap();
@@ -1430,7 +1702,9 @@ mod tests {
         };
 
         let inst = sandboxed_pi("piownconfig01");
-        let stale_sidecar = inst.pi_sandbox_sidecar().expect("default sidecar dir");
+        let PiSidecarSource::SandboxDir(stale_sidecar) = inst.pi_sidecar_source().unwrap() else {
+            panic!("sandboxed Pi must publish into its config bind");
+        };
         std::fs::create_dir_all(&stale_sidecar).unwrap();
         std::fs::write(stale_sidecar.join("session_id"), format!("{STALE_ID}\n")).unwrap();
 
@@ -1444,7 +1718,7 @@ pi = "~/.pi-personal"
 
         let mut declared = sandboxed_pi("piownconfig01");
         let (_, env_prefix) = declared
-            .pi_extension_launch()
+            .identity_extension_launch()
             .expect("declared sandbox config supports the pane extension");
         assert!(env_prefix.contains("AOE_PI_SESSION_ID_FILE=/root/.pi/aoe-session/"));
         declared.mark_pi_extension_launched_for_test();
