@@ -1,30 +1,20 @@
 import type { HighlighterCore, ThemedToken } from "shiki";
 import { createHighlighterCore } from "shiki/core";
 import { createOnigurumaEngine } from "shiki/engine/oniguruma";
+// Shiki's own registry of every theme it bundles, keyed by theme id, each
+// entry a lazy import that code-splits on demand. Reading it directly means
+// any theme, builtin, user-authored, or plugin-contributed, can name any
+// shiki theme and get that palette. Importing the registry pulls in the id
+// table only, not the 65 theme modules behind it.
+import { bundledThemes } from "shiki/themes";
 
 let instance: HighlighterCore | null = null;
 let loading: Promise<HighlighterCore> | null = null;
 
-/** Shiki theme module imports for every theme an AoE-resolved theme
- *  can name. Unknown values fall back to `DEFAULT_SHIKI_THEME`. Lazy
- *  imports so users on Empire don't pay for the Dracula/Tokyo Night
- *  modules they never see. */
-const SHIKI_THEME_IMPORTS: Record<string, () => Promise<unknown>> = {
-  "github-dark": () => import("shiki/themes/github-dark.mjs"),
-  "github-light": () => import("shiki/themes/github-light.mjs"),
-  "github-dark-dimmed": () => import("shiki/themes/github-dark-dimmed.mjs"),
-  "tokyo-night": () => import("shiki/themes/tokyo-night.mjs"),
-  "catppuccin-latte": () => import("shiki/themes/catppuccin-latte.mjs"),
-  dracula: () => import("shiki/themes/dracula.mjs"),
-  "rose-pine": () => import("shiki/themes/rose-pine.mjs"),
-  "material-theme-ocean": () => import("shiki/themes/material-theme-ocean.mjs"),
-};
-
-/** Fallback Shiki themes when the resolver names a theme this bundle
- *  doesn't carry (user-defined themes with arbitrary shiki_theme
- *  entries). Picked by appearance so a light AoE theme falling back
- *  doesn't end up rendering code on a light surface with a dark
- *  syntax theme. */
+/** Fallback Shiki themes for a `shiki_theme` value shiki doesn't ship
+ *  (a user-defined theme naming something arbitrary, or a typo). Picked
+ *  by appearance so a light AoE theme falling back doesn't end up
+ *  rendering code on a light surface with a dark syntax theme. */
 export const DEFAULT_SHIKI_THEME = "github-dark";
 export const DEFAULT_SHIKI_THEME_LIGHT = "github-light";
 
@@ -59,8 +49,8 @@ export async function getHighlighter(): Promise<HighlighterCore> {
  *  (`github-dark` / `github-light`) so a light AoE theme isn't
  *  rendered with a dark syntax palette. Idempotent. */
 export async function ensureThemeLoaded(name: string, appearance?: "dark" | "light"): Promise<string> {
-  const importer = SHIKI_THEME_IMPORTS[name];
-  if (!importer) return fallbackShikiTheme(appearance);
+  if (!Object.hasOwn(bundledThemes, name)) return fallbackShikiTheme(appearance);
+  const importer = bundledThemes[name as keyof typeof bundledThemes];
   const hl = await getHighlighter();
   if (hl.getLoadedThemes().includes(name)) return name;
   try {
