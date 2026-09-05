@@ -864,6 +864,18 @@ pub(crate) fn acquire_storage_shared_flock(dir: &Path, name: &str) -> Result<Sto
     acquire_open_storage_shared_flock(file, &path)
 }
 
+/// [`acquire_storage_flock`] without the wait: `None` when another holder has
+/// the lock, for a caller that must not block while it holds a lock ordered
+/// before this one.
+pub(crate) fn try_acquire_storage_flock(dir: &Path, name: &str) -> Result<Option<StorageFlock>> {
+    let (file, _path) = open_storage_lock_file(dir, name)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(StorageFlock { file })),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 pub struct Storage {
     profile: String,
     sessions_path: PathBuf,

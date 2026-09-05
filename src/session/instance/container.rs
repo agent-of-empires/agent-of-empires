@@ -94,16 +94,14 @@ impl Instance {
         // Charge the sandbox store move to the session that needs it, at the
         // one chokepoint every entry point shares: tmux launches, ACP
         // structured sessions and a bare container terminal all arrive here.
-        // It must stay above the shared flock below, which `run_in` takes
-        // exclusively. A failure leaves the row on its shared store for a
-        // later attempt rather than blocking the launch.
+        // It must stay above the shared flock below, which the move takes
+        // exclusively to plan and publish. A failure leaves the row on its
+        // shared store for a later attempt rather than blocking the launch.
         //
         // A running container is the one case worth skipping outright: its
         // cohort cannot move while it is up, so the pass is guaranteed to
-        // refuse, and it is not free. `run_in` takes the v027 lock and every
-        // registry's storage lock exclusively, and `Storage::update` waits on
-        // the first of those, so attaching to a live legacy session would
-        // stall writes in every AoE process to reach a foregone conclusion.
+        // refuse, and its planning still takes the v027 lock and every
+        // registry's storage lock, on which `Storage::update` waits.
         if self.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION
             && !container.is_running()?
         {
