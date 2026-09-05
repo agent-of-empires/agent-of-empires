@@ -17,8 +17,13 @@ pub(super) struct PendingResponder {
 }
 
 pub(super) enum PendingResolver {
-    /// `session/request_permission` awaiting allow/deny.
-    Approval(oneshot::Sender<ApprovalResolutionMessage>),
+    /// `session/request_permission` awaiting allow/deny. `option_ids` are
+    /// the agent's options, so an answer naming an unknown one is refused
+    /// while the request stays pending (#3741).
+    Approval {
+        option_ids: Vec<String>,
+        resolver: oneshot::Sender<ApprovalResolutionMessage>,
+    },
     /// `elicitation/create` awaiting an accept/decline/cancel answer. The
     /// parsed form is kept so `resolve_elicitation` can validate the
     /// submitted answer BEFORE consuming the resolver: a validation

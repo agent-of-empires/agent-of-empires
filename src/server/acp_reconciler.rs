@@ -1184,10 +1184,9 @@ pub(crate) use crate::acp::state::RATE_LIMIT_EXHAUSTED_RETRIES_REASON;
 /// adapter-reported `resets_at` (plus the configured grace, floored by
 /// `RATE_LIMIT_MIN_PARK_SECS` from when the limit was recorded) has passed.
 ///
-/// Mechanism: publish a `RateLimitAutoResumed` breadcrumb (which supersedes
-/// the terminal `Stopped{rate_limited}` in `latest_status_event`) and clear
-/// the id from `attempted`. The main resume loop on the same tick then sees
-/// a non-park latest status and a clear `attempted` slot, so it fresh-spawns
+/// Mechanism: publish a `RateLimitAutoResumed` breadcrumb, clear the id from
+/// `attempted` and name it in `released_from_park`. The main resume loop on
+/// the same tick then skips the durable park check for it and fresh-spawns
 /// the worker through the existing path. Both the in-process park (id was
 /// inserted into `attempted` while the worker ran) and the daemon-restart
 /// park (the main loop parks it on the first tick) are covered because the
@@ -1466,9 +1465,9 @@ async fn reap_rate_limit_resumes(
         // streak re-delivered the interrupted prompt and the turn still
         // ended rate-limited. Past the cap, stop burning the same prompt:
         // drop the pending continuation, publish the terminal exhausted
-        // park (which `latest_status_event` reports, so the main loop holds
-        // the session parked and this pass no longer sees
-        // `Stopped{rate_limited}`), and keep the `attempted` slot. A
+        // park (`rate_limit_park` then reports `cap_reached`, so the main
+        // loop holds the session until a prompt is queued), and keep the
+        // `attempted` slot. A
         // manual `/acp/spawn` resume or a fresh prompt still works; the
         // streak only counts resumes since the last organic turn end, so
         // either resets it.

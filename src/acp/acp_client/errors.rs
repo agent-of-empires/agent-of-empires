@@ -43,6 +43,8 @@ pub enum AcpError {
     NotRunning,
     #[error("no pending approval with that nonce")]
     UnknownNonce,
+    #[error("the request offers no option {0:?}")]
+    UnknownOption(String),
     #[error("agent did not offer a {0:?} option")]
     NoMatchingOption(ApprovalDecision),
     /// A submitted elicitation answer failed server-side validation. The

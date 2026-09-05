@@ -166,12 +166,20 @@ pub(super) async fn handle_permission_request(
     let approval = build_approval(tool_call, options);
     let nonce = approval.nonce.clone();
     let choice_list = approval.is_choice_list();
+    let option_ids: Vec<String> = approval
+        .options
+        .iter()
+        .map(|o| o.option_id.clone())
+        .collect();
 
     let (resolve_tx, resolve_rx) = oneshot::channel::<ApprovalResolutionMessage>();
     pending.lock().await.insert(
         nonce.clone(),
         PendingResponder {
-            resolver: PendingResolver::Approval(resolve_tx),
+            resolver: PendingResolver::Approval {
+                option_ids,
+                resolver: resolve_tx,
+            },
         },
     );
 

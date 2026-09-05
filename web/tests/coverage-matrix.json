@@ -2763,7 +2763,7 @@
       "components": ["web/src/components/acp/StructuredView.tsx", "web/src/lib/acpTypes.ts"]
     },
     {
-      "id": "sidebar.rate-limit-hook",
+      "id": "sidebar.rate-limit-summary",
       "kind": "vitest",
       "risk": "medium",
       "specs": ["src/lib/rateLimitSummary.test.ts"],

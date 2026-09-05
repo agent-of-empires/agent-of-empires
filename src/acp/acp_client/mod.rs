@@ -598,8 +598,8 @@ impl AcpClient {
         // byte-relay handshake and, for a mid-flight resume, the resume-idle
         // watchdog (guard left None so it still fires).
         let guard = Arc::new(TerminalClaim::new());
-        // Shared with the connection task so the control reader can hand idle
-        // ownership back when it surfaces a waiterless completion (#3190).
+        // Shared with the connection task so the control reader can tell a
+        // completion of a prompt this daemon issued from an adopted turn's.
         let prompt_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let control_client = connect_runner_control_v2(
             &socket_path,
@@ -846,12 +846,19 @@ impl AcpClient {
     ) -> Result<(), AcpError> {
         let mut map = self.pending_responders.lock().await;
         // Only consume the entry if it is actually a permission; a nonce
-        // that belongs to an elicitation is "unknown" to this endpoint.
-        let PendingResolver::Approval(_) = &map.get(&nonce).ok_or(AcpError::UnknownNonce)?.resolver
+        // that belongs to an elicitation is "unknown" to this endpoint. An
+        // answer naming an option the request never offered leaves it
+        // pending for a corrected resubmission.
+        let PendingResolver::Approval { option_ids, .. } =
+            &map.get(&nonce).ok_or(AcpError::UnknownNonce)?.resolver
         else {
             return Err(AcpError::UnknownNonce);
         };
-        let PendingResolver::Approval(resolver) = map.remove(&nonce).unwrap().resolver else {
+        if let Some(id) = option_id.as_ref().filter(|id| !option_ids.contains(id)) {
+            return Err(AcpError::UnknownOption(id.clone()));
+        }
+        let PendingResolver::Approval { resolver, .. } = map.remove(&nonce).unwrap().resolver
+        else {
             unreachable!("checked above");
         };
         resolver
@@ -866,11 +873,13 @@ impl AcpClient {
     /// the agent receives a structured cancellation outcome.
     pub async fn cancel_permission(&self, nonce: Nonce) -> Result<(), AcpError> {
         let mut map = self.pending_responders.lock().await;
-        let PendingResolver::Approval(_) = &map.get(&nonce).ok_or(AcpError::UnknownNonce)?.resolver
+        let PendingResolver::Approval { .. } =
+            &map.get(&nonce).ok_or(AcpError::UnknownNonce)?.resolver
         else {
             return Err(AcpError::UnknownNonce);
         };
-        let PendingResolver::Approval(resolver) = map.remove(&nonce).unwrap().resolver else {
+        let PendingResolver::Approval { resolver, .. } = map.remove(&nonce).unwrap().resolver
+        else {
             unreachable!("checked above");
         };
         resolver
@@ -1055,7 +1064,44 @@ impl AcpClient {
 
 #[cfg(test)]
 mod tests {
+    use super::pending::{PendingResolver, PendingResponder};
     use super::*;
+
+    /// An answer naming an option the request never offered is refused
+    /// while the request stays pending; the corrected answer then lands.
+    #[tokio::test]
+    async fn resolve_permission_refuses_an_unknown_option_and_keeps_the_request() {
+        let (client, _tx) = AcpClient::fake_for_test(AcpSessionId("s-opt".into()));
+        let nonce = Nonce("n-1".into());
+        let (resolve_tx, resolve_rx) = oneshot::channel();
+        client.pending_responders.lock().await.insert(
+            nonce.clone(),
+            PendingResponder {
+                resolver: PendingResolver::Approval {
+                    option_ids: vec!["red".into(), "blue".into()],
+                    resolver: resolve_tx,
+                },
+            },
+        );
+
+        let refused = client
+            .resolve_permission(nonce.clone(), ApprovalDecision::Allow, Some("green".into()))
+            .await;
+        assert!(matches!(refused, Err(AcpError::UnknownOption(id)) if id == "green"));
+        assert!(
+            client.pending_responders.lock().await.contains_key(&nonce),
+            "the request must stay pending after a refused answer"
+        );
+
+        client
+            .resolve_permission(nonce, ApprovalDecision::Allow, Some("blue".into()))
+            .await
+            .expect("a listed option resolves");
+        assert!(matches!(
+            resolve_rx.await.unwrap(),
+            ApprovalResolutionMessage::Decision { option_id: Some(id), .. } if id == "blue"
+        ));
+    }
 
     #[tokio::test]
     async fn fake_client_round_trips_events() {

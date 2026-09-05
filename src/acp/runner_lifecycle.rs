@@ -185,10 +185,15 @@ impl LifecycleTable {
         }
     }
 
-    fn mint(&mut self, session_id: &str) -> u64 {
+    /// Next epoch. Only a spawn or respawn stamps its epoch on a runner, so
+    /// only those note it as a generation; an attach or an adopted stop
+    /// records the generation it finds on the runner at install instead.
+    fn mint(&mut self, session_id: &str, stamped: bool) -> u64 {
         let epoch = self.next_epoch;
         self.next_epoch += 1;
-        self.note_generation(session_id, epoch);
+        if stamped {
+            self.note_generation(session_id, epoch);
+        }
         epoch
     }
 
@@ -236,7 +241,7 @@ impl LifecycleTable {
             }
             Some(_) => return Err(AdmitError::AlreadyPresent),
         }
-        let epoch = self.mint(session_id);
+        let epoch = self.mint(session_id, kind == ResumeKind::Spawn);
         self.entries.insert(
             session_id.to_string(),
             Entry {
@@ -329,7 +334,7 @@ impl LifecycleTable {
         if self.entries.contains_key(session_id) {
             return None;
         }
-        let epoch = self.mint(session_id);
+        let epoch = self.mint(session_id, false);
         self.entries.insert(
             session_id.to_string(),
             Entry {
@@ -375,7 +380,7 @@ impl LifecycleTable {
         let Phase::Running { identity } = entry.phase else {
             return Err(InstallError::Stale);
         };
-        let epoch = self.mint(&session_id);
+        let epoch = self.mint(&session_id, true);
         let entry = self
             .entries
             .get_mut(&session_id)
@@ -786,6 +791,29 @@ mod tests {
         assert_eq!(snap.get("b"), Some(&WorkerPhase::Running));
         assert_eq!(snap.get("c"), Some(&WorkerPhase::Running));
         assert_eq!(snap.len(), 2);
+    }
+
+    #[test]
+    fn an_attach_epoch_is_not_a_generation() {
+        let mut table = LifecycleTable::new(100);
+        let lease = table.admit(ID, ResumeKind::Attach).unwrap();
+        assert_eq!(table.last_generation(ID), 0, "nothing stamped yet");
+        table.install(&lease, Some(identity(1, 5))).unwrap();
+        assert_eq!(table.last_generation(ID), 5, "the runner's own generation");
+        assert!(table.release_running(&lease));
+        let stop = table.adopt_for_stop(ID).unwrap();
+        assert_eq!(
+            table.last_generation(ID),
+            5,
+            "an adopted stop stamps nothing"
+        );
+        table.settle(&stop, Settlement::Proven);
+        let spawn = table.admit(ID, ResumeKind::Spawn).unwrap();
+        assert_eq!(
+            table.last_generation(ID),
+            spawn.epoch(),
+            "a spawn stamps its epoch"
+        );
     }
 
     #[test]

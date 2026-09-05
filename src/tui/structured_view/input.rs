@@ -557,6 +557,19 @@ mod tests {
             dispatch(Focus::Approval, &key(KeyCode::Char('a')), ctx_pending()),
             Intent::ResolveApproval(ApprovalDecisionWire::Allow)
         ));
+        // Digits pick a listed option by position, under approval focus only.
+        assert!(matches!(
+            dispatch(Focus::Approval, &key(KeyCode::Char('1')), ctx_pending()),
+            Intent::ChooseApprovalOption(0)
+        ));
+        assert!(matches!(
+            dispatch(Focus::Approval, &key(KeyCode::Char('9')), ctx_pending()),
+            Intent::ChooseApprovalOption(8)
+        ));
+        assert!(!matches!(
+            dispatch(Focus::Transcript, &key(KeyCode::Char('1')), ctx_pending()),
+            Intent::ChooseApprovalOption(_)
+        ));
         assert!(matches!(
             dispatch(
                 Focus::Approval,

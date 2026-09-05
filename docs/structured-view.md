@@ -97,7 +97,7 @@ aoe acp doctor --fix --adapter codex-acp        # install a specific adapter ins
 aoe acp doctor --fix --all-adapters            # install every bundled adapter
 ```
 
-`--fix` installs a pinned npm adapter under `$AOE_DATA_DIR/acp-worker/adapters/<adapter>/` with the bundled Node's own npm; no `npm install -g` and no sudo, at a version aoe pins per release. Each adapter is a separate several-hundred-MB tree (`claude-agent-acp` ~304 MB, `codex-acp` ~336 MB, `pi-acp` ~7 MB), so `--fix` installs only `claude-agent-acp` unless you ask for more.
+`--fix` installs a pinned npm adapter under `$AOE_DATA_DIR/acp-worker/adapters/<adapter>/` with the bundled Node's own npm; no `npm install -g` and no sudo, at a version aoe pins per release. Each adapter is a separate several-hundred-MB tree (`claude-agent-acp` ~304 MB, `codex-acp` ~336 MB, `pi-acp` ~7 MB; `aoe-agent` is small, its sources ship inside `aoe`), so `--fix` installs only `claude-agent-acp` unless you ask for more.
 
 An adapter already on your `PATH` normally wins, so a manual global install keeps working. The exception is a `PATH` copy below the version floor aoe requires: rather than spawn a binary the agent handshake would reject, aoe uses the pinned bundled copy and logs the substitution. `doctor --fix` tells you when your `PATH` copy is the stale one.
 

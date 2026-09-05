@@ -75,6 +75,19 @@ pub fn resolve_agent_command(
             );
             return None;
         }
+        if let Some(found) =
+            app_dir.and_then(|d| crate::acp::adapters::runtime_too_old_for(d, command))
+        {
+            warn!(
+                target: "acp.adapters",
+                adapter = command,
+                found,
+                "Node cannot run this adapter's sources (needs {}.{}); refusing it",
+                crate::acp::node::MIN_NODE_MAJOR,
+                crate::acp::node::MIN_NODE_MINOR
+            );
+            return None;
+        }
         return Some(bundled_resolution(path, app_dir));
     }
 

@@ -190,6 +190,15 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// matches this binary's embedded sources. Spawning it would run the old
 /// code beside a new daemon, so resolution refuses it and the install hint
 /// names the reinstall (#3553).
+/// The Node an in-tree adapter would launch with, when it cannot run the
+/// adapter's sources: the version string, for the refusal message. `None`
+/// for npm adapters and for a Node that can.
+pub fn runtime_too_old_for(app_dir: &Path, binary: &str) -> Option<String> {
+    lookup(binary).filter(|a| !a.sources.is_empty())?;
+    let node = crate::acp::node::resolve("", app_dir).ok()?;
+    (!crate::acp::node::supports_strip_types(&node.version)).then_some(node.version)
+}
+
 pub fn installed_copy_is_stale(app_dir: &Path, binary: &str) -> bool {
     lookup(binary).is_some_and(|adapter| {
         !adapter.sources.is_empty()

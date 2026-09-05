@@ -338,9 +338,14 @@ fn supervisor_error_response(context: &str, err: &SupervisorError) -> axum::resp
             format!("rate_limited: {context}: {err}"),
         )
             .into_response(),
-        SupervisorError::Acp(_)
-        | SupervisorError::InvalidAgentCommand(_)
-        | SupervisorError::SpawnCancelled(_) => (
+        // A stop landed while the worker was coming up; the caller's spawn
+        // did not fail, it was superseded, and the session is stopped.
+        SupervisorError::SpawnCancelled(_) => (
+            StatusCode::CONFLICT,
+            format!("spawn_cancelled: {context}: {err}"),
+        )
+            .into_response(),
+        SupervisorError::Acp(_) | SupervisorError::InvalidAgentCommand(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("{context}: {err}"),
         )
@@ -2619,6 +2624,11 @@ pub async fn resolve_approval(
             )
                 .into_response()
         }
+        Err(SupervisorError::Acp(crate::acp::acp_client::AcpError::UnknownOption(id))) => (
+            StatusCode::BAD_REQUEST,
+            format!("approval {nonce_str} offers no option {id:?}; it is still pending"),
+        )
+            .into_response(),
         Err(e) => supervisor_error_response("resolve failed", &e),
     }
 }

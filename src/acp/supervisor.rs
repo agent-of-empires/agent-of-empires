@@ -2425,33 +2425,6 @@ impl<S: BroadcastSink> Supervisor<S> {
                         return;
                     }
 
-                    // MCP layers can change between crashes; re-resolve them so
-                    // the replacement sees the current set.
-                    let mcp_agent = respawn_config.agent_key.clone();
-                    let mcp_session = session_id.clone();
-                    let mcp_profile = respawn_config.source_profile.clone();
-                    let mcp_cwd = respawn_config.cwd.clone();
-                    let mcp_env = respawn_config.host_environment.clone();
-                    respawn_config.mcp_servers = tokio::task::spawn_blocking(move || {
-                        resolve_mcp_layers(
-                            &mcp_agent,
-                            &mcp_session,
-                            mcp_profile.as_deref(),
-                            &mcp_cwd,
-                            &mcp_env,
-                        )
-                    })
-                    .await
-                    .unwrap_or_else(|e| {
-                        warn!(
-                            target: "acp.mcp",
-                            session = %session_id,
-                            error = %e,
-                            "MCP re-resolution on respawn failed; forwarding no servers"
-                        );
-                        Vec::new()
-                    });
-
                     // Re-mint `before_session` env so a rotated credential
                     // reaches the replacement; on failure the prior launch's
                     // environment is reused.
@@ -2513,6 +2486,34 @@ impl<S: BroadcastSink> Supervisor<S> {
                             }
                         }
                     }
+
+                    // MCP layers can change between crashes; re-resolve them, against
+                    // the environment just re-minted, so the replacement sees the
+                    // current set from the config dir it will launch with (#3734).
+                    let mcp_agent = respawn_config.agent_key.clone();
+                    let mcp_session = session_id.clone();
+                    let mcp_profile = respawn_config.source_profile.clone();
+                    let mcp_cwd = respawn_config.cwd.clone();
+                    let mcp_env = respawn_config.host_environment.clone();
+                    respawn_config.mcp_servers = tokio::task::spawn_blocking(move || {
+                        resolve_mcp_layers(
+                            &mcp_agent,
+                            &mcp_session,
+                            mcp_profile.as_deref(),
+                            &mcp_cwd,
+                            &mcp_env,
+                        )
+                    })
+                    .await
+                    .unwrap_or_else(|e| {
+                        warn!(
+                            target: "acp.mcp",
+                            session = %session_id,
+                            error = %e,
+                            "MCP re-resolution on respawn failed; forwarding no servers"
+                        );
+                        Vec::new()
+                    });
 
                     let acp_session_id = AcpSessionId(session_id.clone());
                     if let Some((wrapper, base)) = &respawn_config.wrapper_substitution {
@@ -3086,9 +3087,11 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// registry entry. The runner observes EOF on its socket read,
     /// clears its active outbound, and goes back to accepting.
     pub async fn detach_all(&self) {
+        // The table is left as it is: the daemon is exiting, and a resume
+        // still in flight then installs under its own lease and leaves its
+        // runner for the next daemon instead of tearing it down as stale.
         let drained: Vec<(String, WorkerHandle)> = {
             let mut workers = self.workers.lock().await;
-            lock_recover(&self.lifecycle).clear();
             let drained: Vec<(String, WorkerHandle)> = workers.drain().collect();
             info!(
                 target: "acp.supervisor",
@@ -6954,6 +6957,29 @@ cursor-acp-bridge = "agent acp"
         assert!(!sup.take_late_restart_marker("s-x"));
         crate::process::worker_registry::mark_restart_pending("s-x", newest);
         assert!(sup.take_late_restart_marker("s-x"));
+
+        // A reattached runner keeps the generation it was born with; the
+        // attach epoch outranks nothing, so `aoe acp restart` against it
+        // (marker = its generation) is honored after the drain releases it.
+        {
+            let mut table = lock_recover(&sup.lifecycle);
+            let lease = table.admit("s-att", ResumeKind::Attach).unwrap();
+            table
+                .install(
+                    &lease,
+                    Some(RunnerIdentity {
+                        pid: 999_999_998,
+                        generation: 5,
+                    }),
+                )
+                .unwrap();
+            assert!(table.release_running(&lease));
+        }
+        crate::process::worker_registry::mark_restart_pending("s-att", 5);
+        assert!(
+            sup.take_late_restart_marker("s-att"),
+            "a marker for the reattached runner's own generation is honored"
+        );
         assert!(
             !sup.take_late_restart_marker("s-x"),
             "a marker authorizes one respawn"
