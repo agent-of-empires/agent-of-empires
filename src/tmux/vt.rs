@@ -196,6 +196,12 @@ enum SyncState {
 /// so terminals paint it atomically; the reader uses it to hold viewer wakeups
 /// until the frame is complete. Per-byte state survives chunk boundaries, and
 /// 2026 is matched anywhere in a `;`-separated parameter list.
+///
+/// A parameter list longer than 32 bytes abandons the sequence rather than
+/// growing the buffer, so a pane cannot make this allocate. Missing a bracket
+/// costs only the hold for that repaint (the frame publishes as it does on the
+/// capture path), and no real 2026 bracket is anywhere near that long: apps
+/// emit it bare, and the whole point is that it is cheap to write per frame.
 struct SyncOutputScanner {
     state: SyncState,
     params: Vec<u8>,
@@ -1536,6 +1542,15 @@ pub(crate) struct VtChannel {
     /// between chunks, so re-walking (scrollback + screen) into ANSI each
     /// cycle is pure waste; the deeper the user has scrolled, the bigger the
     /// waste. A hit clones the cached string instead.
+    ///
+    /// One entry, so viewers watching this pane at different window sizes (a
+    /// TUI preview beside a web viewer, or one client reading scrollback)
+    /// evict each other and each miss. That costs an assembly, and it also
+    /// means the mid-bracket path below cannot always answer from a complete
+    /// frame; the web loop's own pre-publish check is what guarantees a torn
+    /// frame is never sent. Keyed per window rather than per viewer because
+    /// the common case is one viewer, and a map would outlive the connections
+    /// that populated it.
     sample_cache: Mutex<Option<SampleCache>>,
     /// Shared with the reader thread; see [`ViewerSignals`].
     signals: Arc<ViewerSignals>,
