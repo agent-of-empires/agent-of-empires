@@ -1622,19 +1622,6 @@ impl ReaderCtx {
     }
 }
 
-fn run_drain_listener(
-    listener: UnixListener,
-    stop: Arc<AtomicBool>,
-    control: Arc<Mutex<Option<UnixStream>>>,
-) {
-    let Ok((conn, _)) = listener.accept() else {
-        return;
-    };
-    if !stop.load(Ordering::Relaxed) {
-        *control.lock().unwrap() = Some(conn);
-    }
-}
-
 fn stop_and_wake_reader(stop: &AtomicBool, sock_path: &std::path::Path) {
     stop.store(true, Ordering::Relaxed);
     let _ = UnixStream::connect(sock_path);
