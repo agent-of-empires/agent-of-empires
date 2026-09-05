@@ -215,11 +215,12 @@ impl SyncOutputScanner {
         }
     }
 
-    /// Scan one chunk; returns the last 2026 transition it contains
-    /// (`Some(true)` = bracket opened, `Some(false)` = closed).
-    fn feed(&mut self, chunk: &[u8]) -> Option<bool> {
+    /// Scan one chunk, appending its 2026 transitions to `out` in order
+    /// (`true` = bracket opened, `false` = closed). Order matters: one socket
+    /// read can carry the close of one repaint and the open of the next, and
+    /// each bracket needs its own hold lifetime.
+    fn feed(&mut self, chunk: &[u8], out: &mut Vec<bool>) {
         use SyncState::*;
-        let mut last = None;
         for &b in chunk {
             self.state = match (self.state, b) {
                 (Idle, 0x1b) => Esc,
@@ -235,7 +236,7 @@ impl SyncOutputScanner {
                 }
                 (Params, b'h' | b'l') => {
                     if self.params.split(|&c| c == b';').any(|p| p == b"2026") {
-                        last = Some(b == b'h');
+                        out.push(b == b'h');
                     }
                     Idle
                 }
@@ -243,7 +244,53 @@ impl SyncOutputScanner {
                 (Esc | Csi | Params, _) => Idle,
             };
         }
-        last
+    }
+}
+
+/// How one chunk's synchronized-output transitions move the hold around
+/// applying its bytes to the parser.
+///
+/// Opening is raised before the bytes land, so a sampler racing them serves
+/// the last complete frame; closing waits until they have landed, because the
+/// grid does not hold the finished frame before that. A chunk that closes one
+/// bracket and opens the next restarts the hold rather than letting the new
+/// bracket inherit the old one's age, which would let its first half-drawn
+/// grid outlive the abandon window immediately.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct SyncHoldPlan {
+    /// The chunk opens a bracket.
+    open: bool,
+    /// A close precedes that opener: the new bracket needs a fresh timestamp.
+    restart: bool,
+    /// The chunk ends outside any bracket.
+    close: bool,
+}
+
+impl SyncHoldPlan {
+    fn from_events(events: &[bool]) -> Self {
+        let last_open = events.iter().rposition(|&open| open);
+        Self {
+            open: last_open.is_some(),
+            restart: last_open.is_some_and(|i| events[..i].contains(&false)),
+            close: events.last() == Some(&false),
+        }
+    }
+
+    /// Applied before the chunk reaches the parser.
+    fn begin(&self, signals: &ViewerSignals) {
+        if self.restart {
+            signals.restart_hold();
+        } else if self.open {
+            signals.begin_hold();
+        }
+    }
+
+    /// Applied once the chunk has been applied to the parser, under the same
+    /// lock, so a sampler cannot see the release before the finished frame.
+    fn end(&self, signals: &ViewerSignals) {
+        if self.close {
+            signals.end_hold();
+        }
     }
 }
 
@@ -291,6 +338,14 @@ impl ViewerSignals {
 
     fn end_hold(&self) {
         self.sync_hold_since_ms.store(0, Ordering::Relaxed);
+    }
+
+    /// Start a new bracket's hold without ever releasing the running one: one
+    /// store, so no sampler can observe the gap between them and take the
+    /// previous repaint's still half-drawn grid for a whole frame.
+    fn restart_hold(&self) {
+        self.sync_hold_since_ms
+            .store(chunk_now_ms().max(1), Ordering::Relaxed);
     }
 
     /// True while a synchronized-output bracket is open and has not outlived
@@ -1393,22 +1448,18 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
     let mut buf = [0u8; 8192];
     let mut osc52 = Osc52Scanner::new();
     let mut sync = SyncOutputScanner::new();
+    let mut sync_events: Vec<bool> = Vec::new();
     while !ctx.stop.load(Ordering::Relaxed) {
         match conn.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                // Track the app's synchronized-output bracket before anything
+                // Track the app's synchronized-output brackets before anything
                 // can publish this chunk: a frame is published when the
                 // bracket closes (or the hold expires), never in the middle.
-                let sync_event = sync.feed(&buf[..n]);
-                // Opening is raised before the grid is touched, so a sampler
-                // racing this chunk errs toward the last complete frame.
-                // Closing is raised below, under the parser lock, because the
-                // grid does not hold the finished frame until the chunk has
-                // been applied.
-                if sync_event == Some(true) {
-                    ctx.signals.begin_hold();
-                }
+                sync_events.clear();
+                sync.feed(&buf[..n], &mut sync_events);
+                let sync_plan = SyncHoldPlan::from_events(&sync_events);
+                sync_plan.begin(&ctx.signals);
                 // The vt100 parser below silently drops OSC 52, and in
                 // live-send no tmux client is attached for `set-clipboard`
                 // to forward to, so this tap is the ONLY path an agent's
@@ -1432,6 +1483,11 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
                 // Bytes received during the shorter pipe-connect window are
                 // already present in that later snapshot, so do not replay them.
                 if !ctx.seeded.load(Ordering::Acquire) {
+                    // These bytes never reach the parser, so a closing bracket
+                    // has nothing left to wait for: release it here or the
+                    // stale timestamp outlives the discarded repaint and the
+                    // next one inherits an already-expired hold.
+                    sync_plan.end(&ctx.signals);
                     ctx.settled_chunk_seq.store(seq + 1, Ordering::Release);
                     // OSC 52 remains independent of grid publication.
                     if copied.is_some() {
@@ -1461,15 +1517,13 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
                     );
                     // The finished frame is in the grid now, so the bracket can
                     // release; a sampler waiting on this lock sees a whole frame.
-                    if sync_event == Some(false) {
-                        ctx.signals.end_hold();
-                    }
+                    sync_plan.end(&ctx.signals);
                     // Publish settlement after parser, cursor, generation, and
                     // timing updates. Acquire readers use this completion fence.
                     ctx.settled_chunk_seq.store(seq + 1, Ordering::Release);
                     // Inside a synchronized-output bracket the grid is a
                     // half-drawn frame; viewers wake when it closes.
-                    if sync_event == Some(false) || !ctx.signals.hold_active() {
+                    if sync_plan.close || !ctx.signals.hold_active() {
                         ctx.notify_viewers();
                     }
                 }
@@ -4131,23 +4185,112 @@ mod tests {
     #[test]
     fn sync_output_scanner_tracks_2026_across_chunks_and_param_lists() {
         let mut sc = SyncOutputScanner::new();
-        assert_eq!(sc.feed(b"plain text \x1b[31m"), None);
+        let mut out = Vec::new();
+        let mut scan = |sc: &mut SyncOutputScanner, chunk: &[u8]| {
+            out.clear();
+            sc.feed(chunk, &mut out);
+            out.clone()
+        };
+        assert!(scan(&mut sc, b"plain text \x1b[31m").is_empty());
         // Split at every byte boundary of the opener.
         let opener = b"\x1b[?2026h";
         for (i, _) in opener.iter().enumerate().skip(1) {
             let mut split = SyncOutputScanner::new();
-            assert_eq!(split.feed(&opener[..i]), None);
-            assert_eq!(split.feed(&opener[i..]), Some(true), "split at {i}");
+            assert!(scan(&mut split, &opener[..i]).is_empty());
+            assert_eq!(scan(&mut split, &opener[i..]), vec![true], "split at {i}");
         }
-        assert_eq!(sc.feed(b"\x1b[?2026h"), Some(true));
+        assert_eq!(scan(&mut sc, b"\x1b[?2026h"), vec![true]);
         // 2026 inside a parameter list, closing.
-        assert_eq!(sc.feed(b"\x1b[?25;2026l"), Some(false));
+        assert_eq!(scan(&mut sc, b"\x1b[?25;2026l"), vec![false]);
         // Other private modes are not the bracket.
-        assert_eq!(sc.feed(b"\x1b[?1049h\x1b[?25l"), None);
+        assert!(scan(&mut sc, b"\x1b[?1049h\x1b[?25l").is_empty());
         // A non-private CSI with 2026 is not the bracket either.
-        assert_eq!(sc.feed(b"\x1b[2026h"), None);
-        // Last transition in a chunk wins.
-        assert_eq!(sc.feed(b"\x1b[?2026h frame \x1b[?2026l"), Some(false));
+        assert!(scan(&mut sc, b"\x1b[2026h").is_empty());
+        // Every transition in a chunk is reported, in order: one socket read
+        // can carry the end of one repaint and the start of the next.
+        assert_eq!(
+            scan(&mut sc, b"\x1b[?2026h frame \x1b[?2026l"),
+            vec![true, false]
+        );
+        assert_eq!(
+            scan(&mut sc, b"tail \x1b[?2026l head \x1b[?2026h"),
+            vec![false, true]
+        );
+    }
+
+    #[test]
+    fn sync_hold_plan_gives_each_bracket_its_own_lifetime() {
+        // (transitions in one chunk, plan)
+        for (events, want) in [
+            (
+                &[][..],
+                SyncHoldPlan {
+                    open: false,
+                    restart: false,
+                    close: false,
+                },
+            ),
+            (
+                &[true][..],
+                SyncHoldPlan {
+                    open: true,
+                    restart: false,
+                    close: false,
+                },
+            ),
+            (
+                &[false][..],
+                SyncHoldPlan {
+                    open: false,
+                    restart: false,
+                    close: true,
+                },
+            ),
+            // A whole repaint in one read: hold across the apply, release after.
+            (
+                &[true, false][..],
+                SyncHoldPlan {
+                    open: true,
+                    restart: false,
+                    close: true,
+                },
+            ),
+            // Back-to-back brackets: the new one must not inherit the old age.
+            (
+                &[false, true][..],
+                SyncHoldPlan {
+                    open: true,
+                    restart: true,
+                    close: false,
+                },
+            ),
+            (
+                &[false, true, false, true][..],
+                SyncHoldPlan {
+                    open: true,
+                    restart: true,
+                    close: false,
+                },
+            ),
+        ] {
+            assert_eq!(SyncHoldPlan::from_events(events), want, "{events:?}");
+        }
+
+        // The restart is what refreshes the timestamp: a bare re-open keeps
+        // the running bracket's age (its abandon window must stay bounded),
+        // while a close-then-open starts a new one.
+        let signals = ViewerSignals::new();
+        let stale = u64::MAX;
+        signals.sync_hold_since_ms.store(stale, Ordering::Relaxed);
+        SyncHoldPlan::from_events(&[true]).begin(&signals);
+        assert_eq!(signals.sync_hold_since_ms.load(Ordering::Relaxed), stale);
+        SyncHoldPlan::from_events(&[false, true]).begin(&signals);
+        let fresh = signals.sync_hold_since_ms.load(Ordering::Relaxed);
+        assert_ne!(fresh, stale, "a new bracket gets a new timestamp");
+        // The restart is one store: the previous repaint's tail bytes have not
+        // been applied yet, so a hold released even briefly here would let a
+        // sampler cache that half-drawn grid as a whole frame.
+        assert_ne!(fresh, 0, "and the hold is never dropped between them");
     }
 
     #[test]
@@ -4254,6 +4397,63 @@ mod tests {
             "viewers wake when the frame completes"
         );
         assert_eq!(*wakeup.0.lock().unwrap(), 1);
+
+        stop.store(true, Ordering::Relaxed);
+        drop(conn);
+        let _ = reader.join();
+    }
+
+    #[test]
+    fn reader_releases_a_bracket_closed_before_the_grid_is_seeded() {
+        use std::io::Write;
+
+        // Reads that arrive before the seed are discarded: the snapshot taken
+        // later already contains them. A bracket opened and closed inside that
+        // window must still end, or its timestamp survives into the seeded
+        // grid and the next repaint is born already past its abandon window.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("s.sock");
+        let listener = UnixListener::bind(&sock).expect("bind");
+        let stop = Arc::new(AtomicBool::new(false));
+        let settled = Arc::new(AtomicU64::new(0));
+        let signals = Arc::new(ViewerSignals::new());
+        let ctx = ReaderCtx {
+            parser: Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0))),
+            stop: stop.clone(),
+            seeded: Arc::new(AtomicBool::new(false)),
+            stream: Arc::new(Mutex::new(None)),
+            app_cursor: Arc::new(AtomicBool::new(false)),
+            alive: Arc::new(AtomicBool::new(false)),
+            wakeup: Arc::new(Mutex::new(None)),
+            clipboard: Arc::new(Mutex::new(None)),
+            chunk_seq: Arc::new(AtomicU64::new(0)),
+            settled_chunk_seq: settled.clone(),
+            last_chunk_ms: Arc::new(AtomicU64::new(0)),
+            prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
+            grid_gen: Arc::new(AtomicU64::new(0)),
+            signals: signals.clone(),
+        };
+        let reader = std::thread::spawn(move || run_reader(listener, ctx));
+        let mut conn = UnixStream::connect(&sock).expect("connect");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let await_chunk = |seq: u64| {
+            while settled.load(Ordering::Acquire) < seq {
+                assert!(
+                    Instant::now() < deadline,
+                    "reader never consumed chunk {seq}"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+
+        conn.write_all(b"\x1b[?2026h\x1b[2JPART-A").expect("write");
+        await_chunk(1);
+        assert!(signals.hold_active(), "pre-seed opener still holds");
+
+        conn.write_all(b"PART-B\x1b[?2026l").expect("write");
+        await_chunk(2);
+        assert!(!signals.hold_active(), "pre-seed close releases the hold");
+        assert!(!signals.frame_incomplete());
 
         stop.store(true, Ordering::Relaxed);
         drop(conn);
