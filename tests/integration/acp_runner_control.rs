@@ -304,9 +304,9 @@ fn write_frame(stream: &mut UnixStream, body: &serde_json::Value) {
     stream.flush().expect("flush frame");
 }
 
-/// Invalid peers cannot consume the backlog. A valid peer that stops reading a
-/// 17 MiB agent frame must time out without losing it or monopolizing the accept
-/// slot; the next daemon receives the same frame.
+/// Invalid peers cannot consume a confirmed backlog. A valid peer that stops
+/// reading a 17 MiB agent frame must time out without losing it or monopolizing
+/// the accept slot; the next daemon receives the same frame.
 #[test]
 fn runner_requeues_large_frame_after_stalled_writer() {
     if cfg!(not(unix)) {
@@ -327,8 +327,12 @@ fn runner_requeues_large_frame_after_stalled_writer() {
         &agent,
         r#"import json, sys
 message = {"jsonrpc":"2.0","method":"session/update","params":{"blob":"x" * (17 * 1024 * 1024)}}
-sys.stdout.write(json.dumps(message) + "\n")
+ack = {"jsonrpc":"2.0","id":"queue-ack","method":"fs/read_text_file","params":{"path":"unused"}}
+sys.stdout.write(json.dumps(message) + "\n" + json.dumps(ack) + "\n")
 sys.stdout.flush()
+response = sys.stdin.readline()
+with open(sys.argv[1], "w") as marker:
+    marker.write(response)
 for line in sys.stdin:
     sys.stdout.write(line)
     sys.stdout.flush()
@@ -341,6 +345,7 @@ for line in sys.stdin:
     let socket = workers.join(format!("{session_id}.sock"));
     let control = workers.join(format!("{session_id}.control.sock"));
     let record = workers.join(format!("{session_id}.json"));
+    let queued = scratch.0.join("notification-queued");
     let _child = KillOnDrop(
         Command::new(env!("CARGO_BIN_EXE_aoe"))
             .args([
@@ -356,6 +361,7 @@ for line in sys.stdin:
                 "--",
                 python3.to_str().unwrap(),
                 agent.to_str().unwrap(),
+                queued.to_str().unwrap(),
             ])
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", &xdg)
@@ -366,7 +372,11 @@ for line in sys.stdin:
 
     wait_for(&record, "registry record");
     wait_for(&control, "control socket");
-
+    wait_for(&queued, "notification queue acknowledgment");
+    let acknowledgment: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&queued).unwrap()).unwrap();
+    assert_eq!(acknowledgment["id"], "queue-ack");
+    assert!(acknowledgment["error"].is_object());
     let mut rejected = UnixStream::connect(&control).expect("connect rejected peer");
     rejected
         .set_read_timeout(Some(Duration::from_secs(10)))
