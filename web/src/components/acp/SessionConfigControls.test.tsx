@@ -212,6 +212,152 @@ describe("SessionConfigControls", () => {
   });
 });
 
+describe("ModelDropdown menu direction and height", () => {
+  // The menu prefers opening upward, sized by the trigger's distance to
+  // the viewport top, but flips downward (sized by the distance to the
+  // viewport bottom) when there isn't at least floor-height room above.
+  // When neither direction clears the floor, it picks whichever has more
+  // room and clamps to exactly that, rather than forcing a fixed floor
+  // height that would clip off-screen. See `computeMenuLayout`.
+  it("picks direction and max-height from the trigger's actual room above/below", () => {
+    const cases: Array<{
+      name: string;
+      rectTop: number;
+      rectBottom: number;
+      innerHeight: number;
+      vvHeight?: number;
+      vvOffsetTop?: number;
+      direction: "up" | "down";
+      maxHeightPx: number;
+    }> = [
+      { name: "ample room above", rectTop: 400, rectBottom: 420, innerHeight: 800, direction: "up", maxHeightPx: 288 },
+      {
+        name: "cramped above, ample below",
+        rectTop: 50,
+        rectBottom: 60,
+        innerHeight: 800,
+        direction: "down",
+        maxHeightPx: 288,
+      },
+      {
+        // Above clears the floor (192px) even though below has far more
+        // room (572px): proves the choice is floor-based preference for
+        // "up", not "pick whichever side has more room".
+        name: "clears the floor above, prefers up over a much larger below",
+        rectTop: 200,
+        rectBottom: 220,
+        innerHeight: 800,
+        direction: "up",
+        maxHeightPx: 192,
+      },
+      {
+        name: "cramped both ways, above larger (not a tie)",
+        rectTop: 50,
+        rectBottom: 60,
+        innerHeight: 100,
+        direction: "up",
+        maxHeightPx: 42,
+      },
+      {
+        name: "cramped both ways, below larger",
+        rectTop: 20,
+        rectBottom: 30,
+        innerHeight: 100,
+        direction: "down",
+        maxHeightPx: 62,
+      },
+      {
+        // Exact tie (spaceAbove === spaceBelow, both below the floor):
+        // neither the floor check nor the `spaceBelow > spaceAbove`
+        // strict inequality fires, so the fallthrough resolves to "up".
+        name: "cramped both ways, exact tie resolves to up",
+        rectTop: 58,
+        rectBottom: 68,
+        innerHeight: 126,
+        direction: "up",
+        maxHeightPx: 50,
+      },
+      {
+        // visualViewport.offsetTop shifts where the visible area actually
+        // starts (e.g. after pinch-zoom), so it must shift both edges of
+        // the visible interval, not just its size. Ignoring it here (i.e.
+        // treating the visible top as layout y=0) would compute spaceAbove
+        // as 242px (>= floor) and wrongly pick "up"; correctly offsetting
+        // by 200px puts the trigger only 42px below the true visible top
+        // (< floor), so it correctly flips to "down", where 722px is
+        // available (clamped to the 288px cap).
+        name: "non-zero visualViewport.offsetTop flips the chosen direction",
+        rectTop: 250,
+        rectBottom: 270,
+        innerHeight: 1000,
+        vvHeight: 800,
+        vvOffsetTop: 200,
+        direction: "down",
+        maxHeightPx: 288,
+      },
+    ];
+
+    const originalInnerHeightDescriptor = Object.getOwnPropertyDescriptor(window, "innerHeight");
+    const originalVisualViewportDescriptor = Object.getOwnPropertyDescriptor(window, "visualViewport");
+    const rectSpy = vi.spyOn(Element.prototype, "getBoundingClientRect");
+
+    try {
+      for (const c of cases) {
+        Object.defineProperty(window, "innerHeight", { value: c.innerHeight, configurable: true, writable: true });
+        Object.defineProperty(window, "visualViewport", {
+          value:
+            c.vvHeight == null
+              ? undefined
+              : {
+                  height: c.vvHeight,
+                  offsetTop: c.vvOffsetTop ?? 0,
+                  addEventListener: vi.fn(),
+                  removeEventListener: vi.fn(),
+                },
+          configurable: true,
+          writable: true,
+        });
+        rectSpy.mockReturnValue({
+          top: c.rectTop,
+          bottom: c.rectBottom,
+          left: 0,
+          right: 0,
+          width: 0,
+          height: c.rectBottom - c.rectTop,
+          x: 0,
+          y: c.rectTop,
+          toJSON: () => ({}),
+        } as DOMRect);
+
+        const { unmount } = render(
+          <SessionConfigControls
+            configOptions={[modelOption()]}
+            pendingConfigOption={null}
+            onSetConfigOption={vi.fn()}
+          />,
+        );
+        fireEvent.click(screen.getByTestId("config-option-model"));
+        const menu = document.getElementById("config-option-menu-model");
+        expect(menu, c.name).not.toBeNull();
+        expect(menu!.className.includes(c.direction === "up" ? "bottom-full" : "top-full"), c.name).toBe(true);
+        expect(menu!.style.maxHeight, c.name).toBe(`${c.maxHeightPx}px`);
+
+        unmount();
+      }
+    } finally {
+      rectSpy.mockRestore();
+      if (originalInnerHeightDescriptor) {
+        Object.defineProperty(window, "innerHeight", originalInnerHeightDescriptor);
+      }
+      if (originalVisualViewportDescriptor) {
+        Object.defineProperty(window, "visualViewport", originalVisualViewportDescriptor);
+      } else {
+        delete (window as unknown as { visualViewport?: unknown }).visualViewport;
+      }
+    }
+  });
+});
+
 describe("ConfigOptionSwitchFailedNotice", () => {
   it("renders nothing when there is no failure", () => {
     const { container } = render(
