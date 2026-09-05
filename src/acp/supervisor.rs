@@ -10,7 +10,9 @@
 //! `MAX_RESPAWNS_IN_WINDOW` respawns are allowed inside `RESTART_WINDOW`;
 //! beyond that the session is parked and an `AgentStartupError` event
 //! is published so the UI can surface "session crashed" instead of
-//! going silent.
+//! going silent. A connection that fails before it establishes a session
+//! is not respawned here: its own `AgentStartupError` is the diagnosis,
+//! and the reconciler retries on its cadence and budget.
 //!
 //! Producer side: `Supervisor::spawn(session_id, config)` creates an
 //! AcpClient and a background task that drains its events.
@@ -2140,6 +2142,15 @@ impl<S: BroadcastSink> Supervisor<S> {
                     // limit on the next prompt, so the handle is dropped and
                     // the reconciler's rate-limit pass owns the resume.
                     let mut rate_limited = false;
+                    // A connection that failed before it established a
+                    // session (every establishment path emits
+                    // `AcpSessionAssigned`) is a startup failure, not a
+                    // crash: the message it published is the diagnosis, so
+                    // it is not respawned here where the restart budget
+                    // would replace that message within seconds. The
+                    // reconciler retries on its own cadence and budget.
+                    let mut established = false;
+                    let mut startup_failed = false;
                     while let Some(event) = inbound.recv().await {
                         if let Event::Stopped { reason } = &event {
                             if reason == "agent_unresponsive"
@@ -2152,7 +2163,11 @@ impl<S: BroadcastSink> Supervisor<S> {
                             }
                         }
                         match &event {
+                            Event::AgentStartupError { .. } if !established => {
+                                startup_failed = true;
+                            }
                             Event::AcpSessionAssigned { acp_session_id } => {
+                                established = true;
                                 let mut guard = workers.lock().await;
                                 if let Some(handle) = guard.get_mut(&session_id) {
                                     if let WorkerKind::Runner { spawn_config } = &mut handle.kind {
@@ -2227,6 +2242,15 @@ impl<S: BroadcastSink> Supervisor<S> {
                             target: "acp.supervisor",
                             session = %session_id,
                             "rate-limited; dropping worker handle without respawn"
+                        );
+                        drop_handle(&lease).await;
+                        return;
+                    }
+                    if startup_failed {
+                        info!(
+                            target: "acp.supervisor",
+                            session = %session_id,
+                            "startup failed before a session was established; leaving the retry to the reconciler"
                         );
                         drop_handle(&lease).await;
                         return;
@@ -5513,6 +5537,65 @@ cursor-acp-bridge = "agent acp"
                 .any(|(_, _, ev)| matches!(ev, Event::AgentStartupError { .. })),
             "no synthetic AgentStartupError should be emitted on rate-limit"
         );
+    }
+
+    /// A connection that dies before `AcpSessionAssigned` is a startup
+    /// failure: the drain task drops the handle without a respawn, so the
+    /// diagnosis it published stays on screen instead of being replaced by
+    /// the restart budget's crash message. After a session was
+    /// established the same failure is a crash and is respawned (here a
+    /// `Stdio` fixture, which the budget parks with that message).
+    #[tokio::test]
+    async fn drain_leaves_a_startup_failure_to_the_reconciler() {
+        for (id, established, expect_crash_message) in
+            [("s-startup", false, false), ("s-crash", true, true)]
+        {
+            let sink = VecSink::new();
+            let sup = Supervisor::new(sink.clone());
+            let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<Event>(16);
+            let (client, _client_tx) = AcpClient::fake_for_test(AcpSessionId(id.into()));
+            let lease = sup
+                .test_install_handle(id, client, WorkerKind::Stdio, None)
+                .await;
+            let drain = sup.start_drain_task(id.into(), lease, inbound_rx);
+
+            if established {
+                inbound_tx
+                    .send(Event::AcpSessionAssigned {
+                        acp_session_id: "acp-1".into(),
+                    })
+                    .await
+                    .unwrap();
+            }
+            inbound_tx
+                .send(Event::AgentStartupError {
+                    message: "ACP connection failed: native binary failed to launch".into(),
+                })
+                .await
+                .unwrap();
+            drop(inbound_tx);
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), drain)
+                .await
+                .expect("drain task should exit within 2s of inbound close");
+
+            assert!(
+                !sup.workers.lock().await.contains_key(id),
+                "{id}: the handle must be dropped"
+            );
+            assert_eq!(sup.worker_state(id).await, AcpWorkerState::Absent, "{id}");
+            let frames = sink.frames.lock().unwrap();
+            let crash_messages = frames
+                .iter()
+                .filter(|(_, _, ev)| {
+                    matches!(ev, Event::AgentStartupError { message } if message.contains("crashed more than"))
+                })
+                .count();
+            assert_eq!(
+                crash_messages,
+                usize::from(expect_crash_message),
+                "{id}: restart budget message"
+            );
+        }
     }
 
     /// `Supervisor::shutdown` against an `Stdio` test fixture must NOT
