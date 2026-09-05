@@ -226,7 +226,12 @@ pub(super) async fn handle_permission_request(
             option_id,
         }) => {
             let chosen = select_option(&request.options, decision, option_id, choice_list);
-            if let Some(option_id) = chosen {
+            if let Some(option) = chosen {
+                // The record follows the chosen option: picking a list's
+                // "No" is a Deny even though the digit that picked it sent
+                // Allow.
+                let decision = decision_for_kind(&option.kind).unwrap_or(decision);
+                let option_id = option.option_id;
                 // Surface the resolution to UI clients via the typed event channel.
                 let _ = event_tx
                     .send(Event::ApprovalResolved {
@@ -378,17 +383,28 @@ fn select_option(
     decision: ApprovalDecision,
     option_id: Option<String>,
     choice_list: bool,
-) -> Option<agent_client_protocol::schema::v1::PermissionOptionId> {
-    let by_id = option_id.and_then(|id| {
-        options
-            .iter()
-            .find(|o| o.option_id.0.as_ref() == id)
-            .map(|o| o.option_id.clone())
-    });
+) -> Option<agent_client_protocol::schema::v1::PermissionOption> {
+    let by_id = option_id.and_then(|id| options.iter().find(|o| o.option_id.0.as_ref() == id));
     match by_id {
-        Some(id) => Some(id),
+        Some(option) => Some(option.clone()),
         None if choice_list => None,
-        None => pick_option_id(options, decision),
+        None => {
+            let id = pick_option_id(options, decision)?;
+            options.iter().find(|o| o.option_id == id).cloned()
+        }
+    }
+}
+
+/// The decision an option's kind stands for; `None` for a kind this build
+/// does not know, where the caller's decision stands.
+fn decision_for_kind(kind: &PermissionOptionKind) -> Option<ApprovalDecision> {
+    match kind {
+        PermissionOptionKind::AllowOnce => Some(ApprovalDecision::Allow),
+        PermissionOptionKind::AllowAlways => Some(ApprovalDecision::AllowAlways),
+        PermissionOptionKind::RejectOnce | PermissionOptionKind::RejectAlways => {
+            Some(ApprovalDecision::Deny)
+        }
+        _ => None,
     }
 }
 
@@ -465,7 +481,11 @@ mod tests {
         for (label, decision, option_id, choice_list, expected) in cases {
             let chosen =
                 select_option(&choices, decision, option_id.map(String::from), choice_list);
-            assert_eq!(chosen.as_ref().map(|id| id.0.as_ref()), expected, "{label}");
+            assert_eq!(
+                chosen.as_ref().map(|o| o.option_id.0.as_ref()),
+                expected,
+                "{label}"
+            );
         }
     }
 

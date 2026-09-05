@@ -695,7 +695,8 @@ impl EventStore {
     /// The session's durable rate-limit park, if any. A park is the latest
     /// `RateLimit` event (or a terminal `Stopped { rate_limit_exhausted_retries }`)
     /// with nothing after it that shows the session moved on: a prompt, an
-    /// agent switch, or a stop for any other reason. Activity that does not
+    /// agent switch, a worker that came back up (`AcpSessionAssigned`), or a
+    /// stop for any other reason. Activity that does not
     /// end the park (an `AgentStartupError` from a failed resume, a
     /// `RateLimitAutoResumed` breadcrumb, approvals) leaves it in place, so a
     /// resume that failed is retried instead of silently disarmed (#3514).
@@ -747,7 +748,7 @@ impl EventStore {
                 "SELECT EXISTS(
                    SELECT 1 FROM acp_events
                    WHERE session_id = ?1 AND seq > ?2
-                     AND (discriminant IN ('UserPromptSent', 'AgentSwitched')
+                     AND (discriminant IN ('UserPromptSent', 'AgentSwitched', 'AcpSessionAssigned')
                        OR (discriminant = 'Stopped'
                            AND json_extract(event_json, '$.Stopped.reason')
                                NOT IN ('rate_limited', ?3))))",
@@ -4296,6 +4297,20 @@ mod tests {
                     to: "codex".into(),
                     reason: "rate_limited".into(),
                 }],
+                false,
+                false,
+            ),
+            (
+                "resumed with nothing to redeliver",
+                vec![
+                    Event::RateLimitAutoResumed {
+                        resets_at: chrono::Utc::now(),
+                        manual: true,
+                    },
+                    Event::AcpSessionAssigned {
+                        acp_session_id: "acp-2".into(),
+                    },
+                ],
                 false,
                 false,
             ),

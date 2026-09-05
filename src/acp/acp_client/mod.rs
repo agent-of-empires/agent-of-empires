@@ -352,6 +352,28 @@ impl AcpClient {
         let default_effort = config.default_effort.clone();
         let default_mode = config.default_mode.clone();
         let mcp_servers = config.mcp_servers.clone();
+        // A bundled copy that predates this build (its digest covers the
+        // adapter's sources) is reinstalled here rather than refused at
+        // resolution, so an aoe upgrade does not strand every session on it.
+        if let Ok(app_dir) = crate::session::get_app_dir() {
+            if crate::acp::adapters::installed_copy_is_stale(&app_dir, &install_binary) {
+                let binary = install_binary.clone();
+                let dir = app_dir.clone();
+                let reinstalled = tokio::task::spawn_blocking(move || {
+                    let node =
+                        crate::acp::node::resolve_for("", &dir, true).map_err(|e| e.to_string())?;
+                    crate::acp::adapters::install(&dir, &node, &binary).map_err(|e| e.to_string())
+                })
+                .await
+                .map_err(|e| AcpError::Spawn(format!("adapter reinstall task panicked: {e}")))?;
+                if let Err(e) = reinstalled {
+                    return Err(AcpError::Spawn(format!(
+                        "`{install_binary}` installed copy predates this aoe build and could not \
+                         be reinstalled ({e}); run `aoe acp doctor --fix --adapter {install_binary}`"
+                    )));
+                }
+            }
+        }
         if let Some(socket_path) = config.socket_path.clone() {
             // Supersede guard: a fresh spawn overwrites this session's
             // registry entry, so any runner already registered for it would

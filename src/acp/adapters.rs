@@ -1,6 +1,6 @@
-//! On-demand install and resolution of the bundled ACP adapters (the pinned
-//! npm ones and the in-tree `aoe-agent`)
-//! that aoe pins (`claude-agent-acp`, `codex-acp`, `pi-acp`).
+//! On-demand install and resolution of the bundled ACP adapters: the pinned
+//! npm ones (`claude-agent-acp`, `codex-acp`, `pi-acp`) and the in-tree
+//! `aoe-agent`.
 //!
 //! Mirrors the bundled-Node pattern in [`crate::acp::node`]: a pinned
 //! manifest is embedded in the binary and installed into the data dir by
@@ -186,17 +186,22 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// An in-tree adapter (one that ships sources) whose installed copy no longer
-/// matches this binary's embedded sources. Spawning it would run the old
-/// code beside a new daemon, so resolution refuses it and the install hint
-/// names the reinstall (#3553).
 /// The Node an in-tree adapter would launch with, when it cannot run the
 /// adapter's sources: the version string, for the refusal message. `None`
 /// for npm adapters and for a Node that can.
 pub fn runtime_too_old_for(app_dir: &Path, binary: &str) -> Option<String> {
-    lookup(binary).filter(|a| !a.sources.is_empty())?;
-    let node = crate::acp::node::resolve("", app_dir).ok()?;
+    ships_sources(binary).then_some(())?;
+    let node = crate::acp::node::resolve_for("", app_dir, true).ok()?;
     (!crate::acp::node::supports_strip_types(&node.version)).then_some(node.version)
+}
+
+/// An in-tree adapter (one that ships sources) whose installed copy no longer
+/// matches this binary's embedded sources. Spawning it would run the old
+/// code beside a new daemon, so resolution refuses it and the install hint
+/// names the reinstall (#3553).
+/// Whether `binary` is an in-tree adapter that runs from TypeScript sources.
+pub fn ships_sources(binary: &str) -> bool {
+    lookup(binary).is_some_and(|a| !a.sources.is_empty())
 }
 
 pub fn installed_copy_is_stale(app_dir: &Path, binary: &str) -> bool {

@@ -11,7 +11,8 @@
 //! elicitation answers); `Esc` there returns to the composer. The
 //! composer captures **every** typed key, including `a`/`A`/`d`, so
 //! typing "always allow" into a prompt never resolves an approval. A
-//! pending approval opens a modal shelf and then accepts `a`/`A`/`d`.
+//! pending approval opens a modal shelf and then accepts `a`/`A`/`d`, or a
+//! digit to pick one of the agent's options.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 

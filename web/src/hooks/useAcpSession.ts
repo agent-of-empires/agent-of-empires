@@ -1665,8 +1665,8 @@ export function useAcpSession(
   }, [sessionId, fetchReplay, clearRetryTimers]);
 
   const resolveApproval = useCallback(
-    async (nonce: string, decision: ApprovalDecision, optionId?: string) => {
-      if (!sessionId) return;
+    async (nonce: string, decision: ApprovalDecision, optionId?: string): Promise<boolean> => {
+      if (!sessionId) return false;
       try {
         const res = await fetch(
           `/api/sessions/${encodeURIComponent(sessionId)}/acp/approvals/${encodeURIComponent(nonce)}`,
@@ -1689,14 +1689,16 @@ export function useAcpSession(
           // strand the card. A session-gone 404 (different body) is a real
           // failure and surfaces an error. See #1821.
           dispatch({ kind: "approval_resolved_locally", nonce });
-        } else {
-          dispatch({ kind: "error", message: outcome.message });
+          return true;
         }
+        dispatch({ kind: "error", message: outcome.message });
+        return false;
       } catch (e) {
         dispatch({
           kind: "error",
           message: `Network error resolving approval: ${describeError(e)}`,
         });
+        return false;
       }
     },
     [sessionId],

@@ -1080,6 +1080,7 @@ mod tests {
             ("snoozed", |i| {
                 i.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::hours(1))
             }),
+            ("stopped by the user, nothing to clear", |_| {}),
         ];
         for (label, park) in parks {
             let mut parked = Instance::new("parked-owned", "/tmp/aoe-3686-plugin");

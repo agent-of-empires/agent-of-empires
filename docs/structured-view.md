@@ -167,7 +167,7 @@ Every structured-view operation has a matching `aoe acp <verb>` against the same
 | `aoe acp history <id>` | Dump the persisted transcript |
 | `aoe acp status <id>` | Print highest/lowest seq and the daemon source |
 | `aoe acp prompt <id> <text>` | Send a prompt (`-` reads stdin) |
-| `aoe acp approve <id> <nonce> [--always\|--deny]` | Resolve a pending approval |
+| `aoe acp approve <id> <nonce> [--always\|--deny\|--option <id>]` | Resolve a pending approval |
 | `aoe acp cancel <id>` | Cancel the in-flight prompt |
 | `aoe acp tail <id>` | Stream broadcast frames as JSON lines |
 | `aoe acp attach <id>` | Open the TUI structured view for this session |

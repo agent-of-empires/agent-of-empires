@@ -65,6 +65,16 @@ pub enum NodeSource {
 /// configured in `acp.node_path` (empty when unset). `app_dir` is
 /// where the bundled tarball would be extracted.
 pub fn resolve(settings_node_path: &str, app_dir: &Path) -> Result<ResolvedNode, NodeError> {
+    resolve_for(settings_node_path, app_dir, false)
+}
+
+/// Like [`resolve`]; with `sources` the PATH copy is passed over for the
+/// bundled runtime when it cannot run an in-tree adapter's TypeScript.
+pub fn resolve_for(
+    settings_node_path: &str,
+    app_dir: &Path,
+    sources: bool,
+) -> Result<ResolvedNode, NodeError> {
     if let Ok(env_path) = std::env::var("AOE_ACP_NODE") {
         if !env_path.is_empty() {
             let path = PathBuf::from(env_path);
@@ -79,7 +89,9 @@ pub fn resolve(settings_node_path: &str, app_dir: &Path) -> Result<ResolvedNode,
 
     if let Some(path) = which("node") {
         if let Ok(node) = verify_path(&path, NodeSource::Path) {
-            return Ok(node);
+            if !sources || supports_strip_types(&node.version) {
+                return Ok(node);
+            }
         }
     }
 

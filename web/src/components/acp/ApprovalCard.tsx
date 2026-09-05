@@ -19,7 +19,9 @@ import { hasArgsBody, humanizePermissionTitle, parseJsonObject, previewFromArgs 
 
 interface Props {
   approval: Approval;
-  onResolve: (decision: ApprovalDecision, optionId?: string) => Promise<void>;
+  /** Resolves `false` when the daemon refused the answer and the card
+   *  should roll back to let the user try again. */
+  onResolve: (decision: ApprovalDecision, optionId?: string) => Promise<boolean | void>;
 }
 
 const LONG_PRESS_MS = 800;
@@ -55,7 +57,8 @@ export function ApprovalCard({ approval, onResolve }: Props) {
       try {
         // Keep the trio's one-argument call shape; only a chosen option
         // adds the second argument.
-        await (optionId === undefined ? onResolve(decision) : onResolve(decision, optionId));
+        const ok = await (optionId === undefined ? onResolve(decision) : onResolve(decision, optionId));
+        if (ok === false) setPhase("rolled-back");
       } catch {
         setPhase("rolled-back");
       }

@@ -1533,7 +1533,7 @@
       "id": "acp.worker-stopping",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/components/acp/workerStoppedBanner.test.ts"],
+      "specs": ["src/components/acp/workerStoppedBanner.test.ts", "src/components/__tests__/SessionRowTriage.test.tsx"],
       "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/WorkspaceSidebar.tsx"]
     },
     {

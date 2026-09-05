@@ -101,19 +101,18 @@ pub struct Approval {
 
 impl Approval {
     /// Whether the options are a question's choices rather than an
-    /// allow/deny vocabulary: more than two options of one kind, or pi's
-    /// `ask_user_question` tool-call id prefix. A client renders the labels
-    /// and resolves with the chosen `option_id`; the fixed Allow/Always/Deny
-    /// trio would otherwise answer with whichever option came first (#3741).
+    /// allow/deny vocabulary: options of one kind, either more than two of
+    /// them or under pi's `pi-ui-` tool-call id prefix (its yes/no confirm
+    /// dialogs mix kinds and stay a trio). A client renders the labels and
+    /// resolves with the chosen `option_id`; the fixed Allow/Always/Deny trio
+    /// would otherwise answer with whichever option came first (#3741).
     pub fn is_choice_list(&self) -> bool {
-        if self.tool_call.id.starts_with("pi-ui-") && !self.options.is_empty() {
-            return true;
-        }
-        self.options.len() > 2
+        let one_kind = !self.options.is_empty()
             && self
                 .options
                 .windows(2)
-                .all(|pair| pair[0].kind == pair[1].kind)
+                .all(|pair| pair[0].kind == pair[1].kind);
+        one_kind && (self.options.len() > 2 || self.tool_call.id.starts_with("pi-ui-"))
     }
 }
 
@@ -220,6 +219,12 @@ mod tests {
                 "pi-ui-7",
                 vec![opt("a", "allow_once"), opt("b", "allow_once")],
                 true,
+            ),
+            (
+                "pi confirm dialog mixes kinds",
+                "pi-ui-8",
+                vec![opt("yes", "allow_once"), opt("no", "reject_once")],
+                false,
             ),
             ("pi id with no options", "pi-ui-7", vec![], false),
             ("no options", "t1", vec![], false),

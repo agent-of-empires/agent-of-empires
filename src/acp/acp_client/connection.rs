@@ -2511,6 +2511,10 @@ pub(super) async fn run_connection_task<W, R>(
                             prompt_cancelled,
                             finished_after_orphan_cancel,
                         );
+                        // Claim the turn's terminal so a completion the runner
+                        // reports after this clean break is dropped, not
+                        // surfaced as a second `Stopped`.
+                        terminal_claim.claim();
                         let _ = event_tx_for_block
                             .send(Event::Stopped {
                                 reason: reason.into(),

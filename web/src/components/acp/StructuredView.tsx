@@ -1707,7 +1707,7 @@ function PendingApproval({
   onResolve,
 }: {
   approval: Approval;
-  onResolve: (nonce: string, decision: ApprovalDecision, optionId?: string) => Promise<void>;
+  onResolve: (nonce: string, decision: ApprovalDecision, optionId?: string) => Promise<boolean | void>;
 }) {
   // ApprovalCard owns its own chrome (matches the tool-card style).
   return (

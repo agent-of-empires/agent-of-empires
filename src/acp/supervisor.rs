@@ -3746,9 +3746,11 @@ async fn tear_down_runner_from(
     Settlement::Proven
 }
 
+/// Polls on the tokio clock so paused-time tests advance through the grace
+/// instead of spinning on the wall clock.
 async fn wait_for_exit(control: &dyn ProcessControl, pid: u32, grace: Duration) {
-    let started = Instant::now();
-    while control.is_alive(pid) && started.elapsed() < grace {
+    let deadline = tokio::time::Instant::now() + grace;
+    while control.is_alive(pid) && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(TEARDOWN_POLL).await;
     }
 }
@@ -7063,7 +7065,7 @@ cursor-acp-bridge = "agent acp"
 
     /// A stop against a runner this daemon never adopted (disk-only after a
     /// restart) is owned and proven the same way.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     #[serial_test::serial]
     async fn shutdown_of_a_detached_runner_is_proven_through_the_registry() {
         let _home = isolate_home();
