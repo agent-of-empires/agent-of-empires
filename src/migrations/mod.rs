@@ -203,16 +203,32 @@ pub fn has_pending_migrations() -> bool {
 
 /// Run all pending migrations silently. Call this early in app startup.
 /// Move this session's sandbox store into the private layout, if it is still
-/// on the shared one. Called from the launch path so the copy is paid by the
-/// session being started rather than by every pending row on any `aoe` start.
+/// on the shared one. Called from the container path so the copy is paid by
+/// the session that needs it rather than by every pending row on any `aoe`
+/// start.
+///
+/// `reporter` must be supplied by any caller a user is waiting on. Without an
+/// installed reporter every `progress::step` and `notice` is a no-op
+/// ([`progress`]), and a multi-minute store copy on the launch path would run
+/// with nothing on screen: the hang #3757 removed from boot, moved to attach.
 ///
 /// A failure here is reported by the caller and does not block the launch:
 /// a row that did not move stays on its shared store and is retried.
-pub fn migrate_sandbox_store_for(id: &str) -> Result<()> {
+pub fn migrate_sandbox_store_for_with(
+    id: &str,
+    reporter: Option<progress::Reporter>,
+) -> Result<()> {
     if get_current_version() < 27 {
         return Ok(());
     }
+    let _installed = progress::install(reporter);
     v027_isolate_sandbox_stores::migrate_instance(id)
+}
+
+/// [`migrate_sandbox_store_for_with`] using the process-wide default reporter,
+/// so the copy narrates itself wherever one is configured.
+pub fn migrate_sandbox_store_for(id: &str) -> Result<()> {
+    migrate_sandbox_store_for_with(id, Some(progress::tracing_reporter()))
 }
 
 pub fn run_migrations() -> Result<()> {

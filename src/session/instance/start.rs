@@ -90,16 +90,6 @@ impl Instance {
         if self.is_structured() {
             return Ok(LaunchSidOutcome::Skipped);
         }
-        // The sandbox store move is charged to the session that needs it. A
-        // failure leaves the row on its shared store for a later attempt; it
-        // must not stop the launch.
-        if let Err(error) = crate::migrations::migrate_sandbox_store_for(&self.id) {
-            tracing::warn!(
-                session_id = %self.id,
-                %error,
-                "sandbox store move deferred; session starts on its shared store"
-            );
-        }
         let profile = self.effective_profile();
         let storage = crate::session::storage::Storage::new(&profile, self.resolve_file_watch())
             .context("failed to open lifecycle lock storage")?;

@@ -410,10 +410,6 @@ fn run_in(
                 defer_source_retirement = true;
                 continue;
             }
-            if only.is_some_and(|wanted| wanted != id) {
-                defer_source_retirement = true;
-                continue;
-            }
             let Some(tool) = row.get("tool").and_then(Value::as_str) else {
                 defer_source_retirement = true;
                 continue;
@@ -544,6 +540,29 @@ fn run_in(
             .or_default()
             .push(target);
     }
+    // Scope by cohort, never by row. A cohort is every session sharing one
+    // legacy store, and the liveness gate below asks about all of them before
+    // any copy: a store a peer is still writing to must not be published.
+    // Dropping the peers from the cohort instead would leave that fold asking
+    // only about the session being started, and copy the store mid-write.
+    let mut scoped_out_rows: BTreeSet<(usize, usize)> = BTreeSet::new();
+    if let Some(wanted) = only {
+        let selected: BTreeSet<PathBuf> = cohorts
+            .iter()
+            .filter(|(_, cohort)| cohort.iter().any(|target| target.id == wanted))
+            .map(|(shared, _)| shared.clone())
+            .collect();
+        cohorts.retain(|shared, cohort| {
+            let keep = selected.contains(shared);
+            if !keep {
+                // Another session's cohort. It still holds its shared source,
+                // so nothing may retire underneath it this pass.
+                defer_source_retirement = true;
+                scoped_out_rows.extend(cohort.iter().map(|t| (t.registry, t.row)));
+            }
+            keep
+        });
+    }
     if announce && defer_stores && !affected_rows.is_empty() {
         progress::notice(format!(
             "{DEFER_ENV} is set: {} sandboxed session(s) keep their shared agent store for now; \
@@ -575,6 +594,9 @@ fn run_in(
     }
 
     let mut ready_rows = affected_rows.clone();
+    for key in &scoped_out_rows {
+        ready_rows.remove(key);
+    }
     let mut pending = Vec::new();
     let mut blocked_roots = BTreeSet::new();
     let mut orphan_blocked_roots = BTreeSet::new();
@@ -2247,11 +2269,15 @@ gemini = "{}"
         );
     }
 
-    /// A scoped pass moves the session being started and leaves every other
-    /// pending row where it is, so one launch does not pay for all of them.
+    /// The regression the cohort scoping exists for: a scoped pass must still
+    /// ask about every session sharing the store, not just the one being
+    /// started. Scoping by row instead drops the peers from the cohort, the
+    /// liveness fold then only sees the named session, and the store is copied
+    /// while a live peer is still writing to it. The copy becomes
+    /// authoritative at generation 2, so the loss is silent.
     #[test]
     #[serial_test::serial]
-    fn a_scoped_pass_moves_only_the_named_instance() {
+    fn a_scoped_pass_refuses_a_store_a_live_peer_is_writing() {
         let temp = tempfile::tempdir().unwrap();
         let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
         let app = crate::session::get_app_dir().unwrap();
@@ -2269,6 +2295,62 @@ gemini = "{}"
         )
         .unwrap();
 
+        // Start 1111 while its cohort peer 2222 is live.
+        run_in_only(
+            &app,
+            &home,
+            &|id| Ok(id == "2222222222222222"),
+            "1111111111111111",
+        )
+        .unwrap();
+
+        assert!(
+            !home.join(".gemini/sandbox-v2/1111111111111111").exists(),
+            "a live cohort peer must block the scoped copy"
+        );
+        let rows: Value =
+            serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
+        assert_ne!(
+            rows[0]["sandbox_store_generation"], 2,
+            "a blocked row must not be stamped current"
+        );
+        assert!(legacy.exists(), "the shared source must survive");
+
+        // Once the peer stops, the same scoped pass moves it.
+        run_in_only(&app, &home, &|_| Ok(false), "1111111111111111").unwrap();
+        assert_eq!(
+            fs::read(home.join(".gemini/sandbox-v2/1111111111111111/data")).unwrap(),
+            b"data"
+        );
+    }
+
+    /// A scoped pass moves the named session's whole cohort, since the cohort
+    /// is the unit the liveness gate reasons about, and leaves every other
+    /// agent's cohort alone. That is what stops one launch paying for every
+    /// pending store on the machine.
+    #[test]
+    #[serial_test::serial]
+    fn a_scoped_pass_moves_only_the_named_cohort() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        let home = dirs::home_dir().unwrap();
+        let legacy = home.join(".gemini/sandbox");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("data"), b"data").unwrap();
+        let other = home.join(".claude/sandbox");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("data"), b"other").unwrap();
+        let rows = serde_json::json!([
+            {"id":"1111111111111111","tool":"gemini","sandbox_info":{"enabled":true}},
+            {"id":"3333333333333333","tool":"claude","sandbox_info":{"enabled":true}}
+        ]);
+        fs::write(
+            app.join("sessions.json"),
+            serde_json::to_vec(&rows).unwrap(),
+        )
+        .unwrap();
+
         run_in_only(&app, &home, &|_| Ok(false), "1111111111111111").unwrap();
 
         assert_eq!(
@@ -2276,12 +2358,12 @@ gemini = "{}"
             b"data"
         );
         assert!(
-            !home.join(".gemini/sandbox-v2/2222222222222222").exists(),
-            "an unnamed row must not be moved by a scoped pass"
+            !home.join(".claude/sandbox-v2/3333333333333333").exists(),
+            "another agent's cohort must not be moved by a scoped pass"
         );
         assert!(
-            legacy.exists(),
-            "the unmoved row still needs the shared source"
+            other.exists(),
+            "the untouched cohort still needs its shared source"
         );
     }
 

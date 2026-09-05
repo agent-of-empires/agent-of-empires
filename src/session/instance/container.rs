@@ -91,6 +91,22 @@ impl Instance {
             .image
             .clone();
         let container = DockerContainer::new(&self.id, &image);
+        // Charge the sandbox store move to the session that needs it, at the
+        // one chokepoint every entry point shares: tmux launches, ACP
+        // structured sessions and a bare container terminal all arrive here.
+        // It must stay above the shared flock below, which `run_in` takes
+        // exclusively. A failure leaves the row on its shared store for a
+        // later attempt rather than blocking the launch.
+        if self.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION {
+            match crate::migrations::migrate_sandbox_store_for(&self.id) {
+                Ok(()) => self.reconcile_from_disk(),
+                Err(error) => tracing::warn!(
+                    session_id = %self.id,
+                    %error,
+                    "sandbox store move deferred; session continues on its shared store"
+                ),
+            }
+        }
         let _transition_lock =
             if self.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION {
                 Some(crate::session::acquire_storage_shared_flock(

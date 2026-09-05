@@ -33,6 +33,29 @@ pub enum Event {
 
 pub type Reporter = Arc<dyn Fn(Event) + Send + Sync>;
 
+/// A reporter for callers with no screen of their own: the store move on the
+/// container path runs while a user waits, so it must leave a trail even when
+/// nothing installed a renderer. `Progress` is dropped, being the per-100-file
+/// refinement, and everything else is logged once.
+pub fn tracing_reporter() -> Reporter {
+    Arc::new(|event| match event {
+        Event::Started { version, name, .. } => {
+            tracing::info!(target: "migrations", version, name, "running migration");
+        }
+        Event::Step(message) => tracing::info!(target: "migrations", "{message}"),
+        Event::Notice(message) => tracing::warn!(target: "migrations", "{message}"),
+        Event::Finished { version, elapsed } => {
+            tracing::info!(
+                target: "migrations",
+                version,
+                duration_ms = elapsed.as_millis() as u64,
+                "migration completed"
+            );
+        }
+        Event::Progress(_) => {}
+    })
+}
+
 static REPORTER: RwLock<Option<Reporter>> = RwLock::new(None);
 
 /// Installs `reporter` until the returned guard drops.
