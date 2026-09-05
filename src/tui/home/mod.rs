@@ -440,6 +440,11 @@ pub struct HomeView {
     /// into the next compose dialog the user opens, so voice/dictation never
     /// gets thrown on the floor with a scolding info dialog.
     pub(super) pending_paste: Option<String>,
+    /// Pasted text captured at the home view that we couldn't immediately
+    /// route into the structured composer. Drained by
+    /// `open_structured_view` after the view activates, preserving the
+    /// text if activation fails so the next 'm' press can still drain it.
+    pub(super) pending_paste_for_structured_view: Option<String>,
     /// Session to attach after the custom instruction warning dialog is dismissed
     pub(super) pending_attach_after_warning: Option<String>,
     /// Session to stop after the confirmation dialog is accepted

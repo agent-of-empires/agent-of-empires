@@ -2870,7 +2870,21 @@ impl HomeView {
                     }
                 }
             }
-            ActionId::SendMessage => self.open_send_message_dialog(),
+            ActionId::SendMessage => {
+                if let Some(id) = self.selected_structured_session() {
+                    // Drain pending_paste into the structured composer so
+                    // buffered paste / dictation text is not lost when the
+                    // legacy dialog path is bypassed.  The text stays in
+                    // pending_paste if the view fails to open so it can
+                    // still be drained by the next 'm' press.
+                    if let Some(buf) = self.pending_paste.take() {
+                        self.pending_paste_for_structured_view = Some(buf);
+                    }
+                    self.exit_live_send_if_active();
+                    return Some(Action::OpenStructuredView(id));
+                }
+                self.open_send_message_dialog()
+            }
             ActionId::RespondToPermission => self.open_permission_response_dialog(),
             ActionId::Stop => self.stop_selected(),
             ActionId::Delete => self.open_delete_for_selected(),

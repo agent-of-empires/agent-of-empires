@@ -682,3 +682,34 @@ fn footer_hides_tab_hint_for_structured_sessions() {
         "structured rows keep the plain Enter attach label.\n{out}"
     );
 }
+
+#[test]
+#[serial]
+fn send_message_opens_structured_view() {
+    let (mut env, id) = structured_session_env();
+    let action = env.view.handle_key(key(KeyCode::Char('m')), None);
+    assert!(
+        matches!(&action, Some(Action::OpenStructuredView(returned_id)) if returned_id == &id),
+        "m must open the structured composer for the selected session, got {action:?}"
+    );
+}
+
+/// Pressing 'm' on a structured session drains buffered paste into
+/// `pending_paste_for_structured_view` so the async open path can
+/// forward it into the composer instead of losing it.
+#[test]
+#[serial]
+fn send_message_drains_pending_paste_for_structured_view() {
+    let (mut env, _id) = structured_session_env();
+    env.view.pending_paste = Some("cached text".to_string());
+    env.view.handle_key(key(KeyCode::Char('m')), None);
+    assert_eq!(
+        env.view.pending_paste, None,
+        "pending_paste must be drained when routing to structured view"
+    );
+    assert_eq!(
+        env.view.pending_paste_for_structured_view,
+        Some("cached text".to_string()),
+        "drained text must land in pending_paste_for_structured_view"
+    );
+}

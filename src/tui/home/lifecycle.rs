@@ -289,6 +289,7 @@ impl HomeView {
             passive_fleet_armed: None,
             preview_pane_pending: None,
             pending_paste: None,
+            pending_paste_for_structured_view: None,
             pending_attach_after_warning: None,
             pending_stop_session: None,
             pending_stop_terminal: None,
