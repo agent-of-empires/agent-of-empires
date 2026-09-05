@@ -144,6 +144,14 @@ impl Instance {
         if !self.supports_session_poller() {
             return;
         }
+        // The exclusion-set build below loads `sessions.json` and canonicalizes
+        // a path per stored peer, and `start_observations` would reject the
+        // spawn anyway. Warns here because this return replaces the acquire's
+        // own warning, which is no longer reached once the budget is full.
+        if !crate::session::poller::session_id_poller_budget_available() {
+            crate::session::poller::warn_budget_exhausted(&self.id);
+            return;
+        }
         let managed_lease =
             if context == crate::agents::SessionCaptureContext::ManagedExclusiveStore {
                 let Some(store) = self.sandbox_capture_store_dir() else {
@@ -177,6 +185,7 @@ impl Instance {
                 self.tmux_session()
                     .ok()
                     .map(|session| session.name().to_string())
+                    .filter(|name| crate::tmux::agent_session_belongs_to(name, &self.id))
             })
             .unwrap_or_default();
         let omp_metadata = if backend == crate::agents::SessionCaptureBackend::Omp {
@@ -366,8 +375,16 @@ impl Instance {
             || self
                 .session_id_poller_retry_after
                 .is_some_and(|deadline| std::time::Instant::now() < deadline)
-            || !self.has_live_tmux_pane_in(snapshot)
+            // Agent pane, not any pane: a terminal outliving the agent is not
+            // something a session-id poller can follow.
+            || !self.has_live_agent_pane_in(snapshot)
         {
+            return false;
+        }
+        // Nothing to repair with. Checked before the handle is cleared so an
+        // exhausted budget is a no-op rather than a downgrade.
+        if !crate::session::poller::session_id_poller_budget_available() {
+            crate::session::poller::warn_budget_exhausted(&self.id);
             return false;
         }
         self.session_id_poller = None;
@@ -435,6 +452,7 @@ impl Instance {
 
 #[cfg(test)]
 mod tests {
+    use crate::session::instance::test_helpers::install_aliases;
     use crate::session::{Instance, SandboxInfo, Status};
 
     // Restart, stop, standalone attach, and sid_persist all tear down through
@@ -691,5 +709,34 @@ mod tests {
         drop(first);
         assert!(super::try_acquire_managed_capture_lease(backend, store.path()).is_some());
         drop(distinct);
+    }
+
+    /// Repair declines when no live agent pane exists for the row: a terminal
+    /// outliving the agent is not something a session-id poller can follow.
+    /// Decline happens before the handle is cleared, so a later tick with a
+    /// live pane can still repair.
+    #[test]
+    fn repair_declines_without_a_live_agent_pane() {
+        let mut inst = Instance::new("repair-no-pane", "/tmp/repair-no-pane");
+        inst.tool = "claude".to_string();
+        assert!(
+            inst.supports_session_poller(),
+            "a host claude row resolves support, so the pane lookup is what declines"
+        );
+        let snapshot = crate::tmux::LiveSessionSnapshot::from_parts(
+            Some(vec![]),
+            Some(std::collections::HashMap::new()),
+        );
+        // Present but not running, so the running check does not
+        // short-circuit and the handle stays observable.
+        inst.session_id_poller = Some(std::sync::Arc::new(std::sync::Mutex::new(
+            crate::session::poller::SessionPoller::new("unstarted".to_string()),
+        )));
+
+        assert!(!inst.repair_session_id_poller_if_needed(&snapshot));
+        assert!(
+            inst.session_id_poller.is_some(),
+            "decline must happen before the handle is cleared"
+        );
     }
 }

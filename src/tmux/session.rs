@@ -3934,6 +3934,21 @@ mod tests {
             .map(|s| s.trim() == "1")
             .unwrap_or(false);
         assert!(!pane_dead, "Pane should be alive while command is running");
+
+        // The distinction the session-id poller depends on: tmux
+        // answers a `display-message` against a session it cannot find with
+        // exit 0 and an empty stdout, so "alive" and "no such session" are
+        // only separable by whether the format expanded at all. `is_pane_dead`
+        // keeps folding a missing session into `false` for the callers that
+        // gate on `exists()` first.
+        use crate::tmux::utils::{is_pane_dead, probe_pane, PaneProbe};
+        assert_eq!(probe_pane(&session_name), PaneProbe::Alive);
+        let absent = format!("{session_name}_absent");
+        assert_eq!(probe_pane(&absent), PaneProbe::Missing);
+        assert!(
+            !is_pane_dead(&absent),
+            "a missing session is not a dead pane"
+        );
     }
 
     /// Regression test for #435: with multiple tmux windows, pane health

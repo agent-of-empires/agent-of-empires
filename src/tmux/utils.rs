@@ -218,19 +218,79 @@ pub fn append_window_size_args(args: &mut Vec<String>, target: &str) {
     ]);
 }
 
-pub fn is_pane_dead(session_name: &str) -> bool {
+/// Outcome of one `#{pane_dead}` probe against a session's agent pane.
+///
+/// The distinction that matters is `Dead` vs `Missing`: tmux answers a
+/// `display-message` against a session it cannot find with exit status 0, an
+/// empty stdout, and nothing on stderr, so "the pane is alive and not dead"
+/// and "there is no such session" are only separable by looking at whether
+/// the format expanded to anything at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PaneProbe {
+    /// `#{pane_dead}` expanded to `0`.
+    Alive,
+    /// `#{pane_dead}` expanded to `1`: the pane exists and its process exited.
+    Dead,
+    /// tmux ran and resolved nothing, so the session is gone. Not the same as
+    /// `Dead`: a caller that gates on `exists()` first wants this to read as
+    /// "not dead", while a caller holding a long-lived handle to the session
+    /// wants it to read as "stop".
+    ///
+    /// Both empty-stdout shapes land here, deliberately, and the exit status
+    /// is not consulted to split them:
+    ///
+    /// - exit 0, empty stdout: the session name did not resolve.
+    /// - exit 1, `no server running on <socket>` on stderr: there is no tmux
+    ///   server, so every session on it is gone too.
+    ///
+    /// Classifying the second as `Unknown` would be worse, not safer: nothing
+    /// ever terminates on `Unknown`, so a vanished server would leave every
+    /// poller running against sessions that cannot come back under that
+    /// server, which is the leak this variant exists to close.
+    ///
+    /// `Missing` is a precise signal rather than a catch-all, because any
+    /// target tmux can resolve *to a session* expands the format to a digit,
+    /// including out-of-range window and pane indices (`:99.0`, `:^.99`),
+    /// which it falls back from. Only an unresolvable session name yields
+    /// empty stdout, so a user's `pane-base-index` setting cannot make a live
+    /// pane read as `Missing`. (Measured against tmux 3.7c.)
+    Missing,
+    /// tmux itself could not be run, so the probe says nothing about the pane.
+    Unknown,
+}
+
+pub(crate) fn probe_pane(session_name: &str) -> PaneProbe {
     // Use `^.0` to target the first window's first pane regardless of
     // base-index or which pane is active, so the check always hits the
     // agent's pane even when the user has created additional tmux windows
     // or split panes.  See #435, #488.
     let target = format!("{session_name}:^.0");
-    crate::tmux::tmux_command()
+    let Some(output) = crate::tmux::tmux_command()
         .args(["display-message", "-t", &target, "-p", "#{pane_dead}"])
         .output()
         .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim() == "1")
-        .unwrap_or(false)
+    else {
+        return PaneProbe::Unknown;
+    };
+    let Ok(stdout) = String::from_utf8(output.stdout) else {
+        return PaneProbe::Unknown;
+    };
+    match stdout.trim() {
+        "1" => PaneProbe::Dead,
+        "0" => PaneProbe::Alive,
+        _ => PaneProbe::Missing,
+    }
+}
+
+/// Whether `session_name`'s agent pane exists and its process has exited.
+///
+/// A session tmux cannot find reads as `false`, not `true`: every caller of
+/// this pairs it with an `exists()` check, so folding "missing" into "dead"
+/// here would make an absent session look like a dead pane. Callers that
+/// treat an absent session as terminal (the session-id poller, which holds no
+/// separate existence gate) use [`probe_pane`] instead.
+pub fn is_pane_dead(session_name: &str) -> bool {
+    probe_pane(session_name) == PaneProbe::Dead
 }
 
 pub(crate) fn pane_current_command(session_name: &str) -> Option<String> {
