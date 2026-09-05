@@ -577,6 +577,39 @@ async function handlePrompt(params, client) {
     });
   }
 
+  // A permission request whose options carry a question rather than an
+  // allow/deny vocabulary: every option is allow_once, so answering by
+  // kind would always pick the first. See #3741.
+  if (userText.includes("REQUEST_CHOICE")) {
+    const names = ["Option Alpha", "Option Bravo", "Option Charlie", "Option Delta"];
+    const response = await client.request("session/request_permission", {
+      sessionId: params.sessionId,
+      toolCall: {
+        toolCallId: "tc-choice",
+        title: "Pick an option",
+        kind: "other",
+        status: "pending",
+        rawInput: { message: "Which one?" },
+      },
+      options: names.map((name, index) => ({
+        kind: "allow_once",
+        name,
+        optionId: `choice-${index}`,
+      })),
+    });
+    const verdict =
+      response.outcome.outcome === "selected"
+        ? response.outcome.optionId
+        : "cancelled";
+    await client.notify("session/update", {
+      sessionId: params.sessionId,
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: `choice_outcome=${verdict}` },
+      },
+    });
+  }
+
   await client.notify("session/update", {
     sessionId: params.sessionId,
     update: {

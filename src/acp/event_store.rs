@@ -4188,6 +4188,8 @@ mod tests {
             nonce: nonce_a.clone(),
             tool_call: tool_call.clone(),
             destructive: false,
+            options: Vec::new(),
+            choice: false,
             requested_at: Utc::now(),
             resolved: None,
         };
@@ -4195,6 +4197,8 @@ mod tests {
             nonce: nonce_b.clone(),
             tool_call: tool_call.clone(),
             destructive: false,
+            options: Vec::new(),
+            choice: false,
             requested_at: Utc::now(),
             resolved: None,
         };
@@ -4202,6 +4206,8 @@ mod tests {
             nonce: nonce_c.clone(),
             tool_call,
             destructive: false,
+            options: Vec::new(),
+            choice: false,
             requested_at: Utc::now(),
             resolved: None,
         };

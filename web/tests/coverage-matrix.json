@@ -2931,6 +2931,13 @@
       "components": ["web/src/components/acp/ApprovalCard.tsx"]
     },
     {
+      "id": "acp.story.approval-question",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-stories/approval-question.spec.ts"],
+      "components": ["web/src/components/acp/ApprovalCard.tsx"]
+    },
+    {
       "id": "acp.story.approval-deny",
       "kind": "live-playwright",
       "risk": "high",

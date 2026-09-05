@@ -257,6 +257,8 @@ mod tests {
                 parent_tool_call_id: None,
             },
             destructive: false,
+            options: Vec::new(),
+            choice: false,
             requested_at: chrono::Utc::now(),
             resolved: None,
         };

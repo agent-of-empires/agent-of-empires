@@ -385,7 +385,7 @@ async function emitSessionUpdates(sessionId, updates) {
       // `session/request_permission` request and wait for the client's
       // decision before continuing the turn so the assertions in the
       // approval spec can observe ApprovalRequested + resolve it.
-      await sendRequest("session/request_permission", {
+      const permissionResponse = await sendRequest("session/request_permission", {
         sessionId,
         toolCall: u.toolCall ?? {
           toolCallId: `fake-tool-call-${Date.now()}`,
@@ -395,7 +395,23 @@ async function emitSessionUpdates(sessionId, updates) {
         options: u.options ?? DEFAULT_PERMISSION_OPTIONS,
       }).catch((err) => {
         process.stderr.write(`[fakeAcpAgent] permission_request rejected: ${JSON.stringify(err)}\n`);
+        return undefined;
       });
+      // `echoDecision` makes the option the client picked observable in
+      // the transcript, so a spec can prove WHICH option came back and
+      // not merely that something did. See #3741.
+      if (u.echoDecision) {
+        const outcome = permissionResponse?.outcome;
+        const picked = outcome?.outcome === "selected" ? outcome.optionId : "cancelled";
+        sendNotification("session/update", {
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: `permission_option=${picked}` },
+          },
+        });
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
       continue;
     }
     if (u && u.sessionUpdate === "elicitation_request") {

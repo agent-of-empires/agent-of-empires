@@ -186,10 +186,28 @@ export interface ConfigOptionSwitchFailure {
   at: string;
 }
 
+/** Mirror of `ApprovalOptionKind` in src/acp/approvals.rs. */
+export type ApprovalOptionKind = "allow_once" | "allow_always" | "reject_once" | "reject_always";
+
+/** One option the agent offered on `session/request_permission`. */
+export interface ApprovalOption {
+  option_id: string;
+  name: string;
+  kind: ApprovalOptionKind;
+}
+
 export interface Approval {
   nonce: string;
   tool_call: ToolCall;
   destructive: boolean;
+  /** Options the agent offered, in its own order. Absent on approvals
+   *  replayed from an event log written before #3741. */
+  options?: ApprovalOption[];
+  /** The options carry a question rather than an allow/deny vocabulary
+   *  (two or more share one kind), so the card renders the labels and
+   *  posts back the picked `option_id`. Classified server-side. See
+   *  #3741. */
+  choice?: boolean;
   requested_at: string;
   resolved?: {
     decision: ApprovalDecision;
