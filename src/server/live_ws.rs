@@ -732,11 +732,16 @@ async fn handle_live_ws(
                 let live_grid = capture_vt.as_ref().filter(|ch| ch.is_alive()).cloned();
                 if live_grid.is_some() && pane_count.1.elapsed() >= PANE_COUNT_PROBE_INTERVAL {
                     let name = capture_tmux.clone();
-                    if let Ok(Some(n)) =
-                        tokio::task::spawn_blocking(move || window_pane_count(&name)).await
-                    {
-                        pane_count = (n, Instant::now());
-                    }
+                    // Advance the probe clock even on failure, or a tmux that
+                    // cannot answer would be re-forked on every capture cycle
+                    // instead of once a second. A failed probe keeps the last
+                    // known count.
+                    let probed =
+                        tokio::task::spawn_blocking(move || window_pane_count(&name)).await;
+                    pane_count = (
+                        probed.ok().flatten().unwrap_or(pane_count.0),
+                        Instant::now(),
+                    );
                 }
                 outcome = match live_grid {
                     Some(ch) if pane_count.0 <= 1 && lines <= crate::tmux::vt::SCROLLBACK_LINES => {
@@ -1046,13 +1051,16 @@ async fn handle_live_ws(
                         }
                     }
                     let frame = (content, cursor);
-                    if last_published.as_ref() != Some(&frame) {
+                    // A resync republishes even when the frame is unchanged:
+                    // the client dropped a patch and is showing a stale window
+                    // it cannot recover from on its own.
+                    let force_full = capture_settings.force_full.swap(false, Ordering::Relaxed);
+                    if force_full || last_published.as_ref() != Some(&frame) {
                         seq += 1;
                         let lines = frame_lines(&frame.0);
                         let history = frame.1.as_ref().map_or(0, |c| c.history_size);
                         let alt = frame.1.as_ref().is_some_and(|c| c.alternate_on);
-                        let patch = if capture_settings.patch.load(Ordering::Relaxed)
-                            && !capture_settings.force_full.swap(false, Ordering::Relaxed)
+                        let patch = if capture_settings.patch.load(Ordering::Relaxed) && !force_full
                         {
                             last_sent.as_ref().and_then(|(prev, prev_history)| {
                                 let shift = if alt {
