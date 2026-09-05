@@ -6,7 +6,9 @@
 //! call `step`, `progress` and `notice` from wherever the work happens; with
 //! no reporter installed every call is a no-op.
 
-use std::sync::{Arc, RwLock};
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,31 +58,46 @@ pub fn tracing_reporter() -> Reporter {
     })
 }
 
-static REPORTER: RwLock<Option<Reporter>> = RwLock::new(None);
-
-/// Installs `reporter` until the returned guard drops, which puts back
-/// whatever was installed before. The store-move path installs its own
-/// reporter from a session launch, so an install can now nest inside or race
-/// one from `run_migrations`; restoring `None` would silence that caller for
-/// the rest of its run.
-pub(super) fn install(reporter: Option<Reporter>) -> ReporterGuard {
-    let previous = std::mem::replace(
-        &mut *REPORTER.write().unwrap_or_else(|e| e.into_inner()),
-        reporter,
-    );
-    ReporterGuard(previous)
+thread_local! {
+    /// Reporters installed on this thread, oldest first. Thread-local because
+    /// a migration reports from the thread that runs it, and two can run at
+    /// once (the boot pass and a store move from a session launch); a
+    /// process-wide slot would route one's events to the other's renderer.
+    static REPORTERS: RefCell<Vec<(u64, Reporter)>> = const { RefCell::new(Vec::new()) };
 }
 
-pub(super) struct ReporterGuard(Option<Reporter>);
+static NEXT_REPORTER_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Installs `reporter` on this thread until the returned guard drops. Events
+/// go to the newest installed reporter whose guard is still alive, so guards
+/// may drop in any order: each removes only its own registration. `None`
+/// installs nothing and leaves an outer reporter, if any, in effect.
+pub(super) fn install(reporter: Option<Reporter>) -> ReporterGuard {
+    let id = reporter.map(|reporter| {
+        let id = NEXT_REPORTER_ID.fetch_add(1, Ordering::Relaxed);
+        REPORTERS.with(|reporters| reporters.borrow_mut().push((id, reporter)));
+        id
+    });
+    ReporterGuard(id)
+}
+
+pub(super) struct ReporterGuard(Option<u64>);
 
 impl Drop for ReporterGuard {
     fn drop(&mut self) {
-        *REPORTER.write().unwrap_or_else(|e| e.into_inner()) = self.0.take();
+        if let Some(id) = self.0.take() {
+            REPORTERS.with(|reporters| reporters.borrow_mut().retain(|(other, _)| *other != id));
+        }
     }
 }
 
 pub(crate) fn report(event: Event) {
-    let reporter = REPORTER.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let reporter = REPORTERS.with(|reporters| {
+        reporters
+            .borrow()
+            .last()
+            .map(|(_, reporter)| reporter.clone())
+    });
     if let Some(reporter) = reporter {
         reporter(event);
     }
@@ -221,17 +238,16 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    // The reporter is process-global; a concurrent migration test would
-    // interleave its events into this sequence.
+    fn recording(seen: &Arc<Mutex<Vec<Event>>>) -> Reporter {
+        let sink = seen.clone();
+        Arc::new(move |event| sink.lock().unwrap().push(event))
+    }
+
     #[test]
-    #[serial_test::serial]
     fn reporter_receives_events_only_while_installed() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         {
-            let sink = seen.clone();
-            let _guard = install(Some(Arc::new(move |event| {
-                sink.lock().unwrap().push(event)
-            })));
+            let _guard = install(Some(recording(&seen)));
             step("planning");
             progress("3 files");
             notice("deferred");
@@ -244,6 +260,72 @@ mod tests {
                 Event::Progress("3 files".into()),
                 Event::Notice("deferred".into()),
             ]
+        );
+    }
+
+    /// Guards may overlap and drop in either order: the newest live reporter
+    /// gets the events, a dropped guard takes only its own registration with
+    /// it, and nothing is resurrected once every guard is gone.
+    #[test]
+    fn overlapping_guards_route_to_the_newest_live_reporter() {
+        let a = Arc::new(Mutex::new(Vec::new()));
+        let b = Arc::new(Mutex::new(Vec::new()));
+        let drained = |seen: &Arc<Mutex<Vec<Event>>>| std::mem::take(&mut *seen.lock().unwrap());
+
+        // Non-LIFO: the older guard drops first.
+        let guard_a = install(Some(recording(&a)));
+        let guard_b = install(Some(recording(&b)));
+        step("both");
+        drop(guard_a);
+        step("b only");
+        drop(guard_b);
+        step("nobody");
+        assert!(
+            drained(&a).is_empty(),
+            "a was never the newest live reporter"
+        );
+        assert_eq!(
+            drained(&b),
+            vec![Event::Step("both".into()), Event::Step("b only".into())]
+        );
+
+        // Nested LIFO: the inner guard hands back to the outer one.
+        let guard_a = install(Some(recording(&a)));
+        {
+            let _guard_b = install(Some(recording(&b)));
+            step("inner");
+        }
+        step("outer again");
+        drop(guard_a);
+        step("nobody");
+        assert_eq!(drained(&a), vec![Event::Step("outer again".into())]);
+        assert_eq!(drained(&b), vec![Event::Step("inner".into())]);
+
+        // `None` installs nothing, so an outer reporter keeps receiving.
+        let _guard_a = install(Some(recording(&a)));
+        {
+            let _silent = install(None);
+            step("through none");
+        }
+        assert_eq!(drained(&a), vec![Event::Step("through none".into())]);
+    }
+
+    /// Reporters are per thread: a migration on another thread neither sees
+    /// this thread's reporter nor disturbs it.
+    #[test]
+    fn reporters_do_not_cross_threads() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let _guard = install(Some(recording(&seen)));
+        std::thread::spawn(|| {
+            step("other thread, no reporter");
+            let _inner = install(None);
+        })
+        .join()
+        .unwrap();
+        step("this thread");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![Event::Step("this thread".into())]
         );
     }
 
