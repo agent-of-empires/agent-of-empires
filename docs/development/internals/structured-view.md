@@ -45,6 +45,16 @@ server-owned queue persists follow-ups until its turn-end drain delivers them.
 Cancelling and compacting turns are always queued; a dormant worker is sent the
 prompt so the request can wake it.
 
+Every turn-starting surface claims one per-session submission guard and decides
+under it (`SessionService::begin_prompt_submission`), so decide and dispatch are
+a single step (#3639, #3673). `POST /acp/cancel` waits briefly for that guard
+too, which is what keeps Stop ordered against a prompt still in flight: the
+endpoint answers 202 before the prompt reaches the agent, so a Stop pressed
+right after Enter can otherwise arrive first, and an agent clears its cancel
+state when a prompt opens a turn, leaving the turn uncancellable. The wait is
+bounded and best-effort; on timeout the cancel is forwarded unordered, which is
+no worse than not waiting at all.
+
 ## Conversation persistence and context primer
 
 Transcripts persist in a SQLite event log. The web client mirrors each session's reduced state into `localStorage` under `aoe:acp-state:v1:<session_id>` (7-day expiry, falls back to full server replay past the per-origin quota) so a reload hydrates instantly and only fetches the seq-delta. `clearAcpCache` and the delete handler drop the entry so a recreated session id never shows the prior transcript.

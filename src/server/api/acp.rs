@@ -1645,6 +1645,18 @@ pub async fn acp_attachment(
     }
 }
 
+/// How long a cancel waits for an in-flight prompt submission before giving up
+/// and forwarding anyway.
+///
+/// Sized for the case that matters rather than the worst case. With a live
+/// worker, a submission holds the guard for a decide plus a channel enqueue,
+/// which is milliseconds, so Stop almost never waits at all. The long holds
+/// belong to a cold or dormant worker, where the submission parks on
+/// `WORKER_READY_TIMEOUT` waiting for a spawn; there is no turn running then,
+/// so there is nothing for the cancel to order itself behind and no reason to
+/// make the user watch a dead Stop button for ten seconds.
+const CANCEL_SUBMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub async fn acp_cancel(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1652,6 +1664,39 @@ pub async fn acp_cancel(
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
+    // Order the cancel behind any prompt submission already in flight.
+    //
+    // `POST /acp/prompt` answers 202 and then works: it wakes a dormant
+    // session, folds control state, and only then hands the prompt to the
+    // agent. `POST /acp/cancel` reaches the command channel almost
+    // immediately. A Stop pressed right after Enter therefore used to land
+    // FIRST, where the connection loop takes its no-prompt-in-flight branch and
+    // the agent clears the cancel flag when the prompt finally arrives, so the
+    // turn ran to completion and the composer never returned to Send. Measured
+    // in CI with the two POSTs 78ms apart, and reachable by a user because the
+    // Stop affordance rides the client's optimistic `running` flag.
+    //
+    // Taking the submission guard is what fixes it, rather than a second
+    // reservation of its own: every turn-starting surface already decides and
+    // dispatches under this one guard (#3639, #3673), so waiting for it means
+    // waiting for the prompt to be away, on every producer at once. The guard
+    // is held across the forward so a new submission cannot start in the gap.
+    //
+    // Best-effort by design: on timeout, or for an unknown session, forward
+    // unguarded, which is exactly the pre-existing behaviour and never worse.
+    let _submission = tokio::time::timeout(
+        CANCEL_SUBMISSION_WAIT,
+        state.session_service.prompt_submission_for_session(&id),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        tracing::info!(
+            target: "http.api.acp",
+            session = %id,
+            "cancel timed out waiting on an in-flight prompt submission; forwarding unordered"
+        );
+        None
+    });
     match state.acp_supervisor.cancel_prompt(&id).await {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
         Err(e) => supervisor_error_response("cancel failed", &e),
@@ -3402,6 +3447,74 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert!(state.instance_locks.read().await.is_empty());
+    }
+    /// Stop has to be ordered against a prompt that is still in dispatch.
+    ///
+    /// `POST /acp/prompt` answers 202 and then works, so a Stop pressed right
+    /// after Enter can reach the agent first, where it is discarded: an agent
+    /// clears its cancel state when a prompt opens a turn, and the turn then
+    /// runs uncancellable. Measured in CI with the two POSTs 78ms apart.
+    /// `acp_cancel` waits for the per-session submission guard, which every
+    /// turn-starting surface already holds across decide and dispatch, so the
+    /// cancel cannot overtake a prompt on any producer.
+    ///
+    /// The guard is held directly here rather than by driving `acp_prompt`,
+    /// and a live fake worker is installed on purpose. Without a worker
+    /// `cancel_prompt` parks on `wait_for_worker` for `WORKER_READY_TIMEOUT`
+    /// whether or not this fix is present, which makes "still running" say
+    /// nothing. With one, the forward is immediate, so the only thing that can
+    /// delay the endpoint is the wait under test.
+    #[tokio::test]
+    async fn cancel_waits_for_an_in_flight_prompt_submission() {
+        use std::time::Duration;
+
+        let mut inst = crate::session::Instance::new("cancel-order", "/tmp/aoe-cancel-order");
+        inst.id = "sess-cancel-order".to_string();
+        inst.view = crate::session::View::Structured;
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        state.acp_supervisor.test_insert_worker(&id).await;
+
+        // Sanity: with a live worker and nothing holding the guard, the
+        // endpoint is prompt. This is the baseline the assertion below is
+        // measured against, and it fails loudly if the fixture stops being a
+        // fast path.
+        let baseline = tokio::time::timeout(
+            Duration::from_secs(2),
+            acp_cancel(State(Arc::clone(&state)), Path(id.clone())),
+        )
+        .await;
+        assert!(
+            baseline.is_ok(),
+            "an unguarded cancel against a live worker must not block"
+        );
+
+        // Now stand in for a prompt mid-submission by holding the very guard
+        // `begin_prompt_submission` takes.
+        let submission = state
+            .session_service
+            .prompt_submission_for_session(&id)
+            .await
+            .expect("session exists, so the guard is available");
+
+        let cancel = tokio::spawn({
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            async move { acp_cancel(State(state), Path(id)).await.into_response() }
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !cancel.is_finished(),
+            "acp_cancel forwarded while a prompt submission held the guard, so \
+             the agent can still see cancel-before-prompt and drop the Stop"
+        );
+
+        // And it completes once the submission releases, rather than wedging.
+        drop(submission);
+        tokio::time::timeout(Duration::from_secs(5), cancel)
+            .await
+            .expect("cancel must not hang once the submission clears")
+            .expect("cancel task panicked");
     }
 
     /// #3172: two invariants of the idle-dormant prompt-wake path, both of
