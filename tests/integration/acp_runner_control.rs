@@ -305,7 +305,8 @@ fn runner_validates_attach_before_flushing_backlog() {
     let socket = workers.join(format!("{session_id}.sock"));
     let control = workers.join(format!("{session_id}.control.sock"));
     let record = workers.join(format!("{session_id}.json"));
-    let script = r#"printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"source":"buffered"}}'; exec cat"#;
+    let queued = scratch.0.join("notification-queued");
+    let script = r#"printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"source":"buffered"}}' '{"jsonrpc":"2.0","id":"queue-ack","method":"fs/read_text_file","params":{"path":"unused"}}'; IFS= read -r response; printf '%s\n' "$response" > "$1"; exec cat"#;
     let _child = KillOnDrop(
         Command::new(env!("CARGO_BIN_EXE_aoe"))
             .args([
@@ -322,6 +323,8 @@ fn runner_validates_attach_before_flushing_backlog() {
                 "/bin/sh",
                 "-c",
                 script,
+                "agent",
+                queued.to_str().unwrap(),
             ])
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", &xdg)
@@ -332,13 +335,17 @@ fn runner_validates_attach_before_flushing_backlog() {
 
     wait_for(&record, "registry record");
     wait_for(&control, "control socket");
+    wait_for(&queued, "notification queue acknowledgment");
+    let acknowledgment: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&queued).unwrap()).unwrap();
+    assert_eq!(acknowledgment["id"], "queue-ack");
+    assert!(acknowledgment["error"].is_object());
 
     let mut rejected = UnixStream::connect(&control).expect("connect rejected peer");
     rejected
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
     assert_eq!(read_frame(&mut rejected)["kind"], "hello");
-    std::thread::sleep(Duration::from_millis(150));
     write_frame(
         &mut rejected,
         &serde_json::json!({"kind": "initialize", "request": {"protocolVersion": 1}}),
