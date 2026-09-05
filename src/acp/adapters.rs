@@ -230,6 +230,11 @@ pub fn installation_is_current(app_dir: &Path, binary: &str) -> bool {
 /// npm. Idempotent: returns early when the current lockfile is already
 /// installed.
 pub fn install(app_dir: &Path, node: &ResolvedNode, binary: &str) -> Result<(), AdapterError> {
+    // One install at a time in this process: the staging dir is per pid,
+    // and spawns resumed in parallel after an upgrade would otherwise wipe
+    // each other's `npm ci`. A waiter re-checks currency under the lock.
+    static INSTALLING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _serialized = INSTALLING.lock().unwrap_or_else(|p| p.into_inner());
     let adapter = lookup(binary).ok_or_else(|| AdapterError::UnknownAdapter(binary.to_string()))?;
     if installation_is_current(app_dir, binary) {
         info!(target: "acp.adapters", adapter = binary, "already current; nothing to install");

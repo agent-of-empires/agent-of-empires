@@ -288,6 +288,11 @@ pub(super) async fn run_connection_task<W, R>(
     // hit twice. Stale entries are filtered by reset-in-the-future at read
     // time instead. #3028, #3152.
     let last_rate_limit_rejections = Arc::new(std::sync::Mutex::new(HashMap::<String, i64>::new()));
+    // Set when a rejected first prompt on a stored session already emitted
+    // `SessionContextReset`: the connection then ends on a soft stop that the
+    // respawn recovers from, not on a startup error (#3560).
+    let context_reset_emitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let context_reset_emitted_for_block = context_reset_emitted.clone();
     // In-flight tool calls for the between-prompt (agent-initiated) path,
     // keyed by tool_call_id -> the `run_in_background` flag observed at
     // ToolStarted. Mirrors the per-prompt SilentOrphanWatchdog's
@@ -1985,6 +1990,8 @@ pub(super) async fn run_connection_task<W, R>(
                                                         ),
                                                     })
                                                     .await;
+                                                context_reset_emitted_for_block
+                                                    .store(true, Ordering::Relaxed);
                                             }
                                             return Err(e);
                                         }
@@ -2985,6 +2992,14 @@ pub(super) async fn run_connection_task<W, R>(
                 let _ = event_tx
                     .send(Event::Stopped {
                         reason: "rate_limited".into(),
+                    })
+                    .await;
+            } else if context_reset_emitted.load(Ordering::Relaxed) {
+                // The respawn opens a fresh session; the reset already told
+                // the user why, so end the turn without a startup error.
+                let _ = event_tx
+                    .send(Event::Stopped {
+                        reason: "session_reset".into(),
                     })
                     .await;
             } else {

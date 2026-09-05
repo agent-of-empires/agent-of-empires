@@ -176,30 +176,51 @@ pub async fn list_sessions(
     }
 
     {
-        use std::collections::HashMap;
-        let mut auto_resume_cache: HashMap<String, bool> = HashMap::new();
-        for (resp, inst) in sessions.iter_mut().zip(scoped_instances.iter().copied()) {
-            if !inst.is_structured() {
-                continue;
-            }
-            resp.rate_limit_auto_resume = Some(
-                *auto_resume_cache
-                    .entry(inst.source_profile.clone())
-                    .or_insert_with(|| {
-                        crate::session::config::profile_config::resolve_config_or_warn(
-                            &inst.source_profile,
-                        )
-                        .acp
-                        .rate_limit_auto_resume
-                    }),
-            );
-            // A live worker is never parked, so only workerless sessions pay
-            // for the event-store probe.
-            if resp.acp_worker_state != crate::acp::supervisor::AcpWorkerState::Running {
-                resp.rate_limit = state
-                    .acp_event_store
-                    .rate_limit_park(&inst.id)
-                    .and_then(|park| park.info);
+        // Config reads and the event-store park probe run off the runtime
+        // thread; a live worker is never parked, so only workerless sessions
+        // pay for the probe.
+        let probes: Vec<(usize, String, String, bool)> = sessions
+            .iter()
+            .zip(scoped_instances.iter().copied())
+            .enumerate()
+            .filter(|(_, (_, inst))| inst.is_structured())
+            .map(|(i, (resp, inst))| {
+                (
+                    i,
+                    inst.id.clone(),
+                    inst.source_profile.clone(),
+                    resp.acp_worker_state != crate::acp::supervisor::AcpWorkerState::Running,
+                )
+            })
+            .collect();
+        if !probes.is_empty() {
+            let store = Arc::clone(&state.acp_event_store);
+            let overlays = tokio::task::spawn_blocking(move || {
+                use std::collections::HashMap;
+                let mut auto_resume_cache: HashMap<String, bool> = HashMap::new();
+                probes
+                    .into_iter()
+                    .map(|(i, id, profile, workerless)| {
+                        let auto_resume =
+                            *auto_resume_cache.entry(profile.clone()).or_insert_with(|| {
+                                crate::session::config::profile_config::resolve_config_or_warn(
+                                    &profile,
+                                )
+                                .acp
+                                .rate_limit_auto_resume
+                            });
+                        let park = workerless
+                            .then(|| store.rate_limit_park(&id).and_then(|park| park.info))
+                            .flatten();
+                        (i, auto_resume, park)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap_or_default();
+            for (i, auto_resume, park) in overlays {
+                sessions[i].rate_limit_auto_resume = Some(auto_resume);
+                sessions[i].rate_limit = park;
             }
         }
     }
