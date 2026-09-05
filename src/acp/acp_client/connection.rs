@@ -46,7 +46,7 @@ use super::pending::PendingResponders;
 use super::permission_handlers::{handle_elicitation_request, handle_permission_request};
 use super::rate_limit::{
     captured_rate_limit_resets_at, classify_rate_limit_error, classify_rate_limit_from_message,
-    rate_limit_rejection_from_meta,
+    is_unsupported_session_error, rate_limit_rejection_from_meta,
 };
 use super::reset::{
     await_reset_request, ResetRequestError, ResetSessionOutcome, SESSION_RESET_IN_TASK_TIMEOUT,
@@ -1964,6 +1964,34 @@ pub(super) async fn run_connection_task<W, R>(
                                                 rate_limited = true;
                                                 shutdown = true;
                                                 break;
+                                            }
+                                            // A resumed worker reuses the stored
+                                            // acp_session_id without re-issuing
+                                            // session/load; if the agent dropped
+                                            // that session across the interruption
+                                            // it rejects the first prompt (OMP:
+                                            // "Unsupported ACP session"). Emit the
+                                            // established SessionContextReset so the
+                                            // supervisor clears the persisted id and
+                                            // the respawn opens a fresh session/new
+                                            // (the SQLite transcript is preserved for
+                                            // replay), then return the original error
+                                            // to end this connection so the restart
+                                            // fires. See resume-rejection recovery.
+                                            if is_unsupported_session_error(&e) {
+                                                warn!(
+                                                    target: "acp.protocol",
+                                                    session = %session_label,
+                                                    acp_session_id = %acp_session_id.0,
+                                                    "resumed ACP session rejected as unsupported; resetting context so the respawn starts fresh: {e}"
+                                                );
+                                                let _ = event_tx_for_block
+                                                    .send(Event::SessionContextReset {
+                                                        reason: format!(
+                                                            "resumed session no longer available: {e}"
+                                                        ),
+                                                    })
+                                                    .await;
                                             }
                                             return Err(e);
                                         }
