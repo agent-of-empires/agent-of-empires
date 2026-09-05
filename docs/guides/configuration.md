@@ -61,6 +61,7 @@ settings save on `config.toml`.
 | `AGENT_OF_EMPIRES_PROFILE` | Default profile to use |
 | `AGENT_OF_EMPIRES_DEBUG` | Enable debug logging to `debug.log` in app data dir (`1` to enable). Legacy alias for `AOE_LOG_LEVEL=debug`. |
 | `AOE_LOG_LEVEL` | File log level: `trace`, `debug`, `info`, `warn`, `error`. |
+| `AOE_DEFER_SANDBOX_MIGRATION` | Start without moving sandboxed sessions' agent stores; the move is retried on a later start or with `aoe migrate`. See [Per-session agent stores](sandbox.md#per-session-agent-stores). |
 
 ## Theme
 
@@ -472,7 +473,7 @@ vt_live = true
 
 Detection for the per-option modes (`mouse`, `clipboard`) reads `~/.tmux.conf`, `$XDG_CONFIG_HOME/tmux/tmux.conf`, and `~/.config/tmux/tmux.conf`, looking for a `set` / `setw` of the option. It is deliberately conservative: an option reached via `source-file`, wrapped in `if-shell`, guarded by a false `%if`, or set from inside a key binding (`bind m set -g mouse`) is not detected, and aoe applies its own value. Set the mode to `"disabled"` if you keep yours in one of those places. `/etc/tmux.conf` is not consulted; it is not your file.
 | `socket_name` | unset | Run aoe's sessions on a private tmux server with this socket name (passed as `tmux -L <name>`), so your own `tmux ls` and hand-managed sessions stay separate from aoe's. Leave unset to share the default tmux server (the current behavior). Must be a bare name, not a path; a value with a `/` or `\` is ignored. Takes effect on the next aoe start. Global/profile only. |
-| `vt_live` | `true` | Render native agent and tool previews from a persistent VT channel: `tmux pipe-pane` streams the pane into an in-process terminal grid, and keystrokes go back over the same socket. Terminal previews, including the Web dashboard, always use tmux's rendered `capture-pane` snapshots to avoid prompt-paint races; a raw observer retains OSC 52 clipboard forwarding without affecting rendering. Disabling this setting makes native agent and tool previews use the slower `capture-pane` / `send-keys` path. Applies in place on the next TUI capture cycle. |
+| `vt_live` | `true` | Render agent previews and the web dashboard's agent terminal from a persistent VT channel: `tmux pipe-pane` streams the pane into an in-process terminal grid, and keystrokes go back over the same socket. The paired host and container shells, split windows, and every fallback keep tmux's rendered `capture-pane` snapshots to avoid prompt-paint races; there a raw observer retains OSC 52 clipboard forwarding without affecting rendering. Disabling this setting puts every surface on the slower `capture-pane` / `send-keys` path. Applies in place on the next TUI capture cycle. |
 
 ## Diff
 

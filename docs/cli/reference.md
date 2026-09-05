@@ -120,6 +120,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe acp switch-agent`↴](#aoe-acp-switch-agent)
 * [`aoe uninstall`↴](#aoe-uninstall)
 * [`aoe update`↴](#aoe-update)
+* [`aoe migrate`↴](#aoe-migrate)
 * [`aoe completion`↴](#aoe-completion)
 
 ## `aoe`
@@ -162,6 +163,7 @@ Run without arguments to launch the TUI dashboard.
 * `acp` — Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 * `uninstall` — Uninstall Agent of Empires
 * `update` — Update aoe to the latest release
+* `migrate` — Run pending data migrations now, showing progress. A sandboxed session moves its own agent store when it starts; use this to move every eligible store at once instead. Trashed and archived sessions are skipped; each moves when it is started, or restore or unarchive it and run this again
 * `completion` — Generate shell completions
 
 ###### **Options:**
@@ -1832,6 +1834,14 @@ Update aoe to the latest release
 * `-y`, `--yes` — Skip confirmation prompt
 * `--check` — Print update status and exit (no install)
 * `--dry-run` — Detect install method and print what would happen, no download
+
+
+
+## `aoe migrate`
+
+Run pending data migrations now, showing progress. A sandboxed session moves its own agent store when it starts; use this to move every eligible store at once instead. Trashed and archived sessions are skipped; each moves when it is started, or restore or unarchive it and run this again
+
+**Usage:** `aoe migrate`
 
 
 
