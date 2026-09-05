@@ -1344,6 +1344,10 @@ impl App {
                                         }
                                     };
                                     self.home.flash_status(status);
+                                    // The press is consumed here, so it never
+                                    // reaches the drag-select path that would
+                                    // otherwise clear a finalized highlight.
+                                    let _ = self.home.clear_preview_selection();
                                     // This press is spent; without forgetting
                                     // it, clicking the link again pairs into a
                                     // double-click and attaches the session.

@@ -454,6 +454,28 @@ mod tests {
         assert_eq!(found[0].uri, "https://example.com/logout");
     }
 
+    /// A label or a URL containing wide graphemes must resolve. Reading the
+    /// painted row back out of a scratch buffer used to insert a space after
+    /// every wide cell, so neither could ever match.
+    #[test]
+    fn wide_graphemes_do_not_break_matching() {
+        let found = spans(
+            "見る 日本語ドキュメント です",
+            60,
+            &[link("日本語ドキュメント", "https://example.com/ja")],
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].uri, "https://example.com/ja");
+        // 見る = 4 columns, space = 1, so the label starts at column 5 and
+        // spans 9 wide graphemes = 18 columns.
+        assert_eq!((found[0].start, found[0].end), (5, 23));
+
+        // The same for a bare URL carrying a wide path segment.
+        let bare = spans("see https://example.com/日本 now", 60, &[]);
+        assert_eq!(bare.len(), 1, "{bare:?}");
+        assert_eq!(bare[0].uri, "https://example.com/日本");
+    }
+
     #[test]
     fn an_advertised_target_wins_over_a_bare_match() {
         // A pane that wrapped a visible URL in OSC 8 pointing somewhere else

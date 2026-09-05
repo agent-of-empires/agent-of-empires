@@ -47,13 +47,20 @@ pub fn open_url(url: &str) -> std::io::Result<()> {
 /// choice, and on a remote host it is usually a script that forwards the URL
 /// somewhere useful.
 fn browser_reachable() -> bool {
-    if std::env::var_os("BROWSER").is_some() {
+    // `BROWSER` and `DISPLAY` only mean anything where the launcher reads them.
+    // `webbrowser`'s unix backend tries `$BROWSER` first; its macOS backend goes
+    // straight to `NSWorkspace` and reads neither, so honoring them there would
+    // wave through an SSH session that then opens a browser on the remote Mac
+    // and report it as a success the user never sees.
+    let launcher_reads_env = cfg!(all(unix, not(target_os = "macos")));
+    if launcher_reads_env && std::env::var_os("BROWSER").is_some() {
         return true;
     }
     // In an SSH session the user is elsewhere. X11 forwarding is the exception:
-    // it puts the display back on their own machine.
+    // it puts the display back on their own machine, and only where the
+    // launcher actually targets that display.
     if std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some() {
-        return std::env::var_os("DISPLAY").is_some();
+        return launcher_reads_env && std::env::var_os("DISPLAY").is_some();
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -80,7 +87,10 @@ mod tests {
 
     impl EnvGuard {
         fn clear_all() -> Self {
-            const KEYS: [&str; 5] = [
+            const KEYS: [&str; 6] = [
+                // Steers `open_url` away from the real path entirely, so a
+                // concurrent test setting it would mask the refusal under test.
+                OPEN_URL_TO_ENV,
                 "BROWSER",
                 "SSH_CONNECTION",
                 "SSH_TTY",
@@ -134,6 +144,27 @@ mod tests {
         // An explicit BROWSER is a deliberate choice; honour it either way.
         std::env::set_var("BROWSER", "my-forwarder");
         assert!(browser_reachable(), "an explicit BROWSER always wins");
+    }
+
+    /// On macOS the launcher goes straight to `NSWorkspace` and reads neither
+    /// `BROWSER` nor `DISPLAY`, so honoring them there would wave through an
+    /// SSH session and open a browser on the remote machine.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "macos")]
+    fn macos_ignores_env_hints_its_launcher_never_reads() {
+        let _guard = EnvGuard::clear_all();
+        std::env::set_var("SSH_CONNECTION", "10.0.0.1 22 10.0.0.2 22");
+        std::env::set_var("BROWSER", "my-forwarder");
+        assert!(
+            !browser_reachable(),
+            "BROWSER is not read by the macOS launcher"
+        );
+        std::env::set_var("DISPLAY", "localhost:10.0");
+        assert!(
+            !browser_reachable(),
+            "DISPLAY is not read by the macOS launcher"
+        );
     }
 
     /// The refusal must be an error, so the caller falls back rather than

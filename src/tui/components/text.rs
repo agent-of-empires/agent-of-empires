@@ -2,9 +2,11 @@
 
 /// One rendered row resolved into display columns.
 ///
-/// Built by painting the line into a scratch buffer, because that is the only
-/// way to get ratatui's own idea of which cell each grapheme lands in: a wide
-/// grapheme occupies two cells, and the second carries an empty symbol.
+/// Measured from the line's own graphemes. Reading a scratch buffer back
+/// instead looks tempting but is wrong: `Buffer::set_line` resets the
+/// continuation cell of a wide grapheme, and `Cell::symbol()` answers `" "`
+/// for a reset cell, so every wide grapheme would gain a phantom space and no
+/// label containing one could ever match.
 pub(crate) struct LineColumns {
     /// The row's visible text, concatenated left to right.
     pub(crate) text: String,
@@ -40,16 +42,27 @@ impl LineColumns {
 
 /// Resolve `line` into display columns at `width`.
 pub(crate) fn line_columns(line: &ratatui::text::Line, width: u16) -> LineColumns {
-    let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, width.max(1), 1));
-    buf.set_line(0, 0, line, width.max(1));
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+
     let mut text = String::with_capacity(width as usize);
     let mut column_of = Vec::with_capacity(width as usize);
-    for col in 0..width {
-        let symbol = buf[(col, 0)].symbol();
-        column_of.resize(column_of.len() + symbol.len(), col);
-        text.push_str(symbol);
+    let mut col = 0u16;
+    for span in &line.spans {
+        for grapheme in span.content.graphemes(true) {
+            let cells = UnicodeWidthStr::width(grapheme) as u16;
+            // Mirror what the renderer paints: a grapheme that does not fit the
+            // pane is not drawn, so it must not be matchable either.
+            if col + cells > width {
+                column_of.push(col);
+                return LineColumns { text, column_of };
+            }
+            column_of.resize(column_of.len() + grapheme.len(), col);
+            text.push_str(grapheme);
+            col += cells;
+        }
     }
-    column_of.push(width);
+    column_of.push(col);
     LineColumns { text, column_of }
 }
 
@@ -95,6 +108,40 @@ pub fn truncate_to_width(text: &str, max_width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::line_columns;
+
+    /// A wide grapheme occupies two columns and its continuation cell is reset
+    /// by the renderer. Reading that back out of a buffer yields a phantom
+    /// space, which is what used to stop a CJK label from ever matching.
+    #[test]
+    fn wide_graphemes_span_two_columns_without_a_phantom_space() {
+        use ratatui::text::Line;
+        let columns = line_columns(&Line::from("日本語 x"), 40);
+        assert_eq!(columns.text, "日本語 x", "no space injected between cells");
+        assert_eq!(columns.column_at(0), 0);
+        assert_eq!(columns.column_at("日".len()), 2);
+        assert_eq!(columns.column_at("日本".len()), 4);
+        assert_eq!(columns.column_at("日本語 ".len()), 7);
+        assert_eq!(columns.slice(0, 6), "日本語");
+    }
+
+    /// A grapheme that does not fit the pane is not painted, so it must not be
+    /// matchable either.
+    #[test]
+    fn a_grapheme_past_the_pane_edge_is_not_included() {
+        use ratatui::text::Line;
+        assert_eq!(line_columns(&Line::from("ab日"), 3).text, "ab");
+        assert_eq!(line_columns(&Line::from("ab日"), 4).text, "ab日");
+    }
+
+    #[test]
+    fn slice_returns_the_columns_asked_for() {
+        use ratatui::text::Line;
+        let columns = line_columns(&Line::from("hello world"), 40);
+        assert_eq!(columns.slice(6, 11), "world");
+        assert_eq!(columns.slice(0, 5), "hello");
+    }
+
     use super::truncate_to_width;
 
     #[test]

@@ -3420,6 +3420,12 @@ impl HomeView {
                         continue;
                     }
                     buf[pos].modifier |= Modifier::UNDERLINED;
+                    // The URI lives outside the `Buffer`, so ratatui's diff
+                    // cannot see a target change on otherwise identical cells:
+                    // the same label repointed from A to B would leave the
+                    // terminal holding A while the hit-test resolves B. Hand
+                    // linked cells to the backend on every frame instead.
+                    buf[pos].set_diff_option(ratatui::buffer::CellDiffOption::AlwaysUpdate);
                     // Hand the target to the backend as well, so the host
                     // terminal gets a real hyperlink and not just an
                     // underline it cannot act on.

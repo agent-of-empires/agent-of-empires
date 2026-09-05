@@ -272,6 +272,58 @@ mod tests {
         );
     }
 
+    /// The URI lives outside the `Buffer`, so ratatui's diff cannot see a
+    /// target change on cells whose text and style are unchanged. Without the
+    /// renderer marking linked cells `AlwaysUpdate`, the second frame here
+    /// would emit nothing and the terminal would keep pointing at A.
+    #[test]
+    fn a_retargeted_cell_is_re_emitted_on_the_next_frame() {
+        use ratatui::buffer::CellDiffOption;
+
+        let shared: SharedHyperlinks = SharedHyperlinks::default();
+        let tap = Tap::default();
+        let mut terminal =
+            ratatui::Terminal::new(HyperlinkBackend::new(tap.clone(), shared.clone()))
+                .expect("terminal");
+
+        let mut frame = |uri: &str| {
+            {
+                let mut guard = shared.lock().unwrap();
+                guard.clear();
+                guard.insert(0, 0, uri);
+            }
+            terminal
+                .draw(|f| {
+                    let mut cell = Cell::default();
+                    cell.set_symbol("L");
+                    cell.set_diff_option(CellDiffOption::AlwaysUpdate);
+                    f.buffer_mut()[(0, 0)] = cell;
+                })
+                .expect("draw");
+            let out =
+                String::from_utf8_lossy(&tap.0.lock().unwrap().clone()).replace('\u{1b}', "^[");
+            tap.0.lock().unwrap().clear();
+            out
+        };
+
+        let first = frame("https://a.example");
+        assert!(
+            first.contains("^[]8;;https://a.example^[\\"),
+            "first frame: {first}"
+        );
+
+        // Identical symbol and style, different target.
+        let second = frame("https://b.example");
+        assert!(
+            second.contains("^[]8;;https://b.example^[\\"),
+            "a retargeted cell must be re-emitted, got: {second}"
+        );
+        assert!(
+            !second.contains("https://a.example"),
+            "the old target must not survive: {second}"
+        );
+    }
+
     #[test]
     fn a_frame_with_no_links_emits_no_osc8() {
         let out = render(&[], &[(0, 0, "a"), (1, 0, "b")]);
