@@ -202,6 +202,19 @@ pub fn has_pending_migrations() -> bool {
 }
 
 /// Run all pending migrations silently. Call this early in app startup.
+/// Move this session's sandbox store into the private layout, if it is still
+/// on the shared one. Called from the launch path so the copy is paid by the
+/// session being started rather than by every pending row on any `aoe` start.
+///
+/// A failure here is reported by the caller and does not block the launch:
+/// a row that did not move stays on its shared store and is retried.
+pub fn migrate_sandbox_store_for(id: &str) -> Result<()> {
+    if get_current_version() < 27 {
+        return Ok(());
+    }
+    v027_isolate_sandbox_stores::migrate_instance(id)
+}
+
 pub fn run_migrations() -> Result<()> {
     run_migrations_with(None)
 }
