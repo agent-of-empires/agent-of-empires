@@ -231,6 +231,12 @@ impl LifecycleTable {
         *slot = (*slot).max(generation);
     }
 
+    /// Drop everything remembered for a session that no longer exists.
+    pub fn forget(&mut self, session_id: &str) {
+        self.entries.remove(session_id);
+        self.last_generation.remove(session_id);
+    }
+
     pub fn last_generation(&self, session_id: &str) -> u64 {
         self.last_generation.get(session_id).copied().unwrap_or(0)
     }

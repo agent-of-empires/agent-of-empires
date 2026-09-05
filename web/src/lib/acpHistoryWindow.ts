@@ -104,9 +104,13 @@ export function historyWindow(
   showClearedTurns: boolean,
 ): HistoryWindow {
   const start = historyWindowStart(rows, visibleRows);
-  // Pre-`/clear` rows are reached via the ClearedTurnsBanner, not by "Load
-  // earlier", so they must not make that control look live.
+  return { start, canLoadEarlier: canLoadEarlierFrom(rows, start, showClearedTurns) };
+}
+
+/** Whether "Load earlier" would reveal anything from `start`. Pre-`/clear`
+ *  rows are reached via the ClearedTurnsBanner, not by "Load earlier", so
+ *  they must not make that control look live. */
+export function canLoadEarlierFrom(rows: readonly ActivityRow[], start: number, showClearedTurns: boolean): boolean {
   const clearIndex = showClearedTurns ? -1 : lastClearIndex(rows);
-  const canLoadEarlier = clearIndex < 0 ? start > 0 : start > clearIndex;
-  return { start, canLoadEarlier };
+  return clearIndex < 0 ? start > 0 : start > clearIndex;
 }

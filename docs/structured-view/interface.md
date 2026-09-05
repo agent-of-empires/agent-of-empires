@@ -78,7 +78,8 @@ such as a pending approval, receive a full-width border.
 | Transcript  | `Esc`           | Close the structured view and return to the session list |
 | Approval    | `a`             | Allow once                                            |
 | Approval    | `Shift+A`       | Allow always (session-scoped allow-list entry)        |
-| Approval    | `d`             | Deny                                                  |
+| Approval    | `d`             | Deny (dismiss, for a question)                        |
+| Approval    | `1` to `9`      | Answer a question with that option                    |
 | Approval    | `Esc`           | Stop the in-flight turn                               |
 | Any         | `Ctrl+C`        | Cancel the in-flight prompt                           |
 | Any         | `Ctrl+O`        | Open the session in the web dashboard                 |
@@ -92,6 +93,12 @@ insert `/{command} ` (it does not auto-send, so you can add arguments
 first). `Esc` dismisses the picker. A query with no matching command is
 left alone: `Enter` sends it verbatim. The picker only appears once the
 agent has advertised commands.
+
+**Questions.** Some agents ask multiple-choice questions through the
+permission channel (pi's `ask_user_question`). The shelf lists the
+options and a digit answers with that option; `a` and `Shift+A` are
+refused there, since neither names a choice. The web card renders the
+same list with a Dismiss button in place of Deny.
 
 **Focus isolation.** Approval keys (`a`/`Shift+A`/`d`) only resolve when
 the approval card has focus. Typing "always allow" into the composer

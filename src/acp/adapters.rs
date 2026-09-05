@@ -1,4 +1,5 @@
-//! On-demand install and resolution of the npm-distributed ACP adapters
+//! On-demand install and resolution of the bundled ACP adapters (the pinned
+//! npm ones and the in-tree `aoe-agent`)
 //! that aoe pins (`claude-agent-acp`, `codex-acp`, `pi-acp`).
 //!
 //! Mirrors the bundled-Node pattern in [`crate::acp::node`]: a pinned
@@ -178,9 +179,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// True when a complete, current install of `binary` is present: the digest
-/// sidecar matches its embedded lockfile AND the binary exists. Drives both
-/// the skip-reinstall path and the upgrade-after-aoe-bump path.
 /// An in-tree adapter (one that ships sources) whose installed copy no longer
 /// matches this binary's embedded sources. Spawning it would run the old
 /// code beside a new daemon, so resolution refuses it and the install hint
@@ -193,6 +191,9 @@ pub fn installed_copy_is_stale(app_dir: &Path, binary: &str) -> bool {
     })
 }
 
+/// True when a complete, current install of `binary` is present: the digest
+/// sidecar matches its embedded lockfile AND the binary exists. Drives both
+/// the skip-reinstall path and the upgrade-after-aoe-bump path.
 pub fn installation_is_current(app_dir: &Path, binary: &str) -> bool {
     let Some(adapter) = lookup(binary) else {
         return false;
@@ -285,11 +286,6 @@ pub fn install(app_dir: &Path, node: &ResolvedNode, binary: &str) -> Result<(), 
     Ok(())
 }
 
-/// Build the argv for `npm ci`, run from the target dir. For a bundled
-/// Node, invoke its own `npm-cli.js` with that exact node (the official
-/// tarball ships it at `<root>/lib/node_modules/npm/bin/npm-cli.js`); for a
-/// host Node, use `npm` on PATH, because a host Node's npm layout is not
-/// something we can assume. `None` when no usable npm is found.
 /// The launcher for an in-tree agent: `node --experimental-strip-types`
 /// on the entry script, with `node` taken from `PATH`, which the spawn
 /// prepends the resolved Node's directory to (`bundled_resolution`).
@@ -317,6 +313,11 @@ fn write_entry_wrapper(install_dir: &Path, binary: &str, entry: &str) -> std::io
     Ok(())
 }
 
+/// Build the argv for `npm ci`, run from the target dir. For a bundled
+/// Node, invoke its own `npm-cli.js` with that exact node (the official
+/// tarball ships it at `<root>/lib/node_modules/npm/bin/npm-cli.js`); for a
+/// host Node, use `npm` on PATH, because a host Node's npm layout is not
+/// something we can assume. `None` when no usable npm is found.
 pub fn npm_ci_argv(node: &ResolvedNode) -> Option<(PathBuf, Vec<String>)> {
     let ci_flags = || {
         vec![

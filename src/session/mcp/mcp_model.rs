@@ -533,16 +533,13 @@ pub fn load_native_mcp_servers_checked_from_home(
 /// read, and these definitions carry credentials. `acp::agent_policy` holds the
 /// same line for the same reason.
 ///
-/// Falling back to `CLAUDE_CONFIG_DIR` in AoE's own environment covers the
-/// wrapper case: a shell that exports the variable exports it to the agent's
-/// login shell too. It is a guess, not a fact about the session, so it ranks
-/// below the declared directory.
-/// The config directory the session's agent will actually read, so native
-/// MCP discovery and the launched agent agree on one `.claude.json`.
-/// Precedence: `session.agent_config_dir`, then `CLAUDE_CONFIG_DIR` in the
-/// session's own environment (profile `environment`, with `before_session`
-/// output on top when the caller has it), then the daemon's environment,
-/// then the home default (#3734).
+/// The result is the directory the session's agent will actually read, so
+/// discovery and the launched agent agree on one `.claude.json` (#3734):
+/// `session.agent_config_dir`, then `CLAUDE_CONFIG_DIR` in the session's own
+/// environment (profile `environment`, with `before_session` output on top
+/// when the caller has it), then AoE's own environment (a shell that
+/// exports the variable exports it to the agent too, a guess rather than a
+/// fact about the session), then the home default.
 fn native_config_dir_for(
     agent_key: &str,
     profile: Option<&str>,

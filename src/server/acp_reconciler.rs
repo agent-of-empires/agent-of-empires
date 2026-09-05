@@ -284,7 +284,7 @@ pub async fn reconcile_acp_workers(
         .rate_limit
         .is_none_or(|t| t.elapsed() >= RATE_LIMIT_RESUME_INTERVAL)
     {
-        released_from_park = reap_rate_limit_resumes(state, attempted).await;
+        released_from_park = reap_rate_limit_resumes(state, attempted, parked).await;
         cadence.rate_limit = Some(Instant::now());
     }
 
@@ -1227,6 +1227,7 @@ fn rate_limit_unknown_reset_retry_at(
 async fn reap_rate_limit_resumes(
     state: &Arc<AppState>,
     attempted: &mut HashSet<String>,
+    parked: &HashSet<String>,
 ) -> HashSet<String> {
     let mut released: HashSet<String> = HashSet::new();
     // Candidates: structured view sessions currently parked (recorded in
@@ -1257,15 +1258,26 @@ async fn reap_rate_limit_resumes(
     if candidates.is_empty() {
         return released;
     }
-    // Only sessions without a live worker are parked; a running worker in
-    // `attempted` is the steady-state perf entry, not a park.
-    let mut parked: Vec<(String, String, bool)> = Vec::new();
+    // Only sessions without a live worker can be parked; a running worker in
+    // `attempted` is the steady-state entry, not a park. A crash-loop park
+    // (#1945) is released by a manual retry, not by this pass: resuming here
+    // would only publish a breadcrumb every window into a spawn that keeps
+    // failing for a reason of its own.
+    let mut workerless: Vec<(String, String, bool)> = Vec::new();
     for (id, profile, has_queue) in candidates {
+        if parked.contains(&id) {
+            tracing::debug!(
+                target: "acp.supervisor",
+                session = %id,
+                "rate-limit auto-resume: skipped, session is crash-loop parked"
+            );
+            continue;
+        }
         if !state.acp_supervisor.is_running(&id).await {
-            parked.push((id, profile, has_queue));
+            workerless.push((id, profile, has_queue));
         }
     }
-    if parked.is_empty() {
+    if workerless.is_empty() {
         return released;
     }
     // Resolve the auto-resume config per distinct profile off-thread (it
@@ -1274,7 +1286,7 @@ async fn reap_rate_limit_resumes(
     // the default-off case.
     let distinct_profiles: Vec<String> = {
         let mut seen = HashSet::new();
-        parked
+        workerless
             .iter()
             .map(|(_, p, _)| p.clone())
             .filter(|p| seen.insert(p.clone()))
@@ -1295,7 +1307,7 @@ async fn reap_rate_limit_resumes(
         .unwrap_or_default();
 
     let now = chrono::Utc::now();
-    for (id, profile, has_queued_prompts) in parked {
+    for (id, profile, has_queued_prompts) in workerless {
         let Some(enabled) = cfg_by_profile.get(&profile).copied() else {
             tracing::debug!(
                 target: "acp.supervisor",
@@ -2993,7 +3005,8 @@ mod tests {
             .publish_startup_error(id, "spawn failed once".into());
         let mut attempted: HashSet<String> = [id.to_string()].into();
 
-        let released = super::reap_rate_limit_resumes(&state, &mut attempted).await;
+        let released =
+            super::reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
 
         assert!(
             released.contains(id) && !attempted.contains(id),
@@ -3024,7 +3037,8 @@ mod tests {
             .publish_startup_error(id, "spawn failed".into());
         let mut attempted: HashSet<String> = [id.to_string()].into();
 
-        let released = super::reap_rate_limit_resumes(&state, &mut attempted).await;
+        let released =
+            super::reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
 
         assert!(
             released.is_empty() && attempted.contains(id),
@@ -3656,7 +3670,7 @@ mod tests {
             // The state a live daemon is in: the cap parked this session and
             // kept its slot.
             let mut attempted: HashSet<String> = [id.to_string()].into();
-            super::reap_rate_limit_resumes(&state, &mut attempted).await;
+            super::reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
             assert_eq!(
                 !attempted.contains(id),
                 expect_respawn,
@@ -3700,7 +3714,7 @@ mod tests {
             parked_at_streak(id, RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES as usize - 1).await;
         let mut attempted: HashSet<String> = [id.to_string()].into();
 
-        super::reap_rate_limit_resumes(&state, &mut attempted).await;
+        super::reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
 
         assert!(
             !attempted.contains(id),
@@ -3727,7 +3741,7 @@ mod tests {
             parked_at_streak(id, RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES as usize).await;
         let mut attempted: HashSet<String> = [id.to_string()].into();
 
-        super::reap_rate_limit_resumes(&state, &mut attempted).await;
+        super::reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
 
         assert_eq!(
             latest_stop_reason(&state, id).as_deref(),
@@ -3759,7 +3773,7 @@ mod tests {
         state.acp_supervisor.hydrate_seqs([(id.to_string(), ahead)]);
         let mut attempted: HashSet<String> = [id.to_string()].into();
 
-        super::reap_rate_limit_resumes(&state, &mut attempted).await;
+        super::reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
 
         assert_eq!(
             latest_stop_reason(&state, id).as_deref(),
@@ -3789,7 +3803,7 @@ mod tests {
         // blocking on the lock would hang the whole reconciler tick.
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            super::reap_rate_limit_resumes(&state, &mut attempted),
+            super::reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()),
         )
         .await
         .expect("the cap must not block the tick on a contended instance_lock");

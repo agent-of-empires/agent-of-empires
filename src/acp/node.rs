@@ -22,6 +22,9 @@ use tracing::{debug, info, warn};
 /// `engines.node` field in `acp-worker/aoe-agent/package.json` by
 /// `package_engines_matches_min_node_major`.
 pub const MIN_NODE_MAJOR: u32 = 22;
+/// Minor floor within `MIN_NODE_MAJOR`: `--experimental-strip-types`, which
+/// runs the bundled `aoe-agent`, arrived in 22.6.
+pub const MIN_NODE_MINOR: u32 = 6;
 
 /// The pinned Node version aoe downloads when no host Node is found.
 /// Bumping this requires bumping the SHA-256 below at the same time.
@@ -112,10 +115,15 @@ fn verify_path(path: &Path, source: NodeSource) -> Result<ResolvedNode, NodeErro
     })
 }
 
-fn parse_major(raw: &str) -> Option<u32> {
-    let trimmed = raw.trim_start_matches('v');
-    let major_str = trimmed.split('.').next()?;
-    major_str.parse::<u32>().ok()
+fn parse_major_minor(raw: &str) -> Option<(u32, u32)> {
+    let trimmed = raw.trim().trim_start_matches('v');
+    let mut parts = trimmed.split('.');
+    let major = parts.next()?.parse::<u32>().ok()?;
+    let minor = parts
+        .next()
+        .and_then(|m| m.parse::<u32>().ok())
+        .unwrap_or(0);
+    Some((major, minor))
 }
 
 /// Whether a raw `node --version` string satisfies [`MIN_NODE_MAJOR`].
@@ -123,7 +131,9 @@ fn parse_major(raw: &str) -> Option<u32> {
 /// proven compatible" rather than as a pass. The spawn path and
 /// `aoe acp doctor` share this so their verdicts cannot diverge.
 pub fn meets_minimum(raw: &str) -> Option<bool> {
-    parse_major(raw).map(|major| major >= MIN_NODE_MAJOR)
+    parse_major_minor(raw).map(|(major, minor)| {
+        major > MIN_NODE_MAJOR || (major == MIN_NODE_MAJOR && minor >= MIN_NODE_MINOR)
+    })
 }
 
 fn which(binary: &str) -> Option<PathBuf> {
@@ -305,19 +315,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_major_handles_v_prefix_and_unprefixed() {
-        assert_eq!(parse_major("v22.21.0"), Some(22));
-        assert_eq!(parse_major("v20.0.0"), Some(20));
-        assert_eq!(parse_major("18.17.1"), Some(18));
-        assert_eq!(parse_major("not a version"), None);
+    fn parse_major_minor_handles_v_prefix_and_short_forms() {
+        assert_eq!(parse_major_minor("v22.21.0"), Some((22, 21)));
+        assert_eq!(parse_major_minor("20"), Some((20, 0)));
+        assert_eq!(parse_major_minor("18.17.1"), Some((18, 17)));
+        assert_eq!(parse_major_minor("not a version"), None);
     }
 
     #[test]
     fn meets_minimum_is_inclusive_at_the_boundary() {
         for (raw, expected) in [
             (format!("v{}.9.9", MIN_NODE_MAJOR - 1), Some(false)),
-            (format!("v{MIN_NODE_MAJOR}.0.0"), Some(true)),
-            (format!("{MIN_NODE_MAJOR}.0.0"), Some(true)),
+            (
+                format!("v{MIN_NODE_MAJOR}.{}.9", MIN_NODE_MINOR - 1),
+                Some(false),
+            ),
+            (format!("v{MIN_NODE_MAJOR}.{MIN_NODE_MINOR}.0"), Some(true)),
+            (format!("{MIN_NODE_MAJOR}.{MIN_NODE_MINOR}.0"), Some(true)),
             (format!("v{}.0.0", MIN_NODE_MAJOR + 1), Some(true)),
             ("not a version".to_string(), None),
             (String::new(), None),
@@ -340,9 +354,13 @@ mod tests {
         let engines = json["engines"]["node"]
             .as_str()
             .expect("package.json declares engines.node");
-        let declared = parse_major(engines.trim_start_matches(">="))
+        let declared = parse_major_minor(engines.trim_start_matches(">="))
             .unwrap_or_else(|| panic!("unparseable engines.node range {engines:?}"));
-        assert_eq!(declared, MIN_NODE_MAJOR, "engines.node is {engines:?}");
+        assert_eq!(
+            declared,
+            (MIN_NODE_MAJOR, MIN_NODE_MINOR),
+            "engines.node is {engines:?}"
+        );
 
         // The runtime we download when the host has none must clear the
         // same bar, or `download` returns a Node `verify_path` rejects.

@@ -29,11 +29,12 @@ pub enum AcpCommands {
         #[arg(long)]
         fix: bool,
         /// Adapter to install with --fix (repeatable). Defaults to
-        /// claude-agent-acp. One of: claude-agent-acp, codex-acp, pi-acp.
+        /// claude-agent-acp. One of: claude-agent-acp, codex-acp, pi-acp,
+        /// aoe-agent.
         #[arg(
             long,
             requires = "fix",
-            value_parser = ["claude-agent-acp", "codex-acp", "pi-acp"]
+            value_parser = clap::builder::PossibleValuesParser::new(bundled_adapter_names())
         )]
         adapter: Vec<String>,
         /// Install every pinned adapter with --fix instead of just the
@@ -744,6 +745,15 @@ fn find_in_path(binary: &str) -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
+/// The `--adapter` values, kept equal to the bundled table so a newly
+/// bundled adapter is installable by name without a second list.
+fn bundled_adapter_names() -> Vec<&'static str> {
+    crate::acp::adapters::BUNDLED_ADAPTERS
+        .iter()
+        .map(|a| a.binary)
+        .collect()
+}
+
 pub(crate) fn command_present(command: &str) -> bool {
     // A `${aoe_data_dir}` placeholder resolves the way the spawn resolves it,
     // then the path is checked like any other (#3553).
@@ -762,10 +772,10 @@ pub(crate) fn command_present(command: &str) -> bool {
     } else {
         // PATH first, then the bundled adapter aoe installs on demand.
         find_in_path(command).is_some()
-            || crate::session::get_app_dir()
-                .ok()
-                .and_then(|app_dir| crate::acp::adapters::bundled_adapter_bin(&app_dir, command))
-                .is_some()
+            || crate::session::get_app_dir().ok().is_some_and(|app_dir| {
+                crate::acp::adapters::bundled_adapter_bin(&app_dir, command).is_some()
+                    && !crate::acp::adapters::installed_copy_is_stale(&app_dir, command)
+            })
     }
 }
 

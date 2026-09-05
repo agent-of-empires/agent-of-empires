@@ -1510,6 +1510,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         if let Ok(mut guard) = self.next_seqs.lock() {
             guard.remove(session_id);
         }
+        lock_recover(&self.lifecycle).forget(session_id);
     }
 
     /// Pre-populate `next_seqs` from `(session_id, max_seq)` pairs.
@@ -2091,7 +2092,9 @@ impl<S: BroadcastSink> Supervisor<S> {
         let known = lock_recover(&self.lifecycle)
             .last_generation(session_id)
             .max(on_disk);
-        let honored = marker != 0 && marker >= known;
+        // A zero marker was written for a runner from a pre-generation
+        // build; it is honored only while nothing newer has been admitted.
+        let honored = marker >= known && (marker != 0 || known == 0);
         crate::process::worker_registry::clear_restart_marker(session_id);
         if !honored {
             debug!(
@@ -2563,6 +2566,10 @@ impl<S: BroadcastSink> Supervisor<S> {
                             );
                             let _ = new_client.shutdown().await;
                             tear_down_runner(&*process_control, &session_id, identity).await;
+                            // The install may have gone through against a
+                            // handle that was already gone; do not leave the
+                            // epoch installed with nothing behind it.
+                            lock_recover(&lifecycle).release_running(&respawn_lease);
                             return;
                         }
                     }
@@ -6767,7 +6774,12 @@ cursor-acp-bridge = "agent acp"
         crate::process::worker_registry::mark_restart_pending("s-x", 0);
         assert!(
             !sup.take_late_restart_marker("s-x"),
-            "unbound markers never authorize"
+            "a legacy marker is stale once a newer generation was admitted"
+        );
+        crate::process::worker_registry::mark_restart_pending("s-legacy", 0);
+        assert!(
+            sup.take_late_restart_marker("s-legacy"),
+            "a legacy marker for a session this daemon never generated is honored once"
         );
     }
 
@@ -7244,7 +7256,9 @@ cursor-acp-bridge = "agent acp"
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn capacity_counts_pending_spawn_reservations() {
+        let _home = isolate_home();
         let sink = VecSink::new();
         let sup = Supervisor::with_capacity(sink, 2);
 

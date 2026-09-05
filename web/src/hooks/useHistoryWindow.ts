@@ -1,7 +1,12 @@
 import { useCallback, useMemo, useState } from "react";
 
 import type { ActivityRow } from "../lib/acpTypes";
-import { DEFAULT_HISTORY_WINDOW, HISTORY_WINDOW_STEP, historyWindow } from "../lib/acpHistoryWindow";
+import {
+  DEFAULT_HISTORY_WINDOW,
+  HISTORY_WINDOW_STEP,
+  canLoadEarlierFrom,
+  historyWindow,
+} from "../lib/acpHistoryWindow";
 
 export interface HistoryWindowState {
   /** The recent slice of `activity` to render. */
@@ -37,10 +42,12 @@ export function useHistoryWindow(
   // the DEFAULT window rather than being treated as growth (which would
   // render the whole first page instead of just its tail).
   const [anchorLen, setAnchorLen] = useState<number | null>(null);
+  const [anchorRowId, setAnchorRowId] = useState<string | null>(null);
   if (windowSessionId !== sessionId) {
     setWindowSessionId(sessionId);
     setVisibleRows(DEFAULT_HISTORY_WINDOW);
     setAnchorLen(activity.length > 0 ? activity.length : null);
+    setAnchorRowId(null);
   } else if (anchorLen === null) {
     if (activity.length > 0) setAnchorLen(activity.length);
   } else if (activity.length !== anchorLen) {
@@ -62,18 +69,12 @@ export function useHistoryWindow(
   // that prompt lands, the message's rendered part list shrinks sharply, and
   // assistant-ui's store reads a stale part index (#3707, the #3676 mechanism
   // without a `/clear`). A pin whose row is gone (retention trim) is dropped.
-  const [anchorRowId, setAnchorRowId] = useState<string | null>(null);
-  const [anchorSessionId, setAnchorSessionId] = useState(sessionId);
-  if (anchorSessionId !== sessionId) {
-    setAnchorSessionId(sessionId);
-    setAnchorRowId(null);
-  }
   const start = pinnedWindowStart(activity, computed.start, anchorRowId);
   const startRowId = start < activity.length ? (activity[start]?.id ?? null) : null;
-  if (startRowId !== anchorRowId && anchorSessionId === sessionId) {
+  if (startRowId !== anchorRowId && windowSessionId === sessionId) {
     setAnchorRowId(startRowId);
   }
-  const canLoadEarlier = start === computed.start ? computed.canLoadEarlier : start > 0;
+  const canLoadEarlier = canLoadEarlierFrom(activity, start, showClearedTurns);
   const windowedActivity = useMemo(() => (start === 0 ? activity : activity.slice(start)), [activity, start]);
   const loadEarlier = useCallback(() => setVisibleRows((v) => v + HISTORY_WINDOW_STEP), []);
   return { windowedActivity, canLoadEarlier, loadEarlier };

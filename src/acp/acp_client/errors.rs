@@ -142,13 +142,16 @@ pub(super) fn acp_error_from_value(error: serde_json::Value) -> agent_client_pro
 /// into a context reset, a false negative leaves the runner terminating
 /// with no recovery (#3560).
 pub(crate) fn is_unsupported_session_error(err: &agent_client_protocol::Error) -> bool {
+    const PHRASES: &[&str] = &[
+        "unsupported acp session",
+        "unsupported session",
+        "unknown session",
+        "session not found",
+        "no such session",
+        "session does not exist",
+    ];
     let msg = err.message.to_ascii_lowercase();
-    msg.contains("session")
-        && (msg.contains("unsupported")
-            || msg.contains("unknown")
-            || msg.contains("not found")
-            || msg.contains("no such")
-            || msg.contains("does not exist"))
+    PHRASES.iter().any(|phrase| msg.contains(phrase))
 }
 
 #[cfg(test)]
@@ -172,6 +175,8 @@ mod tests {
             ("transport closed", false),
             ("unsupported model", false),
             ("unknown tool", false),
+            ("Unsupported content block in session/prompt", false),
+            ("Method not found: session/prompt", false),
         ];
         for (msg, expected) in cases {
             assert_eq!(classify(msg), expected, "{msg:?}");

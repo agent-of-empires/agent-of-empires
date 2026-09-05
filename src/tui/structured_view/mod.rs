@@ -906,6 +906,17 @@ async fn handle_terminal_event(
                         format!("answered: {name}"),
                     )
                 }
+                Intent::ResolveApproval(decision)
+                    if pending.choice_list && !matches!(decision, ApprovalDecisionWire::Deny) =>
+                {
+                    set_toast(
+                        state,
+                        toast_deadline,
+                        "this request is a question: press 1-9 to answer or d to dismiss".into(),
+                        ToastKind::Info,
+                    );
+                    return Ok(false);
+                }
                 Intent::ResolveApproval(decision) => (
                     decision,
                     None,

@@ -203,13 +203,15 @@ pub fn peek_restart_marker(session_id: &str) -> Option<u64> {
     crate::process::worker::read_restart_marker(&path)
 }
 
-/// Consume the marker. Returns `true` only when it named `generation`,
-/// which must itself be known (non-zero); the file is removed either way
-/// so a stale marker cannot poison a later stop.
+/// Consume the marker. Returns `true` only when it named `generation`; a
+/// zero marker matches only a zero (pre-generation) identity, so a runner
+/// started by an older build keeps its restart authority across the
+/// upgrade. The file is removed either way so a stale marker cannot poison
+/// a later stop.
 pub fn take_restart_marker(session_id: &str, generation: u64) -> bool {
     let found = peek_restart_marker(session_id);
     clear_restart_marker(session_id);
-    generation != 0 && found == Some(generation)
+    found == Some(generation)
 }
 
 pub fn clear_restart_marker(session_id: &str) {
@@ -1100,8 +1102,13 @@ mod tests {
 
             mark_restart_pending("m", 0);
             assert!(
-                !take_restart_marker("m", 0),
-                "an unbound marker never authorizes a respawn"
+                !take_restart_marker("m", 7),
+                "a legacy marker grants nothing to a generation it did not name"
+            );
+            mark_restart_pending("m", 0);
+            assert!(
+                take_restart_marker("m", 0),
+                "a legacy marker restarts a legacy (pre-generation) runner"
             );
 
             let path = restart_marker_path("m").unwrap();

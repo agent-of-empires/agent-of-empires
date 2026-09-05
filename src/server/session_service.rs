@@ -1457,7 +1457,7 @@ impl SessionService {
     ///    never overlap; where both are genuinely needed, take this one first.
     ///
     /// One input escapes the hold: `acp_prompt` samples `woke_idle_dormant`
-    /// from `touch_on_prompt_and_wake_if_sunk` before claiming the guard,
+    /// from `touch_and_wake_on_prompt` before claiming the guard,
     /// because that helper takes `instance_lock`. A stale `true` only forces
     /// `send_turn`'s resume trigger, which answers `AlreadyResuming` or
     /// `AlreadyRunning` for a worker that is already there, so it costs a
