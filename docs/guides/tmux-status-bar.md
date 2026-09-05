@@ -135,7 +135,10 @@ set -g status-right "#{@aoe_title} #{@aoe_branch} #{@aoe_sandbox} | %H:%M"
 
 ### Status bar shows old info
 
-The tmux user options are set when the session starts. If you rename a session in aoe, the status bar will show the old name until you restart the session.
+Renaming a session refreshes `@aoe_title` on its agent pane straight away. The
+paired terminal and container panes keep the old title, and `@aoe_branch` keeps
+the old branch after a tied worktree branch rename, until those sessions are
+restarted.
 
 ### Branch not showing
 

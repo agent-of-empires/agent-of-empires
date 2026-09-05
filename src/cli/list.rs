@@ -77,7 +77,7 @@ pub(super) fn state_tag(inst: &Instance) -> &'static str {
 }
 
 /// Mirrors the API's snooze surfacing rule (`SessionResponse::from_instance`,
-/// `src/server/api/sessions.rs`): expose `snoozed_until` only while
+/// `src/server/api/sessions/model.rs`): expose `snoozed_until` only while
 /// [`Instance::is_snoozed`] holds. An expired deadline stays persisted until
 /// the next mutation rewrites it, so without this gate a woken row would keep
 /// advertising a snooze that already ended. Shared by `session show --json`

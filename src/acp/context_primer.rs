@@ -283,8 +283,12 @@ pub fn build_context_primer(events: &[(u64, Event)], opts: PrimerOptions) -> Con
                 // Track rate-limit terminal so the post-loop step can
                 // recover the user's unsent prompt as
                 // `unprocessed_prompt` instead of rendering it in the
-                // transcript as if the agent had processed it.
-                ended_non_success = reason == "rate_limited";
+                // transcript as if the agent had processed it. The
+                // redelivery cap publishes a second `Stopped` over the
+                // adapter's, and the prompt is no more processed for it
+                // (#3688), so that reason carries the flag too.
+                ended_non_success = reason == "rate_limited"
+                    || reason == crate::server::acp_reconciler::RATE_LIMIT_EXHAUSTED_RETRIES_REASON;
             }
             Event::AgentStartupError { .. } => {
                 // Startup errors are also non-success terminals: the
@@ -1160,6 +1164,38 @@ mod tests {
         );
         // Only the prior successful turn remains.
         assert_eq!(primer.included_turn_count, 1);
+    }
+
+    #[test]
+    fn unprocessed_prompt_survives_the_redelivery_cap_park() {
+        // #3688: the cap publishes a second `Stopped` over the adapter's
+        // `rate_limited` one. The prompt is no more processed for it, and the
+        // give-up banner's own "Continue in another agent" CTA reads this
+        // primer, so losing it here hands the new backend a recap that shows
+        // the pending request as answered history.
+        let events = vec![
+            user_event(1, "earlier turn"),
+            assistant_event(2, "earlier reply"),
+            stopped_event(3),
+            user_event(4, "Refactor the auth middleware."),
+            rate_limited_stop(5),
+            (
+                6,
+                Event::Stopped {
+                    reason: crate::server::acp_reconciler::RATE_LIMIT_EXHAUSTED_RETRIES_REASON
+                        .into(),
+                },
+            ),
+        ];
+        let primer = build_context_primer(&events, PrimerOptions::default());
+        assert_eq!(
+            primer.unprocessed_prompt.as_deref(),
+            Some("Refactor the auth middleware.")
+        );
+        assert!(
+            !primer.text.contains("Refactor the auth middleware."),
+            "the burned prompt must not be rendered as history the agent answered"
+        );
     }
 
     #[test]

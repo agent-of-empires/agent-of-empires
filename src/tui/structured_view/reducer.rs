@@ -463,6 +463,7 @@ mod tests {
                 image: false,
                 audio: false,
                 embedded_context: false,
+                load_session: None,
             },
             Event::CancelRequested {
                 escalates_at: Utc::now(),

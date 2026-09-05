@@ -1,5 +1,6 @@
 //! Session management module
 
+mod anchored_fs;
 pub mod artifacts;
 pub mod attach_project;
 pub mod builder;
@@ -7,15 +8,12 @@ pub(crate) mod capture;
 pub mod cityhall_bundle;
 pub mod civilizations;
 pub(crate) mod claim;
-// Discovery of on-disk Claude Code sessions. Lives here (not under the
-// serve-gated `acp` module) because terminal/tmux import via the CLI works in
-// every build; only the structured-view import path needs `serve`.
+// Discovery of on-disk Claude Code sessions. Lives here rather than under
+// `acp` because terminal/tmux import via the CLI does not involve ACP.
 pub mod claude_import;
 pub mod config;
-pub(crate) mod container_config;
 // Depends on `crate::acp` (Event / event store) and is only driven from the
-// serve daemon, both of which are serve-gated. See #2808.
-#[cfg(feature = "serve")]
+// serve daemon. See #2808.
 pub mod conversation_summary;
 pub mod deletion;
 pub(crate) mod environment;
@@ -23,20 +21,15 @@ pub mod fork;
 mod groups;
 pub mod idle_reap;
 mod instance;
-pub mod mcp_model;
-pub mod mcp_overrides;
-pub mod mcp_state;
+pub mod mcp;
+mod move_journal;
 pub mod poller;
-pub mod profile_config;
-pub mod project_mcp;
 pub mod projects;
 pub(crate) mod recovery;
-pub mod repo_config;
 pub mod restart;
 pub mod scope;
 pub mod scratch;
 pub(crate) mod serde_helpers;
-pub mod settings_schema;
 pub mod skills_model;
 pub mod smart_rename;
 pub mod stop;
@@ -46,16 +39,18 @@ pub(crate) mod sync;
 pub(crate) mod test_support;
 pub mod trash;
 pub mod worktree_edit;
+pub mod worktree_reconcile;
 
 pub use crate::sound::SoundConfig;
 pub use crate::status_hooks::StatusHookConfig;
+pub(crate) use anchored_fs::AnchoredDir;
 pub(crate) use capture::is_valid_session_id;
 pub use config::{
     get_telemetry_settings, get_update_settings, load_config, update_app_state, update_config,
     validate_snooze_duration, AgentRuntimeConfig, AttachMode, CapabilityGrant, ClickAction, Config,
-    ContainerRuntimeName, DefaultTerminalMode, GroupByMode, PluginConfig, RowTagMode,
-    SandboxConfig, SessionConfig, TelemetryConfig, ThemeConfig, TmuxSettingMode, UpdatesConfig,
-    VolumeIgnoresStrategy, WorktreeConfig,
+    ContainerRuntimeName, DefaultTerminalMode, GroupByMode, NewSessionMode, PluginConfig,
+    RowTagMode, SandboxConfig, SessionConfig, TelemetryConfig, ThemeConfig, TmuxSettingMode,
+    UpdatesConfig, VolumeIgnoresStrategy, WorktreeConfig,
 };
 pub(crate) use environment::user_shell;
 pub use environment::{validate_env_entries, validate_env_entry};
@@ -72,19 +67,27 @@ pub use groups::{
     ARCHIVED_SECTION_PATH, SCRATCH_GROUP_NAME, SCRATCH_GROUP_PATH, TRASH_SECTION_NAME,
     TRASH_SECTION_PATH,
 };
-pub(crate) use instance::ResumeAttemptPolicy;
 pub(crate) use instance::{
     duplicate_session_error, find_duplicate_session, is_duplicate_session,
     persist_omp_session_to_storage, persist_session_to_storage, PassiveStatusPatch, ResumeIntent,
     SidWrite, NEWER_GENERATION_BUSY_REASON,
 };
+pub(crate) use instance::{
+    generic_host_config_path_for, sidecar_host_config_path_for, ResumeAttemptPolicy,
+    TerminalContextResume,
+};
 pub use instance::{
-    is_valid_session_color, EnsureReadyError, EnsureReadyOutcome, Instance, LaunchSidOutcome,
-    LifecycleOperation, LifecycleReservation, LifecycleReservationError, PluginCreateIdempotency,
-    SandboxInfo, SessionBucket, StartOutcome, Status, TerminalInfo, View, WorkspaceInfo,
-    WorkspaceRepo, WorktreeInfo, SESSION_COLORS, TMUX_SESSION_GONE_ERROR,
+    is_valid_session_color, DetectionState, EnsureReadyError, EnsureReadyOutcome, Instance,
+    LaunchSidOutcome, LifecycleOperation, LifecycleReservation, LifecycleReservationError,
+    PluginCreateIdempotency, SandboxInfo, SessionBucket, StartOutcome, Status, TerminalInfo, View,
+    WorkspaceInfo, WorkspaceRepo, WorktreeInfo, SESSION_COLORS, TMUX_SESSION_GONE_ERROR,
+};
+#[cfg(test)]
+pub(crate) use move_journal::{
+    record as record_move_journal, MoveJournalEntry, MOVE_JOURNAL_VERSION,
 };
 pub(crate) use storage::acquire_session_identity_lock;
+pub(crate) use storage::{reconcile_profile_duplicates, DuplicateIdReport};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -123,22 +126,25 @@ pub fn set_favorites_first(on: bool) {
     FAVORITES_FIRST.store(on, Ordering::Relaxed);
 }
 
-pub use profile_config::{
+pub use config::profile_config::{
     load_profile_config, merge_configs, resolve_config, resolve_config_or_warn,
-    save_profile_config, validate_check_interval, validate_env_format, validate_memory_limit,
-    validate_network_format, validate_port_mapping_format, validate_volume_format, ProfileConfig,
+    save_profile_config, validate_capability_format, validate_check_interval, validate_env_format,
+    validate_memory_limit, validate_network_format, validate_port_mapping_format,
+    validate_security_opt_format, validate_volume_format, ProfileConfig,
 };
-pub use projects::{Project, ProjectScope};
-pub use recovery::HookTimeoutScope;
-pub use repo_config::{
+pub use config::repo_config::{
     check_repo_trust, execute_hooks, execute_hooks_in_container, load_repo_config,
     merge_repo_config, profile_to_repo_config, repo_config_to_profile, resolve_config_with_repo,
     resolve_config_with_repo_or_warn, save_repo_config, trust_repo, HookTimeout, HooksConfig,
     RepoConfig, RepoTrust, TrustSurface,
 };
+pub use projects::{Project, ProjectScope};
+pub use recovery::HookTimeoutScope;
 pub use scope::SessionScope;
 pub(crate) use storage::{
-    acquire_session_title_lock, atomic_write, resolve_symlink_chain, StorageFlock,
+    acquire_session_title_lock, acquire_storage_flock, acquire_storage_shared_flock, atomic_write,
+    read_file_no_follow, replace_file_no_follow, resolve_symlink_chain, GroupMovePlan,
+    StorageFlock, STORAGE_LOCK_FILENAME,
 };
 pub use storage::{
     load_recent_projects, load_workspace_ordering, recent_project_entry_for, record_recent_project,
@@ -702,8 +708,8 @@ pub fn probe_global_config() -> ConfigProbe {
 /// Same shape as [`probe_global_config`] but for a profile's `config.toml`.
 pub fn probe_profile_config(profile: &str) -> ConfigProbe {
     probe(
-        || profile_config::load_profile_config(profile),
-        profile_config::profile_config_ignored_keys,
+        || config::profile_config::load_profile_config(profile),
+        config::profile_config::profile_config_ignored_keys,
     )
 }
 
@@ -1482,10 +1488,10 @@ mod tests {
         let unknown_dir = dir.join("profiles").join("does-not-exist");
         assert!(!unknown_dir.exists());
 
-        let cfg = crate::session::profile_config::load_profile_config("does-not-exist")
+        let cfg = crate::session::config::profile_config::load_profile_config("does-not-exist")
             .expect("loading config for an unknown profile must succeed with defaults");
         assert!(
-            !crate::session::profile_config::profile_has_overrides(&cfg),
+            !crate::session::config::profile_config::profile_has_overrides(&cfg),
             "unknown profile must load to defaults",
         );
         assert!(

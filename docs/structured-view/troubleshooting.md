@@ -35,10 +35,10 @@ handshake times out after 30s.
 
 ### `aoe acp doctor` says Node is missing
 
-Install Node.js 20 or newer:
+Install Node.js 22 or newer:
 
 - macOS: `brew install node`
-- Linux: `apt install nodejs` or `nvm install 20`
+- Linux: `apt install nodejs` or `nvm install 22`
 - Windows: download from <https://nodejs.org/>
 
 Then re-run `aoe acp doctor` to verify. If you have Node installed in a
@@ -47,9 +47,10 @@ non-standard location, set `AOE_ACP_NODE=/path/to/node` or configure
 
 ### `aoe acp doctor` says aoe-agent is missing
 
-`aoe-agent` ships with the aoe binary. If the doctor reports it missing, your
-install is incomplete. Reinstall aoe via your package manager (e.g.,
-`brew reinstall aoe`).
+`aoe-agent` is not packaged with the aoe binary yet (#3553). The default
+structured-view agent is `claude-code`; leave `acp.default_agent` on an adapter
+that `aoe acp doctor` reports as installed, or build `acp-worker/aoe-agent`
+yourself and point the registry command at it.
 
 ### `aoe acp doctor` says claude-code adapter is missing
 
@@ -115,13 +116,19 @@ resolves, or symlink the binary into a standard dir (`/usr/local/bin`,
 ### "Project path no longer exists" banner
 
 The session's working directory was renamed, moved, or deleted out from under
-`aoe serve` (most often a `git worktree move` or a manual `mv`). Two ways to
+`aoe serve` (most often a `git worktree move` or a manual `mv`). Three ways to
 recover:
 
-1. **Restore the directory at the path the banner shows** (e.g.
+1. **Restart `aoe serve`.** For an aoe-managed worktree relocated with
+   `git worktree move`, the daemon repairs `project_path` from
+   `git worktree list` on startup and the banner clears on its own. This does
+   not cover a plain `mv` (see the worktrees guide), does not happen while the
+   daemon keeps running, and is skipped entirely on a read-only daemon, which
+   never writes `sessions.json`.
+2. **Restore the directory at the path the banner shows** (e.g.
    `git worktree move <new> <old>`, or recreate the dir), then click **Retry**.
    Transcript continuity is preserved.
-2. **Stop `aoe serve`**, edit `project_path` for this session in
+3. **Stop `aoe serve`**, edit `project_path` for this session in
    `~/.agent-of-empires/profiles/<profile>/sessions.json` to point at the new
    location (update `worktree_info.branch` too if the branch was renamed), then
    start `aoe serve` again. History and `acp_session_id` are preserved; the
@@ -178,9 +185,20 @@ The setting is editable in the structured view settings (TUI and web
 dashboard) and can be overridden per profile. Resume fires once the reported
 reset time plus a fixed 15-second cushion passes, and the reset time survives
 an `aoe serve` restart. With no reported reset time, resume retries an hour
-after the park; if the limit has not cleared the session re-parks and the next
-retry is another hour out. The manual "Continue in another agent" and reconnect paths
-stay available regardless of the setting.
+after the park, and each further attempt waits twice as long as the last: 1h,
+2h, 4h, 8h, 16h. A quota that is exhausted for days is then retried on a
+schedule that matches it, instead of once an hour forever.
+
+Auto-resume re-sends the interrupted prompt each time, so it stops after five
+re-sends that all come back rate-limited. Those five span 31 hours, so a limit
+that clears overnight is still picked up. The banner then reads "Auto-resume
+stopped: the same prompt was re-sent too many times without getting through",
+and the session stays put rather than burning the same turn indefinitely. The park itself resets the count, so recovering from it starts a
+fresh five whether you use "Resume now" or send a new prompt. A completed turn
+and an agent switch reset it too, and "Resume now" retries never count against
+it. A prompt sent before auto-resume gives up does not reset anything: it
+continues on whatever is left of the five. The manual "Continue in another
+agent" and reconnect paths stay available regardless of the setting.
 
 ### Switching agents manually
 

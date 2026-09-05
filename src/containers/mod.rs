@@ -5,11 +5,13 @@ mod runtime;
 pub(crate) mod runtime_base;
 pub mod stats;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::cli::truncate_id;
 use crate::session::{Config, ContainerRuntimeName};
-pub use container_interface::{ContainerConfig, EnvEntry, NamedVolumeMount, VolumeMount};
+pub use container_interface::{
+    ContainerConfig, EnvEntry, NamedVolumeMount, RunPolicy, VolumeMount,
+};
 use error::Result;
 pub use runtime::ContainerRuntime;
 
@@ -166,6 +168,15 @@ impl DockerContainer {
         self.runtime.container_working_dir(&self.name)
     }
 
+    pub fn sandbox_store_generation_matches(&self) -> Result<Option<bool>> {
+        self.runtime.sandbox_store_generation_matches(&self.name)
+    }
+
+    pub fn mount_fingerprint_matches(&self, config: &ContainerConfig) -> Result<Option<bool>> {
+        self.runtime
+            .mount_fingerprint_matches(&self.name, &config.mount_fingerprint())
+    }
+
     pub fn build_create_args(&self, config: &ContainerConfig) -> Vec<String> {
         self.runtime
             .build_create_args(&self.name, &self.image, config)
@@ -232,6 +243,44 @@ impl DockerContainer {
         }
     }
 
+    /// Remove the named ignore volumes a worktree move stranded (#3742).
+    ///
+    /// `names` is an allowlist, and the caller owns what belongs in it;
+    /// `stranded_named_ignore_volumes` computes it. Must be called before the create,
+    /// while no container holds the volumes.
+    ///
+    /// Logs at `info`: this is an irreversible delete of a build cache, and a wrong one
+    /// would otherwise reach the user as an unexplained cold rebuild with nothing to
+    /// attribute it to. Runtimes without named volumes never reach that log, since
+    /// `named_ignore_volumes` stays populated there while the mounts render as
+    /// anonymous, so there is nothing to delete.
+    pub fn remove_stranded_named_ignore_volumes(&self, session_id: &str, names: &[String]) {
+        if names.is_empty() || !self.runtime.base.supports_named_volumes {
+            return;
+        }
+        tracing::info!(
+            target: "containers.runtime",
+            %session_id,
+            ?names,
+            "reclaiming named ignore volumes stranded by a worktree move"
+        );
+        let names: HashSet<&str> = names.iter().map(String::as_str).collect();
+        let prefix = format!("aoe-vi-{}-", session_id);
+        if let Err(e) = self
+            .runtime
+            .base
+            .remove_named_ignore_volumes_in(&prefix, &names)
+        {
+            tracing::warn!(
+                target: "containers.runtime",
+                name = %self.name,
+                %session_id,
+                error = %e,
+                "failed to remove stranded named ignore volumes"
+            );
+        }
+    }
+
     /// Force-remove this container, then sweep its named ignore volumes.
     ///
     /// Idempotent: a container that is already gone yields
@@ -253,9 +302,11 @@ impl DockerContainer {
     /// Idempotent counterpart to [`Self::teardown`]: same removal and
     /// classification, but the session-scoped named ignore volumes
     /// (`aoe-vi-{session_id}-*`, e.g. `target/`, `node_modules/`) are left
-    /// intact so the recreated container re-attaches them on next start.
-    /// Used on the worktree-move discard path where the container is dropped
-    /// to pick up a new bind mount and will be recreated immediately.
+    /// intact so the recreated container re-attaches the ones whose container
+    /// path is unchanged. Used on the worktree-move discard path where the
+    /// container is dropped to pick up a new bind mount and will be recreated
+    /// immediately; [`Self::remove_stranded_named_ignore_volumes`] reclaims the rest
+    /// at that create.
     ///
     /// The same invariant as [`Self::teardown`] applies: callers must invoke
     /// this unconditionally and act on the returned outcome; it must never

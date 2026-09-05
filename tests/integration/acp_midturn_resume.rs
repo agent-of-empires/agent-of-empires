@@ -1,7 +1,7 @@
 //! Mid-turn `aoe serve` reattach: integration coverage for the daemon
-//! side of the fix. Stands up a UNIX socket fronted by a byte-proxy to a
-//! Node ACP shim (so we exercise the real `AcpClient::attach` →
-//! `connect_via_socket` → ACP `initialize` path) and asserts:
+//! side of the fix. Stands up the production runner around a Node ACP shim
+//! so the real `AcpClient::attach`, control connection, and ACP
+//! `initialize` path are exercised. It asserts:
 //!
 //! 1. `attach` with `in_flight_turn = true` synthesizes
 //!    `Event::Stopped { reason: "reattach_idle" }` after the configured
@@ -14,10 +14,10 @@
 //! Skipped automatically if `node` is not on PATH.
 //!
 //! Note: the parent `main.rs` only compiles this module under
-//! `cfg(all(feature = "serve", debug_assertions))`. Debug-only because
+//! `cfg(debug_assertions)`. Debug-only because
 //! the watchdog grace is tunable via `AOE_RESUME_IDLE_GRACE_MS` only
 //! under `cfg(debug_assertions)` (see `resume_idle_grace()` in
-//! `src/structured view/acp_client.rs`); release builds would wait the full
+//! `src/acp/acp_client/connection.rs`); release builds would wait the full
 //! 10s production default and fail the 3s assertion below.
 
 use std::time::{Duration, Instant};
@@ -27,16 +27,6 @@ use agent_of_empires::acp::state::{AcpSessionId, Event};
 
 use crate::common::{shim_ready, spawn_runner_with_shim};
 
-/// Spawn the shim and bridge its stdio to a UNIX listener. Mimics what
-/// `aoe __acp-runner` does in production: byte-proxy, no protocol
-/// awareness. Accepts exactly one connection per call so we don't have
-/// to coordinate listener lifetime with the test's drain logic.
-///
-/// If `preseed_session_id` is `Some`, the shim pre-creates that session
-/// id so `AcpClient::attach` (Resume mode) can immediately send prompts
-/// without going through `session/new`.
-///
-/// Returns the listener path; the bridge task is detached.
 async fn drain_for_stopped_reason(client: &mut AcpClient, deadline: Instant) -> Option<String> {
     while Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(200), client.next_event()).await {
@@ -187,16 +177,9 @@ async fn attach_in_flight_disarms_after_first_inbound_notification() {
     );
 }
 
-/// End-to-end socket transport: attach to the runner-style bridge,
-/// send a prompt, and confirm the shim's response round-trips back as
-/// `AgentMessageChunk` + `Stopped` events. This replaces the
-/// `shim_agent_round_trips_via_unix_socket` test deleted in the
-/// worker-persistence redesign. It does NOT exercise the production
-/// `spawn_runner_detached` path (which requires a built `aoe` binary
-/// with the `__acp-runner` subcommand registered, and so belongs
-/// in `tests/e2e/`); it does exercise everything downstream:
-/// `AcpClient` socket connection, ACP `initialize` handshake,
-/// `session/prompt` round-trip, and event mapping.
+/// Attach to a production runner around the shim, send a prompt, and
+/// confirm the response returns as `AgentMessageChunk` and `Stopped`
+/// events through the v3 control transport.
 #[tokio::test]
 async fn socket_transport_round_trips_prompt_via_attach() {
     if let Err(reason) = shim_ready() {

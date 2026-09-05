@@ -38,14 +38,19 @@ Survival across restart means a daemon on a new binary could re-adopt workers ru
 
 ## Who owns the state
 
-The daemon does, since the server-ownership arc (`../server-owned-sv-state.md`). It folds the event stream once per WS connection into two projections and pushes both, so neither client re-derives them:
+The daemon folds the event stream once per WebSocket connection into two
+projections, so clients do not re-derive them:
 
 - **Control state**: turn flags, pending approvals and elicitations, usage, plan, modes, slash commands. Shipped as `{"kind":"reduced_state","seq","state":<AcpState>,"unchanged":[...]}` on connect and after every event. `unchanged` names the cold fields (commands, modes, config options, recent diffs, background agents) the socket already holds, which the daemon omits rather than re-serializing; a client keeps what it has for those. The connect frame is folded over the WHOLE session even when the client dials with a `since` cursor, because it is a whole-state snapshot the clients adopt verbatim.
 - **Transcript rows**: `{"kind":"transcript_snapshot","rows":[...]}` on connect plus a `{"kind":"transcript_delta", ...}` (`Append` / `Patch` / `Remove`, reconciled by row id) per event, and `GET /api/sessions/{id}/acp/replay?view=rows` for history. Presentation stays client-side: markdown, tool cards, path shortening, diff rendering.
 
 Raw event frames still stream for what the daemon does not model (the worker-lifecycle latches, monitor and wakeup badges, the usage cost baseline, rejected prompts, the web's optimistic turn counters). A client that reads only the projections can pass `?frames=0` to skip them; the native view does, so reopening a long session no longer ships it the whole event log. A `notice` row carries a failed startup, a dead turn, a refused mode switch, or a rate-limit auto-resume; the native view renders it inline and the web skips it, since the web shows the same information as a dismissible banner.
 
-The daemon also owns the send / steer / queue decision (`../server-owned-prompt-dispatch.md`). `POST /acp/prompt` runs `acp::dispatch::decide` over its own control state and answers `{"disposition":"sent"|"steered"|"queued","reason":...,"queued_id":...}` instead of a bare 202; a parked prompt lands on the server-owned queue and the turn-end drain delivers it. Neither client predicts the outcome, so the four incidents that decision encodes (a steerable agent taking a mid-turn prompt #2805, a prompt mid-cancel restarting the runner #1727, `/compact` swallowing a steered message #3219, an idle-dormant worker woken by the POST itself #1689) are fixed once rather than per client.
+The daemon also owns prompt dispatch. `POST /acp/prompt` runs
+`acp::dispatch::decide` and returns `sent`, `steered`, or `queued`. The
+server-owned queue persists follow-ups until its turn-end drain delivers them.
+Cancelling and compacting turns are always queued; a dormant worker is sent the
+prompt so the request can wake it.
 
 ## Conversation persistence and context primer
 
@@ -88,7 +93,7 @@ Three layers recover a turn that stops progressing, in increasing depth:
 
 ## Rate-limit handling
 
-When the backend reports `errorKind: "rate_limit"` on `session/prompt`, aoe treats it as a clean terminal state, not a crash: it emits a typed `RateLimit` event (banner reads its reset time) plus `Stopped { reason: "rate_limited" }`, drops the worker handle, and does not respawn. Earlier behavior respawned into the same limit and burned the restart budget. A daemon restart respects the parked signal in the event log. `RateLimitInfo.resets_at` is optional: it is filled only from a reset the agent attributed to a window it rejected (claude-agent-acp forwards that on a `usage_update`'s `_meta._claude/rateLimit`, never in the error itself), and stays `None` otherwise so no fabricated time reaches the UI (#3152). Optional opt-in `[acp] rate_limit_auto_resume` has the reconciler resume the same worker once `resets_at` plus a fixed 15s grace passes, or an hour after the park when no reset was reported; it is vendor-agnostic and bounded by a minimum park window so a misbehaving adapter cannot drive a respawn loop. The banner's "Continue in another agent" CTA runs the agent-switch path below.
+When the backend reports `errorKind: "rate_limit"` on `session/prompt`, aoe treats it as a clean terminal state, not a crash: it emits a typed `RateLimit` event (banner reads its reset time) plus `Stopped { reason: "rate_limited" }`, drops the worker handle, and does not respawn. Earlier behavior respawned into the same limit and burned the restart budget. A daemon restart respects the parked signal in the event log. `RateLimitInfo.resets_at` is optional: it is filled only from a reset the agent attributed to a window it rejected (claude-agent-acp forwards that on a `usage_update`'s `_meta._claude/rateLimit`, never in the error itself), and stays `None` otherwise so no fabricated time reaches the UI (#3152). Optional opt-in `[acp] rate_limit_auto_resume` has the reconciler resume the same worker once `resets_at` plus a fixed 15s grace passes, or, when no reset was reported, an hour after the park with the wait doubling per redelivery already spent (1h, 2h, 4h, 8h, 16h, so the cap's five attempts span 31 hours rather than five, #3688); it is vendor-agnostic and bounded by a minimum park window so a misbehaving adapter cannot drive a respawn loop. Each resume re-delivers the interrupted prompt once (`pending_initial_turn`, #3028); that redelivery is capped at 5 per streak, so a limit that keeps rejecting parks the session on a terminal `Stopped { reason: "rate_limit_exhausted_retries" }` instead of re-sending the same prompt forever (#3688). The streak is counted from the persisted `RateLimitAutoResumed` breadcrumbs since the last organic turn end or agent switch, skipping manual RESUME NOW resumes and any whose spawn failed before the redelivery landed; see `EventStore::rate_limit_redelivery_streak`. The park has no schedule, so nothing un-parks it on a timer: `dispatch::decide` treats it like idle dormancy, which is what makes the banner's "send a new prompt" true, and a prompt already on the server queue when the cap fires releases the park through `reap_rate_limit_resumes` instead. The streak is kept in a per-session row outside the pruned transcript, so `acp.replay_events` cannot evict it at any supported history cap; sessions that predate the row derive from the log until their next relevant event plants one. The banner's "Continue in another agent" CTA runs the agent-switch path below.
 
 ## Crash-loop park
 
@@ -112,13 +117,13 @@ Profiles are conservative: an unverified tool surface is omitted rather than gue
 - `fs/read_text_file` / `fs/write_text_file`: agents never touch the disk directly; aoe reads and writes on their behalf and enforces sandbox roots (the session's worktree plus any explicit `--repo` paths).
 - `terminal/*`: the command runs in aoe's process, in the worktree, or inside the sandbox container via `docker exec`.
 - Approval nonces are server-generated and single-use; a compromised agent cannot synthesize one. `AOE_TOKEN` is not forwarded to the agent subprocess.
-- **Sandboxed sessions** wrap the agent argv in `docker exec`; the daemon stays on the host. `fs/*` requests are translated from container paths to host paths before the inside-roots check; the unix socket stays on the host and the runner proxies the agent's stdio across the boundary (no socket bind-mount; reserved for a future socket-native agent). Path translation only covers the workspace mount(s); config/credential/`extra_volumes` mounts are not in the path map but are rejected by the worktree-only inside-roots check anyway. The `aoe-sandbox` image must bundle the ACP adapters or the `docker exec` handshake times out after 30s (exit 127); see [Sandbox Internals](sandbox.md).
+- **Sandboxed sessions** wrap the agent argv in `docker exec`; the daemon stays on the host. `fs/*` requests are translated from container paths to host paths before the inside-roots check; the unix socket stays on the host and the runner proxies the agent's stdio across the boundary. Path translation only covers the workspace mounts; config, credential, and `extra_volumes` mounts are rejected by the worktree-only inside-roots check. The image must bundle the ACP adapters or the handshake exits with status 127.
 
 ## Global tuning (`[acp]`)
 
 ```toml
 [acp]
-default_agent = "aoe-agent"
+default_agent = "claude-code"
 approval_timeout_secs = 300
 destructive_require_double_confirm = true
 max_concurrent_workers = 100

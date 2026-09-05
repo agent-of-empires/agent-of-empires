@@ -17,12 +17,11 @@
 //! Without the fix this test hangs until the 45s prompt deadline and panics;
 //! with it, the prompt is accepted once the worker is recovered.
 //!
-//! Compiled only with the default `serve` feature (excluded by `--no-default-features`). Run via:
+//! Run via:
 //!
 //! ```sh
 //! cargo test --features e2e-tests --test e2e -- acp_orphan_runner_recovery
 //! ```
-#![cfg(feature = "serve")]
 
 use std::time::{Duration, Instant};
 

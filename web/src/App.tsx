@@ -2171,9 +2171,6 @@ function AppContent({
 
   return (
     <AcpPrefsProvider value={acpPrefs}>
-      {/* The daemon now owns the prompt queue and drains it server-side even
-          with no tab open, so the old headless background drainers are gone.
-          See docs/development/server-side-prompt-queue.md. */}
       <div className="h-dvh flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">
         {/* Wrapped unconditionally, not behind the `headerCollapsible`
             ternary: swapping the element type at this position would remount

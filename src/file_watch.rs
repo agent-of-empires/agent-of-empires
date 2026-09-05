@@ -40,7 +40,7 @@ use tokio::sync::mpsc;
 /// `Option<WatchIdentity>` because the entry is inserted with
 /// `refcount=0` before `watcher.watch` runs, so `None` represents the
 /// pre-install transient state. Consumers (e.g. `DiskWatchEntry` in
-/// `tui/home/mod.rs`) only construct their entries after a successful
+/// `tui/home/watchers.rs`) only construct their entries after a successful
 /// `subscribe_channel`, so they store a bare `WatchIdentity` and use
 /// `unwrap_or_default()` to record `(0, 0, None)` / `()` when the
 /// install-time stat fails; that sentinel self-heals on the next

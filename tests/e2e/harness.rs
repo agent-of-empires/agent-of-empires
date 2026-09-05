@@ -11,7 +11,6 @@
 //! convert it to a GIF via `agg`. Recordings are saved to
 //! `target/e2e-recordings/`. Both `asciinema` and `agg` must be on `$PATH`.
 
-#[cfg(feature = "serve")]
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -122,7 +121,6 @@ macro_rules! require_tmux {
 }
 pub(crate) use require_tmux;
 
-#[cfg(feature = "serve")]
 pub fn node_available() -> bool {
     Command::new("node")
         .arg("--version")
@@ -134,7 +132,6 @@ pub fn node_available() -> bool {
 /// Skip the calling test if Node.js is not installed. Acp e2e tests
 /// drive the shared `web/tests/helpers/fakeAcpAgent.mjs` fake agent, which
 /// is a Node script; without Node the worker can't speak ACP.
-#[cfg(feature = "serve")]
 macro_rules! require_node {
     () => {
         if !$crate::harness::node_available() {
@@ -143,7 +140,6 @@ macro_rules! require_node {
         }
     };
 }
-#[cfg(feature = "serve")]
 pub(crate) use require_node;
 
 // ---------------------------------------------------------------------------
@@ -161,7 +157,6 @@ pub(crate) use require_node;
 /// whichever daemon lost. Remembering what we have already issued closes the
 /// in-process half of the race; the ephemeral bind still covers ports taken by
 /// unrelated processes.
-#[cfg(feature = "serve")]
 pub fn pick_free_port() -> u16 {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
@@ -185,7 +180,6 @@ pub fn pick_free_port() -> u16 {
 /// `aoe serve --daemon` returns as soon as it has spawned the child, so a
 /// successful exit doesn't prove the child bound the port; this is the
 /// real signal that the daemon is up.
-#[cfg(feature = "serve")]
 pub fn wait_for_port(port: u16, timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
@@ -354,6 +348,7 @@ update_check_mode = "off"
 [app_state]
 has_seen_welcome = true
 has_responded_to_telemetry = true
+has_acknowledged_agent_hooks = true
 last_seen_version = "{}"
 "#,
             env!("CARGO_PKG_VERSION")
@@ -439,6 +434,8 @@ last_seen_version = "{}"
     /// shim (the daemon -> runner -> node spawn chain does not reliably
     /// propagate process env). Also sets the runner-socket timeout high
     /// so a contended CI box doesn't trip the spawn deadline.
+    /// The generated shim embeds Node's real executable because the isolated
+    /// home cannot initialize user-scoped version-manager shims.
     pub fn install_acp_shim(&mut self, fake_acp_script: &Path) {
         self.install_acp_shim_inner(fake_acp_script, None);
     }
@@ -464,6 +461,20 @@ last_seen_version = "{}"
             "fake ACP agent not found at {}",
             fake_agent.display()
         );
+        let node = Command::new("node")
+            .args(["-p", "process.execPath"])
+            .output()
+            .expect("resolve Node executable");
+        assert!(
+            node.status.success(),
+            "node could not resolve process.execPath: {}",
+            String::from_utf8_lossy(&node.stderr)
+        );
+        let node = String::from_utf8(node.stdout)
+            .expect("Node executable path is UTF-8")
+            .trim()
+            .to_string();
+        assert!(!node.is_empty(), "node returned an empty process.execPath");
         let debug_log = app_dir_in(self.home_dir.path()).join("fake-acp.log");
         // Bake the fork-fail knob into the shim (not the daemon env) so it
         // survives the daemon's env_clear + allowlist when spawning the worker.
@@ -479,11 +490,12 @@ last_seen_version = "{}"
             })
             .unwrap_or_default();
         let script = format!(
-            "#!/bin/sh\nexport FAKE_ACP_SCRIPT=\"{}\"\nexport FAKE_ACP_DEBUG_LOG=\"{}\"\n{}{}exec node \"{}\" \"$@\"\n",
+            "#!/bin/sh\nexport FAKE_ACP_SCRIPT=\"{}\"\nexport FAKE_ACP_DEBUG_LOG=\"{}\"\n{}{}exec \"{}\" \"{}\" \"$@\"\n",
             fake_acp_script.display(),
             debug_log.display(),
             fork_fail_line,
             capture_line,
+            node,
             fake_agent.display(),
         );
         for name in ["claude", "claude-agent-acp", "aoe-agent"] {

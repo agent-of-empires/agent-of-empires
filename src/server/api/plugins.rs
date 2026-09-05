@@ -189,7 +189,7 @@ pub async fn plugin_commands() -> Json<serde_json::Value> {
 
 /// `GET /api/plugins/ui-state`: the plugin host's aggregated UI-state snapshot
 /// (the slots workers have pushed, plus the notification ring). Empty when no
-/// host is running (read-only mode, or a TUI-only build with no daemon). The
+/// host is running (read-only mode). The
 /// dashboard polls this alongside `/api/sessions` and renders each slot itself.
 pub async fn plugin_ui_state(
     State(state): State<std::sync::Arc<AppState>>,

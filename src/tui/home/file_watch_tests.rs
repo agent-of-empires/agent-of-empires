@@ -21,10 +21,12 @@ use crate::file_watch::FileWatchService;
 use crate::session::test_support::isolate_home;
 use crate::session::{Instance, Storage};
 
-fn watcher_err(profile: Option<&str>, message: &str) -> super::WatcherInitError {
-    super::WatcherInitError {
+fn watcher_err(profile: Option<&str>, message: &str) -> super::watchers::WatcherInitError {
+    super::watchers::WatcherInitError {
         profile: profile.map(str::to_owned),
-        kind: super::WatcherInitErrorKind::Watch(crate::file_watch::WatchErrorKind::Other),
+        kind: super::watchers::WatcherInitErrorKind::Watch(
+            crate::file_watch::WatchErrorKind::Other,
+        ),
         message: message.to_owned(),
     }
 }
@@ -175,7 +177,7 @@ async fn config_subscriptions_remove_then_recreate_does_not_leak_or_double_subsc
     )
     .expect("HomeView::new");
 
-    use super::ConfigWatchKey;
+    use super::watchers::ConfigWatchKey;
 
     view.rewire_config_subscriptions(&["cfg-leak".to_string()]);
     let baseline = live.subscriber_count();
@@ -217,7 +219,7 @@ async fn config_subscriptions_remove_then_recreate_does_not_leak_or_double_subsc
 #[tokio::test]
 #[serial]
 async fn rewire_config_subscriptions_does_not_resurrect_deleted_profile_dir() {
-    use super::ConfigWatchKey;
+    use super::watchers::ConfigWatchKey;
     let temp = TempDir::new().expect("tempdir");
     let _home = isolate_home(temp.path());
 
@@ -280,7 +282,7 @@ async fn reload_storage_only_keeps_disk_watch_scoped_in_single_profile_mode() {
 
     view.reload_storage_only().expect("reload");
 
-    use super::ConfigWatchKey;
+    use super::watchers::ConfigWatchKey;
     assert_eq!(
         view.disk_watch.handles.len(),
         1,
@@ -344,7 +346,7 @@ async fn rewire_after_profile_delete_keeps_disk_watch_scoped_in_single_profile_m
 
     view.rewire_after_profile_delete("peer-deleted");
 
-    use super::ConfigWatchKey;
+    use super::watchers::ConfigWatchKey;
     assert_eq!(
         view.disk_watch.handles.len(),
         1,
@@ -847,16 +849,16 @@ fn reload_failure_re_arms_when_error_kind_changes() {
     use crate::file_watch::WatchErrorKind;
     let mut state = super::ReloadFailureState::default();
 
-    state.apply_disk_watcher_init_pass(Some(super::WatcherInitError {
+    state.apply_disk_watcher_init_pass(Some(super::watchers::WatcherInitError {
         profile: Some("p".to_string()),
-        kind: super::WatcherInitErrorKind::Watch(WatchErrorKind::ResourceExhausted),
+        kind: super::watchers::WatcherInitErrorKind::Watch(WatchErrorKind::ResourceExhausted),
         message: "EMFILE".to_string(),
     }));
     state.acknowledge_dialog();
 
-    state.apply_disk_watcher_init_pass(Some(super::WatcherInitError {
+    state.apply_disk_watcher_init_pass(Some(super::watchers::WatcherInitError {
         profile: Some("p".to_string()),
-        kind: super::WatcherInitErrorKind::Watch(WatchErrorKind::Permission),
+        kind: super::watchers::WatcherInitErrorKind::Watch(WatchErrorKind::Permission),
         message: "EACCES".to_string(),
     }));
     assert!(
@@ -876,16 +878,16 @@ fn reload_failure_ack_persists_when_message_drifts_but_kind_is_stable() {
     use crate::file_watch::WatchErrorKind;
     let mut state = super::ReloadFailureState::default();
 
-    state.apply_disk_watcher_init_pass(Some(super::WatcherInitError {
+    state.apply_disk_watcher_init_pass(Some(super::watchers::WatcherInitError {
         profile: Some("p".to_string()),
-        kind: super::WatcherInitErrorKind::Watch(WatchErrorKind::ResourceExhausted),
+        kind: super::watchers::WatcherInitErrorKind::Watch(WatchErrorKind::ResourceExhausted),
         message: "Too many open files (os error 24)".to_string(),
     }));
     state.acknowledge_dialog();
 
-    state.apply_disk_watcher_init_pass(Some(super::WatcherInitError {
+    state.apply_disk_watcher_init_pass(Some(super::watchers::WatcherInitError {
         profile: Some("p".to_string()),
-        kind: super::WatcherInitErrorKind::Watch(WatchErrorKind::ResourceExhausted),
+        kind: super::watchers::WatcherInitErrorKind::Watch(WatchErrorKind::ResourceExhausted),
         message: "EMFILE: watch descriptor 8192 exhausted on /tmp/p".to_string(),
     }));
     assert!(
@@ -903,16 +905,16 @@ fn reload_failure_re_arms_when_kind_crosses_watch_resolution_boundary() {
     use crate::file_watch::WatchErrorKind;
     let mut state = super::ReloadFailureState::default();
 
-    state.apply_config_watcher_init_pass(Some(super::WatcherInitError {
+    state.apply_config_watcher_init_pass(Some(super::watchers::WatcherInitError {
         profile: None,
-        kind: super::WatcherInitErrorKind::Watch(WatchErrorKind::Backend),
+        kind: super::watchers::WatcherInitErrorKind::Watch(WatchErrorKind::Backend),
         message: "subscribe failed".to_string(),
     }));
     state.acknowledge_dialog();
 
-    state.apply_config_watcher_init_pass(Some(super::WatcherInitError {
+    state.apply_config_watcher_init_pass(Some(super::watchers::WatcherInitError {
         profile: None,
-        kind: super::WatcherInitErrorKind::Resolution,
+        kind: super::watchers::WatcherInitErrorKind::Resolution,
         message: "app dir resolution failed".to_string(),
     }));
     assert!(
@@ -1114,7 +1116,7 @@ async fn try_present_reload_failure_dialog_skips_while_foreign_dialog_occupies_s
 #[tokio::test]
 #[serial]
 async fn rewire_config_subscriptions_install_loop_skips_missing_profile_dir() {
-    use super::ConfigWatchKey;
+    use super::watchers::ConfigWatchKey;
     let temp = TempDir::new().expect("tempdir");
     let _home = isolate_home(temp.path());
 
@@ -1362,7 +1364,7 @@ async fn rewire_config_invalidates_on_inode_change_with_same_canonical_path() {
     )
     .expect("HomeView::new");
 
-    use super::ConfigWatchKey;
+    use super::watchers::ConfigWatchKey;
     let identity_before = view
         .config_watch
         .handles

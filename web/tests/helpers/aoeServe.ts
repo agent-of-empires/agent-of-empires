@@ -1,7 +1,7 @@
 // Live-backend test harness for Playwright.
 //
 // `spawnAoeServe()` boots a real `aoe serve` subprocess against an isolated
-// filesystem root (`HOME`, `XDG_CONFIG_HOME`, `TMPDIR`, `TMUX_TMPDIR`) and a
+// filesystem root (`HOME`, the XDG bases, `TMPDIR`, `TMUX_TMPDIR`) and a
 // per-worker port range, returns a `ServeHandle`, and cleans up after the
 // test via `stop()`. Designed for fresh-process-per-test isolation: each
 // test gets its own root, its own port, its own tmux socket.
@@ -10,8 +10,6 @@
 // Playwright's `testInfo`). Port and TMUX_TMPDIR are derived deterministically
 // so parallel workers never collide. tmux is contained inside the test's
 // HOME tree, so cleanup is a simple `rm -rf home`.
-//
-// See `docs/development/playwright.md` for the full recipe.
 
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync, mkdtempSync, writeFileSync, chmodSync, mkdirSync, realpathSync, rmSync } from "node:fs";
@@ -20,6 +18,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
 import { expect } from "@playwright/test";
+import { isolateEnv } from "./isolatedEnv";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -102,7 +101,7 @@ export interface ServeHandle {
   /** Directory prepended to PATH (contains the fake `claude` shim). */
   shimBin: string;
   /**
-   * The exact env (isolated HOME / XDG_CONFIG_HOME / TMPDIR / PATH with the
+   * The exact env (isolated HOME / XDG bases / TMPDIR / PATH with the
    * shim) the daemon and seed ran with. Specs that drive `aoe` CLI
    * subprocesses against the same isolated state (e.g. `aoe session rename`
    * from a peer process) MUST pass this as `spawnSync(..., { env })`. Passing
@@ -183,6 +182,35 @@ export async function listSessions(
   if (Array.isArray(body)) return body;
   if (body && Array.isArray(body.sessions)) return body.sessions;
   throw new Error(`GET /api/sessions returned an unexpected shape: ${JSON.stringify(body).slice(0, 200)}`);
+}
+
+/**
+ * Poll `GET /api/sessions` until at least one session is present, and
+ * return the snapshot the poll settled on. The list is a cache the
+ * daemon reconciles on a 2s tick (see `waitForView` below), so a fresh
+ * `listSessions()` issued right after a poll that already saw the
+ * session can come back empty; reading the array from inside the poll
+ * removes that second, racy fetch.
+ */
+export async function waitForSessions(
+  baseUrl: string,
+  timeout = 15_000,
+): Promise<Awaited<ReturnType<typeof listSessions>>> {
+  let settled: Awaited<ReturnType<typeof listSessions>> = [];
+  await expect
+    .poll(
+      async () => {
+        settled = await listSessions(baseUrl);
+        return settled.length;
+      },
+      {
+        timeout,
+        intervals: [100, 200, 400],
+        message: `at least one session should appear in GET /api/sessions within ${timeout}ms`,
+      },
+    )
+    .toBeGreaterThan(0);
+  return settled;
 }
 
 /**
@@ -272,11 +300,10 @@ export function resolveAoeBinary(): string {
   const fromEnv = process.env.AOE_E2E_BINARY;
   if (fromEnv && existsSync(fromEnv)) return fromEnv;
   const repoRoot = resolve(__dirname, "..", "..", "..");
-  // Prefer release if both exist (CI builds release by default), fall
-  // back to debug for local `cargo build` flows.
-  const release = join(repoRoot, "target", "release", "aoe");
-  if (existsSync(release)) return release;
-  return join(repoRoot, "target", "debug", "aoe");
+  // Live tests require debug-only timing overrides. CI also supplies a debug binary.
+  const debug = join(repoRoot, "target", "debug", "aoe");
+  if (existsSync(debug)) return debug;
+  return join(repoRoot, "target", "release", "aoe");
 }
 
 /**
@@ -285,7 +312,7 @@ export function resolveAoeBinary(): string {
  * `cfg!(debug_assertions)`; we can't query it from JS, so we derive it
  * from the build directory in the path. CI passes the binary via
  * `AOE_E2E_BINARY` so this works in CI; locally it falls through to the
- * release/debug heuristic in `resolveAoeBinary`.
+ * debug/release fallback in `resolveAoeBinary`.
  */
 export function tmuxPrefixFor(binaryPath: string): "aoe_" | "aoe_dev_" {
   return binaryPath.includes("/target/debug/") ? "aoe_dev_" : "aoe_";
@@ -499,7 +526,8 @@ function writeFakeAcpShim(
         : name === "codex-acp" || name === "codex"
           ? [...scriptLines, "export FAKE_ACP_IMPERSONATE=codex"]
           : scriptLines;
-    const script = `#!/bin/bash\n${perName.join("\n")}\nexec node ${JSON.stringify(fakeAgentJs)} "$@"\n`;
+    // The isolated home cannot initialize user-scoped Node version-manager shims.
+    const script = `#!/bin/bash\n${perName.join("\n")}\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(fakeAgentJs)} "$@"\n`;
     const path = join(binDir, name);
     writeFileSync(path, script);
     chmodSync(path, 0o755);
@@ -565,12 +593,17 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
   const shortBase = process.platform === "win32" ? tmpdir() : "/tmp";
   const home = realpathSync(mkdtempSync(join(shortBase, `aoe-pw-w${opts.workerIndex}-p${opts.parallelIndex}-`)));
   const xdg = join(home, "config");
+  const xdgData = join(home, "share");
   const tmp = join(home, "tmp");
   const tmuxTmp = join(home, "tmux");
   const shimBin = join(home, "bin");
-  for (const dir of [xdg, tmp, tmuxTmp, shimBin]) {
+  for (const dir of [xdg, xdgData, tmp, tmuxTmp, shimBin]) {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
+  const appDir = appDirFor(home, xdg, aoeBinary);
+  mkdirSync(appDir, { recursive: true, mode: 0o700 });
+  // General live tests exercise launches, not the one-time TUI approval flow.
+  writeFileSync(join(appDir, "config.toml"), "[app_state]\nhas_acknowledged_agent_hooks = true\n");
   const fakeAcpDebugLog = join(home, "fake-acp.log");
   if (opts.acp) {
     writeFakeAcpShim(shimBin, opts.fakeAcpScript, fakeAcpDebugLog, opts.extraEnv);
@@ -581,11 +614,9 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
   const authMode: AuthMode = opts.authMode ?? "none";
 
   const seedEnv: NodeJS.ProcessEnv = {
-    ...process.env,
-    HOME: home,
-    XDG_CONFIG_HOME: xdg,
-    TMPDIR: tmp,
-    TMUX_TMPDIR: tmuxTmp,
+    // The isolated HOME is only isolated if nothing overrides where the agents
+    // read their config and data from. See `isolatedEnv.ts`.
+    ...isolateEnv(process.env, { home, xdgConfig: xdg, xdgData, tmp, tmuxTmp }),
     PATH: `${shimBin}:${process.env.PATH ?? ""}`,
     // Lift the runner-socket appearance deadline. The `aoe
     // __acp-runner` shim re-execs the debug `aoe` binary, which
@@ -818,11 +849,7 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
           // aoe binds its own `-S <socket>` (#2608), not the default socket
           // under TMUX_TMPDIR, so kill the server on that explicit socket.
           spawnSync("tmux", ["-S", tmuxSocketPath(home), "kill-server"], {
-            env: {
-              ...process.env,
-              HOME: home,
-              TMUX_TMPDIR: join(home, "tmux"),
-            },
+            env: seedEnv,
             stdio: "ignore",
           });
         } catch {

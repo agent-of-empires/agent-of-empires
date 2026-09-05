@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-#[cfg(feature = "serve")]
 use std::process::{Child, ChildStdin, Command, Stdio};
 
 pub(super) use super::unix::{
@@ -51,8 +50,11 @@ pub(super) fn build_children_map() -> HashMap<u32, Vec<u32>> {
 
 /// One `/proc` walk deciding, for each candidate `i`, whether a live process
 /// belongs to it: an `/proc/<pid>/environ` *entry* exactly equals
-/// `env_needles[i]` (NUL-delimited, so no prefix-collision), or
-/// `/proc/<pid>/cmdline` contains `cmdline_needles[i]`. `environ` is owner-only,
+/// `env_needles[i]` (NUL-delimited, so no prefix-collision), and
+/// `/proc/<pid>/cmdline` contains `cmdline_needles[i]` when both are supplied.
+/// An executable needle matches an exact argv-token basename. A candidate with
+/// one signal uses that one; otherwise every supplied signal must match.
+/// `environ` is owner-only,
 /// so only same-uid processes (our agent children among them) contribute an
 /// environment match. Skips entries that vanish or are unreadable mid-scan;
 /// stops early once every candidate is matched. Best-effort: an unreadable
@@ -60,6 +62,7 @@ pub(super) fn build_children_map() -> HashMap<u32, Vec<u32>> {
 pub(super) fn processes_matching(
     env_needles: &[String],
     cmdline_needles: &[Option<String>],
+    executable_needles: &[Option<String>],
 ) -> Vec<bool> {
     let n = env_needles.len();
     let mut found = vec![false; n];
@@ -83,7 +86,12 @@ pub(super) fn processes_matching(
             environ.split('\0').filter(|s| !s.is_empty()).collect();
 
         let cmd_raw = fs::read(dir.join("cmdline")).unwrap_or_default();
-        let cmdline = String::from_utf8_lossy(&cmd_raw).replace('\0', " ");
+        let cmdline_raw = String::from_utf8_lossy(&cmd_raw);
+        let cmd_tokens: Vec<&str> = cmdline_raw
+            .split('\0')
+            .filter(|value| !value.is_empty())
+            .collect();
+        let cmdline = cmdline_raw.replace('\0', " ");
 
         for i in 0..n {
             if found[i] {
@@ -94,7 +102,27 @@ pub(super) fn processes_matching(
             let cmd_hit = cmdline_needles[i]
                 .as_deref()
                 .is_some_and(|s| !s.is_empty() && cmdline.contains(s));
-            if env_hit || cmd_hit {
+            let executable_hit = executable_needles[i].as_deref().is_some_and(|needle| {
+                !needle.is_empty()
+                    && cmd_tokens.iter().any(|token| {
+                        std::path::Path::new(token)
+                            .file_name()
+                            .and_then(|value| value.to_str())
+                            == Some(needle)
+                    })
+            });
+            let has_env = !env_needles[i].is_empty();
+            let has_cmd = cmdline_needles[i]
+                .as_deref()
+                .is_some_and(|value| !value.is_empty());
+            let has_executable = executable_needles[i]
+                .as_deref()
+                .is_some_and(|value| !value.is_empty());
+            let matched = (has_env || has_cmd || has_executable)
+                && (!has_env || env_hit)
+                && (!has_cmd || cmd_hit)
+                && (!has_executable || executable_hit);
+            if matched {
                 found[i] = true;
                 remaining -= 1;
             }
@@ -315,13 +343,11 @@ fn parse_stat_field(content: &str, field_idx: usize) -> Option<i64> {
 
 /// Prevents user-idle system sleep by holding a `systemd-inhibit` block lock.
 /// `--what=idle:sleep` blocks idle sleep only (the display still sleeps).
-#[cfg(feature = "serve")]
 pub(super) struct SystemdInhibitor {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
 }
 
-#[cfg(feature = "serve")]
 impl SystemdInhibitor {
     pub(super) fn new() -> Self {
         Self {
@@ -331,7 +357,6 @@ impl SystemdInhibitor {
     }
 }
 
-#[cfg(feature = "serve")]
 impl super::SleepInhibit for SystemdInhibitor {
     fn acquire(&mut self) -> anyhow::Result<()> {
         if super::sleep_inhibit_unavailable() {

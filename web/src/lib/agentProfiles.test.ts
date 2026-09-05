@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_AGENT_PROFILE, isClearAlias, isSubagentToolName, resolveAgentProfile } from "./agentProfiles";
+import {
+  DEFAULT_AGENT_PROFILE,
+  isClearAlias,
+  isSubagentToolName,
+  resolveAgentLifecycle,
+  resolveAgentProfile,
+} from "./agentProfiles";
 
 describe("resolveAgentProfile", () => {
   it("resolves known agent keys", () => {
@@ -12,6 +18,7 @@ describe("resolveAgentProfile", () => {
     expect(resolveAgentProfile("pi").key).toBe("pi");
     expect(resolveAgentProfile("omp").key).toBe("omp");
     expect(resolveAgentProfile("kimi").key).toBe("kimi");
+    expect(resolveAgentProfile("prime-agent").key).toBe("prime-agent");
     expect(resolveAgentProfile("aoe-agent").key).toBe("aoe-agent");
   });
 
@@ -46,6 +53,25 @@ describe("resolveAgentProfile", () => {
     expect(p.capabilities.skills).toBe(false);
     expect(p.capabilities.wakeup).toBe(false);
     expect(p.parentMetaNamespaces).toEqual([]);
+  });
+
+  it("aoe-agent claims no claude specials despite bundling claude as a provider", () => {
+    // Regression for #1904: this profile used to spread CLAUDE, so the view
+    // advertised subagent indentation, the claude specialised cards, and the
+    // legacy mode picker for an adapter whose surface is Read / Write / Bash.
+    const p = resolveAgentProfile("aoe-agent");
+    expect(p.capabilities).toEqual({
+      todos: false,
+      skills: false,
+      wakeup: false,
+      subagents: false,
+      legacyModeFallback: false,
+      heartbeatKeepalives: false,
+    });
+    expect(p.parentMetaNamespaces).toEqual([]);
+    expect(p.specialTitles).toEqual({ skillNames: [], scheduleNames: [], harnessNames: [] });
+    // No subagent card by wire name either: nothing actually runs.
+    expect(isSubagentToolName("task", p)).toBe(false);
   });
 
   it("omp uses its native ACP clear boundary without guessed capabilities", () => {
@@ -83,6 +109,39 @@ describe("resolveAgentProfile", () => {
     expect(p.aliases.read).toContain("read_file");
     expect(p.aliases.read).toContain("read_many_files");
     expect(p.aliases.fetch).toEqual(["web_fetch"]);
+  });
+});
+
+describe("resolveAgentLifecycle", () => {
+  it("marks gemini deprecated with the antigravity replacement", () => {
+    const lifecycle = resolveAgentLifecycle("gemini");
+    expect(lifecycle.state).toBe("deprecated");
+    expect(lifecycle.since).toBe("2026-06-18");
+    expect(lifecycle.note).toContain("consumer accounts cut off by Google");
+    expect(lifecycle.replacement).toBe("antigravity");
+  });
+
+  it("resolves active for every other registered key", () => {
+    // Table over the remaining mirror keys; all must be plain Active.
+    const cases = ["claude", "claude-code", "codex", "opencode", "vibe", "pi", "omp", "kimi", "aoe-agent"];
+    for (const key of cases) {
+      expect(resolveAgentLifecycle(key).state).toBe("active");
+      expect(resolveAgentLifecycle(key).since).toBeUndefined();
+    }
+  });
+
+  it("falls back to active for unknown / nullish keys", () => {
+    const cases = [undefined, null, "", "custom-agent"] as const;
+    for (const key of cases) {
+      expect(resolveAgentLifecycle(key)).toEqual({ state: "active" });
+    }
+  });
+
+  it("mirrors the profile lifecycle field for deprecated entries", () => {
+    // The static flag on AgentProfile and the resolver must agree, so a
+    // consumer reading either source sees the same state.
+    expect(resolveAgentProfile("gemini").lifecycle).toEqual(resolveAgentLifecycle("gemini"));
+    expect(DEFAULT_AGENT_PROFILE.lifecycle).toBeUndefined();
   });
 });
 

@@ -15,6 +15,16 @@ export interface AcpScrollState {
   top: number;
 }
 
+export function restoredScrollTop(
+  saved: AcpScrollState | null,
+  stillPinned: boolean,
+  scrollHeight: number,
+  clientHeight: number,
+): number | null {
+  if (!saved || saved.stuck) return stillPinned ? scrollHeight : null;
+  return Math.max(0, Math.min(saved.top, scrollHeight - clientHeight));
+}
+
 export function saveScrollState(sessionId: string, state: AcpScrollState): void {
   if (!sessionId) return;
   // Best-effort: if the write fails (quota), the reader just gets the default.

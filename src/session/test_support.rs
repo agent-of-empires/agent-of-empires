@@ -192,6 +192,40 @@ impl Drop for EnvGuard {
     }
 }
 
+/// Install a PATH command that remains first after the test pane starts its
+/// login shell.
+pub(crate) fn install_login_shell_path_command(root: &Path, name: &str, script: &str) -> EnvGuard {
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).expect("create test bin directory");
+    let executable = bin.join(name);
+    std::fs::write(&executable, script).expect("write test command");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+            .expect("make test command executable");
+    }
+
+    let bin_text = bin.to_str().expect("temporary test path must be UTF-8");
+    std::fs::write(
+        root.join(".profile"),
+        format!(
+            "export PATH={}:$PATH\n",
+            crate::session::environment::shell_escape(bin_text)
+        ),
+    )
+    .expect("write test login profile");
+    let path = std::env::join_paths(
+        std::iter::once(bin).chain(
+            std::env::var_os("PATH")
+                .iter()
+                .flat_map(|value| std::env::split_paths(value)),
+        ),
+    )
+    .expect("join test PATH");
+    EnvGuard::set(&[("PATH", path), ("SHELL", OsString::from("/bin/sh"))])
+}
+
 /// Restores the process-global tied-worktree setting even when a test panics.
 ///
 /// Declare this after the app-directory isolation guard. Rust drops locals in
@@ -233,6 +267,46 @@ impl Drop for TieWorkdirToNameGuard {
                 target: "session.test",
                 "failed to restore tie_workdir_to_name after test: {error}"
             );
+        }
+        if self._lock.is_some() {
+            ENV_LOCK_HELD.with(|held| held.set(false));
+        }
+    }
+}
+
+#[must_use = "AutoResumeGuard restores config on Drop"]
+pub(crate) struct AutoResumeGuard {
+    previous: bool,
+    _lock: Option<MutexGuard<'static, ()>>,
+}
+
+impl AutoResumeGuard {
+    pub(crate) fn set(enabled: bool) -> Self {
+        let lock = acquire_env_lock();
+        let previous = super::config::load_config()
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .session
+            .auto_resume_on_restart;
+        let guard = Self {
+            previous,
+            _lock: lock,
+        };
+        super::config::update_config(|config| {
+            config.session.auto_resume_on_restart = enabled;
+        })
+        .unwrap();
+        guard
+    }
+}
+
+impl Drop for AutoResumeGuard {
+    fn drop(&mut self) {
+        if let Err(error) = super::config::update_config(|config| {
+            config.session.auto_resume_on_restart = self.previous;
+        }) {
+            tracing::warn!(target: "session.test", "failed to restore auto_resume_on_restart: {error}");
         }
         if self._lock.is_some() {
             ENV_LOCK_HELD.with(|held| held.set(false));
@@ -314,11 +388,10 @@ fn restore_or_remove(key: &str, prev: Option<OsString>) {
     //      matching `serial_test::serial(...)` group, because the mutex
     //      excludes guards across every group (and across un-annotated
     //      tests). `EnvGuard` shims a caller-chosen key (today also
-    //      `CODEX_HOME`, `VIBE_HOME`, `GEMINI_CLI_HOME`,
-    //      `CLAUDE_CONFIG_DIR`, the sibling `*_CONFIG_DIR` overrides, and
-    //      `AOE_MOUSE_CAPTURE`), so no fixed grep list can bound which
-    //      readers might race; routing every env mutation through the
-    //      guard is what keeps that open set safe.
+    //      `CODEX_HOME`, `GEMINI_CLI_HOME`, `CLAUDE_CONFIG_DIR`, the sibling
+    //      `*_CONFIG_DIR` overrides, and `AOE_MOUSE_CAPTURE`), so no fixed grep
+    //      list can bound which readers might race. Routing every env mutation
+    //      through the guard is what keeps that open set safe.
     //   2. The `#[tokio::test]` sites that use this helper all run on
     //      the default single-threaded runtime; no worker task reads env
     //      concurrently with the mutation.

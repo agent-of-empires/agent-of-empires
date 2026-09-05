@@ -215,7 +215,7 @@ pub const GEMINI: AgentProfile = AgentProfile {
     supports_wakeup_tools: false,
     emits_heartbeat_keepalives: false,
     // gemini-cli surfaces its YOLO approval mode over `gemini --acp` with
-    // the `yolo` id (see the CurrentModeUpdate mapping in acp_client.rs).
+    // the `yolo` id (see the CurrentModeUpdate mapping in acp_client/update_events.rs).
     yolo_mode_id: Some("yolo"),
 };
 
@@ -274,19 +274,62 @@ pub const KIMI: AgentProfile = AgentProfile {
     yolo_mode_id: Some("yolo"),
 };
 
-/// aoe's bundled multi-provider agent. Treated as Claude-equivalent
-/// for now (Vercel AI SDK 6 with Claude as one of the providers); the
-/// claude_capabilities subset is the safest reference until aoe-agent
-/// has its own conventions.
+/// PrimeIntellect Prime Agent via native `prime-agent --mode acp`. One ACP
+/// session per process is an upstream limit; a second `session/new` is
+/// refused rather than silently sharing state. Extensions (subagents,
+/// goals, gates) travel in a reverse-domain `_meta` envelope
+/// (`ai.primeintellect.prime-agent`), but only session-info envelopes are
+/// documented; tool-call parent linkage is not, so indentation stays off.
+/// `/new` exists as a TUI command, but its ACP-side clear semantics are
+/// unobserved, so clear aliases stay empty until then.
+pub const PRIME_AGENT: AgentProfile = AgentProfile {
+    key: "prime-agent",
+    parent_meta_namespaces: &[],
+    clear_aliases: &[],
+    clear_requires_driven_reset: false,
+    supports_exit_plan_mode: false,
+    supports_wakeup_tools: false,
+    emits_heartbeat_keepalives: false,
+    yolo_mode_id: None,
+};
+
+/// aoe's own multi-provider agent (Vercel AI SDK 7), at
+/// `acp-worker/aoe-agent/src/index.ts`. Every field below is read off that
+/// source, which is a much smaller surface than Claude's: three tools
+/// (Read, Write, Bash), no `_meta` on any event, no plan mode, no
+/// ScheduleWakeup, no heartbeats, and a `session/set_mode` that is a stub
+/// returning `{}`. It used to inherit `..CLAUDE`, which claimed all of
+/// those; the structured view then advertised subagent indentation and a
+/// mode picker the adapter cannot honor. See #1904.
 pub const AOE_AGENT: AgentProfile = AgentProfile {
     key: "aoe-agent",
-    // Deliberately NOT inherited from CLAUDE: aoe-agent is multi-provider, and
-    // nobody has checked whether its clear rotates an observable session id the
-    // way claude-agent-acp fails to. Driving a reset on an adapter that already
-    // handles the alias natively would double-reset it, so it stays on the
-    // forward path until someone verifies it.
-    clear_requires_driven_reset: false,
-    ..CLAUDE
+    // The adapter sets no `_meta` on its tool_call notifications at all, so
+    // there is no namespace to look up and child tool calls cannot be linked
+    // to a parent. Populate this only once the adapter emits linkage.
+    parent_meta_namespaces: &[],
+    clear_aliases: &["/clear"],
+    // Same defect class as codex-acp: the adapter has no clear handler of any
+    // kind, so a forwarded `/clear` is answered as an ordinary prompt and the
+    // model keeps its whole history while AoE draws a clear divider. Driving
+    // the reset via `session/new` mints an id we can persist and does reset
+    // the in-memory history.
+    //
+    // Known hole: the adapter reseeds from `${AOE_ARTIFACT_DIR}/transcript.jsonl`
+    // on `session/load`, and that file still holds the pre-clear turns, so a
+    // worker restart after a clear resurrects the cleared context. Fixing that
+    // means truncating the transcript on reset, tracked separately.
+    clear_requires_driven_reset: true,
+    // No ExitPlanMode tool and no mode channel; no ScheduleWakeup or cron
+    // tools. Synthesising Plan or WakeupScheduled events here would fire on
+    // nothing.
+    supports_exit_plan_mode: false,
+    supports_wakeup_tools: false,
+    emits_heartbeat_keepalives: false,
+    // `session/set_mode` is `() => ({})`: it accepts any id and changes
+    // nothing, and the adapter advertises no modes. Claiming Claude's
+    // `bypassPermissions` made YOLO look applied when nothing was gated by
+    // the adapter at all, so keep it a documented no-op.
+    yolo_mode_id: None,
 };
 
 /// Permissive default for unknown registry keys: no claude-specific
@@ -317,6 +360,7 @@ pub fn resolve(key: &str) -> &'static AgentProfile {
         "pi" => &PI,
         "omp" => &OMP,
         "kimi" => &KIMI,
+        "prime-agent" => &PRIME_AGENT,
         "aoe-agent" => &AOE_AGENT,
         _ => &DEFAULT,
     }
@@ -353,6 +397,7 @@ mod tests {
         assert_eq!(resolve("pi").key, "pi");
         assert_eq!(resolve("omp").key, "omp");
         assert_eq!(resolve("kimi").key, "kimi");
+        assert_eq!(resolve("prime-agent").key, "prime-agent");
         assert_eq!(resolve("aoe-agent").key, "aoe-agent");
     }
 
@@ -377,7 +422,15 @@ mod tests {
         }
         // Adapters whose default/mode approval behavior is unverified fail
         // closed to unattended, and unknown keys never count as reviewed.
-        for key in ["opencode", "vibe", "pi", "omp", "unknown-agent", ""] {
+        for key in [
+            "opencode",
+            "vibe",
+            "pi",
+            "omp",
+            "prime-agent",
+            "unknown-agent",
+            "",
+        ] {
             assert!(!is_reviewed(key), "{key} should not be reviewed");
         }
     }
@@ -393,7 +446,9 @@ mod tests {
             resolve("claude-code").yolo_mode_id,
             Some("bypassPermissions")
         );
-        assert_eq!(resolve("aoe-agent").yolo_mode_id, Some("bypassPermissions"));
+        // aoe-agent's `session/set_mode` is a stub that accepts any id and
+        // gates nothing, so it advertises no bypass mode (#1904).
+        assert_eq!(resolve("aoe-agent").yolo_mode_id, None);
         // Regression for #1142 and the @agentclientprotocol/codex-acp
         // migration: codex's bypass preset is `agent-full-access`, not
         // Claude's `bypassPermissions` or the old Zed adapter's `full-access`.
@@ -409,6 +464,7 @@ mod tests {
         assert_eq!(resolve("vibe").yolo_mode_id, None);
         assert_eq!(resolve("pi").yolo_mode_id, None);
         assert_eq!(resolve("omp").yolo_mode_id, None);
+        assert_eq!(resolve("prime-agent").yolo_mode_id, None);
         assert_eq!(resolve("unknown-agent").yolo_mode_id, None);
     }
 
@@ -440,19 +496,26 @@ mod tests {
     /// text-forward path leaves the new conversation unresumable across a
     /// worker restart. Both need AoE to mint the id itself.
     ///
-    /// `aoe-agent` must NOT inherit claude's answer here even though it
-    /// inherits the rest of the profile via `..CLAUDE`: it is a different
-    /// multi-provider adapter whose clear semantics nobody has verified. The
-    /// assertion below is what stops a future `..CLAUDE` edit from silently
-    /// flipping it. Same standard for the unverified `/new` mappings
-    /// (opencode, omp, kimi), which keep the old behavior until observed.
+    /// `aoe-agent` lands in the same bucket as codex, for codex's reason
+    /// rather than claude's: its adapter source handles no slash command at
+    /// all, so a forwarded `/clear` reaches the model as an ordinary prompt
+    /// and the conversation keeps its full history (#1904). Same standard for
+    /// the unverified `/new` mappings (opencode, omp, kimi), which keep the
+    /// old behavior until observed.
     #[test]
     fn clear_requires_driven_reset_for_codex_and_claude() {
-        for profile in [&CODEX, &CLAUDE, &CLAUDE_CODE] {
+        for profile in [&CODEX, &CLAUDE, &CLAUDE_CODE, &AOE_AGENT] {
             assert!(profile.clear_requires_driven_reset, "{}", profile.key);
         }
         for profile in [
-            &AOE_AGENT, &OPENCODE, &GEMINI, &VIBE, &PI, &OMP, &KIMI, &DEFAULT,
+            &OPENCODE,
+            &GEMINI,
+            &VIBE,
+            &PI,
+            &OMP,
+            &KIMI,
+            &PRIME_AGENT,
+            &DEFAULT,
         ] {
             assert!(!profile.clear_requires_driven_reset, "{}", profile.key);
         }
@@ -489,6 +552,18 @@ mod tests {
         // Opencode's parent linkage convention is unverified; even if the
         // wire carries the value, we don't claim it until observed.
         assert!(OPENCODE.parent_tool_use_id_from_meta(&Some(meta)).is_none());
+
+        // aoe-agent emits no `_meta` on any tool_call notification, so even
+        // claude's own namespace must not resolve for it (#1904). It used to,
+        // via `..CLAUDE`, which promised linkage the adapter never sends.
+        let mut claude_meta = serde_json::Map::new();
+        claude_meta.insert(
+            "claudeCode".to_string(),
+            serde_json::json!({ "parentToolUseId": "tc-parent-7" }),
+        );
+        assert!(AOE_AGENT
+            .parent_tool_use_id_from_meta(&Some(claude_meta))
+            .is_none());
     }
 
     #[test]
@@ -517,13 +592,40 @@ mod tests {
     }
 
     #[test]
+    fn deferred_profiles_keep_parent_linkage_disabled() {
+        // These adapters' tool-call parent linkage is undocumented; pin the
+        // conservative empty namespace so a future edit cannot silently
+        // start claiming hierarchy (prime-agent's _meta envelope is
+        // session-info only today).
+        for profile in [&VIBE, &PI, &OMP, &KIMI, &PRIME_AGENT] {
+            assert!(
+                profile.parent_meta_namespaces.is_empty(),
+                "{}: parent linkage must stay off until observed",
+                profile.key
+            );
+        }
+    }
+
+    #[test]
     fn capability_flags_only_set_for_claude_family() {
-        for profile in [&CLAUDE, &CLAUDE_CODE, &AOE_AGENT] {
+        for profile in [&CLAUDE, &CLAUDE_CODE] {
             assert!(profile.supports_exit_plan_mode);
             assert!(profile.supports_wakeup_tools);
         }
+        // `aoe-agent` sits with the non-Claude group despite bundling Claude
+        // as one of its providers: the adapter's tool palette is Read/Write/Bash,
+        // with no ExitPlanMode and no ScheduleWakeup to synthesise from (#1904).
         for profile in [
-            &CODEX, &OPENCODE, &GEMINI, &VIBE, &PI, &OMP, &KIMI, &DEFAULT,
+            &CODEX,
+            &OPENCODE,
+            &GEMINI,
+            &VIBE,
+            &PI,
+            &OMP,
+            &KIMI,
+            &PRIME_AGENT,
+            &AOE_AGENT,
+            &DEFAULT,
         ] {
             assert!(!profile.supports_exit_plan_mode, "{}", profile.key);
             assert!(!profile.supports_wakeup_tools, "{}", profile.key);

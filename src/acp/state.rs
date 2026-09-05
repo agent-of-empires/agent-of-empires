@@ -512,9 +512,7 @@ pub struct AcpState {
 
     /// Whether a turn is in flight. Server-observed edges: opened by
     /// `UserPromptSent` / `UserDiffCommentsPrompt` / `ThinkingStarted`, closed
-    /// by `Stopped` / startup error / runtime error / rejection. Ported from
-    /// the TUI's `AcpTranscript` so the daemon derives it once for every client
-    /// (see `docs/development/server-owned-sv-state.md`).
+    /// by `Stopped`, startup error, runtime error, or rejection.
     #[serde(default)]
     pub turn_active: bool,
     /// Whether the running turn is steerable (a mid-turn prompt is injected
@@ -679,8 +677,7 @@ pub struct PromptAttachmentRef {
 /// One entry in a session's server-owned prompt queue: a follow-up the
 /// user lined up while a turn was busy. The daemon is the source of truth
 /// (persisted on the `Instance`), so the queue survives a client reload or
-/// a closed PWA and drains on turn-end with no tab open. See
-/// `docs/development/server-side-prompt-queue.md`.
+/// a closed PWA and drains on turn-end with no tab open.
 ///
 /// Attachments carry metadata only, exactly like [`PromptAttachmentRef`]
 /// on a live prompt: the bytes live in the event store's pending-attachment
@@ -705,6 +702,15 @@ pub struct QueuedPromptEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_device: Option<String>,
 }
+
+/// Terminal park reason the reconciler publishes when rate-limit auto-resume
+/// exhausts its redelivery budget (#3688). Distinct from the agent-reported
+/// `rate_limited` so the park predicates can hold the session without
+/// treating it as a fresh adapter park (no reset schedule applies), while a
+/// manual `/acp/spawn` resume and a new prompt both still recover it. Lives
+/// beside `Event::Stopped` because both the daemon and the transcript fold
+/// read it, and `src/acp/` must not import from `src/server/`.
+pub(crate) const RATE_LIMIT_EXHAUSTED_RETRIES_REASON: &str = "rate_limit_exhausted_retries";
 
 /// Discriminated union of state mutations. ACP `session/update`
 /// notifications become specific variants; client approval taps also
@@ -858,6 +864,14 @@ pub enum Event {
     /// rate-limit lock and drain any queued prompt. See #1722.
     RateLimitAutoResumed {
         resets_at: DateTime<Utc>,
+        /// True when a user drove the resume from RESUME NOW rather than the
+        /// reconciler's timer. The redelivery cap counts automatic resumes
+        /// only, so a user re-sending by hand does not spend the automatic
+        /// budget (#3688). Defaulted: breadcrumbs recorded before the cap
+        /// existed carry no flag and read as automatic, which is how they
+        /// were counted then.
+        #[serde(default)]
+        manual: bool,
     },
     /// Agent-reported context-window usage. Comes from ACP
     /// `SessionUpdate::UsageUpdate` (gated on the
@@ -1062,6 +1076,10 @@ pub enum Event {
         image: bool,
         audio: bool,
         embedded_context: bool,
+        /// Latest ACP initialize result for session/load. Missing on events
+        /// written before this field existed, which means unknown.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        load_session: Option<bool>,
         /// Whether the agent accepts `_session/steering`, so a prompt
         /// sent mid-turn is injected into the running turn instead of
         /// being parked in the composer's client-side queue. Gated on
@@ -1687,8 +1705,30 @@ mod tests {
             image: false,
             audio: false,
             embedded_context: false,
+            load_session: None,
             steering,
         }
+    }
+
+    #[test]
+    fn prompt_capabilities_accept_legacy_events_without_load_session() {
+        let event: Event = serde_json::from_value(serde_json::json!({
+            "PromptCapabilities": {
+                "image": false,
+                "audio": false,
+                "embedded_context": false,
+                "steering": false
+            }
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            event,
+            Event::PromptCapabilities {
+                load_session: None,
+                ..
+            }
+        ));
     }
 
     // The four turn flags ported from the TUI's AcpTranscript (Tier 1: the
@@ -2478,6 +2518,7 @@ mod tests {
         assert!(s.rate_limit.is_some(), "RateLimit seeds the park snapshot");
         s.apply_event(Event::RateLimitAutoResumed {
             resets_at: Utc::now(),
+            manual: false,
         })
         .unwrap();
         assert!(

@@ -1,5 +1,5 @@
 //! Full-stack e2e: the web archive handler's structured-view teardown branch
-//! (`src/server/api/sessions.rs` `update_session_archive`, #1868 / #2179).
+//! (`src/server/api/sessions/lifecycle.rs` `update_session_archive`, #1868 / #2179).
 //!
 //! The handler shuts the ACP worker down via `acp_supervisor.shutdown()`
 //! (unconditional, regardless of `kill_pane`) and then, only when `kill_pane`
@@ -31,12 +31,11 @@
 //! without intrusive hooks; it stays covered by the handler's code comment and
 //! the `acp.rs:1304-1310` precedent.
 //!
-//! Compiled only with `--features serve`. Run via:
+//! Run via:
 //!
 //! ```sh
-//! cargo test --features serve,e2e-tests --test e2e -- archive_structured
+//! cargo test --features e2e-tests --test e2e -- archive_structured
 //! ```
-#![cfg(feature = "serve")]
 
 use std::process::Command;
 use std::time::{Duration, Instant};

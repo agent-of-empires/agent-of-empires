@@ -60,8 +60,6 @@ import { marked } from "marked";
 import { reclassifyBash } from "../../lib/toolReclassify";
 import { useAgentProfile } from "../../lib/agentProfileContext";
 import { useAcpFileRef } from "./AcpFileRefContext";
-import { useAcpSessionId } from "../../lib/acpSessionContext";
-import { PluginToolCardBadges } from "../plugin/PluginSlots";
 import { useBackgroundAgentFor, useOpenBackgroundAgentsPane } from "./backgroundAgentsContext";
 import { relativeDisplayPath } from "../../lib/fileRef";
 import { useToolDisplayMode, type ToolDensity } from "./ToolDisplayMode";
@@ -313,7 +311,22 @@ function renderToolCard(tool: ToolCall, result: ActivityRow | undefined, profile
     case "fetch":
       return <FetchToolCard tool={tool} result={result} />;
     case "think":
-      return <ThinkToolCard tool={tool} result={result} />;
+      // A think call's substance normally lives somewhere other than the card:
+      // in streamed child tool calls, or in a returned report. The quiet
+      // one-line ThinkToolCard is right for that. A *failed* one inverts it,
+      // the error is all there is, and that card renders no error body, so
+      // route failures to the generic card instead.
+      //
+      // aoe-agent makes this the common case rather than an edge: `task` is
+      // not in its palette, so the AI SDK answers every call with a
+      // NoSuchToolError naming the tools that do exist, which is the one
+      // message a user needs to see. A claude or opencode Task can fail too,
+      // and was equally silent before this branch. See #1904.
+      return statusFor(result) === "err" ? (
+        <GenericToolCard tool={tool} result={result} />
+      ) : (
+        <ThinkToolCard tool={tool} result={result} />
+      );
     default:
       return <GenericToolCard tool={tool} result={result} />;
   }
@@ -1361,7 +1374,6 @@ interface SkillProps extends Props {
 
 function SkillToolCard({ tool, result, skillName }: SkillProps) {
   const status = statusFor(result);
-  const sessionId = useAcpSessionId();
   const [open, setOpen] = useToolCardExpansion(status);
   // Memo on the raw string so downstream memos see a stable args reference
   // and don't recompute every render.
@@ -1394,12 +1406,7 @@ function SkillToolCard({ tool, result, skillName }: SkillProps) {
       icon={<Sparkles className="h-3.5 w-3.5" />}
       label="skill"
       primary={skillName}
-      meta={
-        <>
-          {skillSource && <ProvenanceBadge label={badgeLabel(skillSource)} tone={badgeTone(skillSource)} />}
-          {sessionId && <PluginToolCardBadges sessionId={sessionId} kind="skill" target={skillName} />}
-        </>
-      }
+      meta={skillSource && <ProvenanceBadge label={badgeLabel(skillSource)} tone={badgeTone(skillSource)} />}
       expanded={open}
       onToggle={status === "err" || hasBody ? () => setOpen((v) => !v) : undefined}
       startedAt={tool.started_at}
@@ -1713,7 +1720,6 @@ interface McpProps extends Props {
 
 function McpToolCard({ tool, result, server, verb }: McpProps) {
   const status = statusFor(result);
-  const sessionId = useAcpSessionId();
   const [open, setOpen] = useToolCardExpansion(status);
   // Memo on the raw string so downstream memos see a stable args reference
   // and don't recompute every render.
@@ -1763,7 +1769,6 @@ function McpToolCard({ tool, result, server, verb }: McpProps) {
           {argPreview && <span className="ml-2 text-text-dim">· {argPreview}</span>}
         </>
       }
-      meta={sessionId && <PluginToolCardBadges sessionId={sessionId} kind="mcp" target={server} />}
       expanded={open}
       onToggle={status === "err" || hasBody ? () => setOpen((v) => !v) : undefined}
       body={

@@ -27,13 +27,11 @@
 //! reopened for the structured view. It is asserted here rather than in its own
 //! live-daemon test so the coverage costs no extra daemon spawn.
 //!
-//! Compiled only with the `serve` feature (structured view and
-//! `aoe add --structured-view` do not exist otherwise). Run via:
+//! Run via:
 //!
 //! ```sh
-//! cargo test --features serve,e2e-tests --test e2e -- acp_host_environment
+//! cargo test --features e2e-tests --test e2e -- acp_host_environment
 //! ```
-#![cfg(feature = "serve")]
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};

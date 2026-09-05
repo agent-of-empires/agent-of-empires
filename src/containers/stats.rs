@@ -24,10 +24,12 @@ pub struct ContainerStats {
 pub type StatsMap = HashMap<String, ContainerStats>;
 
 /// `docker stats --no-stream` re-samples every running container to compute a
-/// CPU delta, which costs ~2s on a host running a couple dozen sandboxes. That
-/// cannot ride the 1s metrics cadence, so the refresh runs on its own thread
-/// and callers read whatever the last completed pass left behind.
-const STATS_TTL: Duration = Duration::from_secs(5);
+/// CPU delta, which costs ~2s on a host running a dozen sandboxes. That cannot
+/// ride the 1s metrics cadence, so the refresh runs on its own thread and
+/// callers read whatever the last completed pass left behind. At 5s the
+/// command was in flight ~40% of the time; 15s keeps per-row sandbox figures
+/// live enough for a health strip.
+const STATS_TTL: Duration = Duration::from_secs(15);
 
 struct Cache {
     map: Arc<StatsMap>,

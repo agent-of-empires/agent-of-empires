@@ -11,7 +11,6 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
-use uuid::Uuid;
 
 use crate::session::Status;
 
@@ -23,7 +22,8 @@ pub(crate) const SESSION_ID_SIDECAR_MAX_AGE: Duration = Duration::from_secs(5 * 
 /// Cap used when reading a status file. The legitimate values are short
 /// tokens; an attacker-planted larger payload is irrelevant either way.
 const STATUS_FILE_READ_CAP: usize = 64;
-const SESSION_ID_FILE_READ_CAP: usize = 128;
+const SESSION_ID_FILE_MAX_PAYLOAD: usize = crate::session::capture::MAX_SESSION_ID_LEN + 1;
+const SESSION_ID_FILE_READ_CAP: usize = SESSION_ID_FILE_MAX_PAYLOAD + 1;
 const ATTENTION_FILE_READ_CAP: usize = 16 * 1024;
 
 /// `<host base>/<instance_id>`. The base is the per-user directory
@@ -54,9 +54,10 @@ pub fn read_hook_status(instance_id: &str) -> Option<Status> {
 ///
 /// The running-mapped hooks (`PreToolUse`, `UserPromptSubmit`, `ElicitationResult`)
 /// rewrite the file on every fire, so a fresh mtime means the last write is
-/// recent. `reconcile_claude_hook_status` uses this to tell a genuinely fresh
-/// `running` (a turn that just started, spinner not yet rendered) from a stale
-/// one that a missed idle hook left standing after the turn ended.
+/// recent. The detection manifests' hook freshness bounds use this to tell a
+/// genuinely fresh `running` (a turn that just started, spinner not yet
+/// rendered) from a stale one that a missed idle hook left standing after the
+/// turn ended.
 ///
 /// Returns `None` when the file is absent or its mtime can't be read.
 pub fn read_hook_status_age(instance_id: &str) -> Option<std::time::Duration> {
@@ -79,25 +80,85 @@ fn parse_status(bytes: &[u8]) -> Option<Status> {
     }
 }
 
-/// Read a Claude session UUID from the hook-written `session_id` sidecar.
+/// Read the transcript path a Pi pane published beside its `session_id`.
 ///
-/// Returns `None` when the file is absent, malformed (non-UUID), or older
-/// than `SESSION_ID_SIDECAR_MAX_AGE`.
+/// Pi indexes sessions by the cwd they started in, so a managed worktree that
+/// moves leaves the transcript behind: the id alone would resolve to nothing
+/// in the new directory and `--session-id` would create an empty conversation
+/// under it. The absolute path still resolves. Absent, unreadable, oversized,
+/// or relative values give `None`; no age check, since a path does not go
+/// stale the way a fresh-conversation id does.
+pub fn read_hook_session_path(instance_id: &str) -> Option<String> {
+    let dir = dir_guard::open_instance_dir_read_only(instance_id).ok()??;
+    let bytes =
+        dir_guard::read_file_at(dir.as_fd(), "session_path", SESSION_PATH_FILE_READ_CAP).ok()??;
+    let path = std::str::from_utf8(&bytes).ok()?.trim().to_string();
+    (path.starts_with('/') && !path.contains('\n')).then_some(path)
+}
+
+/// Cap on the published transcript path, generous next to `PATH_MAX` and far
+/// below anything worth reading into memory.
+const SESSION_PATH_FILE_READ_CAP: usize = 8 * 1024;
+
+/// Whether a `session_id` sidecar exists for this instance, whatever its age.
+///
+/// [`read_hook_session_id`] answers "is there a fresh id to adopt"; this
+/// answers "does this pane publish its own id at all", which stays true while
+/// a pane sits idle for longer than `SESSION_ID_SIDECAR_MAX_AGE`.
+pub fn session_id_sidecar_exists(instance_id: &str) -> bool {
+    (|| {
+        let dir = dir_guard::open_instance_dir_read_only(instance_id).ok()??;
+        dir_guard::metadata_at(dir.as_fd(), "session_id").ok()?
+    })()
+    .is_some()
+}
+
+/// Read an opaque native session ID from the hook-written sidecar.
+///
+/// Returns `None` when the file is absent, malformed, too large, or older than
+/// `SESSION_ID_SIDECAR_MAX_AGE`.
 pub fn read_hook_session_id(instance_id: &str) -> Option<String> {
+    read_hook_session_id_within(instance_id, Some(SESSION_ID_SIDECAR_MAX_AGE))
+}
+
+/// [`read_hook_session_id`] without the freshness window.
+///
+/// The window exists so a resume does not adopt an id from some earlier run,
+/// which matters when the sidecar competes with other evidence. It has no
+/// place in a final flush at stop: the pane published that id, nothing else
+/// will, and the instance directory is about to be deleted. An idle pane whose
+/// `/new` is older than the window would otherwise lose it.
+pub fn read_hook_session_id_any_age(instance_id: &str) -> Option<String> {
+    read_hook_session_id_within(instance_id, None)
+}
+
+fn read_hook_session_id_within(
+    instance_id: &str,
+    max_age: Option<std::time::Duration>,
+) -> Option<String> {
     let dir = dir_guard::open_instance_dir_read_only(instance_id).ok()??;
     let meta = dir_guard::metadata_at(dir.as_fd(), "session_id").ok()??;
-    let mtime = meta.modified().ok()?;
-    if mtime.elapsed().ok()? > SESSION_ID_SIDECAR_MAX_AGE {
+    // The one extra byte permits a conventional trailing newline. Checking the
+    // metadata before the bounded read prevents a longer valid prefix from
+    // being accepted as a different, truncated identity.
+    if meta.len() > SESSION_ID_FILE_MAX_PAYLOAD as u64 {
         return None;
+    }
+    if let Some(max_age) = max_age {
+        let mtime = meta.modified().ok()?;
+        if mtime.elapsed().ok()? > max_age {
+            return None;
+        }
     }
     let bytes =
         dir_guard::read_file_at(dir.as_fd(), "session_id", SESSION_ID_FILE_READ_CAP).ok()??;
-    let id = std::str::from_utf8(&bytes).ok()?.trim().to_string();
-    if Uuid::parse_str(&id).is_ok() {
-        Some(id)
-    } else {
-        None
+    // Recheck the opened file, not only the earlier path metadata: the hook
+    // writer publishes by atomic rename, so the leaf can change between them.
+    if bytes.len() > SESSION_ID_FILE_MAX_PAYLOAD {
+        return None;
     }
+    let id = std::str::from_utf8(&bytes).ok()?.trim().to_string();
+    crate::session::capture::is_valid_session_id(&id).then_some(id)
 }
 
 /// Read the urgent flag from the hook-written `attention.json`.
@@ -380,9 +441,59 @@ mod tests {
 
     #[test]
     #[serial_test::serial(hook_base)]
-    fn test_read_hook_session_id_rejects_non_uuid() {
+    fn test_read_hook_session_id_accepts_safe_opaque_id() {
         let (_g, _, _tmp) = BaseGuard::ready();
-        write_session_id_sidecar("session_id_garbage", "not-a-uuid");
+        let id = "conversation_opaque.123";
+        write_session_id_sidecar("session_id_opaque", id);
+        assert_eq!(
+            read_hook_session_id("session_id_opaque").as_deref(),
+            Some(id)
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn test_read_hook_session_id_enforces_full_opaque_id_limit() {
+        let (_g, _, _tmp) = BaseGuard::ready();
+        let maximum = "x".repeat(crate::session::capture::MAX_SESSION_ID_LEN);
+        write_session_id_sidecar("session_id_maximum", &maximum);
+        assert_eq!(
+            read_hook_session_id("session_id_maximum").as_deref(),
+            Some(maximum.as_str())
+        );
+
+        let too_long = "x".repeat(crate::session::capture::MAX_SESSION_ID_LEN + 1);
+        write_session_id_sidecar("session_id_too_long", &too_long);
+        assert_eq!(read_hook_session_id("session_id_too_long"), None);
+
+        let oversized_with_whitespace = format!("{maximum}  ");
+        write_session_id_sidecar(
+            "session_id_oversized_whitespace",
+            &oversized_with_whitespace,
+        );
+        assert_eq!(
+            read_hook_session_id("session_id_oversized_whitespace"),
+            None
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn test_read_hook_session_id_rejects_truncated_valid_prefix() {
+        let (_g, _, _tmp) = BaseGuard::ready();
+        let payload = format!("{}suffix", "x".repeat(128));
+        write_session_id_sidecar("session_id_no_truncation", &payload);
+        assert_eq!(
+            read_hook_session_id("session_id_no_truncation").as_deref(),
+            Some(payload.as_str())
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn test_read_hook_session_id_rejects_unsafe_id() {
+        let (_g, _, _tmp) = BaseGuard::ready();
+        write_session_id_sidecar("session_id_garbage", "unsafe id;");
         assert_eq!(read_hook_session_id("session_id_garbage"), None);
     }
 

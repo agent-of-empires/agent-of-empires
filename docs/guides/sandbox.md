@@ -2,7 +2,7 @@
 
 ## Overview
 
-Docker sandboxing runs your AI coding agents (Claude Code, OpenCode, Mistral Vibe, Hermes, Codex CLI, Gemini CLI, Antigravity CLI, Cursor CLI, Copilot CLI, Pi, Oh My Pi (OMP), Kiro CLI, Qwen Code, Kimi Code) inside isolated Docker containers while maintaining access to your project files and credentials.
+Docker sandboxing runs your AI coding agents (Claude Code, OpenCode, Mistral Vibe, Hermes, Codex CLI, Gemini CLI, Antigravity CLI, Cursor CLI, Copilot CLI, Pi, Oh My Pi (OMP), Kiro CLI, Qwen Code, Kimi Code, Prime Agent) inside isolated Docker containers while maintaining access to your project files and credentials.
 
 > **Linux users:** AoE also supports [Podman](podman.md) as a daemonless, rootless-friendly alternative to Docker.
 >
@@ -14,7 +14,9 @@ Docker sandboxing runs your AI coding agents (Claude Code, OpenCode, Mistral Vib
 - Automatic container lifecycle management
 - Full project access via volume mounts
 
-Agent credentials are shared into containers automatically, so agents authenticate without re-login. For how this works, see [Sandbox internals](../development/internals/sandbox.md).
+Agent credentials are seeded from the host config into a private per-session
+sandbox directory, so agents authenticate without re-login. Containers do not
+share a writable agent store.
 
 ## CLI vs TUI Behavior
 
@@ -76,6 +78,33 @@ environment = ["ANTHROPIC_API_KEY"]
 | `extra_volumes` | `[]` | Additional volume mounts |
 | `mount_ssh` | `false` | Mount `~/.ssh/` read-only into containers |
 | `default_terminal_mode` | `"host"` | Paired terminal location: `"host"` (on host machine) or `"container"` (inside Docker) |
+| `privileged` | `false` | Run the container in privileged mode (`--privileged`) |
+| `cap_add` | `[]` | Capabilities granted on top of the runtime default (`--cap-add`) |
+| `cap_drop` | `[]` | Capabilities removed from the runtime default (`--cap-drop`) |
+| `security_opt` | `[]` | Security options (`--security-opt`, e.g. `seccomp=unconfined`) |
+| `extra_run_args` | `[]` | Extra arguments passed to container run, before the image |
+
+### Run Policy
+
+Configure container privileges, capabilities, and security options:
+
+```toml
+[sandbox]
+# Privileged mode
+privileged = true
+
+# Capabilities
+cap_add = ["SYS_ADMIN"]
+cap_drop = ["NET_RAW"]
+
+# Security options
+security_opt = ["seccomp=unconfined"]
+
+# Additional arguments passed to container run
+extra_run_args = ["--device", "/dev/fuse"]
+```
+
+Docker and Podman support all run-policy options. Apple Container supports `cap_add` and `cap_drop`; `privileged` and `security_opt` are ignored with a warning. `extra_run_args` is passed through on all runtimes.
 
 ## Volume Mounts
 
@@ -98,6 +127,12 @@ volume_ignores = ["node_modules", "target", "**/bin", "**/obj"]
 By default, `volume_ignores` paths are mounted as **anonymous volumes** (`volume_ignores_strategy = "anonymous"`). This works on Linux, but on macOS with Docker Desktop's VirtioFS, anonymous volumes may not reliably shadow bind-mount subdirectories, causing host-side directories like `.venv` or `node_modules` to remain visible inside the container.
 
 To fix this on macOS, set `volume_ignores_strategy = "named"`. This mounts each `volume_ignores` path as a **deterministic named Docker/Podman volume** stored entirely inside the Docker VM, bypassing VirtioFS. Named volumes are explicitly removed when the session is deleted.
+
+A volume's name is derived from its mount path, so moving a session's worktree changes it. The recreated container starts from an empty cache for the paths that moved, and the volumes those paths left behind are removed the next time the session starts.
+
+Moving a worktree therefore costs the cache in both directions: move it back and the volumes from the first location are already gone, so that side rebuilds cold too.
+
+The reclaim covers the paths that moved with the worktree, and nothing else. A volume orphaned any other way is left alone, because AoE cannot tell it apart from a cache you are still using: dropping an entry from `volume_ignores`, switching back to `"anonymous"`, or attaching a repo to a multi-repo workspace all strand a volume without a move it can recognize. Neither is anything already orphaned, including the leftovers from a move the session has since restarted after, so a volume that has been sitting there stays. To find what is left over, list them with `docker volume ls -q --filter name=aoe-vi-` and remove what you recognize; `docker volume prune` skips named volumes unless you pass `-a`.
 
 ```toml
 [sandbox]
@@ -146,13 +181,38 @@ If the referenced host env var is not set, the entry is silently skipped.
 
 To use a literal value starting with `$`, double it: `$$LITERAL` is injected as `$LITERAL`.
 
+## Folder Trust
+
+Claude Code, Codex, and Gemini each refuse to start in a directory they have
+not been told to trust. A container workspace is always a new directory to
+them, so AoE pre-trusts it in the agent's staged config before the session
+starts. Claude Code is trusted in every sandboxed session because its prompt
+blocks startup; Codex and Gemini are trusted only in YOLO mode, where their
+prompts guard approvals the user has already opted out of.
+
+A repo that ships an `.mcp.json` still asks per server before any of them run.
+Trust does activate the repo's own `.claude/settings.json`, whose
+`permissions.allow` rules an untrusted workspace drops, and since the prompt is
+what holds a session before startup, a pre-trusted workspace runs that file's
+hooks unprompted.
+
+AoE seeds the config it stages for the container. For a custom agent whose
+wrapper points the CLI at another directory, set that host root in
+`session.agent_config_dir`. AoE stages a private per-session child and mounts it
+at the agent's canonical container config path. Remove any
+`sandbox.extra_volumes` entry for that path because it would shadow AoE's
+managed mount.
+
+To pre-trust worktrees for host sessions too, see `session.pre_trust_agent_folders`
+in the [configuration guide](configuration.md).
+
 ## Available Images
 
 AOE provides two official sandbox images:
 
 | Image | Description |
 |-------|-------------|
-| `ghcr.io/agent-of-empires/aoe-sandbox:latest` | Base image with Claude Code, OpenCode, Mistral Vibe, Hermes, Codex CLI, Gemini CLI, Cursor CLI, Copilot CLI, Pi, Oh My Pi (OMP), Kiro CLI, Qwen Code, Kimi Code, git, ripgrep, fzf |
+| `ghcr.io/agent-of-empires/aoe-sandbox:latest` | Base image with Claude Code, OpenCode, Mistral Vibe, Hermes, Codex CLI, Gemini CLI, Cursor CLI, Copilot CLI, Pi, Oh My Pi (OMP), Kiro CLI, Qwen Code, Kimi Code, Prime Agent, git, ripgrep, fzf |
 | `ghcr.io/agent-of-empires/aoe-dev-sandbox:latest` | Extended image with additional dev tools |
 
 ### Dev Sandbox Tools
@@ -230,11 +290,46 @@ default_image = "my-sandbox:latest"
 aoe add --sandbox-image my-sandbox:latest .
 ```
 
-> Building a custom image and using structured view? Install the ACP adapters too, or the handshake fails. See [Sandbox internals](../development/internals/sandbox.md).
+> Building a custom image and using structured view? Install the agent's ACP
+> adapter in the image too, or the handshake fails.
+
+## Per-session agent stores
+
+Each sandboxed session gets its own agent store on the host: a copy of the
+agent's config and history under `sandbox-v2/<instance-id>` inside the agent's config directory
+(for example `~/.claude/sandbox-v2/<id>`). The container mounts that copy at
+the agent's usual config path, so credentials, hooks and conversation history
+belong to one session and `aoe` can resume the right conversation.
+
+Sessions created before this layout shared one agent store per agent (for
+example `~/.claude/sandbox`). Each one moves when you start it: AoE copies the
+shared store into that session's private directory, removes its stopped
+container so the next launch mounts the copy, and deletes the shared store once
+every session that used it has moved (the private copies are the data from then
+on). A large store takes a while, so the first start of a session is slower
+than usual. A session whose container is still running is skipped and moved on
+a later start, after it stops. Trashed and archived sessions stay on the shared
+store. Starting one moves it; restoring or unarchiving alone does not, so run
+`aoe migrate` afterwards if you want it moved before its next start.
+
+To move every eligible session at once instead of paying for each at its next
+start:
+
+```bash
+aoe migrate
+```
+
+This skips trashed and archived sessions, which keep their shared store until
+one of them is started or brought back.
+
+`AOE_DEFER_SANDBOX_MIGRATION=1` skips the move for that launch. A session whose
+container is still running carries on unaffected, on the shared store. One
+whose container is stopped cannot start until its store has moved, so drop the
+variable or run `aoe migrate` before launching it.
 
 ## Worktrees and Sandboxing
 
-Git worktrees need the bare repo pattern so the container can reach the repo's git directory. See the [Workflow Guide](workflow.md).
+Git worktrees need the bare repo pattern so the container can reach the repo's git directory. See [Worktrees](worktrees.md#bare-repos).
 
 ## Troubleshooting
 

@@ -5,6 +5,13 @@ Breaking changes to stored data (file locations, config schema) go through
 tracks state; `migrations::run_migrations()` runs pending ones in order on
 startup and bumps the version.
 
+A migration whose work is large and per-session may leave rows pending rather
+than doing all of it at startup. v027 is the example: it stamps the version at
+first upgrade, then moves each session's store when that session next needs a
+container, with `aoe migrate` as the bulk path. If you write one of these, the
+startup pass must be cheap and the deferred work must have a trigger a user
+reaches without knowing it exists.
+
 To add one:
 
 1. Create `src/migrations/vNNN_description.rs` with a `pub fn run() -> anyhow::Result<()>`.

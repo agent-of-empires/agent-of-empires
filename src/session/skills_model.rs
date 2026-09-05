@@ -4,10 +4,10 @@
 //! frontmatter (`name`, `description`, plus optional metadata) between `---`
 //! fences, then a markdown body, living in a per-skill directory. AoE has never
 //! had a Rust model for these; they were only bulk-copied into sandboxes
-//! (`src/session/container_config.rs`). This module is the single resolver used
+//! (`src/session/config/container_config.rs`). This module is the single resolver used
 //! by the server, CLI, and plugin host.
 //!
-//! Two provenance layers, mirroring [`super::mcp_model::McpProvenance`]:
+//! Two provenance layers, mirroring [`super::mcp::mcp_model::McpProvenance`]:
 //! host-discovered skills in each agent's own skills dir (`~/.claude/skills`,
 //! `~/.kimi-code/skills`) are READ-ONLY; the AoE-managed store at
 //! `<app_dir>/skills` is the only WRITABLE layer. Editing a host-discovered
@@ -68,7 +68,11 @@ const SKILL_ROOTS: &[SkillRoot] = &[
         id: "agents-standard",
         label: "Agent Skills",
         relative_path: ".agents/skills",
-        consumers: &["codex", "opencode"],
+        // Prime Agent also loads this standard root (upstream
+        // `packages/coding-agent/docs/skills.md` lists `~/.agents/skills/`
+        // alongside `~/.prime/agent/skills/`), so it is a consumer even
+        // though its own root below is where AoE writes managed skills.
+        consumers: &["codex", "opencode", "prime-agent"],
         primary_agent: "codex",
         legacy: false,
     },
@@ -96,6 +100,14 @@ const SKILL_ROOTS: &[SkillRoot] = &[
         primary_agent: "kimi",
         legacy: true,
     },
+    SkillRoot {
+        id: "prime-agent-user",
+        label: "Prime Agent",
+        relative_path: ".prime/agent/skills",
+        consumers: &["prime-agent"],
+        primary_agent: "prime-agent",
+        legacy: false,
+    },
 ];
 
 pub fn skill_roots() -> &'static [SkillRoot] {
@@ -115,8 +127,8 @@ pub fn primary_root_for_agent(agent: &str) -> Option<&'static SkillRoot> {
 /// Where a skill was discovered. The read-only host layers carry a root key;
 /// the single writable layer is [`SkillProvenance::AoeManaged`]. Serializes to a
 /// tagged object (`{ "kind": "external", "root": "claude-user" }` /
-/// `{ "kind": "aoe-managed" }`) so it round-trips as both `skills.list` output
-/// and a source-qualified `skills.read` / `skills.adopt` parameter.
+/// `{ "kind": "aoe-managed" }`) so it round-trips as both list output and a
+/// source-qualified read / adopt parameter on the surfaces built on this model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum SkillProvenance {
@@ -159,7 +171,7 @@ impl SkillProvenance {
 
 /// One discovered skill's list-safe metadata: its identity (`directory`), its
 /// frontmatter `name`/`description`, and where it came from. The body is not
-/// included; `skills.read` returns that.
+/// included; [`read_skill`] returns that.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscoveredSkill {

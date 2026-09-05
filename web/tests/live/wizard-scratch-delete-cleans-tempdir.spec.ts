@@ -4,7 +4,7 @@
 
 import { existsSync } from "node:fs";
 import { test as base, expect } from "@playwright/test";
-import { listSessions, spawnAoeServe } from "../helpers/aoeServe";
+import { listSessions, spawnAoeServe, waitForSessions } from "../helpers/aoeServe";
 
 base("deleting a scratch session removes its scratch dir", async ({ page }, testInfo) => {
   const serve = await spawnAoeServe({
@@ -23,13 +23,7 @@ base("deleting a scratch session removes its scratch dir", async ({ page }, test
     await wizard.getByRole("switch", { name: "Skip project folder" }).click();
     await wizard.getByRole("button", { name: /Launch session/ }).click();
 
-    await expect
-      .poll(async () => (await listSessions(serve.baseUrl)).length, {
-        timeout: 15_000,
-      })
-      .toBeGreaterThan(0);
-
-    const [created] = await listSessions(serve.baseUrl);
+    const [created] = await waitForSessions(serve.baseUrl);
     const sessionId = created!.id as string;
     const projectPath = created!.project_path as string;
     expect(existsSync(projectPath)).toBe(true);

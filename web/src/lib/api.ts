@@ -1,3 +1,4 @@
+import type { AgentLifecycleInfo } from "./agentProfiles";
 import { clientFormFactor } from "./formFactor";
 import type {
   SessionResponse,
@@ -744,8 +745,6 @@ export type PluginUiSlot =
   | "pane"
   | "composer-action"
   | "detail-badge"
-  | "settings-page"
-  | "tool-card-badge"
   | "home-pane"
   | "notification";
 
@@ -1114,7 +1113,7 @@ export function getProfileSettings(name: string): Promise<ProfileSettingsRespons
  *  writable; `description` is the profile-only top-level field that carries no
  *  schema descriptor. Sections absent from the schema, notably `hooks` plus the
  *  agent-command and env fields, are remote-code-execution surfaces the server
- *  rejects (`validate_patch` in src/session/settings_schema/policy.rs); we
+ *  rejects (`validate_patch` in src/session/config/settings_schema/policy.rs); we
  *  reject them client side too as defense in depth. Because both sides read the
  *  same schema, there is no hand-kept list to keep in sync. */
 export function profileWritableSections(schema: SettingsFieldDescriptor[]): Set<string> {
@@ -1310,11 +1309,8 @@ export function reportTelemetrySeen(surface: TelemetrySignal): void {
   }).catch(() => {});
 }
 
-/// Report an acp interaction the daemon cannot observe itself, so its next
-/// opt-in snapshot can fold it in. Today the only kind is a queued prompt: the
-/// prompt queue lives entirely in client state, so the browser is the one
-/// surface that can report it. Best-effort; the daemon only counts when the
-/// user is opted in.
+/// Report a browser ACP interaction for the daemon's next opt-in snapshot.
+/// Best-effort; the daemon only sends counts when the user is opted in.
 export function reportAcpInteraction(kind: "prompt_queued"): void {
   void fetch("/api/telemetry/structured-interaction", {
     method: "POST",
@@ -1413,6 +1409,10 @@ export interface AcpAgentInfo {
   name: string;
   description: string;
   command: string;
+  /** Registry lifecycle state, same contract as `/api/agents`: omitted
+   *  while Active so older daemons and existing consumers read as active.
+   *  Mirrors `AgentLifecycle` in src/agents.rs. */
+  lifecycle?: AgentLifecycleInfo;
 }
 
 /** List ACP registry entries the acp supervisor knows about.
@@ -1505,8 +1505,6 @@ export async function acpDisable(sessionId: string): Promise<ViewSwitchResponse 
   });
 }
 
-// --- Server-owned prompt queue (docs/development/server-side-prompt-queue.md) ---
-//
 // The daemon owns the structured-view prompt queue, so a follow-up queued
 // behind a busy turn survives a client reload / closed PWA and drains
 // server-side. These wrap the /queue endpoints; the queue itself reflects to

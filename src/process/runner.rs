@@ -1,46 +1,19 @@
 //! `aoe __acp-runner`: the per-worker shim that owns the agent
 //! subprocess and outlives `aoe serve`.
 //!
-//! Invoked by `Supervisor::spawn` as a detached child via `setsid` so its
-//! process group is independent of the daemon's. The runner:
+//! The detached runner writes its registry record, spawns a stdio-only ACP
+//! agent, and exposes the framed v3 protocol on `<session_id>.control.sock`.
+//! It owns the ACP handshake, forwards both RPC directions, buffers outbound
+//! control frames while detached, and accepts the next daemon connection
+//! without restarting an established agent session.
 //!
-//! 1. Writes a registry entry at
-//!    `<app_dir>/acp-workers/<session_id>.json` with its PID, socket
-//!    path, and agent metadata.
-//! 2. Spawns the configured ACP agent as a child over stdio.
-//! 3. Binds a Unix listener at `<app_dir>/acp-workers/<session_id>.sock`
-//!    and accepts connections in a loop, proxying bytes between the
-//!    currently-connected aoe daemon and the agent's stdio.
-//! 4. Buffers agent → daemon traffic (line-oriented ndjson) in a ring
-//!    buffer while no daemon is attached, so the next reattach replays
-//!    the gap.
-//! 5. On agent exit or SIGTERM/SIGINT: deletes the registry file and
-//!    socket, then exits.
+//! On agent exit, signal, abandonment, or an incomplete handshake disconnect,
+//! the runner terminates the agent process tree and removes only registry files
+//! that still belong to its PID. Per-runner logs remain under `acp-workers`
+//! so `aoe acp logs --session <id> --follow` can tail them independently.
 //!
-//! The daemon disconnects the unix socket on `detach_all` without
-//! signalling the runner; the runner just sees a closed connection and
-//! goes back to accepting.
-//!
-//! Logging: the runner appends to
-//! `<app_dir>/acp-workers/<session_id>.log` so `aoe acp logs
-//! --session <id> --follow` can tail it independently of the shared
-//! `debug.log` that all aoe processes append to.
-//!
-//! ## Why a shim and not "let the agent bind the socket"
-//!
-//! Issue #1037's Proposal A suggested patching ACP agents to listen on
-//! a unix socket directly, with the daemon connecting in. That works
-//! for cooperating agents (`aoe-agent` already honors `AOE_ACP_SOCKET`)
-//! but the third-party agents we proxy (`claude-agent-acp`, etc.)
-//! only speak stdio today. This shim bridges stdio-only agents into
-//! the socket-mode lifecycle without requiring upstream changes.
-//!
-//! Treat the shim as a deprecation path, not a permanent layer:
-//! agents that gain native socket-mode transport in the future can
-//! bypass `aoe __acp-runner` entirely and have the daemon connect
-//! to them directly. The wire protocol is just newline-delimited
-//! JSON-RPC (ACP), no shim-specific framing, so collapsing this
-//! process is purely an agent-side change.
+//! This shim lets third-party agents that only speak ACP over stdio participate
+//! in the detached worker lifecycle without requiring agent-side socket support.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -55,7 +28,7 @@ use serde::Deserialize;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, watch, Mutex};
 use tracing::{debug, info, warn};
 
 use super::worker_registry::{self, WorkerRecord};
@@ -123,7 +96,7 @@ enum WatchdogShutdown {
 /// An agent that exits within this window of being spawned is treated as a
 /// broken spawn and logged at warn (not info), so a crash loop is visible in
 /// debug.log without grepping for the absence of success. Intentionally
-/// mirrors `runner_socket_deadline()` in `acp/acp_client.rs` (the
+/// mirrors `runner_socket_deadline()` in `acp/acp_client/runner.rs` (the
 /// daemon's 10s wait for this runner's socket to appear); update both if
 /// the handshake window changes. See #1945.
 const FAST_EXIT_THRESHOLD: Duration = Duration::from_secs(10);
@@ -386,13 +359,16 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
                     );
                     worker_registry::mark_attached(&accept_session_id);
                     accept_detached.store(ATTACHED, Ordering::Relaxed);
-                    handle_control_connection(
+                    if handle_control_connection(
                         stream,
                         Arc::clone(&accept_shared),
                         Arc::clone(&accept_stdin),
                         accept_session_id.clone(),
                     )
-                    .await;
+                    .await
+                    {
+                        return true;
+                    }
                     info!(
                         target: "acp.runner",
                         session = %accept_session_id,
@@ -466,8 +442,14 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
                 self_terminate_agent_tree(reason, &session_id, our_pid, &mut agent_child).await;
             }
         }
-        _ = accept_loop => {
-            warn!(target: "acp.runner", session = %session_id, "accept loop exited unexpectedly");
+        terminate_runner = accept_loop => {
+            debug_assert!(terminate_runner);
+            // The daemon owns path cleanup after cancelling an incomplete
+            // handshake and may already have spawned a replacement. Never
+            // unlink that replacement here.
+            preserve_registry = true;
+            let _ = agent_child.start_kill();
+            let _ = agent_child.wait().await;
         }
     }
 
@@ -626,7 +608,7 @@ struct RunnerShared {
     /// write push its frame back to the front without reordering.
     control_wake: tokio::sync::Notify,
     /// Runner-owned ACP handshake cache (#2976 Phase B). Populated the
-    /// first time a v2 daemon drives `initialize` / `session/new|load|fork`
+    /// first time a v3 daemon drives `initialize` / `session/new|load|fork`
     /// through the control channel; replayed verbatim on every later
     /// attach so the agent is handshaken exactly once.
     handshake: Mutex<RunnerHandshake>,
@@ -1177,6 +1159,21 @@ impl RunnerShared {
         self.control.lock().await.ready = false;
     }
 
+    /// Greet a daemon before the queue writer takes ownership of the socket.
+    /// Returns false when the initial write fails, so a failed attach never
+    /// leaves the control queue marked ready.
+    async fn install_control(
+        &self,
+        out: &mut Option<tokio::net::unix::OwnedWriteHalf>,
+        session_id: &str,
+    ) -> bool {
+        let hello = ControlBody::Hello {
+            control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
+            session_id: session_id.to_string(),
+        };
+        write_control_frame(out.as_mut().expect("write half present"), &hello).await
+    }
+
     /// Take the next frame to write, or None when the writer should park.
     async fn next_outbound(&self) -> Option<ControlBody> {
         let mut ch = self.control.lock().await;
@@ -1696,6 +1693,34 @@ async fn run_control_writer(
     }
 }
 
+enum ControlRead {
+    Frame(ControlBody),
+    Closed,
+    Failed(String),
+}
+enum HandshakeCommand {
+    Initialize(serde_json::Value),
+    EstablishSession {
+        method: String,
+        request: serde_json::Value,
+    },
+}
+
+async fn await_handshake_or_control_loss<T>(
+    control_closed: &mut watch::Receiver<bool>,
+    handshake: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    if *control_closed.borrow() {
+        return None;
+    }
+    tokio::pin!(handshake);
+    tokio::select! {
+        biased;
+        _ = control_closed.changed() => None,
+        result = &mut handshake => Some(result),
+    }
+}
+
 /// Handle one control-channel connection. This is the whole daemon-facing
 /// protocol as of Phase C (#2977): the runner-owned handshake and turn
 /// (Phase B), plus the reverse lane's answers and the forward lane's
@@ -1706,48 +1731,138 @@ async fn run_control_writer(
 /// version gate doing its job: a v3 runner binds no relay socket, so there
 /// is no older transport for it to fall back to on this runner.
 ///
-/// The read loop never awaits an agent round trip. The frames it handles
-/// inline only ever WRITE to the agent (`ServerResult` / `ServerError`,
-/// `Prompt`, `Cancel`, `AgentCall`); their responses come back through the
-/// stdout fanout on another task. The two handshake frames do await the agent,
-/// so they are spawned rather than handled inline. Getting that wrong
-/// deadlocks the whole session, and unrecoverably: the accept loop awaits this
-/// function, so a parked read loop also blocks the next daemon from
-/// attaching.
+/// A dedicated socket reader feeds a bounded command queue. Handshake work
+/// runs on a second task, so the connection task can answer agent-issued calls
+/// while `initialize` or `session/*` is in flight. Each handshake round trip is
+/// raced against `control_closed`; if the daemon disappears before the
+/// handshake completes, the future is cancelled and the caller terminates
+/// this incomplete runner.
 async fn handle_control_connection(
     stream: UnixStream,
     shared: Arc<RunnerShared>,
     agent_stdin: Arc<Mutex<tokio::process::ChildStdin>>,
     session_id: String,
-) {
-    let (mut read_half, mut write_half) = stream.into_split();
-    let hello = ControlBody::Hello {
-        control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
-        session_id: session_id.clone(),
-    };
-    if !write_control_frame(&mut write_half, &hello).await {
-        return;
+) -> bool {
+    let (mut read_half, write_half) = stream.into_split();
+    let mut write_half = Some(write_half);
+    if !shared.install_control(&mut write_half, &session_id).await {
+        shared.clear_control_outbound().await;
+        return false;
     }
-    // Writer owns the write half from here; everything outbound goes through
-    // the queue so ordering is one FIFO.
+
+    // The queue writer owns the write half after the greeting. Everything
+    // outbound uses this one FIFO, preserving agent stdout order.
     let writer = tokio::spawn(run_control_writer(
-        write_half,
+        write_half
+            .take()
+            .expect("write half present after greeting"),
         Arc::clone(&shared),
         session_id.clone(),
     ));
     shared.mark_control_ready().await;
 
-    loop {
-        let body = match control_protocol::read_frame(&mut read_half).await {
-            Ok(Some(body)) => body,
-            Ok(None) => break, // clean EOF: daemon closed the control socket.
-            Err(e) => {
+    let (frame_tx, mut frame_rx) = mpsc::channel(8);
+    let (control_closed_tx, control_closed_rx) = watch::channel(false);
+    let reader_session = session_id.clone();
+    let frame_reader = tokio::spawn(async move {
+        loop {
+            match control_protocol::read_frame(&mut read_half).await {
+                Ok(Some(frame)) => match frame_tx.try_send(ControlRead::Frame(frame)) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Closed(_)) => return,
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        warn!(
+                            target: "acp.runner",
+                            session = %reader_session,
+                            "control command queue exceeded capacity"
+                        );
+                        let _ = control_closed_tx.send(true);
+                        return;
+                    }
+                },
+                Ok(None) => {
+                    let _ = frame_tx.try_send(ControlRead::Closed);
+                    let _ = control_closed_tx.send(true);
+                    return;
+                }
+                Err(error) => {
+                    let _ = frame_tx.try_send(ControlRead::Failed(error.to_string()));
+                    let _ = control_closed_tx.send(true);
+                    return;
+                }
+            }
+        }
+    });
+
+    let handshake_complete = Arc::new(std::sync::atomic::AtomicBool::new(
+        shared.acp_session_id().await.is_some(),
+    ));
+    let (handshake_tx, mut handshake_rx) = mpsc::channel(8);
+    let handshake_shared = Arc::clone(&shared);
+    let handshake_stdin = Arc::clone(&agent_stdin);
+    let handshake_done = Arc::clone(&handshake_complete);
+    let handshake_session = session_id.clone();
+    let handshake_worker = tokio::spawn(async move {
+        let mut control_closed = control_closed_rx;
+        while let Some(command) = handshake_rx.recv().await {
+            let frame = match command {
+                HandshakeCommand::Initialize(request) => {
+                    let Some(result) = await_handshake_or_control_loss(
+                        &mut control_closed,
+                        handshake_shared.run_or_replay_initialize(&handshake_stdin, request),
+                    )
+                    .await
+                    else {
+                        return;
+                    };
+                    match result {
+                        Ok(result) => ControlBody::Initialized { result },
+                        Err(error) => {
+                            warn!(target: "acp.runner", session = %handshake_session, "initialize failed: {error}");
+                            ControlBody::HandshakeFailed { error }
+                        }
+                    }
+                }
+                HandshakeCommand::EstablishSession { method, request } => {
+                    let Some(result) = await_handshake_or_control_loss(
+                        &mut control_closed,
+                        handshake_shared.run_or_replay_session(&handshake_stdin, &method, request),
+                    )
+                    .await
+                    else {
+                        return;
+                    };
+                    match result {
+                        Ok((acp_session_id, result)) => {
+                            handshake_done.store(true, Ordering::Release);
+                            ControlBody::SessionReady {
+                                acp_session_id,
+                                result,
+                            }
+                        }
+                        Err(error) => {
+                            warn!(target: "acp.runner", session = %handshake_session, "{method} failed: {error}");
+                            ControlBody::HandshakeFailed { error }
+                        }
+                    }
+                }
+            };
+            handshake_shared.emit_control(frame).await;
+        }
+    });
+    let terminate_runner = 'connection: loop {
+        let body = match frame_rx.recv().await {
+            Some(ControlRead::Frame(frame)) => frame,
+            Some(ControlRead::Closed) | None => {
+                break 'connection !handshake_complete.load(Ordering::Acquire)
+            }
+            Some(ControlRead::Failed(error)) => {
                 warn!(
                     target: "acp.runner",
                     session = %session_id,
-                    "control read error: {e}"
+                    "control read error: {error}"
                 );
-                break;
+                break 'connection !handshake_complete.load(Ordering::Acquire);
             }
         };
         match body {
@@ -1765,54 +1880,34 @@ async fn handle_control_connection(
                         runner_version = control_protocol::CONTROL_PROTOCOL_VERSION,
                         "daemon attached with a mismatched control version; refusing the connection"
                     );
-                    break;
+                    break 'connection false;
                 }
             }
-            // Both handshake arms run OFF this loop. They are the only
-            // frames whose handler awaits a response from the agent, and
-            // awaiting inline deadlocks the session: an agent that issues a
-            // client request while answering `session/new` (legal ACP, and
-            // the reason this proxy layer exists) waits on the runner, while
-            // the runner's read loop is parked on the handshake response and
-            // can never read the `ServerResult` that would unblock it.
-            // Nothing needs to come back to this loop, since the answer goes
-            // out through `emit_control` either way. `handshake_gate` keeps
-            // two frames from double-sending to the agent.
             ControlBody::Initialize { request } => {
-                let shared = Arc::clone(&shared);
-                let agent_stdin = Arc::clone(&agent_stdin);
-                let session_id = session_id.clone();
-                tokio::spawn(async move {
-                    let frame = match shared.run_or_replay_initialize(&agent_stdin, request).await {
-                        Ok(result) => ControlBody::Initialized { result },
-                        Err(error) => {
-                            warn!(target: "acp.runner", session = %session_id, "initialize failed: {error}");
-                            ControlBody::HandshakeFailed { error }
-                        }
-                    };
-                    shared.emit_control(frame).await;
-                });
+                if handshake_tx
+                    .try_send(HandshakeCommand::Initialize(request))
+                    .is_err()
+                {
+                    warn!(
+                        target: "acp.runner",
+                        session = %session_id,
+                        "handshake command queue exceeded capacity"
+                    );
+                    break 'connection false;
+                }
             }
             ControlBody::EstablishSession { method, request } => {
-                let shared = Arc::clone(&shared);
-                let agent_stdin = Arc::clone(&agent_stdin);
-                let session_id = session_id.clone();
-                tokio::spawn(async move {
-                    let frame = match shared
-                        .run_or_replay_session(&agent_stdin, &method, request)
-                        .await
-                    {
-                        Ok((acp_session_id, result)) => ControlBody::SessionReady {
-                            acp_session_id,
-                            result,
-                        },
-                        Err(error) => {
-                            warn!(target: "acp.runner", session = %session_id, "{method} failed: {error}");
-                            ControlBody::HandshakeFailed { error }
-                        }
-                    };
-                    shared.emit_control(frame).await;
-                });
+                if handshake_tx
+                    .try_send(HandshakeCommand::EstablishSession { method, request })
+                    .is_err()
+                {
+                    warn!(
+                        target: "acp.runner",
+                        session = %session_id,
+                        "handshake command queue exceeded capacity"
+                    );
+                    break 'connection false;
+                }
             }
             ControlBody::Prompt { request } => {
                 if shared.agent_prompt(&agent_stdin, request).await.is_none() {
@@ -1847,15 +1942,18 @@ async fn handle_control_connection(
                     .issue_agent_call(&agent_stdin, call_id, &method, params)
                     .await;
             }
-            // Runner -> daemon frames should never arrive here; ignore.
+            // Runner to daemon frames should never arrive here; ignore.
             _ => {}
         }
-    }
+    };
+    frame_reader.abort();
+    handshake_worker.abort();
     writer.abort();
     shared.clear_control_outbound().await;
     // Unblock any reverse call this daemon left unanswered, so the agent's
     // stdio loop is never parked on a daemon that is gone.
     shared.cancel_server_calls(&agent_stdin, &session_id).await;
+    terminate_runner
 }
 
 fn spawn_agent(
@@ -1880,7 +1978,7 @@ fn spawn_agent(
         .stderr(Stdio::piped());
     // The rest of the env is inherited from the launching daemon, which has
     // already applied `env_clear` + the shared allowlist (see
-    // `apply_env_filter` in acp_client.rs), so no second filter pass is
+    // `apply_env_filter` in acp_client/spawn.rs), so no second filter pass is
     // needed here.
     //
     // The one exception is the daemon's configured host environment

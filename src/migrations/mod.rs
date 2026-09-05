@@ -8,6 +8,7 @@
 //! 2. Implement the migration function
 //! 3. Add it to the `MIGRATIONS` array below
 
+pub mod progress;
 mod v001_xdg_linux;
 mod v002_seed_sandbox_from_volumes;
 mod v003_yolo_mode_config;
@@ -33,13 +34,14 @@ mod v022_prune_tuning_settings;
 mod v023_clear_structured_container_error;
 mod v024_backfill_detect_as;
 mod v025_reenable_confirm_delete;
+mod v026_repoint_acp_default_agent;
+pub(crate) mod v027_isolate_sandbox_stores;
 
 use anyhow::Result;
 use std::fs;
-use std::path::PathBuf;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 25;
+const CURRENT_VERSION: u32 = 27;
 const VERSION_FILE: &str = ".schema_version";
 
 struct Migration {
@@ -174,6 +176,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "reenable_confirm_delete",
         run: v025_reenable_confirm_delete::run,
     },
+    Migration {
+        version: 26,
+        name: "repoint_acp_default_agent",
+        run: v026_repoint_acp_default_agent::run,
+    },
+    Migration {
+        version: 27,
+        name: "isolate_sandbox_stores",
+        run: v027_isolate_sandbox_stores::run,
+    },
 ];
 
 /// The data-schema version this build targets, i.e. the version every install
@@ -189,50 +201,117 @@ pub fn has_pending_migrations() -> bool {
     get_current_version() < CURRENT_VERSION
 }
 
-/// Run all pending migrations. Call this early in app startup.
+/// Run all pending migrations silently. Call this early in app startup.
+/// Move this session's sandbox store into the private layout, if it is still
+/// on the shared one. Called from the container path so the copy is paid by
+/// the session that needs it rather than by every pending row on any `aoe`
+/// start.
+///
+/// `reporter` is how a caller with a screen narrates the copy. Nothing passes
+/// one yet: [`migrate_sandbox_store_for`] installs `tracing_reporter`, which
+/// reaches the log and, under `ProcessContext::Tui`, only the log
+/// (`logging.rs` forces a file sink there). So a large store still copies with
+/// nothing drawn, which is #3757's boot hang relocated to attach rather than
+/// removed. This parameter exists so the TUI and CLI launch paths can close
+/// that; until one does, the gap is real and the log is the only trail.
+///
+/// A failure here is reported by the caller and does not block the launch:
+/// a row that did not move stays on its shared store and is retried.
+pub fn migrate_sandbox_store_for_with(
+    id: &str,
+    reporter: Option<progress::Reporter>,
+) -> Result<()> {
+    if get_current_version() < 27 {
+        return Ok(());
+    }
+    let _installed = progress::install(reporter);
+    v027_isolate_sandbox_stores::migrate_instance(id)
+}
+
+/// [`migrate_sandbox_store_for_with`] using the process-wide default reporter,
+/// so the copy narrates itself wherever one is configured.
+pub fn migrate_sandbox_store_for(id: &str) -> Result<()> {
+    migrate_sandbox_store_for_with(id, Some(progress::tracing_reporter()))
+}
+
 pub fn run_migrations() -> Result<()> {
+    run_migrations_with(None)
+}
+
+/// Run all pending migrations, sending [`progress::Event`]s to `reporter` so a
+/// long one (store copies, container probes) reads as work, not a hang.
+///
+/// A still-pending sandbox store move is *not* retried here: v027's rows move
+/// when their session next needs a container, or all at once under
+/// [`run_migrations_announced`] for `aoe migrate`. This path only advances the
+/// schema version and reports the migrations it actually runs.
+pub fn run_migrations_with(reporter: Option<progress::Reporter>) -> Result<()> {
+    run_migrations_inner(reporter, false)
+}
+
+/// [`run_migrations_with`] for an explicit `aoe migrate`: a pending sandbox
+/// store move also narrates what is still pending and why.
+pub fn run_migrations_announced(reporter: Option<progress::Reporter>) -> Result<()> {
+    run_migrations_inner(reporter, true)
+}
+
+fn run_migrations_inner(reporter: Option<progress::Reporter>, announce: bool) -> Result<()> {
+    let _installed = progress::install(reporter);
     let current = get_current_version();
     debug!("Current schema version: {}", current);
 
-    if current >= CURRENT_VERSION {
-        return Ok(());
+    if current > CURRENT_VERSION {
+        anyhow::bail!(
+            "data schema version {current} is newer than this build supports ({CURRENT_VERSION}); refusing to downgrade"
+        );
+    }
+    if current == CURRENT_VERSION {
+        return v027_isolate_sandbox_stores::reconcile_pending(announce);
     }
 
-    for migration in MIGRATIONS {
-        if migration.version > current {
-            let start = std::time::Instant::now();
-            info!(
-                target: "migrations",
-                version = migration.version,
-                name = migration.name,
-                "running migration"
-            );
-            (migration.run)()?;
-            set_version(migration.version)?;
-            info!(
-                target: "migrations",
-                version = migration.version,
-                name = migration.name,
-                duration_ms = start.elapsed().as_millis() as u64,
-                "migration completed"
-            );
-        }
+    let pending: Vec<&Migration> = MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version > current)
+        .collect();
+    for (index, migration) in pending.iter().enumerate() {
+        let start = std::time::Instant::now();
+        info!(
+            target: "migrations",
+            version = migration.version,
+            name = migration.name,
+            "running migration"
+        );
+        progress::report(progress::Event::Started {
+            version: migration.version,
+            name: migration.name,
+            position: index + 1,
+            total: pending.len(),
+        });
+        (migration.run)()?;
+        set_version(migration.version)?;
+        progress::report(progress::Event::Finished {
+            version: migration.version,
+            elapsed: start.elapsed(),
+        });
+        info!(
+            target: "migrations",
+            version = migration.version,
+            name = migration.name,
+            duration_ms = start.elapsed().as_millis() as u64,
+            "migration completed"
+        );
     }
 
     Ok(())
 }
 
-/// Get the current schema version by checking all possible locations.
+/// Get the schema version from the selected app directory.
 fn get_current_version() -> u32 {
-    for dir in get_all_possible_dirs() {
-        let version_file = dir.join(VERSION_FILE);
-        if let Ok(content) = fs::read_to_string(&version_file) {
-            if let Ok(version) = content.trim().parse::<u32>() {
-                return version;
-            }
-        }
-    }
-    0
+    crate::session::get_app_dir()
+        .ok()
+        .and_then(|dir| fs::read_to_string(dir.join(VERSION_FILE)).ok())
+        .and_then(|content| content.trim().parse::<u32>().ok())
+        .unwrap_or(0)
 }
 
 /// Write the version to the current app directory.
@@ -242,25 +321,6 @@ fn set_version(version: u32) -> Result<()> {
     crate::session::atomic_write(&version_file, version.to_string().as_bytes())?;
     debug!("Updated schema version to {}", version);
     Ok(())
-}
-
-/// Returns all directories where app data might exist (for migration discovery).
-fn get_all_possible_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-
-    // Home-dotfile location: the macOS default, the pre-XDG Linux location, and
-    // the only location on Windows.
-    if let Some(home) = dirs::home_dir() {
-        dirs.push(home.join(crate::session::APP_DIR_NAME_OTHER));
-    }
-
-    // XDG location: always current on Linux, and the opt-in layout on macOS.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    if let Ok(base) = crate::session::xdg_config_base() {
-        dirs.push(base.join(crate::session::APP_DIR_NAME_XDG));
-    }
-
-    dirs
 }
 
 #[cfg(test)]
@@ -279,6 +339,20 @@ mod tests {
             );
             prev = m.version;
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn selected_app_dir_refuses_a_newer_schema() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        fs::create_dir_all(&app).unwrap();
+        fs::write(app.join(VERSION_FILE), (CURRENT_VERSION + 1).to_string()).unwrap();
+
+        let error = run_migrations().unwrap_err().to_string();
+
+        assert!(error.contains("refusing to downgrade"));
     }
 
     #[test]

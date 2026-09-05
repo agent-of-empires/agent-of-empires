@@ -4,13 +4,17 @@
 //! sub-struct so the field declaration plus its `#[setting(...)]` attributes
 //! are the single source of truth for every settings surface (TUI, web,
 //! server policy, validation). The generated code references
-//! `crate::session::settings_schema::*`, so the derive is only meant for use
+//! `crate::session::config::settings_schema::*`, so the derive is only meant for use
 //! inside the `agent-of-empires` crate.
 //!
-//! Section attribute (required):
+//! Section attribute (`name` and `category` required):
 //! ```ignore
 //! #[setting_section(name = "acp", category = "Acp")]
+//! #[setting_section(name = "session", category = "Session", repo_default = "deny")]
 //! ```
+//! `repo_default` ("allow" | "deny", default "allow") is the repo-config
+//! policy every field in the section inherits unless it declares its own
+//! `repo = "..."`.
 //!
 //! Per-field attribute:
 //! ```ignore
@@ -21,8 +25,11 @@
 //! Keys: `label`, `desc`, `category` (override the section default), `widget`,
 //! `min`, `max`, `step`, `multiline`, `mono`, `options` ("v:Label,v2:Label2"),
 //! `web` ("allow" | "elevation:reason" | "local_only:reason"),
+//! `repo` ("allow" | "deny": repo-config override policy; defaults to the
+//!   section's `repo_default`),
 //! `validate` ("none" | "range:min[:max]" | "nonempty" | "memory_limit" |
-//!   "volume_list" | "env_list" | "port_mapping_list" | "network"),
+//!   "volume_list" | "env_list" | "port_mapping_list" | "capability_list" |
+//!   "security_opt_list" | "network"),
 //! `global_only` (flag: field is shown but not profile-overridable),
 //! `skip` (flag: exclude the field from the schema entirely).
 //! When `desc` is omitted, the field's doc comment is used.
@@ -43,6 +50,9 @@ pub fn derive_settings_section(input: TokenStream) -> TokenStream {
 struct SectionMeta {
     name: String,
     category: String,
+    /// Repo-config policy inherited by fields with no `repo = "..."` of their
+    /// own. `RepoPolicy::Allow` unless the section declares otherwise.
+    repo_default: proc_macro2::TokenStream,
 }
 
 fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
@@ -79,6 +89,7 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         }
         let widget = build_widget(field, &attrs)?;
         let web = build_web(field, &attrs)?;
+        let repo = build_repo_policy(field, &attrs, &section.repo_default)?;
         let validation = build_validation(field, &attrs)?;
         let overridable = !attrs.global_only;
         let advanced = attrs.advanced;
@@ -98,6 +109,7 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 description: #description.to_string(),
                 widget: #widget,
                 web_write: #web,
+                repo_policy: #repo,
                 profile_overridable: #overridable,
                 validation: #validation,
                 advanced: #advanced,
@@ -114,9 +126,9 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             /// Schema descriptors for this section, emitted by
             /// `#[derive(SettingsSection)]`. The single source of truth for
             /// how every surface renders and guards these fields.
-            pub fn settings_descriptors() -> ::std::vec::Vec<crate::session::settings_schema::FieldDescriptor> {
-                use crate::session::settings_schema::{
-                    FieldDescriptor, WidgetKind, WebWritePolicy, ValidationKind, SelectOption,
+            pub fn settings_descriptors() -> ::std::vec::Vec<crate::session::config::settings_schema::FieldDescriptor> {
+                use crate::session::config::settings_schema::{
+                    FieldDescriptor, WidgetKind, WebWritePolicy, RepoPolicy, ValidationKind, SelectOption,
                 };
                 ::std::vec![ #(#descriptors),* ]
             }
@@ -127,6 +139,7 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 fn parse_section_meta(input: &DeriveInput) -> syn::Result<SectionMeta> {
     let mut name = None;
     let mut category = None;
+    let mut repo_default = None;
     for attr in &input.attrs {
         if !attr.path().is_ident("setting_section") {
             continue;
@@ -136,19 +149,38 @@ fn parse_section_meta(input: &DeriveInput) -> syn::Result<SectionMeta> {
                 name = Some(meta.value()?.parse::<LitStr>()?.value());
             } else if meta.path.is_ident("category") {
                 category = Some(meta.value()?.parse::<LitStr>()?.value());
+            } else if meta.path.is_ident("repo_default") {
+                repo_default = Some(meta.value()?.parse::<LitStr>()?);
             } else {
                 return Err(meta.error("unknown setting_section key"));
             }
             Ok(())
         })?;
     }
+    let repo_default = match repo_default {
+        None => quote!(RepoPolicy::Allow),
+        Some(lit) => match lit.value().as_str() {
+            "allow" => quote!(RepoPolicy::Allow),
+            "deny" => quote!(RepoPolicy::Deny),
+            other => {
+                return Err(syn::Error::new_spanned(
+                    lit,
+                    format!("unknown repo_default `{other}` (expected \"allow\" or \"deny\")"),
+                ))
+            }
+        },
+    };
     let name = name.ok_or_else(|| {
         syn::Error::new_spanned(input, "missing #[setting_section(name = \"...\")]")
     })?;
     let category = category.ok_or_else(|| {
         syn::Error::new_spanned(input, "missing #[setting_section(category = \"...\")]")
     })?;
-    Ok(SectionMeta { name, category })
+    Ok(SectionMeta {
+        name,
+        category,
+        repo_default,
+    })
 }
 
 #[derive(Default)]
@@ -161,6 +193,7 @@ struct FieldAttrs {
     category: Option<String>,
     widget: Option<String>,
     web: Option<String>,
+    repo: Option<String>,
     validate: Option<String>,
     options: Option<String>,
     min: Option<i64>,
@@ -195,6 +228,7 @@ fn parse_field_attrs(field: &syn::Field, field_name: &str) -> syn::Result<FieldA
                 "category" => out.category = Some(meta.value()?.parse::<LitStr>()?.value()),
                 "widget" => out.widget = Some(meta.value()?.parse::<LitStr>()?.value()),
                 "web" => out.web = Some(meta.value()?.parse::<LitStr>()?.value()),
+                "repo" => out.repo = Some(meta.value()?.parse::<LitStr>()?.value()),
                 "validate" => out.validate = Some(meta.value()?.parse::<LitStr>()?.value()),
                 "options" => out.options = Some(meta.value()?.parse::<LitStr>()?.value()),
                 "min" => out.min = Some(meta.value()?.parse::<LitInt>()?.base10_parse()?),
@@ -296,6 +330,27 @@ fn build_web(field: &syn::Field, attrs: &FieldAttrs) -> syn::Result<proc_macro2:
     Ok(ts)
 }
 
+fn build_repo_policy(
+    field: &syn::Field,
+    attrs: &FieldAttrs,
+    section_default: &proc_macro2::TokenStream,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let Some(spec) = attrs.repo.as_deref() else {
+        return Ok(section_default.clone());
+    };
+    let ts = match spec {
+        "allow" => quote!(RepoPolicy::Allow),
+        "deny" => quote!(RepoPolicy::Deny),
+        other => {
+            return Err(syn::Error::new_spanned(
+                field,
+                format!("unknown repo policy `{other}` (expected \"allow\" or \"deny\")"),
+            ))
+        }
+    };
+    Ok(ts)
+}
+
 fn build_validation(
     field: &syn::Field,
     attrs: &FieldAttrs,
@@ -308,6 +363,8 @@ fn build_validation(
         "volume_list" => quote!(ValidationKind::VolumeList),
         "env_list" => quote!(ValidationKind::EnvList),
         "port_mapping_list" => quote!(ValidationKind::PortMappingList),
+        "capability_list" => quote!(ValidationKind::CapabilityList),
+        "security_opt_list" => quote!(ValidationKind::SecurityOptList),
         "network" => quote!(ValidationKind::Network),
         range if range.starts_with("range:") => {
             let parts: Vec<&str> = range.trim_start_matches("range:").split(':').collect();

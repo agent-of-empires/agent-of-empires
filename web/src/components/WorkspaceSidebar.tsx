@@ -2445,7 +2445,7 @@ export function AddProjectModal({
 /** Bounds for `validate_snooze_duration` on the server. Mirrored
  *  client-side so the modal can pre-validate and disable the submit
  *  button rather than round-trip a 400. See
- *  `src/session/config.rs::SNOOZE_MAX_MINUTES`. */
+ *  `src/session/config/mod.rs::SNOOZE_MAX_MINUTES`. */
 const SNOOZE_MIN_MINUTES = 1;
 const SNOOZE_MAX_MINUTES = 30 * 24 * 60;
 

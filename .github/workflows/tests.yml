@@ -6,7 +6,13 @@ on:
   # No branch filter: a stacked PR targets its parent branch rather than main,
   # and a base filter would leave every PR but the bottom of the stack with no
   # checks at all.
+  #
+  # `labeled` is listed so adding `ci-macos` starts a run that can see the
+  # label; the default types alone would leave the macOS job waiting for the
+  # next push. It re-runs the workflow on any label, which is rare enough to
+  # cost less than a macOS regression reaching main.
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
 
 env:
   CARGO_TERM_COLOR: always
@@ -27,7 +33,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        leg: [serve-e2e, serve-rest, bare-core]
+        leg: [web-e2e, core-rest, bare-core]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -55,16 +61,17 @@ jobs:
       # tests/integration/acp_smoke.rs spawns the Node ACP shim under
       # acp-worker/test-shim/. The shim depends on @agentclientprotocol/sdk,
       # so its deps must be installed before the integration crate runs. Only
-      # the serve-rest leg runs the integration binary; the serve-e2e leg uses
+      # the core-rest leg runs the integration binary; the web-e2e leg uses
       # the fake ACP agent under web/tests/helpers/ instead, and bare-core does
-      # not exercise the shim.
+      # not exercise the shim. Node here is a test-runtime dependency, not a
+      # build one: core-rest's `cargo build` never invokes npm.
       - name: Install ACP shim deps
-        if: matrix.leg == 'serve-rest'
+        if: matrix.leg == 'core-rest'
         working-directory: acp-worker/test-shim
         run: npm ci
-      # serve-e2e: just the e2e binary. The e2e target is gated behind the
-      # `e2e-tests` feature so the serve-rest leg below can skip it; this leg
-      # opts in.
+      # web-e2e: just the e2e binary, and the only leg that builds the
+      # dashboard bundle. The e2e target is gated behind the `e2e-tests`
+      # feature so the core-rest leg below can skip it; this leg opts in.
       #
       # `--test-threads=3` on a 4-vCPU runner: the suite used to be entirely
       # `#[serial]` and took ~4 min of pure wall. Only the handful of tests that
@@ -75,32 +82,46 @@ jobs:
       # measured 336s -> 114s pinned to 4 cores, with identical results.
       # Raise this only with evidence; 4+ starts trading wall for flake risk on
       # the tests that wait on an ACP handshake.
-      - name: Cargo test (serve, e2e only)
-        if: matrix.leg == 'serve-e2e'
-        run: cargo test --features serve,e2e-tests --test e2e -- --test-threads=3
-      # serve-rest: the full serve suite minus e2e (lib + bins + integration +
-      # the standalone test bins). `--features serve` leaves the e2e target
-      # gated off, so it is skipped here while every non-e2e test binary stays
-      # auto-discovered. `--features serve` is a strict superset of the default
-      # suite and pulls in the aoe.web plugin (serve-gated) the e2e tests assert
-      # on, so the two feature gates are both covered across this leg + serve-e2e.
-      - name: Cargo test (serve, everything except e2e)
-        if: matrix.leg == 'serve-rest'
-        run: cargo test --features serve
-      # bare-core: the three no-default-features feature corners.
+      - name: Cargo test (web, e2e only)
+        if: matrix.leg == 'web-e2e'
+        run: cargo test --features web,e2e-tests --test e2e -- --test-threads=3
+      # The `web`-gated test code runs nowhere else: core-rest builds at
+      # default features and the step above names only the e2e target. Both
+      # halves need naming. The integration blocks are the dashboard-route half
+      # of daemon_core_web_optional and the aoe.web builtin assertion in
+      # plugin_install; the lib-level ones are src/server/assets.rs (the whole
+      # module is `web`-gated) and the QR seam in src/tui/dialogs/serve.rs,
+      # which would otherwise be neither compiled nor run on a PR. Keep
+      # `e2e-tests` on so the feature set matches the step above and cargo
+      # reuses its artifacts instead of rebuilding the crate; filter the lib run
+      # so it does not re-run the whole suite core-rest already covers.
+      - name: Cargo test (web-gated test blocks)
+        if: matrix.leg == 'web-e2e'
+        run: |
+          cargo test --features web,e2e-tests \
+            --test integration -- daemon_core_web_optional plugin_install
+          cargo test --features web,e2e-tests --lib -- \
+            server::assets:: tui::dialogs::serve::qr_seam
+      # core-rest: the full default-feature suite minus e2e (lib + bins +
+      # the consolidated integration binary). The daemon is core, so this
+      # leg covers it end to end with no dashboard bundle and no npm in the
+      # build. Without `e2e-tests` the e2e target is gated off, so it is
+      # skipped here while every non-e2e test binary stays auto-discovered.
+      - name: Cargo test (default features, everything except e2e)
+        if: matrix.leg == 'core-rest'
+        run: cargo test
+      # bare-core: the three no-default-features feature corners. `web` is not
+      # a default feature, so these runs are also the dashboard-off compile
+      # gate that keeps the `cfg(feature = "web")` sites from rotting.
       #  - lib/bins: with every bundled plugin compiled out, core must still
-      #    build and pass its unit tests. `--no-default-features` also drops
-      #    `serve`, so this doubles as the TUI-only compile gate, keeping the
-      #    ~27 cfg(feature = "serve") sites from rotting.
+      #    build and pass its unit tests.
       #  - e2e: acceptance criterion 1 of #268 (issue #2097): with all default
       #    plugins disabled, aoe still creates, attaches to, and destroys a
-      #    tmux + worktree session from CLI and TUI. The serve-gated e2e modules
-      #    self-gate to empty here. `e2e-tests` opts the gated target back in.
-      #    Filtered to the modules that carry that criterion instead of the
-      #    whole 134-test suite: the rest re-asserts serve-off behavior the
-      #    serve-e2e leg already covers with plugins on, for ~90s of duplicate
-      #    wall on a concurrency-bound workflow.
-      #  - check --all-targets: default-plugins on, serve off compile gate;
+      #    tmux + worktree session from CLI and TUI. Filtered to the modules
+      #    that carry that criterion instead of the whole 134-test suite: the
+      #    rest re-asserts behavior the web-e2e leg already covers with plugins
+      #    on, for ~90s of duplicate wall on a concurrency-bound workflow.
+      #  - check --all-targets: default-plugins on, dashboard off compile gate;
       #    `e2e-tests` keeps the e2e target inside the --all-targets sweep, which
       #    the gate would otherwise silently drop.
       - name: Cargo test (bare core, no default features)
@@ -110,23 +131,36 @@ jobs:
           cargo test --no-default-features --features e2e-tests --test e2e -- \
             --test-threads=3 cli:: tui_launch:: new_session::
           cargo check --no-default-features --features default-plugins,e2e-tests --all-targets
+      # A default `cargo build` must ship the daemon without invoking Node
+      # (#3619). Shadow node and npm with failing stubs so a `web`-gate
+      # regression in build.rs fails here rather than silently reintroducing
+      # the toolchain requirement for every source build.
+      - name: Cargo build without a Node toolchain
+        if: matrix.leg == 'bare-core'
+        run: |
+          mkdir -p "$RUNNER_TEMP/no-node"
+          for stub in node npm npx; do
+            printf '#!/bin/sh\necho "$0 must not be invoked by a default cargo build" >&2\nexit 1\n' \
+              > "$RUNNER_TEMP/no-node/$stub"
+            chmod +x "$RUNNER_TEMP/no-node/$stub"
+          done
+          PATH="$RUNNER_TEMP/no-node:$PATH" cargo build
       # Folded in from a former standalone `hook-privdrop` job. That job existed
       # only to build a lib test binary it could re-run under sudo, which meant a
       # third full compile of the crate at a third feature set (~1.7 min) plus
       # its own 451MB rust-cache slot. This leg has already built the lib test
-      # binary, and `--features serve` is a superset of the default feature set,
-      # so the privdrop tests are present in it. Reusing that binary makes the
-      # privileged run nearly free.
+      # binary, and the privdrop tests are core, so they are present in it.
+      # Reusing that binary makes the privileged run nearly free.
       #
       # The privileged step is safe only on a disposable GitHub-hosted runner.
       # Do not move this leg to a persistent or self-hosted machine.
       - name: Exercise alien uid guards (privdrop)
-        if: matrix.leg == 'serve-rest'
+        if: matrix.leg == 'core-rest'
         shell: bash
         run: |
           set -euo pipefail
           test_binary="$(
-            cargo test --features serve --no-run --lib --message-format=json \
+            cargo test --no-run --lib --message-format=json \
               | jq -r '
                   select(
                     .reason == "compiler-artifact"
@@ -192,11 +226,19 @@ jobs:
     # job can move to its own workflow with a `push` + `schedule` trigger and
     # drop the per-step conditions.
     #
+    # To run it on a pull request, add the `ci-macos` label. Every step below
+    # is gated on `not a PR, or that label`, so labelling runs this job for
+    # real and the required context reports a pass either way. Reach for it
+    # whenever a change touches `src/process/macos.rs`, a `target_os` cfg, or
+    # anything filesystem-shaped: macOS resolves `/tmp` and the per-user temp
+    # root through symlinks and its `mode_t` is 16 bits, and both have already
+    # reached main unnoticed because this suite does not run here by default.
+    #
     # Both cargo invocations share one feature set so the crate compiles once.
     # `e2e-tests` is an empty feature whose only consumer is `required-features`
     # on the `[[test]] name = "e2e"` target, so adding it to the --lib --bins
     # run changes the cargo fingerprint and not one line of compiled behavior.
-    # `--features serve` is a strict superset of the default suite, so one run
+    # `--features web` is a strict superset of the default suite, so one run
     # covers both feature gates.
     #
     # The two halves of the macOS surface:
@@ -221,7 +263,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')
         with:
           # These jobs run repository-controlled build/test code after checkout
           # and never push, so the job token must not linger in .git/config
@@ -229,28 +271,28 @@ jobs:
           # release.yml.
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')
         with:
           cache-bin: "true"
           save-if: true
       - name: Install tmux
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')
         run: brew install tmux
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')
         with:
           node-version: '22'
       - name: Cargo test (macOS, lib + bins)
-        if: github.event_name != 'pull_request'
-        run: cargo test --features serve,e2e-tests --lib --bins
+        if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')
+        run: cargo test --features web,e2e-tests --lib --bins
       - name: Cargo test (macOS, acp live-daemon e2e)
-        if: github.event_name != 'pull_request'
-        run: cargo test --features serve,e2e-tests --test e2e -- acp_ --test-threads=1 --nocapture
+        if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')
+        run: cargo test --features web,e2e-tests --test e2e -- acp_ --test-threads=1 --nocapture
       - name: Skipped on pull requests
-        if: github.event_name == 'pull_request'
-        run: echo "macOS runs post-merge on main; see the comment on this job."
+        if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'ci-macos')
+        run: echo "macOS runs post-merge on main. Add the 'ci-macos' label to run it here."
 
   vitest:
     name: Vitest
@@ -272,6 +314,14 @@ jobs:
       - name: Run Vitest with coverage
         working-directory: web
         run: npm run test:unit -- --coverage --reporter=default --reporter=junit --outputFile.junit=test-report.junit.xml
+      # The bundled aoe-agent ACP adapter is a separate npm package with its
+      # own node:test suite (transcript round-tripping, tool-kind mapping).
+      # Nothing ran it before, so both of its test files could rot unnoticed;
+      # it rides this job because Node is already set up here. Seconds to run,
+      # and it is deliberately not part of the coverage upload below.
+      - name: aoe-agent adapter tests
+        working-directory: acp-worker/aoe-agent
+        run: npm ci && npm test
       # Vitest's v8 coverage reporter emits LCOV paths relative to the
       # vitest cwd (web/), so SF: lines read "SF:src/...". Codecov
       # matches file paths against the PR diff, which uses repo-root
@@ -484,7 +534,7 @@ jobs:
           # keeps INLINE sourcemaps. The mocked job uses external maps (much
           # smaller `.js`, far faster navigation); see web/vite.config.ts.
           AOE_COVERAGE_INLINE_SOURCEMAP: '1'
-        run: cargo build --features serve
+        run: cargo build --features web
       - name: Install web deps
         working-directory: web
         run: npm ci

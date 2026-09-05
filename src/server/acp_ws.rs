@@ -135,26 +135,14 @@ async fn handle(
     // events get dropped.
     let mut rx = state.acp_events_tx.subscribe();
 
-    // Server-side reduced control state for this connection (Tier 1, see
-    // docs/development/server-owned-sv-state.md). The daemon reduces the event
-    // stream through `AcpState::apply_event` and pushes the result as a
-    // `reduced_state` frame, so clients render control state (turn/steering/
-    // approvals/usage/modes) instead of re-deriving it. Reduction is
-    // per-connection but deterministic (same reducer over the same ordered
-    // stream), so every client converges. Agent/model seed the frame's identity
-    // fields; the reducer corrects `agent` on any `AgentSwitched`.
+    // Each connection deterministically reduces the ordered event stream into
+    // control state. Agent and model seed identity until an event changes it.
     let (agent, model) = seed_identity(&state, &session_id).await;
     // Kept so a lag can rebuild the fold from the same identity seed.
     let seed = (agent.clone(), model.clone());
     let mut reduced = AcpState::new(AcpSessionId(session_id.clone()), agent, model);
 
-    // Server-side transcript render model for this connection (Tier 4, see
-    // docs/development/server-owned-sv-state.md). Alongside the reduced control
-    // state, the daemon folds the event stream into ordered transcript rows and
-    // streams them as a `transcript_snapshot` on connect plus per-event
-    // `transcript_delta` frames, so clients render the activity stream from the
-    // server model instead of re-reducing it. Same deterministic-reducer,
-    // per-connection story as `reduced`.
+    // Fold the same stream into the transcript snapshot and deltas.
     let mut transcript = TranscriptModel::new();
     // Per-connection memory of the cold state fields already delivered.
     let mut cold = ColdFieldCache::default();
@@ -444,6 +432,7 @@ async fn drain_replay_into_socket(
             session_id: session_id.to_string(),
             seq,
             event: Arc::new(event),
+            worker_generation: None,
         };
         let payload = match serde_json::to_string(&frame) {
             Ok(s) => s,
@@ -503,7 +492,8 @@ const COLD_STATE_FIELDS: [&str; 5] = [
 /// Identity fields to seed a fresh `AcpState` with: the reducer corrects
 /// `agent` on any `AgentSwitched`, but a fold that never sees one keeps this
 /// seed, so both the WS connection fold and the on-demand
-/// [`fold_control_state`] must start from the same place.
+/// [`crate::server::session_service::SessionService::fold_control_state`]
+/// must start from the same place.
 async fn seed_identity(state: &AppState, session_id: &str) -> (AgentName, Option<String>) {
     let instances = state.instances.read().await;
     instances
@@ -516,55 +506,6 @@ async fn seed_identity(state: &AppState, session_id: &str) -> (AgentName, Option
             )
         })
         .unwrap_or_else(|| (AgentName(String::new()), None))
-}
-
-/// The daemon's current control state for a session.
-///
-/// The WS folds are per-connection (see `handle`), so an HTTP handler has no
-/// `AcpState` to read. This serves one from the live projection
-/// (`crate::acp::control_cache`), which the publish choke point keeps folded,
-/// and rebuilds it from the durable log on a miss. Used by prompt dispatch
-/// (Tier 3, `docs/development/server-owned-prompt-dispatch.md`), where the
-/// alternative is asking the client what the daemon's own state is.
-///
-/// The rebuild is the reason this is cached rather than folded per call. It
-/// measured 68ms at 20k events and 342ms at 100k, on a store whose retention
-/// default is unlimited, and it holds the event store's connection mutex for
-/// the whole scan, so a prompt on one long session would stall event recording
-/// for every session. Cached, that cost is paid once per session per daemon
-/// life instead of on every prompt.
-pub(crate) async fn fold_control_state(state: &AppState, session_id: &str) -> AcpState {
-    let (agent, model) = seed_identity(state, session_id).await;
-    let store = Arc::clone(&state.acp_event_store);
-    let cache = Arc::clone(&state.acp_control_cache);
-    let sid = session_id.to_string();
-    // The hydrate closure runs under the cache's per-session lock and does a
-    // locking SQLite scan, so the whole thing goes off the runtime rather than
-    // just the scan.
-    tokio::task::spawn_blocking(move || {
-        cache.get_or_hydrate(&sid.clone(), || {
-            let mut reduced = AcpState::new(AcpSessionId(sid.clone()), agent, model);
-            let mut last_seq = 0;
-            for (seq, event) in store.replay_from(&sid, 0) {
-                let _ = reduced.apply_event(event);
-                last_seq = seq;
-            }
-            (reduced, last_seq)
-        })
-    })
-    .await
-    .unwrap_or_else(|_| {
-        // The blocking pool panicked or shut down. An empty state reads as
-        // "idle", and dispatch's fall-through would then send into whatever
-        // turn is running, so hand back one that parks instead.
-        let mut fallback = AcpState::new(
-            AcpSessionId(session_id.to_string()),
-            AgentName(String::new()),
-            None,
-        );
-        fallback.turn_active = true;
-        fallback
-    })
 }
 
 fn fold_connect_history(
@@ -948,7 +889,7 @@ where
     }
 }
 
-#[cfg(all(test, feature = "serve"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1099,6 +1040,7 @@ mod tests {
                 image: false,
                 audio: false,
                 embedded_context: false,
+                load_session: None,
                 steering: true,
             },
         );
@@ -1110,7 +1052,7 @@ mod tests {
                 prompt_id: None,
             },
         );
-        let folded = fold_control_state(&state, "s-fold").await;
+        let folded = state.session_service.fold_control_state("s-fold").await;
         assert!(folded.turn_active, "the prompt opened a turn");
         assert!(folded.steering, "capabilities survive the fold");
         assert!(!folded.cancelling);
@@ -1120,6 +1062,7 @@ mod tests {
                 crate::acp::dispatch::WorkerLiveness {
                     running: true,
                     idle_dormant: false,
+                    rate_limit_exhausted: false,
                 },
             ),
             crate::acp::dispatch::PromptDispatch::Steered
@@ -1133,7 +1076,7 @@ mod tests {
                 escalates_at: chrono::Utc::now(),
             },
         );
-        let folded = fold_control_state(&state, "s-fold").await;
+        let folded = state.session_service.fold_control_state("s-fold").await;
         assert!(folded.cancelling);
         assert_eq!(
             crate::acp::dispatch::decide(
@@ -1141,6 +1084,7 @@ mod tests {
                 crate::acp::dispatch::WorkerLiveness {
                     running: true,
                     idle_dormant: false,
+                    rate_limit_exhausted: false,
                 },
             ),
             crate::acp::dispatch::PromptDispatch::Queued {
@@ -1155,7 +1099,7 @@ mod tests {
                 reason: "cancelled".into(),
             },
         );
-        let folded = fold_control_state(&state, "s-fold").await;
+        let folded = state.session_service.fold_control_state("s-fold").await;
         assert!(!folded.turn_active, "Stopped closed the turn");
         assert!(!folded.cancelling, "and cleared the pending cancel");
         assert_eq!(
@@ -1164,6 +1108,7 @@ mod tests {
                 crate::acp::dispatch::WorkerLiveness {
                     running: true,
                     idle_dormant: false,
+                    rate_limit_exhausted: false,
                 },
             ),
             crate::acp::dispatch::PromptDispatch::Sent
@@ -1172,7 +1117,7 @@ mod tests {
         // An unknown session folds to a default (idle) state rather than
         // erroring, so a prompt for a session the daemon has not seen is not
         // parked forever on a phantom turn.
-        let unknown = fold_control_state(&state, "s-missing").await;
+        let unknown = state.session_service.fold_control_state("s-missing").await;
         assert!(!unknown.turn_active);
     }
 
@@ -1325,6 +1270,7 @@ mod tests {
             session_id: "s".into(),
             seq: 1,
             event: Arc::new(crate::acp::Event::ThinkingStarted),
+            worker_generation: None,
         });
         // Sending to a channel with no receivers returns Err, but
         // publish() in this module deliberately discards the result.
