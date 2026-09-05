@@ -34,7 +34,6 @@ fn parse_prime_agent_launch_options(words: &[String]) -> Option<PrimeAgentLaunch
         "--skill",
         "--prompt-template",
         "--theme",
-        "--autonomous",
         "--goal",
         "--goal-token-budget",
     ];
@@ -99,11 +98,9 @@ fn read_prime_agent_settings(
     let Some(bytes) = root.read_regular(Path::new(leaf), PRIME_AGENT_SETTINGS_MAX_BYTES)? else {
         anyhow::bail!("Prime Agent settings are not a bounded regular file");
     };
-    serde_json::from_slice::<serde_json::Value>(&bytes)?
-        .as_object()
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("Prime Agent settings root is not an object"))
-        .map(Some)
+    Ok(serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|settings| settings.as_object().cloned()))
 }
 
 fn read_sandbox_sidecar_file(store: &Path, instance_id: &str, leaf: &str) -> Option<Vec<u8>> {
@@ -210,15 +207,14 @@ impl Instance {
                 .iter()
                 .find(|entry| entry.key() == key)
                 .map(|entry| entry.value())
-                .filter(|value| !value.is_empty())
         };
+        let environment_session_dir = environment_value("PRIME_AGENT_SESSION_DIR")
+            .or_else(|| environment_value("PRIME_AGENT_CODING_AGENT_SESSION_DIR"))
+            .filter(|value| !value.is_empty());
         let configured_session_dir = options
             .session_dir
             .filter(|value| !value.is_empty())
-            .or_else(|| environment_value("PRIME_AGENT_SESSION_DIR").map(str::to_string))
-            .or_else(|| {
-                environment_value("PRIME_AGENT_CODING_AGENT_SESSION_DIR").map(str::to_string)
-            });
+            .or_else(|| environment_session_dir.map(str::to_string));
 
         let session_dir_value = if let Some(value) = configured_session_dir {
             value
@@ -1571,7 +1567,26 @@ mod tests {
             .prime_agent_capture_plan_with(&config, store.clone())
             .unwrap();
         assert_eq!(plan.session_dir, Path::new("project"));
-
+        std::fs::write(store.join("settings.json"), "{").unwrap();
+        let plan = inst
+            .prime_agent_capture_plan_with(&config, store.clone())
+            .unwrap();
+        assert_eq!(plan.session_dir, Path::new("project"));
+        std::fs::write(
+            store.join("settings.json"),
+            serde_json::json!({"sessionDir": "~/.prime/agent/global"}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(project.join(".prime/agent/settings.json"), "[]").unwrap();
+        let plan = inst
+            .prime_agent_capture_plan_with(&config, store.clone())
+            .unwrap();
+        assert_eq!(plan.session_dir, Path::new("global"));
+        std::fs::write(
+            project.join(".prime/agent/settings.json"),
+            serde_json::json!({"sessionDir": "~/.prime/agent/project"}).to_string(),
+        )
+        .unwrap();
         config
             .environment
             .push(crate::containers::EnvEntry::Literal {
@@ -1594,7 +1609,22 @@ mod tests {
             .unwrap();
         assert_eq!(plan.session_dir, Path::new("current"));
 
-        inst.extra_args = "--cwd /root/.prime/agent/work/../work --session-dir ../cli".to_string();
+        config
+            .environment
+            .retain(|entry| entry.key() != "PRIME_AGENT_SESSION_DIR");
+        config
+            .environment
+            .push(crate::containers::EnvEntry::Literal {
+                key: "PRIME_AGENT_SESSION_DIR".to_string(),
+                value: String::new(),
+            });
+        let plan = inst
+            .prime_agent_capture_plan_with(&config, store.clone())
+            .unwrap();
+        assert_eq!(plan.session_dir, Path::new("project"));
+
+        inst.extra_args =
+            "--autonomous --cwd /root/.prime/agent/work/../work --session-dir ../cli".to_string();
         let plan = inst
             .prime_agent_capture_plan_with(&config, store.clone())
             .unwrap();
@@ -1697,6 +1727,7 @@ import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 const extension = (await import(pathToFileURL(process.argv[1]).href)).default;
+process.chdir(process.argv[4]);
 const context = (id, path, rlmDepth) => ({
   sessionManager: {
     getSessionId: () => id,
@@ -1712,8 +1743,13 @@ async function publish(target, rootOnly) {
   extension({ on(name, handler) { if (name === "session_start") sessionStart = handler; } });
   await sessionStart({}, context(
     "018f47a6-7b80-7cc3-98a2-37b5f486b2a1",
-    "/root/.prime/agent/custom-sessions/parent.jsonl",
+    "custom-sessions/parent.jsonl",
     0,
+  ));
+  await sessionStart({}, context(
+    "018f47a6-7b80-7cc3-98a2-37b5f486b2a2",
+    "custom-sessions/children/child.jsonl",
+    undefined,
   ));
   await sessionStart({}, context(
     "018f47a6-7b80-7cc3-98a2-37b5f486b2a2",
@@ -1731,6 +1767,7 @@ process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
             .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/session/aoe-session-id.js"))
             .arg(&sidecar)
             .arg(&default_sidecar)
+            .arg(&store)
             .output()
             .unwrap();
 
@@ -1747,7 +1784,7 @@ process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
         );
         assert_eq!(
             std::fs::read_to_string(&path_sidecar).unwrap().trim(),
-            "/root/.prime/agent/custom-sessions/parent.jsonl"
+            store.join("custom-sessions/parent.jsonl").to_str().unwrap()
         );
 
         std::fs::write(&sidecar, child_id).unwrap();

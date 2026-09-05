@@ -10,7 +10,7 @@
 // `session_start` covers startup, resume, fork, and new. Failures are
 // swallowed: publishing identity must never interfere with the agent.
 import { mkdirSync, writeFileSync, renameSync, unlinkSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 export default function (pi) {
   const idTarget = process.env.AOE_SESSION_ID_FILE;
@@ -38,13 +38,14 @@ export default function (pi) {
     if (!idTarget) return;
     try {
       // Prime writes rlmDepth into every child header; depth zero owns the pane.
-      if (rootOnly && ctx?.sessionManager?.getHeader?.()?.rlmDepth > 0) return;
+      if (rootOnly && ctx?.sessionManager?.getHeader?.()?.rlmDepth !== 0) return;
       const id = ctx?.sessionManager?.getSessionId?.();
       if (!id) return;
-      writeAtomic(idTarget, id);
       const file = ctx?.sessionManager?.getSessionFile?.();
-      if (file) {
-        writeAtomic(join(dirname(idTarget), "session_path"), file);
+      const absoluteFile = file ? resolve(file) : undefined;
+      writeAtomic(idTarget, id);
+      if (absoluteFile) {
+        writeAtomic(join(dirname(idTarget), "session_path"), absoluteFile);
       }
       if (rootOnly) {
         writeAtomic(join(dirname(idTarget), "root_only"), "1");

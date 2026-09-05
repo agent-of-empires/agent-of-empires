@@ -1199,7 +1199,9 @@ fn scan_prime_agent_sessions(store: &Path, session_dir: &Path) -> Vec<PrimeAgent
         let Ok(header) = serde_json::from_slice::<serde_json::Value>(&header) else {
             continue;
         };
-        if header.get("type").and_then(|value| value.as_str()) != Some("session") {
+        if header.get("type").and_then(|value| value.as_str()) != Some("session")
+            || header.get("rlmDepth").and_then(|value| value.as_u64()) != Some(0)
+        {
             continue;
         }
         let (Some(id), Some(cwd)) = (
@@ -2628,6 +2630,13 @@ mod tests {
             let path = write_prime_session(&sessions, &format!("{name}.jsonl"), id, cwd);
             set_mtime_seconds(&path, mtime);
         }
+        let child =
+            write_prime_session(&sessions, "newest-child.jsonl", "prime_child", "/workspace");
+        let mut child_header: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&child).unwrap()).unwrap();
+        child_header["rlmDepth"] = serde_json::json!(1);
+        std::fs::write(&child, format!("{child_header}\n")).unwrap();
+        set_mtime_seconds(&child, 5_000);
 
         let poll = prime_agent_poll_fn_sandboxed_store(
             tmp.path().to_path_buf(),
