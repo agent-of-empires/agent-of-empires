@@ -61,6 +61,7 @@ settings save on `config.toml`.
 | `AGENT_OF_EMPIRES_PROFILE` | Default profile to use |
 | `AGENT_OF_EMPIRES_DEBUG` | Enable debug logging to `debug.log` in app data dir (`1` to enable). Legacy alias for `AOE_LOG_LEVEL=debug`. |
 | `AOE_LOG_LEVEL` | File log level: `trace`, `debug`, `info`, `warn`, `error`. |
+| `AOE_DEFER_SANDBOX_MIGRATION` | Start without moving sandboxed sessions' agent stores; the move is retried on a later start or with `aoe migrate`. See [Per-session agent stores](sandbox.md#per-session-agent-stores). |
 
 ## Theme
 

@@ -91,6 +91,31 @@ impl Instance {
             .image
             .clone();
         let container = DockerContainer::new(&self.id, &image);
+        // Charge the sandbox store move to the session that needs it, at the
+        // one chokepoint every entry point shares: tmux launches, ACP
+        // structured sessions and a bare container terminal all arrive here.
+        // It must stay above the shared flock below, which `run_in` takes
+        // exclusively. A failure leaves the row on its shared store for a
+        // later attempt rather than blocking the launch.
+        //
+        // A running container is the one case worth skipping outright: its
+        // cohort cannot move while it is up, so the pass is guaranteed to
+        // refuse, and it is not free. `run_in` takes the v027 lock and every
+        // registry's storage lock exclusively, and `Storage::update` waits on
+        // the first of those, so attaching to a live legacy session would
+        // stall writes in every AoE process to reach a foregone conclusion.
+        if self.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION
+            && !container.is_running()?
+        {
+            match crate::migrations::migrate_sandbox_store_for(&self.id) {
+                Ok(()) => self.reconcile_from_disk(),
+                Err(error) => tracing::warn!(
+                    session_id = %self.id,
+                    %error,
+                    "sandbox store move deferred; session continues on its shared store"
+                ),
+            }
+        }
         let _transition_lock =
             if self.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION {
                 Some(crate::session::acquire_storage_shared_flock(
@@ -147,7 +172,7 @@ impl Instance {
 
         if self.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION {
             anyhow::bail!(
-                "sandbox store transition is pending for {}; stop all legacy sandbox peers and restart AoE before relaunching it",
+                "sandbox store transition is pending for {}; stop the other sandboxed sessions sharing this agent's store, then relaunch it or run `aoe migrate`",
                 self.id
             );
         }
