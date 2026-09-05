@@ -97,7 +97,16 @@ impl Instance {
         // It must stay above the shared flock below, which `run_in` takes
         // exclusively. A failure leaves the row on its shared store for a
         // later attempt rather than blocking the launch.
-        if self.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION {
+        //
+        // A running container is the one case worth skipping outright: its
+        // cohort cannot move while it is up, so the pass is guaranteed to
+        // refuse, and it is not free. `run_in` takes the v027 lock and every
+        // registry's storage lock exclusively, and `Storage::update` waits on
+        // the first of those, so attaching to a live legacy session would
+        // stall writes in every AoE process to reach a foregone conclusion.
+        if self.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION
+            && !container.is_running()?
+        {
             match crate::migrations::migrate_sandbox_store_for(&self.id) {
                 Ok(()) => self.reconcile_from_disk(),
                 Err(error) => tracing::warn!(

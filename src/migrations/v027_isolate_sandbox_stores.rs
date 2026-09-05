@@ -269,6 +269,11 @@ fn transition_may_be_pending(app_dir: &Path) -> Result<bool> {
 /// A parked row still blocks retirement of the shared source it reads, via
 /// `defer_source_retirement`: retiring underneath it would leave a restored
 /// session with no store to open.
+///
+/// A pass scoped to the parked row itself ignores this: `aoe send`, `aoe
+/// session start` and the HTTP start/send handlers all launch a trashed or
+/// archived session without unparking it first, and skipping it there leaves
+/// it on a shared store no later pass will move, so the launch bails forever.
 fn row_is_parked(row: &Value) -> bool {
     ["trashed_at", "archived_at"]
         .iter()
@@ -406,7 +411,7 @@ fn run_in(
                 }
                 continue;
             }
-            if row_is_parked(row) {
+            if row_is_parked(row) && only != Some(id.as_str()) {
                 defer_source_retirement = true;
                 continue;
             }
@@ -2364,6 +2369,55 @@ gemini = "{}"
         assert!(
             other.exists(),
             "the untouched cohort still needs its shared source"
+        );
+        let rows: Value =
+            serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
+        assert_eq!(rows[0]["sandbox_store_generation"], 2);
+        // The scoped-out row must not be stamped current: its store was never
+        // copied, and generation 2 would point the session at a private store
+        // that does not exist.
+        assert_ne!(rows[1]["sandbox_store_generation"], 2);
+    }
+
+    /// A parked row is skipped by the bulk passes, but `aoe send` / `aoe
+    /// session start` / the HTTP handlers start a trashed or archived session
+    /// without unparking it. The pass scoped to that session must move it, or
+    /// nothing ever will and its launch bails on the pending transition.
+    #[test]
+    #[serial_test::serial]
+    fn a_scoped_pass_moves_the_parked_row_it_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        let home = dirs::home_dir().unwrap();
+        let legacy = home.join(".gemini/sandbox");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("data"), b"data").unwrap();
+        let rows = serde_json::json!([
+            {"id":"1111111111111111","tool":"gemini","sandbox_info":{"enabled":true},
+             "archived_at":"2026-09-05T00:00:00Z"},
+            {"id":"2222222222222222","tool":"gemini","sandbox_info":{"enabled":true},
+             "trashed_at":"2026-09-05T00:00:00Z"}
+        ]);
+        fs::write(
+            app.join("sessions.json"),
+            serde_json::to_vec(&rows).unwrap(),
+        )
+        .unwrap();
+
+        run_in_only(&app, &home, &|_| Ok(false), "1111111111111111").unwrap();
+
+        assert_eq!(
+            fs::read(home.join(".gemini/sandbox-v2/1111111111111111/data")).unwrap(),
+            b"data"
+        );
+        let rows: Value =
+            serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
+        assert_eq!(rows[0]["sandbox_store_generation"], 2);
+        assert_ne!(rows[1]["sandbox_store_generation"], 2);
+        assert!(
+            legacy.exists(),
+            "the still-parked peer must keep the shared source"
         );
     }
 

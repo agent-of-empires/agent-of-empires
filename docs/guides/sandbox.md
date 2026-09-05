@@ -309,18 +309,22 @@ every session that used it has moved (the private copies are the data from then
 on). A large store takes a while, so the first start of a session is slower
 than usual. A session whose container is still running is skipped and moved on
 a later start, after it stops. Trashed and archived sessions stay on the shared
-store until they are restored.
+store until they are restored, unarchived, or started directly.
 
-To move every pending session at once instead of paying for each at its next
+To move every eligible session at once instead of paying for each at its next
 start:
 
 ```bash
 aoe migrate
 ```
 
-`AOE_DEFER_SANDBOX_MIGRATION=1` skips the move for that launch, so the session
-starts on the shared store; the move is retried on a later start without the
-variable, or with `aoe migrate`.
+This skips trashed and archived sessions, which keep their shared store until
+one of them is started or brought back.
+
+`AOE_DEFER_SANDBOX_MIGRATION=1` skips the move for that launch. A session whose
+container is still running carries on unaffected, on the shared store. One
+whose container is stopped cannot start until its store has moved, so drop the
+variable or run `aoe migrate` before launching it.
 
 ## Worktrees and Sandboxing
 
