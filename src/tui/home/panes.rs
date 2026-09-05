@@ -55,6 +55,20 @@ impl HomeView {
         }
         let term = inst.container_terminal_tmux_session()?;
         if !term.exists() || term.is_pane_dead() {
+            // A running container needs no move and the chokepoint skips it;
+            // otherwise the copy can take minutes, so it runs on the worker
+            // with the status line narrating it, and the send is not queued
+            // behind it.
+            if self.needs_store_move_before_launch(session_id)
+                && !crate::containers::DockerContainer::from_session_id(session_id)
+                    .is_running()
+                    .unwrap_or(false)
+            {
+                self.begin_store_move(session_id, None);
+                anyhow::bail!(
+                    "its agent store is being moved first; retry once the status line clears"
+                );
+            }
             if term.exists() {
                 let _ = term.kill();
             }
