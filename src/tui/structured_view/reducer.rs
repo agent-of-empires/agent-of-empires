@@ -355,7 +355,7 @@ impl AcpTranscript {
             .into_iter()
             .filter(|a| !self.locally_resolved.contains(&a.nonce.0))
             .map(|a| {
-                let choice_list = a.is_choice_list();
+                let choice_list = a.choice_list;
                 PendingApproval {
                     nonce: a.nonce.0,
                     title: a.tool_call.name,

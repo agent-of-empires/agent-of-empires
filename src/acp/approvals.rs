@@ -104,12 +104,6 @@ pub struct Approval {
     pub resolved: Option<ResolvedApproval>,
 }
 
-impl Approval {
-    pub fn is_choice_list(&self) -> bool {
-        self.choice_list
-    }
-}
-
 /// Whether an agent's options are a question's choices rather than an
 /// allow/deny vocabulary: options of one kind, either more than two of them
 /// or under pi's `pi-ui-` tool-call id prefix (its yes/no confirm dialogs mix

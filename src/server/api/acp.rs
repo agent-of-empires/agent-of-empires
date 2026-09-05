@@ -22,7 +22,7 @@ use crate::acp::protocol::{
     FilesResponse, PromptAttachmentUpload, PromptRequest, ReplayQuery, ReplayResponse,
     ResolveApprovalRequest, SwitchAgentRequest, SwitchAgentResponse,
 };
-use crate::acp::state::{Event, PromptAttachmentKind, RateLimitInfo};
+use crate::acp::state::PromptAttachmentKind;
 use crate::acp::supervisor::SupervisorError;
 use crate::server::session_service::{SendTurnError, SessionCaller};
 use crate::server::AppState;
@@ -221,28 +221,25 @@ pub(crate) fn validate_attachments(
     Ok(blobs)
 }
 
+/// The resume-at instant a manual RESUME NOW breadcrumb carries, from the
+/// session's durable park (#3514: a failed auto-resume's startup error must
+/// not hide it). #3688: an exhausted-retries park also continues the
+/// interrupted turn on manual resume; no schedule applies, so the marker is
+/// only the resume-at instant.
 fn rate_limit_resume_marker_resets_at(
-    latest_status: Option<&Event>,
-    latest_rate_limit: Option<&RateLimitInfo>,
+    park: Option<&crate::acp::event_store::RateLimitPark>,
     fallback_resets_at: DateTime<Utc>,
 ) -> Option<DateTime<Utc>> {
-    // #3688: an exhausted-retries park also continues the interrupted turn
-    // on manual resume. No schedule applies (the reconciler already gave
-    // up), so the marker's timestamp is only the resume-at instant the
-    // breadcrumb reports.
-    match latest_status {
-        Some(Event::Stopped { reason }) if reason == "rate_limited" => Some(
-            latest_rate_limit
-                .and_then(|info| info.resets_at)
-                .unwrap_or(fallback_resets_at),
-        ),
-        Some(Event::Stopped { reason })
-            if reason == crate::server::acp_reconciler::RATE_LIMIT_EXHAUSTED_RETRIES_REASON =>
-        {
-            Some(fallback_resets_at)
-        }
-        _ => None,
+    let park = park?;
+    if park.cap_reached {
+        return Some(fallback_resets_at);
     }
+    Some(
+        park.info
+            .as_ref()
+            .and_then(|info| info.resets_at)
+            .unwrap_or(fallback_resets_at),
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -459,15 +456,8 @@ pub async fn spawn_acp(
         let store = Arc::clone(&state.acp_event_store);
         let id_for_probe = id.clone();
         tokio::task::spawn_blocking(move || {
-            let latest_status = store.latest_status_event(&id_for_probe);
-            let latest_rate_limit = store
-                .latest_rate_limit_event(&id_for_probe)
-                .map(|(info, _created_at)| info);
-            rate_limit_resume_marker_resets_at(
-                latest_status.as_ref(),
-                latest_rate_limit.as_ref(),
-                Utc::now(),
-            )
+            let park = store.rate_limit_park(&id_for_probe);
+            rate_limit_resume_marker_resets_at(park.as_ref(), Utc::now())
         })
         .await
         .unwrap_or_else(|e| {
@@ -2882,6 +2872,7 @@ pub async fn list_claude_sessions(State(state): State<Arc<AppState>>) -> impl In
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::state::{Event, RateLimitInfo};
     use std::io::Write;
 
     fn utc_ts(raw: &str) -> DateTime<Utc> {
@@ -3906,90 +3897,52 @@ mod tests {
         assert_eq!(rows_resp.lost, frames_resp.lost);
     }
 
+    /// The marker follows the durable park: none without one; the reported
+    /// reset when there is one; the fallback when the agent reported none
+    /// (#3152) or the cap parked the session terminally (#3688), where a
+    /// manual resume must still continue the interrupted turn.
     #[test]
-    fn rate_limit_resume_marker_requires_latest_rate_limit_park() {
+    fn rate_limit_resume_marker_follows_the_durable_park() {
+        use crate::acp::event_store::RateLimitPark;
         let fallback = utc_ts("2099-01-01T00:00:00Z");
-        assert_eq!(
-            rate_limit_resume_marker_resets_at(None, None, fallback),
-            None
-        );
-
-        let stopped = Event::Stopped {
-            reason: "user_stopped".to_string(),
-        };
-        assert_eq!(
-            rate_limit_resume_marker_resets_at(Some(&stopped), None, fallback),
-            None
-        );
-    }
-
-    #[test]
-    fn rate_limit_resume_marker_uses_latest_rate_limit_reset() {
-        let stopped = Event::Stopped {
-            reason: "rate_limited".to_string(),
-        };
         let resets_at = utc_ts("2099-02-03T04:05:06Z");
-        let fallback = utc_ts("2099-01-01T00:00:00Z");
-        let info = RateLimitInfo {
+        let info = |resets_at| RateLimitInfo {
             status: "limited".to_string(),
-            resets_at: Some(resets_at),
+            resets_at,
             kind: "rate_limit".to_string(),
         };
-
-        assert_eq!(
-            rate_limit_resume_marker_resets_at(Some(&stopped), Some(&info), fallback),
-            Some(resets_at)
-        );
-    }
-
-    #[test]
-    fn rate_limit_resume_marker_falls_back_when_rate_limit_event_missing() {
-        let stopped = Event::Stopped {
-            reason: "rate_limited".to_string(),
+        let park = |info, cap_reached| RateLimitPark {
+            info,
+            recorded_at_ms: 0,
+            cap_reached,
+            last_resume_attempt_ms: None,
         };
-        let fallback = utc_ts("2099-01-01T00:00:00Z");
-
-        assert_eq!(
-            rate_limit_resume_marker_resets_at(Some(&stopped), None, fallback),
-            Some(fallback)
-        );
-    }
-
-    /// #3688: an exhausted-retries park still resumes manually. The marker
-    /// gates whether the spawn path queues the interrupted prompt, so a
-    /// None here would leave RESUME NOW spawning an idle worker.
-    #[test]
-    fn rate_limit_resume_marker_covers_exhausted_retries_park() {
-        let stopped = Event::Stopped {
-            reason: "rate_limit_exhausted_retries".to_string(),
-        };
-        let fallback = utc_ts("2099-01-01T00:00:00Z");
-
-        assert_eq!(
-            rate_limit_resume_marker_resets_at(Some(&stopped), None, fallback),
-            Some(fallback)
-        );
-    }
-
-    /// The park exists but the agent reported no reset: the marker has to
-    /// fall through to the caller's fallback, or auto-resume loses its
-    /// schedule for exactly the sessions #3152 is about.
-    #[test]
-    fn rate_limit_resume_marker_falls_back_when_reset_unknown() {
-        let stopped = Event::Stopped {
-            reason: "rate_limited".to_string(),
-        };
-        let fallback = utc_ts("2099-01-01T00:00:00Z");
-        let info = RateLimitInfo {
-            status: "limited".to_string(),
-            resets_at: None,
-            kind: "rate_limit".to_string(),
-        };
-
-        assert_eq!(
-            rate_limit_resume_marker_resets_at(Some(&stopped), Some(&info), fallback),
-            Some(fallback)
-        );
+        let cases = [
+            ("no park", None, None),
+            (
+                "reported reset",
+                Some(park(Some(info(Some(resets_at))), false)),
+                Some(resets_at),
+            ),
+            (
+                "reset unknown",
+                Some(park(Some(info(None)), false)),
+                Some(fallback),
+            ),
+            ("limit row pruned", Some(park(None, false)), Some(fallback)),
+            (
+                "cap park",
+                Some(park(Some(info(Some(resets_at))), true)),
+                Some(fallback),
+            ),
+        ];
+        for (label, park, expected) in cases {
+            assert_eq!(
+                rate_limit_resume_marker_resets_at(park.as_ref(), fallback),
+                expected,
+                "{label}"
+            );
+        }
     }
 
     #[test]

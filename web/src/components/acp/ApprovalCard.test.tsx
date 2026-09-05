@@ -74,7 +74,7 @@ describe("ApprovalCard (choice list, #3741)", () => {
     expect(screen.queryByRole("group", { name: /choose an answer/i })).toBeNull();
   });
 
-  it("treats a pi question with two choices as a list", () => {
+  it("renders a daemon-flagged question as a list", () => {
     const onResolve = vi.fn().mockResolvedValue(undefined);
     render(
       <ApprovalCard
@@ -261,21 +261,21 @@ describe("ApprovalCard (benign)", () => {
     render(<ApprovalCard approval={makeApproval()} onResolve={onResolve} />);
     fireEvent.click(screen.getByText("Allow"));
     expect(onResolve).toHaveBeenCalledTimes(1);
-    expect(onResolve).toHaveBeenCalledWith<ApprovalDecision[]>("Allow");
+    expect(onResolve).toHaveBeenCalledWith("Allow", undefined);
   });
 
   it("routes Always to onResolve('AllowAlways')", () => {
     const onResolve = vi.fn().mockResolvedValue(undefined);
     render(<ApprovalCard approval={makeApproval()} onResolve={onResolve} />);
     fireEvent.click(screen.getByText("Always"));
-    expect(onResolve).toHaveBeenCalledWith("AllowAlways");
+    expect(onResolve).toHaveBeenCalledWith("AllowAlways", undefined);
   });
 
   it("routes Deny to onResolve('Deny')", () => {
     const onResolve = vi.fn().mockResolvedValue(undefined);
     render(<ApprovalCard approval={makeApproval()} onResolve={onResolve} />);
     fireEvent.click(screen.getByText("Deny"));
-    expect(onResolve).toHaveBeenCalledWith("Deny");
+    expect(onResolve).toHaveBeenCalledWith("Deny", undefined);
   });
 
   it("shows the rolled-back message when onResolve rejects", async () => {
@@ -332,14 +332,14 @@ describe("ApprovalCard (destructive)", () => {
       vi.advanceTimersByTime(800);
     });
     expect(onResolve).toHaveBeenCalledTimes(1);
-    expect(onResolve).toHaveBeenCalledWith("Allow");
+    expect(onResolve).toHaveBeenCalledWith("Allow", undefined);
   });
 
   it("routes Deny without requiring a hold even in destructive mode", () => {
     const onResolve = vi.fn().mockResolvedValue(undefined);
     render(<ApprovalCard approval={makeApproval({ destructive: true })} onResolve={onResolve} />);
     fireEvent.click(screen.getByText("Deny"));
-    expect(onResolve).toHaveBeenCalledWith("Deny");
+    expect(onResolve).toHaveBeenCalledWith("Deny", undefined);
   });
 });
 

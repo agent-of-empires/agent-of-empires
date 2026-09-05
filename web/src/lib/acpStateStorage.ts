@@ -113,8 +113,8 @@ export function setQueueCount(sessionId: string, count: number): void {
   notify(sessionId);
 }
 
-// Drop a session's cached count (session delete / cache
-// clear). With no argument, clears the whole cache.
+// Drop a session's cached count (session delete / cache clear). With no
+// argument, clears the whole cache.
 export function clearQueueCount(sessionId?: string): void {
   if (sessionId === undefined) {
     queueCounts.clear();

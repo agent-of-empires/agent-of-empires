@@ -196,6 +196,14 @@ pub fn mark_restart_pending(session_id: &str, generation: u64) {
     }
 }
 
+/// Whether any registered runner for `agent_binary` is still alive, so an
+/// adapter reinstall does not rename the install dir under it.
+pub fn any_live_runner_for(agent_binary: &str) -> bool {
+    list().unwrap_or_default().iter().any(|record| {
+        record.agent_name == agent_binary && crate::process::worker::is_pid_alive(record.pid)
+    })
+}
+
 /// Whether a restart marker file exists, malformed or not. One stat, for
 /// the reconciler's per-tick probe of pinned sessions.
 pub fn restart_marker_present(session_id: &str) -> bool {

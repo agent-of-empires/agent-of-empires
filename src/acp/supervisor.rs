@@ -64,6 +64,9 @@ const TEARDOWN_POLL: Duration = Duration::from_millis(50);
 /// though its registry record could not be settled (unreadable file), so
 /// the session does not stay `stopping` until the daemon restarts.
 const TEARDOWN_RETRY_CAP: u32 = 30;
+/// A teardown still claimed this long after it began has lost its driver
+/// (the request future was dropped mid-await); the retry pass takes it over.
+const TEARDOWN_ORPHAN_GRACE: Duration = Duration::from_secs(15);
 
 /// Builds the client for a spawn. Indirected so lifecycle tests can drive
 /// the production spawn, respawn and shutdown paths without a runner.
@@ -2104,33 +2107,44 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// each tick; a session stays owned, refusing resumes, until its runner
     /// is proven gone.
     pub async fn retry_pending_teardowns(&self) {
-        let ids = lock_recover(&self.lifecycle).retry_ids();
+        let ids = lock_recover(&self.lifecycle).retry_ids_after(TEARDOWN_ORPHAN_GRACE);
         for id in ids {
-            let Some(claim) = lock_recover(&self.lifecycle).claim_retry(&id) else {
+            let Some(claim) = lock_recover(&self.lifecycle).claim_retry(&id, TEARDOWN_ORPHAN_GRACE)
+            else {
                 continue;
             };
+            let pid = claim.identity.map(|i| i.pid);
             if claim.attempts > TEARDOWN_RETRY_CAP
-                && !self.process_control.is_alive(claim.identity.pid)
+                && pid.is_none_or(|pid| !self.process_control.is_alive(pid))
             {
                 warn!(
                     target: "acp.supervisor",
                     session = %id,
-                    pid = claim.identity.pid,
+                    pid,
                     attempts = claim.attempts,
                     "runner is dead but its registry record could not be settled; releasing the session"
                 );
                 self.settle(&claim.lease, Settlement::Proven);
                 continue;
             }
-            warn!(
-                target: "acp.supervisor",
-                session = %id,
-                pid = claim.identity.pid,
-                attempt = claim.attempts,
-                "runner still alive after SIGKILL; retrying teardown"
-            );
+            match claim.identity {
+                Some(identity) => warn!(
+                    target: "acp.supervisor",
+                    session = %id,
+                    pid = identity.pid,
+                    attempt = claim.attempts,
+                    "runner still alive after SIGKILL; retrying teardown"
+                ),
+                None => warn!(
+                    target: "acp.supervisor",
+                    session = %id,
+                    attempt = claim.attempts,
+                    "teardown lost its driver; finishing it from the registry"
+                ),
+            }
+            let killed_before = claim.identity.is_some();
             let settlement =
-                tear_down_runner_from(&*self.process_control, &id, Some(claim.identity), true)
+                tear_down_runner_from(&*self.process_control, &id, claim.identity, killed_before)
                     .await;
             self.settle(&claim.lease, settlement);
         }
@@ -2537,83 +2551,103 @@ impl<S: BroadcastSink> Supervisor<S> {
                         log_wrapper_substitution(&session_id, &respawn_config.tool, wrapper, base);
                     }
 
-                    let mut new_client =
-                        match launcher(respawn_config.clone(), acp_session_id).await {
-                            Ok(c) => c,
-                            Err(e) => {
-                                let publish = |event: Event| {
-                                    let seq = next_seq(&next_seqs, &session_id);
-                                    sink.publish(&session_id, seq, &event);
-                                };
-                                // A stop that landed during the launch owns the
-                                // outcome: the user asked for a stopped session
-                                // and gets that, not the launch error.
-                                let cancelled =
-                                    lock_recover(&lifecycle).cancel_requested(&respawn_lease);
-                                if let Some(reason) = cancelled.clone() {
-                                    info!(
-                                        target: "acp.supervisor",
-                                        session = %session_id,
-                                        "respawn launch failed under a pending stop: {e}"
-                                    );
-                                    publish(Event::Stopped { reason });
-                                } else {
-                                    warn!(
-                                        target: "acp.supervisor",
-                                        session = %session_id,
-                                        "respawn failed: {e}"
-                                    );
-                                }
-                                match &e {
-                                    _ if cancelled.is_some() => {}
-                                    AcpError::IncompatibleAgent(payload) => {
-                                        lock_recover(&incompatible_binaries).insert(
-                                            session_id.clone(),
-                                            respawn_config.spec.command.clone(),
-                                        );
-                                        publish(Event::IncompatibleAgent {
-                                            detail: payload.detail.clone(),
-                                        });
-                                        publish(Event::AgentStartupError {
-                                            message: payload.message.clone(),
-                                        });
-                                    }
-                                    // The respawn hit the provider limit: park
-                                    // rather than report a crash (#3514).
-                                    AcpError::RateLimited(info) => {
-                                        publish(Event::RateLimit {
-                                            info: (**info).clone(),
-                                        });
-                                        publish(Event::Stopped {
-                                            reason: "rate_limited".into(),
-                                        });
-                                    }
-                                    _ => publish(Event::AgentStartupError {
-                                        message: format!("ACP agent respawn failed: {e}"),
-                                    }),
-                                }
-                                workers.lock().await.remove(&session_id);
-                                // A runner launched under this epoch is retired
-                                // before the epoch is released.
-                                let launched = crate::process::worker_registry::load(&session_id)
-                                    .ok()
-                                    .flatten()
-                                    .filter(|r| r.generation == respawn_lease.epoch())
-                                    .map(|r| RunnerIdentity {
-                                        pid: r.pid,
-                                        generation: r.generation,
-                                    });
-                                if launched.is_some()
-                                    && lock_recover(&lifecycle).convert_to_stopping(&respawn_lease)
-                                {
-                                    let settlement =
-                                        tear_down_runner(&*process_control, &session_id, launched)
-                                            .await;
-                                    settle_lease(&lifecycle, &notify, &respawn_lease, settlement);
-                                }
-                                return;
+                    let mut new_client = match launcher(respawn_config.clone(), acp_session_id)
+                        .await
+                    {
+                        Ok(c) => c,
+                        Err(e) => {
+                            let publish = |event: Event| {
+                                let seq = next_seq(&next_seqs, &session_id);
+                                sink.publish(&session_id, seq, &event);
+                            };
+                            // A stop that landed during the launch owns the
+                            // outcome: the user asked for a stopped session
+                            // and gets that, not the launch error.
+                            let cancelled =
+                                lock_recover(&lifecycle).cancel_requested(&respawn_lease);
+                            if let Some(reason) = cancelled.clone() {
+                                info!(
+                                    target: "acp.supervisor",
+                                    session = %session_id,
+                                    "respawn launch failed under a pending stop: {e}"
+                                );
+                                publish(Event::Stopped { reason });
+                            } else {
+                                warn!(
+                                    target: "acp.supervisor",
+                                    session = %session_id,
+                                    "respawn failed: {e}"
+                                );
                             }
-                        };
+                            match &e {
+                                _ if cancelled.is_some() => {}
+                                AcpError::IncompatibleAgent(payload) => {
+                                    lock_recover(&incompatible_binaries).insert(
+                                        session_id.clone(),
+                                        respawn_config.spec.command.clone(),
+                                    );
+                                    publish(Event::IncompatibleAgent {
+                                        detail: payload.detail.clone(),
+                                    });
+                                    publish(Event::AgentStartupError {
+                                        message: payload.message.clone(),
+                                    });
+                                }
+                                // The respawn hit the provider limit: park
+                                // rather than report a crash (#3514).
+                                AcpError::RateLimited(info) => {
+                                    publish(Event::RateLimit {
+                                        info: (**info).clone(),
+                                    });
+                                    publish(Event::Stopped {
+                                        reason: "rate_limited".into(),
+                                    });
+                                }
+                                _ => publish(Event::AgentStartupError {
+                                    message: format!("ACP agent respawn failed: {e}"),
+                                }),
+                            }
+                            workers.lock().await.remove(&session_id);
+                            // A runner launched under this epoch is retired
+                            // before the epoch is released.
+                            let launched = crate::process::worker_registry::load(&session_id)
+                                .ok()
+                                .flatten()
+                                .filter(|r| r.generation == respawn_lease.epoch())
+                                .map(|r| RunnerIdentity {
+                                    pid: r.pid,
+                                    generation: r.generation,
+                                });
+                            // Under a pending stop the replaced runner is
+                            // retired as well, as `finish_cancelled` does.
+                            let retire_previous = cancelled.is_some();
+                            if (launched.is_some() || retire_previous)
+                                && lock_recover(&lifecycle).convert_to_stopping(&respawn_lease)
+                            {
+                                let mut settlement =
+                                    tear_down_runner(&*process_control, &session_id, launched)
+                                        .await;
+                                if let Some(previous) =
+                                    previous.filter(|p| retire_previous && Some(*p) != launched)
+                                {
+                                    if let Settlement::Unproven(_) = tear_down_runner(
+                                        &*process_control,
+                                        &session_id,
+                                        Some(previous),
+                                    )
+                                    .await
+                                    {
+                                        settlement = match settlement {
+                                            Settlement::Proven => Settlement::Unproven(previous),
+                                            unproven => unproven,
+                                        };
+                                    }
+                                }
+                                settle_lease(&lifecycle, &notify, &respawn_lease, settlement);
+                            }
+                            return;
+                        }
+                    };
                     let new_inbound = match new_client.take_inbound() {
                         Some(rx) => rx,
                         None => {
@@ -7118,6 +7152,51 @@ cursor-acp-bridge = "agent acp"
             lock_recover(&sup.lifecycle).last_generation("s-disk") >= 9,
             "the record's generation bounds later marker authority"
         );
+    }
+
+    /// A teardown whose driver was dropped mid-await (a request future
+    /// cancelled by a client disconnect) stays `stopping` with nobody to
+    /// settle it; the retry pass takes it over after the orphan grace.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_orphaned_teardown_is_finished_by_the_retry_pass() {
+        let _home = isolate_home();
+        let control = Arc::new(FakeProcessControl::default());
+        control.alive(5858);
+        let sup = Supervisor::new(VecSink::new()).with_process_control(control.clone());
+        save_record("s-orphan", 5858, 2);
+        {
+            let mut table = lock_recover(&sup.lifecycle);
+            let lease = table.admit("s-orphan", ResumeKind::Spawn).unwrap();
+            table
+                .install(
+                    &lease,
+                    Some(RunnerIdentity {
+                        pid: 5858,
+                        generation: 2,
+                    }),
+                )
+                .unwrap();
+            // The stop began, then its driver went away before settling.
+            assert!(matches!(
+                table.begin_stop("s-orphan", "user_stopped"),
+                StopDecision::TearDown { .. }
+            ));
+        }
+        sup.retry_pending_teardowns().await;
+        assert_eq!(
+            sup.worker_state("s-orphan").await,
+            AcpWorkerState::Stopping,
+            "a fresh teardown is left to its driver"
+        );
+
+        lock_recover(&sup.lifecycle).age_stopping("s-orphan", TEARDOWN_ORPHAN_GRACE);
+        sup.retry_pending_teardowns().await;
+        assert_eq!(sup.worker_state("s-orphan").await, AcpWorkerState::Absent);
+        assert!(control.signals().contains(&(5858, "TERM")));
+        assert!(crate::process::worker_registry::load("s-orphan")
+            .unwrap()
+            .is_none());
     }
 
     /// A runner that outlived SIGKILL is retried each tick; once it is dead

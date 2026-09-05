@@ -13,7 +13,7 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::Responder;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{trace, warn};
+use tracing::{debug, trace, warn};
 
 use super::fs_handlers::enter_timestamp_ns;
 use super::pending::{
@@ -165,7 +165,7 @@ pub(super) async fn handle_permission_request(
         .collect();
     let approval = build_approval(tool_call, options);
     let nonce = approval.nonce.clone();
-    let choice_list = approval.is_choice_list();
+    let choice_list = approval.choice_list;
     let option_ids: Vec<String> = approval
         .options
         .iter()
@@ -252,13 +252,16 @@ pub(super) async fn handle_permission_request(
                     "selected",
                 )
             } else {
-                warn!(
-                    target: "acp.protocol",
-                    "agent did not offer a {decision:?}-compatible option; cancelling"
-                );
-                // No compatible option: the agent gets Cancelled, but the
-                // user still acted, so clear the approval card and close
-                // the hanging start frame. See #1713.
+                if choice_list {
+                    debug!(target: "acp.protocol", "question dismissed; cancelling");
+                } else {
+                    warn!(
+                        target: "acp.protocol",
+                        "agent did not offer a {decision:?}-compatible option; cancelling"
+                    );
+                }
+                // The agent gets Cancelled, but the user still acted, so clear
+                // the approval card and close the hanging start frame (#1713).
                 let _ = event_tx
                     .send(Event::ApprovalResolved {
                         nonce: nonce.clone(),

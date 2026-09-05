@@ -511,12 +511,12 @@ impl SessionService {
             match outcome {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => tracing::warn!(
-                    target: "http.api.acp",
+                    target: "server.session_service",
                     session = %id,
                     "failed to save after prompt touch and wake: {e}"
                 ),
                 Err(join_err) => tracing::warn!(
-                    target: "http.api.acp",
+                    target: "server.session_service",
                     session = %id,
                     "spawn_blocking join error during prompt touch save: {join_err}"
                 ),
@@ -1788,11 +1788,9 @@ fn spec_payload_hash(spec: &StructuredSessionSpec) -> String {
 /// otherwise clear a sink it has never observed. Tier 2 stops that, and only
 /// that.
 ///
-/// It does not make this save path safe against #3465's wipe: advancing
-/// `last_accessed_at` on disk is the signal `merge_user_action_diff` keys on
-/// (`session/instance/merge.rs`) to clear `archived_at` / `snoozed_until` /
-/// `idle_dormant_since`, which is the intended invariant for a real user
-/// gesture; #3465 was about a passive stamp reaching that arm.
+/// Advancing `last_accessed_at` on disk is the signal `merge_user_action_diff`
+/// (`session/instance/merge.rs`) keys on to clear a park, which is right for a
+/// real user gesture (#3465 was about a passive stamp reaching that arm).
 pub(crate) fn apply_prompt_persist_to_disk(disk: &mut crate::session::Instance, wake: bool) {
     if wake {
         disk.touch_last_accessed();

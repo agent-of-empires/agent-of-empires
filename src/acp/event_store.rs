@@ -694,14 +694,13 @@ impl EventStore {
         }
     }
 
-    /// The session's durable rate-limit park, if any. A park is the latest
-    /// `RateLimit` event (or a terminal `Stopped { rate_limit_exhausted_retries }`)
-    /// with nothing after it that shows the session moved on: a prompt, an
+    /// The session's durable rate-limit park, if any: the latest `RateLimit`
+    /// event (or a terminal `Stopped { rate_limit_exhausted_retries }`) with
+    /// nothing after it that shows the session moved on, that is a prompt, an
     /// agent switch, a worker that came back up (`AcpSessionAssigned`), or a
-    /// stop for any other reason. Activity that does not
-    /// end the park (an `AgentStartupError` from a failed resume, a
-    /// `RateLimitAutoResumed` breadcrumb, approvals) leaves it in place, so a
-    /// resume that failed is retried instead of silently disarmed (#3514).
+    /// stop for any other reason. A failed resume's `AgentStartupError`, the
+    /// `RateLimitAutoResumed` breadcrumb and approvals leave it in place, so
+    /// a resume that failed is retried instead of silently disarmed (#3514).
     pub fn rate_limit_park(&self, session_id: &str) -> Option<RateLimitPark> {
         let conn = match self.conn.lock() {
             Ok(g) => g,

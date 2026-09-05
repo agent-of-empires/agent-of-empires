@@ -111,7 +111,9 @@ config read per agent:
   then `CLAUDE_CONFIG_DIR` in AoE's own environment, then `~`. Discovery,
   drift reconciliation and the management surfaces all resolve the same file;
   outside a spawn the hook's value is unknown, so those read the static profile
-  environment.
+  environment. A sandboxed session launches without the profile `environment`,
+  so its discovery ignores that variable too; the surfaces describe a host
+  session.
 - **Gemini**: `~/.gemini/settings.json` (`mcpServers`; transport is chosen by
   which key the entry sets, `command` for stdio, `httpUrl` for http, `url` for
   sse).

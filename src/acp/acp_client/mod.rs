@@ -355,8 +355,13 @@ impl AcpClient {
         // A bundled copy that predates this build (its digest covers the
         // adapter's sources) is reinstalled here rather than refused at
         // resolution, so an aoe upgrade does not strand every session on it.
+        // Not while another runner of the same adapter is alive: publishing
+        // renames the install dir under its lazy imports (see `publish`), so
+        // that case keeps the refusal and the doctor hint.
         if let Ok(app_dir) = crate::session::get_app_dir() {
-            if crate::acp::adapters::installed_copy_is_stale(&app_dir, &install_binary) {
+            if crate::acp::adapters::installed_copy_is_stale(&app_dir, &install_binary)
+                && !crate::process::worker_registry::any_live_runner_for(&install_binary)
+            {
                 let binary = install_binary.clone();
                 let dir = app_dir.clone();
                 let reinstalled = tokio::task::spawn_blocking(move || {

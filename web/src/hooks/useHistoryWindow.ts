@@ -63,12 +63,9 @@ export function useHistoryWindow(
     () => historyWindow(activity, visibleRows, showClearedTurns),
     [activity, visibleRows, showClearedTurns],
   );
-  // Once a row has been rendered at the top of the window it stays rendered
-  // for the session: the start may only move earlier. Without this pin a cut
-  // inside a long assistant turn snaps forward to the next user prompt when
-  // that prompt lands, the message's rendered part list shrinks sharply, and
-  // assistant-ui's store reads a stale part index (#3707, the #3676 mechanism
-  // without a `/clear`). A pin whose row is gone (retention trim) is dropped.
+  // The start may only move earlier: a cut inside a long assistant turn that
+  // snapped forward on the next prompt shrank the message's rendered parts
+  // under assistant-ui's store (#3707). A pin whose row was trimmed is dropped.
   const start = pinnedWindowStart(activity, computed.start, anchorRowId);
   const startRowId = start < activity.length ? (activity[start]?.id ?? null) : null;
   if (startRowId !== anchorRowId && windowSessionId === sessionId) {

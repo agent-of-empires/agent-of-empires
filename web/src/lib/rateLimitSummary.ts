@@ -23,7 +23,7 @@ export function summarizeRateLimits(sessions: readonly Pick<SessionResponse, "ra
     const info = session.rate_limit;
     if (!info) continue;
     count += 1;
-    if (info.resets_at !== null && (soonest === null || info.resets_at < soonest)) {
+    if (info.resets_at !== null && (soonest === null || Date.parse(info.resets_at) < Date.parse(soonest))) {
       soonest = info.resets_at;
     }
   }

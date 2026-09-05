@@ -600,6 +600,11 @@ async fn sessions_turn_send(
                 ));
             }
         }
+        // As the user path does: this newer turn supersedes any interrupted
+        // prompt a rate-limit resume would otherwise redeliver (#3028).
+        deps.session_service
+            .clear_pending_initial_turn(&req.session_id)
+            .await;
         deps.session_service
             .send_turn(
                 &caller,

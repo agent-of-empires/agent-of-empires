@@ -18,9 +18,9 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
-/// The minimum Node major version aoe-agent supports. Pinned to the
-/// `engines.node` field in `acp-worker/aoe-agent/package.json` by
-/// `package_engines_matches_min_node_major`.
+/// The Node major floor for every adapter. With `MIN_NODE_MINOR` it is
+/// pinned to the `engines.node` field in `acp-worker/aoe-agent/package.json`
+/// by `package_engines_matches_min_node_major`.
 pub const MIN_NODE_MAJOR: u32 = 22;
 /// Minor floor, within `MIN_NODE_MAJOR`, for adapters that ship sources:
 /// `--experimental-strip-types`, which runs the bundled `aoe-agent`, arrived

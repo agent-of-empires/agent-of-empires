@@ -8,6 +8,7 @@
 //! it does not own.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 /// Exact identity of a runner process: its pid plus the generation stamped
 /// into its registry record at spawn. Records written by older binaries
@@ -76,6 +77,9 @@ enum Phase {
     Stopping {
         /// Teardown attempts already made under this epoch.
         attempts: u32,
+        /// When this teardown was claimed, so one whose driver went away
+        /// (a dropped request future) can be reclaimed by the retry pass.
+        since: Instant,
     },
     TeardownRetry {
         identity: RunnerIdentity,
@@ -161,7 +165,9 @@ pub enum Settlement {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetryClaim {
     pub lease: Lease,
-    pub identity: RunnerIdentity,
+    /// `None` for a reclaimed teardown whose driver never settled; the
+    /// registry record then names the runner.
+    pub identity: Option<RunnerIdentity>,
     pub attempts: u32,
 }
 
@@ -266,7 +272,10 @@ impl LifecycleTable {
             _ => return Err(InstallError::Stale),
         };
         if let Some(reason) = cancel {
-            entry.phase = Phase::Stopping { attempts: 0 };
+            entry.phase = Phase::Stopping {
+                attempts: 0,
+                since: Instant::now(),
+            };
             return Err(InstallError::Cancelled { reason });
         }
         entry.phase = Phase::Running { identity };
@@ -319,7 +328,10 @@ impl LifecycleTable {
             }
             Phase::Running { identity } => {
                 let identity = *identity;
-                entry.phase = Phase::Stopping { attempts: 0 };
+                entry.phase = Phase::Stopping {
+                    attempts: 0,
+                    since: Instant::now(),
+                };
                 StopDecision::TearDown {
                     lease: self.lease(session_id, epoch),
                     identity,
@@ -339,7 +351,10 @@ impl LifecycleTable {
             session_id.to_string(),
             Entry {
                 epoch,
-                phase: Phase::Stopping { attempts: 0 },
+                phase: Phase::Stopping {
+                    attempts: 0,
+                    since: Instant::now(),
+                },
             },
         );
         Some(self.lease(session_id, epoch))
@@ -350,7 +365,7 @@ impl LifecycleTable {
         let Some(entry) = self.current(lease) else {
             return;
         };
-        let Phase::Stopping { attempts } = entry.phase else {
+        let Phase::Stopping { attempts, .. } = entry.phase else {
             return;
         };
         match settlement {
@@ -402,7 +417,10 @@ impl LifecycleTable {
         ) {
             return false;
         }
-        entry.phase = Phase::Stopping { attempts: 0 };
+        entry.phase = Phase::Stopping {
+            attempts: 0,
+            since: Instant::now(),
+        };
         true
     }
 
@@ -418,13 +436,26 @@ impl LifecycleTable {
         }
     }
 
-    /// Claim a parked teardown for another attempt.
-    pub fn claim_retry(&mut self, session_id: &str) -> Option<RetryClaim> {
+    /// Claim a parked teardown for another attempt, or one still marked
+    /// `Stopping` after `orphaned_after`: its driver was dropped (a request
+    /// future cancelled mid-teardown) and would otherwise never settle.
+    pub fn claim_retry(
+        &mut self,
+        session_id: &str,
+        orphaned_after: Duration,
+    ) -> Option<RetryClaim> {
         let entry = self.entries.get_mut(session_id)?;
-        let Phase::TeardownRetry { identity, attempts } = entry.phase else {
-            return None;
+        let (identity, attempts) = match entry.phase {
+            Phase::TeardownRetry { identity, attempts } => (Some(identity), attempts),
+            Phase::Stopping { attempts, since } if since.elapsed() >= orphaned_after => {
+                (None, attempts)
+            }
+            _ => return None,
         };
-        entry.phase = Phase::Stopping { attempts };
+        entry.phase = Phase::Stopping {
+            attempts,
+            since: Instant::now(),
+        };
         let epoch = entry.epoch;
         Some(RetryClaim {
             lease: self.lease(session_id, epoch),
@@ -433,12 +464,28 @@ impl LifecycleTable {
         })
     }
 
-    pub fn retry_ids(&self) -> Vec<String> {
+    /// Sessions the retry pass should look at: parked teardowns, and any
+    /// teardown still claimed but older than `orphaned_after`.
+    pub fn retry_ids_after(&self, orphaned_after: Duration) -> Vec<String> {
         self.entries
             .iter()
-            .filter(|(_, e)| matches!(e.phase, Phase::TeardownRetry { .. }))
+            .filter(|(_, e)| match e.phase {
+                Phase::TeardownRetry { .. } => true,
+                Phase::Stopping { since, .. } => since.elapsed() >= orphaned_after,
+                _ => false,
+            })
             .map(|(id, _)| id.clone())
             .collect()
+    }
+
+    /// Backdate a claimed teardown, for tests of the orphan reclaim.
+    #[cfg(test)]
+    pub fn age_stopping(&mut self, session_id: &str, by: Duration) {
+        if let Some(entry) = self.entries.get_mut(session_id) {
+            if let Phase::Stopping { since, .. } = &mut entry.phase {
+                *since = since.checked_sub(by).unwrap_or(*since);
+            }
+        }
     }
 
     /// The running epoch and identity, for a reaper that must revalidate
@@ -675,16 +722,23 @@ mod tests {
         table.settle(&lease, Settlement::Unproven(identity(9, 1)));
         assert_eq!(table.phase(ID), WorkerPhase::Stopping);
 
-        let claim = table.claim_retry(ID).unwrap();
+        let grace = Duration::from_secs(15);
+        let claim = table.claim_retry(ID, grace).unwrap();
         assert_eq!(claim.attempts, 2);
-        assert_eq!(claim.identity, identity(9, 1));
+        assert_eq!(claim.identity, Some(identity(9, 1)));
         assert!(
-            table.claim_retry(ID).is_none(),
-            "a claimed retry is Stopping"
+            table.claim_retry(ID, grace).is_none(),
+            "a claimed retry is Stopping until it goes stale"
         );
-        table.settle(&claim.lease, Settlement::Unproven(identity(9, 1)));
-        let again = table.claim_retry(ID).unwrap();
-        assert_eq!(again.attempts, 3, "attempts accumulate across retries");
+        table.age_stopping(ID, grace);
+        let orphan = table.claim_retry(ID, grace).unwrap();
+        assert_eq!(
+            orphan.identity, None,
+            "a stale claim is reclaimed without an identity"
+        );
+        table.settle(&orphan.lease, Settlement::Unproven(identity(9, 1)));
+        let again = table.claim_retry(ID, grace).unwrap();
+        assert_eq!(again.attempts, 3, "attempts accumulate per settled retry");
         table.settle(&again.lease, Settlement::Proven);
         assert!(!table.is_owned(ID));
     }
@@ -760,7 +814,10 @@ mod tests {
         assert_eq!(table.phase(ID), WorkerPhase::Stopping);
         assert!(table.adopt_for_stop(ID).is_none());
         table.settle(&lease, Settlement::Unproven(identity(3, 0)));
-        assert_eq!(table.retry_ids(), vec![ID.to_string()]);
+        assert_eq!(
+            table.retry_ids_after(Duration::from_secs(15)),
+            vec![ID.to_string()]
+        );
         assert!(matches!(
             table.begin_stop(ID, "x"),
             StopDecision::AlreadyStopping

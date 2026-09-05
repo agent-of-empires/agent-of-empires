@@ -29,8 +29,7 @@ pub enum AcpCommands {
         #[arg(long)]
         fix: bool,
         /// Adapter to install with --fix (repeatable). Defaults to
-        /// claude-agent-acp. One of: claude-agent-acp, codex-acp, pi-acp,
-        /// aoe-agent.
+        /// claude-agent-acp.
         #[arg(
             long,
             requires = "fix",
@@ -376,10 +375,15 @@ fn doctor_version_issue(
 /// reporter and the plain listing so the #1017 fallback semantics have
 /// one definition.
 fn bundled_copy_installed(binary: &str) -> bool {
-    crate::session::get_app_dir().is_ok_and(|app_dir| {
-        crate::acp::adapters::bundled_adapter_bin(&app_dir, binary).is_some()
-            && !crate::acp::adapters::installed_copy_is_stale(&app_dir, binary)
-    })
+    crate::session::get_app_dir().is_ok_and(|app_dir| bundled_copy_usable(&app_dir, binary))
+}
+
+/// What spawn resolution would accept: a bundled copy that is present, not
+/// stale, and runnable by the Node that would launch it.
+fn bundled_copy_usable(app_dir: &std::path::Path, binary: &str) -> bool {
+    crate::acp::adapters::bundled_adapter_bin(app_dir, binary).is_some()
+        && !crate::acp::adapters::installed_copy_is_stale(app_dir, binary)
+        && crate::acp::adapters::runtime_too_old_for(app_dir, binary).is_none()
 }
 
 /// Resolve whether `gate`'s adapter would miss its version floor at
@@ -791,10 +795,9 @@ pub(crate) fn command_present(command: &str) -> bool {
     } else {
         // PATH first, then the bundled adapter aoe installs on demand.
         find_in_path(command).is_some()
-            || crate::session::get_app_dir().ok().is_some_and(|app_dir| {
-                crate::acp::adapters::bundled_adapter_bin(&app_dir, command).is_some()
-                    && !crate::acp::adapters::installed_copy_is_stale(&app_dir, command)
-            })
+            || crate::session::get_app_dir()
+                .ok()
+                .is_some_and(|app_dir| bundled_copy_usable(&app_dir, command))
     }
 }
 

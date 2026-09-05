@@ -1855,7 +1855,7 @@ export function SystemNotices({
     });
     // Say whether the park ends by itself: the same banner with the setting
     // off used to read as "AoE is broken" rather than "as configured" (#3514).
-    if (rateLimitAutoResume === true) {
+    if (rateLimitAutoResume === true && !rateLimitRetriesExhausted) {
       messages.push({ kind: "muted", text: "Auto-resume is armed; the session resumes when the window clears." });
     } else if (rateLimitAutoResume === false) {
       messages.push({
@@ -2010,9 +2010,8 @@ function WorkerResumingBanner() {
 }
 
 /** Shown while `SessionResponse.acp_worker_state === "stopping"`: the
- *  daemon has signalled the worker but has not proven it gone. Prompts
- *  and resumes are refused until it settles, so the composer parks
- *  queued prompts the same way it does while resuming. See #3487. */
+ *  daemon has signalled the worker but has not proven it gone. Prompts are
+ *  held and resumes refused until it settles. See #3487. */
 export function WorkerStoppingBanner() {
   return (
     <div className="flex items-center gap-2 border-b border-status-warning/30 bg-status-warning/10 px-4 py-2 text-xs text-status-warning">

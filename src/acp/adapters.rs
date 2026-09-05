@@ -383,7 +383,8 @@ pub fn npm_ci_argv(node: &ResolvedNode) -> Option<(PathBuf, Vec<String>)> {
 /// keeps its open file descriptors, but Node resolves a lazy `require()`
 /// against the absolute `__dirname` that the rename just invalidated, so a
 /// running adapter can fail on its next deferred import. Acceptable for an
-/// explicit `doctor --fix`, and the reason we do not install implicitly.
+/// explicit `doctor --fix`; the spawn-time reinstall of a stale in-tree
+/// adapter runs only while no runner of that adapter is alive.
 fn publish(tmp: &Path, final_dir: &Path) -> std::io::Result<()> {
     if !final_dir.exists() {
         return std::fs::rename(tmp, final_dir);

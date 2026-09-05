@@ -55,9 +55,7 @@ export function ApprovalCard({ approval, onResolve }: Props) {
     async (decision: ApprovalDecision, optionId?: string) => {
       setPhase("submitting");
       try {
-        // Keep the trio's one-argument call shape; only a chosen option
-        // adds the second argument.
-        const ok = await (optionId === undefined ? onResolve(decision) : onResolve(decision, optionId));
+        const ok = await onResolve(decision, optionId);
         if (ok === false) setPhase("rolled-back");
       } catch {
         setPhase("rolled-back");

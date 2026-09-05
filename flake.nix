@@ -39,7 +39,7 @@
             # sandbox npm floor, and acp-worker/aoe-agent (manifest, lock and
             # sources), which src/acp/adapters.rs embeds to install the
             # in-tree agent and the acp::node test reads to pin `engines.node`
-            # to MIN_NODE_MAJOR (the aoe-test and aoe-clippy checks compile
+            # to the Node floor (the aoe-test and aoe-clippy checks compile
             # test code, so they need these even though the packages do not).
             # `scripts/check-nix-embedded-assets.py` fails CI if a new embedded
             # asset lands without being added here.
