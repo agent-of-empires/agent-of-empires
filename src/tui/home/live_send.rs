@@ -1636,9 +1636,16 @@ impl LiveCaptureWorker {
                                         &command_deadline,
                                     )
                                 } else {
-                                    let (content, cur) =
-                                        v.sample_with_deadline(lines, &command_deadline);
-                                    (Some(content), cur)
+                                    let sample = v.sample_with_deadline(lines, &command_deadline);
+                                    // A half-drawn synchronized-output frame is
+                                    // not published: the bracket closing (or
+                                    // abandoning) brings a whole one, and the
+                                    // preview keeps the last frame until then.
+                                    if sample.incomplete {
+                                        (None, None)
+                                    } else {
+                                        (Some(sample.content), sample.cursor)
+                                    }
                                 }
                             }
                             // No grid for pane 0, so every pane comes from the
@@ -1669,6 +1676,29 @@ impl LiveCaptureWorker {
                     let vt_timing = vt_source.as_ref().and_then(|v| v.chunk_timing());
                     #[cfg(not(unix))]
                     let vt_timing: Option<(u64, u64)> = None;
+                    // Recheck the target once for both publishes: a retarget
+                    // mid-fork means these bytes (and this cursor) belong to
+                    // the old pane and must not land under the new view.
+                    // `set_target` also clears the mailbox, but the fork may
+                    // have started before that switch.
+                    let still_current = target_cell.lock().ok().is_some_and(|g| *g == name)
+                        && generation_cell.load(Ordering::Relaxed) == generation_now;
+                    // Publish an agent clipboard write and wake the render loop
+                    // even if the frame dedups, fails, or is withheld as half
+                    // drawn: the read above already consumed it, and this tap is
+                    // the only path an agent's copy has to the host (#2420).
+                    if still_current {
+                        if let Some(text) = clipboard_now {
+                            if let Ok(mut guard) = clipboard_cell.lock() {
+                                *guard = Some(ClipboardFrame {
+                                    generation: generation_now,
+                                    target: name.clone(),
+                                    text,
+                                });
+                            }
+                            wake.notify_one();
+                        }
+                    }
                     if let Some(content) = capture {
                         // Skip unchanged frames (no point waking a re-parse).
                         // Empties are skipped too unless this pane forwards
@@ -1676,28 +1706,7 @@ impl LiveCaptureWorker {
                         // render loop, so an idle pane never repaints.
                         let changed = last_captured.as_deref() != Some(content.as_str());
 
-                        // Recheck the target once for both publishes: a retarget
-                        // mid-fork means these bytes (and this cursor) belong to
-                        // the old pane and must not land under the new view.
-                        // `set_target` also clears the mailbox, but the fork may
-                        // have started before that switch.
-                        let still_current = target_cell.lock().ok().is_some_and(|g| *g == name)
-                            && generation_cell.load(Ordering::Relaxed) == generation_now;
                         if still_current {
-                            // Publish an agent clipboard write and wake the
-                            // render loop even if the frame itself dedups: a
-                            // copy must reach the host clipboard promptly
-                            // whether or not the grid changed visibly.
-                            if let Some(text) = clipboard_now {
-                                if let Ok(mut guard) = clipboard_cell.lock() {
-                                    *guard = Some(ClipboardFrame {
-                                        generation: generation_now,
-                                        target: name.clone(),
-                                        text,
-                                    });
-                                }
-                                wake.notify_one();
-                            }
                             // A budget change alone (deeper scroll, viewport
                             // resize over a quiet pane) must republish even
                             // when the bytes are identical, or consumers
