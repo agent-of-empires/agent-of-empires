@@ -1722,6 +1722,7 @@ mod tests {
         let sidecar = store.join("aoe-session").join(&inst.id).join("session_id");
         let path_sidecar = sidecar.parent().unwrap().join("session_path");
         let default_sidecar = tmp.path().join("pi-default/session_id");
+        let default_path_sidecar = default_sidecar.parent().unwrap().join("session_path");
         let script = r#"
 import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
@@ -1753,7 +1754,7 @@ async function publish(target, rootOnly) {
   ));
   await sessionStart({}, context(
     "018f47a6-7b80-7cc3-98a2-37b5f486b2a2",
-    "/root/.prime/agent/custom-sessions/children/child.jsonl",
+    "custom-sessions/children/child.jsonl",
     1,
   ));
   return readFileSync(target, "utf8").trim();
@@ -1781,6 +1782,13 @@ process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
         assert_eq!(
             published["defaultMode"], child_id,
             "Pi default behavior changed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&default_path_sidecar)
+                .unwrap()
+                .trim(),
+            "custom-sessions/children/child.jsonl",
+            "Pi default path publication changed"
         );
         assert_eq!(
             std::fs::read_to_string(&path_sidecar).unwrap().trim(),

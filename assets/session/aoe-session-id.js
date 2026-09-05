@@ -3,9 +3,9 @@
 // started inside the pane is attributed to that pane rather than guessed from
 // a store keyed by cwd alone.
 //
-// Two files: `session_id` (the uuid) and `session_path` (the absolute
-// transcript path). The path survives a worktree move when the agent indexes
-// sessions by their starting cwd.
+// Two files: `session_id` (the uuid) and `session_path` (the transcript
+// path). Prime root-only publications normalize the path to absolute so it
+// survives a worktree move when the agent indexes sessions by starting cwd.
 //
 // `session_start` covers startup, resume, fork, and new. Failures are
 // swallowed: publishing identity must never interfere with the agent.
@@ -42,10 +42,10 @@ export default function (pi) {
       const id = ctx?.sessionManager?.getSessionId?.();
       if (!id) return;
       const file = ctx?.sessionManager?.getSessionFile?.();
-      const absoluteFile = file ? resolve(file) : undefined;
+      const publishedFile = rootOnly && file ? resolve(file) : file;
       writeAtomic(idTarget, id);
-      if (absoluteFile) {
-        writeAtomic(join(dirname(idTarget), "session_path"), absoluteFile);
+      if (publishedFile) {
+        writeAtomic(join(dirname(idTarget), "session_path"), publishedFile);
       }
       if (rootOnly) {
         writeAtomic(join(dirname(idTarget), "root_only"), "1");
