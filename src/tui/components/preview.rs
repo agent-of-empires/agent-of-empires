@@ -609,14 +609,13 @@ fn shorten_path(path: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Each case reads `$HOME` twice, once here and once inside `shorten_path`,
-    /// so a concurrent writer between them makes the two disagree. `isolate_home`
-    /// holds the process-global env lock for the guard's lifetime and restores
-    /// `$HOME` on Drop, before the tempdir is deleted.
+    /// Pins `$HOME` so the read inside `shorten_path` cannot see a value another
+    /// test set. `isolate_home` holds the process-global env lock for the guard's
+    /// lifetime and restores `$HOME` on Drop, before the tempdir is deleted.
     ///
-    /// Pinning `$HOME` also gives these cases something to assert: each was
-    /// wrapped in `if let Some(home)`, so an unset `$HOME` passed all four
-    /// without running an assertion.
+    /// Pinning also gives these cases something to assert: each was wrapped in
+    /// `if let Some(home)`, so an unset `$HOME` passed all four without running
+    /// an assertion.
     #[test]
     #[serial_test::serial]
     fn shorten_path_abbreviates_home() {

@@ -446,10 +446,10 @@ mod tests {
         assert!(!looks_like_git_url("git@host: /path"));
     }
 
-    /// Reads `$HOME` twice, once here and once inside `expand_tilde`, so a
-    /// concurrent writer between them makes the two disagree. `isolate_home`
-    /// holds the process-global env lock for the guard's lifetime and restores
-    /// `$HOME` on Drop, before the tempdir is deleted.
+    /// Pins `$HOME` so the read inside `expand_tilde` cannot see a value another
+    /// test set. `isolate_home` holds the process-global env lock for the guard's
+    /// lifetime and restores `$HOME` on Drop, before the tempdir is deleted;
+    /// `#[serial]` alone does not exclude the writers that go through the guard.
     #[test]
     #[serial_test::serial]
     fn expand_tilde_expands_home() {
