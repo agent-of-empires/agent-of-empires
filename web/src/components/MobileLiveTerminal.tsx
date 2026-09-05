@@ -1132,8 +1132,8 @@ export function MobileLiveTerminal({
   // composition after the fact, so `compositionend` carries the whole word a
   // second time and "test" reached the pane as "testtest"; whatever the run
   // already delivered is dropped from that word. Sending clears it below, so it
-  // stays a suffix of what the pane received and the strip can never swallow
-  // bytes the pane never saw; the two paths that continue a word re-arm it.
+  // only ever holds bytes the pane received and the strip can never swallow
+  // bytes it never saw; the paths that continue a word re-arm it.
   const plainRunRef = useRef("");
   // Typed input interrupts the coast. Without this, keystrokes sent in the
   // coast's 1-2s tail interleave with the wheel storm and the app is busy
@@ -1712,6 +1712,10 @@ export function MobileLiveTerminal({
       // edits; only the part the pane has not seen yet is new.
       const rest = run && data.startsWith(run) ? data.slice(run.length) : data;
       if (rest) sendKeys(rest);
+      // The composed word is still the one under the caret, so a second
+      // composition over it (a suggestion tap, then the space commit) has to
+      // be stripped against everything the pane has of that word.
+      plainRunRef.current = plainRunAfter(run, rest);
       if (e.currentTarget instanceof HTMLTextAreaElement) e.currentTarget.value = "";
     },
     [sendKeys],

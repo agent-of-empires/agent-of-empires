@@ -120,6 +120,27 @@ describe("MobileLiveTerminal Android IME word commits", () => {
       sent: ["t", "e", "s", "t"],
     },
     {
+      name: "sends the word once when a second composition commits it",
+      run: (t) => {
+        t.type("tes");
+        t.compose("test");
+        t.compose("test");
+        t.type(" ");
+      },
+      sent: ["t", "e", "s", "t", " "],
+    },
+    {
+      name: "keeps stripping a word typed on after a composition",
+      run: (t) => {
+        t.type("test");
+        t.compose("test");
+        t.type("s");
+        t.compose("tests");
+        t.type(" ");
+      },
+      sent: ["t", "e", "s", "t", "s", " "],
+    },
+    {
       name: "sends a composed word that does not continue what was typed",
       run: (t) => {
         t.type("a");
