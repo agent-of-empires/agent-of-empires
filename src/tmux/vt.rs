@@ -1674,8 +1674,6 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
     // The forwarder is connected: the channel is now the live
     // single-writer. `acquire` is blocked until this flips.
     ctx.alive.store(true, Ordering::Relaxed);
-    let mut conn = conn;
-    let _ = conn.set_nonblocking(true);
     let mut buf = [0u8; 8192];
     let mut osc52 = Osc52Scanner::new();
     let mut sync = SyncOutputScanner::new();
@@ -1701,9 +1699,18 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
         let Ok(_snapshot) = ctx.snapshot.lock() else {
             break;
         };
-        match conn.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
+        let received = unsafe {
+            libc::recv(
+                conn.as_raw_fd(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        match received {
+            0 => break,
+            n if n > 0 => {
+                let n = n as usize;
                 // Track the app's synchronized-output bracket before anything
                 // can publish this chunk: a frame is published when the
                 // bracket closes (or the hold expires), never in the middle.
@@ -1781,10 +1788,10 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
                     }
                 }
             }
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(_) => break,
+            _ => match std::io::Error::last_os_error().kind() {
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {}
+                _ => break,
+            },
         }
     }
     // Reader is exiting (pipe EOF / socket error / stop): the
@@ -3717,6 +3724,80 @@ mod tests {
 
         stop.store(true, Ordering::Relaxed);
         drop(conn);
+        reader.join().expect("reader exits");
+    }
+
+    #[test]
+    fn reader_keeps_published_input_socket_blocking_under_backpressure() {
+        use std::io::{Read, Write};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("s.sock");
+        let listener = UnixListener::bind(&sock).expect("bind");
+        let stop = Arc::new(AtomicBool::new(false));
+        let alive = Arc::new(AtomicBool::new(false));
+        let stream = Arc::new(Mutex::new(None));
+        let ctx = ReaderCtx {
+            parser: Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0))),
+            stop: stop.clone(),
+            seeded: Arc::new(AtomicBool::new(true)),
+            snapshot: Arc::new(Mutex::new(())),
+            stream: stream.clone(),
+            app_cursor: Arc::new(AtomicBool::new(false)),
+            alive: alive.clone(),
+            wakeup: Arc::new(Mutex::new(None)),
+            clipboard: Arc::new(Mutex::new(None)),
+            chunk_seq: Arc::new(AtomicU64::new(0)),
+            settled_chunk_seq: Arc::new(AtomicU64::new(0)),
+            last_chunk_ms: Arc::new(AtomicU64::new(0)),
+            prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
+            grid_gen: Arc::new(AtomicU64::new(0)),
+            signals: Arc::new(ViewerSignals::new()),
+        };
+        let reader = std::thread::spawn(move || run_reader(listener, ctx));
+        let mut peer = UnixStream::connect(&sock).expect("connect");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !alive.load(Ordering::Relaxed) {
+            assert!(Instant::now() < deadline, "reader never connected");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        let flags = unsafe {
+            libc::fcntl(
+                stream
+                    .lock()
+                    .expect("published stream")
+                    .as_ref()
+                    .expect("reader published input socket")
+                    .as_raw_fd(),
+                libc::F_GETFL,
+            )
+        };
+        assert_eq!(flags & libc::O_NONBLOCK, 0, "input socket must block");
+
+        let payload = vec![b'x'; 1024 * 1024];
+        let writer_stream = stream.clone();
+        let writer_payload = payload.clone();
+        let writer = std::thread::spawn(move || {
+            writer_stream
+                .lock()
+                .expect("published stream")
+                .as_mut()
+                .expect("reader published input socket")
+                .write_all(&writer_payload)
+                .is_ok()
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        peer.set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("read timeout");
+        let mut received = vec![0; payload.len()];
+        peer.read_exact(&mut received)
+            .expect("read complete input payload");
+        assert!(writer.join().expect("input writer exits"));
+        assert_eq!(received, payload, "input payload must arrive exactly once");
+
+        stop.store(true, Ordering::Relaxed);
+        drop(peer);
         reader.join().expect("reader exits");
     }
 
