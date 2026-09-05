@@ -502,18 +502,26 @@ fn drain_forwarder(control: &Mutex<Option<UnixStream>>) -> bool {
     let Ok(mut control) = control.lock() else {
         return false;
     };
-    let Some(control) = control.as_mut() else {
+    // A timeout leaves an acknowledgement in flight. Keep the stream out of
+    // the channel until its own probe completes, so that late byte cannot
+    // become the acknowledgement for a later snapshot attempt.
+    let Some(mut stream) = control.take() else {
         return false;
     };
-    if control
+    if stream
         .set_read_timeout(Some(Duration::from_millis(100)))
         .is_err()
-        || control.write_all(&[DRAIN_PROBE]).is_err()
+        || stream.write_all(&[DRAIN_PROBE]).is_err()
     {
         return false;
     }
     let mut ack = [0u8; 1];
-    control.read_exact(&mut ack).is_ok() && ack == [DRAIN_ACK]
+    if stream.read_exact(&mut ack).is_ok() && ack == [DRAIN_ACK] {
+        *control = Some(stream);
+        true
+    } else {
+        false
+    }
 }
 
 /// Live channels keyed by tmux session name, held weakly so the entry vanishes
@@ -3860,6 +3868,99 @@ mod tests {
         assert_eq!(&forwarded, b"FORWARDER-MARKER");
         drop(pane_writer);
         forwarder_thread.join().expect("forwarder exits");
+    }
+
+    #[test]
+    fn drain_timeout_drops_control_before_late_ack_retry() {
+        use std::io::{Read, Write};
+        use std::sync::mpsc;
+
+        let (mut data_reader, mut data_forwarder) = UnixStream::pair().expect("data pair");
+        let (parent_control, mut forwarder_control) = UnixStream::pair().expect("control pair");
+        let (probe_tx, probe_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let (late_ack_tx, late_ack_rx) = mpsc::channel();
+        let forwarder = std::thread::spawn(move || {
+            let mut probe = [0; 1];
+            forwarder_control
+                .read_exact(&mut probe)
+                .expect("receive first drain probe");
+            assert_eq!(probe, [DRAIN_PROBE]);
+            probe_tx.send(()).expect("signal held probe");
+            resume_rx.recv().expect("release held pane byte");
+            data_forwarder
+                .write_all(b"RETRY-MARKER")
+                .expect("forward held pane byte");
+            late_ack_tx
+                .send(forwarder_control.write_all(&[DRAIN_ACK]).is_err())
+                .expect("report late ack");
+        });
+
+        let control = Mutex::new(Some(parent_control));
+        let parser = Mutex::new(vt100::Parser::new(6, 40, 0));
+        let app_cursor = AtomicBool::new(false);
+        let grid_gen = AtomicU64::new(0);
+        let first = swap_drained_seeded_parser(
+            &parser,
+            &app_cursor,
+            &grid_gen,
+            None,
+            b"RETRY-MARKER\r\n",
+            (40, 6),
+            DrainedSeedGuard {
+                guard: SeedGuard {
+                    chunk: None,
+                    pipe: Some(&data_reader),
+                },
+                control: &control,
+            },
+        );
+        probe_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("forwarder receives first probe");
+        assert_eq!(
+            first,
+            VtRefreshResult::Busy,
+            "timed-out drain must stand down"
+        );
+        assert!(
+            control.lock().unwrap().is_none(),
+            "a timed-out control connection must not survive for a retry"
+        );
+
+        resume_tx.send(()).expect("release forwarder");
+        let mut marker = [0; b"RETRY-MARKER".len()];
+        data_reader
+            .read_exact(&mut marker)
+            .expect("drain late pane byte");
+        assert_eq!(&marker, b"RETRY-MARKER");
+        assert!(
+            late_ack_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("late ack result"),
+            "the retired peer must reject the late acknowledgement"
+        );
+
+        assert_eq!(
+            swap_drained_seeded_parser(
+                &parser,
+                &app_cursor,
+                &grid_gen,
+                None,
+                b"RETRY-MARKER\r\n",
+                (40, 6),
+                DrainedSeedGuard {
+                    guard: SeedGuard {
+                        chunk: None,
+                        pipe: Some(&data_reader),
+                    },
+                    control: &control,
+                },
+            ),
+            VtRefreshResult::Busy,
+            "a late acknowledgement must not certify the retry"
+        );
+        forwarder.join().expect("forwarder exits");
     }
 
     #[test]
