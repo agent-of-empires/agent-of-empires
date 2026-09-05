@@ -327,6 +327,24 @@ impl ViewerSignals {
 /// iterations, holding nothing, with its stdin queue empty (#3737).
 const DRAIN_PROBE: u8 = b'Q';
 const DRAIN_ACK: u8 = b'D';
+const DRAIN_GENERATION_BYTES: usize = std::mem::size_of::<u64>();
+const DRAIN_FRAME_BYTES: usize = 1 + DRAIN_GENERATION_BYTES;
+
+fn drain_frame(kind: u8, generation: u64) -> [u8; DRAIN_FRAME_BYTES] {
+    let mut frame = [0; DRAIN_FRAME_BYTES];
+    frame[0] = kind;
+    frame[1..].copy_from_slice(&generation.to_le_bytes());
+    frame
+}
+
+fn read_drain_frame(mut stream: impl std::io::Read) -> std::io::Result<(u8, u64)> {
+    let mut frame = [0; DRAIN_FRAME_BYTES];
+    stream.read_exact(&mut frame)?;
+    Ok((
+        frame[0],
+        u64::from_le_bytes(frame[1..].try_into().expect("drain frame generation")),
+    ))
+}
 
 /// One unbuffered `read(2)`, retried on `EINTR`, so pane bytes are either
 /// still in the stdin queue (visible to `FIONREAD`) or in the caller's
@@ -450,10 +468,9 @@ fn pump_pane_output_with_hook<F: FnMut()>(
             let Some(mut ctl) = ctl else {
                 unreachable!("ctl_open implies ctl")
             };
-            let mut probe = [0u8; 1];
-            match ctl.read(&mut probe) {
-                Ok(0) => ctl_open = false,
-                Ok(_) => {
+            match read_drain_frame(ctl) {
+                Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => ctl_open = false,
+                Ok((DRAIN_PROBE, generation)) => {
                     // Forward the whole stdin backlog before acknowledging,
                     // so the acknowledgement covers it: the channel reads
                     // DRAIN_ACK as "every pane byte this forwarder had is
@@ -484,44 +501,59 @@ fn pump_pane_output_with_hook<F: FnMut()>(
                         }
                     }
                     if ack {
-                        let _ = ctl.write_all(&[DRAIN_ACK]);
+                        let _ = ctl.write_all(&drain_frame(DRAIN_ACK, generation));
                     }
                 }
-                Err(_) => ctl_open = false,
+                Ok(_) | Err(_) => ctl_open = false,
             }
         }
     }
 }
 
+#[derive(Default)]
+struct DrainControl {
+    stream: Option<UnixStream>,
+    next_generation: u64,
+}
+
 /// Ask the forwarder to put every byte it already read from `pipe-pane` onto
-/// the data socket. The caller holds the reader's `stream` mutex, so a matching
-/// acknowledgement and an empty `FIONREAD` queue form one snapshot boundary.
-fn drain_forwarder(control: &Mutex<Option<UnixStream>>) -> bool {
+/// the data socket. A matching generation acknowledgement and an empty
+/// `FIONREAD` queue form one snapshot boundary without reusing an old ACK.
+fn drain_forwarder(control: &Mutex<DrainControl>) -> bool {
     use std::io::Write;
 
     let Ok(mut control) = control.lock() else {
         return false;
     };
-    // A timeout leaves an acknowledgement in flight. Keep the stream out of
-    // the channel until its own probe completes, so that late byte cannot
-    // become the acknowledgement for a later snapshot attempt.
-    let Some(mut stream) = control.take() else {
+    let generation = control.next_generation;
+    control.next_generation = control.next_generation.wrapping_add(1);
+    let Some(stream) = control.stream.as_mut() else {
         return false;
     };
+    let deadline = Instant::now() + Duration::from_millis(100);
     if stream
-        .set_read_timeout(Some(Duration::from_millis(100)))
+        .write_all(&drain_frame(DRAIN_PROBE, generation))
         .is_err()
-        || stream.write_all(&[DRAIN_PROBE]).is_err()
     {
         return false;
     }
-    let mut ack = [0u8; 1];
-    if stream.read_exact(&mut ack).is_ok() && ack == [DRAIN_ACK] {
-        *control = Some(stream);
-        true
-    } else {
-        false
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return false;
+        };
+        if stream.set_read_timeout(Some(remaining)).is_err() {
+            return false;
+        }
+        match read_drain_frame(&mut *stream) {
+            Ok((DRAIN_ACK, ack_generation)) if ack_generation == generation => return true,
+            Ok(_) => continue,
+            Err(_) => return false,
+        }
     }
+}
+
+fn clone_pipe_socket(stream: &Mutex<Option<UnixStream>>) -> Option<UnixStream> {
+    stream.lock().ok()?.as_ref()?.try_clone().ok()
 }
 
 /// Live channels keyed by tmux session name, held weakly so the entry vanishes
@@ -901,12 +933,12 @@ struct SeedDestination<'a> {
 struct SeedInstallFence<'a> {
     snapshot: Option<&'a Mutex<()>>,
     socket: Option<&'a Mutex<Option<UnixStream>>>,
-    control: Option<&'a Mutex<Option<UnixStream>>>,
+    control: Option<&'a Mutex<DrainControl>>,
 }
 
 struct DrainedSeedGuard<'a> {
     guard: SeedGuard<'a>,
-    control: &'a Mutex<Option<UnixStream>>,
+    control: &'a Mutex<DrainControl>,
 }
 
 fn seed_parser(
@@ -1604,13 +1636,13 @@ struct ReaderCtx {
 fn run_drain_listener(
     listener: UnixListener,
     stop: Arc<AtomicBool>,
-    control: Arc<Mutex<Option<UnixStream>>>,
+    control: Arc<Mutex<DrainControl>>,
 ) {
     let Ok((conn, _)) = listener.accept() else {
         return;
     };
     if !stop.load(Ordering::Relaxed) {
-        *control.lock().unwrap() = Some(conn);
+        control.lock().unwrap().stream = Some(conn);
     }
 }
 
@@ -1769,7 +1801,7 @@ pub(crate) struct VtChannel {
     stream: Arc<Mutex<Option<UnixStream>>>,
     /// Forwarder's separate control socket. A snapshot probes it after the
     /// capture and before checking the data socket's unread-byte queue.
-    drain: Arc<Mutex<Option<UnixStream>>>,
+    drain: Arc<Mutex<DrainControl>>,
     /// DECCKM snapshot, refreshed by the reader thread on each grid change.
     app_cursor: Arc<AtomicBool>,
     /// `true` while the forwarder is connected and the reader loop is running.
@@ -1959,7 +1991,7 @@ impl VtChannel {
         let seeded = Arc::new(AtomicBool::new(false));
         let snapshot = Arc::new(Mutex::new(()));
         let stream: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
-        let drain: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
+        let drain: Arc<Mutex<DrainControl>> = Arc::new(Mutex::new(DrainControl::default()));
         let app_cursor = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(false));
         let clipboard: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -2055,7 +2087,7 @@ impl VtChannel {
         // and be dropped instead of falling back to `send-keys`. If the
         // forwarder never connects, tear down and fall back to capture.
         let connect_deadline = Instant::now() + Duration::from_millis(500);
-        while !alive.load(Ordering::Relaxed) || drain.lock().unwrap().is_none() {
+        while !alive.load(Ordering::Relaxed) || drain.lock().unwrap().stream.is_none() {
             if Instant::now() >= connect_deadline {
                 tracing::warn!(%target, "vt: forwarder did not connect; falling back to capture");
                 stop_and_wake_reader(&stop, &sock_path);
@@ -2286,7 +2318,7 @@ impl VtChannel {
         let Ok(_snapshot) = self.snapshot.lock() else {
             return VtRefreshResult::Failed;
         };
-        let Ok(pipe_guard) = self.stream.lock() else {
+        let Some(pipe) = clone_pipe_socket(&self.stream) else {
             return VtRefreshResult::Failed;
         };
         let result = swap_drained_seeded_parser(
@@ -2299,7 +2331,7 @@ impl VtChannel {
             DrainedSeedGuard {
                 guard: SeedGuard {
                     chunk: Some((&self.chunk_seq, &self.settled_chunk_seq, expected_chunk_seq)),
-                    pipe: pipe_guard.as_ref(),
+                    pipe: Some(&pipe),
                 },
                 control: &self.drain,
             },
@@ -3340,7 +3372,7 @@ mod tests {
             parser: Arc::new(Mutex::new(vt100::Parser::new(4, 20, SCROLLBACK_LINES))),
             snapshot: Arc::new(Mutex::new(())),
             stream: Arc::new(Mutex::new(None)),
-            drain: Arc::new(Mutex::new(None)),
+            drain: Arc::new(Mutex::new(DrainControl::default())),
             app_cursor: Arc::new(AtomicBool::new(false)),
             alive: alive.clone(),
             wakeup: Arc::new(Mutex::new(None)),
@@ -3828,7 +3860,10 @@ mod tests {
         let parser = Mutex::new(vt100::Parser::new(6, 40, 0));
         let app_cursor = AtomicBool::new(false);
         let grid_gen = AtomicU64::new(0);
-        let control = Mutex::new(Some(parent_control));
+        let control = Mutex::new(DrainControl {
+            stream: Some(parent_control),
+            next_generation: 0,
+        });
         assert_eq!(
             swap_drained_seeded_parser(
                 &parser,
@@ -3858,7 +3893,7 @@ mod tests {
     }
 
     #[test]
-    fn drain_timeout_drops_control_before_late_ack_retry() {
+    fn drain_timeout_ignores_late_ack_and_recovers_on_retry() {
         use std::io::{Read, Write};
         use std::sync::mpsc;
 
@@ -3868,22 +3903,33 @@ mod tests {
         let (resume_tx, resume_rx) = mpsc::channel();
         let (late_ack_tx, late_ack_rx) = mpsc::channel();
         let forwarder = std::thread::spawn(move || {
-            let mut probe = [0; 1];
-            forwarder_control
-                .read_exact(&mut probe)
-                .expect("receive first drain probe");
-            assert_eq!(probe, [DRAIN_PROBE]);
+            let (kind, generation) =
+                read_drain_frame(&mut forwarder_control).expect("receive first drain probe");
+            assert_eq!(kind, DRAIN_PROBE);
             probe_tx.send(()).expect("signal held probe");
             resume_rx.recv().expect("release held pane byte");
             data_forwarder
                 .write_all(b"RETRY-MARKER")
                 .expect("forward held pane byte");
             late_ack_tx
-                .send(forwarder_control.write_all(&[DRAIN_ACK]).is_err())
+                .send(
+                    forwarder_control
+                        .write_all(&drain_frame(DRAIN_ACK, generation))
+                        .is_ok(),
+                )
                 .expect("report late ack");
+            let (kind, generation) =
+                read_drain_frame(&mut forwarder_control).expect("receive retry drain probe");
+            assert_eq!(kind, DRAIN_PROBE);
+            forwarder_control
+                .write_all(&drain_frame(DRAIN_ACK, generation))
+                .expect("acknowledge retry probe");
         });
 
-        let control = Mutex::new(Some(parent_control));
+        let control = Mutex::new(DrainControl {
+            stream: Some(parent_control),
+            next_generation: 0,
+        });
         let parser = Mutex::new(vt100::Parser::new(6, 40, 0));
         let app_cursor = AtomicBool::new(false);
         let grid_gen = AtomicU64::new(0);
@@ -3911,8 +3957,8 @@ mod tests {
             "timed-out drain must stand down"
         );
         assert!(
-            control.lock().unwrap().is_none(),
-            "a timed-out control connection must not survive for a retry"
+            control.lock().unwrap().stream.is_some(),
+            "a timed-out control connection remains available for a correlated retry"
         );
 
         resume_tx.send(()).expect("release forwarder");
@@ -3925,7 +3971,7 @@ mod tests {
             late_ack_rx
                 .recv_timeout(Duration::from_secs(1))
                 .expect("late ack result"),
-            "the retired peer must reject the late acknowledgement"
+            "the control stream remains open so the retry can observe generations"
         );
 
         assert_eq!(
@@ -3944,10 +3990,27 @@ mod tests {
                     control: &control,
                 },
             ),
-            VtRefreshResult::Busy,
-            "a late acknowledgement must not certify the retry"
+            VtRefreshResult::Refreshed,
+            "the stale acknowledgement is ignored until the matching retry acknowledgement arrives"
         );
         forwarder.join().expect("forwarder exits");
+    }
+
+    #[test]
+    fn cloned_pipe_socket_releases_stream_mutex_before_snapshot_fence() {
+        use std::io::{Read, Write};
+
+        let (stream, mut peer) = UnixStream::pair().expect("pipe pair");
+        let stream = Mutex::new(Some(stream));
+        let mut clone = clone_pipe_socket(&stream).expect("clone pipe socket");
+        assert!(
+            stream.try_lock().is_ok(),
+            "cloning must release the input mutex"
+        );
+        clone.write_all(b"input").expect("write cloned input");
+        let mut input = [0; b"input".len()];
+        peer.read_exact(&mut input).expect("read cloned input");
+        assert_eq!(&input, b"input");
     }
 
     #[test]
