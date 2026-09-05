@@ -25,6 +25,7 @@ mod rows;
 mod selection;
 mod send;
 mod status;
+mod store_move;
 #[cfg(test)]
 mod tests;
 mod user_action;
@@ -558,6 +559,16 @@ pub struct HomeView {
     /// Suppresses the StatusPoller's missing-tmux Error transition until the
     /// worker reports back via `apply_restart_results`.
     pub(super) restart_in_flight: std::collections::HashSet<String>,
+
+    // Performance: background sandbox store move. A session still on the
+    // shared store copies it before its first launch, which can take
+    // minutes; see `tui::store_move_poller`.
+    store_move_poller: crate::tui::store_move_poller::StoreMovePoller,
+    store_move_in_flight: Option<store_move::StoreMoveInFlight>,
+    /// A session whose container a move found already up. Its next launch
+    /// goes ahead on the shared store instead of deferring to another move,
+    /// which would find the same container and hand the launch back again.
+    store_move_bypass: Option<String>,
 
     // Performance: background attach-a-project (#3103). `git worktree add`, an
     // optional fetch and submodule init, the worker bounce and the container

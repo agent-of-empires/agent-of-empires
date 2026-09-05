@@ -519,7 +519,22 @@ impl ContainerRuntime {
         self.base.exec(name, cmd)
     }
 
+    /// Whether each container named with `prefix` is in the `running` state,
+    /// in a single subprocess call. Paused and restarting containers read as
+    /// not running here; use [`Self::batch_container_states`] where inspect's
+    /// `State.Running` is the question.
     pub fn batch_running_states(&self, prefix: &str) -> HashMap<String, bool> {
+        self.batch_container_states(prefix)
+            .into_iter()
+            .map(|(name, state)| (name, state == ContainerState::Running))
+            .collect()
+    }
+
+    /// The listed state of every container named with `prefix`, in a single
+    /// subprocess call. Empty when the runtime cannot list (Apple's CLI has no
+    /// state column), so a caller must treat an absent name as unknown, not
+    /// as stopped.
+    pub fn batch_container_states(&self, prefix: &str) -> HashMap<String, ContainerState> {
         match self.kind {
             RuntimeKind::Docker | RuntimeKind::Podman => {
                 let mut cmd = self.base.command();
@@ -535,22 +550,7 @@ impl ContainerRuntime {
                     Ok(output) if output.status.success() => output,
                     _ => return HashMap::new(),
                 };
-
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                stdout
-                    .lines()
-                    .filter_map(|line| {
-                        let mut parts = line.splitn(2, '\t');
-                        let name = parts.next()?.trim();
-                        let state = parts.next()?.trim();
-                        // Docker/Podman's --filter name= does substring matching, so
-                        // post-filter to ensure we only include exact prefix matches.
-                        if name.is_empty() || !name.starts_with(prefix) {
-                            return None;
-                        }
-                        Some((name.to_string(), state == "running"))
-                    })
-                    .collect()
+                parse_batch_states(&String::from_utf8_lossy(&output.stdout), prefix)
             }
             RuntimeKind::AppleContainer => {
                 let _ = prefix;
@@ -601,9 +601,105 @@ impl ContainerRuntime {
     }
 }
 
+/// A container's state as `ps --format {{.State}}` lists it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContainerState {
+    Running,
+    Paused,
+    Restarting,
+    Created,
+    Exited,
+    Dead,
+    /// A transitional (`removing`, `stopping`) or unrecognised state.
+    Other,
+}
+
+impl ContainerState {
+    pub fn from_listing(state: &str) -> Self {
+        match state {
+            "running" => Self::Running,
+            "paused" => Self::Paused,
+            "restarting" => Self::Restarting,
+            "created" => Self::Created,
+            "exited" => Self::Exited,
+            "dead" => Self::Dead,
+            _ => Self::Other,
+        }
+    }
+
+    /// Inspect's `State.Running`, which Moby keeps true while a container is
+    /// paused or restarting: the process is alive and its mounts are in use.
+    /// `None` for a state that says nothing certain either way, so a caller
+    /// that must not guess inspects the container instead.
+    pub fn is_live(self) -> Option<bool> {
+        match self {
+            Self::Running | Self::Paused | Self::Restarting => Some(true),
+            Self::Created | Self::Exited | Self::Dead => Some(false),
+            Self::Other => None,
+        }
+    }
+}
+
+/// Parse `{{.Names}}\t{{.State}}` lines. Docker and Podman's `--filter name=`
+/// matches substrings, so names are post-filtered to the exact prefix.
+fn parse_batch_states(stdout: &str, prefix: &str) -> HashMap<String, ContainerState> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(2, '\t');
+            let name = parts.next()?.trim();
+            let state = parts.next()?.trim();
+            if name.is_empty() || !name.starts_with(prefix) {
+                return None;
+            }
+            Some((name.to_string(), ContainerState::from_listing(state)))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every state the listing can report, including ones the parser has not
+    /// heard of. Paused and restarting are live, like `State.Running` says;
+    /// anything transitional stays undecided rather than reading as stopped.
+    #[test]
+    fn batch_listing_states_keep_inspect_liveness() {
+        let listing = "aoe-sandbox-a\trunning\n\
+                       aoe-sandbox-b\tpaused\n\
+                       aoe-sandbox-c\trestarting\n\
+                       aoe-sandbox-d\texited\n\
+                       aoe-sandbox-e\tcreated\n\
+                       aoe-sandbox-f\tdead\n\
+                       aoe-sandbox-g\tremoving\n\
+                       aoe-sandbox-h\tsomething-new\n\
+                       other-aoe-sandbox-i\trunning\n\
+                       aoe-sandbox-j\n";
+        let states = parse_batch_states(listing, "aoe-sandbox-");
+        let cases = [
+            ("aoe-sandbox-a", ContainerState::Running, Some(true)),
+            ("aoe-sandbox-b", ContainerState::Paused, Some(true)),
+            ("aoe-sandbox-c", ContainerState::Restarting, Some(true)),
+            ("aoe-sandbox-d", ContainerState::Exited, Some(false)),
+            ("aoe-sandbox-e", ContainerState::Created, Some(false)),
+            ("aoe-sandbox-f", ContainerState::Dead, Some(false)),
+            ("aoe-sandbox-g", ContainerState::Other, None),
+            ("aoe-sandbox-h", ContainerState::Other, None),
+        ];
+        assert_eq!(states.len(), cases.len(), "{states:?}");
+        for (name, state, live) in cases {
+            assert_eq!(states[name], state, "{name}");
+            assert_eq!(state.is_live(), live, "{name}");
+        }
+        // The health map keeps its strict reading: only `running` is running.
+        let running: HashMap<String, bool> = states
+            .iter()
+            .map(|(name, state)| (name.clone(), *state == ContainerState::Running))
+            .collect();
+        assert!(running["aoe-sandbox-a"]);
+        assert!(!running["aoe-sandbox-b"]);
+    }
     #[test]
     fn runtime_timeout_classification_matches_io_error_kind() {
         let cases = [
