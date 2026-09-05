@@ -208,7 +208,8 @@ pub fn run_migrations() -> Result<()> {
 
 /// Run all pending migrations, sending [`progress::Event`]s to `reporter` so a
 /// long one (store copies, container probes) reads as work, not a hang. A
-/// still-pending sandbox store move is retried quietly.
+/// still-pending sandbox store move is retried too; it reports only the work
+/// it actually does (copies and their outcome), not what stays pending.
 pub fn run_migrations_with(reporter: Option<progress::Reporter>) -> Result<()> {
     run_migrations_inner(reporter, false)
 }

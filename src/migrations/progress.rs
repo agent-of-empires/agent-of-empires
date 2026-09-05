@@ -3,8 +3,8 @@
 //! A migration can run for minutes (copying agent stores, probing a container
 //! runtime). With nothing but a spinner the user cannot tell work from a hang.
 //! The runner installs a reporter for the duration of a run and migrations
-//! call [`step`], [`progress`] and [`notice`] from wherever the work happens;
-//! with no reporter installed every call is a no-op.
+//! call `step`, `progress` and `notice` from wherever the work happens; with
+//! no reporter installed every call is a no-op.
 
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -152,14 +152,38 @@ pub fn format_elapsed(elapsed: Duration) -> String {
 }
 
 pub fn format_bytes(bytes: u64) -> String {
-    const MB: u64 = 1024 * 1024;
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
     if bytes >= 10 * MB {
         format!("{} MB", bytes / MB)
     } else if bytes >= MB {
         format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{} KB", bytes / KB)
     } else {
-        format!("{} KB", bytes / 1024)
+        format!("{bytes} B")
     }
+}
+
+/// Clamp `line` to `width` columns by eliding its middle, so a status line
+/// redrawn in place with `\r` + erase-line never wraps onto rows the erase
+/// cannot reach. Paths make these lines long; keeping both ends keeps the
+/// counts and the elapsed time readable.
+pub fn fit_width(line: &str, width: usize) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    if width == 0 || chars.len() <= width {
+        return line.to_string();
+    }
+    if width < 8 {
+        return chars[..width].iter().collect();
+    }
+    let keep = width - 1;
+    let head = keep / 2;
+    let tail = keep - head;
+    let mut out: String = chars[..head].iter().collect();
+    out.push('\u{2026}');
+    out.extend(chars[chars.len() - tail..].iter());
+    out
 }
 
 #[cfg(test)]
@@ -167,7 +191,10 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    // The reporter is process-global; a concurrent migration test would
+    // interleave its events into this sequence.
     #[test]
+    #[serial_test::serial]
     fn reporter_receives_events_only_while_installed() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         {
@@ -245,8 +272,23 @@ mod tests {
         assert_eq!(format_elapsed(Duration::from_millis(1500)), "1.5s");
         assert_eq!(format_elapsed(Duration::from_secs(42)), "42s");
         assert_eq!(format_elapsed(Duration::from_secs(125)), "2m05s");
+        assert_eq!(format_bytes(500), "500 B");
         assert_eq!(format_bytes(512 * 1024), "512 KB");
         assert_eq!(format_bytes(3 * 1024 * 1024 / 2), "1.5 MB");
         assert_eq!(format_bytes(40 * 1024 * 1024), "40 MB");
+    }
+
+    #[test]
+    fn fit_width_elides_the_middle_and_keeps_both_ends() {
+        assert_eq!(fit_width("short", 80), "short");
+        assert_eq!(fit_width("short", 0), "short");
+        let long =
+            "copying store 1/2: /home/u/.gemini/sandbox -> /home/u/.gemini/sandbox-v2/abc (0.4s)";
+        let fitted = fit_width(long, 40);
+        assert_eq!(fitted.chars().count(), 40);
+        assert!(fitted.starts_with("copying store 1/2: "));
+        assert!(fitted.ends_with(" (0.4s)"));
+        assert!(fitted.contains('\u{2026}'));
+        assert_eq!(fit_width("abcdefghij", 5), "abcde");
     }
 }

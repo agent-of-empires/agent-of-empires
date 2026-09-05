@@ -229,8 +229,10 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
 
     // Run pending migrations with a spinner that names the migration, its
     // current step and the elapsed time, and keeps the notices a migration
-    // emits (what is being moved, how to defer it) on screen.
-    if migrations::has_pending_migrations() {
+    // emits (what is being moved, how to defer it) on screen. Unconditional:
+    // a deferred sandbox store move runs from the schema-current path too, and
+    // the spinner draws nothing until a migration reports it has started.
+    {
         const SPINNER_FRAMES: &[char] = &['◐', '◓', '◑', '◒'];
         let console = std::sync::Arc::new(std::sync::Mutex::new(
             migrations::progress::ConsoleProgress::default(),
@@ -255,10 +257,13 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
                 println!("  {line}");
             }
             if let Some(status) = console.status_line() {
-                print!(
+                // One row only: the erase above cannot reach a wrapped line.
+                let width = crate::terminal::get_size().map_or(80, |(w, _)| w as usize);
+                let line = format!(
                     "  {} {status}",
                     SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]
                 );
+                print!("{}", migrations::progress::fit_width(&line, width));
             }
             let _ = io::stdout().flush();
         };
@@ -281,8 +286,6 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
                 }
             }
         }
-    } else {
-        tokio::task::spawn_blocking(migrations::run_migrations).await??;
     }
 
     // Check for tmux
