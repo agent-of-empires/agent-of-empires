@@ -949,6 +949,7 @@ mod tests {
                 5,
                 Event::ApprovalRequested {
                     approval: Approval {
+                        choice_list: false,
                         nonce: Nonce::new(),
                         tool_call: ToolCall {
                             id: "tc-x".into(),
@@ -962,6 +963,7 @@ mod tests {
                         },
                         destructive: false,
                         requested_at: Utc::now(),
+                        options: Vec::new(),
                         resolved: None,
                     },
                 },

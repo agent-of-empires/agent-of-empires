@@ -904,6 +904,7 @@ mod tests {
     #[test]
     fn connect_fold_covers_all_history_while_frames_stay_scoped_to_since() {
         let approval = crate::acp::approvals::Approval {
+            choice_list: false,
             nonce: crate::acp::approvals::Nonce("n-1".into()),
             tool_call: crate::acp::state::ToolCall {
                 id: "t-1".into(),
@@ -917,6 +918,7 @@ mod tests {
             },
             destructive: false,
             requested_at: chrono::Utc::now(),
+            options: Vec::new(),
             resolved: None,
         };
         let history = vec![
@@ -1127,6 +1129,7 @@ mod tests {
     #[test]
     fn control_fold_skips_events_the_drain_already_applied() {
         let approval = |nonce: &str| crate::acp::approvals::Approval {
+            choice_list: false,
             nonce: crate::acp::approvals::Nonce(nonce.into()),
             tool_call: crate::acp::state::ToolCall {
                 id: "t-1".into(),
@@ -1140,6 +1143,7 @@ mod tests {
             },
             destructive: false,
             requested_at: chrono::Utc::now(),
+            options: Vec::new(),
             resolved: None,
         };
         let mut reduced =

@@ -69,8 +69,7 @@ pub(super) fn spawn_runner_detached(
     socket_path: &std::path::Path,
     session_id: String,
     session_sandbox: Option<&SessionSandbox>,
-) -> Result<(), AcpError> {
-    use std::process::Command as StdCommand;
+) -> Result<u32, AcpError> {
     let current_exe =
         std::env::current_exe().map_err(|e| AcpError::Spawn(format!("current_exe: {e}")))?;
     let log_path = crate::process::worker_registry::log_path_for(&session_id)
@@ -143,7 +142,7 @@ pub(super) fn spawn_runner_detached(
             (None, None) => (config.spec.command.clone(), Vec::new()),
         };
 
-    let mut cmd = StdCommand::new(&current_exe);
+    let mut cmd = tokio::process::Command::new(&current_exe);
     cmd.arg("__acp-runner")
         .arg("--socket")
         .arg(socket_path)
@@ -179,6 +178,7 @@ pub(super) fn spawn_runner_detached(
     if let Some(stored) = &config.stored_acp_session_id {
         cmd.arg("--stored-acp-session-id").arg(stored);
     }
+    cmd.arg("--generation").arg(config.generation.to_string());
     cmd.arg("--");
     if let Some(s) = &sandbox_argv {
         cmd.arg(&s.docker_binary);
@@ -201,7 +201,7 @@ pub(super) fn spawn_runner_detached(
     // filter pass needed). AOE_TOKEN is stripped here so it never reaches
     // either process.
     cmd.env_clear();
-    apply_env_filter(&mut cmd, config);
+    apply_env_filter(cmd.as_std_mut(), config);
     // Trusted `Config.environment`, destined for the adapter only. It rides
     // one reserved carrier key rather than the runner's own environment
     // because HOME / PATH / XDG_CONFIG_HOME are legal entries here: setting
@@ -270,7 +270,6 @@ pub(super) fn spawn_runner_detached(
     // own signal handlers.
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt;
         unsafe {
             cmd.pre_exec(|| {
                 nix::unistd::setsid().map_err(std::io::Error::other)?;
@@ -297,7 +296,7 @@ pub(super) fn spawn_runner_detached(
         "spawning detached structured view runner"
     );
 
-    cmd.spawn().map_err(|e| {
+    let mut child = cmd.spawn().map_err(|e| {
         warn!(
             target: "acp.protocol.spawn",
             session = %session_id,
@@ -305,10 +304,16 @@ pub(super) fn spawn_runner_detached(
         );
         AcpError::Spawn(format!("spawn runner: {e}"))
     })?;
-    // Drop the std::process::Child here. std::process::Command doesn't
-    // wait on drop, so the runner stays alive. setsid + nohup-equivalent
-    // make this an actual detach.
-    Ok(())
+    let pid = child
+        .id()
+        .ok_or_else(|| AcpError::Spawn("runner exited before it could be identified".into()))?;
+    // setsid above detaches the runner; reap it on exit so a finished runner
+    // does not linger as a zombie that still answers `kill(pid, 0)`, which
+    // would keep a teardown from ever proving the process gone.
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
+    Ok(pid)
 }
 
 /// Poll the socket file's existence with `connect()` until a deadline.

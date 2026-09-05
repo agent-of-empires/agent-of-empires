@@ -1530,6 +1530,13 @@
       "components": ["web/src/components/acp/StructuredView.tsx"]
     },
     {
+      "id": "acp.worker-stopping",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/acp/workerStoppedBanner.test.ts", "src/components/__tests__/SessionRowTriage.test.tsx"],
+      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
       "id": "session.workspace-delete",
       "kind": "vitest",
       "risk": "high",
@@ -2756,11 +2763,11 @@
       "components": ["web/src/components/acp/StructuredView.tsx", "web/src/lib/acpTypes.ts"]
     },
     {
-      "id": "sidebar.rate-limit-hook",
+      "id": "sidebar.rate-limit-summary",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/hooks/__tests__/useAcpRateLimit.test.tsx"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/lib/acpStateStorage.ts"]
+      "specs": ["src/lib/rateLimitSummary.test.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/lib/rateLimitSummary.ts"]
     },
     {
       "id": "story.sidebar-select-focuses-input",

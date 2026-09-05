@@ -930,6 +930,8 @@ mod tests {
             kind: "read".into(),
             args: String::new(),
             destructive: false,
+            options: Vec::new(),
+            choice_list: false,
         };
         let mut state = test_state(None);
         state.transcript.pending_approvals = vec![pending("approval-b"), pending("approval-c")];

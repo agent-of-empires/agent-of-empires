@@ -11,7 +11,8 @@
 //! elicitation answers); `Esc` there returns to the composer. The
 //! composer captures **every** typed key, including `a`/`A`/`d`, so
 //! typing "always allow" into a prompt never resolves an approval. A
-//! pending approval opens a modal shelf and then accepts `a`/`A`/`d`.
+//! pending approval opens a modal shelf and then accepts `a`/`A`/`d`, or a
+//! digit to pick one of the agent's options.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
@@ -42,6 +43,8 @@ pub enum Intent {
     Scroll(i32),
     /// Resolve the focused approval card.
     ResolveApproval(ApprovalDecisionWire),
+    /// Answer the focused choice-list approval with its N-th option (#3741).
+    ChooseApprovalOption(usize),
     /// Skip the oldest pending elicitation (ACP `decline`): the agent
     /// continues with no answer. The rich answer form is web-only.
     SkipElicitation,
@@ -422,6 +425,9 @@ fn pane_keys(key: &KeyEvent) -> Intent {
 
 fn approval_keys(key: &KeyEvent) -> Intent {
     match (key.modifiers, key.code) {
+        (m, KeyCode::Char(c @ '1'..='9')) if m.is_empty() => {
+            Intent::ChooseApprovalOption(c as usize - '1' as usize)
+        }
         (m, KeyCode::Char('a')) if m.is_empty() => {
             Intent::ResolveApproval(ApprovalDecisionWire::Allow)
         }
@@ -551,6 +557,19 @@ mod tests {
         assert!(matches!(
             dispatch(Focus::Approval, &key(KeyCode::Char('a')), ctx_pending()),
             Intent::ResolveApproval(ApprovalDecisionWire::Allow)
+        ));
+        // Digits pick a listed option by position, under approval focus only.
+        assert!(matches!(
+            dispatch(Focus::Approval, &key(KeyCode::Char('1')), ctx_pending()),
+            Intent::ChooseApprovalOption(0)
+        ));
+        assert!(matches!(
+            dispatch(Focus::Approval, &key(KeyCode::Char('9')), ctx_pending()),
+            Intent::ChooseApprovalOption(8)
+        ));
+        assert!(!matches!(
+            dispatch(Focus::Transcript, &key(KeyCode::Char('1')), ctx_pending()),
+            Intent::ChooseApprovalOption(_)
         ));
         assert!(matches!(
             dispatch(

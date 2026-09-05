@@ -67,6 +67,48 @@ describe("useHistoryWindow", () => {
     expect(ids).toContain("nu-4");
   });
 
+  it("keeps a cut inside a long turn in place when the next prompt lands (#3707)", () => {
+    // One assistant turn longer than the window: the cut lands mid-turn with
+    // no user boundary at or after it.
+    const long: ActivityRow[] = [{ id: "u-0", kind: "user_prompt", text: "big question" }];
+    for (let r = 0; r < DEFAULT_HISTORY_WINDOW + 10; r += 1) {
+      long.push({ id: `m-0-${r}`, kind: "message", text: `part ${r}` });
+    }
+    const { result, rerender } = renderHook(({ a }) => useHistoryWindow("s1", a, false), {
+      initialProps: { a: long },
+    });
+    const topBefore = result.current.windowedActivity[0]!.id;
+    expect(topBefore).toMatch(/^m-0-/);
+    expect(result.current.canLoadEarlier).toBe(true);
+
+    // The next prompt used to become the nearest boundary the start snapped
+    // forward to, dropping every rendered part of the long turn at once.
+    const next = long.concat([
+      { id: "u-1", kind: "user_prompt", text: "follow-up" },
+      { id: "m-1-0", kind: "message", text: "short answer" },
+    ]);
+    rerender({ a: next });
+    expect(result.current.windowedActivity[0]!.id).toBe(topBefore);
+    expect(result.current.windowedActivity.at(-1)!.id).toBe("m-1-0");
+    expect(result.current.canLoadEarlier).toBe(true);
+
+    // Load earlier still moves the start back, and the pin follows it.
+    act(() => result.current.loadEarlier());
+    expect(result.current.windowedActivity[0]!.id).toBe("u-0");
+  });
+
+  it("drops the pin when its row is trimmed away", () => {
+    const activity = transcript(100, 1);
+    const { result, rerender } = renderHook(({ a }) => useHistoryWindow("s1", a, false), {
+      initialProps: { a: activity },
+    });
+    const topBefore = result.current.windowedActivity[0]!.id;
+    // A retention trim removes the head of the transcript, pin included.
+    const trimmed = activity.filter((r) => r.id !== topBefore).slice(60);
+    rerender({ a: trimmed });
+    expect(result.current.windowedActivity[0]!.id).toBe(trimmed[0]!.id);
+  });
+
   it("resets the window to recent when the session changes", () => {
     const activity = transcript(100, 1);
     const { result, rerender } = renderHook(({ id }) => useHistoryWindow(id, activity, false), {

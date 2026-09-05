@@ -47,10 +47,12 @@ non-standard location, set `AOE_ACP_NODE=/path/to/node` or configure
 
 ### `aoe acp doctor` says aoe-agent is missing
 
-`aoe-agent` is not packaged with the aoe binary yet (#3553). The default
-structured-view agent is `claude-code`; leave `acp.default_agent` on an adapter
-that `aoe acp doctor` reports as installed, or build `acp-worker/aoe-agent`
-yourself and point the registry command at it.
+`aoe-agent` ships inside the `aoe` binary as sources and is installed into the
+data dir on demand, like the npm adapters: run
+`aoe acp doctor --fix --adapter aoe-agent`. It needs Node 22.6 or newer (the
+other adapters accept any 22). Until it is installed, sessions that pick it
+fail to start with an install hint and `aoe acp agents` reports it as missing
+rather than present (#3553).
 
 ### `aoe acp doctor` says claude-code adapter is missing
 
@@ -182,7 +184,9 @@ rate_limit_auto_resume = true
 ```
 
 The setting is editable in the structured view settings (TUI and web
-dashboard) and can be overridden per profile. Resume fires once the reported
+dashboard) and can be overridden per profile. The park survives a resume
+that fails to start: the sidebar badge and the banner stay until the worker
+is back or the session is stopped for another reason. Resume fires once the reported
 reset time plus a fixed 15-second cushion passes, and the reset time survives
 an `aoe serve` restart. With no reported reset time, resume retries an hour
 after the park, and each further attempt waits twice as long as the last: 1h,

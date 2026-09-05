@@ -2,7 +2,7 @@
 //! from the approval policy or by asking the user.
 
 use crate::acp::agent_profiles;
-use crate::acp::approvals::{ApprovalDecision, Nonce};
+use crate::acp::approvals::{ApprovalDecision, ApprovalOption, Nonce};
 use crate::acp::elicitations::{parse_elicitation, ElicitationOutcome};
 use crate::acp::permissions::build_approval;
 use crate::acp::state::{Event, ToolCall};
@@ -13,7 +13,7 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::Responder;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{trace, warn};
+use tracing::{debug, trace, warn};
 
 use super::fs_handlers::enter_timestamp_ns;
 use super::pending::{
@@ -22,6 +22,16 @@ use super::pending::{
 };
 use super::tool_context::{permission_raw_input_with_context, ToolContextCache};
 use super::tool_output::{preview_optional_args, tool_kind_str};
+
+fn permission_option_kind_str(kind: &PermissionOptionKind) -> &'static str {
+    match kind {
+        PermissionOptionKind::AllowOnce => "allow_once",
+        PermissionOptionKind::AllowAlways => "allow_always",
+        PermissionOptionKind::RejectOnce => "reject_once",
+        PermissionOptionKind::RejectAlways => "reject_always",
+        _ => "other",
+    }
+}
 
 /// Translate the user's decision into the matching option_id from the
 /// list the agent offered. Falls back gracefully if the agent didn't
@@ -144,14 +154,33 @@ pub(super) async fn handle_permission_request(
             tool_call: tool_call.clone(),
         })
         .await;
-    let approval = build_approval(tool_call);
+    let options: Vec<ApprovalOption> = request
+        .options
+        .iter()
+        .map(|o| ApprovalOption {
+            option_id: o.option_id.0.to_string(),
+            name: o.name.clone(),
+            kind: permission_option_kind_str(&o.kind).to_string(),
+        })
+        .collect();
+    let approval = build_approval(tool_call, options);
     let nonce = approval.nonce.clone();
+    let choice_list = approval.choice_list;
+    let option_ids: Vec<String> = approval
+        .options
+        .iter()
+        .map(|o| o.option_id.clone())
+        .collect();
 
     let (resolve_tx, resolve_rx) = oneshot::channel::<ApprovalResolutionMessage>();
     pending.lock().await.insert(
         nonce.clone(),
         PendingResponder {
-            resolver: PendingResolver::Approval(resolve_tx),
+            resolver: PendingResolver::Approval {
+                option_ids,
+                choice_list,
+                resolver: resolve_tx,
+            },
         },
     );
 
@@ -193,8 +222,17 @@ pub(super) async fn handle_permission_request(
     // a foreign `#[non_exhaustive]` enum it doesn't fully own.
     let (outcome, outcome_label): (RequestPermissionOutcome, &'static str) = match resolve_rx.await
     {
-        Ok(ApprovalResolutionMessage::Decision { decision }) => {
-            if let Some(option_id) = pick_option_id(&request.options, decision) {
+        Ok(ApprovalResolutionMessage::Decision {
+            decision,
+            option_id,
+        }) => {
+            let chosen = select_option(&request.options, decision, option_id, choice_list);
+            if let Some(option) = chosen {
+                // The record follows the chosen option: picking a list's
+                // "No" is a Deny even though the digit that picked it sent
+                // Allow.
+                let decision = decision_for_kind(&option.kind).unwrap_or(decision);
+                let option_id = option.option_id;
                 // Surface the resolution to UI clients via the typed event channel.
                 let _ = event_tx
                     .send(Event::ApprovalResolved {
@@ -214,13 +252,16 @@ pub(super) async fn handle_permission_request(
                     "selected",
                 )
             } else {
-                warn!(
-                    target: "acp.protocol",
-                    "agent did not offer a {decision:?}-compatible option; cancelling"
-                );
-                // No compatible option: the agent gets Cancelled, but the
-                // user still acted, so clear the approval card and close
-                // the hanging start frame. See #1713.
+                if choice_list {
+                    debug!(target: "acp.protocol", "question dismissed; cancelling");
+                } else {
+                    warn!(
+                        target: "acp.protocol",
+                        "agent did not offer a {decision:?}-compatible option; cancelling"
+                    );
+                }
+                // The agent gets Cancelled, but the user still acted, so clear
+                // the approval card and close the hanging start frame (#1713).
                 let _ = event_tx
                     .send(Event::ApprovalResolved {
                         nonce: nonce.clone(),
@@ -336,9 +377,121 @@ pub(super) async fn handle_elicitation_request(
     responder.respond(response)
 }
 
+/// The option a resolution selects. An explicit option (a choice-list
+/// answer, #3741) wins over kind matching, which would otherwise return the
+/// first option of a list whose entries all share one kind. A choice list
+/// answered without naming an option (a client that only knows the trio)
+/// selects nothing and is cancelled.
+fn select_option(
+    options: &[agent_client_protocol::schema::v1::PermissionOption],
+    decision: ApprovalDecision,
+    option_id: Option<String>,
+    choice_list: bool,
+) -> Option<agent_client_protocol::schema::v1::PermissionOption> {
+    let by_id = option_id.and_then(|id| options.iter().find(|o| o.option_id.0.as_ref() == id));
+    match by_id {
+        Some(option) => Some(option.clone()),
+        None if choice_list => None,
+        None => {
+            let id = pick_option_id(options, decision)?;
+            options.iter().find(|o| o.option_id == id).cloned()
+        }
+    }
+}
+
+/// The decision an option's kind stands for; `None` for a kind this build
+/// does not know, where the caller's decision stands.
+fn decision_for_kind(kind: &PermissionOptionKind) -> Option<ApprovalDecision> {
+    match kind {
+        PermissionOptionKind::AllowOnce => Some(ApprovalDecision::Allow),
+        PermissionOptionKind::AllowAlways => Some(ApprovalDecision::AllowAlways),
+        PermissionOptionKind::RejectOnce | PermissionOptionKind::RejectAlways => {
+            Some(ApprovalDecision::Deny)
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn select_option_honors_an_explicit_answer_and_cancels_an_unanswered_list() {
+        use agent_client_protocol::schema::v1::{PermissionOption, PermissionOptionId};
+        let choices = vec![
+            PermissionOption::new(
+                PermissionOptionId::new("red"),
+                "Red",
+                PermissionOptionKind::AllowOnce,
+            ),
+            PermissionOption::new(
+                PermissionOptionId::new("blue"),
+                "Blue",
+                PermissionOptionKind::AllowOnce,
+            ),
+        ];
+        type Case = (
+            &'static str,
+            ApprovalDecision,
+            Option<&'static str>,
+            bool,
+            Option<&'static str>,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "explicit option wins",
+                ApprovalDecision::Allow,
+                Some("blue"),
+                true,
+                Some("blue"),
+            ),
+            (
+                "choice list without an option cancels",
+                ApprovalDecision::Allow,
+                None,
+                true,
+                None,
+            ),
+            (
+                "deny on a choice list cancels",
+                ApprovalDecision::Deny,
+                None,
+                true,
+                None,
+            ),
+            (
+                "unknown option on a choice list cancels",
+                ApprovalDecision::Allow,
+                Some("green"),
+                true,
+                None,
+            ),
+            (
+                "trio request falls back to kind",
+                ApprovalDecision::Allow,
+                None,
+                false,
+                Some("red"),
+            ),
+            (
+                "unknown option on a trio request falls back to kind",
+                ApprovalDecision::Allow,
+                Some("green"),
+                false,
+                Some("red"),
+            ),
+        ];
+        for (label, decision, option_id, choice_list, expected) in cases {
+            let chosen =
+                select_option(&choices, decision, option_id.map(String::from), choice_list);
+            assert_eq!(
+                chosen.as_ref().map(|o| o.option_id.0.as_ref()),
+                expected,
+                "{label}"
+            );
+        }
+    }
 
     #[test]
     fn pick_option_id_finds_allow_once() {

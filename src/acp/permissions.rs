@@ -11,18 +11,21 @@
 
 use chrono::Utc;
 
-use super::approvals::{is_destructive, Approval, Nonce, ResolvedApproval};
+use super::approvals::{is_destructive, Approval, ApprovalOption, Nonce, ResolvedApproval};
 use super::state::ToolCall;
 
 /// Build a fresh `Approval` for an incoming permission request. Generates
 /// a server-side nonce and decides destructive/benign classification.
-pub fn build_approval(tool_call: ToolCall) -> Approval {
+pub fn build_approval(tool_call: ToolCall, options: Vec<ApprovalOption>) -> Approval {
     let destructive = is_destructive(&tool_call.name, &tool_call.args_preview);
+    let choice_list = crate::acp::approvals::is_choice_list(&tool_call.id, &options);
     Approval {
+        choice_list,
         nonce: Nonce::new(),
         tool_call,
         destructive,
         requested_at: Utc::now(),
+        options,
         resolved: None,
     }
 }
@@ -57,7 +60,7 @@ mod tests {
             memory_recall: None,
             diffs: Vec::new(),
         };
-        let a = build_approval(tc);
+        let a = build_approval(tc, Vec::new());
         assert!(a.destructive);
         assert!(a.resolved.is_none());
         assert!(!a.nonce.0.is_empty());
@@ -75,7 +78,7 @@ mod tests {
             memory_recall: None,
             diffs: Vec::new(),
         };
-        let mut a = build_approval(tc);
+        let mut a = build_approval(tc, Vec::new());
         resolve(&mut a, ApprovalDecision::Allow, None);
         let resolved = a.resolved.unwrap();
         assert_eq!(resolved.decision, ApprovalDecision::Allow);

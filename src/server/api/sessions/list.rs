@@ -175,6 +175,63 @@ pub async fn list_sessions(
         }
     }
 
+    {
+        // Config reads and the event-store park probe run off the runtime
+        // thread; a live worker is never parked, so only workerless sessions
+        // pay for the probe.
+        let probes: Vec<(usize, String, String, bool)> = sessions
+            .iter()
+            .zip(scoped_instances.iter().copied())
+            .enumerate()
+            .filter(|(_, (_, inst))| {
+                inst.is_structured() && !inst.is_archived() && !inst.is_trashed()
+            })
+            .map(|(i, (resp, inst))| {
+                (
+                    i,
+                    inst.id.clone(),
+                    inst.source_profile.clone(),
+                    resp.acp_worker_state != crate::acp::supervisor::AcpWorkerState::Running,
+                )
+            })
+            .collect();
+        if !probes.is_empty() {
+            let store = Arc::clone(&state.acp_event_store);
+            let overlays = tokio::task::spawn_blocking(move || {
+                use std::collections::HashMap;
+                let mut auto_resume_cache: HashMap<String, bool> = HashMap::new();
+                probes
+                    .into_iter()
+                    .map(|(i, id, profile, workerless)| {
+                        let auto_resume =
+                            *auto_resume_cache.entry(profile.clone()).or_insert_with(|| {
+                                crate::session::config::profile_config::resolve_config_or_warn(
+                                    &profile,
+                                )
+                                .acp
+                                .rate_limit_auto_resume
+                            });
+                        let park = workerless
+                            .then(|| {
+                                store.rate_limit_park(&id).map(|park| {
+                                    park.info
+                                        .unwrap_or_else(crate::acp::state::RateLimitInfo::undated)
+                                })
+                            })
+                            .flatten();
+                        (i, auto_resume, park)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap_or_default();
+            for (i, auto_resume, park) in overlays {
+                sessions[i].rate_limit_auto_resume = Some(auto_resume);
+                sessions[i].rate_limit = park;
+            }
+        }
+    }
+
     // Overlay the smart-rename indicator. `Running` comes from the live
     // in-flight set; `Pending` from the shared eligibility predicate, so the
     // indicator cannot drift from the runtime gate. Config is projected from
@@ -545,6 +602,8 @@ mod workspace_ordering_tests {
                 reason: ContextResumeUnavailableReason::NoTarget,
             },
             acp_worker_state: crate::acp::supervisor::AcpWorkerState::Absent,
+            rate_limit: None,
+            rate_limit_auto_resume: None,
             queued_prompts: Vec::new(),
             acp_capable: false,
             acp_session_id: None,

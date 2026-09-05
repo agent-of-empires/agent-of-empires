@@ -1,5 +1,6 @@
-//! On-demand install and resolution of the npm-distributed ACP adapters
-//! that aoe pins (`claude-agent-acp`, `codex-acp`, `pi-acp`).
+//! On-demand install and resolution of the bundled ACP adapters: the pinned
+//! npm ones (`claude-agent-acp`, `codex-acp`, `pi-acp`) and the in-tree
+//! `aoe-agent`.
 //!
 //! Mirrors the bundled-Node pattern in [`crate::acp::node`]: a pinned
 //! manifest is embedded in the binary and installed into the data dir by
@@ -30,6 +31,15 @@ pub struct BundledAdapter {
     pub binary: &'static str,
     package_json: &'static [u8],
     package_lock: &'static [u8],
+    /// In-tree sources written beside the manifest before `npm ci`, as
+    /// `(relative path, bytes)`. Empty for adapters that are pure npm
+    /// dependencies.
+    sources: &'static [(&'static str, &'static [u8])],
+    /// Entry script for an in-tree agent, run as `node
+    /// --experimental-strip-types <entry>` through a wrapper the install
+    /// writes at `node_modules/.bin/<binary>`, so resolution and the doctor
+    /// treat it like any other bundled adapter (#3553).
+    entry: Option<&'static str>,
 }
 
 pub const BUNDLED_ADAPTERS: &[BundledAdapter] = &[
@@ -39,16 +49,42 @@ pub const BUNDLED_ADAPTERS: &[BundledAdapter] = &[
         package_lock: include_bytes!(
             "../../acp-worker/adapters/claude-agent-acp/package-lock.json"
         ),
+        sources: &[],
+        entry: None,
     },
     BundledAdapter {
         binary: "codex-acp",
         package_json: include_bytes!("../../acp-worker/adapters/codex-acp/package.json"),
         package_lock: include_bytes!("../../acp-worker/adapters/codex-acp/package-lock.json"),
+        sources: &[],
+        entry: None,
     },
     BundledAdapter {
         binary: "pi-acp",
         package_json: include_bytes!("../../acp-worker/adapters/pi-acp/package.json"),
         package_lock: include_bytes!("../../acp-worker/adapters/pi-acp/package-lock.json"),
+        sources: &[],
+        entry: None,
+    },
+    BundledAdapter {
+        binary: crate::acp::install_hints::AOE_AGENT_BINARY,
+        package_json: include_bytes!("../../acp-worker/aoe-agent/package.json"),
+        package_lock: include_bytes!("../../acp-worker/aoe-agent/package-lock.json"),
+        sources: &[
+            (
+                "src/index.ts",
+                include_bytes!("../../acp-worker/aoe-agent/src/index.ts"),
+            ),
+            (
+                "src/toolKind.ts",
+                include_bytes!("../../acp-worker/aoe-agent/src/toolKind.ts"),
+            ),
+            (
+                "src/transcript.ts",
+                include_bytes!("../../acp-worker/aoe-agent/src/transcript.ts"),
+            ),
+        ],
+        entry: Some("src/index.ts"),
     },
 ];
 
@@ -75,6 +111,13 @@ pub enum AdapterError {
     NpmFailed(String),
     #[error("adapter binary `{0}` missing after install")]
     BinaryMissing(String),
+    #[error("`{adapter}` needs Node {major}.{minor} or newer to run its sources; found {found}")]
+    NodeTooOld {
+        adapter: String,
+        major: u32,
+        minor: u32,
+        found: String,
+    },
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -115,6 +158,20 @@ pub fn bundled_adapter_bin(app_dir: &Path, binary: &str) -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
+/// Digest of everything the install is built from, so a source edit
+/// reinstalls the same way a lock bump does.
+fn install_digest(adapter: &BundledAdapter) -> String {
+    let mut bytes: Vec<u8> = Vec::with_capacity(adapter.package_lock.len());
+    bytes.extend_from_slice(adapter.package_lock);
+    for (path, contents) in adapter.sources {
+        bytes.extend_from_slice(path.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(contents);
+        bytes.push(0);
+    }
+    sha256_hex(&bytes)
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -129,6 +186,32 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
+/// The Node an in-tree adapter would launch with, when it cannot run the
+/// adapter's sources: the version string, for the refusal message. `None`
+/// for npm adapters and for a Node that can.
+pub fn runtime_too_old_for(app_dir: &Path, binary: &str) -> Option<String> {
+    ships_sources(binary).then_some(())?;
+    let node = crate::acp::node::resolve_for("", app_dir, true).ok()?;
+    (!crate::acp::node::supports_strip_types(&node.version)).then_some(node.version)
+}
+
+/// Whether `binary` is an in-tree adapter that runs from TypeScript sources.
+pub fn ships_sources(binary: &str) -> bool {
+    lookup(binary).is_some_and(|a| !a.sources.is_empty())
+}
+
+/// An in-tree adapter (one that ships sources) whose installed copy no longer
+/// matches this binary's embedded sources. A spawn reinstalls it first; a
+/// resolution outside a spawn refuses it and the install hint names the
+/// reinstall (#3553).
+pub fn installed_copy_is_stale(app_dir: &Path, binary: &str) -> bool {
+    lookup(binary).is_some_and(|adapter| {
+        !adapter.sources.is_empty()
+            && bundled_adapter_bin(app_dir, binary).is_some()
+            && !installation_is_current(app_dir, binary)
+    })
+}
+
 /// True when a complete, current install of `binary` is present: the digest
 /// sidecar matches its embedded lockfile AND the binary exists. Drives both
 /// the skip-reinstall path and the upgrade-after-aoe-bump path.
@@ -136,7 +219,7 @@ pub fn installation_is_current(app_dir: &Path, binary: &str) -> bool {
     let Some(adapter) = lookup(binary) else {
         return false;
     };
-    let expected = sha256_hex(adapter.package_lock);
+    let expected = install_digest(adapter);
     let digest_ok = std::fs::read_to_string(adapter_dir(app_dir, binary).join(DIGEST_FILE))
         .map(|s| s.trim() == expected)
         .unwrap_or(false);
@@ -147,10 +230,23 @@ pub fn installation_is_current(app_dir: &Path, binary: &str) -> bool {
 /// npm. Idempotent: returns early when the current lockfile is already
 /// installed.
 pub fn install(app_dir: &Path, node: &ResolvedNode, binary: &str) -> Result<(), AdapterError> {
+    // One install at a time in this process: the staging dir is per pid,
+    // and spawns resumed in parallel after an upgrade would otherwise wipe
+    // each other's `npm ci`. A waiter re-checks currency under the lock.
+    static INSTALLING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _serialized = INSTALLING.lock().unwrap_or_else(|p| p.into_inner());
     let adapter = lookup(binary).ok_or_else(|| AdapterError::UnknownAdapter(binary.to_string()))?;
     if installation_is_current(app_dir, binary) {
         info!(target: "acp.adapters", adapter = binary, "already current; nothing to install");
         return Ok(());
+    }
+    if !adapter.sources.is_empty() && !crate::acp::node::supports_strip_types(&node.version) {
+        return Err(AdapterError::NodeTooOld {
+            adapter: binary.to_string(),
+            major: crate::acp::node::MIN_NODE_MAJOR,
+            minor: crate::acp::node::MIN_NODE_MINOR,
+            found: node.version.clone(),
+        });
     }
 
     let parent = bundled_adapters_dir(app_dir);
@@ -169,6 +265,13 @@ pub fn install(app_dir: &Path, node: &ResolvedNode, binary: &str) -> Result<(), 
 
     std::fs::write(tmp.join("package.json"), adapter.package_json)?;
     std::fs::write(tmp.join("package-lock.json"), adapter.package_lock)?;
+    for (path, contents) in adapter.sources {
+        let target = tmp.join(path);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(target, contents)?;
+    }
 
     let (program, args) =
         npm_ci_argv(node).ok_or_else(|| AdapterError::NpmUnavailable(node.path.clone()))?;
@@ -191,6 +294,9 @@ pub fn install(app_dir: &Path, node: &ResolvedNode, binary: &str) -> Result<(), 
         return Err(AdapterError::NpmFailed(status.to_string()));
     }
 
+    if let Some(entry) = adapter.entry {
+        write_entry_wrapper(&tmp, binary, entry)?;
+    }
     let produced = tmp.join("node_modules").join(".bin").join(binary);
     let produced = if cfg!(windows) {
         produced.with_extension("cmd")
@@ -206,11 +312,38 @@ pub fn install(app_dir: &Path, node: &ResolvedNode, binary: &str) -> Result<(), 
     // a matching digest behind.
     std::fs::write(
         tmp.join(DIGEST_FILE),
-        format!("{}\n", sha256_hex(adapter.package_lock)),
+        format!("{}\n", install_digest(adapter)),
     )?;
 
     publish(&tmp, &adapter_dir(app_dir, binary))?;
     info!(target: "acp.adapters", adapter = binary, "installed");
+    Ok(())
+}
+
+/// The launcher for an in-tree agent: `node --experimental-strip-types`
+/// on the entry script, with `node` taken from `PATH`, which the spawn
+/// prepends the resolved Node's directory to (`bundled_resolution`).
+fn write_entry_wrapper(install_dir: &Path, binary: &str, entry: &str) -> std::io::Result<()> {
+    let bin = install_dir.join("node_modules").join(".bin");
+    std::fs::create_dir_all(&bin)?;
+    if cfg!(windows) {
+        let script = format!(
+            "@echo off\r\nnode --experimental-strip-types \"%~dp0..\\..\\{}\" %*\r\n",
+            entry.replace('/', "\\")
+        );
+        std::fs::write(bin.join(binary).with_extension("cmd"), script)?;
+        return Ok(());
+    }
+    let path = bin.join(binary);
+    let script = format!(
+        "#!/bin/sh\nexec node --experimental-strip-types \"$(dirname \"$0\")/../../{entry}\" \"$@\"\n"
+    );
+    std::fs::write(&path, script)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+    }
     Ok(())
 }
 
@@ -255,7 +388,8 @@ pub fn npm_ci_argv(node: &ResolvedNode) -> Option<(PathBuf, Vec<String>)> {
 /// keeps its open file descriptors, but Node resolves a lazy `require()`
 /// against the absolute `__dirname` that the rename just invalidated, so a
 /// running adapter can fail on its next deferred import. Acceptable for an
-/// explicit `doctor --fix`, and the reason we do not install implicitly.
+/// explicit `doctor --fix`; the spawn-time reinstall of a stale in-tree
+/// adapter runs only while no runner of that adapter is alive.
 fn publish(tmp: &Path, final_dir: &Path) -> std::io::Result<()> {
     if !final_dir.exists() {
         return std::fs::rename(tmp, final_dir);
@@ -336,7 +470,7 @@ mod tests {
         let adapter = lookup(binary).unwrap();
         std::fs::write(
             adapter_dir(app_dir, binary).join(DIGEST_FILE),
-            format!("{}\n", sha256_hex(adapter.package_lock)),
+            format!("{}\n", install_digest(adapter)),
         )
         .unwrap();
     }

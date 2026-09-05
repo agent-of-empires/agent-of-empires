@@ -30,10 +30,12 @@
 //! `agent_capabilities.load_session = true` on the ACP `initialize`
 //! response, the supervisor stores the agent-assigned `session_id` on
 //! `Instance.acp_session_id` and uses `session/load` on
-//! subsequent spawns instead of `session/new`. If `session/load`
-//! fails, the stored id is cleared and a `SessionContextReset` event
-//! is published; the UI renders an amber callout in the transcript so
-//! the user knows prior turns are no longer in the model's context.
+//! subsequent spawns instead of `session/new`. If the agent no longer
+//! holds that session (`session/load` fails, or it rejects the first
+//! prompt on a resumed id), the stored id is cleared and a
+//! `SessionContextReset` event is published; the UI renders an amber
+//! callout in the transcript so the user knows prior turns are no longer
+//! in the model's context.
 //!
 //! ## Lifecycle
 //!
@@ -131,6 +133,22 @@ fn is_user_turn_boundary(ev: &Event) -> bool {
         ev,
         Event::UserPromptSent { .. } | Event::UserDiffCommentsPrompt { .. }
     )
+}
+
+/// A session parked on a provider rate limit. See `EventStore::rate_limit_park`.
+#[derive(Debug, Clone)]
+pub struct RateLimitPark {
+    /// The latest reported limit; `None` for a cap park whose `RateLimit`
+    /// row was pruned.
+    pub info: Option<RateLimitInfo>,
+    /// When the latest `RateLimit` was recorded (epoch ms), 0 when unknown.
+    pub recorded_at_ms: i64,
+    /// The redelivery cap already parked the session terminally; only a
+    /// queued prompt or a manual resume releases it.
+    pub cap_reached: bool,
+    /// When auto-resume last fired for this park, so a resume whose spawn
+    /// failed is retried on a schedule rather than every pass.
+    pub last_resume_attempt_ms: Option<i64>,
 }
 
 /// SQLite-backed structured view event log. One row per (session_id, seq).
@@ -676,6 +694,107 @@ impl EventStore {
         }
     }
 
+    /// The session's durable rate-limit park, if any: the latest `RateLimit`
+    /// event (or a terminal `Stopped { rate_limit_exhausted_retries }`) with
+    /// nothing after it that shows the session moved on, that is a prompt, an
+    /// agent switch, a worker that came back up (`AcpSessionAssigned`), or a
+    /// stop for any other reason. A failed resume's `AgentStartupError`, the
+    /// `RateLimitAutoResumed` breadcrumb and approvals leave it in place, so
+    /// a resume that failed is retried instead of silently disarmed (#3514).
+    pub fn rate_limit_park(&self, session_id: &str) -> Option<RateLimitPark> {
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let latest_rate_limit: Option<(i64, String, i64)> = conn
+            .query_row(
+                "SELECT seq, event_json, created_at FROM acp_events
+                 WHERE session_id = ?1 AND discriminant = 'RateLimit'
+                 ORDER BY seq DESC LIMIT 1",
+                params![session_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .unwrap_or_else(|e| {
+                warn!(target: "acp.event_store", "rate_limit_park query for {session_id}: {e}");
+                None
+            });
+        let (anchor_seq, info, recorded_at_ms) = match latest_rate_limit {
+            Some((seq, json, created_at)) => match serde_json::from_str::<Event>(&json) {
+                Ok(Event::RateLimit { info }) => (seq, Some(info), created_at),
+                _ => (seq, None, created_at),
+            },
+            // Retention may have pruned the `RateLimit` row while its stop
+            // survives; the stop still anchors a park, with no reset time.
+            None => conn
+                .query_row(
+                    "SELECT seq, created_at FROM acp_events
+                     WHERE session_id = ?1 AND discriminant = 'Stopped'
+                       AND json_extract(event_json, '$.Stopped.reason') = 'rate_limited'
+                     ORDER BY seq DESC LIMIT 1",
+                    params![session_id],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()
+                .unwrap_or(None)
+                .map_or((0, None, 0), |(seq, created_at)| (seq, None, created_at)),
+        };
+        let cap_seq: Option<i64> = conn
+            .query_row(
+                "SELECT MAX(seq) FROM acp_events
+                 WHERE session_id = ?1 AND seq > ?2 AND discriminant = 'Stopped'
+                   AND json_extract(event_json, '$.Stopped.reason') = ?3",
+                params![
+                    session_id,
+                    anchor_seq,
+                    crate::acp::state::RATE_LIMIT_EXHAUSTED_RETRIES_REASON
+                ],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .unwrap_or(None);
+        let park_seq = match (cap_seq, anchor_seq) {
+            (Some(cap), _) => cap,
+            (None, 0) => return None,
+            (None, anchor) => anchor,
+        };
+        let superseded: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM acp_events
+                   WHERE session_id = ?1 AND seq > ?2
+                     AND (discriminant IN ('UserPromptSent', 'UserDiffCommentsPrompt',
+                                           'AgentSwitched', 'AcpSessionAssigned')
+                       OR (discriminant = 'Stopped'
+                           AND json_extract(event_json, '$.Stopped.reason')
+                               NOT IN ('rate_limited', ?3))))",
+                params![
+                    session_id,
+                    park_seq,
+                    crate::acp::state::RATE_LIMIT_EXHAUSTED_RETRIES_REASON
+                ],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap_or(false);
+        if superseded {
+            return None;
+        }
+        let last_resume_attempt_ms: Option<i64> = conn
+            .query_row(
+                "SELECT MAX(created_at) FROM acp_events
+                 WHERE session_id = ?1 AND seq > ?2
+                   AND discriminant = 'RateLimitAutoResumed'",
+                params![session_id, anchor_seq],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .unwrap_or(None);
+        Some(RateLimitPark {
+            info,
+            recorded_at_ms,
+            cap_reached: cap_seq.is_some(),
+            last_resume_attempt_ms,
+        })
+    }
+
     /// Return the most recent unfired `WakeupScheduled` for `session_id`.
     /// "Pending" means the latest scheduled `at` is still in the future;
     /// the previous heuristic (any `UserPromptSent` with a higher seq
@@ -1026,56 +1145,6 @@ impl EventStore {
         collected
     }
 
-    /// Latest terminal-lifecycle event for `session_id`, used by the
-    /// rate-limit park callers to detect a `Stopped{rate_limited}` and
-    /// decide whether to auto-resume or hold the session parked.
-    ///
-    /// `RateLimitAutoResumed` is included deliberately: the rate-limit
-    /// auto-resume reconciler pass publishes it to supersede the terminal
-    /// `Stopped{rate_limited}`, so this query stops reporting the park and
-    /// the main resume loop falls through to a fresh spawn instead of
-    /// re-parking. A new status event added here also participates in
-    /// park supersession; keep that in mind before extending the set. See
-    /// #1722.
-    ///
-    /// This set intentionally EXCLUDES agent-transcript activity events
-    /// (`ThinkingStarted` / `AgentMessageChunk` / `ToolCallStarted`) so an
-    /// activity event that lands after a `Stopped{rate_limited}` cannot hide
-    /// the park from the resume logic. Status seeding wants the opposite and
-    /// uses `latest_seed_status_event` instead. See #2625.
-    pub fn latest_status_event(&self, session_id: &str) -> Option<Event> {
-        let conn = match self.conn.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        let json: Option<String> = conn
-            .query_row(
-                "SELECT event_json FROM acp_events
-                 WHERE session_id = ?1
-                   AND (json_extract(event_json, '$.UserPromptSent') IS NOT NULL
-                     OR json_extract(event_json, '$.ApprovalRequested') IS NOT NULL
-                     OR json_extract(event_json, '$.ApprovalResolved') IS NOT NULL
-                     OR json_extract(event_json, '$.ElicitationRequested') IS NOT NULL
-                     OR json_extract(event_json, '$.ElicitationResolved') IS NOT NULL
-                     OR json_extract(event_json, '$.Stopped') IS NOT NULL
-                     OR json_extract(event_json, '$.RateLimitAutoResumed') IS NOT NULL
-                     OR json_extract(event_json, '$.AgentStartupError') IS NOT NULL)
-                 ORDER BY seq DESC
-                 LIMIT 1",
-                params![session_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .unwrap_or_else(|e| {
-                warn!(
-                    target: "acp.event_store",
-                    "latest_status_event query for {session_id}: {e}"
-                );
-                None
-            });
-        json.and_then(|s| serde_json::from_str(&s).ok())
-    }
-
     /// Latest event for `session_id` that the sidebar status derivation
     /// cares about. Used at daemon startup (`seed_acp_statuses`) and on
     /// reattach to seed `Instance.status` from history: the in-memory status
@@ -1084,7 +1153,7 @@ impl EventStore {
     /// daemon died would render Idle until the next lifecycle event arrived.
     /// See #1103.
     ///
-    /// Unlike [`Self::latest_status_event`] this set ALSO matches the
+    /// Unlike the rate-limit park query this set ALSO matches the
     /// agent-transcript activity events (`ThinkingStarted` /
     /// `AgentMessageChunk` / `ToolCallStarted`). The live status path
     /// (`derive_acp_status`) maps those to `Running`, so a turn that the
@@ -4014,60 +4083,11 @@ mod tests {
         assert_eq!(store.highest_seq("s-1"), 2);
     }
 
-    /// `latest_status_event` returns the most recent lifecycle event the
-    /// sidebar status derivation cares about. Used by the startup
-    /// seeding pass (#1103) so a session that was mid-turn when the
-    /// previous daemon died renders Running on cold start.
-    #[test]
-    fn latest_status_event_returns_most_recent_lifecycle_event() {
-        let (_tmp, store) = open_store(1000);
-        store
-            .record(
-                "s-1",
-                1,
-                &Event::UserPromptSent {
-                    prompt_id: None,
-                    text: "hi".into(),
-                    attachments: Vec::new(),
-                },
-            )
-            .unwrap();
-        store.record("s-1", 2, &Event::ThinkingStarted).unwrap();
-        store.record("s-1", 3, &Event::ThinkingEnded).unwrap();
-        // Most recent matching event is the UserPromptSent at seq 1.
-        let latest = store.latest_status_event("s-1");
-        assert!(matches!(
-            latest,
-            Some(Event::UserPromptSent { text, .. }) if text == "hi"
-        ));
-
-        // Stopped at seq 4 takes over as the most recent lifecycle event.
-        store
-            .record(
-                "s-1",
-                4,
-                &Event::Stopped {
-                    reason: "prompt_complete".into(),
-                },
-            )
-            .unwrap();
-        let latest = store.latest_status_event("s-1");
-        assert!(matches!(latest, Some(Event::Stopped { reason }) if reason == "prompt_complete"));
-
-        // Session with no lifecycle events → None.
-        store.record("s-2", 1, &Event::ThinkingStarted).unwrap();
-        assert!(store.latest_status_event("s-2").is_none());
-
-        // Unknown session → None.
-        assert!(store.latest_status_event("nope").is_none());
-    }
-
     /// `latest_seed_status_event` also matches agent-transcript activity
     /// events, so a turn the agent resumed on its own after a terminal
     /// `Stopped{prompt_complete}` (no new `UserPromptSent`) seeds Running,
-    /// not a stale Idle, across a daemon restart. `latest_status_event`
-    /// keeps ignoring those activity events so rate-limit park detection is
-    /// unaffected. See #2625.
+    /// not a stale Idle, across a daemon restart. The rate-limit park query
+    /// keeps ignoring those activity events. See #2625.
     #[test]
     fn latest_seed_status_event_sees_activity_after_stopped() {
         let (_tmp, store) = open_store(1000);
@@ -4108,11 +4128,6 @@ mod tests {
             store.latest_seed_status_event("s-1"),
             Some(Event::AgentMessageChunk { text }) if text == "build done"
         ));
-        // Park detection still sees only the terminal Stopped.
-        assert!(matches!(
-            store.latest_status_event("s-1"),
-            Some(Event::Stopped { reason }) if reason == "prompt_complete"
-        ));
 
         // A `ThinkingStarted` alone (no other lifecycle event) seeds via the
         // activity set, whereas the narrow query returns None.
@@ -4121,16 +4136,147 @@ mod tests {
             store.latest_seed_status_event("s-2"),
             Some(Event::ThinkingStarted)
         ));
-        assert!(store.latest_status_event("s-2").is_none());
     }
 
-    /// A rate-limit park must not be hidden from `latest_status_event` by a
-    /// trailing activity event, or the auto-resume logic would try to resume
-    /// a quota-blocked session. `latest_seed_status_event` is free to move on
-    /// (the sidebar shows the resumed work), but the park query stays put.
-    /// See #1722, #2625.
+    /// The durable park (#1722, #2625, #3514): only a prompt, an agent switch
+    /// or a stop for another reason ends it. Trailing activity, a failed
+    /// resume's `AgentStartupError`, the auto-resume breadcrumb and approvals
+    /// leave it in place, so the reaper keeps its schedule instead of being
+    /// disarmed for the session's life. `latest_seed_status_event` is free to
+    /// move on (the sidebar shows the resumed work); the park query stays put.
     #[test]
-    fn latest_status_event_ignores_activity_after_rate_limit_park() {
+    fn rate_limit_park_survives_everything_but_a_real_continuation() {
+        let (_tmp, store) = open_store(1000);
+        let info = crate::acp::state::RateLimitInfo {
+            status: "limited".into(),
+            resets_at: None,
+            kind: "usage".into(),
+        };
+        let park = |store: &EventStore, id: &str| {
+            store
+                .record(id, 1, &Event::RateLimit { info: info.clone() })
+                .unwrap();
+            store
+                .record(
+                    id,
+                    2,
+                    &Event::Stopped {
+                        reason: "rate_limited".into(),
+                    },
+                )
+                .unwrap();
+        };
+        let cases: Vec<(&str, Vec<Event>, bool, bool)> = vec![
+            ("bare park", vec![], true, false),
+            (
+                "failed resume",
+                vec![
+                    Event::RateLimitAutoResumed {
+                        resets_at: chrono::Utc::now(),
+                        manual: false,
+                    },
+                    Event::AgentStartupError {
+                        message: "spawn failed".into(),
+                    },
+                ],
+                true,
+                false,
+            ),
+            (
+                "a second rate-limited stop",
+                vec![Event::Stopped {
+                    reason: "rate_limited".into(),
+                }],
+                true,
+                false,
+            ),
+            (
+                "prompt got through",
+                vec![Event::UserPromptSent {
+                    text: "again".into(),
+                    attachments: Vec::new(),
+                    prompt_id: None,
+                }],
+                false,
+                false,
+            ),
+            (
+                "agent switched",
+                vec![Event::AgentSwitched {
+                    from: "claude".into(),
+                    to: "codex".into(),
+                    reason: "rate_limited".into(),
+                }],
+                false,
+                false,
+            ),
+            (
+                "resumed with nothing to redeliver",
+                vec![
+                    Event::RateLimitAutoResumed {
+                        resets_at: chrono::Utc::now(),
+                        manual: true,
+                    },
+                    Event::AcpSessionAssigned {
+                        acp_session_id: "acp-2".into(),
+                    },
+                ],
+                false,
+                false,
+            ),
+            (
+                "user stopped",
+                vec![Event::Stopped {
+                    reason: "user_stopped".into(),
+                }],
+                false,
+                false,
+            ),
+            (
+                "cap reached",
+                vec![Event::Stopped {
+                    reason: crate::acp::state::RATE_LIMIT_EXHAUSTED_RETRIES_REASON.into(),
+                }],
+                true,
+                true,
+            ),
+        ];
+        for (i, (label, events, parked, cap)) in cases.into_iter().enumerate() {
+            let id = format!("s-{i}");
+            park(&store, &id);
+            for (n, event) in events.iter().enumerate() {
+                store.record(&id, 3 + n as u64, event).unwrap();
+            }
+            let got = store.rate_limit_park(&id);
+            assert_eq!(got.is_some(), parked, "{label}: parked");
+            if let Some(got) = got {
+                assert_eq!(got.cap_reached, cap, "{label}: cap");
+                assert!(got.info.is_some(), "{label}: carries the limit");
+                assert_eq!(
+                    got.last_resume_attempt_ms.is_some(),
+                    label == "failed resume",
+                    "{label}: resume attempt"
+                );
+            }
+        }
+
+        // A cap park whose RateLimit row is gone still reads as a cap park.
+        store
+            .record(
+                "s-cap-only",
+                1,
+                &Event::Stopped {
+                    reason: crate::acp::state::RATE_LIMIT_EXHAUSTED_RETRIES_REASON.into(),
+                },
+            )
+            .unwrap();
+        let cap_only = store.rate_limit_park("s-cap-only").expect("cap park");
+        assert!(cap_only.cap_reached && cap_only.info.is_none());
+        assert!(store.rate_limit_park("never-limited").is_none());
+    }
+
+    #[test]
+    fn seed_status_follows_activity_after_a_rate_limit_park() {
         let (_tmp, store) = open_store(1000);
         store
             .record(
@@ -4151,10 +4297,6 @@ mod tests {
             )
             .unwrap();
 
-        assert!(matches!(
-            store.latest_status_event("s-1"),
-            Some(Event::Stopped { reason }) if reason == "rate_limited"
-        ));
         assert!(matches!(
             store.latest_seed_status_event("s-1"),
             Some(Event::AgentMessageChunk { text }) if text == "trailing"
@@ -4185,24 +4327,30 @@ mod tests {
         let nonce_b = Nonce("bbbb".into());
         let nonce_c = Nonce("cccc".into());
         let approval_a = Approval {
+            choice_list: false,
             nonce: nonce_a.clone(),
             tool_call: tool_call.clone(),
             destructive: false,
             requested_at: Utc::now(),
+            options: Vec::new(),
             resolved: None,
         };
         let approval_b = Approval {
+            choice_list: false,
             nonce: nonce_b.clone(),
             tool_call: tool_call.clone(),
             destructive: false,
             requested_at: Utc::now(),
+            options: Vec::new(),
             resolved: None,
         };
         let approval_c = Approval {
+            choice_list: false,
             nonce: nonce_c.clone(),
             tool_call,
             destructive: false,
             requested_at: Utc::now(),
+            options: Vec::new(),
             resolved: None,
         };
         // A is requested and resolved. B and C are requested but never
@@ -4313,47 +4461,6 @@ mod tests {
         assert!(store.unresolved_elicitation_nonces("s-2").is_empty());
     }
 
-    /// `latest_status_event` must recognize elicitation lifecycle events,
-    /// so a session blocked on a pending elicitation re-derives to Waiting
-    /// on cold-start / attach instead of waiting for the next live event.
-    #[test]
-    fn latest_status_event_includes_elicitation_lifecycle() {
-        use crate::acp::approvals::Nonce;
-        use crate::acp::elicitations::ElicitationOutcome;
-
-        let (_tmp, store) = open_store(1000);
-        let nonce_a = Nonce::new();
-        store
-            .record(
-                "s-1",
-                1,
-                &Event::ElicitationRequested {
-                    elicitation: orphan_test_elicitation(&nonce_a),
-                },
-            )
-            .unwrap();
-        assert!(matches!(
-            store.latest_status_event("s-1"),
-            Some(Event::ElicitationRequested { .. })
-        ));
-
-        store
-            .record(
-                "s-1",
-                2,
-                &Event::ElicitationResolved {
-                    nonce: nonce_a,
-                    outcome: ElicitationOutcome::Accepted,
-                    answers: Vec::new(),
-                },
-            )
-            .unwrap();
-        assert!(matches!(
-            store.latest_status_event("s-1"),
-            Some(Event::ElicitationResolved { .. })
-        ));
-    }
-
     fn rate_limit_event(secs_until_reset: i64) -> Event {
         Event::RateLimit {
             info: RateLimitInfo {
@@ -4388,46 +4495,6 @@ mod tests {
         );
         // A session with no rate-limit event returns None.
         assert!(store.latest_rate_limit_event("s-2").is_none());
-    }
-
-    #[test]
-    fn rate_limit_auto_resumed_supersedes_stopped_in_latest_status() {
-        let (_tmp, store) = open_store(1000);
-        store.record("s-1", 1, &rate_limit_event(60)).unwrap();
-        store
-            .record(
-                "s-1",
-                2,
-                &Event::Stopped {
-                    reason: "rate_limited".into(),
-                },
-            )
-            .unwrap();
-        // While parked, the latest status is the rate-limit Stopped.
-        assert!(matches!(
-            store.latest_status_event("s-1"),
-            Some(Event::Stopped { reason }) if reason == "rate_limited"
-        ));
-        // The auto-resume breadcrumb must become the latest status event so
-        // the reconciler's resume loop stops seeing the park. See #1722.
-        let resets_at = Utc::now();
-        store
-            .record(
-                "s-1",
-                3,
-                &Event::RateLimitAutoResumed {
-                    resets_at,
-                    manual: false,
-                },
-            )
-            .unwrap();
-        assert!(
-            matches!(
-                store.latest_status_event("s-1"),
-                Some(Event::RateLimitAutoResumed { .. })
-            ),
-            "RateLimitAutoResumed must supersede Stopped{{rate_limited}}"
-        );
     }
 
     // #3688: the redelivery streak is what bounds auto-resume. One table

@@ -3,7 +3,7 @@
 
 use crate::acp::agent_compat::{self, ExpectedAgent};
 use crate::acp::state::{Event, ModeInfo, StartupErrorDetail};
-use crate::acp::{agent_profiles, control_protocol, mcp_config};
+use crate::acp::{agent_profiles, mcp_config};
 use agent_client_protocol::schema::v1::{
     CancelNotification, ContentBlock, CreateElicitationRequest, CreateElicitationResponse,
     CreateTerminalRequest, CreateTerminalResponse, ForkSessionRequest, ForkSessionResponse,
@@ -34,7 +34,9 @@ use super::config_options::{
 };
 use super::control::{establish_session_v2, prompt_outcome_to_response, DaemonControlClient};
 use super::delete::handle_delete_session_cmd;
-use super::errors::{acp_internal_error, AcpError, IncompatibleAgentError};
+use super::errors::{
+    acp_internal_error, is_unsupported_session_error, AcpError, IncompatibleAgentError,
+};
 use super::fs_handlers::{handle_read_text_file, handle_write_text_file};
 use super::handshake::{build_initialize_request, should_fork};
 use super::lifecycle::{
@@ -287,6 +289,11 @@ pub(super) async fn run_connection_task<W, R>(
     // hit twice. Stale entries are filtered by reset-in-the-future at read
     // time instead. #3028, #3152.
     let last_rate_limit_rejections = Arc::new(std::sync::Mutex::new(HashMap::<String, i64>::new()));
+    // Set when a rejected first prompt on a stored session already emitted
+    // `SessionContextReset`: the connection then ends on a soft stop that the
+    // respawn recovers from, not on a startup error (#3560).
+    let context_reset_emitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let context_reset_emitted_for_block = context_reset_emitted.clone();
     // In-flight tool calls for the between-prompt (agent-initiated) path,
     // keyed by tool_call_id -> the `run_in_background` flag observed at
     // ToolStarted. Mirrors the per-prompt SilentOrphanWatchdog's
@@ -915,6 +922,10 @@ pub(super) async fn run_connection_task<W, R>(
             // fresh id from its `session/new` so every later
             // `session/prompt` / cancel / mode switch addresses the new
             // conversation.
+            // Whether the session id in use came from storage (a mid-turn
+            // resume, or a `session/load` of the stored id): only then is a
+            // first-prompt rejection the agent having dropped that session.
+            let mut session_from_storage = matches!(mode, ConnectMode::Resume { .. });
             let mut acp_session_id: SessionId = match mode {
                 ConnectMode::Resume {
                     acp_session_id: stored,
@@ -1154,6 +1165,7 @@ pub(super) async fn run_connection_task<W, R>(
                             };
                             match load_result {
                                 Ok(resp) => {
+                                    session_from_storage = true;
                                     info!(
                                         target: "acp.protocol",
                                         session = %session_label,
@@ -1761,18 +1773,9 @@ pub(super) async fn run_connection_task<W, R>(
                                 blocks,
                             )) {
                                 Ok(params) => {
-                                    let rx = control.prompt(params).await;
+                                    let control = Arc::clone(control);
                                     Box::pin(async move {
-                                        match rx.await {
-                                            Ok(outcome) => prompt_outcome_to_response(outcome),
-                                            // Control channel closed before
-                                            // completion: end the turn
-                                            // cleanly; the dying connection
-                                            // surfaces the underlying failure.
-                                            Err(_) => prompt_outcome_to_response(
-                                                control_protocol::PromptOutcome::Aborted,
-                                            ),
-                                        }
+                                        prompt_outcome_to_response(control.prompt(params).await)
                                     })
                                 }
                                 Err(e) => Box::pin(async move {
@@ -1964,6 +1967,32 @@ pub(super) async fn run_connection_task<W, R>(
                                                 rate_limited = true;
                                                 shutdown = true;
                                                 break;
+                                            }
+                                            // A resumed worker reuses the stored
+                                            // acp_session_id without session/load; an
+                                            // agent that dropped that session rejects
+                                            // the first prompt. Reset the context so
+                                            // the respawn opens a fresh session/new
+                                            // (the transcript is preserved for replay)
+                                            // instead of terminating the runner (#3560).
+                                            if this_prompt_epoch == 1
+                                                && session_from_storage
+                                                && is_unsupported_session_error(&e)
+                                            {
+                                                warn!(
+                                                    target: "acp.protocol",
+                                                    session = %session_label,
+                                                    "resumed ACP session rejected; resetting context so the respawn starts fresh: {e}"
+                                                );
+                                                let _ = event_tx_for_block
+                                                    .send(Event::SessionContextReset {
+                                                        reason: format!(
+                                                            "resumed session no longer available: {e}"
+                                                        ),
+                                                    })
+                                                    .await;
+                                                context_reset_emitted_for_block
+                                                    .store(true, Ordering::Relaxed);
                                             }
                                             return Err(e);
                                         }
@@ -2496,6 +2525,10 @@ pub(super) async fn run_connection_task<W, R>(
                             prompt_cancelled,
                             finished_after_orphan_cancel,
                         );
+                        // Claim the turn's terminal so a completion the runner
+                        // reports after this clean break is dropped, not
+                        // surfaced as a second `Stopped`.
+                        terminal_claim.claim();
                         let _ = event_tx_for_block
                             .send(Event::Stopped {
                                 reason: reason.into(),
@@ -2922,16 +2955,29 @@ pub(super) async fn run_connection_task<W, R>(
                 "ACP connection task ended with error: {:?}", e
             );
             let message = format!("ACP connection failed: {e}");
-            // If the handshake never completed, hand the failure back so
-            // `spawn()` can surface a typed error to the caller; otherwise
-            // publish a synthetic event so the UI can show a remediation
-            // hint instead of a silent dead session.
-            if let Some(tx) = ready_tx.lock().await.take() {
-                let _ = tx.send(Err(AcpError::Spawn(message.clone())));
-            } else if let Some(info) = classify_rate_limit_from_message(
+            let rate_limit = classify_rate_limit_from_message(
                 &message,
                 captured_rate_limit_resets_at(&last_rate_limit_rejections, chrono::Utc::now()),
-            ) {
+            );
+            if let Some(tx) = ready_tx.lock().await.take() {
+                // A limit hit during the handshake is still a rate limit:
+                // fail the spawn with the typed error so the supervisor
+                // parks the session instead of burning respawn budget on a
+                // generic startup error (#3514).
+                let err = match rate_limit {
+                    Some(info) => {
+                        info!(
+                            target: "acp.protocol",
+                            session = %session_label_for_log,
+                            resets_at = ?info.resets_at,
+                            "handshake failed on rate_limit; failing spawn as rate-limited"
+                        );
+                        AcpError::RateLimited(Box::new(info))
+                    }
+                    None => AcpError::Spawn(message.clone()),
+                };
+                let _ = tx.send(Err(err));
+            } else if let Some(info) = rate_limit {
                 // Defensive: rate-limit can also surface from paths the
                 // prompt arm doesn't cover (handshake-time, mid-handshake
                 // request). Treat it as a parked terminal state instead
@@ -2947,6 +2993,17 @@ pub(super) async fn run_connection_task<W, R>(
                 let _ = event_tx
                     .send(Event::Stopped {
                         reason: "rate_limited".into(),
+                    })
+                    .await;
+            } else if context_reset_emitted.load(Ordering::Relaxed) {
+                // The respawn opens a fresh session; the reset already told
+                // the user why, so end the turn without a startup error. Its
+                // own reason keeps the drain task from mistaking a driven
+                // `/reset`, which also stops the turn as `session_reset`
+                // and keeps the connection, for this terminal one.
+                let _ = event_tx
+                    .send(Event::Stopped {
+                        reason: "stored_session_rejected".into(),
                     })
                     .await;
             } else {

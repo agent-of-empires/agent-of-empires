@@ -245,6 +245,7 @@ mod tests {
     #[test]
     fn a_repeated_seq_is_not_folded_twice() {
         let approval = |nonce: &str| crate::acp::approvals::Approval {
+            choice_list: false,
             nonce: crate::acp::approvals::Nonce(nonce.to_string()),
             tool_call: crate::acp::state::ToolCall {
                 id: "tc-1".into(),
@@ -258,6 +259,7 @@ mod tests {
             },
             destructive: false,
             requested_at: chrono::Utc::now(),
+            options: Vec::new(),
             resolved: None,
         };
         let cache = ControlStateCache::new();

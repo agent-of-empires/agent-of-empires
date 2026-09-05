@@ -17,8 +17,15 @@ pub(super) struct PendingResponder {
 }
 
 pub(super) enum PendingResolver {
-    /// `session/request_permission` awaiting allow/deny.
-    Approval(oneshot::Sender<ApprovalResolutionMessage>),
+    /// `session/request_permission` awaiting allow/deny. `option_ids` are
+    /// the agent's options, so an answer naming an unknown one, or none at
+    /// all for a question (`choice_list`), is refused while the request
+    /// stays pending (#3741).
+    Approval {
+        option_ids: Vec<String>,
+        choice_list: bool,
+        resolver: oneshot::Sender<ApprovalResolutionMessage>,
+    },
     /// `elicitation/create` awaiting an accept/decline/cancel answer. The
     /// parsed form is kept so `resolve_elicitation` can validate the
     /// submitted answer BEFORE consuming the resolver: a validation
@@ -35,7 +42,12 @@ pub(super) enum PendingResolver {
 /// Message sent over the resolver oneshot to unblock the parked
 /// `on_receive_request` callback.
 pub(super) enum ApprovalResolutionMessage {
-    Decision { decision: ApprovalDecision },
+    Decision {
+        decision: ApprovalDecision,
+        /// An option the client picked by id (a choice list, #3741). Wins
+        /// over kind matching when it names one of the request's options.
+        option_id: Option<String>,
+    },
     Cancelled,
 }
 

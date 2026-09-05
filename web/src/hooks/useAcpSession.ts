@@ -42,7 +42,6 @@ import {
   STATE_TTL_MS,
   clearQueueCount,
   setQueueCount,
-  setRateLimit,
   type PersistedEntry,
 } from "../lib/acpStateStorage";
 import { getToken } from "../lib/token";
@@ -223,7 +222,6 @@ function persistState(sessionId: string, state: AcpState): void {
   } satisfies PersistedEntry);
   if (safeSetItem(key, body)) {
     setQueueCount(sessionId, state.queuedPrompts.length);
-    setRateLimit(sessionId, state.rateLimit);
     return;
   }
   // Storage write failed (likely QuotaExceeded). Evict a single oldest
@@ -233,7 +231,6 @@ function persistState(sessionId: string, state: AcpState): void {
   if (!evictOldestPersistedAcpState(key)) return;
   if (safeSetItem(key, body)) {
     setQueueCount(sessionId, state.queuedPrompts.length);
-    setRateLimit(sessionId, state.rateLimit);
   }
 }
 
@@ -933,7 +930,7 @@ export function useAcpSession(
    *  When not `"running"`, the drain effect parks queued prompts so they
    *  don't dispatch into a worker that isn't online yet. Defaults to
    *  `"running"` so non-structured view / pre-#1088 call sites keep working. */
-  workerState: "absent" | "resuming" | "running" = "running",
+  workerState: "absent" | "resuming" | "running" | "stopping" = "running",
   /** RFC3339 archived-at, or null. `sendPrompt` clears this server-side
    *  (via PATCH /api/sessions/{id}/archive) before enqueueing so the
    *  reconciler stops skipping the session and respawns the worker.
@@ -1668,15 +1665,17 @@ export function useAcpSession(
   }, [sessionId, fetchReplay, clearRetryTimers]);
 
   const resolveApproval = useCallback(
-    async (nonce: string, decision: ApprovalDecision) => {
-      if (!sessionId) return;
+    async (nonce: string, decision: ApprovalDecision, optionId?: string): Promise<boolean> => {
+      if (!sessionId) return false;
       try {
         const res = await fetch(
           `/api/sessions/${encodeURIComponent(sessionId)}/acp/approvals/${encodeURIComponent(nonce)}`,
           {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ decision }),
+            // `option_id` names a choice-list answer (#3741); undefined is
+            // dropped by JSON.stringify so the trio keeps its old body.
+            body: JSON.stringify({ decision, option_id: optionId }),
           },
         );
         const detail = res.ok ? "" : await safeText(res);
@@ -1690,14 +1689,16 @@ export function useAcpSession(
           // strand the card. A session-gone 404 (different body) is a real
           // failure and surfaces an error. See #1821.
           dispatch({ kind: "approval_resolved_locally", nonce });
-        } else {
-          dispatch({ kind: "error", message: outcome.message });
+          return true;
         }
+        dispatch({ kind: "error", message: outcome.message });
+        return false;
       } catch (e) {
         dispatch({
           kind: "error",
           message: `Network error resolving approval: ${describeError(e)}`,
         });
+        return false;
       }
     },
     [sessionId],

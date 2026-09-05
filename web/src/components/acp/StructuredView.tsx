@@ -47,7 +47,7 @@ import { SwitchAgentModal } from "./SwitchAgentModal";
 import { Markdown } from "./Markdown";
 import { isQueuedPromptLong, queuedStripLayout } from "./queuedPromptsLayout";
 import { StartupErrorScreen } from "./StartupErrorScreen";
-import { pickWorkerStoppedVariant } from "./workerStoppedBanner";
+import { pickWorkerStoppedVariant, showWorkerStoppingBanner } from "./workerStoppedBanner";
 import { BackgroundAgentsContext } from "./backgroundAgentsContext";
 import { AsyncSubagentCard, SubagentCard, ToolCard, ToolGroupCard, TodoGroupCard } from "./ToolCards";
 import { DiffCommentsUserCard } from "../diff/comments/DiffCommentsUserCard";
@@ -93,7 +93,11 @@ interface Props {
   /** Structured view worker lifecycle pulled from `SessionResponse.acp_worker_state`
    *  (REST-poll-driven, ~3s cadence). Drives the `WorkerResumingBanner`
    *  while the reconciler is mid-spawn/attach. See #1088. */
-  acpWorkerState: "absent" | "resuming" | "running";
+  acpWorkerState: "absent" | "resuming" | "running" | "stopping";
+  /** Whether `[acp] rate_limit_auto_resume` is on for this session's
+   *  profile, from `SessionResponse.rate_limit_auto_resume`. The rate-limit
+   *  notice says whether the park ends by itself (#3514). */
+  rateLimitAutoResume?: boolean;
   /** Session's `tool` registry key (claude / codex / opencode / gemini
    *  / etc.). Resolves the active AgentProfile that drives card
    *  dispatch and claude-specific capability gates. */
@@ -162,6 +166,7 @@ export function StructuredView(props: Props) {
   const {
     sessionId,
     acpWorkerState,
+    rateLimitAutoResume,
     tool,
     acpAgent,
     clearAliases,
@@ -200,6 +205,7 @@ export function StructuredView(props: Props) {
                 <AcpChrome
                   sessionId={sessionId}
                   acpWorkerState={acpWorkerState}
+                  rateLimitAutoResume={rateLimitAutoResume}
                   acpAgent={acpAgent}
                   showClearedTurns={showClearedTurns}
                   onToggleClearedTurns={() => setShowClearedTurns((v) => !v)}
@@ -286,6 +292,7 @@ export function StructuredViewRoot({ children }: { children: React.ReactNode }) 
 function AcpChrome({
   sessionId,
   acpWorkerState,
+  rateLimitAutoResume,
   acpAgent,
   showClearedTurns,
   onToggleClearedTurns,
@@ -329,7 +336,8 @@ function AcpChrome({
   isSandboxed,
 }: AcpContext & {
   sessionId: string;
-  acpWorkerState: "absent" | "resuming" | "running";
+  acpWorkerState: "absent" | "resuming" | "running" | "stopping";
+  rateLimitAutoResume?: boolean;
   acpAgent: string | null;
   showClearedTurns: boolean;
   onToggleClearedTurns: () => void;
@@ -718,6 +726,7 @@ function AcpChrome({
               status={status}
               lagged={state.lagged}
               rateLimit={state.rateLimit}
+              rateLimitAutoResume={rateLimitAutoResume}
               rateLimitRetriesExhausted={state.rateLimitRetriesExhausted}
               hasEverOpened={hasEverOpened}
               reconnecting={reconnecting}
@@ -742,6 +751,7 @@ function AcpChrome({
           trashedAt,
           archivedAt,
           snoozedUntil,
+          workerStopping: acpWorkerState === "stopping",
         });
         if (variant === "trashed") {
           return <TrashedWorkerStoppedBanner sessionId={sessionId} onRestore={onRestore} />;
@@ -765,6 +775,7 @@ function AcpChrome({
         !state.workerStopped &&
         !state.workerRestarting &&
         (state.lastSeq === 0 ? <SpawningBanner /> : <WorkerResumingBanner />)}
+      {showWorkerStoppingBanner({ acpWorkerState, startupError: state.startupError }) && <WorkerStoppingBanner />}
       {state.nextWakeupAt &&
         !state.turnActive &&
         !state.startupError &&
@@ -1696,10 +1707,15 @@ function PendingApproval({
   onResolve,
 }: {
   approval: Approval;
-  onResolve: (nonce: string, decision: ApprovalDecision) => Promise<void>;
+  onResolve: (nonce: string, decision: ApprovalDecision, optionId?: string) => Promise<boolean | void>;
 }) {
   // ApprovalCard owns its own chrome (matches the tool-card style).
-  return <ApprovalCard approval={approval} onResolve={(decision) => onResolve(approval.nonce, decision)} />;
+  return (
+    <ApprovalCard
+      approval={approval}
+      onResolve={(decision, optionId) => onResolve(approval.nonce, decision, optionId)}
+    />
+  );
 }
 
 /* ── System notices ──────────────────────────────────────────────── */
@@ -1753,6 +1769,7 @@ export function SystemNotices({
   status,
   lagged,
   rateLimit,
+  rateLimitAutoResume,
   rateLimitRetriesExhausted,
   hasEverOpened,
   reconnecting,
@@ -1768,6 +1785,9 @@ export function SystemNotices({
   status: AcpContext["status"];
   lagged: boolean;
   rateLimit: AcpState["rateLimit"];
+  /** Whether auto-resume is armed for the session's profile; omitted when
+   *  the caller does not know, in which case nothing is claimed. */
+  rateLimitAutoResume?: boolean;
   rateLimitRetriesExhausted: boolean;
   hasEverOpened: boolean;
   reconnecting: boolean;
@@ -1833,6 +1853,16 @@ export function SystemNotices({
           ? `Rate-limited (${rateLimit.kind}); resets at ${reset.toLocaleTimeString()}.`
           : `Rate-limited (${rateLimit.kind}); ${rateLimitWording(rateLimit.status)}`,
     });
+    // Say whether the park ends by itself: the same banner with the setting
+    // off used to read as "AoE is broken" rather than "as configured" (#3514).
+    if (rateLimitAutoResume === true && !rateLimitRetriesExhausted) {
+      messages.push({ kind: "muted", text: "Auto-resume is armed; the session resumes when the window clears." });
+    } else if (rateLimitAutoResume === false) {
+      messages.push({
+        kind: "muted",
+        text: "Auto-resume is off for this profile; use Resume now, or enable acp.rate_limit_auto_resume.",
+      });
+    }
   }
   if (rateLimitRetriesExhausted) {
     messages.push({
@@ -1975,6 +2005,18 @@ function WorkerResumingBanner() {
         Resuming structured view worker… cached transcript still available. Queued prompts will send once the agent is
         back online.
       </span>
+    </div>
+  );
+}
+
+/** Shown while `SessionResponse.acp_worker_state === "stopping"`: the
+ *  daemon has signalled the worker but has not proven it gone. Prompts are
+ *  held and resumes refused until it settles. See #3487. */
+export function WorkerStoppingBanner() {
+  return (
+    <div className="flex items-center gap-2 border-b border-status-warning/30 bg-status-warning/10 px-4 py-2 text-xs text-status-warning">
+      <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-status-warning" aria-hidden />
+      <span>Stopping structured view worker… waiting for the agent process to exit before anything can resume.</span>
     </div>
   );
 }

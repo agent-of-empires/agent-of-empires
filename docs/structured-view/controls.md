@@ -21,7 +21,7 @@ Turning on `[session] yolo_mode_default` (or the wizard's "Auto-approve actions"
 
 ## Approvals
 
-When the agent wants to run a tool that needs approval, the structured view shows a card:
+When the agent wants to run a tool that needs approval, the structured view shows a card. An agent that asks a multiple-choice question through the same channel (pi's `ask_user_question`) gets a card listing its options instead of Allow / Always / Deny; the answer is the option you pick, and Dismiss cancels the question.
 
 - **Benign tools** (read, search, list): single tap.
 - **Destructive tools** (`rm -rf`, `git push --force`, writes to system paths): long-press 800ms with a confirmation ring; single tap is reserved for deny.

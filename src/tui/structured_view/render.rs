@@ -155,7 +155,7 @@ fn render_choice_picker(
 /// while `render` recomputes it per frame.
 pub(super) fn compute_layout(area: Rect, state: &StructuredViewState) -> ViewLayout {
     let queue_height = queued_strip_height(state);
-    let approval_height = u16::from(!state.transcript.pending_approvals.is_empty()) * 3;
+    let approval_height = approval_shelf_height(state);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -267,6 +267,31 @@ fn render_queue(frame: &mut Frame, area: Rect, theme: &Theme, state: &Structured
     frame.render_widget(Paragraph::new(line), area);
 }
 
+/// Three rows for the framed actions line, plus one per listed choice when
+/// the selected request is a question (#3741).
+fn approval_shelf_height(state: &StructuredViewState) -> u16 {
+    if state.transcript.pending_approvals.is_empty() {
+        return 0;
+    }
+    let choices = state
+        .selected_approval
+        .as_deref()
+        .and_then(|selected| {
+            state
+                .transcript
+                .pending_approvals
+                .iter()
+                .find(|pending| pending.nonce == selected)
+        })
+        .filter(|pending| pending.choice_list)
+        .map(|pending| pending.options.len().min(MAX_LISTED_CHOICES))
+        .unwrap_or(0);
+    3 + choices as u16
+}
+
+/// Digits `1`..`9` answer a choice list, so only that many are listed.
+pub(super) const MAX_LISTED_CHOICES: usize = 9;
+
 fn render_approval_shelf(
     frame: &mut Frame,
     area: Rect,
@@ -317,16 +342,55 @@ fn render_approval_shelf(
         .border_style(Style::default().fg(accent));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let actions = approval_actions_line(theme, active);
-    frame.render_widget(Paragraph::new(actions), inner);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if row.choice_list {
+        for (i, (_, label)) in row.options.iter().take(MAX_LISTED_CHOICES).enumerate() {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{}", i + 1),
+                    Style::default()
+                        .fg(theme.running)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!(" {label}"), Style::default().fg(theme.text)),
+            ]));
+        }
+    }
+    lines.push(approval_actions_line(theme, active, row.choice_list));
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn approval_actions_line(theme: &Theme, active: bool) -> Line<'static> {
+fn approval_actions_line(theme: &Theme, active: bool, choice_list: bool) -> Line<'static> {
     if !active {
         return Line::from(Span::styled(
             "Enter to respond",
             Style::default().fg(theme.hint),
         ));
+    }
+    if choice_list {
+        return Line::from(vec![
+            Span::styled(
+                "1-9",
+                Style::default()
+                    .fg(theme.running)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" choose", Style::default().fg(theme.hint)),
+            Span::styled("  ·  ", Style::default().fg(theme.border)),
+            Span::styled(
+                "d",
+                Style::default()
+                    .fg(theme.error)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" dismiss", Style::default().fg(theme.hint)),
+            Span::styled("  ·  ", Style::default().fg(theme.border)),
+            Span::styled(
+                "Esc",
+                Style::default().fg(theme.hint).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" stop", Style::default().fg(theme.hint)),
+        ]);
     }
     Line::from(vec![
         Span::styled(
@@ -1965,7 +2029,7 @@ mod tests {
 
     #[test]
     fn approval_actions_read_as_key_hints_not_buttons() {
-        let line = approval_actions_line(&Theme::default(), true);
+        let line = approval_actions_line(&Theme::default(), true, false);
         let text: String = line
             .spans
             .iter()
@@ -2478,6 +2542,8 @@ mod tests {
             kind: "read".into(),
             args: r#"{"path":"src/lib.rs"}"#.into(),
             destructive: false,
+            options: Vec::new(),
+            choice_list: false,
         });
         t.server_rows = server_rows(&[crate::acp::state::Event::AgentMessageChunk {
             text: "working on it".into(),

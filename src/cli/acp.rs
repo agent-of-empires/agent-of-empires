@@ -29,11 +29,11 @@ pub enum AcpCommands {
         #[arg(long)]
         fix: bool,
         /// Adapter to install with --fix (repeatable). Defaults to
-        /// claude-agent-acp. One of: claude-agent-acp, codex-acp, pi-acp.
+        /// claude-agent-acp.
         #[arg(
             long,
             requires = "fix",
-            value_parser = ["claude-agent-acp", "codex-acp", "pi-acp"]
+            value_parser = clap::builder::PossibleValuesParser::new(bundled_adapter_names())
         )]
         adapter: Vec<String>,
         /// Install every pinned adapter with --fix instead of just the
@@ -115,18 +115,24 @@ pub enum AcpCommands {
         text: String,
     },
     /// Resolve a pending approval (default: allow). Use --always for a
-    /// session-scoped allow-list entry, --deny to refuse the request.
+    /// session-scoped allow-list entry, --deny to refuse the request, and
+    /// --option to answer a request that lists choices.
     Approve {
         /// Acp session id.
         session: String,
         /// Approval nonce, as printed in the pending-approval banner.
         nonce: String,
         /// Allow this kind of operation for the rest of the session.
-        #[arg(long, conflicts_with = "deny")]
+        #[arg(long, conflicts_with_all = ["deny", "option"])]
         always: bool,
         /// Refuse the request.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "option")]
         deny: bool,
+        /// Answer with this option id, from the request's option list. A
+        /// question answered without one is refused and lists its options;
+        /// --deny dismisses it.
+        #[arg(long, value_name = "ID")]
+        option: Option<String>,
     },
     /// Cancel the in-flight prompt for an agent session.
     Cancel {
@@ -198,7 +204,8 @@ pub async fn run(command: AcpCommands) -> Result<()> {
             nonce,
             always,
             deny,
-        } => approve(&session, &nonce, always, deny).await,
+            option,
+        } => approve(&session, &nonce, always, deny, option).await,
         AcpCommands::Cancel { session } => cancel(&session).await,
         AcpCommands::Tail { session, since } => tail(&session, since).await,
         AcpCommands::Attach { session } => attach(&session).await,
@@ -368,8 +375,15 @@ fn doctor_version_issue(
 /// reporter and the plain listing so the #1017 fallback semantics have
 /// one definition.
 fn bundled_copy_installed(binary: &str) -> bool {
-    crate::session::get_app_dir()
-        .is_ok_and(|app_dir| crate::acp::adapters::bundled_adapter_bin(&app_dir, binary).is_some())
+    crate::session::get_app_dir().is_ok_and(|app_dir| bundled_copy_usable(&app_dir, binary))
+}
+
+/// What spawn resolution would accept: a bundled copy that is present, not
+/// stale, and runnable by the Node that would launch it.
+fn bundled_copy_usable(app_dir: &std::path::Path, binary: &str) -> bool {
+    crate::acp::adapters::bundled_adapter_bin(app_dir, binary).is_some()
+        && !crate::acp::adapters::installed_copy_is_stale(app_dir, binary)
+        && crate::acp::adapters::runtime_too_old_for(app_dir, binary).is_none()
 }
 
 /// Resolve whether `gate`'s adapter would miss its version floor at
@@ -514,7 +528,17 @@ async fn doctor(json: bool, fix: bool, adapter: Vec<String>, all_adapters: bool)
                 "Cannot resolve the app data dir ({e}); skipping the Node and adapter install."
             ),
             Ok(app_dir) => {
-                let node = match node::resolve("", &app_dir) {
+                // A source adapter needs a Node that runs its TypeScript; a
+                // PATH copy below that floor is passed over for the bundled
+                // runtime, downloaded below if absent, so the install the
+                // hint names cannot refuse the Node this same command found.
+                let needs_sources =
+                    adapters_to_install(&adapter, all_adapters).is_ok_and(|wanted| {
+                        wanted
+                            .iter()
+                            .any(|b| crate::acp::adapters::ships_sources(b))
+                    });
+                let node = match node::resolve_for("", &app_dir, needs_sources) {
                     Ok(node) => {
                         println!("Node available: {} ({})", node.path.display(), node.version);
                         Some(node)
@@ -744,15 +768,28 @@ fn find_in_path(binary: &str) -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
+/// The `--adapter` values, kept equal to the bundled table so a newly
+/// bundled adapter is installable by name without a second list.
+fn bundled_adapter_names() -> Vec<&'static str> {
+    crate::acp::adapters::BUNDLED_ADAPTERS
+        .iter()
+        .map(|a| a.binary)
+        .collect()
+}
+
 pub(crate) fn command_present(command: &str) -> bool {
-    // Placeholders like `${aoe_data_dir}/acp-worker/...` resolve at
-    // runtime against the app data dir, so the literal string contains
-    // both `${` and `/`. Check the placeholder branch FIRST — otherwise
-    // the `/`-branch tries to stat a literal path containing `${...}`
-    // and reports "missing" for every placeholder-based agent (notably
-    // `aoe-agent`).
+    // A `${aoe_data_dir}` placeholder resolves the way the spawn resolves it,
+    // then the path is checked like any other (#3553).
+    if command.contains("${aoe_data_dir}") {
+        return crate::session::get_app_dir()
+            .map(|dir| {
+                std::path::Path::new(&command.replace("${aoe_data_dir}", &dir.to_string_lossy()))
+                    .exists()
+            })
+            .unwrap_or(false);
+    }
     if command.contains("${") {
-        true
+        false
     } else if command.contains('/') || command.contains('\\') {
         std::path::Path::new(command).exists()
     } else {
@@ -760,8 +797,7 @@ pub(crate) fn command_present(command: &str) -> bool {
         find_in_path(command).is_some()
             || crate::session::get_app_dir()
                 .ok()
-                .and_then(|app_dir| crate::acp::adapters::bundled_adapter_bin(&app_dir, command))
-                .is_some()
+                .is_some_and(|app_dir| bundled_copy_usable(&app_dir, command))
     }
 }
 
@@ -973,7 +1009,7 @@ fn restart(session: &str) -> Result<()> {
     // instead of `user_stopped` — the UI then renders a transient
     // "Restarting…" banner instead of the persistent "Stopped +
     // Reconnect" affordance.
-    worker_registry::mark_restart_pending(session);
+    worker_registry::mark_restart_pending(session, record.generation);
     worker_registry::delete(session).ok();
     // Group-SIGTERM so the agent's node/SDK grandchildren die with the
     // runner rather than orphaning under PID 1 before respawn (#1689).
@@ -1081,7 +1117,13 @@ async fn prompt(session: &str, text: &str) -> Result<()> {
     Ok(())
 }
 
-async fn approve(session: &str, nonce: &str, always: bool, deny: bool) -> Result<()> {
+async fn approve(
+    session: &str,
+    nonce: &str,
+    always: bool,
+    deny: bool,
+    option: Option<String>,
+) -> Result<()> {
     let decision = match (always, deny) {
         (_, true) => ApprovalDecisionWire::Deny,
         (true, false) => ApprovalDecisionWire::AllowAlways,
@@ -1089,11 +1131,15 @@ async fn approve(session: &str, nonce: &str, always: bool, deny: bool) -> Result
     };
     let endpoint = require_daemon().await?;
     let client = HttpClient::new(endpoint)?;
+    let label = match &option {
+        Some(id) => format!("{decision:?} (option {id})"),
+        None => format!("{decision:?}"),
+    };
     client
-        .resolve_approval(session, nonce, decision)
+        .resolve_approval(session, nonce, decision, option)
         .await
         .map_err(map_http)?;
-    println!("approval {nonce} -> {decision:?}");
+    println!("approval {nonce} -> {label}");
     Ok(())
 }
 

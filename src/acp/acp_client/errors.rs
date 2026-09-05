@@ -27,6 +27,12 @@ pub enum AcpError {
     /// `result_large_err`).
     #[error("incompatible agent: {0}")]
     IncompatibleAgent(Box<IncompatibleAgentError>),
+    /// The agent rejected the handshake with a provider rate limit. Carried
+    /// as a typed failure so the caller parks the session on
+    /// `RateLimit` + `Stopped { rate_limited }` instead of a generic startup
+    /// error that would burn the respawn budget against the same limit.
+    #[error("agent is rate-limited during startup: {}", .0.status)]
+    RateLimited(Box<crate::acp::state::RateLimitInfo>),
     #[error("transport error: {0}")]
     Transport(String),
     #[error("protocol violation: {0}")]
@@ -37,6 +43,10 @@ pub enum AcpError {
     NotRunning,
     #[error("no pending approval with that nonce")]
     UnknownNonce,
+    #[error("the request offers no option {0:?}")]
+    UnknownOption(String),
+    #[error("this request is a question; answer with one of its options: {}", .0.join(", "))]
+    UnansweredQuestion(Vec<String>),
     #[error("agent did not offer a {0:?} option")]
     NoMatchingOption(ApprovalDecision),
     /// A submitted elicitation answer failed server-side validation. The
@@ -129,9 +139,53 @@ pub(super) fn acp_error_from_value(error: serde_json::Value) -> agent_client_pro
         .unwrap_or_else(|_| acp_internal_error(format!("runner handshake failed: {error}")))
 }
 
+/// Whether a `session/prompt` rejection means the agent no longer holds
+/// the stored ACP session a resumed worker reused without `session/load`
+/// (OMP replies `Unsupported ACP session`). Deliberately a narrow message
+/// fingerprint: a false positive would turn an unrelated prompt failure
+/// into a context reset, a false negative leaves the runner terminating
+/// with no recovery (#3560).
+pub(crate) fn is_unsupported_session_error(err: &agent_client_protocol::Error) -> bool {
+    const PHRASES: &[&str] = &[
+        "unsupported acp session",
+        "unsupported session",
+        "unknown session",
+        "session not found",
+        "no such session",
+        "session does not exist",
+    ];
+    let msg = err.message.to_ascii_lowercase();
+    PHRASES.iter().any(|phrase| msg.contains(phrase))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_session_matches_only_stale_session_rejections() {
+        let classify = |m: &str| {
+            let mut err = agent_client_protocol::Error::internal_error();
+            err.message = m.into();
+            is_unsupported_session_error(&err)
+        };
+        let cases = [
+            ("Unsupported ACP session", true),
+            ("Unknown session 01a040bb", true),
+            ("session not found", true),
+            ("no such session: abc", true),
+            ("Session does not exist", true),
+            ("You've hit your limit", false),
+            ("transport closed", false),
+            ("unsupported model", false),
+            ("unknown tool", false),
+            ("Unsupported content block in session/prompt", false),
+            ("Method not found: session/prompt", false),
+        ];
+        for (msg, expected) in cases {
+            assert_eq!(classify(msg), expected, "{msg:?}");
+        }
+    }
 
     /// Belt-and-suspenders: even if the pre-flight raced (cwd vanishes
     /// between `cwd.exists()` and `Command::spawn`), the classifier turns

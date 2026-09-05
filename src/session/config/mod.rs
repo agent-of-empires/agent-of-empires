@@ -652,8 +652,7 @@ impl Default for AcpConfig {
     }
 }
 
-/// Built-in `acp.default_agent`. `aoe-agent` is not packaged yet (#3553), so
-/// the default has to be an adapter `aoe acp doctor --fix` can install.
+/// Built-in `acp.default_agent`.
 pub const DEFAULT_ACP_AGENT: &str = "claude-code";
 
 fn default_agent() -> String {

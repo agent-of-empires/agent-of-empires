@@ -12,13 +12,16 @@
 
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Check, ChevronDown, Shield, X } from "lucide-react";
-import type { Approval, ApprovalDecision } from "../../lib/acpTypes";
+import type { Approval, ApprovalDecision, ApprovalOption } from "../../lib/acpTypes";
+import { isChoiceList } from "../../lib/acpApprovals";
 import { useServerDown, OFFLINE_TITLE } from "../../lib/connectionState";
 import { hasArgsBody, humanizePermissionTitle, parseJsonObject, previewFromArgs } from "../../lib/acpArgs";
 
 interface Props {
   approval: Approval;
-  onResolve: (decision: ApprovalDecision) => Promise<void>;
+  /** Resolves `false` when the daemon refused the answer and the card
+   *  should roll back to let the user try again. */
+  onResolve: (decision: ApprovalDecision, optionId?: string) => Promise<boolean | void>;
 }
 
 const LONG_PRESS_MS = 800;
@@ -49,16 +52,18 @@ export function ApprovalCard({ approval, onResolve }: Props) {
   }, []);
 
   const submit = useCallback(
-    async (decision: ApprovalDecision) => {
+    async (decision: ApprovalDecision, optionId?: string) => {
       setPhase("submitting");
       try {
-        await onResolve(decision);
+        const ok = await onResolve(decision, optionId);
+        if (ok === false) setPhase("rolled-back");
       } catch {
         setPhase("rolled-back");
       }
     },
     [onResolve],
   );
+  const choices: ApprovalOption[] = isChoiceList(approval) ? (approval.options ?? []) : [];
 
   const startLongPress = () => {
     if (phase !== "pending") return;
@@ -142,12 +147,34 @@ export function ApprovalCard({ approval, onResolve }: Props) {
       {(expanded || showEmptyArgsState) && <ArgsView raw={raw} />}
 
       {phase === "rolled-back" && (
-        <p className="px-3 pt-2 text-rose-400 text-xs">Could not reach the server. Tap to retry.</p>
+        <p className="px-3 pt-2 text-rose-400 text-xs">The answer was not accepted. Tap to retry.</p>
       )}
       {offline && <p className="px-3 pt-2 text-status-error text-xs">{OFFLINE_TITLE}</p>}
 
+      {choices.length > 0 && (
+        <div className="flex flex-col gap-1.5 p-2" role="group" aria-label="Choose an answer">
+          {choices.map((option) => (
+            <button
+              key={option.option_id}
+              type="button"
+              className={[
+                "flex items-center gap-2 rounded-md border border-brand-700/40 bg-surface-800",
+                "px-3 py-2 text-left text-xs font-medium text-text-primary hover:bg-brand-700/20",
+                phase === "submitting" && "opacity-60 cursor-wait",
+              ]
+                .filter(Boolean)
+                .join(" ")}
+              disabled={offline || phase === "submitting"}
+              onClick={() => void submit("Allow", option.option_id)}
+            >
+              <Check className="h-3.5 w-3.5 shrink-0 text-brand-500" />
+              {option.name}
+            </button>
+          ))}
+        </div>
+      )}
       <div className="flex items-stretch gap-1.5 p-2">
-        {approval.destructive ? (
+        {choices.length > 0 ? null : approval.destructive ? (
           <button
             type="button"
             className={[
@@ -178,9 +205,9 @@ export function ApprovalCard({ approval, onResolve }: Props) {
               className={[
                 "flex flex-1 items-center justify-center gap-1.5",
                 "rounded-md text-white text-xs font-medium py-2 px-3",
-                phase === "pending" ? "bg-brand-600 hover:bg-brand-500" : "bg-brand-700 opacity-70 cursor-wait",
+                phase === "submitting" ? "bg-brand-700 opacity-70 cursor-wait" : "bg-brand-600 hover:bg-brand-500",
               ].join(" ")}
-              disabled={offline || phase !== "pending"}
+              disabled={offline || phase === "submitting"}
               onClick={() => void submit("Allow")}
             >
               <Check className="h-3.5 w-3.5" />
@@ -221,7 +248,7 @@ export function ApprovalCard({ approval, onResolve }: Props) {
           onClick={() => void submit("Deny")}
         >
           <X className="h-3.5 w-3.5" />
-          Deny
+          {choices.length > 0 ? "Dismiss" : "Deny"}
         </button>
       </div>
     </div>

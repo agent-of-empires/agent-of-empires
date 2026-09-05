@@ -569,9 +569,21 @@ async fn sessions_turn_send(
         // foreign session is refused before its disposition is computed, so
         // it cannot answer `agent_busy` for a session the caller may not see
         // (#3685).
+        // Ownership is checked before the wake so a foreign session is never
+        // touched. The wake clears an idle-dormant (or manually stopped)
+        // park the same way a user prompt does: a turn is intent to continue,
+        // so the host resumes rather than refusing (#3686).
+        deps.session_service
+            .admits_turn(&caller, &req.session_id)
+            .await
+            .map_err(|e| map_send_error(e.into()))?;
+        let woke_idle_dormant = deps
+            .session_service
+            .touch_and_wake_on_prompt(&req.session_id)
+            .await;
         let (_submission, dispatch) = deps
             .session_service
-            .begin_prompt_submission(&caller, &req.session_id, false)
+            .begin_prompt_submission(&caller, &req.session_id, woke_idle_dormant)
             .await
             .map_err(|e| map_send_error(e.into()))?;
         // A cold worker is not a refusal on this path: `send_turn` resumes it
@@ -588,8 +600,18 @@ async fn sessions_turn_send(
                 ));
             }
         }
+        // Unlike the user path, the pending initial turn is left alone: for
+        // a plugin session it may be the `sessions.create { initial_turn }`
+        // the worker has not delivered yet.
         deps.session_service
-            .send_turn(&caller, &req.session_id, &req.text, &[], false, None)
+            .send_turn(
+                &caller,
+                &req.session_id,
+                &req.text,
+                &[],
+                woke_idle_dormant,
+                None,
+            )
             .await
             .map_err(map_send_error)
     }
@@ -1042,6 +1064,54 @@ mod tests {
             .expect_err("a foreign session must be refused");
             assert_eq!(kind(&err), "not_owner", "{label}");
             assert_eq!(err.code, codes::FORBIDDEN, "{label}");
+        }
+    }
+
+    /// #3686: a parked plugin session is woken by a turn, not refused as
+    /// missing. The resume itself fails here (no real agent), which is a
+    /// worker error, never `session_not_found`.
+    #[tokio::test]
+    async fn turn_send_wakes_a_parked_session() {
+        type Park = (&'static str, fn(&mut Instance));
+        let parks: Vec<Park> = vec![
+            ("idle-dormant", |i| i.mark_idle_dormant()),
+            ("archived", |i| i.archived_at = Some(chrono::Utc::now())),
+            ("snoozed", |i| {
+                i.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::hours(1))
+            }),
+            ("stopped by the user, nothing to clear", |_| {}),
+        ];
+        for (label, park) in parks {
+            let mut parked = Instance::new("parked-owned", "/tmp/aoe-3686-plugin");
+            parked.id = "sess-3686".to_string();
+            parked.view = crate::session::View::Structured;
+            parked.agent_name = Some("aoe-no-such-agent-3686".to_string());
+            parked.created_by_plugin = Some("cron".to_string());
+            park(&mut parked);
+            let (deps, state, _dir) = test_deps_with_state(vec![parked]);
+            let ctx = ctx_with(&["session.prompt"]);
+
+            let result = dispatch(
+                &deps,
+                &ctx,
+                "sessions.turn.send",
+                &serde_json::json!({ "session_id": "sess-3686", "text": "wake up" }),
+            )
+            .await;
+            if let Err(err) = &result {
+                assert_ne!(
+                    kind(err),
+                    "session_not_found",
+                    "{label}: a parked session is resumed, not reported missing: {err:?}"
+                );
+            }
+            let instances = state.instances.read().await;
+            let inst = instances.iter().find(|i| i.id == "sess-3686").unwrap();
+            assert!(
+                !inst.is_idle_dormant() && !inst.is_archived() && !inst.is_snoozed(),
+                "{label}: the turn clears the park"
+            );
+            assert!(inst.last_accessed_at.is_some(), "{label}");
         }
     }
 

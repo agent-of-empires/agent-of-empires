@@ -1593,7 +1593,7 @@ Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 * `history` — Print the persisted transcript for an agent session
 * `status` — Print live status for an agent session: highest/lowest seq, and whether the on-disk retention window has truncated history
 * `prompt` — Send a prompt to an agent session's agent
-* `approve` — Resolve a pending approval (default: allow). Use --always for a session-scoped allow-list entry, --deny to refuse the request
+* `approve` — Resolve a pending approval (default: allow). Use --always for a session-scoped allow-list entry, --deny to refuse the request, and --option to answer a request that lists choices
 * `cancel` — Cancel the in-flight prompt for an agent session
 * `tail` — Stream the agent broadcast for a session to stdout as JSON lines (one frame per line). Press Ctrl-C to stop
 * `attach` — Open the TUI structured view directly for a known session id. Combine with `AOE_DAEMON_URL` (+ `AOE_DAEMON_TOKEN`) to attach across machines without going through the home session list
@@ -1611,9 +1611,9 @@ Verify the structured view can start: Node runtime, configured agents, provider 
 
 * `--json` — Emit machine-readable JSON instead of a human report
 * `--fix` — Attempt safe remediations: download the bundled Node runtime if none is present, then install the pinned npm ACP adapter into the data dir with that Node's own npm (no global install, no sudo). Installs claude-agent-acp by default; each adapter is a separate several-hundred-MB tree, so pick others with --adapter
-* `--adapter <ADAPTER>` — Adapter to install with --fix (repeatable). Defaults to claude-agent-acp. One of: claude-agent-acp, codex-acp, pi-acp
+* `--adapter <ADAPTER>` — Adapter to install with --fix (repeatable). Defaults to claude-agent-acp
 
-  Possible values: `claude-agent-acp`, `codex-acp`, `pi-acp`
+  Possible values: `claude-agent-acp`, `codex-acp`, `pi-acp`, `aoe-agent`
 
 * `--all-adapters` — Install every pinned adapter with --fix instead of just the default one
 
@@ -1733,7 +1733,7 @@ Send a prompt to an agent session's agent
 
 ## `aoe acp approve`
 
-Resolve a pending approval (default: allow). Use --always for a session-scoped allow-list entry, --deny to refuse the request
+Resolve a pending approval (default: allow). Use --always for a session-scoped allow-list entry, --deny to refuse the request, and --option to answer a request that lists choices
 
 **Usage:** `aoe acp approve [OPTIONS] <SESSION> <NONCE>`
 
@@ -1746,6 +1746,7 @@ Resolve a pending approval (default: allow). Use --always for a session-scoped a
 
 * `--always` — Allow this kind of operation for the rest of the session
 * `--deny` — Refuse the request
+* `--option <ID>` — Answer with this option id, from the request's option list. A question answered without one is refused and lists its options; --deny dismisses it
 
 
 

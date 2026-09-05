@@ -70,6 +70,17 @@ pub enum ApprovalDecision {
     Cancelled,
 }
 
+/// One option the agent offered on `session/request_permission`. ACP lets
+/// an option carry any label, so an adapter can ship a multiple-choice
+/// question as N `allow_once` options (pi-acp's `ask_user_question`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalOption {
+    pub option_id: String,
+    pub name: String,
+    /// ACP kind: `allow_once`, `allow_always`, `reject_once`, `reject_always`.
+    pub kind: String,
+}
+
 /// A pending or resolved approval for a tool call. Held in
 /// `AcpState::pending_approvals` until it is resolved through
 /// `apply_event(Event::ApprovalResolved { ... })`.
@@ -81,7 +92,28 @@ pub struct Approval {
     /// `git push --force`, etc.). Mobile UI requires long-press for these.
     pub destructive: bool,
     pub requested_at: DateTime<Utc>,
+    /// The agent's options, in the order it offered them. Empty for
+    /// approvals recorded before options were carried (#3741).
+    #[serde(default)]
+    pub options: Vec<ApprovalOption>,
+    /// Whether `options` are a question's choices rather than an allow/deny
+    /// vocabulary, decided once by [`is_choice_list`] so every client renders
+    /// the same card. False for approvals recorded before it was carried.
+    #[serde(default)]
+    pub choice_list: bool,
     pub resolved: Option<ResolvedApproval>,
+}
+
+/// Whether an agent's options are a question's choices rather than an
+/// allow/deny vocabulary: options of one kind, either more than two of them
+/// or under pi's `pi-ui-` tool-call id prefix (its yes/no confirm dialogs mix
+/// kinds and stay a trio). A client renders the labels and resolves with the
+/// chosen `option_id`; the fixed Allow/Always/Deny trio would otherwise answer
+/// with whichever option came first (#3741).
+pub fn is_choice_list(tool_call_id: &str, options: &[ApprovalOption]) -> bool {
+    let one_kind =
+        !options.is_empty() && options.windows(2).all(|pair| pair[0].kind == pair[1].kind);
+    one_kind && (options.len() > 2 || tool_call_id.starts_with("pi-ui-"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,6 +160,61 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(a.0.len(), NONCE_BYTES * 2);
         assert!(a.0.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn choice_list_is_many_options_of_one_kind_or_a_pi_question() {
+        let opt = |id: &str, kind: &str| ApprovalOption {
+            option_id: id.into(),
+            name: id.to_uppercase(),
+            kind: kind.into(),
+        };
+        let cases = [
+            (
+                "allow/deny pair",
+                "t1",
+                vec![opt("y", "allow_once"), opt("n", "reject_once")],
+                false,
+            ),
+            (
+                "allow/always/deny",
+                "t1",
+                vec![
+                    opt("y", "allow_once"),
+                    opt("a", "allow_always"),
+                    opt("n", "reject_once"),
+                ],
+                false,
+            ),
+            (
+                "four choices of one kind",
+                "t1",
+                vec![
+                    opt("alpha", "allow_once"),
+                    opt("bravo", "allow_once"),
+                    opt("charlie", "allow_once"),
+                    opt("delta", "allow_once"),
+                ],
+                true,
+            ),
+            (
+                "pi question with two choices",
+                "pi-ui-7",
+                vec![opt("a", "allow_once"), opt("b", "allow_once")],
+                true,
+            ),
+            (
+                "pi confirm dialog mixes kinds",
+                "pi-ui-8",
+                vec![opt("yes", "allow_once"), opt("no", "reject_once")],
+                false,
+            ),
+            ("pi id with no options", "pi-ui-7", vec![], false),
+            ("no options", "t1", vec![], false),
+        ];
+        for (label, tool_id, options, expected) in cases {
+            assert_eq!(is_choice_list(tool_id, &options), expected, "{label}");
+        }
     }
 
     #[test]

@@ -534,12 +534,16 @@ impl HttpClient {
         session_id: &str,
         nonce: &str,
         decision: ApprovalDecisionWire,
+        option_id: Option<String>,
     ) -> Result<(), HttpError> {
         let url = format!(
             "{}/api/sessions/{}/acp/approvals/{}",
             self.endpoint.base_url, session_id, nonce
         );
-        let body = ResolveApprovalRequest { decision };
+        let body = ResolveApprovalRequest {
+            decision,
+            option_id,
+        };
         let res = self.auth(self.http.post(&url)).json(&body).send().await?;
         let status = res.status();
         if status.is_success() {

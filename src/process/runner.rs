@@ -184,6 +184,10 @@ pub struct AcpRunnerArgs {
     /// profile, matching pre-persistence behavior.
     #[arg(long, default_value = "")]
     pub source_profile: String,
+    /// Lifecycle generation the daemon minted for this runner. Stamped on
+    /// the registry record and compared against the restart marker.
+    #[arg(long, default_value_t = 0)]
+    pub generation: u64,
     /// Agent program + args after `--`.
     #[arg(last = true, required = true)]
     pub agent_argv: Vec<String>,
@@ -287,7 +291,8 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         } else {
             Some(args.source_profile.clone())
         },
-    );
+    )
+    .with_generation(args.generation);
     if let Err(e) = worker_registry::save(&record).context("writing registry record") {
         let _ = std::fs::remove_file(&args.socket);
         return Err(e);
@@ -416,6 +421,7 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
             record_path,
             restart_marker,
             our_pid,
+            args.generation,
             Arc::clone(&detached_since),
             session_id.clone(),
             watchdog_tx,
@@ -557,6 +563,7 @@ async fn run_watchdog(
     record_path: PathBuf,
     restart_marker: PathBuf,
     own_pid: u32,
+    own_generation: u64,
     detached_since: Arc<DetachedSince>,
     session_id: String,
     tx: tokio::sync::oneshot::Sender<WatchdogShutdown>,
@@ -605,7 +612,9 @@ async fn run_watchdog(
                 // `aoe acp restart` deletes the record right before it
                 // SIGTERMs us; the marker tells us not to race that to a
                 // hard self-destruct.
-                if restart_marker.exists() {
+                if crate::process::worker::read_restart_marker(&restart_marker)
+                    == Some(own_generation)
+                {
                     missing = 0;
                     continue;
                 }

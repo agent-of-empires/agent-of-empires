@@ -903,3 +903,30 @@ describe("SessionRow color label (#2383)", () => {
     }
   });
 });
+
+describe("structured worker chips from the session payload (#3487, #3514)", () => {
+  it("shows the Stopping chip while the daemon proves the worker dead", () => {
+    render(
+      <Wrap>
+        <Row ws={workspace("w-stop", [session({ view: "structured", acp_worker_state: "stopping" })])} />
+      </Wrap>,
+    );
+    expect(screen.getByLabelText("Stopping")).not.toBeNull();
+  });
+
+  it("shows the rate-limited badge from the payload park, not browser state", () => {
+    render(
+      <Wrap>
+        <Row
+          ws={workspace("w-rl", [
+            session({
+              view: "structured",
+              rate_limit: { status: "limited", resets_at: "2099-01-01T00:00:00Z", kind: "usage" },
+            }),
+          ])}
+        />
+      </Wrap>,
+    );
+    expect(screen.getByTitle(/Rate-limited/)).not.toBeNull();
+  });
+});

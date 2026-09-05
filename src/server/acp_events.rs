@@ -1782,7 +1782,7 @@ mod tests {
         );
         assert_eq!(
             derive_acp_status(&Event::ApprovalRequested {
-                approval: build_approval(tool_call.clone()),
+                approval: build_approval(tool_call.clone(), Vec::new()),
             }),
             Some(StatusIntent::Set(Status::Waiting))
         );
@@ -2007,7 +2007,7 @@ mod tests {
         // monotone max persists it, so a phantom stamp here wiped
         // concurrent archives through merge_user_action_diff's touched
         // arm. Structured rows take real touches from user prompts
-        // (touch_on_prompt_and_wake_if_sunk), so the field stays gesture-only.
+        // (`SessionService::touch_and_wake_on_prompt`), so the field stays gesture-only.
         let mut inst = stopped_structured_instance();
         inst.status = Status::Idle;
         let user_touch = chrono::Utc::now() - chrono::Duration::seconds(60);

@@ -188,6 +188,18 @@ pub struct RateLimitInfo {
     pub kind: String,
 }
 
+impl RateLimitInfo {
+    /// A park whose reporting `RateLimit` event is gone (retention): still a
+    /// limit, with no reset time.
+    pub fn undated() -> Self {
+        Self {
+            status: "limited".into(),
+            resets_at: None,
+            kind: "rate_limit".into(),
+        }
+    }
+}
+
 /// Snapshot of the most recent ACP agent handoff. Stored on
 /// `AcpState` so reload/replay reflects the active backend without
 /// needing to walk the event log. Emitted by the `/acp/switch-agent`
@@ -1177,8 +1189,8 @@ pub enum Event {
     /// capabilities (`availableCommands`, `availableModes`, `plan`,
     /// `mode`) and cancels any open approvals; UI collapses rows above
     /// the divider behind a disclosure. Distinct from
-    /// `SessionContextReset` (which fires only on `session/load`
-    /// failure now) and `ConversationCompacted` because the
+    /// `SessionContextReset` (the agent no longer holds the stored
+    /// session) and `ConversationCompacted` because the
     /// user-experience contract differs: cleared is "the model has
     /// forgotten", reset is "the model has empty context", compacted
     /// is "the model has a summary". See #1101.
@@ -1354,7 +1366,10 @@ impl AcpState {
             // being respawned. Clear the rate-limit snapshot so a client
             // seeding state from the store (or the persistent reducer)
             // doesn't keep showing the parked banner after the resume.
-            Event::RateLimitAutoResumed { .. } => self.rate_limit = None,
+            // The park outlives the resume breadcrumb until the worker is
+            // back (`AcpSessionAssigned`), so a resume that fails to start
+            // keeps the park every surface reports (#3514).
+            Event::RateLimitAutoResumed { .. } => {}
             Event::UsageUpdated { usage } => self.usage = Some(usage),
             Event::ModeChanged { mode } => self.mode = mode,
             // The real ACP-advertised modes, reduced here so a client renders
@@ -1421,7 +1436,7 @@ impl AcpState {
             Event::CancelRequested { .. } => {
                 self.cancelling = true;
             }
-            Event::Stopped { .. } => {
+            Event::Stopped { ref reason } => {
                 // The turn is over however it ended (completion, cancel, killed
                 // worker), so clear every in-turn phase. This is the
                 // self-healing clear for a dropped compaction marker (#3219),
@@ -1433,6 +1448,11 @@ impl AcpState {
                 self.compacting = false;
                 self.in_flight_tool = None;
                 self.thinking = None;
+                // A stop for any other reason ends a rate-limit park, as it
+                // does for the durable park the sidebar reads.
+                if reason != "rate_limited" && reason != RATE_LIMIT_EXHAUSTED_RETRIES_REASON {
+                    self.rate_limit = None;
+                }
             }
             Event::AgentStartupError { .. } => {
                 self.turn_active = false;
@@ -1475,7 +1495,11 @@ impl AcpState {
                 // post-upgrade respawn unblocks the UI without a hard
                 // reload. Mirrors the frontend reducer's
                 // `incompatibleAgent = null` clear on the same event.
+                // The rate-limit park ends here, not on the resume
+                // breadcrumb, so a resume that fails to start keeps the
+                // park every surface reports (#3514).
                 self.startup_error = None;
+                self.rate_limit = None;
             }
             Event::SessionContextReset { .. } => {
                 // Agent's stored context is gone; clear the cached
@@ -2505,7 +2529,7 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_auto_resumed_clears_rate_limit_snapshot() {
+    fn rate_limit_snapshot_outlives_the_resume_breadcrumb_until_the_worker_is_back() {
         let mut s = fresh_state();
         s.apply_event(Event::RateLimit {
             info: RateLimitInfo {
@@ -2522,8 +2546,16 @@ mod tests {
         })
         .unwrap();
         assert!(
+            s.rate_limit.is_some(),
+            "a resume that has not come up yet keeps the park (#3514)"
+        );
+        s.apply_event(Event::AcpSessionAssigned {
+            acp_session_id: "acp-2".into(),
+        })
+        .unwrap();
+        assert!(
             s.rate_limit.is_none(),
-            "RateLimitAutoResumed must clear the rate-limit snapshot"
+            "the worker coming back ends the park"
         );
     }
 }

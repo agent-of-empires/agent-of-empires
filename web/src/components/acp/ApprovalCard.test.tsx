@@ -17,7 +17,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import { ApprovalCard } from "./ApprovalCard";
-import type { Approval, ApprovalDecision } from "../../lib/acpTypes";
+import type { Approval } from "../../lib/acpTypes";
 
 vi.mock("../../lib/connectionState", () => ({
   useServerDown: () => false,
@@ -42,6 +42,52 @@ function makeApproval(over: Partial<Approval> = {}): Approval {
 
 afterEach(() => {
   cleanup();
+});
+
+describe("ApprovalCard (choice list, #3741)", () => {
+  const choices = ["alpha", "bravo", "charlie", "delta"].map((id) => ({
+    option_id: id,
+    name: `Option ${id[0]!.toUpperCase()}${id.slice(1)}`,
+    kind: "allow_once",
+  }));
+
+  it("lists the agent's options and resolves with the one chosen", async () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    render(<ApprovalCard approval={makeApproval({ options: choices, choice_list: true })} onResolve={onResolve} />);
+    expect(screen.queryByRole("button", { name: /^allow$/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /always/i })).toBeNull();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /option charlie/i }));
+    });
+    expect(onResolve).toHaveBeenCalledWith("Allow", "charlie");
+  });
+
+  it("keeps the trio for a genuine allow/deny vocabulary", () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    const trio = [
+      { option_id: "y", name: "Allow once", kind: "allow_once" },
+      { option_id: "a", name: "Allow always", kind: "allow_always" },
+      { option_id: "n", name: "Reject", kind: "reject_once" },
+    ];
+    render(<ApprovalCard approval={makeApproval({ options: trio })} onResolve={onResolve} />);
+    expect(screen.getByRole("button", { name: /^allow$/i })).toBeDefined();
+    expect(screen.queryByRole("group", { name: /choose an answer/i })).toBeNull();
+  });
+
+  it("renders a daemon-flagged question as a list", () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ApprovalCard
+        approval={makeApproval({
+          tool_call: { ...makeApproval().tool_call, id: "pi-ui-3" },
+          options: choices.slice(0, 2),
+          choice_list: true,
+        })}
+        onResolve={onResolve}
+      />,
+    );
+    expect(screen.getByRole("group", { name: /choose an answer/i })).toBeDefined();
+  });
 });
 
 describe("ApprovalCard (benign)", () => {
@@ -215,21 +261,21 @@ describe("ApprovalCard (benign)", () => {
     render(<ApprovalCard approval={makeApproval()} onResolve={onResolve} />);
     fireEvent.click(screen.getByText("Allow"));
     expect(onResolve).toHaveBeenCalledTimes(1);
-    expect(onResolve).toHaveBeenCalledWith<ApprovalDecision[]>("Allow");
+    expect(onResolve).toHaveBeenCalledWith("Allow", undefined);
   });
 
   it("routes Always to onResolve('AllowAlways')", () => {
     const onResolve = vi.fn().mockResolvedValue(undefined);
     render(<ApprovalCard approval={makeApproval()} onResolve={onResolve} />);
     fireEvent.click(screen.getByText("Always"));
-    expect(onResolve).toHaveBeenCalledWith("AllowAlways");
+    expect(onResolve).toHaveBeenCalledWith("AllowAlways", undefined);
   });
 
   it("routes Deny to onResolve('Deny')", () => {
     const onResolve = vi.fn().mockResolvedValue(undefined);
     render(<ApprovalCard approval={makeApproval()} onResolve={onResolve} />);
     fireEvent.click(screen.getByText("Deny"));
-    expect(onResolve).toHaveBeenCalledWith("Deny");
+    expect(onResolve).toHaveBeenCalledWith("Deny", undefined);
   });
 
   it("shows the rolled-back message when onResolve rejects", async () => {
@@ -238,7 +284,7 @@ describe("ApprovalCard (benign)", () => {
     await act(async () => {
       fireEvent.click(screen.getByText("Allow"));
     });
-    expect(screen.getByText(/Could not reach the server/i)).toBeTruthy();
+    expect(screen.getByText(/not accepted/i)).toBeTruthy();
   });
 });
 
@@ -286,14 +332,14 @@ describe("ApprovalCard (destructive)", () => {
       vi.advanceTimersByTime(800);
     });
     expect(onResolve).toHaveBeenCalledTimes(1);
-    expect(onResolve).toHaveBeenCalledWith("Allow");
+    expect(onResolve).toHaveBeenCalledWith("Allow", undefined);
   });
 
   it("routes Deny without requiring a hold even in destructive mode", () => {
     const onResolve = vi.fn().mockResolvedValue(undefined);
     render(<ApprovalCard approval={makeApproval({ destructive: true })} onResolve={onResolve} />);
     fireEvent.click(screen.getByText("Deny"));
-    expect(onResolve).toHaveBeenCalledWith("Deny");
+    expect(onResolve).toHaveBeenCalledWith("Deny", undefined);
   });
 });
 
