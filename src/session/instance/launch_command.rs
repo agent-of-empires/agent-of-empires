@@ -381,6 +381,18 @@ impl Instance {
         })
     }
 
+    /// Rebuild a restart command if the quiesced Prime pane published a newer root.
+    pub(super) fn refresh_prepared_prime_launch_after_quiescence(
+        &mut self,
+        prepared: PreparedLaunch,
+    ) -> Result<PreparedLaunch> {
+        if self.absorb_published_prime_session() {
+            self.prepare_launch_command()
+        } else {
+            Ok(prepared)
+        }
+    }
+
     /// Construct the command only after hook execution has completed. Keeping
     /// this phase hook-free prevents a revalidation retry from replaying user
     /// code while the lifecycle lock is held.
@@ -492,19 +504,32 @@ impl Instance {
                 shell_escape(&profile),
                 shell_escape(&self.id)
             ));
+            if let Some(&(key, expected)) = agent.and_then(|agent| {
+                agent
+                    .container_env
+                    .iter()
+                    .find(|(key, _)| *key == "PRIME_AGENT_CODING_AGENT_DIR")
+            }) {
+                env_info
+                    .docker_args
+                    .push_str(&format!(" -e {key}={}", shell_escape(expected)));
+            }
             if let Some((_, ref env)) = identity_extension {
                 // `KEY=VALUE ` from the host form, passed as a docker `-e`.
                 env_info
                     .docker_args
                     .push_str(&format!(" -e {}", shell_escape(env.trim())));
             }
-            if extension_configured
-                && matches!(
+            if extension_configured {
+                let root_only = matches!(
                     extension_backend.and_then(|backend| backend.identity_publisher()),
                     Some(crate::agents::SessionIdentityPublisher::Extension { root_only: true })
-                )
-            {
-                env_info.docker_args.push_str(" -e AOE_SESSION_ROOT_ONLY=1");
+                );
+                env_info.docker_args.push_str(if root_only {
+                    " -e AOE_SESSION_ROOT_ONLY=1"
+                } else {
+                    " -e AOE_SESSION_ROOT_ONLY=0"
+                });
             }
             let env_part = format!("{} ", env_info.docker_args);
             let raw_command = container.exec_command(Some(&env_part), &tool_cmd);
@@ -594,6 +619,7 @@ impl Instance {
         if let Some((_, ref env)) = identity_extension {
             env_prefix.push_str(env);
             self.pi_extension_launched = true;
+            env_prefix.push_str("AOE_SESSION_ROOT_ONLY=0 ");
         }
         let env_prefix = env_prefix;
 
@@ -688,7 +714,7 @@ mod tests {
             container_id: None,
             image: "test:latest".to_string(),
             container_name: "aoe-pi-argv".to_string(),
-            extra_env: None,
+            extra_env: Some(vec!["AOE_SESSION_ROOT_ONLY=1".to_string()]),
             custom_instruction: None,
             container_workdir: Some("/workspace".to_string()),
             before_start_env: Vec::new(),
@@ -709,6 +735,10 @@ mod tests {
         assert!(
             !cmd.contains(" -e /") || !cmd.contains("aoe-session-id.js"),
             "no `-e` path may reach a container launch: {cmd}"
+        );
+        assert!(
+            cmd.contains(" -e AOE_SESSION_ROOT_ONLY=0"),
+            "the launch override must keep Pi out of Prime-only mode: {cmd}"
         );
     }
 
@@ -775,6 +805,7 @@ mod tests {
 
         assert!(command.contains(" -e "), "missing Pi extension: {command}");
         assert!(command.contains("AOE_SESSION_ID_FILE="));
+        assert!(command.contains("AOE_SESSION_ROOT_ONLY=0"));
         assert!(inst.pi_extension_launched);
     }
 

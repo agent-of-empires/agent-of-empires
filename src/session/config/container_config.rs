@@ -1786,11 +1786,12 @@ fn validate_managed_container_environment(
 
     require_path("HOME", container_home)?;
     if let Some(agent) = active_agent {
-        for &(key, expected) in agent
-            .container_env
-            .iter()
-            .filter(|(key, _)| matches!(*key, "CLAUDE_CONFIG_DIR" | "CURSOR_CONFIG_DIR"))
-        {
+        for &(key, expected) in agent.container_env.iter().filter(|(key, _)| {
+            matches!(
+                *key,
+                "CLAUDE_CONFIG_DIR" | "CURSOR_CONFIG_DIR" | "PRIME_AGENT_CODING_AGENT_DIR"
+            )
+        }) {
             require_path(key, expected)?;
         }
     }
@@ -7056,6 +7057,7 @@ volume_ignores = ["target"]
         };
         let claude = crate::agents::get_agent("claude");
         let cursor = crate::agents::get_agent("cursor");
+        let prime = crate::agents::get_agent("prime-agent");
 
         for (environment, agent, rejected_key) in [
             (vec![literal("HOME", "/home/user")], claude, "HOME"),
@@ -7074,6 +7076,14 @@ volume_ignores = ["target"]
                 ],
                 cursor,
                 "CURSOR_CONFIG_DIR",
+            ),
+            (
+                vec![
+                    literal("HOME", "/root"),
+                    literal("PRIME_AGENT_CODING_AGENT_DIR", "/other"),
+                ],
+                prime,
+                "PRIME_AGENT_CODING_AGENT_DIR",
             ),
         ] {
             let error =
@@ -7099,6 +7109,15 @@ volume_ignores = ["target"]
                 literal("CURSOR_CONFIG_DIR", "/other"),
             ],
             claude,
+            "/root",
+        )
+        .unwrap();
+        validate_managed_container_environment(
+            &[
+                literal("HOME", "/root"),
+                literal("PRIME_AGENT_CODING_AGENT_DIR", "/root/.prime/agent"),
+            ],
+            prime,
             "/root",
         )
         .unwrap();

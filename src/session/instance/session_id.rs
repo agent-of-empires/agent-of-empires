@@ -12,12 +12,19 @@ const PRIME_AGENT_DEFAULT_SESSION_DIR: &str = "/root/.prime/agent/sessions";
 struct PrimeAgentLaunchOptions {
     cwd: Option<String>,
     session_dir: Option<String>,
+    mode: Option<String>,
     no_session: bool,
 }
 
 fn parse_prime_agent_launch_options(words: &[String]) -> Option<PrimeAgentLaunchOptions> {
     const VALUE_OPTIONS: &[&str] = &[
-        "--mode",
+        "--autonomous-gate",
+        "--autonomous-gate-retries",
+        "--autonomous-gate-timeout-ms",
+        "--autonomous-max-continuations",
+        "--autonomous-max-turns",
+        "--autonomous-max-tokens",
+        "--autonomous-timeout-ms",
         "--daemon-socket",
         "--provider",
         "--model",
@@ -44,6 +51,10 @@ fn parse_prime_agent_launch_options(words: &[String]) -> Option<PrimeAgentLaunch
         match argument {
             "--" => break,
             "--no-session" => options.no_session = true,
+            "--mode" => {
+                options.mode = Some(words.get(index + 1)?.clone());
+                index += 1;
+            }
             "--cwd" | "--session-dir" => {
                 let value = words.get(index + 1)?.clone();
                 if argument == "--cwd" {
@@ -188,7 +199,7 @@ impl Instance {
         let mut words = parsed.words;
         words.extend(shell_words::split(&self.extra_args).ok()?);
         let options = parse_prime_agent_launch_options(&words)?;
-        if options.no_session {
+        if options.no_session || options.mode.as_deref() == Some("daemon") {
             return None;
         }
 
@@ -227,18 +238,18 @@ impl Instance {
                 config.host_path_for_container_path(&project_container_path, false)?;
             let global = read_prime_agent_settings(&global_host_path).ok()?;
             let project = read_prime_agent_settings(&project_host_path).ok()?;
-            project
+            match project
                 .as_ref()
                 .and_then(|settings| settings.get("sessionDir"))
                 .or_else(|| {
                     global
                         .as_ref()
                         .and_then(|settings| settings.get("sessionDir"))
-                })
-                .and_then(serde_json::Value::as_str)
-                .filter(|value| !value.is_empty())
-                .unwrap_or(PRIME_AGENT_DEFAULT_SESSION_DIR)
-                .to_string()
+                }) {
+                Some(serde_json::Value::String(value)) => value.clone(),
+                Some(serde_json::Value::Null) | None => PRIME_AGENT_DEFAULT_SESSION_DIR.to_string(),
+                Some(_) => return None,
+            }
         };
 
         let container_session_dir = resolve_prime_agent_path(&session_dir_value, &container_cwd);
@@ -785,10 +796,15 @@ impl Instance {
         validated_prime_root_publication(&plan, &self.id)
     }
 
-    fn absorb_published_prime_session(&mut self) {
-        if let Some(id) = self.prime_published_root_session_id() {
-            self.agent_session_id = Some(id);
+    pub(super) fn absorb_published_prime_session(&mut self) -> bool {
+        let Some(id) = self.prime_published_root_session_id() else {
+            return false;
+        };
+        if self.agent_session_id.as_deref() == Some(id.as_str()) {
+            return false;
         }
+        self.agent_session_id = Some(id);
+        true
     }
 
     pub(crate) fn prime_root_sidecar_poll_fn(
@@ -1623,6 +1639,58 @@ mod tests {
             .unwrap();
         assert_eq!(plan.session_dir, Path::new("project"));
 
+        config.environment.retain(|entry| {
+            !matches!(
+                entry.key(),
+                "PRIME_AGENT_SESSION_DIR" | "PRIME_AGENT_CODING_AGENT_SESSION_DIR"
+            )
+        });
+        inst.sandbox_info.as_mut().unwrap().container_workdir =
+            Some("/root/.prime/agent/work".to_string());
+        let work_settings = store.join("work/.prime/agent/settings.json");
+        std::fs::create_dir_all(work_settings.parent().unwrap()).unwrap();
+        std::fs::write(
+            &work_settings,
+            serde_json::json!({"sessionDir": ""}).to_string(),
+        )
+        .unwrap();
+        let plan = inst
+            .prime_agent_capture_plan_with(&config, store.clone())
+            .unwrap();
+        assert_eq!(plan.session_dir, Path::new("work"));
+        std::fs::write(
+            &work_settings,
+            serde_json::json!({"sessionDir": null}).to_string(),
+        )
+        .unwrap();
+        let plan = inst
+            .prime_agent_capture_plan_with(&config, store.clone())
+            .unwrap();
+        assert_eq!(plan.session_dir, Path::new("sessions"));
+
+        inst.sandbox_info.as_mut().unwrap().container_workdir =
+            Some("/workspace/project".to_string());
+        for option in [
+            "--autonomous-gate",
+            "--autonomous-gate-retries",
+            "--autonomous-gate-timeout-ms",
+            "--autonomous-max-continuations",
+            "--autonomous-max-turns",
+            "--autonomous-max-tokens",
+            "--autonomous-timeout-ms",
+        ] {
+            inst.extra_args = format!("{option} --session-dir");
+            let plan = inst
+                .prime_agent_capture_plan_with(&config, store.clone())
+                .unwrap_or_else(|| panic!("{option} value was parsed as a session option"));
+            assert_eq!(plan.session_dir, Path::new("project"));
+        }
+
+        inst.extra_args = "--mode daemon".to_string();
+        assert!(inst
+            .prime_agent_capture_plan_with(&config, store.clone())
+            .is_none());
+
         inst.extra_args =
             "--autonomous --cwd /root/.prime/agent/work/../work --session-dir ../cli".to_string();
         let plan = inst
@@ -1680,6 +1748,7 @@ mod tests {
             "{launch}"
         );
         assert!(launch.contains("AOE_SESSION_ROOT_ONLY=1"));
+        assert!(launch.contains(" -e PRIME_AGENT_CODING_AGENT_DIR='/root/.prime/agent'"));
         assert!(!launch.contains("--session-id"));
 
         let store = inst.sandbox_capture_store_dir().unwrap();
@@ -1739,7 +1808,7 @@ const context = (id, path, rlmDepth) => ({
 async function publish(target, rootOnly) {
   process.env.AOE_SESSION_ID_FILE = target;
   if (rootOnly) process.env.AOE_SESSION_ROOT_ONLY = "1";
-  else delete process.env.AOE_SESSION_ROOT_ONLY;
+  else process.env.AOE_SESSION_ROOT_ONLY = "0";
   let sessionStart;
   extension({ on(name, handler) { if (name === "session_start") sessionStart = handler; } });
   await sessionStart({}, context(
@@ -1818,6 +1887,36 @@ process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
         let mut command = "prime-agent".to_string();
         assert!(restarted.apply_session_flags(&mut command, "test").unwrap());
         assert_eq!(command, format!("prime-agent --resume {parent_id}"));
+
+        let prepared = restarted.prepare_launch_command().unwrap();
+        assert!(prepared.command.as_deref().unwrap().contains(parent_id));
+        let newer_id = "018f47a6-7b80-7cc3-98a2-37b5f486b2a3";
+        std::fs::write(
+            sessions.join("newer.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "type": "session",
+                    "version": 3,
+                    "id": newer_id,
+                    "timestamp": "2026-09-05T00:00:02.000Z",
+                    "cwd": "/workspace/project",
+                    "rlmDepth": 0,
+                })
+            ),
+        )
+        .unwrap();
+        std::fs::write(&sidecar, newer_id).unwrap();
+        std::fs::write(
+            &path_sidecar,
+            "/root/.prime/agent/custom-sessions/newer.jsonl",
+        )
+        .unwrap();
+        let prepared = restarted
+            .refresh_prepared_prime_launch_after_quiescence(prepared)
+            .unwrap();
+        assert_eq!(restarted.agent_session_id.as_deref(), Some(newer_id));
+        assert!(prepared.command.as_deref().unwrap().contains(newer_id));
     }
     #[test]
     fn clearing_the_conversation_drops_its_transcript_path() {
