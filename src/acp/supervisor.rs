@@ -1589,7 +1589,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     ///
     /// Concurrency: `AcpClient::spawn` performs the ACP handshake
     /// (initialize + session/new), which takes 2-3s while no lock is
-    /// held. Without the `pending_spawns` reservation below, two
+    /// held. Without the lease reservation below, two
     /// concurrent callers for the same session_id would both pass
     /// the empty-`workers` check, both finish the handshake, and
     /// both insert into `workers` — the second insert silently
@@ -2205,7 +2205,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             .max(on_disk);
         // A zero marker was written for a runner from a pre-generation
         // build; it is honored only while nothing newer has been admitted.
-        let honored = marker >= known && (marker != 0 || known == 0);
+        let honored = marker >= known;
         crate::process::worker_registry::clear_restart_marker(session_id);
         if !honored {
             debug!(
@@ -2270,7 +2270,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                                 agent_unresponsive = true;
                             } else if reason == "rate_limited" {
                                 rate_limited = true;
-                            } else if reason == "session_reset" {
+                            } else if reason == "stored_session_rejected" {
                                 // The stored session is gone (#3560); a fresh
                                 // spawn recovers it, which an attached handle
                                 // cannot do from here.
@@ -3298,8 +3298,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         // Refusing to attach is not enough on its own: the disallowed runner
         // would keep running, still holding whatever credentials it was spawned
         // with, and the next reconciler tick would attach it again. So terminate
-        // it. `worker_registry::terminate` is the canonical teardown already
-        // used by the shutdown paths: it SIGTERMs the whole process group and
+        // it. `worker_registry::terminate` SIGTERMs the whole process group and
         // clears the record plus socket generation-aware, so it will not strand a
         // replacement runner that rebound the socket meanwhile.
         //

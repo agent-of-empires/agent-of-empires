@@ -205,9 +205,9 @@ export function ApprovalCard({ approval, onResolve }: Props) {
               className={[
                 "flex flex-1 items-center justify-center gap-1.5",
                 "rounded-md text-white text-xs font-medium py-2 px-3",
-                phase === "pending" ? "bg-brand-600 hover:bg-brand-500" : "bg-brand-700 opacity-70 cursor-wait",
+                phase === "submitting" ? "bg-brand-700 opacity-70 cursor-wait" : "bg-brand-600 hover:bg-brand-500",
               ].join(" ")}
-              disabled={offline || phase !== "pending"}
+              disabled={offline || phase === "submitting"}
               onClick={() => void submit("Allow")}
             >
               <Check className="h-3.5 w-3.5" />

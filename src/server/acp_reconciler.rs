@@ -2087,6 +2087,9 @@ pub(crate) async fn trigger_resume_background(
     id: &str,
 ) -> Result<ResumeTrigger, crate::acp::supervisor::SupervisorError> {
     use crate::acp::supervisor::{ResumeKind, ResumeReservationOutcome};
+    // A prompt is the user resuming on purpose, like the resume endpoints:
+    // a stop kept from a resume that failed before install no longer applies.
+    service.acp_supervisor.forget_stale_cancel(id);
     let reservation = match service
         .acp_supervisor
         .begin_resume(id, ResumeKind::Spawn)
@@ -2163,12 +2166,11 @@ pub(crate) async fn trigger_resume_background(
     Ok(ResumeTrigger::Started)
 }
 
-/// Re-adopt live orphan runners. A fresh spawn whose in-memory handshake
-/// fails or times out can leave its DETACHED runner alive and registered on
-/// disk: the runner binds its socket and writes its registry entry BEFORE the
-/// handshake completes, and `connect_via_socket`'s error/timeout path does not
-/// kill it (the runner owns the agent and survives daemon death by design).
-/// Such a session is left in `attempted` with no in-memory worker, so the
+/// Re-adopt live orphan runners. A failed launch retires the runner it
+/// built once that runner has stamped its record; a daemon that dies
+/// mid-handshake, or a runner that came up only after the launcher gave up
+/// on its socket, still leaves a DETACHED runner alive and registered on
+/// disk with no in-memory worker. Such a session sits in `attempted`, so the
 /// reconciler's work-list loop skips it forever and the live runner is never
 /// reattached, so every prompt 404s even though `aoe acp ps` shows the worker
 /// alive.

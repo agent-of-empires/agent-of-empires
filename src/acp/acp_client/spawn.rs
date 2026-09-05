@@ -1076,7 +1076,7 @@ done
         );
         assert_eq!(
             terminal.as_deref(),
-            Some("session_reset"),
+            Some("stored_session_rejected"),
             "the connection ends on a soft stop the respawn recovers from"
         );
         let _ = client.shutdown().await;

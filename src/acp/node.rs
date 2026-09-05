@@ -390,8 +390,9 @@ mod tests {
         );
 
         // The runtime we download when the host has none must clear the
-        // same bar, or `download` returns a Node `verify_path` rejects.
+        // same bar, including the source adapters' floor.
         assert_eq!(meets_minimum(PINNED_NODE_VERSION), Some(true));
+        assert!(supports_strip_types(PINNED_NODE_VERSION));
     }
 
     #[test]

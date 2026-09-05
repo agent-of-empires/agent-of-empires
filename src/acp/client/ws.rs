@@ -1,10 +1,10 @@
 //! WebSocket client for the structured view broadcast stream.
 //!
 //! Subscribes to `/sessions/{id}/acp/ws?since=N` and yields a
-//! stream of decoded events. The daemon may push three shapes:
+//! stream of decoded events. The daemon may push these shapes:
 //!
-//! - `{"kind":"frame", ...AcpBroadcastFrame}`: the next replayed
-//!   or live event.
+//! - An `AcpBroadcastFrame` (`session_id`, `seq`, `event`, no `kind`):
+//!   the next replayed or live event.
 //! - `{"kind":"lagged"}`: the in-memory ring buffer evicted events
 //!   the client hadn't acked yet. The consumer must drop its local
 //!   state and rehydrate via [`super::http::HttpClient::replay`].
@@ -312,10 +312,8 @@ fn parse_text(raw: &str) -> Result<Option<WsMessage>, WsError> {
             }
             // A control frame this build does not consume, typically a
             // sentinel a newer daemon grew. Dropping it is safe: the
-            // projections above are re-sent on every event and on connect.
-            // Falling through to the event parse would fail on the missing
-            // `event` field and read as a dropped socket, which reconnects
-            // in a loop against the same connect-time frame (#3560).
+            // projections above are re-sent on every event and on connect
+            // (#3560).
             _ => {
                 debug!(
                     target: "acp.client.ws",

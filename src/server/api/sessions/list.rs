@@ -183,7 +183,9 @@ pub async fn list_sessions(
             .iter()
             .zip(scoped_instances.iter().copied())
             .enumerate()
-            .filter(|(_, (_, inst))| inst.is_structured())
+            .filter(|(_, (_, inst))| {
+                inst.is_structured() && !inst.is_archived() && !inst.is_trashed()
+            })
             .map(|(i, (resp, inst))| {
                 (
                     i,

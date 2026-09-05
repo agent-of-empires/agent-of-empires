@@ -4276,7 +4276,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_status_event_ignores_activity_after_rate_limit_park() {
+    fn seed_status_follows_activity_after_a_rate_limit_park() {
         let (_tmp, store) = open_store(1000);
         store
             .record(

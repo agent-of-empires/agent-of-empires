@@ -1067,12 +1067,8 @@ mod tests {
         }
     }
 
-    /// `prompt_submission` auto-vivifies a per-session lock-registry entry
-    /// and nothing ever prunes one, so a plugin probing distinct nonexistent
-    /// session ids must be refused before the guard is claimed, or the
-    /// registry grows without bound within the caller's turn quota.
-    /// #3686: an idle-reaped plugin session is woken by a turn, not refused
-    /// as missing. The resume itself fails here (no real agent), which is a
+    /// #3686: a parked plugin session is woken by a turn, not refused as
+    /// missing. The resume itself fails here (no real agent), which is a
     /// worker error, never `session_not_found`.
     #[tokio::test]
     async fn turn_send_wakes_a_parked_session() {
@@ -1119,6 +1115,10 @@ mod tests {
         }
     }
 
+    /// `prompt_submission` auto-vivifies a per-session lock-registry entry
+    /// and nothing ever prunes one, so a plugin probing distinct nonexistent
+    /// session ids must be refused before the guard is claimed, or the
+    /// registry grows without bound within the caller's turn quota.
     #[tokio::test]
     async fn turn_send_does_not_grow_the_lock_registry_for_nonexistent_sessions() {
         let (deps, _dir) = test_deps(Vec::new());

@@ -2997,10 +2997,13 @@ pub(super) async fn run_connection_task<W, R>(
                     .await;
             } else if context_reset_emitted.load(Ordering::Relaxed) {
                 // The respawn opens a fresh session; the reset already told
-                // the user why, so end the turn without a startup error.
+                // the user why, so end the turn without a startup error. Its
+                // own reason keeps the drain task from mistaking a driven
+                // `/reset`, which also stops the turn as `session_reset`
+                // and keeps the connection, for this terminal one.
                 let _ = event_tx
                     .send(Event::Stopped {
-                        reason: "session_reset".into(),
+                        reason: "stored_session_rejected".into(),
                     })
                     .await;
             } else {
