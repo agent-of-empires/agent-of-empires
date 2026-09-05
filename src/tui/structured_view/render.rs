@@ -317,7 +317,7 @@ fn render_approval_shelf(
         .border_style(Style::default().fg(accent));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let actions = approval_actions_line(theme, active, row.choice);
+    let actions = approval_actions_line(theme, active, row.choice && !row.options.is_empty());
     frame.render_widget(Paragraph::new(actions), inner);
 }
 
@@ -1923,7 +1923,7 @@ fn selected_approval_is_choice(state: &StructuredViewState) -> bool {
         .transcript
         .pending_approvals
         .iter()
-        .any(|pending| pending.nonce == selected && pending.choice)
+        .any(|pending| pending.nonce == selected && pending.choice && !pending.options.is_empty())
 }
 
 fn help_hint(focus: Focus, approval_is_choice: bool) -> &'static str {

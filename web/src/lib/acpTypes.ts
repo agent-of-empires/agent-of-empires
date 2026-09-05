@@ -203,10 +203,10 @@ export interface Approval {
   /** Options the agent offered, in its own order. Absent on approvals
    *  replayed from an event log written before #3741. */
   options?: ApprovalOption[];
-  /** The options carry a question rather than an allow/deny vocabulary
-   *  (two or more share one kind), so the card renders the labels and
-   *  posts back the picked `option_id`. Classified server-side. See
-   *  #3741. */
+  /** The options are a list of answers, not a permission vocabulary, so
+   *  the card renders the labels and posts back the picked `option_id`.
+   *  Classified server-side by `is_choice_list` in
+   *  src/acp/approvals.rs. */
   choice?: boolean;
   requested_at: string;
   resolved?: {

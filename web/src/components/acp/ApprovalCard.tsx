@@ -7,10 +7,12 @@
 //   - Destructive: "Allow" requires an 800ms hold (haptic on touch),
 //     swipe is reserved for dismiss-only and never approves.
 //
-// A `choice` approval is a third shape: the agent put a question in the
-// option list (pi's ask_user_question), so the trio cannot express it
-// and the card renders the agent's own labels instead, posting back the
-// picked option_id. See #3741.
+// A `choice` approval is a third shape: the daemon classified the
+// agent's options as a list of answers rather than a permission
+// vocabulary (`is_choice_list` in src/acp/approvals.rs), so the card
+// renders those labels and posts back the picked option_id. Destructive
+// chrome still wins the header, but not the action area: holding cannot
+// express which answer was meant.
 //
 // Optimistic state shows a spinner until the server's broadcast removes
 // the approval from AcpState.pendingApprovals.
@@ -37,14 +39,13 @@ export function ApprovalCard({ approval, onResolve }: Props) {
 
   const raw = approval.tool_call.args_preview;
   const options = approval.options ?? [];
-  // The server classified the option list as a question; without labels
-  // there is nothing to render, so fall back to the trio.
+  // Without labels there is nothing to render, so fall back to the trio.
   const isChoice = approval.choice === true && options.length > 0;
   // Benign approvals collapse to a one-line preview so the queue stays
   // scannable; destructive ones default expanded so the full command is
   // in view before a hold-to-allow. Either way the toggle stays under
   // user control and nothing re-expands it on plan approval. See #1767.
-  // A question defaults expanded too: its args carry the question text.
+  // An answer list defaults expanded too: its args carry the question.
   const [expanded, setExpanded] = useState(approval.destructive || isChoice);
   const preview = useMemo(() => previewFromArgs(raw), [raw]);
   const canExpand = useMemo(() => hasArgsBody(raw), [raw]);

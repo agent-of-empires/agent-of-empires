@@ -34,7 +34,7 @@ destructive_require_double_confirm = true
 
 The card clears as soon as your decision is accepted. If it already resolved on the daemon (a concurrent decision or a watchdog), resolving again clears it quietly instead of erroring.
 
-Some agents put a **question** in the permission options rather than an allow/deny vocabulary: pi's `ask_user_question`, for instance, sends one `allow_once` option per answer. The daemon spots this (two or more options share a kind, so Allow / Always / Deny cannot say which one you meant) and the card renders the agent's own labels instead, one button each; picking one sends back that option. **Dismiss** answers nothing. In the TUI the same card offers `a` to open the answer picker instead of allow-once.
+Some agents put a **question** in the permission options rather than an allow/deny vocabulary: pi's `ask_user_question`, for instance, sends one `allow_once` option per answer. The daemon spots this (every option carries the same kind, so there is no allow/deny meaning to read and the labels are the whole content) and the card renders those labels instead, one button each; picking one sends back that option. **Dismiss** answers nothing. In the TUI the same card offers `a` to open the answer picker instead of allow-once. Lists that mix kinds stay on the Allow / Always / Deny buttons, including ones that repeat a kind, such as gemini's two "allow always" options for an MCP tool.
 
 ## Questions (AskUserQuestion)
 

@@ -91,26 +91,23 @@ pub enum ApprovalOptionKind {
     RejectAlways,
 }
 
-/// True when the offered options carry a question rather than an
+/// True when the offered options are a list of answers rather than an
 /// allow/deny vocabulary, so clients must render the labels and send back
 /// the picked `option_id`.
 ///
-/// The test is that two or more options share one kind. Allow / Always /
-/// Deny addresses an option by its kind, so a repeated kind is precisely
-/// the case where that trio cannot say which option the user meant and
-/// would answer with whichever came first. pi's `ask_user_question`
-/// arrives as N `allow_once` options; a real permission vocabulary
-/// (allow_once + allow_always + reject_once) has one option per kind.
-/// See #3741.
+/// The test is that every option shares one kind, and there are at least
+/// two. Allow / Always / Deny addresses an option by its kind, so a list
+/// with no kind to distinguish its entries carries no permission
+/// semantics at all: the names are the whole content. pi's
+/// `ask_user_question` arrives as N `allow_once` options.
+///
+/// Repeated kinds alone are deliberately not enough. Real permission
+/// vocabularies do repeat one: gemini offers two `allow_always` options
+/// for an MCP tool ("all server tools" and "this tool") beside
+/// `allow_once` and `reject_once`, and that is still an approval, not a
+/// question. Those keep the trio. See #3741.
 pub fn is_choice_list(options: &[ApprovalOption]) -> bool {
-    let mut seen: Vec<ApprovalOptionKind> = Vec::with_capacity(options.len());
-    for option in options {
-        if seen.contains(&option.kind) {
-            return true;
-        }
-        seen.push(option.kind);
-    }
-    false
+    options.len() > 1 && options.iter().all(|o| o.kind == options[0].kind)
 }
 
 /// A pending or resolved approval for a tool call. Held in
@@ -128,7 +125,7 @@ pub struct Approval {
     #[serde(default)]
     pub options: Vec<ApprovalOption>,
     /// `is_choice_list(&options)`, resolved server-side so the TUI and the
-    /// web dashboard cannot disagree about which cards are questions.
+    /// web dashboard cannot disagree about which cards are answer lists.
     #[serde(default)]
     pub choice: bool,
     pub requested_at: DateTime<Utc>,
@@ -182,7 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn choice_list_detects_repeated_kinds() {
+    fn choice_list_needs_every_option_to_share_one_kind() {
         let option = |id: &str, kind| ApprovalOption {
             option_id: id.into(),
             name: id.into(),
@@ -191,11 +188,28 @@ mod tests {
         let cases = [
             ("empty", vec![], false),
             (
+                "single option",
+                vec![option("once", ApprovalOptionKind::AllowOnce)],
+                false,
+            ),
+            (
                 "permission vocabulary",
                 vec![
                     option("once", ApprovalOptionKind::AllowOnce),
                     option("always", ApprovalOptionKind::AllowAlways),
                     option("no", ApprovalOptionKind::RejectOnce),
+                ],
+                false,
+            ),
+            (
+                // gemini's MCP confirmation: a repeated kind, but still a
+                // permission vocabulary, so it keeps the trio.
+                "gemini mcp",
+                vec![
+                    option("proceed_always_server", ApprovalOptionKind::AllowAlways),
+                    option("proceed_always_tool", ApprovalOptionKind::AllowAlways),
+                    option("proceed_once", ApprovalOptionKind::AllowOnce),
+                    option("cancel", ApprovalOptionKind::RejectOnce),
                 ],
                 false,
             ),

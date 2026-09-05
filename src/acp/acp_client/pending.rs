@@ -37,9 +37,8 @@ pub(super) enum PendingResolver {
 pub(super) enum ApprovalResolutionMessage {
     Decision {
         decision: ApprovalDecision,
-        /// The `option_id` the client picked from the agent's own option
-        /// list, when the card rendered those labels instead of the
-        /// Allow / Always / Deny trio. See #3741.
+        /// An `option_id` the client picked off the agent's own labels,
+        /// rather than the Allow / Always / Deny trio.
         option_id: Option<String>,
     },
     Cancelled,

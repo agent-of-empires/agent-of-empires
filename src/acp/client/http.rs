@@ -529,8 +529,7 @@ impl HttpClient {
     }
 
     /// `POST /api/sessions/{id}/acp/approvals/{nonce}`. `option_id` names
-    /// an option from the agent's own list, for approvals the TUI
-    /// answered through the option picker. See #3741.
+    /// an option the TUI answered through the option picker.
     pub async fn resolve_approval(
         &self,
         session_id: &str,

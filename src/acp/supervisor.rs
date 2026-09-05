@@ -2824,8 +2824,8 @@ impl<S: BroadcastSink> Supervisor<S> {
         Ok(())
     }
 
-    /// Resolve a pending approval. `option_id` names an option from the
-    /// agent's own list when the client rendered those labels. See #3741.
+    /// Resolve a pending approval. `option_id` names an option off the
+    /// agent's own labels; `None` picks by option kind.
     pub async fn resolve_permission(
         &self,
         session_id: &str,

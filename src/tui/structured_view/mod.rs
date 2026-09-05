@@ -1288,15 +1288,25 @@ async fn accept_choice(state: &mut StructuredViewState, toast_deadline: &mut Opt
                 )
                 .await
             {
-                Ok(()) | Err(HttpError::ApprovalGone) => {
-                    // Clear locally now; the ApprovalResolved broadcast
-                    // also clears it, but the seq dedupe can swallow that.
+                // Clear locally now; the ApprovalResolved broadcast also
+                // clears it, but the seq dedupe can swallow that.
+                Ok(()) => {
                     state.transcript.resolve_approval_locally(&nonce);
                     state.reconcile_selection();
                     set_toast(
                         state,
                         toast_deadline,
                         format!("answered {label}"),
+                        ToastKind::Info,
+                    );
+                }
+                Err(HttpError::ApprovalGone) => {
+                    state.transcript.resolve_approval_locally(&nonce);
+                    state.reconcile_selection();
+                    set_toast(
+                        state,
+                        toast_deadline,
+                        "question already answered".into(),
                         ToastKind::Info,
                     );
                 }

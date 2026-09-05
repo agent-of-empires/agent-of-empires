@@ -812,9 +812,8 @@ impl AcpClient {
     /// Resolve a pending permission request. Looks up the parked
     /// responder by nonce and unblocks the `on_receive_request` callback.
     ///
-    /// `option_id` names an option from the agent's own list, for cards
-    /// that rendered those labels rather than the Allow / Always / Deny
-    /// trio; `None` lets `decision` pick by option kind. See #3741.
+    /// `option_id` names an option off the agent's own labels; `None`
+    /// lets `decision` pick by option kind.
     pub async fn resolve_permission(
         &self,
         nonce: Nonce,

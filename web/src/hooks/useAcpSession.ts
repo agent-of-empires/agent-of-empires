@@ -1668,9 +1668,8 @@ export function useAcpSession(
   }, [sessionId, fetchReplay, clearRetryTimers]);
 
   const resolveApproval = useCallback(
-    // `optionId` answers a question option list with the agent's own
-    // option, instead of letting the daemon pick by option kind. See
-    // #3741.
+    // `optionId` answers with the agent's own option instead of letting
+    // the daemon pick by option kind.
     async (nonce: string, decision: ApprovalDecision, optionId?: string) => {
       if (!sessionId) return;
       try {

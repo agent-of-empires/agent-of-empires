@@ -131,11 +131,10 @@ pub struct DiffCommentsPromptRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ResolveApprovalRequest {
     pub decision: ApprovalDecisionWire,
-    /// The `option_id` the user picked from the agent's own option list,
-    /// for approvals the client rendered as a question rather than as the
-    /// Allow / Always / Deny trio (`Approval.choice`). Omitted by clients
-    /// that only send the trio; then `decision` picks by option kind, as
-    /// before. See #3741.
+    /// The `option_id` the user picked off the agent's own labels, for an
+    /// approval the client rendered as an answer list (`Approval.choice`).
+    /// Omitted by trio-only clients; `decision` then picks by option kind,
+    /// as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub option_id: Option<String>,
 }
