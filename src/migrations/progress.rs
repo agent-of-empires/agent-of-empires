@@ -212,24 +212,61 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// Clamp `line` to `width` columns by eliding its middle, so a status line
-/// redrawn in place with `\r` + erase-line never wraps onto rows the erase
-/// cannot reach. Paths make these lines long; keeping both ends keeps the
-/// counts and the elapsed time readable.
+/// Clamp `line` to `width` terminal columns by eliding its middle, so a
+/// status line redrawn in place with `\r` + erase-line never wraps onto rows
+/// the erase cannot reach. Paths make these lines long; keeping both ends
+/// keeps the counts and the elapsed time readable. Measured in display cells
+/// over grapheme clusters, so a wide glyph counts as two columns and a
+/// combining mark as none, and no cluster is ever split.
 pub fn fit_width(line: &str, width: usize) -> String {
-    let chars: Vec<char> = line.chars().collect();
-    if width == 0 || chars.len() <= width {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+
+    if width == 0 || line.width() <= width {
         return line.to_string();
     }
+    let clusters: Vec<(&str, usize)> = line
+        .graphemes(true)
+        .map(|cluster| (cluster, cluster.width()))
+        .collect();
+    // Clusters from the front whose widths fit in `budget`.
+    let take_head = |budget: usize| {
+        let mut used = 0;
+        clusters
+            .iter()
+            .take_while(|(_, cells)| {
+                used += cells;
+                used <= budget
+            })
+            .count()
+    };
     if width < 8 {
-        return chars[..width].iter().collect();
+        return clusters[..take_head(width)]
+            .iter()
+            .map(|(cluster, _)| *cluster)
+            .collect();
     }
     let keep = width - 1;
-    let head = keep / 2;
-    let tail = keep - head;
-    let mut out: String = chars[..head].iter().collect();
+    let head = take_head(keep / 2);
+    let mut used = 0;
+    let tail = clusters
+        .iter()
+        .rev()
+        .take_while(|(_, cells)| {
+            used += cells;
+            used <= keep - keep / 2
+        })
+        .count();
+    let mut out: String = clusters[..head]
+        .iter()
+        .map(|(cluster, _)| *cluster)
+        .collect();
     out.push('\u{2026}');
-    out.extend(chars[chars.len() - tail..].iter());
+    out.extend(
+        clusters[clusters.len() - tail..]
+            .iter()
+            .map(|(cluster, _)| *cluster),
+    );
     out
 }
 
@@ -237,6 +274,7 @@ pub fn fit_width(line: &str, width: usize) -> String {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use unicode_segmentation::UnicodeSegmentation;
 
     fn recording(seen: &Arc<Mutex<Vec<Event>>>) -> Reporter {
         let sink = seen.clone();
@@ -392,15 +430,56 @@ mod tests {
 
     #[test]
     fn fit_width_elides_the_middle_and_keeps_both_ends() {
+        use unicode_width::UnicodeWidthStr;
+
         assert_eq!(fit_width("short", 80), "short");
         assert_eq!(fit_width("short", 0), "short");
         let long =
             "copying store 1/2: /home/u/.gemini/sandbox -> /home/u/.gemini/sandbox-v2/abc (0.4s)";
         let fitted = fit_width(long, 40);
-        assert_eq!(fitted.chars().count(), 40);
+        assert_eq!(fitted.width(), 40);
         assert!(fitted.starts_with("copying store 1/2: "));
         assert!(fitted.ends_with(" (0.4s)"));
         assert!(fitted.contains('\u{2026}'));
         assert_eq!(fit_width("abcdefghij", 5), "abcde");
+
+        // Width is measured in terminal cells over grapheme clusters, never
+        // in chars: wide glyphs cost two columns, combining marks and
+        // zero-width joiners none, and no cluster is split.
+        let wide = "copying store: /home/u/\u{6f22}\u{5b57}\u{6f22}\u{5b57}\u{6f22}\u{5b57}\u{6f22}\u{5b57}/sandbox (0.4s)";
+        for width in [9, 12, 20, 33] {
+            let fitted = fit_width(wide, width);
+            assert!(fitted.width() <= width, "{width}: {fitted:?}");
+            assert!(fitted.width() >= width - 2, "{width}: {fitted:?}");
+            assert!(fitted.contains('\u{2026}'));
+            assert!(fitted.starts_with("cop"), "{width}: {fitted:?}");
+            assert!(fitted.ends_with("s)"), "{width}: {fitted:?}");
+        }
+        assert_eq!(fit_width("\u{6f22}\u{5b57}\u{6f22}", 5), "\u{6f22}\u{5b57}");
+        assert_eq!(fit_width("\u{6f22}\u{5b57}\u{6f22}", 4), "\u{6f22}\u{5b57}");
+        assert_eq!(fit_width("\u{6f22}\u{5b57}\u{6f22}", 1), "");
+        let combining =
+            "e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}";
+        assert_eq!(combining.width(), 10);
+        assert_eq!(
+            fit_width(combining, 10),
+            combining,
+            "10 cells fit in 10 columns"
+        );
+        let fitted = fit_width(combining, 9);
+        assert_eq!(fitted.width(), 9);
+        assert_eq!(fitted.graphemes(true).count(), 9);
+        assert!(fitted
+            .graphemes(true)
+            .all(|g| g == "e\u{301}" || g == "\u{2026}"));
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+        let joined = format!("{family}{family}{family}{family}{family}");
+        let fitted = fit_width(&joined, 8);
+        assert!(fitted.width() <= 8);
+        assert!(
+            !fitted.contains("\u{200d}\u{2026}"),
+            "must not split a joiner sequence: {fitted:?}"
+        );
+        assert_eq!(fit_width("abcdefghij", 3), "abc");
     }
 }
