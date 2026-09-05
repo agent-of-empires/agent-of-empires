@@ -19,40 +19,47 @@ use crate::tui::styles::{has_min_contrast, Theme};
 
 const SELECTED_ROW_CONTRAST_RATIO: f32 = 3.0;
 
-/// Widest a plugin's `row-column` cell may grow, in terminal cells, so a chatty
-/// plugin cannot push the project path off the row. Matches the title column's
-/// budget.
-const ROW_COLUMN_MAX_WIDTH: usize = 24;
+/// Widest the whole plugin region may grow, in terminal cells: the `row-badge`
+/// chips, the `row-column` cells, and the gap between the two groups. One shared
+/// cap rather than one per slot because the row already spends 41 cells on the
+/// highlight symbol, title, and status before any plugin content, so a second
+/// independent 24-cell group would push the project path past the right edge of
+/// an 80-column terminal instead of merely squeezing it.
+const PLUGIN_REGION_MAX_WIDTH: usize = 24;
 
-/// Gap between two plugins' cells inside the same column.
-const ROW_COLUMN_GAP: &str = "  ";
+/// Slice of the region the `row-badge` chips may claim, leaving the rest to the
+/// wordier `row-column` text. Badges are terse state markers ("draft",
+/// "approved"), so they need far less room than a status sentence.
+const ROW_BADGE_MAX_WIDTH: usize = 10;
 
-/// One plugin's `row-column` text plus the tone to paint it in.
-type RowColumnCell = (String, Option<Tone>);
+/// Gap between two plugins' cells inside a group, and between the two groups.
+const PLUGIN_COLUMN_GAP: &str = "  ";
+
+/// One plugin's cell text plus the tone to paint it in.
+type PluginCell = (String, Option<Tone>);
 
 /// A session's cells and the display width they occupy together.
-type MeasuredCells = (Vec<RowColumnCell>, usize);
+type MeasuredCells = (Vec<PluginCell>, usize);
 
-/// One session's `row-column` cells, truncated to the shared budget, plus the
-/// display width they occupy. Separate from rendering so the column width can be
-/// computed across every listed session before any row is painted: every row
-/// pads to that one width, so a session with no cell leaves a blank of the same
-/// size instead of shifting the path column (#2948). Returns width 0 when no
-/// plugin pushed anything, which keeps the row identical to before this slot
-/// rendered at all.
+/// One session's cells for a slot, truncated to `budget`, plus the display width
+/// they occupy. Separate from rendering so a group's width can be computed
+/// across every listed session before any row is painted: every row pads to that
+/// one width, so a session with no cell leaves a blank of the same size instead
+/// of shifting the path column (#2948). Returns width 0 when no plugin pushed
+/// anything, which keeps the row identical to before these slots rendered at
+/// all.
 ///
 /// Budgets in terminal cells, not chars: plugin text is arbitrary, and a wide
 /// glyph (an emoji status marker, CJK) paints two cells while counting as one
-/// char, which would under-measure the column and shift the path after all.
-fn row_column_cells(state: &RemoteHomeState, session_id: &str) -> MeasuredCells {
-    let mut budget = ROW_COLUMN_MAX_WIDTH;
+/// char, which would under-measure the group and shift the path after all.
+fn measured_cells(cells: Vec<PluginCell>, mut budget: usize) -> MeasuredCells {
     let mut width = 0;
-    let mut cells = Vec::new();
-    for (text, tone) in plugin_ui::row_column_cells(&state.plugin_ui, session_id) {
-        let gap = if cells.is_empty() {
+    let mut kept = Vec::new();
+    for (text, tone) in cells {
+        let gap = if kept.is_empty() {
             0
         } else {
-            UnicodeWidthStr::width(ROW_COLUMN_GAP)
+            UnicodeWidthStr::width(PLUGIN_COLUMN_GAP)
         };
         // Needs room for the gap plus at least one cell of text, else the
         // remaining plugins are dropped rather than rendered as a bare gap.
@@ -67,9 +74,61 @@ fn row_column_cells(state: &RemoteHomeState, session_id: &str) -> MeasuredCells 
         let len = UnicodeWidthStr::width(text.as_str()).min(budget - gap);
         width += gap + len;
         budget -= gap + len;
-        cells.push((text, tone));
+        kept.push((text, tone));
     }
-    (cells, width)
+    (kept, width)
+}
+
+/// This session's `row-badge` chips, measured against the badge sub-cap.
+fn row_badge_cells(state: &RemoteHomeState, session_id: &str) -> MeasuredCells {
+    measured_cells(
+        plugin_ui::row_badge_cells(&state.plugin_ui, session_id),
+        ROW_BADGE_MAX_WIDTH,
+    )
+}
+
+/// This session's `row-column` cells, measured against whatever the badges left
+/// of the shared region.
+fn row_column_cells(state: &RemoteHomeState, session_id: &str, budget: usize) -> MeasuredCells {
+    measured_cells(
+        plugin_ui::row_column_cells(&state.plugin_ui, session_id),
+        budget,
+    )
+}
+
+/// Paint one group's cells and pad them out to `group_width`, then the gap that
+/// separates the group from what follows. A zero-width group paints nothing, so
+/// a picker with no plugin entries keeps its original row layout.
+fn push_group(
+    spans: &mut Vec<Span<'static>>,
+    measured: &MeasuredCells,
+    group_width: usize,
+    theme: &Theme,
+    is_selected: bool,
+) {
+    if group_width == 0 {
+        return;
+    }
+    let (cells, width) = measured;
+    for (i, (text, tone)) in cells.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(PLUGIN_COLUMN_GAP));
+        }
+        let style = plugin_ui::tone_style(*tone, theme);
+        spans.push(Span::styled(
+            text.clone(),
+            if is_selected {
+                selected_row_style(style, theme)
+            } else {
+                style
+            },
+        ));
+    }
+    spans.push(Span::raw(format!(
+        "{:pad$}{PLUGIN_COLUMN_GAP}",
+        "",
+        pad = group_width - width
+    )));
 }
 
 fn selected_row_style(style: Style, theme: &Theme) -> Style {
@@ -178,13 +237,28 @@ Press r to refresh, q to quit.",
         frame.render_widget(para, area);
         return;
     }
-    // Measure every row's plugin cells first so they all pad to one width.
-    let plugin_cells: Vec<MeasuredCells> = state
+    // Measure every row's plugin cells first so they all pad to one width. The
+    // badges go first and eat into the shared region, so the column's budget is
+    // whatever they leave: with no badges anywhere the column still gets the
+    // whole region and the row renders exactly as it did before #2947.
+    let badge_cells: Vec<MeasuredCells> = state
         .sessions
         .iter()
-        .map(|s| row_column_cells(state, &s.id))
+        .map(|s| row_badge_cells(state, &s.id))
         .collect();
-    let plugin_width = plugin_cells.iter().map(|(_, w)| *w).max().unwrap_or(0);
+    let badge_width = badge_cells.iter().map(|(_, w)| *w).max().unwrap_or(0);
+    let column_budget = if badge_width == 0 {
+        PLUGIN_REGION_MAX_WIDTH
+    } else {
+        PLUGIN_REGION_MAX_WIDTH
+            .saturating_sub(badge_width + UnicodeWidthStr::width(PLUGIN_COLUMN_GAP))
+    };
+    let column_cells: Vec<MeasuredCells> = state
+        .sessions
+        .iter()
+        .map(|s| row_column_cells(state, &s.id, column_budget))
+        .collect();
+    let column_width = column_cells.iter().map(|(_, w)| *w).max().unwrap_or(0);
     let items: Vec<ListItem> = state
         .sessions
         .iter()
@@ -212,25 +286,22 @@ Press r to refresh, q to quit.",
                     readable(status_style),
                 ),
             ];
-            if plugin_width > 0 {
-                let (cells, width) = &plugin_cells[idx];
-                for (i, (text, tone)) in cells.iter().enumerate() {
-                    if i > 0 {
-                        spans.push(Span::raw(ROW_COLUMN_GAP));
-                    }
-                    spans.push(Span::styled(
-                        text.clone(),
-                        readable(plugin_ui::tone_style(*tone, theme)),
-                    ));
-                }
-                // Pad to the shared width, then the inter-column gap, so the
-                // path starts at the same screen column on every row.
-                spans.push(Span::raw(format!(
-                    "{:width$}{ROW_COLUMN_GAP}",
-                    "",
-                    width = plugin_width - width
-                )));
-            }
+            // Each group pads to its shared width, then the gap, so the path
+            // starts at the same screen column on every row.
+            push_group(
+                &mut spans,
+                &badge_cells[idx],
+                badge_width,
+                theme,
+                is_selected,
+            );
+            push_group(
+                &mut spans,
+                &column_cells[idx],
+                column_width,
+                theme,
+                is_selected,
+            );
             spans.push(Span::styled(s.project_path.clone(), readable(path_style)));
             ListItem::new(Line::from(spans))
         })
@@ -328,6 +399,11 @@ mod tests {
                "session_id": session_id, "payload": {"text": text}})
     }
 
+    fn row_badge(session_id: &str, payload: serde_json::Value) -> serde_json::Value {
+        json!({"plugin_id": "gh", "slot": "row-badge", "id": "pr",
+               "session_id": session_id, "payload": payload})
+    }
+
     /// Screen column where `needle` starts on the first row carrying it. Indexes
     /// the per-cell strings from `rows`, one character per painted cell, so it is
     /// a real column: a byte offset would be skewed by the multi-byte `▸ `
@@ -401,10 +477,10 @@ mod tests {
 
     #[test]
     fn long_plugin_text_is_capped_so_the_path_survives() {
-        let long = "x".repeat(ROW_COLUMN_MAX_WIDTH + 20);
+        let long = "x".repeat(PLUGIN_REGION_MAX_WIDTH + 20);
         let state = state_with(&["s1"], json!([row_column("s1", &long)]));
-        let (cells, width) = row_column_cells(&state, "s1");
-        assert_eq!(width, ROW_COLUMN_MAX_WIDTH);
+        let (cells, width) = row_column_cells(&state, "s1", PLUGIN_REGION_MAX_WIDTH);
+        assert_eq!(width, PLUGIN_REGION_MAX_WIDTH);
         assert!(cells[0].0.ends_with('…'));
         let painted = rows(&state);
         assert!(painted.iter().any(|l| l.contains("/tmp/s1")), "{painted:?}");
@@ -417,8 +493,8 @@ mod tests {
         let wide = "検査失敗検査失敗検査失敗中";
         assert_eq!(wide.chars().count(), 13);
         let state = state_with(&["s1"], json!([row_column("s1", wide)]));
-        let (cells, width) = row_column_cells(&state, "s1");
-        assert!(width <= ROW_COLUMN_MAX_WIDTH, "{width} cells");
+        let (cells, width) = row_column_cells(&state, "s1", PLUGIN_REGION_MAX_WIDTH);
+        assert!(width <= PLUGIN_REGION_MAX_WIDTH, "{width} cells");
         assert!(cells[0].0.ends_with('…'));
         // The four CJK chars paint 8 cells, followed by the two-cell gap.
         let both = state_with(&["s1", "s2"], json!([row_column("s1", "検査失敗")]));
@@ -446,13 +522,13 @@ mod tests {
             ]),
         );
         for id in ["s1", "s2"] {
-            let (cells, width) = row_column_cells(&state, id);
-            assert!(width <= ROW_COLUMN_MAX_WIDTH, "{id}: {width} cells");
+            let (cells, width) = row_column_cells(&state, id, PLUGIN_REGION_MAX_WIDTH);
+            assert!(width <= PLUGIN_REGION_MAX_WIDTH, "{id}: {width} cells");
             let painted: usize = cells
                 .iter()
                 .map(|(t, _)| UnicodeWidthStr::width(t.as_str()))
                 .sum::<usize>()
-                + ROW_COLUMN_GAP.len() * cells.len().saturating_sub(1);
+                + PLUGIN_COLUMN_GAP.len() * cells.len().saturating_sub(1);
             assert_eq!(painted, width, "{id}: measured width must match painted");
         }
         // The cap holds, so the path still renders and stays aligned.
@@ -468,13 +544,92 @@ mod tests {
         let state = state_with(
             &["s1"],
             json!([
-                row_column("s1", &"y".repeat(ROW_COLUMN_MAX_WIDTH)),
+                row_column("s1", &"y".repeat(PLUGIN_REGION_MAX_WIDTH)),
                 row_column("s1", "dropped")
             ]),
         );
-        let (cells, width) = row_column_cells(&state, "s1");
+        let (cells, width) = row_column_cells(&state, "s1", PLUGIN_REGION_MAX_WIDTH);
         assert_eq!(cells.len(), 1);
-        assert_eq!(width, ROW_COLUMN_MAX_WIDTH);
+        assert_eq!(width, PLUGIN_REGION_MAX_WIDTH);
+    }
+
+    #[test]
+    fn row_shows_the_plugin_row_badge_text_before_the_column() {
+        let state = state_with(
+            &["s1"],
+            json!([
+                row_column("s1", "CI failing"),
+                row_badge("s1", json!({"text": "draft", "tone": "warn"}))
+            ]),
+        );
+        let painted = rows(&state);
+        assert!(painted.iter().any(|l| l.contains("draft")), "{painted:?}");
+        // Badges sit left of the column, matching the web's row line.
+        assert!(column_of(&painted, "draft") < column_of(&painted, "CI failing"));
+    }
+
+    #[test]
+    fn badges_share_the_plugin_region_instead_of_widening_it() {
+        // A badge plus a column wordy enough to have filled the region alone.
+        let long = "x".repeat(PLUGIN_REGION_MAX_WIDTH + 10);
+        let state = state_with(
+            &["s1"],
+            json!([
+                row_badge("s1", json!({"text": "draft"})),
+                row_column("s1", &long)
+            ]),
+        );
+        let painted = rows(&state);
+        assert!(painted.iter().any(|l| l.contains("draft")), "{painted:?}");
+        // The 41-cell prefix, the whole region, and the gap before the path:
+        // the badge took its cells from the column, not from the path, which
+        // starts exactly where a badge-free capped column leaves it.
+        assert_eq!(
+            column_of(&painted, "/tmp/s1"),
+            41 + PLUGIN_REGION_MAX_WIDTH + 2
+        );
+    }
+
+    #[test]
+    fn badge_free_rows_leave_the_whole_region_to_the_column() {
+        let long = "x".repeat(PLUGIN_REGION_MAX_WIDTH + 10);
+        let state = state_with(&["s1"], json!([row_column("s1", &long)]));
+        let (_, width) = row_column_cells(&state, "s1", PLUGIN_REGION_MAX_WIDTH);
+        assert_eq!(width, PLUGIN_REGION_MAX_WIDTH);
+    }
+
+    #[test]
+    fn badge_column_pads_so_the_path_stays_aligned() {
+        // s2 has no badge; both rows must start the path at the same column.
+        let state = state_with(
+            &["s1", "s2"],
+            json!([row_badge("s1", json!({"text": "changes requested"}))]),
+        );
+        let painted = rows(&state);
+        assert_eq!(
+            column_of(&painted, "/tmp/s1"),
+            column_of(&painted, "/tmp/s2")
+        );
+    }
+
+    #[test]
+    fn cleared_and_icon_only_badges_reserve_no_width() {
+        // Both render nothing, so the path sits where it does with no entries.
+        for payload in [json!({"items": []}), json!({"icon": "git-pull-request"})] {
+            let state = state_with(&["s1"], json!([row_badge("s1", payload.clone())]));
+            assert_eq!(column_of(&rows(&state), "/tmp/s1"), 41, "{payload}");
+        }
+    }
+
+    #[test]
+    fn long_badge_text_is_capped_to_the_badge_budget() {
+        let long = "b".repeat(ROW_BADGE_MAX_WIDTH + 20);
+        let state = state_with(&["s1"], json!([row_badge("s1", json!({"text": long}))]));
+        let (cells, width) = row_badge_cells(&state, "s1");
+        assert_eq!(width, ROW_BADGE_MAX_WIDTH);
+        assert!(cells[0].0.ends_with('\u{2026}'));
+        let painted = rows(&state);
+        assert!(painted.iter().any(|l| l.contains("/tmp/s1")), "{painted:?}");
     }
 
     #[test]

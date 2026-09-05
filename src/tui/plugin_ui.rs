@@ -4,9 +4,9 @@
 //! `StatusBar` (global) and `DetailBadge` (per-session) text, tone-colored,
 //! plus `Notification` toasts, and `Pane` (per session) and `HomePane` (global)
 //! blocks in a toggleable overlay (#2467); the remote-home picker shows
-//! `RowColumn` text per session row
-//! (#2948). Icons, tooltips, hrefs, and the
-//! `Card`/`RowBadge`/`SortKey`/`FilterFacet` slots have no TUI surface here and
+//! `RowBadge` (#2947) and `RowColumn` (#2948) text per session row.
+//! Icons, tooltips, hrefs, and the
+//! `Card`/`SortKey`/`FilterFacet` slots have no TUI surface here and
 //! are ignored.
 //!
 //! Kept side-effect-free so the render layer can borrow the snapshot and so the
@@ -72,6 +72,35 @@ pub fn row_column_cells(snapshot: &UiSnapshot, session_id: &str) -> Vec<(String,
     session_entries(snapshot, UiSlot::RowColumn, session_id)
         .filter_map(|e| entry_text(e).map(|t| (t.to_string(), entry_tone(e))))
         .collect()
+}
+
+/// This session's `RowBadge` chips as `(text, tone)`, in snapshot order
+/// (#2947). One entry is either a single badge or a list of them under `items`,
+/// so the picker row can show several chips the way the web sidebar does.
+///
+/// The presence of `items` selects the list form: the documented `items: []`
+/// clears the row rather than falling back to the entry's own `text`, and a
+/// malformed `items` clears it too rather than silently rendering the other
+/// form. A badge carrying only an `icon` yields nothing, since a lucide name
+/// has no terminal glyph and a generic stand-in would keep the badge's presence
+/// while dropping which state it meant. `tooltip` and `href` have no terminal
+/// surface either; opening the `href` is tracked as #2528.
+pub fn row_badge_cells(snapshot: &UiSnapshot, session_id: &str) -> Vec<(String, Option<Tone>)> {
+    session_entries(snapshot, UiSlot::RowBadge, session_id)
+        .flat_map(|e| match e.payload.get("items") {
+            Some(items) => items
+                .as_array()
+                .map(|items| items.iter().filter_map(badge_cell).collect())
+                .unwrap_or_default(),
+            None => badge_cell(&e.payload).into_iter().collect::<Vec<_>>(),
+        })
+        .collect()
+}
+
+/// One badge's renderable `(text, tone)`, from either a whole `row-badge`
+/// payload or one element of its `items` list: the two carry the same fields.
+fn badge_cell(badge: &Value) -> Option<(String, Option<Tone>)> {
+    Some((block_str(badge, "text")?.to_string(), block_tone(badge)))
 }
 
 /// Map a tone to a foreground style against the active theme. `None` (no tone)
@@ -697,7 +726,8 @@ fn section_lines(block: &Value, indent: usize, theme: &Theme) -> Vec<Line<'stati
     out
 }
 
-/// The block's tone, if it carries a valid one.
+/// The tone of a pane block or a `row-badge` payload, if it carries a valid
+/// one. Both spell the field the same way.
 fn block_tone(block: &Value) -> Option<Tone> {
     block
         .get("tone")
@@ -711,8 +741,9 @@ fn value_tone(block: &Value) -> Option<Tone> {
         .and_then(|v| serde_json::from_value::<Tone>(v.clone()).ok())
 }
 
-/// A trimmed, non-empty string field, or `None`. Defensive against a malformed
-/// or schema-skewed block so the renderer never panics on plugin data.
+/// A trimmed, non-empty string field of a plugin-authored object, or `None`.
+/// Defensive against a malformed or schema-skewed payload so the renderer never
+/// panics on plugin data.
 fn block_str<'a>(block: &'a Value, key: &str) -> Option<&'a str> {
     block
         .get(key)
@@ -929,6 +960,79 @@ mod tests {
             row_column_cells(&snap, "s1"),
             vec![("kept".to_string(), None)]
         );
+    }
+
+    #[test]
+    fn row_badge_cells_read_both_payload_forms() {
+        // One badge payload and the cells it must yield. Covers the single
+        // badge form, the `items` list, and every shape that renders nothing.
+        let cases: [(serde_json::Value, &[(&str, Option<Tone>)]); 9] = [
+            // Single badge: text and tone kept, the web-only fields dropped.
+            (
+                json!({"text": "open", "tone": "success", "icon": "git-pull-request",
+                       "href": "https://example.test/1", "tooltip": "dropped"}),
+                &[("open", Some(Tone::Success))],
+            ),
+            // Items keep snapshot order and carry their own tones.
+            (
+                json!({"items": [{"text": "draft"}, {"text": "2 checks", "tone": "warn"}]}),
+                &[("draft", None), ("2 checks", Some(Tone::Warn))],
+            ),
+            // The documented "clear the row" form.
+            (json!({"items": []}), &[]),
+            // `items` present selects the list form, so the entry's own text
+            // is not a fallback: a plugin clearing the row means it.
+            (json!({"text": "stale", "items": []}), &[]),
+            (
+                json!({"text": "outer", "items": [{"text": "inner"}]}),
+                &[("inner", None)],
+            ),
+            // Malformed `items` clears the row rather than quietly rendering
+            // the other form.
+            (json!({"text": "stale", "items": 7}), &[]),
+            // A lucide name has no terminal glyph, so an icon-only badge
+            // yields nothing; its text-carrying neighbours still render.
+            (json!({"icon": "git-pull-request"}), &[]),
+            (
+                json!({"items": [{"icon": "check"}, {"text": "kept"}, {"text": "  "}, {"text": 7}]}),
+                &[("kept", None)],
+            ),
+            // An unreadable tone degrades to neutral rather than dropping text.
+            (
+                json!({"text": "kept", "tone": "chartreuse"}),
+                &[("kept", None)],
+            ),
+        ];
+        for (payload, expected) in cases {
+            let snap = pane_snapshot(json!([
+                {"plugin_id": "gh", "slot": "row-badge", "id": "pr",
+                 "session_id": "s1", "payload": payload}
+            ]));
+            let expected: Vec<(String, Option<Tone>)> = expected
+                .iter()
+                .map(|(t, tone)| ((*t).to_string(), *tone))
+                .collect();
+            assert_eq!(row_badge_cells(&snap, "s1"), expected);
+        }
+    }
+
+    #[test]
+    fn row_badge_cells_read_this_session_and_slot_only() {
+        let snap = pane_snapshot(json!([
+            {"plugin_id": "gh", "slot": "row-badge", "id": "pr", "session_id": "s1",
+             "payload": {"text": "mine"}},
+            {"plugin_id": "gh", "slot": "row-badge", "id": "pr", "session_id": "s2",
+             "payload": {"text": "theirs"}},
+            {"plugin_id": "gh", "slot": "row-badge", "id": "pr",
+             "payload": {"text": "global"}},
+            {"plugin_id": "gh", "slot": "row-column", "id": "col", "session_id": "s1",
+             "payload": {"text": "column"}}
+        ]));
+        assert_eq!(
+            row_badge_cells(&snap, "s1"),
+            vec![("mine".to_string(), None)]
+        );
+        assert!(row_badge_cells(&snap, "s3").is_empty());
     }
 
     #[test]

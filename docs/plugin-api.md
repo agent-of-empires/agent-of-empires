@@ -366,6 +366,11 @@ id = "my_pane"
 | `composer-action` | per-session | A button beside the ACP composer controls (requires `api_version >= 8`). |
 | `notification` | n/a | A transient notification pushed via `ui.notify`; gated by the `notifications` capability, not a slot declaration. |
 
+The native TUI's daemon-connected session picker renders `row-badge` and
+`row-column` as tone-colored text, sharing one bounded column between them. A
+badge carrying only an `icon` renders nothing there, since a lucide name has no
+terminal glyph: send `text` for a badge that should be visible in a terminal.
+
 ### Pane payload
 
 A `pane` entry renders a dockable tool-window. The worker pushes it with
