@@ -497,23 +497,26 @@ export function useLiveTerminal(
     };
   }, [sessionId, wsPath, setState]);
 
-  const sendData = useCallback((data: string) => {
+  /** True when the pane will receive `data`: sent now, or queued for a flush
+   *  that is still expected. False means it was dropped and no caller may
+   *  treat it as delivered. */
+  const sendData = useCallback((data: string): boolean => {
     const ws = wsRef.current;
     const canSend = ownerKnownRef.current && storeRef.current!.snapshot.isOwner;
     if (canSend && ws?.readyState === WebSocket.OPEN) {
       ws.send(new TextEncoder().encode(data));
-      return;
+      return true;
     }
     // A confirmed non-owner must not leave keystrokes queued for a later
     // takeover. Only the short, unresolved initial handshake (or a socket
     // reconnect while we were the owner) may retain input.
-    if (ownerKnownRef.current && !storeRef.current!.snapshot.isOwner) return;
+    if (ownerKnownRef.current && !storeRef.current!.snapshot.isOwner) return false;
     const bytes = new TextEncoder().encode(data);
     const pending = pendingInputRef.current;
     const used = pending.reduce((total, item) => total + item.byteLength, 0);
-    if (bytes.byteLength <= MAX_PENDING_INPUT_BYTES - used) {
-      pending.push(bytes);
-    }
+    if (bytes.byteLength > MAX_PENDING_INPUT_BYTES - used) return false;
+    pending.push(bytes);
+    return true;
   }, []);
 
   /** Explicit take-over from a read-only viewer: steal the size-owner lock

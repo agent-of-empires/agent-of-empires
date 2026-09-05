@@ -224,6 +224,13 @@
       ]
     },
     {
+      "id": "terminal.mobile-ime-word-commit",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/MobileLiveTerminal.composition.test.tsx"],
+      "components": ["web/src/components/MobileLiveTerminal.tsx"]
+    },
+    {
       "id": "terminal.mobile-live-scrollback",
       "kind": "mocked-playwright",
       "risk": "high",
