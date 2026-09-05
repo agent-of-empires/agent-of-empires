@@ -17,7 +17,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import { ApprovalCard } from "./ApprovalCard";
-import type { Approval, ApprovalDecision } from "../../lib/acpTypes";
+import type { Approval } from "../../lib/acpTypes";
 
 vi.mock("../../lib/connectionState", () => ({
   useServerDown: () => false,
