@@ -34,8 +34,9 @@ use super::config_options::{
 };
 use super::control::{establish_session_v2, prompt_outcome_to_response, DaemonControlClient};
 use super::delete::handle_delete_session_cmd;
-use super::errors::is_unsupported_session_error;
-use super::errors::{acp_internal_error, AcpError, IncompatibleAgentError};
+use super::errors::{
+    acp_internal_error, is_unsupported_session_error, AcpError, IncompatibleAgentError,
+};
 use super::fs_handlers::{handle_read_text_file, handle_write_text_file};
 use super::handshake::{build_initialize_request, should_fork};
 use super::lifecycle::{

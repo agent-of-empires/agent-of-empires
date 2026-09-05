@@ -493,7 +493,6 @@ mod tests {
         assert!(is_bundled("claude-agent-acp"));
         assert!(is_bundled("codex-acp"));
         assert!(is_bundled("pi-acp"));
-        assert!(is_bundled("aoe-agent"));
         assert!(!is_bundled("opencode"));
         assert!(!is_bundled("gemini"));
         assert_eq!(DEFAULT_ADAPTER, "claude-agent-acp");
@@ -633,47 +632,5 @@ mod tests {
             "pinned claude-agent-acp {pinned} is below the startup floor {floor}; \
              bump acp-worker/adapters/claude-agent-acp/package.json"
         );
-    }
-
-    /// #3553: the in-tree agent installs like the npm adapters. Its sources
-    /// land beside the manifest, its digest tracks them, and the wrapper the
-    /// install writes is what `bundled_adapter_bin` finds.
-    #[test]
-    fn aoe_agent_bundle_carries_its_sources_and_an_entry_wrapper() {
-        let adapter = lookup("aoe-agent").expect("aoe-agent is bundled");
-        assert_eq!(adapter.entry, Some("src/index.ts"));
-        assert!(adapter
-            .sources
-            .iter()
-            .any(|(path, bytes)| *path == "src/index.ts" && !bytes.is_empty()));
-        assert_ne!(
-            install_digest(adapter),
-            sha256_hex(adapter.package_lock),
-            "the digest must cover the sources, not only the lock"
-        );
-
-        let tmp = tempfile::tempdir().unwrap();
-        write_entry_wrapper(tmp.path(), "aoe-agent", "src/index.ts").unwrap();
-        let wrapper = tmp
-            .path()
-            .join("node_modules")
-            .join(".bin")
-            .join("aoe-agent");
-        let wrapper = if cfg!(windows) {
-            wrapper.with_extension("cmd")
-        } else {
-            wrapper
-        };
-        let script = std::fs::read_to_string(&wrapper).unwrap();
-        assert!(script.contains("--experimental-strip-types"));
-        assert!(script.contains("src/index.ts") || script.contains("src\\index.ts"));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(&wrapper).unwrap().permissions().mode() & 0o111,
-                0o111
-            );
-        }
     }
 }

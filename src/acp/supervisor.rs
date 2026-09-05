@@ -829,6 +829,12 @@ impl<S: BroadcastSink> Supervisor<S> {
         lock_recover(&self.incompatible_binaries).remove(session_id);
     }
 
+    /// A user-initiated resume overrides a stop kept from a resume that
+    /// failed before it installed.
+    pub fn forget_stale_cancel(&self, session_id: &str) {
+        lock_recover(&self.lifecycle).forget_stale_cancel(session_id);
+    }
+
     /// Ask the reconciler to fresh-spawn these sessions on its next tick,
     /// bypassing the `attempted` guard. Idempotent. See #2109.
     pub fn request_respawn(&self, session_id: &str) {
@@ -1631,8 +1637,10 @@ impl<S: BroadcastSink> Supervisor<S> {
             Err(AdmitError::Cancelled(reason)) => {
                 // The resume this stop was asked of failed before it
                 // installed; the stop stands, so this admission (the
-                // reconciler's fallback) is the one that publishes it.
+                // reconciler's fallback) is the one that publishes it, off
+                // the locks.
                 drop(table);
+                drop(_workers);
                 self.publish_next(session_id, &Event::Stopped { reason });
                 return Err(SupervisorError::SpawnCancelled(session_id.to_string()));
             }
@@ -2145,7 +2153,16 @@ impl<S: BroadcastSink> Supervisor<S> {
                 continue;
             }
             match claim.identity {
-                Some(identity) => warn!(
+                // Loud for the first few ticks; a process that ignores
+                // SIGKILL for longer is in the kernel's hands, not ours.
+                Some(identity) if claim.attempts <= 3 => warn!(
+                    target: "acp.supervisor",
+                    session = %id,
+                    pid = identity.pid,
+                    attempt = claim.attempts,
+                    "runner still alive after SIGKILL; retrying teardown"
+                ),
+                Some(identity) => debug!(
                     target: "acp.supervisor",
                     session = %id,
                     pid = identity.pid,

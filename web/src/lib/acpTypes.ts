@@ -1478,6 +1478,11 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       next.monitorWorkSeen = false;
       next.monitorDescription = null;
     }
+    // A stop for any reason but the limit itself ends the park, matching the
+    // daemon's durable park the sidebar badge reads.
+    if (event.Stopped.reason !== "rate_limited" && event.Stopped.reason !== "rate_limit_exhausted_retries") {
+      next.rateLimit = null;
+    }
     if (event.Stopped.reason === "user_stopped") {
       next.workerStopped = true;
       next.workerRestarting = false;

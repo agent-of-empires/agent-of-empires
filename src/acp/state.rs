@@ -1436,7 +1436,7 @@ impl AcpState {
             Event::CancelRequested { .. } => {
                 self.cancelling = true;
             }
-            Event::Stopped { .. } => {
+            Event::Stopped { ref reason } => {
                 // The turn is over however it ended (completion, cancel, killed
                 // worker), so clear every in-turn phase. This is the
                 // self-healing clear for a dropped compaction marker (#3219),
@@ -1448,6 +1448,11 @@ impl AcpState {
                 self.compacting = false;
                 self.in_flight_tool = None;
                 self.thinking = None;
+                // A stop for any other reason ends a rate-limit park, as it
+                // does for the durable park the sidebar reads.
+                if reason != "rate_limited" && reason != RATE_LIMIT_EXHAUSTED_RETRIES_REASON {
+                    self.rate_limit = None;
+                }
             }
             Event::AgentStartupError { .. } => {
                 self.turn_active = false;

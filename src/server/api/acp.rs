@@ -466,6 +466,9 @@ pub async fn spawn_acp(
         })
     };
 
+    // An explicit resume overrides a stop kept from a resume that failed
+    // before it installed; only the reconciler's fallback must honor it.
+    state.acp_supervisor.forget_stale_cancel(&id);
     let spawn_result = state
         .acp_supervisor
         .spawn(crate::acp::supervisor::SpawnRequest {
@@ -1087,6 +1090,9 @@ pub async fn switch_acp_agent(
     let source_profile = Some(instance.source_profile.clone());
 
     let model = req.model.clone().or(instance.agent_model.clone());
+    // An explicit resume overrides a stop kept from a resume that failed
+    // before it installed; only the reconciler's fallback must honor it.
+    state.acp_supervisor.forget_stale_cancel(&id);
     let spawn_result = state
         .acp_supervisor
         .spawn(crate::acp::supervisor::SpawnRequest {

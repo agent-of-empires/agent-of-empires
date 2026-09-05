@@ -197,14 +197,23 @@ pub fn summarize(servers: &[ResolvedMcpServer]) -> String {
 }
 
 /// The environment a host session of `profile` launches with, as far as it
-/// can be known without spawning: the static `environment` entries, values
-/// resolved. `host_hooks.before_session` output is only known at spawn, so
-/// the spawn path passes its minted environment instead (#3734).
+/// can be known without spawning: the static `environment` entries that
+/// carry a value. A bare key inherits from AoE's own environment, which the
+/// config-dir lookup already falls back to, so those are skipped here rather
+/// than warned about on every poll. `host_hooks.before_session` output is
+/// only known at spawn, so the spawn path passes its minted environment
+/// instead (#3734).
 pub fn session_env_for_discovery(profile: Option<&str>) -> Vec<(String, String)> {
     let cfg = crate::session::config::profile_config::resolve_config_or_warn(
         &crate::session::config::effective_profile(profile.unwrap_or_default()),
     );
-    crate::session::environment::resolve_host_environment_pairs(&cfg.environment)
+    let valued: Vec<String> = cfg
+        .environment
+        .iter()
+        .filter(|entry| entry.contains('='))
+        .cloned()
+        .collect();
+    crate::session::environment::resolve_host_environment_pairs(&valued)
 }
 
 /// Resolve the effective MCP server set for a session context, applying the
@@ -817,8 +826,6 @@ fn read_codex_toml(path: &Path) -> Result<NativeRead> {
 
 #[cfg(test)]
 mod tests {
-    /// #3734: discovery reads the file the agent will read. The session's
-    /// own environment outranks the daemon's, and a later entry (a
     /// The static profile `environment` reaches discovery the way it
     /// reaches a host launch, so both resolve the same config dir (#3734).
     #[test]
@@ -841,6 +848,8 @@ mod tests {
         );
     }
 
+    /// #3734: discovery reads the file the agent will read. The session's
+    /// own environment outranks the daemon's, and a later entry (a
     /// `before_session` value applied on top of the static profile
     /// environment) outranks an earlier one.
     #[test]

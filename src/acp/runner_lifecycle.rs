@@ -235,6 +235,12 @@ impl LifecycleTable {
         *slot = (*slot).max(generation);
     }
 
+    /// Drop a stop kept for the next admission: the user is resuming the
+    /// session on purpose, so the earlier stop no longer applies.
+    pub fn forget_stale_cancel(&mut self, session_id: &str) {
+        self.stale_cancels.remove(session_id);
+    }
+
     /// Drop everything remembered for a session that no longer exists.
     pub fn forget(&mut self, session_id: &str) {
         self.entries.remove(session_id);

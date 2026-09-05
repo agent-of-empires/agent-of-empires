@@ -184,7 +184,9 @@ rate_limit_auto_resume = true
 ```
 
 The setting is editable in the structured view settings (TUI and web
-dashboard) and can be overridden per profile. Resume fires once the reported
+dashboard) and can be overridden per profile. The park survives a resume
+that fails to start: the sidebar badge and the banner stay until the worker
+is back or the session is stopped for another reason. Resume fires once the reported
 reset time plus a fixed 15-second cushion passes, and the reset time survives
 an `aoe serve` restart. With no reported reset time, resume retries an hour
 after the park, and each further attempt waits twice as long as the last: 1h,

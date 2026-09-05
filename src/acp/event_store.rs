@@ -1153,7 +1153,7 @@ impl EventStore {
     /// daemon died would render Idle until the next lifecycle event arrived.
     /// See #1103.
     ///
-    /// Unlike [`Self::latest_status_event`] this set ALSO matches the
+    /// Unlike the rate-limit park query this set ALSO matches the
     /// agent-transcript activity events (`ThinkingStarted` /
     /// `AgentMessageChunk` / `ToolCallStarted`). The live status path
     /// (`derive_acp_status`) maps those to `Running`, so a turn that the
@@ -4086,9 +4086,8 @@ mod tests {
     /// `latest_seed_status_event` also matches agent-transcript activity
     /// events, so a turn the agent resumed on its own after a terminal
     /// `Stopped{prompt_complete}` (no new `UserPromptSent`) seeds Running,
-    /// not a stale Idle, across a daemon restart. `latest_status_event`
-    /// keeps ignoring those activity events so rate-limit park detection is
-    /// unaffected. See #2625.
+    /// not a stale Idle, across a daemon restart. The rate-limit park query
+    /// keeps ignoring those activity events. See #2625.
     #[test]
     fn latest_seed_status_event_sees_activity_after_stopped() {
         let (_tmp, store) = open_store(1000);
