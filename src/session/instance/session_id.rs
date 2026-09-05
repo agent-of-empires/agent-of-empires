@@ -4,6 +4,107 @@ use super::*;
 
 const SESSION_SIDECAR_MAX_BYTES: usize = 4096;
 const PRIME_AGENT_HEADER_MAX_BYTES: u64 = 64 * 1024;
+const PRIME_AGENT_SETTINGS_MAX_BYTES: usize = 64 * 1024;
+const PRIME_AGENT_HOME: &str = "/root/.prime/agent";
+const PRIME_AGENT_DEFAULT_SESSION_DIR: &str = "/root/.prime/agent/sessions";
+
+#[derive(Default)]
+struct PrimeAgentLaunchOptions {
+    cwd: Option<String>,
+    session_dir: Option<String>,
+    no_session: bool,
+}
+
+fn parse_prime_agent_launch_options(words: &[String]) -> Option<PrimeAgentLaunchOptions> {
+    const VALUE_OPTIONS: &[&str] = &[
+        "--mode",
+        "--daemon-socket",
+        "--provider",
+        "--model",
+        "--api-key",
+        "--system-prompt",
+        "--append-system-prompt",
+        "--fork",
+        "--models",
+        "--tools",
+        "-t",
+        "--thinking",
+        "--extension",
+        "-e",
+        "--skill",
+        "--prompt-template",
+        "--theme",
+        "--autonomous",
+        "--goal",
+        "--goal-token-budget",
+    ];
+
+    let mut options = PrimeAgentLaunchOptions::default();
+    let mut index = 1;
+    while let Some(argument) = words.get(index).map(String::as_str) {
+        match argument {
+            "--" => break,
+            "--no-session" => options.no_session = true,
+            "--cwd" | "--session-dir" => {
+                let value = words.get(index + 1)?.clone();
+                if argument == "--cwd" {
+                    options.cwd = Some(value);
+                } else {
+                    options.session_dir = Some(value);
+                }
+                index += 1;
+            }
+            _ if VALUE_OPTIONS.contains(&argument) => {
+                words.get(index + 1)?;
+                index += 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    Some(options)
+}
+
+fn resolve_prime_agent_path(value: &str, cwd: &Path) -> PathBuf {
+    let expanded = if value == "~" {
+        PathBuf::from("/root")
+    } else if let Some(relative) = value.strip_prefix("~/") {
+        Path::new("/root").join(relative)
+    } else {
+        PathBuf::from(value)
+    };
+    let absolute = if expanded.is_absolute() {
+        expanded
+    } else {
+        cwd.join(expanded)
+    };
+    crate::git::template::lexical_normalize(&absolute)
+}
+
+fn read_prime_agent_settings(
+    path: &Path,
+) -> anyhow::Result<Option<serde_json::Map<String, serde_json::Value>>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Prime Agent settings path has no parent"))?;
+    let leaf = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("Prime Agent settings path has no file name"))?;
+    let root = crate::session::AnchoredDir::open(parent)?;
+    let Some(bytes) = root.read_regular(Path::new(leaf), PRIME_AGENT_SETTINGS_MAX_BYTES)? else {
+        anyhow::bail!("Prime Agent settings are not a bounded regular file");
+    };
+    serde_json::from_slice::<serde_json::Value>(&bytes)?
+        .as_object()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Prime Agent settings root is not an object"))
+        .map(Some)
+}
 
 fn read_sandbox_sidecar_file(store: &Path, instance_id: &str, leaf: &str) -> Option<Vec<u8>> {
     crate::session::validate_instance_id(instance_id).ok()?;
@@ -14,36 +115,30 @@ fn read_sandbox_sidecar_file(store: &Path, instance_id: &str, leaf: &str) -> Opt
 }
 
 fn validated_prime_root_publication(
-    store: &Path,
+    plan: &PrimeAgentCapturePlan,
     instance_id: &str,
-    expected_cwd: &str,
 ) -> Option<String> {
     use std::io::{BufRead as _, Read as _};
 
-    let marker = read_sandbox_sidecar_file(store, instance_id, "root_only")?;
+    let marker = read_sandbox_sidecar_file(&plan.store, instance_id, "root_only")?;
     if std::str::from_utf8(&marker).ok()?.trim() != "1" {
         return None;
     }
-    let id = read_sandbox_sidecar_file(store, instance_id, "session_id")?;
+    let id = read_sandbox_sidecar_file(&plan.store, instance_id, "session_id")?;
     let id = std::str::from_utf8(&id).ok()?.trim();
     let id = crate::session::capture::validated_session_id(id.to_string())?;
-    let path = read_sandbox_sidecar_file(store, instance_id, "session_path")?;
-    let path = std::str::from_utf8(&path).ok()?.trim();
-    let relative = path.strip_prefix("/root/.prime/agent/")?;
-    let mut components = Path::new(relative).components();
-    if components.next()? != std::path::Component::Normal(std::ffi::OsStr::new("sessions")) {
+    let path = read_sandbox_sidecar_file(&plan.store, instance_id, "session_path")?;
+    let path = Path::new(std::str::from_utf8(&path).ok()?.trim());
+    if !path.is_absolute()
+        || crate::git::template::lexical_normalize(path) != path
+        || path.parent()? != plan.container_session_dir
+        || path.extension()?.to_str()? != "jsonl"
+    {
         return None;
     }
-    let file_name = match components.next()? {
-        std::path::Component::Normal(name) => name,
-        _ => return None,
-    };
-    if components.next().is_some() || Path::new(file_name).extension()?.to_str()? != "jsonl" {
-        return None;
-    }
-
-    let root = crate::session::AnchoredDir::open(store).ok()?;
-    let relative = Path::new("sessions").join(file_name);
+    let file_name = path.file_name()?;
+    let root = crate::session::AnchoredDir::open(&plan.store).ok()?;
+    let relative = plan.session_dir.join(file_name);
     let file = root.open_regular(&relative, usize::MAX).ok()??;
     let mut header = Vec::with_capacity(4096);
     let read = std::io::BufReader::new(file)
@@ -62,12 +157,111 @@ fn validated_prime_root_publication(
             .and_then(|value| value.as_str())
             .is_some_and(|cwd| {
                 crate::session::capture::canonicalize_or_raw(cwd)
-                    == crate::session::capture::canonicalize_or_raw(expected_cwd)
+                    == crate::session::capture::canonicalize_or_raw(&plan.container_cwd)
             });
     valid.then_some(id)
 }
 
 impl Instance {
+    pub(crate) fn prime_agent_capture_plan(&self) -> Option<PrimeAgentCapturePlan> {
+        if self.resolved_capture_backend() != Some(crate::agents::SessionCaptureBackend::PrimeAgent)
+            || !self.is_sandboxed()
+        {
+            return None;
+        }
+        let agent = self.resolved_agent()?;
+        if !self.launch_invokes_resolved_agent_directly(agent) {
+            return None;
+        }
+        let store = self.extension_config_bind_dir()?;
+        let config = self.build_container_config().ok()?;
+        self.prime_agent_capture_plan_with(&config, store)
+    }
+
+    fn prime_agent_capture_plan_with(
+        &self,
+        config: &crate::containers::ContainerConfig,
+        store: PathBuf,
+    ) -> Option<PrimeAgentCapturePlan> {
+        if !config.uses_default_container_home() {
+            return None;
+        }
+
+        let parsed = super::launch_command::parse_launch_command(self.get_tool_command())?;
+        let mut words = parsed.words;
+        words.extend(shell_words::split(&self.extra_args).ok()?);
+        let options = parse_prime_agent_launch_options(&words)?;
+        if options.no_session {
+            return None;
+        }
+
+        let launch_cwd = PathBuf::from(self.container_workdir());
+        let container_cwd = options.cwd.as_deref().map_or_else(
+            || launch_cwd.clone(),
+            |cwd| resolve_prime_agent_path(cwd, &launch_cwd),
+        );
+        if !container_cwd.is_absolute() {
+            return None;
+        }
+
+        let environment_value = |key: &str| {
+            config
+                .environment
+                .iter()
+                .find(|entry| entry.key() == key)
+                .map(|entry| entry.value())
+                .filter(|value| !value.is_empty())
+        };
+        let configured_session_dir = options
+            .session_dir
+            .filter(|value| !value.is_empty())
+            .or_else(|| environment_value("PRIME_AGENT_SESSION_DIR").map(str::to_string))
+            .or_else(|| {
+                environment_value("PRIME_AGENT_CODING_AGENT_SESSION_DIR").map(str::to_string)
+            });
+
+        let session_dir_value = if let Some(value) = configured_session_dir {
+            value
+        } else {
+            let global_container_path = Path::new(PRIME_AGENT_HOME).join("settings.json");
+            let project_container_path = container_cwd.join(".prime/agent/settings.json");
+            let global_host_path =
+                config.host_path_for_container_path(&global_container_path, false)?;
+            let project_host_path =
+                config.host_path_for_container_path(&project_container_path, false)?;
+            let global = read_prime_agent_settings(&global_host_path).ok()?;
+            let project = read_prime_agent_settings(&project_host_path).ok()?;
+            project
+                .as_ref()
+                .and_then(|settings| settings.get("sessionDir"))
+                .or_else(|| {
+                    global
+                        .as_ref()
+                        .and_then(|settings| settings.get("sessionDir"))
+                })
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(PRIME_AGENT_DEFAULT_SESSION_DIR)
+                .to_string()
+        };
+
+        let container_session_dir = resolve_prime_agent_path(&session_dir_value, &container_cwd);
+        let session_dir = container_session_dir
+            .strip_prefix(Path::new(PRIME_AGENT_HOME))
+            .ok()?
+            .to_path_buf();
+        if config.host_path_for_container_path(&container_session_dir, true)?
+            != store.join(&session_dir)
+        {
+            return None;
+        }
+        Some(PrimeAgentCapturePlan {
+            store,
+            session_dir,
+            container_session_dir,
+            container_cwd: container_cwd.to_str()?.to_string(),
+        })
+    }
     /// Acquire a pre-launch session ID for the agent.
     ///
     /// Returns `(session_id, is_existing)`. Explicit use, clear, and fork
@@ -392,6 +586,7 @@ impl Instance {
         backend.identity_publisher()?;
         if self.is_sandboxed() {
             let bind_dir = self.extension_config_bind_dir()?;
+            let config = self.build_container_config().ok()?;
             let (container_root, flag) = match backend {
                 crate::agents::SessionCaptureBackend::Pi => {
                     crate::session::config::container_config::install_pi_sandbox_extension_at(
@@ -401,6 +596,7 @@ impl Instance {
                     (Path::new("/root/.pi"), String::new())
                 }
                 crate::agents::SessionCaptureBackend::PrimeAgent => {
+                    self.prime_agent_capture_plan_with(&config, bind_dir.clone())?;
                     crate::session::config::container_config::install_prime_sandbox_extension_at(
                         &bind_dir,
                     )
@@ -419,7 +615,6 @@ impl Instance {
                 }
                 _ => return None,
             };
-            let config = self.build_container_config().ok()?;
             if !config.uses_default_container_home()
                 || !config.path_is_mounted(&bind_dir, container_root, true)
             {
@@ -447,7 +642,7 @@ impl Instance {
             return Some((
                 flag,
                 format!(
-                    "AOE_PI_SESSION_ID_FILE={}/{}/session_id ",
+                    "AOE_SESSION_ID_FILE={}/{}/session_id ",
                     sidecar_root, self.id
                 ),
             ));
@@ -458,14 +653,14 @@ impl Instance {
         {
             return None;
         }
-        let extension = super::launch_command::pi_extension_path().ok()?;
+        let extension = super::launch_command::session_identity_extension_path().ok()?;
         let sidecar = crate::hooks::ensure_instance_dir_path(&self.id)
             .ok()?
             .join("session_id");
         Some((
             format!(" -e {}", shell_escape(&extension.to_string_lossy())),
             format!(
-                "AOE_PI_SESSION_ID_FILE={} ",
+                "AOE_SESSION_ID_FILE={} ",
                 shell_escape(&sidecar.to_string_lossy())
             ),
         ))
@@ -484,14 +679,14 @@ impl Instance {
             return None;
         }
         match self.extension_sidecar_source()? {
-            PiSidecarSource::HostHooks => {
+            SessionSidecarSource::HostHooks => {
                 if any_age {
                     crate::hooks::read_hook_session_id_any_age(&self.id)
                 } else {
                     crate::hooks::read_hook_session_id(&self.id)
                 }
             }
-            PiSidecarSource::SandboxDir(_) => {
+            SessionSidecarSource::SandboxDir(_) => {
                 let raw = self.read_extension_sandbox_file("session_id")?;
                 let id = std::str::from_utf8(&raw).ok()?.trim();
                 uuid::Uuid::parse_str(id).ok().map(|_| id.to_string())
@@ -511,8 +706,8 @@ impl Instance {
 
     fn published_extension_session_path(&self) -> Option<String> {
         match self.extension_sidecar_source()? {
-            PiSidecarSource::HostHooks => crate::hooks::read_hook_session_path(&self.id),
-            PiSidecarSource::SandboxDir(_) => {
+            SessionSidecarSource::HostHooks => crate::hooks::read_hook_session_path(&self.id),
+            SessionSidecarSource::SandboxDir(_) => {
                 let raw = self.read_extension_sandbox_file("session_path")?;
                 let path = std::str::from_utf8(&raw).ok()?.trim();
                 path.starts_with('/').then(|| path.to_string())
@@ -521,22 +716,22 @@ impl Instance {
     }
 
     /// Where this Pi pane publishes, or None when that cannot be established.
-    pub(crate) fn pi_sidecar_source(&self) -> Option<PiSidecarSource> {
+    pub(crate) fn pi_sidecar_source(&self) -> Option<SessionSidecarSource> {
         (self.resolved_capture_backend() == Some(crate::agents::SessionCaptureBackend::Pi))
             .then(|| self.extension_sidecar_source())?
     }
 
-    fn extension_sidecar_source(&self) -> Option<PiSidecarSource> {
+    fn extension_sidecar_source(&self) -> Option<SessionSidecarSource> {
         self.resolved_capture_backend()?.identity_publisher()?;
         if self.is_sandboxed() {
             crate::session::validate_instance_id(&self.id).ok()?;
-            return Some(PiSidecarSource::SandboxDir(
+            return Some(SessionSidecarSource::SandboxDir(
                 self.extension_config_bind_dir()?
                     .join("aoe-session")
                     .join(&self.id),
             ));
         }
-        Some(PiSidecarSource::HostHooks)
+        Some(SessionSidecarSource::HostHooks)
     }
 
     fn extension_config_bind_dir(&self) -> Option<std::path::PathBuf> {
@@ -590,16 +785,8 @@ impl Instance {
     }
 
     fn prime_published_root_session_id(&self) -> Option<String> {
-        if self.resolved_capture_backend() != Some(crate::agents::SessionCaptureBackend::PrimeAgent)
-            || !self.is_sandboxed()
-        {
-            return None;
-        }
-        validated_prime_root_publication(
-            &self.extension_config_bind_dir()?,
-            &self.id,
-            &self.container_workdir(),
-        )
+        let plan = self.prime_agent_capture_plan()?;
+        validated_prime_root_publication(&plan, &self.id)
     }
 
     fn absorb_published_prime_session(&mut self) {
@@ -610,13 +797,10 @@ impl Instance {
 
     pub(crate) fn prime_root_sidecar_poll_fn(
         &self,
+        plan: PrimeAgentCapturePlan,
     ) -> Box<dyn Fn() -> Option<String> + Send + 'static> {
-        let Some(store) = self.extension_config_bind_dir() else {
-            return Box::new(|| None);
-        };
         let instance_id = self.id.clone();
-        let expected_cwd = self.container_workdir();
-        Box::new(move || validated_prime_root_publication(&store, &instance_id, &expected_cwd))
+        Box::new(move || validated_prime_root_publication(&plan, &instance_id))
     }
 
     pub(crate) fn uses_pi_session_sidecar(&self) -> bool {
@@ -627,11 +811,13 @@ impl Instance {
 
     fn extension_sidecar_exists(&self) -> bool {
         match self.extension_sidecar_source() {
-            Some(PiSidecarSource::SandboxDir(_)) => {
+            Some(SessionSidecarSource::SandboxDir(_)) => {
                 let relative = Path::new("aoe-session").join(&self.id).join("session_id");
                 self.extension_sandbox_regular_exists(&relative)
             }
-            Some(PiSidecarSource::HostHooks) => crate::hooks::session_id_sidecar_exists(&self.id),
+            Some(SessionSidecarSource::HostHooks) => {
+                crate::hooks::session_id_sidecar_exists(&self.id)
+            }
             None => false,
         }
     }
@@ -648,10 +834,10 @@ impl Instance {
                 crate::agents::SessionCaptureBackend::Pi
                 | crate::agents::SessionCaptureBackend::PrimeAgent,
             ) => match self.extension_sidecar_source() {
-                Some(PiSidecarSource::HostHooks) => {
+                Some(SessionSidecarSource::HostHooks) => {
                     let _ = crate::hooks::unlink_session_id_via_guard(&self.id);
                 }
-                Some(PiSidecarSource::SandboxDir(_)) => {
+                Some(SessionSidecarSource::SandboxDir(_)) => {
                     if let Some(root_path) = self.extension_config_bind_dir() {
                         if let Ok(root) = crate::session::AnchoredDir::open(&root_path) {
                             let base = Path::new("aoe-session").join(&self.id);
@@ -1328,7 +1514,7 @@ mod tests {
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
-            container_workdir: Some("/workspace".to_string()),
+            container_workdir: Some("/workspace/test".to_string()),
         });
 
         assert_eq!(inst.try_retroactive_capture(), None);
@@ -1338,6 +1524,100 @@ mod tests {
         assert!(inst.session_id_poller.is_some());
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn prime_capture_plan_follows_upstream_session_directory_precedence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(project.join(".prime/agent")).unwrap();
+        let mut inst = Instance::new("prime-plan", project.to_str().unwrap());
+        inst.tool = "prime-agent".to_string();
+        inst.sandbox_info = Some(SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test-image".to_string(),
+            container_name: "prime-plan".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: Some("/workspace/project".to_string()),
+        });
+        let store = inst.sandbox_capture_store_dir().unwrap();
+        std::fs::create_dir_all(&store).unwrap();
+        let mut config = inst.build_container_config().unwrap();
+
+        let plan = inst
+            .prime_agent_capture_plan_with(&config, store.clone())
+            .unwrap();
+        assert_eq!(plan.session_dir, Path::new("sessions"));
+
+        std::fs::write(
+            store.join("settings.json"),
+            serde_json::json!({"sessionDir": "~/.prime/agent/global"}).to_string(),
+        )
+        .unwrap();
+        let plan = inst
+            .prime_agent_capture_plan_with(&config, store.clone())
+            .unwrap();
+        assert_eq!(plan.session_dir, Path::new("global"));
+
+        std::fs::write(
+            project.join(".prime/agent/settings.json"),
+            serde_json::json!({"sessionDir": "~/.prime/agent/project"}).to_string(),
+        )
+        .unwrap();
+        let plan = inst
+            .prime_agent_capture_plan_with(&config, store.clone())
+            .unwrap();
+        assert_eq!(plan.session_dir, Path::new("project"));
+
+        config
+            .environment
+            .push(crate::containers::EnvEntry::Literal {
+                key: "PRIME_AGENT_CODING_AGENT_SESSION_DIR".to_string(),
+                value: "~/.prime/agent/legacy".to_string(),
+            });
+        let plan = inst
+            .prime_agent_capture_plan_with(&config, store.clone())
+            .unwrap();
+        assert_eq!(plan.session_dir, Path::new("legacy"));
+
+        config
+            .environment
+            .push(crate::containers::EnvEntry::Literal {
+                key: "PRIME_AGENT_SESSION_DIR".to_string(),
+                value: "~/.prime/agent/current".to_string(),
+            });
+        let plan = inst
+            .prime_agent_capture_plan_with(&config, store.clone())
+            .unwrap();
+        assert_eq!(plan.session_dir, Path::new("current"));
+
+        inst.extra_args = "--cwd /root/.prime/agent/work/../work --session-dir ../cli".to_string();
+        let plan = inst
+            .prime_agent_capture_plan_with(&config, store.clone())
+            .unwrap();
+        assert_eq!(plan.container_cwd, "/root/.prime/agent/work");
+        assert_eq!(plan.session_dir, Path::new("cli"));
+
+        inst.extra_args = "--no-session".to_string();
+        assert!(inst
+            .prime_agent_capture_plan_with(&config, store.clone())
+            .is_none());
+        inst.extra_args = "--session-dir /tmp/outside".to_string();
+        assert!(inst
+            .prime_agent_capture_plan_with(&config, store.clone())
+            .is_none());
+
+        inst.extra_args = "--session-dir ~/masked".to_string();
+        config.volumes.push(crate::containers::VolumeMount {
+            host_path: tmp.path().join("masked").to_string_lossy().into_owned(),
+            container_path: "/root/.prime/agent/masked".to_string(),
+            read_only: true,
+        });
+        assert!(inst.prime_agent_capture_plan_with(&config, store).is_none());
+    }
     #[test]
     #[serial_test::serial]
     fn prime_extension_root_only_keeps_parent_publication() {
@@ -1351,6 +1631,7 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         let mut inst = Instance::new("prime-root-only", project.to_str().unwrap());
         inst.tool = "prime-agent".to_string();
+        inst.extra_args = "--session-dir /root/.prime/agent/custom-sessions".to_string();
         inst.sandbox_info = Some(SandboxInfo {
             enabled: true,
             container_id: None,
@@ -1359,7 +1640,7 @@ mod tests {
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
-            container_workdir: Some("/workspace".to_string()),
+            container_workdir: Some("/workspace/project".to_string()),
         });
 
         let (launch, _, _, _) = inst.build_launch_command().unwrap();
@@ -1374,9 +1655,9 @@ mod tests {
         let store = inst.sandbox_capture_store_dir().unwrap();
         assert_eq!(
             std::fs::read(store.join("extensions/aoe-session-id.js")).unwrap(),
-            PI_SESSION_EXTENSION.as_bytes()
+            SESSION_IDENTITY_EXTENSION.as_bytes()
         );
-        let sessions = store.join("sessions");
+        let sessions = store.join("custom-sessions");
         std::fs::create_dir_all(sessions.join("children")).unwrap();
         let parent_id = "018f47a6-7b80-7cc3-98a2-37b5f486b2a1";
         let child_id = "018f47a6-7b80-7cc3-98a2-37b5f486b2a2";
@@ -1389,7 +1670,7 @@ mod tests {
                     "version": 3,
                     "id": parent_id,
                     "timestamp": "2026-09-05T00:00:00.000Z",
-                    "cwd": "/workspace",
+                    "cwd": "/workspace/project",
                     "rlmDepth": 0,
                 })
             ),
@@ -1402,7 +1683,7 @@ mod tests {
                 "version": 3,
                 "id": child_id,
                 "timestamp": "2026-09-05T00:00:01.000Z",
-                "cwd": "/workspace",
+                "cwd": "/workspace/project",
                 "rlmDepth": 1,
             })
         );
@@ -1424,19 +1705,19 @@ const context = (id, path, rlmDepth) => ({
   },
 });
 async function publish(target, rootOnly) {
-  process.env.AOE_PI_SESSION_ID_FILE = target;
+  process.env.AOE_SESSION_ID_FILE = target;
   if (rootOnly) process.env.AOE_SESSION_ROOT_ONLY = "1";
   else delete process.env.AOE_SESSION_ROOT_ONLY;
   let sessionStart;
   extension({ on(name, handler) { if (name === "session_start") sessionStart = handler; } });
   await sessionStart({}, context(
     "018f47a6-7b80-7cc3-98a2-37b5f486b2a1",
-    "/root/.prime/agent/sessions/parent.jsonl",
+    "/root/.prime/agent/custom-sessions/parent.jsonl",
     0,
   ));
   await sessionStart({}, context(
     "018f47a6-7b80-7cc3-98a2-37b5f486b2a2",
-    "/root/.prime/agent/sessions/children/child.jsonl",
+    "/root/.prime/agent/custom-sessions/children/child.jsonl",
     1,
   ));
   return readFileSync(target, "utf8").trim();
@@ -1447,7 +1728,7 @@ process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
 "#;
         let output = std::process::Command::new("node")
             .args(["--input-type=module", "--eval", script])
-            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/pi/aoe-session-id.js"))
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/session/aoe-session-id.js"))
             .arg(&sidecar)
             .arg(&default_sidecar)
             .output()
@@ -1466,18 +1747,26 @@ process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
         );
         assert_eq!(
             std::fs::read_to_string(&path_sidecar).unwrap().trim(),
-            "/root/.prime/agent/sessions/parent.jsonl"
+            "/root/.prime/agent/custom-sessions/parent.jsonl"
         );
 
         std::fs::write(&sidecar, child_id).unwrap();
-        std::fs::write(&path_sidecar, "/root/.prime/agent/sessions/child.jsonl").unwrap();
+        std::fs::write(
+            &path_sidecar,
+            "/root/.prime/agent/custom-sessions/child.jsonl",
+        )
+        .unwrap();
         assert_eq!(
             inst.prime_published_root_session_id(),
             None,
             "a direct child transcript must fail root validation"
         );
         std::fs::write(&sidecar, parent_id).unwrap();
-        std::fs::write(&path_sidecar, "/root/.prime/agent/sessions/parent.jsonl").unwrap();
+        std::fs::write(
+            &path_sidecar,
+            "/root/.prime/agent/custom-sessions/parent.jsonl",
+        )
+        .unwrap();
 
         let mut restarted: Instance =
             serde_json::from_str(&serde_json::to_string(&inst).unwrap()).unwrap();
@@ -1553,7 +1842,10 @@ process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
         // The host pane it must not be confused with does have a source.
         let mut host = Instance::new("pi-host-src", "/tmp/pi-unresolvable");
         host.tool = "pi".to_string();
-        assert_eq!(host.pi_sidecar_source(), Some(PiSidecarSource::HostHooks));
+        assert_eq!(
+            host.pi_sidecar_source(),
+            Some(SessionSidecarSource::HostHooks)
+        );
     }
 
     #[test]
@@ -1587,7 +1879,7 @@ process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
         let dir = reloaded
             .pi_sidecar_source()
             .and_then(|s| match s {
-                crate::session::instance::PiSidecarSource::SandboxDir(d) => Some(d),
+                crate::session::instance::SessionSidecarSource::SandboxDir(d) => Some(d),
                 _ => None,
             })
             .expect("a sandboxed pane has a bind-backed sidecar");
@@ -1634,7 +1926,7 @@ process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
             container_workdir: None,
             before_start_env: Vec::new(),
         });
-        let PiSidecarSource::SandboxDir(dir) = inst.pi_sidecar_source().unwrap() else {
+        let SessionSidecarSource::SandboxDir(dir) = inst.pi_sidecar_source().unwrap() else {
             panic!("sandboxed Pi must publish into its config bind");
         };
         std::fs::create_dir_all(&dir).unwrap();
@@ -1647,7 +1939,7 @@ process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
         assert_eq!(inst.pi_published_session_id(true), None);
         let poll = crate::session::capture::pi_sidecar_poll_fn(
             inst.id.clone(),
-            PiSidecarSource::SandboxDir(dir.clone()),
+            SessionSidecarSource::SandboxDir(dir.clone()),
         );
         assert!(poll().is_none());
 
@@ -1702,7 +1994,8 @@ process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
         };
 
         let inst = sandboxed_pi("piownconfig01");
-        let PiSidecarSource::SandboxDir(stale_sidecar) = inst.pi_sidecar_source().unwrap() else {
+        let SessionSidecarSource::SandboxDir(stale_sidecar) = inst.pi_sidecar_source().unwrap()
+        else {
             panic!("sandboxed Pi must publish into its config bind");
         };
         std::fs::create_dir_all(&stale_sidecar).unwrap();
@@ -1720,7 +2013,7 @@ pi = "~/.pi-personal"
         let (_, env_prefix) = declared
             .identity_extension_launch()
             .expect("declared sandbox config supports the pane extension");
-        assert!(env_prefix.contains("AOE_PI_SESSION_ID_FILE=/root/.pi/aoe-session/"));
+        assert!(env_prefix.contains("AOE_SESSION_ID_FILE=/root/.pi/aoe-session/"));
         declared.mark_pi_extension_launched_for_test();
         assert!(declared.pi_sidecar_source().is_some());
         assert!(declared.uses_pi_session_sidecar());

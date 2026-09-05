@@ -144,9 +144,21 @@ impl Instance {
         if !self.supports_session_poller() {
             return;
         }
+        let prime_plan = if backend == crate::agents::SessionCaptureBackend::PrimeAgent {
+            let Some(plan) = self.prime_agent_capture_plan() else {
+                return;
+            };
+            Some(plan)
+        } else {
+            None
+        };
         let managed_lease =
             if context == crate::agents::SessionCaptureContext::ManagedExclusiveStore {
-                let Some(store) = self.sandbox_capture_store_dir() else {
+                let Some(store) = prime_plan
+                    .as_ref()
+                    .map(|plan| plan.store.clone())
+                    .or_else(|| self.sandbox_capture_store_dir())
+                else {
                     return;
                 };
                 // Lease contention is the common multi-process loser path. Check it
@@ -301,14 +313,15 @@ impl Instance {
                 ))
             }
             crate::agents::SessionCaptureBackend::PrimeAgent => {
-                let Some(store) = self.sandbox_capture_store_dir() else {
+                let Some(plan) = prime_plan else {
                     return;
                 };
-                let preferred_sidecar = self.prime_root_sidecar_poll_fn();
+                let preferred_sidecar = self.prime_root_sidecar_poll_fn(plan.clone());
                 Box::new(prime_agent_poll_fn_sandboxed(
                     preferred_sidecar,
-                    store,
-                    self.container_workdir(),
+                    plan.store,
+                    plan.session_dir,
+                    plan.container_cwd,
                     self.id.clone(),
                     capture_floor_ms,
                     extra_excludes,
@@ -493,7 +506,7 @@ mod tests {
         host.tool = "pi".to_string();
         assert_eq!(
             host.pi_sidecar_source().and_then(|s| match s {
-                crate::session::instance::PiSidecarSource::SandboxDir(d) => Some(d),
+                crate::session::instance::SessionSidecarSource::SandboxDir(d) => Some(d),
                 _ => None,
             }),
             None,
@@ -515,7 +528,7 @@ mod tests {
         let dir = sandboxed
             .pi_sidecar_source()
             .and_then(|s| match s {
-                crate::session::instance::PiSidecarSource::SandboxDir(d) => Some(d),
+                crate::session::instance::SessionSidecarSource::SandboxDir(d) => Some(d),
                 _ => None,
             })
             .expect("a sandboxed pane reads its bind");

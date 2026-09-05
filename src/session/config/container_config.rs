@@ -1044,7 +1044,7 @@ pub(crate) const PRIME_AGENT_EXTENSION_IN_CONTAINER: &str =
     "/root/.prime/agent/extensions/aoe-session-id.js";
 
 fn install_session_extension_at(root: &Path, rel: &Path) -> Result<()> {
-    let source = crate::session::instance::PI_SESSION_EXTENSION;
+    let source = crate::session::instance::SESSION_IDENTITY_EXTENSION;
     let current = crate::session::read_file_no_follow(root, rel)?;
     if current.as_deref() != Some(source) {
         crate::session::replace_file_no_follow(root, rel, source.as_bytes())?;
@@ -2525,7 +2525,7 @@ mod tests {
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::write(
             outside.join("aoe-session-id.js"),
-            crate::session::instance::PI_SESSION_EXTENSION,
+            crate::session::instance::SESSION_IDENTITY_EXTENSION,
         )
         .unwrap();
         std::fs::create_dir_all(root.join("agent")).unwrap();

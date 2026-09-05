@@ -33,8 +33,8 @@
             # every other compile-time embedded asset has to be unioned in
             # explicitly: the acp-worker/adapters manifests that
             # src/acp/adapters.rs reads with include_bytes! (#3204), and
-            # assets/pi, the extension src/session/instance.rs materializes so
-            # pi can publish its own conversation id, and
+            # assets/session, the identity extension that lets supported agents
+            # publish their own conversation id, and
             # docker/Dockerfile, which the agent_compat test embeds to pin the
             # sandbox npm floor, and acp-worker/aoe-agent/package.json, which
             # the acp::node test embeds to pin `engines.node` to

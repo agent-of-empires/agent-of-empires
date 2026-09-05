@@ -1,12 +1,11 @@
-// Loaded by AoE with `pi -e`. Publishes the pane's current conversation to the
-// per-instance sidecar AoE reads, so a conversation started inside the pane
-// with `/new` is attributed to that pane rather than guessed from a store
-// keyed by cwd alone.
+// Loaded by AoE as an agent extension. Publishes the pane's current
+// conversation to the per-instance sidecar AoE reads, so a conversation
+// started inside the pane is attributed to that pane rather than guessed from
+// a store keyed by cwd alone.
 //
 // Two files: `session_id` (the uuid) and `session_path` (the absolute
-// transcript path). The path is what survives a worktree move, since pi
-// indexes sessions by the cwd they started in and `--session-id` only looks in
-// the current one.
+// transcript path). The path survives a worktree move when the agent indexes
+// sessions by their starting cwd.
 //
 // `session_start` covers startup, resume, fork, and new. Failures are
 // swallowed: publishing identity must never interfere with the agent.
@@ -14,7 +13,7 @@ import { mkdirSync, writeFileSync, renameSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 export default function (pi) {
-  const idTarget = process.env.AOE_PI_SESSION_ID_FILE;
+  const idTarget = process.env.AOE_SESSION_ID_FILE;
   const rootOnly = process.env.AOE_SESSION_ROOT_ONLY === "1";
 
   const writeAtomic = (target, value) => {

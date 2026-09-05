@@ -40,8 +40,8 @@ fn apply_yolo_mode(cmd: &mut String, yolo: &crate::agents::YoloMode, is_sandboxe
 /// Write the Pi session-id extension into the app dir and return its path.
 ///
 /// Rewritten when the content differs so an upgrade ships its own version.
-pub(super) fn pi_extension_path() -> Result<PathBuf> {
-    const SOURCE: &str = crate::session::instance::PI_SESSION_EXTENSION;
+pub(super) fn session_identity_extension_path() -> Result<PathBuf> {
+    const SOURCE: &str = crate::session::instance::SESSION_IDENTITY_EXTENSION;
     let root = crate::session::get_app_dir()?;
     let rel = Path::new("agent-extensions").join("pi-aoe-session-id.js");
     let path = root.join(&rel);
@@ -700,7 +700,7 @@ mod tests {
         let cmd = cmd.expect("a command");
         assert!(
             cmd.contains(&format!(
-                "AOE_PI_SESSION_ID_FILE={}/{}/session_id",
+                "AOE_SESSION_ID_FILE={}/{}/session_id",
                 crate::session::config::container_config::PI_SIDECAR_DIR_IN_CONTAINER,
                 inst.id
             )),
@@ -745,7 +745,7 @@ mod tests {
         assert_eq!(
             env.trim(),
             format!(
-                "AOE_PI_SESSION_ID_FILE={}/{}/session_id",
+                "AOE_SESSION_ID_FILE={}/{}/session_id",
                 crate::session::config::container_config::PI_SIDECAR_DIR_IN_CONTAINER,
                 inst.id
             )
@@ -767,14 +767,14 @@ mod tests {
                 agent,
                 Some((
                     " -e '/tmp/pi-aoe-session-id.js'".to_string(),
-                    "AOE_PI_SESSION_ID_FILE='/tmp/pi-session-id' ".to_string(),
+                    "AOE_SESSION_ID_FILE='/tmp/pi-session-id' ".to_string(),
                 )),
             )
             .unwrap();
         let command = command.unwrap();
 
         assert!(command.contains(" -e "), "missing Pi extension: {command}");
-        assert!(command.contains("AOE_PI_SESSION_ID_FILE="));
+        assert!(command.contains("AOE_SESSION_ID_FILE="));
         assert!(inst.pi_extension_launched);
     }
 
@@ -794,7 +794,7 @@ mod tests {
         let command = command.unwrap();
 
         assert!(!command.contains("pi-aoe-session-id.js"));
-        assert!(!command.contains("AOE_PI_SESSION_ID_FILE="));
+        assert!(!command.contains("AOE_SESSION_ID_FILE="));
         assert!(!inst.pi_extension_launched);
     }
 

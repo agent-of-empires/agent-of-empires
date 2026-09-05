@@ -40,10 +40,11 @@ mod hooks;
 mod kill;
 mod launch_command;
 
-/// The extension AoE loads into Pi so a pane publishes its own conversation.
-/// Written to the app dir for a host launch and into the Pi sandbox dir for a
-/// container one.
-pub(crate) const PI_SESSION_EXTENSION: &str = include_str!("../../../assets/pi/aoe-session-id.js");
+/// Identity extension shared by supported agents. AoE writes it to the app
+/// directory for host launches and into the agent's private sandbox bind for
+/// container launches.
+pub(crate) const SESSION_IDENTITY_EXTENSION: &str =
+    include_str!("../../../assets/session/aoe-session-id.js");
 mod lifecycle;
 mod merge;
 mod omp;
@@ -102,12 +103,13 @@ pub(crate) enum TerminalContextResume {
     ForkPending,
     PreviousFailure,
 }
-pub(crate) use types::{
-    PiSidecarSource, PriorToolSession, ResumeIntent, SandboxStoreTransitionPath,
-};
 pub use types::{
     PluginCreateIdempotency, SandboxInfo, TerminalInfo, View, WorkspaceInfo, WorkspaceRepo,
     WorktreeInfo,
+};
+pub(crate) use types::{
+    PrimeAgentCapturePlan, PriorToolSession, ResumeIntent, SandboxStoreTransitionPath,
+    SessionSidecarSource,
 };
 
 // Re-exported so each submodule can reach its siblings through `use super::*`.

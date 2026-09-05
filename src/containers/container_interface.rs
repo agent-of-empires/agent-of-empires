@@ -160,12 +160,11 @@ impl ContainerConfig {
             .collect()
     }
 
-    pub(crate) fn path_is_mounted(
+    pub(crate) fn host_path_for_container_path(
         &self,
-        host_path: &std::path::Path,
         container_path: &std::path::Path,
         writable: bool,
-    ) -> bool {
+    ) -> Option<std::path::PathBuf> {
         self.volumes
             .iter()
             .filter_map(|volume| {
@@ -174,11 +173,23 @@ impl ContainerConfig {
                     .ok()
                     .map(|relative| (volume, relative))
             })
-            .max_by_key(|(volume, _)| volume.container_path.len())
-            .is_some_and(|(volume, relative)| {
-                (!writable || !volume.read_only)
-                    && std::path::Path::new(&volume.host_path).join(relative) == host_path
+            .max_by_key(|(volume, _)| {
+                std::path::Path::new(&volume.container_path)
+                    .components()
+                    .count()
             })
+            .filter(|(volume, _)| !writable || !volume.read_only)
+            .map(|(volume, relative)| std::path::Path::new(&volume.host_path).join(relative))
+    }
+
+    pub(crate) fn path_is_mounted(
+        &self,
+        host_path: &std::path::Path,
+        container_path: &std::path::Path,
+        writable: bool,
+    ) -> bool {
+        self.host_path_for_container_path(container_path, writable)
+            .is_some_and(|mapped| mapped == host_path)
     }
 
     pub(crate) fn uses_default_container_home(&self) -> bool {
