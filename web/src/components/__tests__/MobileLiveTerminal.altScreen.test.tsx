@@ -39,9 +39,9 @@ function frame(over: Partial<LiveFrame>): LiveFrame {
 
 function renderTerm(f: LiveFrame, forwardWheel = vi.fn()) {
   const inputRef = createRef<HTMLTextAreaElement>();
-  const utils = render(
+  const view = (current: LiveFrame) => (
     <MobileLiveTerminal
-      frame={f}
+      frame={current}
       connected
       active
       reading={false}
@@ -60,11 +60,14 @@ function renderTerm(f: LiveFrame, forwardWheel = vi.fn()) {
       onInputFocusChange={vi.fn()}
       bottomAlign
       keyboardOpen={false}
-    />,
+    />
   );
+  const utils = render(view(f));
   const scroller = utils.container.querySelector("[data-live-terminal] > div") as HTMLElement;
   const rows = () => utils.container.querySelectorAll("[data-live-content] > div:not([aria-hidden])").length;
-  return { ...utils, scroller, rows, forwardWheel };
+  /** Deliver a new frame: the app's acknowledgement of forwarded input. */
+  const showFrame = (next: LiveFrame) => utils.rerender(view(next));
+  return { ...utils, scroller, rows, showFrame, forwardWheel };
 }
 
 describe("MobileLiveTerminal on the alternate screen", () => {
@@ -80,56 +83,43 @@ describe("MobileLiveTerminal on the alternate screen", () => {
     beforeEach(() => vi.useFakeTimers());
     afterEach(() => vi.useRealTimers());
 
-    it("releases one notch per frame acknowledgement, or per ack timeout", () => {
+    it("covers the whole drag, in bursts paced by frames and the ack timeout", () => {
       const f = frame({ altScreen: true, mouse: true, mouseSgr: true, lines: ["a", "b", "c", "", ""] });
-      const { scroller, forwardWheel, rerender } = renderTerm(f);
+      const { scroller, forwardWheel, showFrame } = renderTerm(f);
       const touch = (y: number) => [{ clientX: 40, clientY: y, identifier: 1, target: scroller }];
-      // A drag of three line-heights (lineH = 14 * 1.2 = 16.8px; gain 1.25).
+      // 200px of finger travel, geared by FORWARD_TOUCH_GAIN over a 16.8px
+      // line, asks for 14 lines: past one burst and past one round trip.
       fireEvent.touchStart(scroller, { touches: touch(200) });
-      fireEvent.touchMove(scroller, { touches: touch(200 + 45) });
-      expect(forwardWheel).toHaveBeenCalledTimes(1);
+      fireEvent.touchMove(scroller, { touches: touch(400) });
+      // Dragging down reveals older content, so the wheel goes up.
+      expect(forwardWheel).toHaveBeenCalledTimes(4);
+      expect(forwardWheel.mock.calls.every((call) => call[0] === true)).toBe(true);
 
-      // No frame yet: the next notch waits for the ack timeout.
+      // Inside the ack window with no frame back: nothing more goes out.
       act(() => {
         vi.advanceTimersByTime(30);
       });
-      expect(forwardWheel).toHaveBeenCalledTimes(1);
+      expect(forwardWheel).toHaveBeenCalledTimes(4);
 
-      // A new frame is the app's acknowledgement and releases a notch.
-      rerender(
-        <MobileLiveTerminal
-          frame={{ ...f, lines: ["A", "b", "c", "", ""], content: "A\nb\nc\n\n\n" }}
-          connected
-          active
-          reading={false}
-          sendResize={vi.fn()}
-          setWindow={vi.fn()}
-          setCadence={vi.fn()}
-          enterReading={vi.fn()}
-          returnToLive={vi.fn()}
-          sendData={vi.fn()}
-          uploadPastedImage={vi.fn(async () => null)}
-          forwardWheel={forwardWheel}
-          forwardButton={vi.fn()}
-          ctrlActiveRef={createRef<boolean>() as React.RefObject<boolean>}
-          clearCtrl={vi.fn()}
-          inputRef={createRef<HTMLTextAreaElement>()}
-          onInputFocusChange={vi.fn()}
-          bottomAlign
-          keyboardOpen={false}
-        />,
-      );
-      expect(forwardWheel).toHaveBeenCalledTimes(2);
+      // A frame is the acknowledgement and releases the next burst at once.
+      showFrame({ ...f, lines: ["A", "b", "c", "", ""], content: "A\nb\nc\n\n\n" });
+      expect(forwardWheel).toHaveBeenCalledTimes(8);
 
-      // Without a frame, the timeout releases the remaining notch.
+      // With no frame coming, the timeout keeps the gesture moving.
       act(() => {
         vi.advanceTimersByTime(60);
       });
-      expect(forwardWheel).toHaveBeenCalledTimes(3);
+      expect(forwardWheel).toHaveBeenCalledTimes(12);
       act(() => {
-        vi.advanceTimersByTime(200);
+        vi.advanceTimersByTime(60);
       });
-      expect(forwardWheel).toHaveBeenCalledTimes(3);
+      // The whole gesture lands: 14 lines asked for, 14 forwarded, none of
+      // the drag discarded by the queue bound.
+      expect(forwardWheel).toHaveBeenCalledTimes(14);
+      act(() => {
+        vi.advanceTimersByTime(500);
+      });
+      expect(forwardWheel).toHaveBeenCalledTimes(14);
     });
   });
 });

@@ -106,9 +106,16 @@ const FLICK_VELOCITY_WINDOW_MS = 100;
 const MOMENTUM_DECAY_PER_MS = 0.992;
 /** Momentum ends when velocity decays below this (px/ms). */
 const MOMENTUM_STOP_VELOCITY = 0.05;
-/** A full-screen app redraws remotely, so send a bounded stream of wheel
- * reports rather than dumping an entire fast drag into one network burst. */
-const MAX_QUEUED_TOUCH_NOTCHES = 16;
+/** Backlog a drag may build up. A finger crossing the pane asks for more lines
+ *  than one round trip can deliver, and the excess used to be discarded, so a
+ *  long drag moved a fraction of what it asked for. Deep enough to hold a
+ *  full-screen drag, while still bounding what a flick can queue. */
+const MAX_QUEUED_TOUCH_NOTCHES = 64;
+/** Notches released per acknowledgement. The app drains every wheel report it
+ *  has received before it repaints, so a small burst covers several lines for
+ *  the same round trip; one at a time made distance cost one trip per line.
+ *  Bounded so a flick still cannot outrun what the app can draw. */
+const NOTCH_BURST = 4;
 /** Forward-mode notches are paced to the app's redraws: the next one goes
  *  out when a frame arrives after the previous one, or after this long if
  *  none does, so a drag tracks what the app can actually show instead of
@@ -259,21 +266,23 @@ class FrameTimingProbe {
  *  notch of a gesture goes out at once; each later one waits for a frame to
  *  arrive (the app's acknowledgement) or for NOTCH_ACK_TIMEOUT_MS, so a long
  *  drag tracks what the app can actually show instead of racing ahead of it
- *  as a wheel storm. Opposite-direction input drops the pending run. */
+ *  as a wheel storm. Each release is a bounded burst rather than one notch,
+ *  because the app coalesces the reports it has received into one repaint.
+ *  Opposite-direction input drops the pending run. */
 class NotchPacer {
   private notches = 0;
-  private send: ((up: boolean) => void) | null = null;
+  private send: ((up: boolean, count: number) => void) | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private awaiting = false;
 
-  enqueue(notches: number, send: (up: boolean) => void) {
+  enqueue(notches: number, send: (up: boolean, count: number) => void) {
     if (this.notches !== 0 && Math.sign(this.notches) !== Math.sign(notches)) this.notches = 0;
     this.notches = Math.max(-MAX_QUEUED_TOUCH_NOTCHES, Math.min(MAX_QUEUED_TOUCH_NOTCHES, this.notches + notches));
     this.send = send;
     if (!this.awaiting) this.flush();
   }
 
-  /** A frame landed: release the next notch without waiting out the timer. */
+  /** A frame landed: release the next burst without waiting out the timer. */
   onFrame() {
     if (this.awaiting && this.notches !== 0) this.flush();
   }
@@ -291,8 +300,9 @@ class NotchPacer {
     this.awaiting = false;
     if (this.notches === 0 || !this.send) return;
     const up = this.notches < 0;
-    this.send(up);
-    this.notches += up ? 1 : -1;
+    const burst = Math.min(Math.abs(this.notches), NOTCH_BURST);
+    this.send(up, burst);
+    this.notches += up ? burst : -burst;
     if (this.notches !== 0) {
       this.awaiting = true;
       this.timer = setTimeout(() => this.flush(), NOTCH_ACK_TIMEOUT_MS);
@@ -1107,10 +1117,11 @@ export function MobileLiveTerminal({
       const { notches, remainder } = wheelNotches(wheelAccumRef.current, lineH || 16, MAX_QUEUED_TOUCH_NOTCHES);
       wheelAccumRef.current = remainder;
       if (notches === 0) return;
-      notchPacer.enqueue(notches, (up) => {
+      notchPacer.enqueue(notches, (up, count) => {
         if (!forwardModeRef.current) return;
         const { col } = pointerCell(clientX, clientY);
-        forwardWheel(up, mouseSgrRef.current, col, inputPaneMiddleRow());
+        const row = inputPaneMiddleRow();
+        for (let i = 0; i < count; i++) forwardWheel(up, mouseSgrRef.current, col, row);
       });
     },
     [lineH, notchPacer, pointerCell, forwardWheel, forwardModeRef, mouseSgrRef, inputPaneMiddleRow],
