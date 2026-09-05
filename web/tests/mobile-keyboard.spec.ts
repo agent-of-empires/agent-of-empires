@@ -355,7 +355,10 @@ test.describe("Mobile proxy input keydown handling", () => {
       const delivered = proxy.dispatchEvent(event);
       return { data: event.data, delivered, inputType: event.inputType };
     });
-    expect(input).toEqual({ data: "reselected", delivered: false, inputType: "insertText" });
+    // `delivered` is dispatchEvent's return: true means the default was NOT
+    // prevented, so the text also lands in the proxy textarea as IME context
+    // (forwardTerminalBeforeInput).
+    expect(input).toEqual({ data: "reselected", delivered: true, inputType: "insertText" });
     await expect
       .poll(() => terminal.liveMessages.map((message) => message.toString()).join("\n"))
       .toContain("reselected");
