@@ -323,6 +323,14 @@ function navigationKeySequence(e: TerminalKeyLike): string | null {
   }
 }
 
+const PLAIN_RUN_MAX = 64;
+
+/** Longest run of non-whitespace at the end of `run + typed`, capped: only the
+ *  word still under the caret can be swallowed by a retroactive composition. */
+function plainRunAfter(run: string, typed: string): string {
+  return (/\S*$/.exec(run + typed)?.[0] ?? "").slice(-PLAIN_RUN_MAX);
+}
+
 function specialKeySequence(e: TerminalKeyLike): string | null {
   switch (e.key) {
     case "Enter":
@@ -1119,6 +1127,14 @@ export function MobileLiveTerminal({
     },
     [stopMomentum, enqueueTouchWheelDelta, forwardModeRef],
   );
+  // The word being typed as plain `insertText` edits. Android IMEs (SwiftKey,
+  // #3746) spell a word out as plain edits and then, on space, wrap it in a
+  // composition after the fact, so `compositionend` carries the whole word a
+  // second time and "test" reached the pane as "testtest"; whatever the run
+  // already delivered is dropped from that word. Sending clears it below, so it
+  // stays a suffix of what the pane received and the strip can never swallow
+  // bytes the pane never saw; the two paths that continue a word re-arm it.
+  const plainRunRef = useRef("");
   // Typed input interrupts the coast. Without this, keystrokes sent in the
   // coast's 1-2s tail interleave with the wheel storm and the app is busy
   // redrawing scroll frames instead of echoing them (reported as "I start
@@ -1129,6 +1145,7 @@ export function MobileLiveTerminal({
     (data: string) => {
       stopMomentum();
       cancelTouchWheelQueue();
+      plainRunRef.current = "";
       sendDataRaw(data);
     },
     [sendDataRaw, stopMomentum, cancelTouchWheelQueue],
@@ -1532,16 +1549,24 @@ export function MobileLiveTerminal({
   const handleMobileKeyboardProxyInput = useCallback(
     (input: MobileKeyboardProxyInput) => {
       if (composingRef.current || input.isComposing) return;
+      const run = plainRunRef.current;
+      plainRunRef.current = "";
       switch (input.inputType) {
-        case "insertText":
-          if (input.data) sendKeys(input.data);
+        case "insertText": {
+          const data = input.data ?? "";
+          if (data) sendKeys(data);
+          plainRunRef.current = plainRunAfter(run, data);
           break;
+        }
         case "insertLineBreak":
         case "insertParagraph":
           sendKeys("\r");
           break;
         case "deleteContentBackward":
+          // One character, so the IME's word loses its last one too;
+          // `deleteWordBackward` is a separate input type and not forwarded.
           sendKeys("\x7f");
+          plainRunRef.current = run.slice(0, -1);
           break;
         case "insertFromPaste": {
           const text = input.data ?? "";
@@ -1680,7 +1705,13 @@ export function MobileLiveTerminal({
   const handleCompositionEnd = useCallback(
     (e: CompositionEvent) => {
       composingRef.current = false;
-      if (e.data) sendKeys(e.data);
+      const run = plainRunRef.current;
+      plainRunRef.current = "";
+      const data = e.data ?? "";
+      // The composition may have taken over a word already spelled out as plain
+      // edits; only the part the pane has not seen yet is new.
+      const rest = run && data.startsWith(run) ? data.slice(run.length) : data;
+      if (rest) sendKeys(rest);
       if (e.currentTarget instanceof HTMLTextAreaElement) e.currentTarget.value = "";
     },
     [sendKeys],
