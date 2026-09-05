@@ -111,16 +111,20 @@ const MOMENTUM_STOP_VELOCITY = 0.05;
  *  long drag moved a fraction of what it asked for. Deep enough to hold a
  *  full-screen drag, while still bounding what a flick can queue. */
 const MAX_QUEUED_TOUCH_NOTCHES = 64;
-/** Notches released per acknowledgement. The app drains every wheel report it
- *  has received before it repaints, so a small burst covers several lines for
- *  the same round trip; one at a time made distance cost one trip per line.
- *  Bounded so a flick still cannot outrun what the app can draw. */
-const NOTCH_BURST = 4;
-/** Forward-mode notches are paced to the app's redraws: the next one goes
- *  out when a frame arrives after the previous one, or after this long if
- *  none does, so a drag tracks what the app can actually show instead of
- *  racing ahead of it. */
-const NOTCH_ACK_TIMEOUT_MS = 48;
+/** Largest release. A burst costs one round trip whatever its size, because
+ *  the app drains every wheel report it has received before it repaints, so a
+ *  deep backlog is worth clearing in big steps. Bounded so a flick still
+ *  cannot outrun what the app can draw. */
+const NOTCH_BURST_MAX = 6;
+/** Backlog that each additional line in a burst is worth. A shallow queue,
+ *  which is what a slow drag builds, releases a line at a time and moves
+ *  smoothly; only a queue the finger is outrunning takes larger steps. */
+const NOTCH_BURST_DIVISOR = 4;
+/** Gap between releases when no frame comes back to acknowledge the last one.
+ *  One animation frame: the app acknowledges sooner than this whenever it can,
+ *  and a slower fallback made a drag feel sticky for as long as anything was
+ *  queued, which is most of a gesture. */
+const NOTCH_FALLBACK_GAP_MS = 16;
 /** Frames within this window feed the debug overlay's rate. */
 const DEBUG_RATE_WINDOW_MS = 2000;
 
@@ -264,10 +268,13 @@ class FrameTimingProbe {
 
 /** Paces forward-mode wheel notches to the remote app's redraws. The first
  *  notch of a gesture goes out at once; each later one waits for a frame to
- *  arrive (the app's acknowledgement) or for NOTCH_ACK_TIMEOUT_MS, so a long
+ *  arrive (the app's acknowledgement) or for NOTCH_FALLBACK_GAP_MS, so a long
  *  drag tracks what the app can actually show instead of racing ahead of it
- *  as a wheel storm. Each release is a bounded burst rather than one notch,
- *  because the app coalesces the reports it has received into one repaint.
+ *  as a wheel storm. Each release is sized to the backlog: a slow drag keeps
+ *  the queue shallow and moves a line at a time, while a queue the finger is
+ *  outrunning clears in larger steps, since the app coalesces the reports it
+ *  has received into one repaint either way. An emptied queue leaves nothing
+ *  pending, so the next line the finger earns goes out with no wait at all.
  *  Opposite-direction input drops the pending run. */
 class NotchPacer {
   private notches = 0;
@@ -300,12 +307,13 @@ class NotchPacer {
     this.awaiting = false;
     if (this.notches === 0 || !this.send) return;
     const up = this.notches < 0;
-    const burst = Math.min(Math.abs(this.notches), NOTCH_BURST);
+    const pending = Math.abs(this.notches);
+    const burst = Math.min(NOTCH_BURST_MAX, Math.ceil(pending / NOTCH_BURST_DIVISOR));
     this.send(up, burst);
     this.notches += up ? burst : -burst;
     if (this.notches !== 0) {
       this.awaiting = true;
-      this.timer = setTimeout(() => this.flush(), NOTCH_ACK_TIMEOUT_MS);
+      this.timer = setTimeout(() => this.flush(), NOTCH_FALLBACK_GAP_MS);
     }
   }
 }
