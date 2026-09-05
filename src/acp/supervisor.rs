@@ -1287,10 +1287,9 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// `resets_at` is when the resume fired, not a reset the agent reported:
     /// the reported reset plus grace when there was one, and a retry interval
     /// after the park when there was not (#3152). Don't word it as a reset on
-    /// any surface. This event doubles as the supersede marker: it becomes the
-    /// session's latest status event (see `latest_status_event`'s filter),
-    /// so the next reconciler tick no longer sees `Stopped{rate_limited}`
-    /// and falls through to a fresh spawn instead of re-parking. The web
+    /// any surface. The durable park (`rate_limit_park`) outlives this
+    /// breadcrumb; the reconciler names the id in `released_from_park` for
+    /// the tick that resumes it. The web
     /// reducer also keys off it to clear the rate-limit banner and drain a
     /// queued prompt. See #1722.
     pub fn publish_rate_limit_auto_resumed(
@@ -1629,6 +1628,14 @@ impl<S: BroadcastSink> Supervisor<S> {
             Err(AdmitError::TeardownPending) => {
                 return Err(SupervisorError::TeardownPending(session_id.to_string()))
             }
+            Err(AdmitError::Cancelled(reason)) => {
+                // The resume this stop was asked of failed before it
+                // installed; the stop stands, so this admission (the
+                // reconciler's fallback) is the one that publishes it.
+                drop(table);
+                self.publish_next(session_id, &Event::Stopped { reason });
+                return Err(SupervisorError::SpawnCancelled(session_id.to_string()));
+            }
         };
         if matches!(kind, ResumeKind::Spawn) {
             // Count every slot this daemon holds plus live detached runners
@@ -1956,6 +1963,15 @@ impl<S: BroadcastSink> Supervisor<S> {
         let mut client = match (self.launcher)(config.clone(), acp_session_id.clone()).await {
             Ok(c) => c,
             Err(err) => {
+                // A stop that landed during the launch owns the outcome; the
+                // reservation drop keeps it for the next admission to publish.
+                if lock_recover(&self.lifecycle)
+                    .cancel_requested(&lease)
+                    .is_some()
+                {
+                    self.reap_failed_launch(&lease).await;
+                    return Err(SupervisorError::SpawnCancelled(session_id));
+                }
                 if matches!(err, AcpError::IncompatibleAgent(_)) {
                     self.mark_incompatible_binary(&session_id, &config.spec.command);
                 }
@@ -2094,6 +2110,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                     session = %session_id,
                     "resume completed under a stale lease; runner torn down"
                 );
+                self.worker_notify.notify_waiters();
             }
         }
         SupervisorError::SpawnCancelled(session_id.to_string())
@@ -2236,6 +2253,11 @@ impl<S: BroadcastSink> Supervisor<S> {
                                 agent_unresponsive = true;
                             } else if reason == "rate_limited" {
                                 rate_limited = true;
+                            } else if reason == "session_reset" {
+                                // The stored session is gone (#3560); a fresh
+                                // spawn recovers it, which an attached handle
+                                // cannot do from here.
+                                startup_failed = true;
                             }
                         }
                         match &event {
@@ -7151,6 +7173,39 @@ cursor-acp-bridge = "agent acp"
         assert!(
             lock_recover(&sup.lifecycle).last_generation("s-disk") >= 9,
             "the record's generation bounds later marker authority"
+        );
+    }
+
+    /// A stop asked of a resume that then fails before install (a dead
+    /// runner socket on attach) must not be lost with that lease: the
+    /// reconciler's fallback spawn is refused once and publishes the stop.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_stop_during_a_failed_resume_refuses_the_fallback_spawn_once() {
+        let _home = isolate_home();
+        let sink = VecSink::new();
+        let sup = Supervisor::new(sink.clone());
+        let reservation = reserve(sup.begin_resume("s-lost", ResumeKind::Attach).await);
+        sup.shutdown("s-lost")
+            .await
+            .expect("a stop on a starting lease is a cancel");
+        drop(reservation);
+
+        let refused = sup.begin_resume("s-lost", ResumeKind::Spawn).await;
+        assert!(
+            matches!(refused, Err(SupervisorError::SpawnCancelled(_))),
+            "the fallback spawn must honor the stop"
+        );
+        assert_eq!(
+            stopped_reasons(&sink, "s-lost"),
+            vec!["user_stopped".to_string()]
+        );
+        assert!(
+            matches!(
+                sup.begin_resume("s-lost", ResumeKind::Spawn).await,
+                Ok(ResumeReservationOutcome::Reserved(_))
+            ),
+            "a later resume proceeds"
         );
     }
 

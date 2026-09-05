@@ -600,11 +600,9 @@ async fn sessions_turn_send(
                 ));
             }
         }
-        // As the user path does: this newer turn supersedes any interrupted
-        // prompt a rate-limit resume would otherwise redeliver (#3028).
-        deps.session_service
-            .clear_pending_initial_turn(&req.session_id)
-            .await;
+        // Unlike the user path, the pending initial turn is left alone: for
+        // a plugin session it may be the `sessions.create { initial_turn }`
+        // the worker has not delivered yet.
         deps.session_service
             .send_turn(
                 &caller,

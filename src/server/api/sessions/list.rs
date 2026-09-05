@@ -210,7 +210,12 @@ pub async fn list_sessions(
                                 .rate_limit_auto_resume
                             });
                         let park = workerless
-                            .then(|| store.rate_limit_park(&id).and_then(|park| park.info))
+                            .then(|| {
+                                store.rate_limit_park(&id).map(|park| {
+                                    park.info
+                                        .unwrap_or_else(crate::acp::state::RateLimitInfo::undated)
+                                })
+                            })
                             .flatten();
                         (i, auto_resume, park)
                     })

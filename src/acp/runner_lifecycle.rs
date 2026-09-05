@@ -93,12 +93,16 @@ struct Entry {
     phase: Phase,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdmitError {
     /// A worker is running or another task is mid-resume.
     AlreadyPresent,
     /// A previous runner has not been proven dead yet.
     TeardownPending,
+    /// A stop was asked of a resume that then failed before it installed;
+    /// the stop stands against this one admission (the reconciler's
+    /// fallback), carrying its reason.
+    Cancelled(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,6 +184,10 @@ pub struct LifecycleTable {
     /// Highest generation ever admitted or observed per session. Bounds
     /// restart-marker authority: a marker older than this is stale.
     last_generation: HashMap<String, u64>,
+    /// Stops asked of resumes that were abandoned before they installed,
+    /// consumed by the next `admit` so the reconciler cannot spawn over
+    /// the user's stop.
+    stale_cancels: HashMap<String, String>,
 }
 
 impl LifecycleTable {
@@ -188,6 +196,7 @@ impl LifecycleTable {
             entries: HashMap::new(),
             next_epoch: seed_epoch.max(1),
             last_generation: HashMap::new(),
+            stale_cancels: HashMap::new(),
         }
     }
 
@@ -230,6 +239,7 @@ impl LifecycleTable {
     pub fn forget(&mut self, session_id: &str) {
         self.entries.remove(session_id);
         self.last_generation.remove(session_id);
+        self.stale_cancels.remove(session_id);
     }
 
     pub fn last_generation(&self, session_id: &str) -> u64 {
@@ -246,6 +256,9 @@ impl LifecycleTable {
                 return Err(AdmitError::TeardownPending)
             }
             Some(_) => return Err(AdmitError::AlreadyPresent),
+        }
+        if let Some(reason) = self.stale_cancels.remove(session_id) {
+            return Err(AdmitError::Cancelled(reason));
         }
         let epoch = self.mint(session_id, kind == ResumeKind::Spawn);
         self.entries.insert(
@@ -291,14 +304,15 @@ impl LifecycleTable {
         let Some(entry) = self.current(lease) else {
             return false;
         };
-        if matches!(
-            entry.phase,
-            Phase::Starting { .. } | Phase::Respawning { .. }
-        ) {
-            self.entries.remove(&lease.session_id);
-            return true;
+        let cancel = match &entry.phase {
+            Phase::Starting { cancel, .. } | Phase::Respawning { cancel } => cancel.clone(),
+            _ => return false,
+        };
+        self.entries.remove(&lease.session_id);
+        if let Some(reason) = cancel {
+            self.stale_cancels.insert(lease.session_id.clone(), reason);
         }
-        false
+        true
     }
 
     /// Drop a running worker whose runner is left alive on disk (a
@@ -848,6 +862,26 @@ mod tests {
         assert_eq!(snap.get("b"), Some(&WorkerPhase::Running));
         assert_eq!(snap.get("c"), Some(&WorkerPhase::Running));
         assert_eq!(snap.len(), 2);
+    }
+
+    #[test]
+    fn a_stop_asked_of_an_abandoned_resume_refuses_the_next_admit_once() {
+        let mut table = LifecycleTable::new(1);
+        let lease = table.admit(ID, ResumeKind::Attach).unwrap();
+        assert!(matches!(
+            table.begin_stop(ID, "user_stopped"),
+            StopDecision::CancelRequested
+        ));
+        assert!(table.abandon(&lease), "the attach failed before install");
+        assert_eq!(
+            table.admit(ID, ResumeKind::Spawn),
+            Err(AdmitError::Cancelled("user_stopped".into())),
+            "the fallback spawn is refused with the stop's reason"
+        );
+        assert!(
+            table.admit(ID, ResumeKind::Spawn).is_ok(),
+            "the stop is honored once; a later resume proceeds"
+        );
     }
 
     #[test]

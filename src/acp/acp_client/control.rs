@@ -107,9 +107,9 @@ impl DaemonControlClient {
 
     /// Issue a turn and wait for the runner's `PromptCompleted`. An outcome
     /// left over from a turn the caller stopped waiting on is drained first;
-    /// one that arrives only after this prompt was issued is still taken as
-    /// this turn's, as before, since the daemon does not track the runner's
-    /// prompt request ids. A failed write resolves as `Aborted` at once.
+    /// one that arrives only after this prompt was issued is taken as this
+    /// turn's, since the daemon does not track the runner's prompt request
+    /// ids. A failed write resolves as `Aborted` at once.
     pub(super) async fn prompt(
         &self,
         request: serde_json::Value,

@@ -1387,14 +1387,13 @@ async fn reap_rate_limit_resumes(
             }
             continue;
         }
-        let Some(info) = park.info.clone() else {
-            tracing::debug!(
-                target: "acp.supervisor",
-                session = %id,
-                "rate-limit auto-resume: skipped, park carries no RateLimit event"
-            );
-            continue;
-        };
+        // A park whose `RateLimit` row retention pruned has no reset time;
+        // it follows the unknown-reset schedule like a limit the agent never
+        // dated.
+        let info = park
+            .info
+            .clone()
+            .unwrap_or_else(crate::acp::state::RateLimitInfo::undated);
         let recorded_at_ms = park.recorded_at_ms;
         // Read before the schedule gate below, not just before the cap: the
         // unreported-reset backoff widens with each redelivery already spent,

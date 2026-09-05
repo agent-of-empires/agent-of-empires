@@ -819,6 +819,28 @@ fn read_codex_toml(path: &Path) -> Result<NativeRead> {
 mod tests {
     /// #3734: discovery reads the file the agent will read. The session's
     /// own environment outranks the daemon's, and a later entry (a
+    /// The static profile `environment` reaches discovery the way it
+    /// reaches a host launch, so both resolve the same config dir (#3734).
+    #[test]
+    #[serial_test::serial]
+    fn discovery_reads_claude_config_dir_from_the_profile_environment() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp.path());
+        let app_dir = crate::session::get_app_dir().unwrap();
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("config.toml"),
+            "environment = [\"CLAUDE_CONFIG_DIR=/from-profile\"]\n",
+        )
+        .unwrap();
+        let env = super::session_env_for_discovery(None);
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "CLAUDE_CONFIG_DIR" && v == "/from-profile"),
+            "profile environment must reach discovery: {env:?}"
+        );
+    }
+
     /// `before_session` value applied on top of the static profile
     /// environment) outranks an earlier one.
     #[test]

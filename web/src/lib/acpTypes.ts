@@ -1594,6 +1594,8 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.workerIdleStopped = false;
     next.agentUnresponsive = false;
     next.agentOrphaned = false;
+    // The worker is back: the park is over on every surface (#3514).
+    next.rateLimit = null;
     return next;
   }
   if ("RateLimitAutoResumed" in event) {
