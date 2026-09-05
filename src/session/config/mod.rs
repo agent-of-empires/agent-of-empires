@@ -2702,11 +2702,12 @@ pub struct TmuxConfig {
     )]
     pub socket_name: Option<String>,
 
-    /// Render native agent and tool previews from a persistent VT channel
-    /// (`tmux pipe-pane` into an in-process terminal grid) instead of polling
-    /// `capture-pane` and forking `send-keys` per keystroke. Terminal previews,
-    /// including the web terminal, always use tmux's rendered capture and keep
-    /// OSC 52 forwarding through a raw observer.
+    /// Render agent previews and the web dashboard's agent terminal from a
+    /// persistent VT channel (`tmux pipe-pane` into an in-process terminal
+    /// grid) instead of polling `capture-pane` and forking `send-keys` per
+    /// keystroke. The paired host and container shells, split windows, and
+    /// every fallback keep tmux's rendered capture, with OSC 52 forwarding
+    /// through a raw observer.
     #[serde(default = "default_true")]
     #[setting(label = "VT Live Transport", widget = "toggle", advanced, global_only)]
     pub vt_live: bool,

@@ -122,17 +122,21 @@ as a fallback.
 
 ## The VT live transport
 
-Live views (this TUI preview and the web/mobile live terminal) render
+The TUI's agent preview and the web dashboard's agent terminal render
 through a persistent VT channel by default: `tmux pipe-pane` streams the
 agent's raw output into an in-process terminal grid, and your keystrokes
-travel back over the same socket. Compared to the older polling path
+travel back over the same socket. Compared to the polling path
 (`capture-pane` scrapes plus a `send-keys` fork per keystroke), typing
-echo and streaming output land with near-attach latency, and agent
-copies (OSC 52) reach your clipboard in live-send.
+echo and streaming output land with near-attach latency, agent copies
+(OSC 52) reach your clipboard, and a full-screen agent that brackets its
+repaints in synchronized output (DEC 2026) is shown only between brackets,
+never mid-redraw.
 
-The channel needs tmux 3.4 or newer. A pane that cannot arm one, an
-older tmux, or a non-Unix host falls back to the polling path
-automatically; everything still works, just with more latency.
+The channel needs tmux 3.4 or newer. A pane that cannot arm one, a pane
+whose grid could not be seeded, an older tmux, a split window, or a
+non-Unix host falls back to the polling path automatically; everything
+still works, with more latency and without the synchronized-output hold.
+The paired host and container shells always use the polling path.
 
 To rule the VT transport in or out while troubleshooting, toggle "VT
 Live Transport" under Settings (Tmux tab, Advanced) or set it in
