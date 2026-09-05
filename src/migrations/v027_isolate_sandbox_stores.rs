@@ -6,17 +6,105 @@
 //! journal, and the legacy quarantine exist only while that bounded transition
 //! is pending; the committed state keeps only `sandbox-v2/<instance>`.
 
+use super::progress;
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const JOURNAL: &str = ".v027-sandbox-transition.json";
 pub(crate) const LOCK: &str = ".v027-sandbox-transition.lock";
+/// Set to any non-empty value to start without moving stores: every sandboxed
+/// session stays on its shared store and is retried on a later start (or with
+/// `aoe migrate`). The schema version still advances, so this is a deferral,
+/// not a downgrade.
+pub const DEFER_ENV: &str = "AOE_DEFER_SANDBOX_MIGRATION";
+
+fn defer_requested() -> bool {
+    defer_requested_by(std::env::var_os(DEFER_ENV).as_deref())
+}
+
+fn defer_requested_by(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| !value.is_empty())
+}
+
+/// Files and bytes copied by the store copy in flight, for the progress line.
+static COPY_FILES: AtomicU64 = AtomicU64::new(0);
+static COPY_BYTES: AtomicU64 = AtomicU64::new(0);
+
+fn begin_copy_progress() {
+    COPY_FILES.store(0, Ordering::Relaxed);
+    COPY_BYTES.store(0, Ordering::Relaxed);
+}
+
+/// One regular file copied. Reports every 100 files so a large store shows
+/// movement without flooding the reporter.
+fn copied_file(bytes: u64) {
+    let files = COPY_FILES.fetch_add(1, Ordering::Relaxed) + 1;
+    let total = COPY_BYTES.fetch_add(bytes, Ordering::Relaxed) + bytes;
+    if files % 100 == 0 {
+        progress::progress(format!("{files} files, {}", progress::format_bytes(total)));
+    }
+}
+
+/// One liveness probe per session inspects a container each; a machine with
+/// many sandboxed sessions paid for a subprocess per row. Ask the runtime for
+/// every sandbox container once and answer from that; a session it did not
+/// list (or a runtime that returned nothing) still gets the per-row probe, so
+/// an unreachable runtime keeps reading as live.
+///
+/// The snapshot is taken at the first probe and reused for the pass, so a
+/// container started mid-pass reads as stopped for later cohorts. That is
+/// contained: `reap_migrated_container` removes without force, so a container
+/// that came alive fails the removal and the transition, rather than losing
+/// its store underneath a running agent.
+///
+/// `announce` lets the fallback probe say once, per pass, that the runtime
+/// could not be asked; the per-startup reconcile passes `false` so a machine
+/// whose runtime is down is not told the same thing on every command.
+fn batched_running_probe(announce: bool) -> impl Fn(&str) -> Result<bool> {
+    let batch: std::sync::OnceLock<std::collections::HashMap<String, bool>> =
+        std::sync::OnceLock::new();
+    let runtime_noticed = std::cell::Cell::new(false);
+    move |id: &str| {
+        let states = batch.get_or_init(|| {
+            progress::step("checking which sandbox containers are running");
+            crate::containers::batch_container_health()
+        });
+        if let Some(running) = states.get(&crate::containers::DockerContainer::generate_name(id)) {
+            return Ok(*running);
+        }
+        let (running, unanswered) = probe_container_running(id)?;
+        if unanswered && announce && !runtime_noticed.replace(true) {
+            progress::notice(
+                "container runtime unavailable; sandboxed sessions keep their shared agent store until their containers can be checked",
+            );
+        }
+        Ok(running)
+    }
+}
+
+/// Whether a migrated row's container is live, so its store must be left
+/// alone this pass, plus whether that answer is the fail-closed substitute for
+/// a runtime that could not be asked. Publishing a store and retiring its
+/// legacy source while a container AoE cannot see may still be writing to it
+/// is the one outcome this migration must never produce, so an unknown answer
+/// takes the arm that copies nothing.
+fn probe_container_running(id: &str) -> Result<(bool, bool)> {
+    match crate::containers::DockerContainer::from_session_id(id).is_running() {
+        Ok(running) => Ok((running, false)),
+        Err(error) if runtime_cannot_answer(&error) => {
+            tracing::warn!("v027 treating {id} as live: container runtime unavailable ({error})");
+            Ok((true, true))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
 
 /// Reports whether a migrated row's container is live. See
-/// [`migrated_container_is_running`] for what an unreachable runtime answers.
+/// [`probe_container_running`] for what an unreachable runtime answers.
 type RunningProbe<'a> = dyn Fn(&str) -> Result<bool> + 'a;
 
 /// Reaps the stopped container of a row whose store has moved. `Ok(false)`
@@ -44,24 +132,6 @@ fn runtime_cannot_answer(error: &crate::containers::error::DockerError) -> bool 
             | DockerError::PermissionDenied
             | DockerError::InspectFailed(_)
     )
-}
-
-/// Whether a migrated row's container is live, so its store must be left
-/// alone this pass.
-///
-/// A runtime that cannot answer reports live. Publishing a store and retiring
-/// its legacy source while a container AoE cannot see may still be writing to
-/// it is the one outcome this migration must never produce, so an unknown
-/// answer takes the arm that copies nothing.
-fn migrated_container_is_running(id: &str) -> Result<bool> {
-    match crate::containers::DockerContainer::from_session_id(id).is_running() {
-        Ok(running) => Ok(running),
-        Err(error) if runtime_cannot_answer(&error) => {
-            tracing::warn!("v027 treating {id} as live: container runtime unavailable ({error})");
-            Ok(true)
-        }
-        Err(error) => Err(error.into()),
-    }
 }
 
 /// Remove the stopped container of a row whose store has moved, so its next
@@ -108,25 +178,42 @@ pub fn run() -> Result<()> {
     run_in(
         &app_dir,
         &home,
-        &migrated_container_is_running,
+        &batched_running_probe(true),
         &reap_migrated_container,
+        defer_requested(),
+        true,
     )
 }
 
 /// Retry cohorts that were live during the schema migration. This is called on
 /// every startup until no pre-v2 row remains, then becomes a cheap read.
-pub(crate) fn reconcile_pending() -> Result<()> {
+/// `announce` narrates pending rows (see [`ANNOUNCE`]).
+pub(crate) fn reconcile_pending(announce: bool) -> Result<()> {
     let app_dir = crate::session::get_app_dir()?;
     if !transition_may_be_pending(&app_dir)? {
         return Ok(());
     }
     let home = dirs::home_dir().context("home directory unavailable for sandbox migration")?;
+    let start = std::time::Instant::now();
+    progress::report(progress::Event::Started {
+        version: 27,
+        name: "isolate_sandbox_stores",
+        position: 1,
+        total: 1,
+    });
     run_in(
         &app_dir,
         &home,
-        &migrated_container_is_running,
+        &batched_running_probe(announce),
         &reap_migrated_container,
-    )
+        defer_requested(),
+        announce,
+    )?;
+    progress::report(progress::Event::Finished {
+        version: 27,
+        elapsed: start.elapsed(),
+    });
+    Ok(())
 }
 
 fn transition_may_be_pending(app_dir: &Path) -> Result<bool> {
@@ -157,12 +244,19 @@ fn transition_may_be_pending(app_dir: &Path) -> Result<bool> {
     Ok(false)
 }
 
+/// `defer_stores` leaves every cohort on its shared store this pass (see
+/// [`DEFER_ENV`]); rows stay pending as they do behind a live container.
+/// `announce` narrates deferrals and pending rows: the schema migration and
+/// `aoe migrate` do, the per-startup reconcile reports only stores it moves.
 fn run_in(
     app_dir: &Path,
     home: &Path,
     is_running: &RunningProbe<'_>,
     reap: &ReapProbe<'_>,
+    defer_stores: bool,
+    announce: bool,
 ) -> Result<()> {
+    progress::step("reading session registries");
     fs::create_dir_all(app_dir)?;
     let _lock = crate::session::acquire_storage_flock(app_dir, LOCK)?;
     let registry_paths = registry_paths(app_dir)?;
@@ -410,6 +504,13 @@ fn run_in(
             .or_default()
             .push(target);
     }
+    if announce && defer_stores && !affected_rows.is_empty() {
+        progress::notice(format!(
+            "{DEFER_ENV} is set: {} sandboxed session(s) keep their shared agent store for now; \
+             the move is retried on a later start or with `aoe migrate`.",
+            affected_rows.len()
+        ));
+    }
     if !needs_registry_write
         && cohorts.is_empty()
         && known_sources.iter().all(|source| !source.exists())
@@ -508,7 +609,11 @@ fn run_in(
             let id = orphan.to_string_lossy();
             let source = root.join(orphan);
             let metadata = fs::symlink_metadata(&source)?;
-            if metadata.file_type().is_symlink() || !metadata.is_dir() || is_running(&id)? {
+            if defer_stores
+                || metadata.file_type().is_symlink()
+                || !metadata.is_dir()
+                || is_running(&id)?
+            {
                 tracing::warn!(
                     "v027 preserving ambiguous or live orphan store: {}",
                     source.display()
@@ -517,6 +622,7 @@ fn run_in(
                 orphan_blocked_roots.insert(root.clone());
                 continue;
             }
+            progress::step(format!("copying unregistered store {}", source.display()));
             publish_store(
                 &source,
                 &destination_parent.join(orphan),
@@ -536,20 +642,45 @@ fn run_in(
         }
     }
 
+    let total_targets: usize = cohorts.values().map(Vec::len).sum();
+    let mut copied_targets = 0usize;
     for (shared, cohort) in &cohorts {
         let ids: BTreeSet<&str> = cohort.iter().map(|target| target.id.as_str()).collect();
-        let live = ids.iter().try_fold(false, |live, id| {
-            is_running(id).map(|running| live || running)
-        })?;
+        let live = defer_stores
+            || ids.iter().try_fold(false, |live, id| {
+                is_running(id).map(|running| live || running)
+            })?;
         if live {
             for target in cohort {
                 ready_rows.remove(&(target.registry, target.row));
                 blocked_roots.insert(target.cleanup_root.clone());
             }
+            if announce && !defer_stores {
+                progress::notice(format!(
+                    "session(s) {} running or unverified; their agent store moves after they stop",
+                    ids.iter().copied().collect::<Vec<_>>().join(", ")
+                ));
+            }
             pending.push(shared.to_string_lossy().into_owned());
             continue;
         }
         for target in cohort {
+            copied_targets += 1;
+            if copied_targets == 1 {
+                // Said once, right before the first copy: this is the part
+                // that can take minutes, and the one a user may want to skip.
+                progress::notice(format!(
+                    "Isolating agent stores for {} sandboxed session(s): each gets its own copy of the \
+                     shared agent store under sandbox-v2/. Large stores take a while. To start without \
+                     waiting, quit and run with {DEFER_ENV}=1; finish later with `aoe migrate`.",
+                    affected_rows.len()
+                ));
+            }
+            progress::step(format!(
+                "copying agent store {copied_targets}/{total_targets}: {} -> {}",
+                shared.display(),
+                target.private.display()
+            ));
             let excluded = excluded_by_root
                 .get(&target.cleanup_root)
                 .context("missing cleanup-root exclusions")?;
@@ -591,6 +722,12 @@ fn run_in(
         }
     }
     let mut deferred_rows = BTreeSet::new();
+    if !ready_ids.is_empty() {
+        progress::step(format!(
+            "removing {} stopped sandbox container(s) so they relaunch on the new store",
+            ready_ids.len()
+        ));
+    }
     for (id, keys) in &ready_ids {
         if !reap(id)? {
             deferred_rows.extend(keys.iter().copied());
@@ -618,6 +755,7 @@ fn run_in(
                 .iter()
                 .all(|target| ready_rows.contains(&(target.registry, target.row)));
         if !defer_source_retirement && !blocked_roots.contains(root) && all_ready {
+            progress::step(format!("retiring shared agent store {}", root.display()));
             retire_legacy(root)?;
         } else {
             pending.push(root.to_string_lossy().into_owned());
@@ -655,6 +793,17 @@ fn run_in(
         sync_parent(&registry.path)?;
     }
 
+    let done = ready_rows.len();
+    if !affected_rows.is_empty() && (announce || done > 0) {
+        let left = affected_rows.len().saturating_sub(done);
+        progress::notice(if left == 0 {
+            format!("{done} sandboxed session(s) now use private agent stores.")
+        } else {
+            format!(
+                "{done} sandboxed session(s) moved to private agent stores, {left} still pending; the move resumes on a later start or with `aoe migrate`."
+            )
+        });
+    }
     if pending.is_empty() {
         match fs::remove_file(&journal) {
             Ok(()) => {}
@@ -874,6 +1023,7 @@ fn publish_store(
         return Ok(());
     }
     fs::create_dir(&stage)?;
+    begin_copy_progress();
     copy_tree_no_links(
         source,
         &stage,
@@ -1066,7 +1216,8 @@ fn copy_tree_from_fd(
                 options.create_new(true);
             }
             let mut output = options.open(&target)?;
-            std::io::copy(&mut input, &mut output)?;
+            let bytes = std::io::copy(&mut input, &mut output)?;
+            copied_file(bytes);
             output.set_permissions(fs::Permissions::from_mode(opened.st_mode as u32))?;
             futimens(
                 &output,
@@ -1144,7 +1295,7 @@ fn copy_tree_no_links(
                 Err(error) => return Err(error.into()),
             };
             if should_copy {
-                fs::copy(entry.path(), &target)?;
+                copied_file(fs::copy(entry.path(), &target)?);
                 fs::set_permissions(&target, metadata.permissions())?;
                 fs::File::open(&target)?.sync_all()?;
             }
@@ -1242,7 +1393,7 @@ mod tests {
     /// the glob import keeps these tests hermetic: they assert the migration's
     /// own logic and must not depend on a container runtime being installed.
     fn run_in(app_dir: &Path, home: &Path, is_running: &RunningProbe<'_>) -> Result<()> {
-        super::run_in(app_dir, home, is_running, &|_| Ok(true))
+        super::run_in(app_dir, home, is_running, &|_| Ok(true), false, true)
     }
 
     fn row(id: &str) -> String {
@@ -1295,7 +1446,7 @@ mod tests {
 
         // The answers the production probes give when the runtime is
         // unreachable: liveness cannot be disproved, and nothing is reaped.
-        super::run_in(&app, &home, &|_| Ok(true), &|_| Ok(false)).unwrap();
+        super::run_in(&app, &home, &|_| Ok(true), &|_| Ok(false), false, true).unwrap();
         let deferred: Value =
             serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
         assert_eq!(
@@ -1308,7 +1459,7 @@ mod tests {
         );
         assert!(transition_may_be_pending(&app).unwrap());
 
-        super::run_in(&app, &home, &|_| Ok(false), &|_| Ok(true)).unwrap();
+        super::run_in(&app, &home, &|_| Ok(false), &|_| Ok(true), false, true).unwrap();
         let committed: Value =
             serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
         assert_eq!(committed[0]["sandbox_store_generation"], 2);
@@ -1318,6 +1469,119 @@ mod tests {
         );
         assert!(!home.join(".gemini/sandbox").exists());
         assert!(!transition_may_be_pending(&app).unwrap());
+    }
+
+    /// `AOE_DEFER_SANDBOX_MIGRATION` must behave exactly like a live cohort: no
+    /// copy, no reap, the row pending, and a later undeferred pass finishing
+    /// the move. It also has to say so, since a silent deferral would look
+    /// like a migration that did nothing.
+    #[test]
+    #[serial_test::serial]
+    fn deferral_leaves_stores_pending_and_reports_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        let home = dirs::home_dir().unwrap();
+        fs::create_dir_all(&app).unwrap();
+        fs::create_dir_all(home.join(".gemini/sandbox/history")).unwrap();
+        fs::write(home.join(".gemini/sandbox/history/id.json"), b"legacy").unwrap();
+        fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
+
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let guard = progress::install(Some(std::sync::Arc::new(move |event| {
+            sink.lock().unwrap().push(event)
+        })));
+        let probed = std::cell::Cell::new(false);
+        super::run_in(
+            &app,
+            &home,
+            &|_| {
+                probed.set(true);
+                Ok(false)
+            },
+            &|_| panic!("a deferred pass must not reap containers"),
+            true,
+            true,
+        )
+        .unwrap();
+        drop(guard);
+        assert!(!probed.get(), "deferral skips the container probe");
+        let pending: Value =
+            serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
+        assert_eq!(pending[0]["sandbox_store_generation"], 1);
+        assert!(!home.join(".gemini/sandbox-v2").exists());
+        assert!(home.join(".gemini/sandbox").is_dir());
+        assert!(app.join(JOURNAL).is_file());
+        let notices: Vec<String> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                progress::Event::Notice(line) => Some(line.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            notices
+                .iter()
+                .any(|line| line.contains(DEFER_ENV) && line.contains("1 sandboxed session")),
+            "deferral is announced: {notices:?}"
+        );
+        assert!(
+            notices.iter().any(|line| line.contains("1 still pending")),
+            "summary counts the pending row: {notices:?}"
+        );
+
+        run_in(&app, &home, &|_| Ok(false)).unwrap();
+        let committed: Value =
+            serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
+        assert_eq!(committed[0]["sandbox_store_generation"], 2);
+        assert_eq!(
+            fs::read(home.join(".gemini/sandbox-v2/one/history/id.json")).unwrap(),
+            b"legacy"
+        );
+        assert!(!app.join(JOURNAL).exists());
+    }
+
+    /// The documented recipe end to end: `AOE_DEFER_SANDBOX_MIGRATION=1` on a
+    /// pre-v27 install commits the schema version (so the next start reaches
+    /// the reconcile path) while the store stays put and the row stays pending.
+    #[test]
+    #[serial_test::serial]
+    fn deferring_through_the_runner_advances_the_schema_and_keeps_the_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        let home = dirs::home_dir().unwrap();
+        fs::create_dir_all(&app).unwrap();
+        fs::create_dir_all(home.join(".gemini/sandbox/history")).unwrap();
+        fs::write(home.join(".gemini/sandbox/history/id.json"), b"legacy").unwrap();
+        fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
+        fs::write(app.join(".schema_version"), b"26").unwrap();
+
+        assert!(!defer_requested_by(None));
+        assert!(!defer_requested_by(Some(std::ffi::OsStr::new(""))));
+        assert!(defer_requested_by(Some(std::ffi::OsStr::new("1"))));
+
+        std::env::set_var(DEFER_ENV, "1");
+        let result = super::super::run_migrations_announced(None);
+        std::env::remove_var(DEFER_ENV);
+        result.unwrap();
+
+        assert_eq!(
+            fs::read_to_string(app.join(".schema_version"))
+                .unwrap()
+                .trim(),
+            "27"
+        );
+        assert!(!super::super::has_pending_migrations());
+        assert!(transition_may_be_pending(&app).unwrap());
+        assert!(home.join(".gemini/sandbox").is_dir());
+        assert!(!home.join(".gemini/sandbox-v2").exists());
+        let pending: Value =
+            serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
+        assert_eq!(pending[0]["sandbox_store_generation"], 1);
     }
 
     #[test]

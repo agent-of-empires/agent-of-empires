@@ -227,30 +227,65 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
         return remote_home::run_standalone(endpoint).await;
     }
 
-    // Run pending migrations with a spinner so users see progress
-    if migrations::has_pending_migrations() {
+    // Run pending migrations with a spinner that names the migration, its
+    // current step and the elapsed time, and keeps the notices a migration
+    // emits (what is being moved, how to defer it) on screen. Unconditional:
+    // a deferred sandbox store move runs from the schema-current path too, and
+    // the spinner draws nothing until a migration reports it has started.
+    {
         const SPINNER_FRAMES: &[char] = &['◐', '◓', '◑', '◒'];
-        let migration_handle = tokio::task::spawn_blocking(migrations::run_migrations);
+        let console = std::sync::Arc::new(std::sync::Mutex::new(
+            migrations::progress::ConsoleProgress::default(),
+        ));
+        let reporter: migrations::progress::Reporter = {
+            let console = console.clone();
+            std::sync::Arc::new(move |event| {
+                console
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .apply(event);
+            })
+        };
+        let migration_handle =
+            tokio::task::spawn_blocking(move || migrations::run_migrations_with(Some(reporter)));
         tokio::pin!(migration_handle);
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(120));
         let mut frame = 0usize;
+        let draw = |frame: usize, console: &mut migrations::progress::ConsoleProgress| {
+            print!("\r\x1b[2K");
+            for line in console.take_lines() {
+                println!("  {line}");
+            }
+            if let Some(status) = console.status_line() {
+                // One row only: the erase above cannot reach a wrapped line.
+                let width = crate::terminal::get_size().map_or(80, |(w, _)| w as usize);
+                let line = format!(
+                    "  {} {status}",
+                    SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]
+                );
+                print!("{}", migrations::progress::fit_width(&line, width));
+            }
+            let _ = io::stdout().flush();
+        };
         loop {
             tokio::select! {
                 result = &mut migration_handle => {
+                    let mut console = console.lock().unwrap_or_else(|e| e.into_inner());
                     print!("\r\x1b[2K");
+                    for line in console.take_lines() {
+                        println!("  {line}");
+                    }
                     let _ = io::stdout().flush();
+                    drop(console);
                     result??;
                     break;
                 }
                 _ = tick.tick() => {
-                    print!("\r  {} Running data migrations...", SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]);
-                    let _ = io::stdout().flush();
+                    draw(frame, &mut console.lock().unwrap_or_else(|e| e.into_inner()));
                     frame += 1;
                 }
             }
         }
-    } else {
-        tokio::task::spawn_blocking(migrations::run_migrations).await??;
     }
 
     // Check for tmux

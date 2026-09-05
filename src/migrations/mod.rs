@@ -8,6 +8,7 @@
 //! 2. Implement the migration function
 //! 3. Add it to the `MIGRATIONS` array below
 
+pub mod progress;
 mod v001_xdg_linux;
 mod v002_seed_sandbox_from_volumes;
 mod v003_yolo_mode_config;
@@ -200,8 +201,27 @@ pub fn has_pending_migrations() -> bool {
     get_current_version() < CURRENT_VERSION
 }
 
-/// Run all pending migrations. Call this early in app startup.
+/// Run all pending migrations silently. Call this early in app startup.
 pub fn run_migrations() -> Result<()> {
+    run_migrations_with(None)
+}
+
+/// Run all pending migrations, sending [`progress::Event`]s to `reporter` so a
+/// long one (store copies, container probes) reads as work, not a hang. A
+/// still-pending sandbox store move is retried too; it reports only the work
+/// it actually does (copies and their outcome), not what stays pending.
+pub fn run_migrations_with(reporter: Option<progress::Reporter>) -> Result<()> {
+    run_migrations_inner(reporter, false)
+}
+
+/// [`run_migrations_with`] for an explicit `aoe migrate`: a pending sandbox
+/// store move also narrates what is still pending and why.
+pub fn run_migrations_announced(reporter: Option<progress::Reporter>) -> Result<()> {
+    run_migrations_inner(reporter, true)
+}
+
+fn run_migrations_inner(reporter: Option<progress::Reporter>, announce: bool) -> Result<()> {
+    let _installed = progress::install(reporter);
     let current = get_current_version();
     debug!("Current schema version: {}", current);
 
@@ -211,28 +231,40 @@ pub fn run_migrations() -> Result<()> {
         );
     }
     if current == CURRENT_VERSION {
-        return v027_isolate_sandbox_stores::reconcile_pending();
+        return v027_isolate_sandbox_stores::reconcile_pending(announce);
     }
 
-    for migration in MIGRATIONS {
-        if migration.version > current {
-            let start = std::time::Instant::now();
-            info!(
-                target: "migrations",
-                version = migration.version,
-                name = migration.name,
-                "running migration"
-            );
-            (migration.run)()?;
-            set_version(migration.version)?;
-            info!(
-                target: "migrations",
-                version = migration.version,
-                name = migration.name,
-                duration_ms = start.elapsed().as_millis() as u64,
-                "migration completed"
-            );
-        }
+    let pending: Vec<&Migration> = MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version > current)
+        .collect();
+    for (index, migration) in pending.iter().enumerate() {
+        let start = std::time::Instant::now();
+        info!(
+            target: "migrations",
+            version = migration.version,
+            name = migration.name,
+            "running migration"
+        );
+        progress::report(progress::Event::Started {
+            version: migration.version,
+            name: migration.name,
+            position: index + 1,
+            total: pending.len(),
+        });
+        (migration.run)()?;
+        set_version(migration.version)?;
+        progress::report(progress::Event::Finished {
+            version: migration.version,
+            elapsed: start.elapsed(),
+        });
+        info!(
+            target: "migrations",
+            version = migration.version,
+            name = migration.name,
+            duration_ms = start.elapsed().as_millis() as u64,
+            "migration completed"
+        );
     }
 
     Ok(())
