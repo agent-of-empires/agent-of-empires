@@ -309,7 +309,8 @@ every session that used it has moved (the private copies are the data from then
 on). A large store takes a while, so the first start of a session is slower
 than usual. A session whose container is still running is skipped and moved on
 a later start, after it stops. Trashed and archived sessions stay on the shared
-store until they are restored, unarchived, or started directly.
+store. Starting one moves it; restoring or unarchiving alone does not, so run
+`aoe migrate` afterwards if you want it moved before its next start.
 
 To move every eligible session at once instead of paying for each at its next
 start:

@@ -236,7 +236,8 @@ pub enum Commands {
     /// Run pending data migrations now, showing progress. A sandboxed session
     /// moves its own agent store when it starts; use this to move every
     /// eligible store at once instead. Trashed and archived sessions are
-    /// skipped; they move when started, restored or unarchived.
+    /// skipped; each moves when it is started, or restore or unarchive it
+    /// and run this again.
     Migrate,
 
     /// Generate shell completions

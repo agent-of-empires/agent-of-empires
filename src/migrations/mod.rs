@@ -207,10 +207,13 @@ pub fn has_pending_migrations() -> bool {
 /// the session that needs it rather than by every pending row on any `aoe`
 /// start.
 ///
-/// `reporter` must be supplied by any caller a user is waiting on. Without an
-/// installed reporter every `progress::step` and `notice` is a no-op
-/// ([`progress`]), and a multi-minute store copy on the launch path would run
-/// with nothing on screen: the hang #3757 removed from boot, moved to attach.
+/// `reporter` is how a caller with a screen narrates the copy. Nothing passes
+/// one yet: [`migrate_sandbox_store_for`] installs `tracing_reporter`, which
+/// reaches the log and, under `ProcessContext::Tui`, only the log
+/// (`logging.rs` forces a file sink there). So a large store still copies with
+/// nothing drawn, which is #3757's boot hang relocated to attach rather than
+/// removed. This parameter exists so the TUI and CLI launch paths can close
+/// that; until one does, the gap is real and the log is the only trail.
 ///
 /// A failure here is reported by the caller and does not block the launch:
 /// a row that did not move stays on its shared store and is retried.

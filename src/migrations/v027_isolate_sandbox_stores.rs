@@ -435,10 +435,12 @@ fn run_in(
                 }
                 continue;
             }
+            // A parked row does not defer retirement globally: it becomes a
+            // `Hold` target, and `all_ready` refuses to retire any root that
+            // carries one. Setting the pass-wide flag here would block every
+            // unrelated root too, so no store on a machine with a single
+            // archived session would ever be reclaimed.
             let parked = row_is_parked(row) && only != Some(id.as_str());
-            if parked {
-                defer_source_retirement = true;
-            }
             let Some(tool) = row.get("tool").and_then(Value::as_str) else {
                 defer_source_retirement = true;
                 continue;
@@ -595,9 +597,10 @@ fn run_in(
             if selected.contains(shared) {
                 continue;
             }
-            // Another session's cohort: it still holds its shared source, so
-            // nothing may retire underneath it this pass.
-            defer_source_retirement = true;
+            // Another session's cohort: it still holds its shared source.
+            // Demoting its members to `Hold` is what protects it, through
+            // `all_ready`; the pass-wide flag would also strand the cohort
+            // this pass just emptied.
             for target in cohort.iter_mut() {
                 target.disposition = Disposition::Hold;
             }
@@ -611,6 +614,17 @@ fn run_in(
         .filter(|target| target.disposition == Disposition::Move)
         .map(|target| (target.registry, target.row))
         .collect();
+    // Reporting only. `affected_rows` excludes held rows by construction, so
+    // without this the completion notice subtracts them from nothing and tells
+    // a user the transition finished while parked sessions are still on the
+    // shared store.
+    let held_row_count = cohorts
+        .values()
+        .flatten()
+        .filter(|target| target.disposition == Disposition::Hold)
+        .map(|target| (target.registry, target.row))
+        .collect::<BTreeSet<_>>()
+        .len();
     if announce && defer_stores && !affected_rows.is_empty() {
         progress::notice(format!(
             "{DEFER_ENV} is set: {} sandboxed session(s) keep their shared agent store for now; \
@@ -787,8 +801,8 @@ fn run_in(
             // Copying its store is the cost this skip exists to avoid.
             if target.disposition == Disposition::Hold {
                 // Held members are asked about by the fold above but publish
-                // nothing, and their source stays put.
-                defer_source_retirement = true;
+                // nothing. Their root is protected by `all_ready`, which
+                // requires every member to be `Move` and ready.
                 continue;
             }
             copied_targets += 1;
@@ -799,7 +813,7 @@ fn run_in(
                     "Isolating agent stores for {} sandboxed session(s): each gets its own copy of the \
                      shared agent store under sandbox-v2/. Large stores take a while. To start without \
                      waiting, quit and run with {DEFER_ENV}=1; finish later with `aoe migrate`.",
-                    affected_rows.len()
+                    total_targets
                 ));
             }
             progress::step(format!(
@@ -880,12 +894,12 @@ fn run_in(
         // included: a held row still reads this source, so retiring it would
         // leave that session with no store to open.
         //
-        // The `Move` clause is deliberately redundant. A held target never
-        // reaches `affected_rows`, so it can never be in `ready_rows`, and
-        // `defer_source_retirement` is set for it besides. It is written here
-        // anyway because this is the line that decides to delete a store, and
-        // it should say what it requires rather than inherit it from two
-        // places several hundred lines up.
+        // The `Move` clause is the mechanism, not a restatement. It is what
+        // keeps a root alive for a held member, per root. The pass-wide
+        // `defer_source_retirement` below stays for the rows that never
+        // produce a target at all (no id, no tool, no agent), whose root
+        // cannot be known; routing an ordinary parked row through it instead
+        // would block every unrelated root on the machine.
         let all_ready = !related.is_empty()
             && related.iter().all(|target| {
                 target.disposition == Disposition::Move
@@ -933,12 +947,17 @@ fn run_in(
     let done = ready_rows.len();
     if !affected_rows.is_empty() && (announce || done > 0) {
         let left = affected_rows.len().saturating_sub(done);
-        progress::notice(if left == 0 {
-            format!("{done} sandboxed session(s) now use private agent stores.")
-        } else {
-            format!(
+        progress::notice(match (left, held_row_count) {
+            (0, 0) => format!("{done} sandboxed session(s) now use private agent stores."),
+            (0, held) => format!(
+                "{done} sandboxed session(s) now use private agent stores. {held} trashed or archived session(s) stay on the shared store; each moves when it is started, or restore or unarchive it and run `aoe migrate`."
+            ),
+            (left, 0) => format!(
                 "{done} sandboxed session(s) moved to private agent stores, {left} still pending; the move resumes on a later start or with `aoe migrate`."
-            )
+            ),
+            (left, held) => format!(
+                "{done} sandboxed session(s) moved to private agent stores, {left} still pending and {held} trashed or archived; the move resumes on a later start or with `aoe migrate`."
+            ),
         });
     }
     if pending.is_empty() {
@@ -2306,6 +2325,87 @@ gemini = "{}"
 
     /// Clearing `trashed_at` makes the row eligible again, and the start that
     /// follows the restore moves its store.
+    /// Retirement is per root. A parked row holds its own root and nothing
+    /// else: every test above asserts a source *survives*, so nothing caught
+    /// a pass-wide flag suppressing retirement everywhere, which left the
+    /// transition unable to finish on any machine with one archived session.
+    #[test]
+    #[serial_test::serial]
+    fn an_unrelated_parked_row_does_not_hold_a_ready_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        let home = dirs::home_dir().unwrap();
+        let gemini = home.join(".gemini/sandbox");
+        fs::create_dir_all(&gemini).unwrap();
+        fs::write(gemini.join("data"), b"g").unwrap();
+        let claude = home.join(".claude/sandbox");
+        fs::create_dir_all(&claude).unwrap();
+        fs::write(claude.join("data"), b"c").unwrap();
+        let rows = serde_json::json!([
+            {"id":"1111111111111111","tool":"gemini","sandbox_info":{"enabled":true}},
+            {"id":"3333333333333333","tool":"claude","sandbox_info":{"enabled":true},
+             "archived_at":"2026-09-05T00:00:00Z"}
+        ]);
+        fs::write(
+            app.join("sessions.json"),
+            serde_json::to_vec(&rows).unwrap(),
+        )
+        .unwrap();
+
+        run_in(&app, &home, &|_| Ok(false)).unwrap();
+
+        assert_eq!(
+            fs::read(home.join(".gemini/sandbox-v2/1111111111111111/data")).unwrap(),
+            b"g"
+        );
+        assert!(
+            !gemini.exists(),
+            "the gemini root had no held member and must be retired"
+        );
+        assert!(
+            claude.exists(),
+            "the claude root carries a parked member and must survive"
+        );
+    }
+
+    /// The scoped counterpart: a launch that empties its own cohort retires
+    /// that root, while the cohort it held keeps its own.
+    #[test]
+    #[serial_test::serial]
+    fn a_scoped_pass_retires_the_root_it_emptied() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        let home = dirs::home_dir().unwrap();
+        let gemini = home.join(".gemini/sandbox");
+        fs::create_dir_all(&gemini).unwrap();
+        fs::write(gemini.join("data"), b"g").unwrap();
+        let claude = home.join(".claude/sandbox");
+        fs::create_dir_all(&claude).unwrap();
+        fs::write(claude.join("data"), b"c").unwrap();
+        let rows = serde_json::json!([
+            {"id":"1111111111111111","tool":"gemini","sandbox_info":{"enabled":true}},
+            {"id":"3333333333333333","tool":"claude","sandbox_info":{"enabled":true}}
+        ]);
+        fs::write(
+            app.join("sessions.json"),
+            serde_json::to_vec(&rows).unwrap(),
+        )
+        .unwrap();
+
+        run_in_only(&app, &home, &|_| Ok(false), "1111111111111111").unwrap();
+
+        assert!(
+            !gemini.exists(),
+            "the scoped cohort moved in full and its root must be retired"
+        );
+        assert!(
+            claude.exists(),
+            "the cohort this pass held must keep its source"
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn a_restored_row_migrates_on_its_next_pass() {

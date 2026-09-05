@@ -229,9 +229,11 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
 
     // Run pending migrations with a spinner that names the migration, its
     // current step and the elapsed time, and keeps the notices a migration
-    // emits (what is being moved, how to defer it) on screen. Unconditional:
-    // a deferred sandbox store move runs from the schema-current path too, and
-    // the spinner draws nothing until a migration reports it has started.
+    // emits (what is being moved, how to defer it) on screen. Unconditional
+    // because the spinner draws nothing until a migration reports it has
+    // started, so the schema-current path costs nothing. Note this covers the
+    // startup pass only: v027's store move now runs from the container path,
+    // which has no reporter installed and so draws nothing here.
     {
         const SPINNER_FRAMES: &[char] = &['◐', '◓', '◑', '◒'];
         let console = std::sync::Arc::new(std::sync::Mutex::new(
