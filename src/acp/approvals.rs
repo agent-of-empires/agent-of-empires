@@ -96,24 +96,30 @@ pub struct Approval {
     /// approvals recorded before options were carried (#3741).
     #[serde(default)]
     pub options: Vec<ApprovalOption>,
+    /// Whether `options` are a question's choices rather than an allow/deny
+    /// vocabulary, decided once by [`is_choice_list`] so every client renders
+    /// the same card. False for approvals recorded before it was carried.
+    #[serde(default)]
+    pub choice_list: bool,
     pub resolved: Option<ResolvedApproval>,
 }
 
 impl Approval {
-    /// Whether the options are a question's choices rather than an
-    /// allow/deny vocabulary: options of one kind, either more than two of
-    /// them or under pi's `pi-ui-` tool-call id prefix (its yes/no confirm
-    /// dialogs mix kinds and stay a trio). A client renders the labels and
-    /// resolves with the chosen `option_id`; the fixed Allow/Always/Deny trio
-    /// would otherwise answer with whichever option came first (#3741).
     pub fn is_choice_list(&self) -> bool {
-        let one_kind = !self.options.is_empty()
-            && self
-                .options
-                .windows(2)
-                .all(|pair| pair[0].kind == pair[1].kind);
-        one_kind && (self.options.len() > 2 || self.tool_call.id.starts_with("pi-ui-"))
+        self.choice_list
     }
+}
+
+/// Whether an agent's options are a question's choices rather than an
+/// allow/deny vocabulary: options of one kind, either more than two of them
+/// or under pi's `pi-ui-` tool-call id prefix (its yes/no confirm dialogs mix
+/// kinds and stay a trio). A client renders the labels and resolves with the
+/// chosen `option_id`; the fixed Allow/Always/Deny trio would otherwise answer
+/// with whichever option came first (#3741).
+pub fn is_choice_list(tool_call_id: &str, options: &[ApprovalOption]) -> bool {
+    let one_kind =
+        !options.is_empty() && options.windows(2).all(|pair| pair[0].kind == pair[1].kind);
+    one_kind && (options.len() > 2 || tool_call_id.starts_with("pi-ui-"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,23 +175,6 @@ mod tests {
             name: id.to_uppercase(),
             kind: kind.into(),
         };
-        let approval = |tool_id: &str, options: Vec<ApprovalOption>| Approval {
-            nonce: Nonce::new(),
-            tool_call: super::super::state::ToolCall {
-                id: tool_id.into(),
-                name: "ask".into(),
-                kind: "other".into(),
-                args_preview: String::new(),
-                started_at: Utc::now(),
-                parent_tool_call_id: None,
-                memory_recall: None,
-                diffs: Vec::new(),
-            },
-            destructive: false,
-            requested_at: Utc::now(),
-            options,
-            resolved: None,
-        };
         let cases = [
             (
                 "allow/deny pair",
@@ -230,11 +219,7 @@ mod tests {
             ("no options", "t1", vec![], false),
         ];
         for (label, tool_id, options, expected) in cases {
-            assert_eq!(
-                approval(tool_id, options).is_choice_list(),
-                expected,
-                "{label}"
-            );
+            assert_eq!(is_choice_list(tool_id, &options), expected, "{label}");
         }
     }
 

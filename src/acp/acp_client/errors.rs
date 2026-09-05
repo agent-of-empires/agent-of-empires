@@ -45,6 +45,8 @@ pub enum AcpError {
     UnknownNonce,
     #[error("the request offers no option {0:?}")]
     UnknownOption(String),
+    #[error("this request is a question; answer with one of its options: {}", .0.join(", "))]
+    UnansweredQuestion(Vec<String>),
     #[error("agent did not offer a {0:?} option")]
     NoMatchingOption(ApprovalDecision),
     /// A submitted elicitation answer failed server-side validation. The

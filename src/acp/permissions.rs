@@ -18,7 +18,9 @@ use super::state::ToolCall;
 /// a server-side nonce and decides destructive/benign classification.
 pub fn build_approval(tool_call: ToolCall, options: Vec<ApprovalOption>) -> Approval {
     let destructive = is_destructive(&tool_call.name, &tool_call.args_preview);
+    let choice_list = crate::acp::approvals::is_choice_list(&tool_call.id, &options);
     Approval {
+        choice_list,
         nonce: Nonce::new(),
         tool_call,
         destructive,

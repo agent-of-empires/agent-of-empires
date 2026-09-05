@@ -18,10 +18,12 @@ pub(super) struct PendingResponder {
 
 pub(super) enum PendingResolver {
     /// `session/request_permission` awaiting allow/deny. `option_ids` are
-    /// the agent's options, so an answer naming an unknown one is refused
-    /// while the request stays pending (#3741).
+    /// the agent's options, so an answer naming an unknown one, or none at
+    /// all for a question (`choice_list`), is refused while the request
+    /// stays pending (#3741).
     Approval {
         option_ids: Vec<String>,
+        choice_list: bool,
         resolver: oneshot::Sender<ApprovalResolutionMessage>,
     },
     /// `elicitation/create` awaiting an accept/decline/cancel answer. The

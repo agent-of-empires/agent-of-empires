@@ -53,7 +53,7 @@ describe("ApprovalCard (choice list, #3741)", () => {
 
   it("lists the agent's options and resolves with the one chosen", async () => {
     const onResolve = vi.fn().mockResolvedValue(undefined);
-    render(<ApprovalCard approval={makeApproval({ options: choices })} onResolve={onResolve} />);
+    render(<ApprovalCard approval={makeApproval({ options: choices, choice_list: true })} onResolve={onResolve} />);
     expect(screen.queryByRole("button", { name: /^allow$/i })).toBeNull();
     expect(screen.queryByRole("button", { name: /always/i })).toBeNull();
     await act(async () => {
@@ -81,6 +81,7 @@ describe("ApprovalCard (choice list, #3741)", () => {
         approval={makeApproval({
           tool_call: { ...makeApproval().tool_call, id: "pi-ui-3" },
           options: choices.slice(0, 2),
+          choice_list: true,
         })}
         onResolve={onResolve}
       />,
@@ -283,7 +284,7 @@ describe("ApprovalCard (benign)", () => {
     await act(async () => {
       fireEvent.click(screen.getByText("Allow"));
     });
-    expect(screen.getByText(/Could not reach the server/i)).toBeTruthy();
+    expect(screen.getByText(/not accepted/i)).toBeTruthy();
   });
 });
 

@@ -178,6 +178,7 @@ pub(super) async fn handle_permission_request(
         PendingResponder {
             resolver: PendingResolver::Approval {
                 option_ids,
+                choice_list,
                 resolver: resolve_tx,
             },
         },

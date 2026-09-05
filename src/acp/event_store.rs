@@ -30,10 +30,12 @@
 //! `agent_capabilities.load_session = true` on the ACP `initialize`
 //! response, the supervisor stores the agent-assigned `session_id` on
 //! `Instance.acp_session_id` and uses `session/load` on
-//! subsequent spawns instead of `session/new`. If `session/load`
-//! fails, the stored id is cleared and a `SessionContextReset` event
-//! is published; the UI renders an amber callout in the transcript so
-//! the user knows prior turns are no longer in the model's context.
+//! subsequent spawns instead of `session/new`. If the agent no longer
+//! holds that session (`session/load` fails, or it rejects the first
+//! prompt on a resumed id), the stored id is cleared and a
+//! `SessionContextReset` event is published; the UI renders an amber
+//! callout in the transcript so the user knows prior turns are no longer
+//! in the model's context.
 //!
 //! ## Lifecycle
 //!
@@ -723,7 +725,20 @@ impl EventStore {
                 Ok(Event::RateLimit { info }) => (seq, Some(info), created_at),
                 _ => (seq, None, created_at),
             },
-            None => (0, None, 0),
+            // Retention may have pruned the `RateLimit` row while its stop
+            // survives; the stop still anchors a park, with no reset time.
+            None => conn
+                .query_row(
+                    "SELECT seq, created_at FROM acp_events
+                     WHERE session_id = ?1 AND discriminant = 'Stopped'
+                       AND json_extract(event_json, '$.Stopped.reason') = 'rate_limited'
+                     ORDER BY seq DESC LIMIT 1",
+                    params![session_id],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()
+                .unwrap_or(None)
+                .map_or((0, None, 0), |(seq, created_at)| (seq, None, created_at)),
         };
         let cap_seq: Option<i64> = conn
             .query_row(
@@ -738,17 +753,18 @@ impl EventStore {
                 |row| row.get::<_, Option<i64>>(0),
             )
             .unwrap_or(None);
-        let park_seq = match (cap_seq, info.is_some()) {
+        let park_seq = match (cap_seq, anchor_seq) {
             (Some(cap), _) => cap,
-            (None, true) => anchor_seq,
-            (None, false) => return None,
+            (None, 0) => return None,
+            (None, anchor) => anchor,
         };
         let superseded: bool = conn
             .query_row(
                 "SELECT EXISTS(
                    SELECT 1 FROM acp_events
                    WHERE session_id = ?1 AND seq > ?2
-                     AND (discriminant IN ('UserPromptSent', 'AgentSwitched', 'AcpSessionAssigned')
+                     AND (discriminant IN ('UserPromptSent', 'UserDiffCommentsPrompt',
+                                           'AgentSwitched', 'AcpSessionAssigned')
                        OR (discriminant = 'Stopped'
                            AND json_extract(event_json, '$.Stopped.reason')
                                NOT IN ('rate_limited', ?3))))",
@@ -4273,7 +4289,7 @@ mod tests {
                 false,
             ),
             (
-                "approval noise",
+                "a second rate-limited stop",
                 vec![Event::Stopped {
                     reason: "rate_limited".into(),
                 }],
@@ -4421,6 +4437,7 @@ mod tests {
         let nonce_b = Nonce("bbbb".into());
         let nonce_c = Nonce("cccc".into());
         let approval_a = Approval {
+            choice_list: false,
             nonce: nonce_a.clone(),
             tool_call: tool_call.clone(),
             destructive: false,
@@ -4429,6 +4446,7 @@ mod tests {
             resolved: None,
         };
         let approval_b = Approval {
+            choice_list: false,
             nonce: nonce_b.clone(),
             tool_call: tool_call.clone(),
             destructive: false,
@@ -4437,6 +4455,7 @@ mod tests {
             resolved: None,
         };
         let approval_c = Approval {
+            choice_list: false,
             nonce: nonce_c.clone(),
             tool_call,
             destructive: false,

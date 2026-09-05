@@ -2629,6 +2629,11 @@ pub async fn resolve_approval(
             format!("approval {nonce_str} offers no option {id:?}; it is still pending"),
         )
             .into_response(),
+        Err(SupervisorError::Acp(e @ crate::acp::acp_client::AcpError::UnansweredQuestion(_))) => (
+            StatusCode::BAD_REQUEST,
+            format!("approval {nonce_str}: {e}; it is still pending"),
+        )
+            .into_response(),
         Err(e) => supervisor_error_response("resolve failed", &e),
     }
 }

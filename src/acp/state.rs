@@ -1177,8 +1177,8 @@ pub enum Event {
     /// capabilities (`availableCommands`, `availableModes`, `plan`,
     /// `mode`) and cancels any open approvals; UI collapses rows above
     /// the divider behind a disclosure. Distinct from
-    /// `SessionContextReset` (which fires only on `session/load`
-    /// failure now) and `ConversationCompacted` because the
+    /// `SessionContextReset` (the agent no longer holds the stored
+    /// session) and `ConversationCompacted` because the
     /// user-experience contract differs: cleared is "the model has
     /// forgotten", reset is "the model has empty context", compacted
     /// is "the model has a summary". See #1101.

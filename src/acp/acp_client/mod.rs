@@ -871,13 +871,21 @@ impl AcpClient {
         // that belongs to an elicitation is "unknown" to this endpoint. An
         // answer naming an option the request never offered leaves it
         // pending for a corrected resubmission.
-        let PendingResolver::Approval { option_ids, .. } =
-            &map.get(&nonce).ok_or(AcpError::UnknownNonce)?.resolver
+        let PendingResolver::Approval {
+            option_ids,
+            choice_list,
+            ..
+        } = &map.get(&nonce).ok_or(AcpError::UnknownNonce)?.resolver
         else {
             return Err(AcpError::UnknownNonce);
         };
         if let Some(id) = option_id.as_ref().filter(|id| !option_ids.contains(id)) {
             return Err(AcpError::UnknownOption(id.clone()));
+        }
+        // A question answered with the bare trio names no choice; only a
+        // deny (dismiss) is meaningful without one.
+        if *choice_list && option_id.is_none() && decision != ApprovalDecision::Deny {
+            return Err(AcpError::UnansweredQuestion(option_ids.clone()));
         }
         let PendingResolver::Approval { resolver, .. } = map.remove(&nonce).unwrap().resolver
         else {
@@ -1101,6 +1109,7 @@ mod tests {
             PendingResponder {
                 resolver: PendingResolver::Approval {
                     option_ids: vec!["red".into(), "blue".into()],
+                    choice_list: true,
                     resolver: resolve_tx,
                 },
             },
@@ -1110,6 +1119,10 @@ mod tests {
             .resolve_permission(nonce.clone(), ApprovalDecision::Allow, Some("green".into()))
             .await;
         assert!(matches!(refused, Err(AcpError::UnknownOption(id)) if id == "green"));
+        let unanswered = client
+            .resolve_permission(nonce.clone(), ApprovalDecision::Allow, None)
+            .await;
+        assert!(matches!(unanswered, Err(AcpError::UnansweredQuestion(ids)) if ids.len() == 2));
         assert!(
             client.pending_responders.lock().await.contains_key(&nonce),
             "the request must stay pending after a refused answer"

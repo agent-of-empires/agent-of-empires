@@ -60,6 +60,10 @@ const RESPAWN_BACKOFF: Duration = Duration::from_millis(500);
 const TEARDOWN_TERM_GRACE: Duration = Duration::from_secs(2);
 const TEARDOWN_KILL_GRACE: Duration = Duration::from_millis(500);
 const TEARDOWN_POLL: Duration = Duration::from_millis(50);
+/// Teardown retries after which a runner proven dead is released even
+/// though its registry record could not be settled (unreadable file), so
+/// the session does not stay `stopping` until the daemon restarts.
+const TEARDOWN_RETRY_CAP: u32 = 30;
 
 /// Builds the client for a spawn. Indirected so lifecycle tests can drive
 /// the production spawn, respawn and shutdown paths without a runner.
@@ -383,13 +387,13 @@ impl From<WorkerPhase> for AcpWorkerState {
 }
 
 /// Outcome of `Supervisor::begin_resume`: either the caller now holds a
-/// fresh `pending_resumes` reservation it must carry into `spawn_inner`
+/// fresh lease reservation it must carry into `spawn_inner`
 /// (or `attach`), or a worker is already running / already mid-resume so
 /// there is nothing to reserve. `CapacityFull` surfaces as the `Err` arm.
 pub(crate) enum ResumeReservationOutcome {
     /// A reservation was placed; the caller owns the RAII guard.
     Reserved(ResumeReservation),
-    /// The session is already in `workers` or `pending_resumes`.
+    /// The session is already owned: running, or mid-resume.
     AlreadyPresent,
 }
 
@@ -421,8 +425,8 @@ pub struct Supervisor<S: BroadcastSink> {
     /// the lock, see the agent is now warmed up, and proceed without
     /// re-acquiring it. See #1088.
     agent_warmup_locks: Arc<std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>>,
-    /// Wakes `wait_for_worker` whenever the (workers, pending_resumes)
-    /// snapshot changes. Notified after every workers.insert and after
+    /// Wakes `wait_for_worker` whenever the workers map or the lifecycle
+    /// table changes. Notified after every workers.insert and after
     /// every ResumeReservation drop. Replaces the previous 50 ms poll
     /// loop with edge triggered wakeups, so a request that arrives
     /// just after the spawn handshake finishes resumes within a
@@ -1360,8 +1364,8 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
             // Best-effort socket file removal: the new spawn will bind
             // <workers_dir>/<session_id>.sock, so a stale inode from
-            // the old runner would collide. terminate_runner_for_session
-            // already removed the registry entry; this cleans up the
+            // the old runner would collide. The teardown already removed
+            // the registry entry; this cleans up the
             // socket. Failures (already gone, no perms) are non-fatal.
             if let Ok(socket_path) = crate::process::worker_registry::socket_path_for(session_id) {
                 if socket_path.exists() {
@@ -1652,8 +1656,8 @@ impl<S: BroadcastSink> Supervisor<S> {
             notify: Arc::clone(&self.worker_notify),
         }))
     }
-    /// Spawn body proper, run while holding a `pending_resumes`
-    /// reservation acquired by `begin_resume`. Split out so the
+    /// Spawn body proper, run while holding the lease reservation
+    /// acquired by `begin_resume`. Split out so the
     /// prompt-wake path (#1748) can reserve synchronously, then drive
     /// this in a detached task without re-reserving.
     pub(crate) async fn spawn_inner(
@@ -2105,6 +2109,19 @@ impl<S: BroadcastSink> Supervisor<S> {
             let Some(claim) = lock_recover(&self.lifecycle).claim_retry(&id) else {
                 continue;
             };
+            if claim.attempts > TEARDOWN_RETRY_CAP
+                && !self.process_control.is_alive(claim.identity.pid)
+            {
+                warn!(
+                    target: "acp.supervisor",
+                    session = %id,
+                    pid = claim.identity.pid,
+                    attempts = claim.attempts,
+                    "runner is dead but its registry record could not be settled; releasing the session"
+                );
+                self.settle(&claim.lease, Settlement::Proven);
+                continue;
+            }
             warn!(
                 target: "acp.supervisor",
                 session = %id,
@@ -2524,16 +2541,31 @@ impl<S: BroadcastSink> Supervisor<S> {
                         match launcher(respawn_config.clone(), acp_session_id).await {
                             Ok(c) => c,
                             Err(e) => {
-                                warn!(
-                                    target: "acp.supervisor",
-                                    session = %session_id,
-                                    "respawn failed: {e}"
-                                );
                                 let publish = |event: Event| {
                                     let seq = next_seq(&next_seqs, &session_id);
                                     sink.publish(&session_id, seq, &event);
                                 };
+                                // A stop that landed during the launch owns the
+                                // outcome: the user asked for a stopped session
+                                // and gets that, not the launch error.
+                                let cancelled =
+                                    lock_recover(&lifecycle).cancel_requested(&respawn_lease);
+                                if let Some(reason) = cancelled.clone() {
+                                    info!(
+                                        target: "acp.supervisor",
+                                        session = %session_id,
+                                        "respawn launch failed under a pending stop: {e}"
+                                    );
+                                    publish(Event::Stopped { reason });
+                                } else {
+                                    warn!(
+                                        target: "acp.supervisor",
+                                        session = %session_id,
+                                        "respawn failed: {e}"
+                                    );
+                                }
                                 match &e {
+                                    _ if cancelled.is_some() => {}
                                     AcpError::IncompatibleAgent(payload) => {
                                         lock_recover(&incompatible_binaries).insert(
                                             session_id.clone(),
@@ -7088,6 +7120,44 @@ cursor-acp-bridge = "agent acp"
         );
     }
 
+    /// A runner that outlived SIGKILL is retried each tick; once it is dead
+    /// but its record cannot be read (here the path is a directory), the
+    /// bounded retry releases the session instead of pinning it in
+    /// `stopping` until the daemon restarts.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn a_dead_runner_with_an_unreadable_record_is_released_after_the_retry_cap() {
+        let _home = isolate_home();
+        let control = Arc::new(FakeProcessControl::default());
+        control.immortal(5757);
+        let sup = Supervisor::new(VecSink::new()).with_process_control(control.clone());
+        save_record("s-stuck", 5757, 4);
+
+        sup.shutdown("s-stuck").await.expect("stop is accepted");
+        assert_eq!(sup.worker_state("s-stuck").await, AcpWorkerState::Stopping);
+
+        control.exit(5757);
+        let record = crate::process::worker_registry::record_path("s-stuck").unwrap();
+        std::fs::remove_file(&record).unwrap();
+        std::fs::create_dir_all(&record).unwrap();
+
+        // The stop itself was attempt one; the cap counts retries after it.
+        for _ in 1..TEARDOWN_RETRY_CAP {
+            sup.retry_pending_teardowns().await;
+            assert_eq!(
+                sup.worker_state("s-stuck").await,
+                AcpWorkerState::Stopping,
+                "an unsettled record keeps the session owned within the cap"
+            );
+        }
+        sup.retry_pending_teardowns().await;
+        assert_eq!(
+            sup.worker_state("s-stuck").await,
+            AcpWorkerState::Absent,
+            "past the cap a dead runner's session is released"
+        );
+    }
+
     /// Regression: `publish_startup_error` and a subsequent drain-task
     /// publish must not collide on seq=1, otherwise the client-side
     /// dedupe (`frame.seq <= state.lastSeq → drop`) eats the agent's
@@ -7442,8 +7512,8 @@ cursor-acp-bridge = "agent acp"
         assert_eq!(texts, vec!["first", "second", "third", "after restart"]);
     }
 
-    /// `worker_state` returns Resuming while an entry sits in
-    /// `pending_resumes`, regardless of ResumeKind (attach or spawn).
+    /// `worker_state` returns Resuming while the session's lease is
+    /// starting, regardless of ResumeKind (attach or spawn).
     /// The UI uses the same indicator for both lifecycle paths so the
     /// kind distinction is supervisor-internal only. See #1088.
     #[tokio::test]

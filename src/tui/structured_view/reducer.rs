@@ -452,6 +452,7 @@ mod tests {
 
     fn approval(nonce: &str) -> Approval {
         Approval {
+            choice_list: false,
             nonce: Nonce(nonce.into()),
             tool_call: tool("t-1", "Edit a file"),
             destructive: true,

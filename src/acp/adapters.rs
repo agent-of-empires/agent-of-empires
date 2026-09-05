@@ -195,15 +195,15 @@ pub fn runtime_too_old_for(app_dir: &Path, binary: &str) -> Option<String> {
     (!crate::acp::node::supports_strip_types(&node.version)).then_some(node.version)
 }
 
-/// An in-tree adapter (one that ships sources) whose installed copy no longer
-/// matches this binary's embedded sources. Spawning it would run the old
-/// code beside a new daemon, so resolution refuses it and the install hint
-/// names the reinstall (#3553).
 /// Whether `binary` is an in-tree adapter that runs from TypeScript sources.
 pub fn ships_sources(binary: &str) -> bool {
     lookup(binary).is_some_and(|a| !a.sources.is_empty())
 }
 
+/// An in-tree adapter (one that ships sources) whose installed copy no longer
+/// matches this binary's embedded sources. A spawn reinstalls it first; a
+/// resolution outside a spawn refuses it and the install hint names the
+/// reinstall (#3553).
 pub fn installed_copy_is_stale(app_dir: &Path, binary: &str) -> bool {
     lookup(binary).is_some_and(|adapter| {
         !adapter.sources.is_empty()

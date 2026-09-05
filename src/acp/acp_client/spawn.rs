@@ -929,7 +929,7 @@ mod tests {
         }
     }
 
-    /// Scripted stdio agent: completes `initialize` and `session/new`, then
+    /// Scripted stdio agent: completes `initialize` and `session/load`, then
     /// rejects every `session/prompt` the way OMP rejects a stored session
     /// id it no longer holds.
     #[cfg(unix)]
@@ -941,7 +941,10 @@ while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -En 's/.*"id":("[^"]*"|[0-9]+).*/\1/p')
   case $line in
     *'"method":"initialize"'*)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":false}}}\n' "$id"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}\n' "$id"
+      ;;
+    *'"method":"session/load"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
       ;;
     *'"method":"session/new"'*)
       printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sid-1"}}\n' "$id"
@@ -970,7 +973,8 @@ done
         let dir = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         let script = write_unsupported_session_fake_agent(dir.path());
-        let config = reset_fake_spawn_config(&script, cwd.path());
+        let mut config = reset_fake_spawn_config(&script, cwd.path());
+        config.stored_acp_session_id = Some("sid-stored".into());
         let mut client = AcpClient::spawn(config, AcpSessionId("resume-reject".into()))
             .await
             .expect("spawn fake agent");

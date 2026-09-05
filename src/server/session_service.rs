@@ -1586,9 +1586,8 @@ impl SessionService {
         Ok((guard, dispatch))
     }
 
-    /// Whether the session's newest lifecycle event is the redelivery-cap
-    /// park (#3688). Off the runtime: `latest_status_event` takes the store's
-    /// lock and scans back to the first lifecycle row.
+    /// Whether the session is parked on the redelivery cap (#3688). Off the
+    /// runtime: `rate_limit_park` takes the store's lock.
     async fn is_rate_limit_exhausted_park(&self, id: &str) -> bool {
         let store = Arc::clone(&self.acp_event_store);
         let id = id.to_string();
@@ -1789,16 +1788,11 @@ fn spec_payload_hash(spec: &StructuredSessionSpec) -> String {
 /// otherwise clear a sink it has never observed. Tier 2 stops that, and only
 /// that.
 ///
-/// It does NOT make this save path safe against #3465's wipe, and it was a
-/// mistake to claim otherwise. Advancing `last_accessed_at` on disk arms the
-/// very signal the wipe keys on: `merge_user_action_diff` computes
-/// `touched = self.last_accessed_at > pre.last_accessed_at`
-/// (`session/instance/merge.rs`) and clears `archived_at` / `snoozed_until` /
-/// `idle_dormant_since` when it holds, so a writer whose `pre` snapshot
-/// predates this advance still loses its archive one hop later. That is the
-/// documented invariant rather than a bug (a prompt is a real user gesture, and
-/// a real touch is meant to dethrone a concurrent archive); what #3465 was
-/// about is a *passive* stamp reaching the same arm with no gesture behind it.
+/// It does not make this save path safe against #3465's wipe: advancing
+/// `last_accessed_at` on disk is the signal `merge_user_action_diff` keys on
+/// (`session/instance/merge.rs`) to clear `archived_at` / `snoozed_until` /
+/// `idle_dormant_since`, which is the intended invariant for a real user
+/// gesture; #3465 was about a passive stamp reaching that arm.
 pub(crate) fn apply_prompt_persist_to_disk(disk: &mut crate::session::Instance, wake: bool) {
     if wake {
         disk.touch_last_accessed();

@@ -201,6 +201,8 @@ export interface Approval {
   /** The agent's options in its order; absent on approvals recorded before
    *  options were carried (#3741). */
   options?: ApprovalOption[];
+  /** Whether `options` are a question's choices; decided by the daemon. */
+  choice_list?: boolean;
   resolved?: {
     decision: ApprovalDecision;
     message?: string | null;

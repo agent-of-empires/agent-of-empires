@@ -149,7 +149,7 @@ export function ApprovalCard({ approval, onResolve }: Props) {
       {(expanded || showEmptyArgsState) && <ArgsView raw={raw} />}
 
       {phase === "rolled-back" && (
-        <p className="px-3 pt-2 text-rose-400 text-xs">Could not reach the server. Tap to retry.</p>
+        <p className="px-3 pt-2 text-rose-400 text-xs">The answer was not accepted. Tap to retry.</p>
       )}
       {offline && <p className="px-3 pt-2 text-status-error text-xs">{OFFLINE_TITLE}</p>}
 

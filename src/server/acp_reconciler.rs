@@ -2760,6 +2760,7 @@ mod tests {
                 name: "unresolved approval, marker still latest",
                 events: finished_agent_turn(vec![Event::ApprovalRequested {
                     approval: crate::acp::approvals::Approval {
+                        choice_list: false,
                         nonce: crate::acp::approvals::Nonce("n-1".to_string()),
                         tool_call: tool_call("t-approval"),
                         destructive: false,

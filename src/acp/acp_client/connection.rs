@@ -916,6 +916,10 @@ pub(super) async fn run_connection_task<W, R>(
             // fresh id from its `session/new` so every later
             // `session/prompt` / cancel / mode switch addresses the new
             // conversation.
+            // Whether the session id in use came from storage (a mid-turn
+            // resume, or a `session/load` of the stored id): only then is a
+            // first-prompt rejection the agent having dropped that session.
+            let mut session_from_storage = matches!(mode, ConnectMode::Resume { .. });
             let mut acp_session_id: SessionId = match mode {
                 ConnectMode::Resume {
                     acp_session_id: stored,
@@ -1155,6 +1159,7 @@ pub(super) async fn run_connection_task<W, R>(
                             };
                             match load_result {
                                 Ok(resp) => {
+                                    session_from_storage = true;
                                     info!(
                                         target: "acp.protocol",
                                         session = %session_label,
@@ -1965,6 +1970,7 @@ pub(super) async fn run_connection_task<W, R>(
                                             // (the transcript is preserved for replay)
                                             // instead of terminating the runner (#3560).
                                             if this_prompt_epoch == 1
+                                                && session_from_storage
                                                 && is_unsupported_session_error(&e)
                                             {
                                                 warn!(

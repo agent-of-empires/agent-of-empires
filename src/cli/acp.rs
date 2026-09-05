@@ -129,8 +129,9 @@ pub enum AcpCommands {
         /// Refuse the request.
         #[arg(long, conflicts_with = "option")]
         deny: bool,
-        /// Answer with this option id, from the request's option list (see
-        /// `aoe acp tail`). A choice list resolved without one is dismissed.
+        /// Answer with this option id, from the request's option list. A
+        /// question answered without one is refused and lists its options;
+        /// --deny dismisses it.
         #[arg(long, value_name = "ID")]
         option: Option<String>,
     },
@@ -523,7 +524,17 @@ async fn doctor(json: bool, fix: bool, adapter: Vec<String>, all_adapters: bool)
                 "Cannot resolve the app data dir ({e}); skipping the Node and adapter install."
             ),
             Ok(app_dir) => {
-                let node = match node::resolve("", &app_dir) {
+                // A source adapter needs a Node that runs its TypeScript; a
+                // PATH copy below that floor is passed over for the bundled
+                // runtime, downloaded below if absent, so the install the
+                // hint names cannot refuse the Node this same command found.
+                let needs_sources =
+                    adapters_to_install(&adapter, all_adapters).is_ok_and(|wanted| {
+                        wanted
+                            .iter()
+                            .any(|b| crate::acp::adapters::ships_sources(b))
+                    });
+                let node = match node::resolve_for("", &app_dir, needs_sources) {
                     Ok(node) => {
                         println!("Node available: {} ({})", node.path.display(), node.version);
                         Some(node)

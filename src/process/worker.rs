@@ -37,7 +37,9 @@ pub fn is_pid_alive(_pid: u32) -> bool {
 /// Like `is_pid_alive`, but `EPERM` counts as dead: a pid this daemon
 /// cannot signal belongs to another user, so it is not a runner of ours
 /// (a reused pid). Teardown proofs use this so a stale record cannot pin
-/// a session on someone else's process.
+/// a session on someone else's process. A daemon running as a different
+/// user from its own runners would prove them dead here while the CLI's
+/// `is_pid_alive` still reports them; runners inherit the daemon's user.
 #[cfg(unix)]
 pub fn is_pid_alive_and_ours(pid: u32) -> bool {
     use nix::sys::signal::kill;

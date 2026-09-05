@@ -1744,7 +1744,7 @@ Resolve a pending approval (default: allow). Use --always for a session-scoped a
 
 * `--always` — Allow this kind of operation for the rest of the session
 * `--deny` — Refuse the request
-* `--option <ID>` — Answer with this option id, from the request's option list (see `aoe acp tail`). A choice list resolved without one is dismissed
+* `--option <ID>` — Answer with this option id, from the request's option list. A question answered without one is refused and lists its options; --deny dismisses it
 
 
 
