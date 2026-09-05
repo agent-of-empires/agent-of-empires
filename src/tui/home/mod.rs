@@ -200,6 +200,10 @@ pub struct HomeView {
     /// is about tmux server options, which cannot influence this in-process
     /// path.
     pub(super) agent_clipboard_forward: bool,
+    /// Cells carrying an OSC 8 target in the frame being painted, shared with
+    /// the terminal backend so it can re-emit the sequences. Cleared at the top
+    /// of every render.
+    pub(super) hyperlink_cells: crate::tui::hyperlink::SharedHyperlinks,
     /// Whether live previews may use the VT transport (`[tmux] vt_live`).
     /// Cached at construction + config refresh and pushed into the capture
     /// worker (`set_vt_enabled`), so a settings toggle applies in place.
@@ -379,6 +383,15 @@ pub struct HomeView {
     /// shows the which-key menu. Always false outside live mode; cleared on
     /// live-send exit. See `handle_live_send_key`.
     pub(super) live_send_pending_leader: bool,
+    /// Target of the link under the pointer, shown in the status bar while it
+    /// rests there. A plain click opens without confirmation and the pane
+    /// controls both the visible text and the target, so this is the chance to
+    /// see where a link goes BEFORE committing to it.
+    pub(super) hover_cell: Option<(u16, u16)>,
+    /// A short-lived status-bar message and its expiry, for one-shot feedback
+    /// that needs no acknowledgement (opening a link). Distinct from
+    /// `App::update_status`, which is a persistent notice the user dismisses.
+    pub(super) status_flash: Option<(String, std::time::Instant)>,
     /// Deadline until which the live-send footer flashes a "Ctrl+C sent to
     /// agent" reminder. Set on every Ctrl+C forwarded through live mode
     /// (#2894) so the user learns the keystroke reached the agent rather

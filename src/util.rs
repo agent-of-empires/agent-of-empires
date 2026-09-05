@@ -2,6 +2,18 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Whether `url` is a plain web URL, the only kind aoe hands to a browser
+/// opener or renders as a clickable link.
+///
+/// Deliberately narrow: agent output, plugin UI state and pane text are all
+/// untrusted, and `javascript:`, `file:` and `data:` must never reach an
+/// opener. Scheme comparison is case-insensitive because a URL's scheme is.
+/// Mirrors the web `isExternalHttpUrl`.
+pub(crate) fn is_http_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
 /// Current Unix time in whole seconds, saturating to 0 if the clock is before
 /// the epoch (which should never happen on a sane system).
 pub(crate) fn now_secs() -> u64 {

@@ -464,14 +464,7 @@ pub(super) fn build_tool_hotkey_cache(
 /// cell symbols then mirrors the old frame-buffer extraction cell for
 /// cell. Unwritten cells read as a single space, which the caller trims.
 fn slice_line_columns(line: &ratatui::text::Line, from: u16, to_excl: u16, width: u16) -> String {
-    let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, width, 1));
-    buf.set_line(0, 0, line, width);
-    let hi = to_excl.min(width);
-    let mut out = String::new();
-    for col in from..hi {
-        out.push_str(buf[(col, 0)].symbol());
-    }
-    out
+    crate::tui::components::text::line_columns(line, width).slice(from, to_excl.min(width))
 }
 
 impl HomeView {
@@ -5681,6 +5674,74 @@ impl HomeView {
         self.preview_double_click_action_at(std::time::Instant::now(), kind, modifiers, col, row)
     }
 
+    /// Forget the press that would have paired with the next one into a
+    /// double-click. Called once a press has been spent on something else, so
+    /// clicking a link twice (the browser opened behind the terminal, so the
+    /// user tries again) does not also activate the session.
+    pub fn forget_preview_click(&mut self) {
+        self.last_preview_click = None;
+    }
+
+    /// Record the link under `(col, row)` for the status bar. Returns whether
+    /// it changed, so the caller only repaints when the answer moved.
+    pub fn update_hovered_link(&mut self, col: u16, row: u16) -> bool {
+        let cell = Some((col, row));
+        if cell == self.hover_cell {
+            return false;
+        }
+        // Report whether the resolved LINK moved, not the pointer: tracking a
+        // pointer across one link must not repaint on every motion event.
+        let before = self.hovered_link();
+        self.hover_cell = cell;
+        before != self.hovered_link()
+    }
+
+    /// The link the pointer is resting on, if any.
+    pub(in crate::tui) fn hovered_link(&self) -> Option<String> {
+        let (col, row) = self.hover_cell?;
+        self.preview_link_at(col, row)
+    }
+
+    /// The link under `(col, row)`, if one is painted there this frame. The
+    /// preview's transport strips OSC 8 before the text reaches ratatui, so a
+    /// target is recovered by matching the pane's advertised link text against
+    /// the row, or by finding a plain URL in the row itself (`crate::tui::links`).
+    pub fn preview_link_at(&self, col: u16, row: u16) -> Option<String> {
+        if self.has_non_live_send_overlay() {
+            return None;
+        }
+        // A mounted structured transcript owns the pane and supplies its own
+        // rows, but `active_preview_cache` still returns the tmux capture and
+        // `preview_text_view` was set from the transcript's geometry. Resolving
+        // one against the other opens a URL from a different session's output,
+        // and the painter returns before it can underline anything, so nothing
+        // would warn the user. Same line-source branch
+        // `extract_preview_selection_text` already makes.
+        let structured_owns_pane = self
+            .structured_preview
+            .as_ref()
+            .zip(self.selected_session.as_deref())
+            .is_some_and(|(view, id)| view.session_id() == id);
+        if structured_owns_pane {
+            return None;
+        }
+        let view = self.preview_text_view;
+        if !view.contains(col, row) {
+            return None;
+        }
+        let cache = self.active_preview_cache();
+        let line = cache
+            .parsed_text
+            .as_ref()?
+            .lines
+            .get(view.abs_line_at_row(row))?;
+        let offset = col - view.pane.x;
+        crate::tui::links::link_spans_for_line(line, view.pane.width, &cache.links)
+            .into_iter()
+            .find(|span| (span.start..span.end).contains(&offset))
+            .map(|span| span.uri)
+    }
+
     /// Same as `preview_double_click_action`, but the caller supplies `now` so
     /// unit tests can drive double-click detection deterministically.
     pub(super) fn preview_double_click_action_at(
@@ -7122,7 +7183,7 @@ mod tests {
             height: 999,
         });
         assert_eq!(mouse_pane_rect(&cursor, pane), pane);
-        // And the origin is honoured: a cell above/left of the rect is outside.
+        // And the origin is honored: a cell above/left of the rect is outside.
         assert_eq!(mouse_target_rect(&cursor, pane, 1, 3), None);
         assert!(mouse_target_rect(&cursor, pane, 2, 3).is_some());
     }

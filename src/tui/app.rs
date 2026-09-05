@@ -125,6 +125,10 @@ impl UpdateStatus {
     }
 }
 
+/// The terminal backend the TUI runs on: crossterm plus OSC 8 re-emission for
+/// the cells the renderer marked as hyperlinks.
+pub type TuiBackend = crate::tui::hyperlink::HyperlinkBackend<std::io::Stdout>;
+
 pub struct App {
     home: HomeView,
     should_quit: bool,
@@ -408,6 +412,13 @@ impl App {
         }
     }
 
+    /// The per-frame hyperlink map the renderer fills, for the terminal backend
+    /// to re-emit as OSC 8. Handed out after construction so `run` can build the
+    /// backend around the same map the `HomeView` writes into.
+    pub fn hyperlink_cells(&self) -> crate::tui::hyperlink::SharedHyperlinks {
+        self.home.hyperlink_cells.clone()
+    }
+
     pub fn new(
         profile: &str,
         available_tools: AvailableTools,
@@ -519,10 +530,7 @@ impl App {
     /// event-loop `Event::Key` arm and the tail of `with_raw_mode_disabled`
     /// cover this; new event sources that mutate dialog state need to call
     /// this too or mouse capture will lag a frame behind reality.
-    fn sync_mouse_capture(
-        &mut self,
-        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    ) -> Result<()> {
+    fn sync_mouse_capture(&mut self, terminal: &mut Terminal<TuiBackend>) -> Result<()> {
         // Mouse capture is on by default; the Mouse Capture setting (or the
         // AOE_MOUSE_CAPTURE=0 backstop) opts out so iOS Mosh + Termius/Blink
         // use the terminal app's native scrollback for touch-scroll (Mosh
@@ -561,7 +569,7 @@ impl App {
     /// because the only cursor set in that state is the remote live-preview
     /// pane caret, not a local IME candidate window, so there's nothing for
     /// the early Hide to protect.
-    fn draw(&mut self, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
+    fn draw(&mut self, terminal: &mut Terminal<TuiBackend>) -> Result<()> {
         // An ACTIVE embedded structured view sets a composer caret every
         // frame, just like the live-send preview caret: hiding it
         // before each ~30fps redraw makes it strobe (the reported "cursor
@@ -610,7 +618,7 @@ impl App {
     /// editors) have exclusive access to stdin, then creates a fresh one.
     fn with_raw_mode_disabled<F, R>(
         &mut self,
-        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        terminal: &mut Terminal<TuiBackend>,
         f: F,
     ) -> Result<R>
     where
@@ -688,7 +696,7 @@ impl App {
 
     fn with_attached_status_hooks<F, R>(
         &mut self,
-        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        terminal: &mut Terminal<TuiBackend>,
         f: F,
     ) -> Result<(R, Vec<StatusUpdate>)>
     where
@@ -744,10 +752,7 @@ impl App {
         self.needs_redraw = true;
     }
 
-    pub async fn run(
-        &mut self,
-        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    ) -> Result<()> {
+    pub async fn run(&mut self, terminal: &mut Terminal<TuiBackend>) -> Result<()> {
         // Keep the display snapshots (sessions, pane metadata) fresh off the
         // paint thread: every _for_display helper and the passive preview
         // resize executor answers from these snapshots and never forks in render.
@@ -1310,6 +1315,47 @@ impl App {
                                 }
                                 continue;
                             }
+                            // A hyperlink under the pointer opens in the
+                            // browser. aoe captures the mouse, so the host
+                            // terminal never sees this click and its own URL
+                            // matching cannot help; a plain press is therefore
+                            // the gesture. Runs ahead of the mouse forward so a
+                            // mouse-tracking agent doesn't swallow it, and skips
+                            // on Shift, which everywhere else on the preview
+                            // means "aoe stays out of the way".
+                            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                                && !mouse.modifiers.contains(KeyModifiers::SHIFT)
+                            {
+                                if let Some(url) =
+                                    self.home.preview_link_at(mouse.column, mouse.row)
+                                {
+                                    // The browser can open behind the terminal,
+                                    // so say what happened either way, and never
+                                    // claim an open that did not happen. When no
+                                    // browser the user could see is reachable
+                                    // (the normal case over SSH), the clipboard
+                                    // does reach their machine over OSC 52, so
+                                    // hand them the URL instead of a dead end.
+                                    let status = match crate::tui::open_url::open_url(&url) {
+                                        Ok(()) => format!("opened {url}"),
+                                        Err(e) => {
+                                            crate::tui::clipboard::copy_to_clipboard(&url);
+                                            format!("{e}; copied {url}")
+                                        }
+                                    };
+                                    self.home.flash_status(status);
+                                    // The press is consumed here, so it never
+                                    // reaches the drag-select path that would
+                                    // otherwise clear a finalized highlight.
+                                    let _ = self.home.clear_preview_selection();
+                                    // This press is spent; without forgetting
+                                    // it, clicking the link again pairs into a
+                                    // double-click and attaches the session.
+                                    self.home.forget_preview_click();
+                                    self.draw(terminal)?;
+                                    continue;
+                                }
+                            }
                             // Mouse-tracking agent under the preview (live-send
                             // OR passive hover): forward the press / drag /
                             // release straight to it, exactly as a direct attach
@@ -1517,6 +1563,13 @@ impl App {
                                     // overlay dialogs).
                                     let mut changed =
                                         self.home.handle_hover(mouse.column, mouse.row);
+                                    // Show where a link goes while the pointer
+                                    // rests on it: the click opens without
+                                    // confirmation, so this is the only look
+                                    // the user gets before committing.
+                                    changed |= self
+                                        .home
+                                        .update_hovered_link(mouse.column, mouse.row);
                                     if hit_diff {
                                         changed |= self
                                             .home
@@ -1717,6 +1770,14 @@ impl App {
             // updates, dialog ticks) get painted right away.
             let mut refresh_needed = false;
             let mut needs_full_refresh = false;
+
+            // A closed flash window needs exactly one repaint to clear the
+            // row; the loop already wakes on the ticker, so this costs a
+            // single frame rather than polling.
+            if self.home.expire_status_flash() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
 
             // Continuous edge auto-scroll for a preview drag-select. The
             // mouse-event arm `continue`s above, so this runs on the
@@ -2543,7 +2604,7 @@ impl App {
         &mut self,
         method: crate::update::install::InstallMethod,
         version: String,
-        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        terminal: &mut Terminal<TuiBackend>,
     ) -> Result<()> {
         use crate::update::install::InstallMethod;
 
@@ -2820,7 +2881,7 @@ impl App {
     async fn handle_key(
         &mut self,
         key: KeyEvent,
-        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        terminal: &mut Terminal<TuiBackend>,
     ) -> Result<()> {
         // An ACTIVE embedded structured view owns the keyboard, just as
         // the full-screen view owned the whole event stream: letters must
@@ -3032,11 +3093,7 @@ impl App {
     /// `aoe serve`, so the spawn is part of the consented action rather
     /// than a hidden side effect. `terminal` is borrowed to paint the
     /// "Starting…" status before the (up to several seconds) wait.
-    async fn perform_view_switch(
-        &mut self,
-        session_id: &str,
-        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    ) {
+    async fn perform_view_switch(&mut self, session_id: &str, terminal: &mut Terminal<TuiBackend>) {
         use crate::acp::client::{require_daemon, HttpClient, ManagerError};
 
         let Some(inst) = self.home.get_instance(session_id) else {
@@ -3188,7 +3245,7 @@ impl App {
     async fn start_daemon_then_open(
         &mut self,
         session_id: &str,
-        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        terminal: &mut Terminal<TuiBackend>,
     ) {
         self.update_status = Some(UpdateStatus::transient("Starting local daemon…".into()));
         let _ = self.draw(terminal);
@@ -3383,7 +3440,7 @@ impl App {
     fn execute_action(
         &mut self,
         action: Action,
-        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        terminal: &mut Terminal<TuiBackend>,
     ) -> Result<()> {
         match action {
             Action::Quit => self.should_quit = true,
@@ -3552,7 +3609,7 @@ impl App {
     fn dispatch_new_session_attach(
         &mut self,
         session_id: &str,
-        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        terminal: &mut Terminal<TuiBackend>,
     ) -> Result<()> {
         if self
             .home
@@ -3581,7 +3638,7 @@ impl App {
     fn attach_session(
         &mut self,
         session_id: &str,
-        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        terminal: &mut Terminal<TuiBackend>,
     ) -> Result<()> {
         let instance = match self.home.get_instance(session_id) {
             Some(inst) => inst.clone(),
@@ -3775,7 +3832,7 @@ impl App {
         &mut self,
         session_id: &str,
         mode: TerminalMode,
-        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        terminal: &mut Terminal<TuiBackend>,
     ) -> Result<()> {
         let instance = match self.home.get_instance(session_id) {
             Some(inst) => inst.clone(),
@@ -3848,7 +3905,7 @@ impl App {
         &mut self,
         session_id: &str,
         tool_name: &str,
-        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        terminal: &mut Terminal<TuiBackend>,
     ) -> Result<()> {
         let instance = match self.home.get_instance(session_id) {
             Some(inst) => inst.clone(),
@@ -3979,7 +4036,7 @@ impl App {
     fn edit_file(
         &mut self,
         path: &std::path::Path,
-        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        terminal: &mut Terminal<TuiBackend>,
     ) -> Result<()> {
         // Determine which editor to use (prefer vim, fall back to nano)
         let editor = std::env::var("EDITOR")
