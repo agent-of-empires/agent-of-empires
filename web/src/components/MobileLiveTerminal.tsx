@@ -132,6 +132,8 @@ export interface MobileLiveTerminalProps {
   frame: LiveFrame | null;
   /** Wire counters from the hook, shown by the `?livedebug=1` overlay. */
   liveStats?: LiveStats;
+  /** Which transport the server is rendering with, for the same overlay. */
+  transport?: "grid" | "snapshot" | null;
   /** Arm the parent view's gesture-bound clipboard write before an agent
    *  selection release crosses the WebSocket. */
   armAgentClipboard?: () => void;
@@ -573,6 +575,7 @@ export const Row = memo(function Row({
 export function MobileLiveTerminal({
   frame,
   liveStats,
+  transport,
   armAgentClipboard,
   connected,
   active,
@@ -2018,7 +2021,9 @@ export function MobileLiveTerminal({
             `seq=${frame?.seq ?? "-"} alt=${altScreen ? 1 : 0} fps=${frameTiming.fps().toFixed(1)} paint=${frameTiming
               .meanPaintMs()
               .toFixed(1)}ms`,
-            `frames=${liveStats?.frames ?? "-"} patches=${liveStats?.patches ?? "-"} resyncs=${liveStats?.resyncs ?? "-"} wire=${
+            `transport=${transport ?? "-"} frames=${liveStats?.frames ?? "-"} patches=${
+              liveStats?.patches ?? "-"
+            } resyncs=${liveStats?.resyncs ?? "-"} wire=${
               liveStats ? `${(liveStats.wireBytes / 1024).toFixed(1)}k` : "-"
             }`,
           ].join("\n")}

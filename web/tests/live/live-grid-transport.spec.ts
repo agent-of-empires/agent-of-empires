@@ -2,15 +2,38 @@
 // the in-process VT grid, so a full-screen app that brackets its repaints in
 // DEC 2026 synchronized output is never shown half-drawn, and once the client
 // advertises `caps.patch` the stream carries row patches instead of whole
-// windows. Both are behaviors the `capture-pane` snapshot path cannot offer,
-// so the assertions double as proof that the grid transport is in use.
-import { devices } from "@playwright/test";
+// windows.
+//
+// Only the first of those is grid-only. Row patches are planned in the shared
+// publish path and arrive on the snapshot fallback too, so neither assertion
+// proves which transport is live. The server says so directly instead, and
+// both cases check it: a run that quietly fell back to snapshots would
+// otherwise read as a tearing bug in the grid rather than as an absent grid.
+import { devices, type Page } from "@playwright/test";
 import { join } from "node:path";
 import { writeFileSync, chmodSync, mkdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { test, expect } from "../helpers/liveTest";
 import { spawnAoeServe, resolveAoeBinary, type SpawnOptions } from "../helpers/aoeServe";
 import { clickSidebarSession, openMobileSidebar } from "../helpers/sidebar";
+
+/** The server announces its transport on the first frame. Fail here rather
+ *  than letting a snapshot fallback masquerade as a grid that tears: the
+ *  fallback cannot suppress a half-drawn repaint and is not what these cases
+ *  are about. */
+async function expectGridTransport(page: Page) {
+  const transport = async () => {
+    const text = (await page.locator("[data-live-debug]").textContent()) ?? "";
+    return /transport=(\w+)/.exec(text)?.[1] ?? null;
+  };
+  await expect
+    .poll(transport, {
+      timeout: 30_000,
+      message: "server reported which transport is live",
+    })
+    .not.toBeNull();
+  expect(await transport(), "the VT grid armed; a snapshot fallback cannot hold a repaint").toBe("grid");
+}
 
 function seedTool(title: string, script: string): SpawnOptions["seedFn"] {
   return (e) => {
@@ -59,10 +82,11 @@ test("synchronized-output brackets publish whole frames only", async ({ browser 
   try {
     const ctx = await browser.newContext({ ...devices["iPhone 13"] });
     const page = await ctx.newPage();
-    await page.goto(serve.baseUrl);
+    await page.goto(`${serve.baseUrl}/?livedebug=1`);
     await openMobileSidebar(page);
     await clickSidebarSession(page, "sync-app");
     await page.locator("[data-live-terminal]").waitFor({ state: "visible", timeout: 15_000 });
+    await expectGridTransport(page);
     await page
       .locator("[data-live-content]")
       .filter({ hasText: /FRAME-B \d+/ })
@@ -114,6 +138,7 @@ test("a streaming agent is delivered as row patches after the first frame", asyn
     await openMobileSidebar(page);
     await clickSidebarSession(page, "patch-stream");
     await page.locator("[data-live-terminal]").waitFor({ state: "visible", timeout: 15_000 });
+    await expectGridTransport(page);
     await page
       .locator("[data-live-content]")
       .filter({ hasText: /patch line \d+/ })

@@ -106,6 +106,10 @@ export interface LiveTerminalState {
    * Until then input is buffered and the UI must not present a takeover
    * banner as though another viewer had been confirmed. */
   ownerKnown: boolean;
+  /** Which transport is producing frames, once the server has said. The
+   *  capture fallback cannot suppress a half-drawn repaint, so a torn screen
+   *  means something different on each, and only the server knows which. */
+  transport: "grid" | "snapshot" | null;
   stats: LiveStats;
 }
 
@@ -118,6 +122,7 @@ const INITIAL_STATE: LiveTerminalState = {
   reading: false,
   isOwner: false,
   ownerKnown: false,
+  transport: null,
   stats: { frames: 0, patches: 0, wireBytes: 0, resyncs: 0 },
 };
 
@@ -290,6 +295,7 @@ export function useLiveTerminal(
         if (wsRef.current !== ws) return;
         let msg: {
           type?: string;
+          grid?: boolean;
           content?: string;
           seq?: number;
           base?: number;
@@ -317,6 +323,11 @@ export function useLiveTerminal(
             prev.isOwner === owner && prev.ownerKnown ? prev : { ...prev, isOwner: owner, ownerKnown: true },
           );
           if (owner) flushPendingInput();
+          return;
+        }
+        if (msg.type === "transport") {
+          const transport = msg.grid ? "grid" : "snapshot";
+          setState((prev) => (prev.transport === transport ? prev : { ...prev, transport }));
           return;
         }
         if (msg.type === "clipboard") {
@@ -642,7 +653,9 @@ export function frameLines(content: string): string[] {
 export function applyPatch(prev: readonly string[], shift: number, changed: readonly [number, string][]): string[] {
   const n = prev.length;
   const k = Math.max(0, Math.min(n, Math.trunc(shift)));
-  const next = k > 0 ? [...prev.slice(k), ...new Array<string>(k).fill("")] : [...prev];
+  // Pad from `prev` itself rather than allocating by a wire-supplied length,
+  // so the result can never be longer than the window it replaces.
+  const next = prev.slice(k).concat(prev.slice(0, k).map(() => ""));
   for (const [i, row] of changed) {
     if (i >= 0 && i < n) next[i] = row;
   }

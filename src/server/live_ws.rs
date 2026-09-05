@@ -1,6 +1,6 @@
 //! Live terminal view for the web dashboard.
 //!
-//! The agent surface renders from the shared [`crate::tmux::vt::VtChannel`]
+//! The agent surface renders from the shared VT channel (`crate::tmux::vt`)
 //! when one can be armed (`[tmux] vt_live`, tmux >= 3.4, unix): the pane's
 //! bytes stream through `pipe-pane` into an in-process grid, frames publish
 //! the moment the grid changes (held while the app is inside a DEC 2026
@@ -46,6 +46,9 @@
 //!     non-owner at fast cadence auto-reclaims the lock (claim, never
 //!     steal) once the holder releases it, so ownership returns without
 //!     another "take over" tap.
+//!   `{"type":"transport","grid":bool}`: which transport is producing frames,
+//!     sent on the first frame and whenever it flips. `false` means the
+//!     capture fallback, which cannot suppress a half-drawn repaint.
 //!   `{"type":"clipboard","text":"..."}`: an OSC 52 clipboard write emitted
 //!     by the pane. The browser resolves it against the user gesture that
 //!     triggered the agent's copy action.
@@ -358,6 +361,14 @@ fn size_owner_json(is_owner: bool) -> String {
 
 fn clipboard_json(text: &str) -> String {
     serde_json::json!({ "type": "clipboard", "text": text }).to_string()
+}
+
+/// Which transport is producing frames. The grid can be unavailable for
+/// reasons no user can see (an old tmux, a pane that would not seed, a split
+/// window), and the fallback tears where the grid does not, so a viewer
+/// debugging "it still tears" needs to know which one it has.
+fn transport_json(grid: bool) -> String {
+    serde_json::json!({ "type": "transport", "grid": grid }).to_string()
 }
 
 /// Whether this connection may push the pane's OSC 52 copies into the
@@ -697,11 +708,19 @@ async fn handle_live_ws(
         let mut vt_rx = capture_vt.as_ref().map(|ch| ch.subscribe());
         // Pane count of the window, re-probed at most once per
         // PANE_COUNT_PROBE_INTERVAL while the grid path is in use.
+        // `None` until tmux answers. An unprobed count must not read as a
+        // single pane: the grid holds pane 0 alone, so believing that of a
+        // split window would drop every other pane from the view. Unknown
+        // takes the composited capture path, which is right for any count.
         #[cfg(unix)]
-        let mut pane_count: (u16, Instant) = (1, Instant::now() - PANE_COUNT_PROBE_INTERVAL);
+        let mut pane_count: (Option<u16>, Instant) =
+            (None, Instant::now() - PANE_COUNT_PROBE_INTERVAL);
         #[cfg(unix)]
         let mut first_publish_wait_started: Option<Instant> = None;
         let mut last_published: Option<(String, Option<crate::tmux::PaneCursor>)> = None;
+        // Announced on the first frame and whenever it flips, so a client can
+        // report the transport rather than infer it.
+        let mut announced_grid: Option<bool> = None;
         // Patch baseline: rows of the last message the client applied and its
         // scrollback depth, plus the running sequence number.
         let mut last_sent: Option<(Vec<String>, u32)> = None;
@@ -735,16 +754,16 @@ async fn handle_live_ws(
                     // Advance the probe clock even on failure, or a tmux that
                     // cannot answer would be re-forked on every capture cycle
                     // instead of once a second. A failed probe keeps the last
-                    // known count.
+                    // answer, which is `None` until one arrives.
                     let probed =
                         tokio::task::spawn_blocking(move || window_pane_count(&name)).await;
-                    pane_count = (
-                        probed.ok().flatten().unwrap_or(pane_count.0),
-                        Instant::now(),
-                    );
+                    pane_count = (probed.ok().flatten().or(pane_count.0), Instant::now());
                 }
                 outcome = match live_grid {
-                    Some(ch) if pane_count.0 <= 1 && lines <= crate::tmux::vt::SCROLLBACK_LINES => {
+                    Some(ch)
+                        if pane_count.0 == Some(1)
+                            && lines <= crate::tmux::vt::SCROLLBACK_LINES =>
+                    {
                         grid_frame = true;
                         match tokio::task::spawn_blocking(move || {
                             let deadline = crate::tmux::TmuxCommandDeadline::new();
@@ -1050,6 +1069,17 @@ async fn handle_live_ws(
                             }
                         }
                     }
+                    #[cfg(unix)]
+                    if announced_grid != Some(grid_frame) {
+                        announced_grid = Some(grid_frame);
+                        if capture_tx
+                            .send(Message::Text(transport_json(grid_frame).into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                     let frame = (content, cursor);
                     // A resync republishes even when the frame is unchanged:
                     // the client dropped a patch and is showing a stale window
@@ -1081,7 +1111,7 @@ async fn handle_live_ws(
                             None => frame_json(&frame.0, frame.1.as_ref(), seq),
                         };
                         last_sent = Some((lines.iter().map(|l| l.to_string()).collect(), history));
-                        stats.frames += 1;
+                        stats.publishes += 1;
                         stats.bytes += json.len() as u64;
                         if deflater.is_none() && capture_settings.deflate.load(Ordering::Relaxed) {
                             deflater = Some(FrameDeflater::new());
@@ -1139,7 +1169,7 @@ async fn handle_live_ws(
             target: "terminal.ws",
             tmux = %capture_tmux,
             kind = "live",
-            frames = stats.frames,
+            publishes = stats.publishes,
             patches = stats.patches,
             bytes = stats.bytes,
             samples = stats.samples,
@@ -1412,7 +1442,8 @@ async fn handle_live_ws(
 /// Per-connection counters, logged when the capture loop ends.
 #[derive(Default)]
 struct LiveStats {
-    frames: u64,
+    /// Every message that carried content, full frames and patches alike.
+    publishes: u64,
     patches: u64,
     bytes: u64,
     samples: u64,
@@ -1460,9 +1491,15 @@ async fn wait_for_next(
     let small_window = settings.window_lines.load(Ordering::Relaxed) <= screen * 4;
     #[cfg(not(unix))]
     let grid_driven = false;
-    let ms = if grid_driven {
+    // A backgrounded tab or an inactive terminal asks for the idle cadence.
+    // The grid path has to honor that too: left armed, its change signal would
+    // wake this loop on every repaint and re-render the window for a viewer
+    // nobody is looking at, which on a phone is battery and data. The input
+    // nudge is unaffected, so typed echo still wakes immediately.
+    let fast = settings.fast.load(Ordering::Relaxed);
+    let ms = if grid_driven && fast {
         GRID_CEILING_MS
-    } else if settings.fast.load(Ordering::Relaxed) && small_window {
+    } else if fast && small_window {
         CAPTURE_INTERVAL_FAST_MS
     } else {
         CAPTURE_INTERVAL_IDLE_MS
@@ -1474,7 +1511,7 @@ async fn wait_for_next(
     }
     #[cfg(unix)]
     {
-        let grid_arm = grid_driven && small_window;
+        let grid_arm = grid_driven && small_window && fast;
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(ms)) => {}
             _ = nudge.notified() => {}

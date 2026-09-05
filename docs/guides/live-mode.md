@@ -132,10 +132,11 @@ echo and streaming output land with near-attach latency, agent copies
 repaints in synchronized output (DEC 2026) is shown only between brackets,
 never mid-redraw.
 
-The channel needs tmux 3.4 or newer. A pane that cannot arm one, an
-older tmux, a split window, or a non-Unix host falls back to the polling
-path automatically; everything still works, just with more latency. The
-paired host and container shells always use the polling path.
+The channel needs tmux 3.4 or newer. A pane that cannot arm one, a pane
+whose grid could not be seeded, an older tmux, a split window, or a
+non-Unix host falls back to the polling path automatically; everything
+still works, with more latency and without the synchronized-output hold.
+The paired host and container shells always use the polling path.
 
 To rule the VT transport in or out while troubleshooting, toggle "VT
 Live Transport" under Settings (Tmux tab, Advanced) or set it in

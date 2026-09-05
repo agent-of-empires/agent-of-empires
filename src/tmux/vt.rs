@@ -171,10 +171,17 @@ fn is_payload_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'?')
 }
 
-/// Longest a DEC 2026 synchronized-output bracket may hold publication. An app
-/// that opens a bracket and never closes it (or dies mid-frame) must not
-/// freeze every viewer, so the hold expires like it does in real terminals.
+/// Longest a DEC 2026 synchronized-output bracket suppresses viewer wakeups.
+/// Past this the capture loop resumes its normal cadence so death detection
+/// and the size-owner heartbeat keep running; the sampler still prefers the
+/// last complete frame, so resuming costs no tearing.
 const SYNC_HOLD_MAX_MS: u64 = 200;
+/// Longest the sampler keeps preferring the last complete frame over a grid
+/// that is still mid-bracket. A repaint slower than [`SYNC_HOLD_MAX_MS`] is
+/// ordinary on a loaded machine and must not tear; an app that opens a bracket
+/// and never closes it is stuck, and past this its partial screen is the only
+/// truth left to show.
+const SYNC_BRACKET_ABANDON_MS: u64 = 2_000;
 
 #[derive(Clone, Copy, PartialEq)]
 enum SyncState {
@@ -281,14 +288,21 @@ impl ViewerSignals {
     }
 
     /// True while a synchronized-output bracket is open and has not outlived
-    /// [`SYNC_HOLD_MAX_MS`].
+    /// [`SYNC_HOLD_MAX_MS`]. Gates wakeups and publication.
     pub(crate) fn hold_active(&self) -> bool {
-        self.hold_active_at(chunk_now_ms())
+        self.open_within(chunk_now_ms(), SYNC_HOLD_MAX_MS)
     }
 
-    fn hold_active_at(&self, now_ms: u64) -> bool {
+    /// True while the grid holds a frame the app has not finished drawing, up
+    /// to [`SYNC_BRACKET_ABANDON_MS`]. Outlives [`Self::hold_active`] so a slow
+    /// repaint is served from the last complete frame instead of torn.
+    pub(crate) fn frame_incomplete(&self) -> bool {
+        self.open_within(chunk_now_ms(), SYNC_BRACKET_ABANDON_MS)
+    }
+
+    fn open_within(&self, now_ms: u64, window_ms: u64) -> bool {
         let since = self.sync_hold_since_ms.load(Ordering::Relaxed);
-        since != 0 && now_ms.saturating_sub(since) < SYNC_HOLD_MAX_MS
+        since != 0 && now_ms.saturating_sub(since) < window_ms
     }
 }
 
@@ -793,6 +807,14 @@ const SEED_PROBE_ATTEMPTS: usize = 3;
 /// Pause between disagreeing seed attempts, letting a mid-flight burst (a
 /// clear-then-reprint, an alt-screen flip) finish before the re-probe.
 const SEED_RETRY_SETTLE: Duration = Duration::from_millis(5);
+
+/// How many times arming re-runs the whole snapshot-and-install cycle when the
+/// install fences against a chunk that landed during the capture. A busy pane
+/// loses that race often; a handful of attempts finds a gap between repaints.
+const SEED_INSTALL_ATTEMPTS: usize = 8;
+/// Pause between those attempts. Long enough to clear a repaint burst, short
+/// enough that eight of them stay well inside the tmux command deadline.
+const SEED_INSTALL_RETRY: Duration = Duration::from_millis(20);
 
 /// One `capture-pane -e` body plus a [`PaneSeedState`] that is KNOWN to
 /// describe the same instant, or `None` when the pane is gone.
@@ -1373,10 +1395,13 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
                 // can publish this chunk: a frame is published when the
                 // bracket closes (or the hold expires), never in the middle.
                 let sync_event = sync.feed(&buf[..n]);
-                match sync_event {
-                    Some(true) => ctx.signals.begin_hold(),
-                    Some(false) => ctx.signals.end_hold(),
-                    None => {}
+                // Opening is raised before the grid is touched, so a sampler
+                // racing this chunk errs toward the last complete frame.
+                // Closing is raised below, under the parser lock, because the
+                // grid does not hold the finished frame until the chunk has
+                // been applied.
+                if sync_event == Some(true) {
+                    ctx.signals.begin_hold();
                 }
                 // The vt100 parser below silently drops OSC 52, and in
                 // live-send no tmux client is attached for `set-clipboard`
@@ -1428,6 +1453,11 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
                         },
                         Ordering::Relaxed,
                     );
+                    // The finished frame is in the grid now, so the bracket can
+                    // release; a sampler waiting on this lock sees a whole frame.
+                    if sync_event == Some(false) {
+                        ctx.signals.end_hold();
+                    }
                     // Publish settlement after parser, cursor, generation, and
                     // timing updates. Acquire readers use this completion fence.
                     ctx.settled_chunk_seq.store(seq + 1, Ordering::Release);
@@ -1748,18 +1778,39 @@ impl VtChannel {
         // The seed therefore either includes each chunk or returns Busy, never
         // dropping the capture-to-install window.
         seeded.store(true, Ordering::Release);
-        let expected_chunk_seq = chunk_seq.load(Ordering::Acquire);
-        if seed_parser(
-            &target,
-            &parser,
-            &app_cursor,
-            &grid_gen,
-            (cols, rows),
-            deadline,
-            Some((&chunk_seq, &settled_chunk_seq, expected_chunk_seq)),
-        ) != VtRefreshResult::Refreshed
-        {
-            tracing::warn!(%target, "vt: initial seed failed; falling back to capture");
+        // A pane that repaints continuously lands a chunk inside nearly every
+        // seed window, and the fence then reports Busy rather than installing
+        // a snapshot that would drop it. That is the pane being active, not
+        // unseedable, so retry: giving up here strands the caller on the
+        // capture fallback for the channel's whole lifetime, and a full-screen
+        // agent is repainting from the moment it starts. Failed is different
+        // and terminal (the pane is gone), so it breaks out immediately.
+        let mut seed_result = VtRefreshResult::Failed;
+        for attempt in 0..SEED_INSTALL_ATTEMPTS {
+            if attempt > 0 {
+                std::thread::sleep(SEED_INSTALL_RETRY);
+            }
+            let expected_chunk_seq = chunk_seq.load(Ordering::Acquire);
+            seed_result = seed_parser(
+                &target,
+                &parser,
+                &app_cursor,
+                &grid_gen,
+                (cols, rows),
+                deadline,
+                Some((&chunk_seq, &settled_chunk_seq, expected_chunk_seq)),
+            );
+            match seed_result {
+                VtRefreshResult::Refreshed | VtRefreshResult::Failed => break,
+                VtRefreshResult::Busy => {}
+            }
+        }
+        if seed_result != VtRefreshResult::Refreshed {
+            tracing::warn!(
+                %target,
+                result = ?seed_result,
+                "vt: initial seed failed; falling back to capture"
+            );
             stop_and_wake_reader(&stop, &sock_path);
             session.release_vt_pipe_owner_with_deadline(&owner, deadline);
             let _ = reader.join();
@@ -1967,42 +2018,49 @@ impl VtChannel {
         max_lines: usize,
         deadline: &crate::tmux::TmuxCommandDeadline,
     ) -> (String, Option<PaneCursor>) {
+        // Both fork tmux and take the parser lock themselves, so they run
+        // before this sampler takes it.
         self.reconcile_grid(deadline);
         self.refresh_owner_heartbeat(deadline);
         let cols = self.cols.load(Ordering::Relaxed);
         let rows = self.rows.load(Ordering::Relaxed);
-        // Read the generation BEFORE assembling: a chunk that lands
-        // mid-assembly then leaves the cached frame tagged one generation
-        // stale (a wasted rebuild next cycle), never tagged fresh (a stale
-        // frame served as current).
+        let mut p = match self.parser.lock() {
+            Ok(p) => p,
+            Err(_) => return (String::new(), None),
+        };
+        // Read both under the parser lock, which is where the reader applies a
+        // chunk and bumps the generation, and where it releases a bracket. The
+        // grid therefore cannot change identity between these reads and the
+        // assembly below.
         let grid_gen = self.grid_gen.load(Ordering::Relaxed);
+        let incomplete = self.signals.frame_incomplete();
         if let Ok(guard) = self.sample_cache.lock() {
             if let Some(c) = guard.as_ref() {
                 let same_window = (c.max_lines, c.cols, c.rows) == (max_lines, cols, rows);
                 // Mid-bracket the grid is a half-drawn frame: serve the last
                 // complete one instead. The reader wakes viewers on close.
-                if same_window && (c.grid_gen == grid_gen || self.signals.hold_active()) {
+                if same_window && (c.grid_gen == grid_gen || incomplete) {
                     return (c.content.clone(), Some(c.cursor));
                 }
             }
         }
-        let mut p = match self.parser.lock() {
-            Ok(p) => p,
-            Err(_) => return (String::new(), None),
-        };
         let (content, history) = grid_content(&mut p, max_lines, cols, rows);
         let mut cursor = cursor_from_screen(p.screen(), rows, cols);
         cursor.history_size = history as u32;
         drop(p);
-        if let Ok(mut guard) = self.sample_cache.lock() {
-            *guard = Some(SampleCache {
-                grid_gen,
-                max_lines,
-                cols,
-                rows,
-                content: content.clone(),
-                cursor,
-            });
+        // Never cache a frame assembled mid-bracket: it is half drawn, and a
+        // cached copy would outlive the bracket that explains it.
+        if !incomplete {
+            if let Ok(mut guard) = self.sample_cache.lock() {
+                *guard = Some(SampleCache {
+                    grid_gen,
+                    max_lines,
+                    cols,
+                    rows,
+                    content: content.clone(),
+                    cursor,
+                });
+            }
         }
         (content, Some(cursor))
     }
@@ -4062,11 +4120,32 @@ mod tests {
         assert_eq!(signals.sync_hold_since_ms.load(Ordering::Relaxed), since);
         signals.end_hold();
         assert!(!signals.hold_active());
-        // An abandoned bracket expires.
+        assert!(!signals.frame_incomplete());
+
+        // A repaint slower than the wakeup hold stops suppressing publication
+        // but must still read as incomplete, or the sampler would serve the
+        // half-drawn grid instead of the last whole frame it already has.
         signals.begin_hold();
         let since = signals.sync_hold_since_ms.load(Ordering::Relaxed);
-        assert!(signals.hold_active_at(since + SYNC_HOLD_MAX_MS - 1));
-        assert!(!signals.hold_active_at(since + SYNC_HOLD_MAX_MS));
+        for (elapsed, hold, incomplete) in [
+            (0, true, true),
+            (SYNC_HOLD_MAX_MS - 1, true, true),
+            (SYNC_HOLD_MAX_MS, false, true),
+            (SYNC_BRACKET_ABANDON_MS - 1, false, true),
+            // Past this the app is stuck and its partial screen is all there is.
+            (SYNC_BRACKET_ABANDON_MS, false, false),
+        ] {
+            assert_eq!(
+                signals.open_within(since + elapsed, SYNC_HOLD_MAX_MS),
+                hold,
+                "hold at {elapsed}ms"
+            );
+            assert_eq!(
+                signals.open_within(since + elapsed, SYNC_BRACKET_ABANDON_MS),
+                incomplete,
+                "incomplete at {elapsed}ms"
+            );
+        }
     }
 
     #[test]
