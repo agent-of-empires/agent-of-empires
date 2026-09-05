@@ -124,7 +124,7 @@ fn read_frame(stream: &mut UnixStream) -> serde_json::Value {
     serde_json::from_slice(&body).expect("parse frame json")
 }
 
-/// The Phase C (#2977) core loop over real sockets and real framing: an
+/// The v3 core loop over real sockets and framing: an
 /// agent-issued request reaches the daemon as a `ServerCall`, and the
 /// daemon's `ServerResult` reaches the agent as a JSON-RPC response echoing
 /// the agent's own id.
@@ -179,7 +179,7 @@ fn runner_proxies_agent_requests_over_the_control_channel() {
     // #2977: the relay socket is retired, so the runner must NOT create it.
     assert!(
         !socket.exists(),
-        "a v3 runner must not bind the retired byte relay at {}",
+        "a v3 runner must not bind the retired raw socket at {}",
         socket.display()
     );
 
@@ -251,6 +251,25 @@ fn runner_proxies_agent_requests_over_the_control_channel() {
     assert_eq!(result["kind"], "agent_result", "got {result}");
     assert_eq!(result["call_id"], 1);
 
+    // More than the former eight-slot staging channel must be consumed without
+    // treating a local queue-full condition as a daemon disconnect.
+    for index in 0..16 {
+        write_frame(
+            &mut ctl,
+            &serde_json::json!({
+                "kind": "agent_call",
+                "call_id": 100 + index,
+                "method": "fs/read_text_file",
+                "params": {"index": index},
+            }),
+        );
+    }
+    for index in 0..16 {
+        let call = read_frame(&mut ctl);
+        assert_eq!(call["kind"], "server_call", "burst frame {index}: {call}");
+        assert_eq!(call["params"]["index"], index);
+    }
+
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -285,27 +304,43 @@ fn write_frame(stream: &mut UnixStream, body: &serde_json::Value) {
     stream.flush().expect("flush frame");
 }
 
-/// A peer cannot consume buffered frames until it proves protocol v3 with
-/// `Attach` as its first frame. A rejected peer must leave the backlog for
-/// the next valid daemon.
+/// Invalid peers cannot consume the backlog. A valid peer that stops reading a
+/// 17 MiB agent frame must time out without losing it or monopolizing the accept
+/// slot; the next daemon receives the same frame.
 #[test]
-fn runner_validates_attach_before_flushing_backlog() {
+fn runner_requeues_large_frame_after_stalled_writer() {
     if cfg!(not(unix)) {
         return;
     }
+    let Some(python3) = find_python3() else {
+        eprintln!("skipping: python3 not found for large-frame agent");
+        return;
+    };
 
     let scratch = Scratch::new("attach");
     let home = scratch.0.join("home");
     let xdg = scratch.0.join("xdg");
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&xdg).unwrap();
+    let agent = scratch.0.join("large_agent.py");
+    std::fs::write(
+        &agent,
+        r#"import json, sys
+message = {"jsonrpc":"2.0","method":"session/update","params":{"blob":"x" * (17 * 1024 * 1024)}}
+sys.stdout.write(json.dumps(message) + "\n")
+sys.stdout.flush()
+for line in sys.stdin:
+    sys.stdout.write(line)
+    sys.stdout.flush()
+"#,
+    )
+    .unwrap();
 
     let session_id = "sattach1";
     let workers = app_dir(&home, &xdg).join("acp-workers");
     let socket = workers.join(format!("{session_id}.sock"));
     let control = workers.join(format!("{session_id}.control.sock"));
     let record = workers.join(format!("{session_id}.json"));
-    let script = r#"printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"source":"buffered"}}'; exec cat"#;
     let _child = KillOnDrop(
         Command::new(env!("CARGO_BIN_EXE_aoe"))
             .args([
@@ -319,9 +354,8 @@ fn runner_validates_attach_before_flushing_backlog() {
                 "--cwd",
                 home.to_str().unwrap(),
                 "--",
-                "/bin/sh",
-                "-c",
-                script,
+                python3.to_str().unwrap(),
+                agent.to_str().unwrap(),
             ])
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", &xdg)
@@ -338,19 +372,26 @@ fn runner_validates_attach_before_flushing_backlog() {
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
     assert_eq!(read_frame(&mut rejected)["kind"], "hello");
-    std::thread::sleep(Duration::from_millis(150));
     write_frame(
         &mut rejected,
         &serde_json::json!({"kind": "initialize", "request": {"protocolVersion": 1}}),
     );
     let mut prefix = [0u8; 4];
-    assert!(
-        rejected.read_exact(&mut prefix).is_err(),
-        "a non-Attach first frame must not receive or consume buffered traffic"
-    );
+    assert!(rejected.read_exact(&mut prefix).is_err());
     drop(rejected);
 
-    let mut accepted = UnixStream::connect(&control).expect("connect valid peer");
+    let mut stalled = UnixStream::connect(&control).expect("connect stalled peer");
+    stalled
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    assert_eq!(read_frame(&mut stalled)["kind"], "hello");
+    write_frame(
+        &mut stalled,
+        &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
+    );
+    std::thread::sleep(Duration::from_millis(2500));
+
+    let mut accepted = UnixStream::connect(&control).expect("connect replacement peer");
     accepted
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
@@ -362,10 +403,13 @@ fn runner_validates_attach_before_flushing_backlog() {
     let buffered = read_frame(&mut accepted);
     assert_eq!(buffered["kind"], "notify", "got {buffered}");
     assert_eq!(buffered["method"], "session/update");
-    assert_eq!(buffered["params"]["source"], "buffered");
+    assert_eq!(
+        buffered["params"]["blob"].as_str().unwrap().len(),
+        17 * 1024 * 1024
+    );
 }
 
-/// Regression for the deadlock the Phase C lane merge introduced: an agent
+/// Regression for a control-lane deadlock: an agent
 /// that issues a client request while it is answering `session/new`.
 ///
 /// That is legal ACP and precisely what this proxy layer exists to support.
@@ -421,6 +465,9 @@ for line in sys.stdin:
         pending_session = msg["id"]
         send({"jsonrpc": "2.0", "id": 9001, "method": "fs/read_text_file",
               "params": {"path": "/tmp/setup"}})
+    elif method == "session/prompt":
+        send({"jsonrpc": "2.0", "id": msg["id"],
+              "result": {"stopReason": "end_turn"}})
     elif method is None and msg.get("id") == 9001 and pending_session is not None:
         # Our fs request was answered; now we can finish session/new.
         send({"jsonrpc": "2.0", "id": pending_session,
@@ -505,6 +552,35 @@ for line in sys.stdin:
         "the handshake must complete once the agent's own request is answered: {ready}"
     );
     assert_eq!(ready["acp_session_id"], "sess-dl");
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&record).expect("read worker record"))
+            .expect("parse worker record");
+    assert_eq!(
+        persisted["stored_acp_session_id"], "sess-dl",
+        "session identity must be durable before SessionReady"
+    );
+    write_frame(
+        &mut ctl,
+        &serde_json::json!({"kind": "prompt", "request": {"sessionId": "sess-dl", "prompt": []}}),
+    );
+    let completion = read_typed_frame(&mut ctl);
+    assert_eq!(completion["kind"], "prompt_completed");
+    drop(ctl);
+
+    let mut resumed = UnixStream::connect(&control).expect("reconnect control socket");
+    resumed
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    assert_eq!(read_frame(&mut resumed)["kind"], "hello");
+    write_frame(
+        &mut resumed,
+        &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
+    );
+    assert_eq!(
+        read_typed_frame(&mut resumed),
+        completion,
+        "a flushed completion must replay after daemon loss"
+    );
 }
 
 /// Resolve python3 through PATH first, retaining the common absolute fallbacks
@@ -614,7 +690,7 @@ for line in sys.stdin:
     wait_for(&control, "old control socket");
     assert!(
         !socket.exists(),
-        "a v3 runner must not bind the retired byte relay at {}",
+        "a v3 runner must not bind the retired raw socket at {}",
         socket.display()
     );
     let old_agent_pid = wait_for_u32(&agent_pid_file, "old agent pid");
@@ -735,7 +811,7 @@ for line in sys.stdin:
     drop(replacement);
 }
 
-/// #2976 Phase B: the runner owns the ACP handshake. Drive it as a v3
+/// The runner owns the ACP handshake. Drive it as a v3
 /// daemon over the control channel across two attaches and assert the
 /// agent is handshaken (initialize + session/new) exactly once, that the
 /// second attach replays the cache without touching the agent, and that a
@@ -879,6 +955,10 @@ for line in sys.stdin:
             &mut ctl,
             &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
         );
+        let replayed = read_typed_frame(&mut ctl);
+        assert_eq!(replayed["kind"], "prompt_completed");
+        assert_eq!(replayed["outcome"]["stop_reason"], "end_turn");
+
         write_frame(
             &mut ctl,
             &serde_json::json!({"kind": "initialize", "request": {"protocolVersion": 1}}),
@@ -1055,11 +1135,11 @@ fn runner_load_uses_requested_id_and_caches_response() {
     );
 }
 
-/// #2976 Phase B regression: when the agent answers `session/new` with a
+/// When the agent answers session/new with a
 /// JSON-RPC error, the runner forwards the FULL error object (including
 /// `data`) in `HandshakeFailed`, so the daemon can reconstruct the crate
 /// error and surface the same `data.details` remediation banner the
-/// byte-relay path did. Guards the startup-error-banner live test at the
+/// direct stdio path does. Guards the startup-error-banner live test at the
 /// runner layer.
 #[test]
 fn runner_forwards_session_error_data_in_handshake_failed() {

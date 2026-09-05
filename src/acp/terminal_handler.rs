@@ -70,11 +70,6 @@ pub struct TerminalManager {
 #[derive(Debug, Default)]
 struct TerminalManagerInner {
     outputs: std::collections::HashMap<TerminalId, TerminalOutput>,
-    /// Ids this session has already released. Lets `terminal/release` be
-    /// idempotent for a duplicate call (an agent retrying after a daemon
-    /// disconnect, say) without masking a genuinely unknown id, which still
-    /// errors. Holds ids only, and is bounded by the session's terminal count.
-    released: std::collections::HashSet<TerminalId>,
 }
 
 /// Build the `docker exec` argv and inherit-env pairs for a sandboxed
@@ -197,21 +192,10 @@ impl TerminalManager {
             .ok_or_else(|| TerminalError::UnknownTerminal(terminal_id.into()))
     }
 
-    /// Implements ACP `terminal/release` by dropping the captured output.
-    pub async fn release(&self, terminal_id: &str) -> Result<(), TerminalError> {
-        let mut inner = self.inner.lock().await;
-        if inner.outputs.remove(terminal_id).is_none() {
-            return Err(TerminalError::UnknownTerminal(terminal_id.into()));
-        }
-        inner.released.insert(terminal_id.into());
-        Ok(())
-    }
-
-    /// Whether this session already released `terminal_id`. Distinguishes a
-    /// duplicate release (idempotent success) from an id that was never
-    /// created (a real error).
-    pub async fn was_released(&self, terminal_id: &str) -> bool {
-        self.inner.lock().await.released.contains(terminal_id)
+    /// Drop captured output. Release is a cleanup operation, so absent ids are
+    /// already in the requested postcondition and succeed idempotently.
+    pub async fn release(&self, terminal_id: &str) {
+        self.inner.lock().await.outputs.remove(terminal_id);
     }
 }
 
@@ -233,41 +217,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn release_removes_terminal() {
-        let mgr = TerminalManager::new();
-        let cwd = std::env::temp_dir();
-        let id = mgr
-            .create_and_run("s-1", "true", vec![], cwd, None)
-            .await
-            .unwrap();
-        mgr.release(&id).await.unwrap();
-        let result = mgr.output(&id).await;
-        assert!(matches!(result, Err(TerminalError::UnknownTerminal(_))));
-    }
-
-    // #2977: a replayed `terminal/release` must be distinguishable from one
-    // naming an id that never existed, so the handler can answer the first
-    // idempotently while still erroring on the second.
-    #[tokio::test]
-    async fn released_ids_are_remembered_but_unknown_ids_are_not() {
+    async fn release_is_idempotent_cleanup() {
         let mgr = TerminalManager::new();
         let id = mgr
             .create_and_run("s-1", "true", vec![], std::env::temp_dir(), None)
             .await
             .unwrap();
-        assert!(!mgr.was_released(&id).await, "not released yet");
-        mgr.release(&id).await.unwrap();
-        assert!(mgr.was_released(&id).await, "release is recorded");
-        // A second release still errors at the manager layer; the handler is
-        // what turns that into idempotent success, and only for a known id.
+        mgr.release(&id).await;
+        mgr.release(&id).await;
+        mgr.release("never-existed").await;
         assert!(matches!(
-            mgr.release(&id).await,
+            mgr.output(&id).await,
             Err(TerminalError::UnknownTerminal(_))
         ));
-        assert!(
-            !mgr.was_released("never-existed").await,
-            "a bogus id must stay an error rather than being masked"
-        );
     }
 
     // Regression: pipe-buffer deadlock when stderr exceeds the

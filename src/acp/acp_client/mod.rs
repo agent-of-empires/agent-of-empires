@@ -55,13 +55,13 @@ pub(crate) use spawn::host_environment_denyreason;
 pub use spawn::SpawnConfig;
 
 use crate::acp::agent_compat::ExpectedAgent;
+use crate::acp::agent_profiles;
 use crate::acp::approvals::{ApprovalDecision, Nonce};
 use crate::acp::elicitations::{build_response, summarize_answers, ElicitationResolution};
 use crate::acp::event_store::AttachmentBlob;
 use crate::acp::fs_handler::{FsPolicy, SandboxPathMap};
 use crate::acp::state::{AcpSessionId, Event, PromptAttachmentKind};
 use crate::acp::terminal_handler::TerminalManager;
-use crate::acp::{agent_profiles, control_protocol};
 use agent_client_protocol::schema::v1::{
     AudioContent, BlobResourceContents, ContentBlock, EmbeddedResource, EmbeddedResourceResource,
     ImageContent, McpServer, TextContent,
@@ -340,7 +340,7 @@ impl AcpClient {
             // runner's whole process group and clear its stale entry/socket
             // before binding the replacement. No-op when there is no live
             // prior runner. See #1689.
-            crate::process::worker_registry::terminate(&session_id.0);
+            crate::process::worker_registry::terminate_and_wait(&session_id.0).await;
             spawn_runner_detached(&config, &socket_path, session_id.0.clone(), runner_sandbox)?;
             return Self::connect_via_socket(
                 socket_path,
@@ -569,20 +569,14 @@ impl AcpClient {
         // on a mid-flight resume, so the resume-idle / between-prompt
         // watchdogs stand down.
         //
-        // A runner too old to speak v3 yields None. There is no byte relay to
-        // fall back to any more, so this is a hard failure for that runner:
-        // there is no legacy path left to serve it on. The reconciler is
-        // supposed to have replaced such a worker before we get here
-        // (`adopt_decision` sends a generation-stale worker straight to
-        // `RespawnStaleIdle` precisely because it cannot be attached), so
-        // reaching this is a race, not the migration's normal course. The
-        // caller terminates the worker rather than merely dropping its record,
-        // so losing that race leaks nothing.
+        // An incompatible runner cannot attach. The reconciler normally reaps
+        // it before this path; any remaining identity, version, framing, or I/O
+        // failure is returned with its original cause.
         let guard = Arc::new(TerminalClaim::new());
         // Shared with the connection task so the control reader can hand idle
         // ownership back when it surfaces a waiterless completion (#3190).
         let prompt_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let Some((control_client, crate_transport)) = connect_runner_control_v3(
+        let (control_client, crate_transport) = connect_runner_control_v3(
             &control_path,
             event_tx.clone(),
             session_label.clone(),
@@ -590,13 +584,12 @@ impl AcpClient {
             prompt_in_flight.clone(),
         )
         .await
-        else {
-            return Err(AcpError::Spawn(format!(
-                "runner at {} does not speak control protocol v{}",
-                control_path.display(),
-                control_protocol::CONTROL_PROTOCOL_VERSION
-            )));
-        };
+        .map_err(|error| {
+            AcpError::Spawn(format!(
+                "runner control attach failed at {}: {error:#}",
+                control_path.display()
+            ))
+        })?;
         let control_client = Some(control_client);
         let (read_half, write_half) = tokio::io::split(crate_transport);
         let transport = ByteStreams::new(write_half.compat_write(), read_half.compat());

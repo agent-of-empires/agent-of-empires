@@ -32,7 +32,7 @@ use super::config_options::{
     config_options_event, dispatch_set_config_option, dispatch_set_mode, mode_config_id,
     thought_level_config_id, ConfigOptionDispatchPurpose,
 };
-use super::control::{establish_session_v2, prompt_outcome_to_response, DaemonControlClient};
+use super::control::{establish_session_v3, prompt_outcome_to_response, DaemonControlClient};
 use super::delete::handle_delete_session_cmd;
 use super::errors::{acp_internal_error, AcpError, IncompatibleAgentError};
 use super::fs_handlers::{handle_read_text_file, handle_write_text_file};
@@ -142,20 +142,15 @@ pub(super) async fn run_connection_task<W, R>(
     default_effort: Option<String>,
     default_mode: Option<String>,
     mcp_servers: Vec<McpServer>,
-    // Shared terminal-Stopped guard, supplied when a runner control
-    // channel (#1054 Phase A) may deliver the adopted turn's completion
-    // natively. The control reader CAS-claims it before emitting
-    // `Stopped`, so the resume-idle and between-prompt watchdogs below
-    // see it already fired and stand down. `None` on paths with no
-    // control channel (direct stdio), where the task owns its own guard.
+    // Shared terminal guard for a completion reported by an attached runner.
+    // The control reader claims it before emitting `Stopped`, so the fallback
+    // watchdogs stand down. Direct stdio creates its own guard.
     external_terminal_guard: Option<Arc<TerminalClaim>>,
     external_prompt_in_flight: Option<Arc<std::sync::atomic::AtomicBool>>,
-    // #2976 Phase B: control client for a v2 runner. When Some, the task
-    // drives `initialize` / `session/*` / `session/prompt` / cancel over it
-    // instead of the crate connection (relay), which stays attached only
-    // for `session/update` notifications and server->client callbacks. None
-    // on the direct-stdio path and against an older (v1) runner, where the
-    // task speaks the full protocol over the relay as before.
+    // Control protocol v3 client for detached runners. The runner owns the
+    // handshake and prompt; the synthetic crate transport maps all remaining
+    // ACP requests and notifications onto the same typed control socket.
+    // Direct stdio has no control client and speaks ACP on its process pipes.
     control_client: Option<Arc<DaemonControlClient>>,
 ) where
     W: futures_util::AsyncWrite + Send + 'static,
@@ -266,7 +261,7 @@ pub(super) async fn run_connection_task<W, R>(
     let last_event_at = Arc::new(AtomicI64::new(now_ms));
     let first_event_after_attach = Arc::new(AtomicBool::new(false));
     let prompt_sent_since_attach = Arc::new(AtomicBool::new(false));
-    // Shared with the runner control reader (#1054 Phase A) when present, so
+    // Shared with the attached runner control reader when present, so
     // a native `prompt_complete` from the runner and the resume-idle /
     // between-prompt watchdogs all claim the same per-turn terminal.
     let terminal_claim = external_terminal_guard.unwrap_or_else(|| Arc::new(TerminalClaim::new()));
@@ -782,14 +777,9 @@ pub(super) async fn run_connection_task<W, R>(
         )
         .connect_with(transport, |connection: ConnectionTo<Agent>| async move {
             info!(target: "acp.protocol", session = %session_label, "initializing ACP agent");
-            // #2976 Phase B: against a v2 runner the runner owns
-            // `initialize` (it runs it once and caches the result), so the
-            // daemon drives it over the control channel and deserializes the
-            // cached result. Against the direct-stdio path or an older (v1)
-            // runner, send it over the relay via the crate connection as
-            // before. `initialize` is idempotent on every ACP agent we ship
-            // against (aoe-agent, claude-agent-acp); the response only
-            // carries capability metadata.
+            // A detached v3 runner owns `initialize` and caches its result, so
+            // the daemon requests it over the control channel. Direct stdio
+            // sends the same request through the crate connection.
             let init: InitializeResponse = if let Some(control) = control_client.as_ref() {
                 let params = serde_json::to_value(build_initialize_request())
                     .map_err(|e| acp_internal_error(format!("serialize initialize params: {e}")))?;
@@ -1012,12 +1002,10 @@ pub(super) async fn run_connection_task<W, R>(
                         );
                         let req = ForkSessionRequest::new(parent.clone(), agent_cwd.clone())
                             .mcp_servers(mcp_servers.clone());
-                        // #2976 Phase B: a v2 runner owns session creation;
-                        // drive session/fork over the control channel and
-                        // deserialize the cached result. Else send over the
-                        // relay via the crate connection.
+                        // Detached v3 runners own session creation; direct stdio
+                        // sends the request through the crate connection.
                         let fork_result = if let Some(control) = control_client.as_ref() {
-                            establish_session_v2::<ForkSessionResponse>(
+                            establish_session_v3::<ForkSessionResponse>(
                                 control,
                                 "session/fork",
                                 &req,
@@ -1162,9 +1150,9 @@ pub(super) async fn run_connection_task<W, R>(
                             }
                             let req = LoadSessionRequest::new(stored.clone(), agent_cwd.clone())
                                 .mcp_servers(mcp_servers.clone());
-                            // #2976 Phase B: v2 runner owns session/load.
+                            // Detached v3 runners own session/load.
                             let load_result = if let Some(control) = control_client.as_ref() {
-                                establish_session_v2::<LoadSessionResponse>(
+                                establish_session_v3::<LoadSessionResponse>(
                                     control,
                                     "session/load",
                                     &req,
@@ -1273,9 +1261,9 @@ pub(super) async fn run_connection_task<W, R>(
                         );
                         let req =
                             NewSessionRequest::new(agent_cwd.clone()).mcp_servers(mcp_servers);
-                        // #2976 Phase B: v2 runner owns session/new.
+                        // Detached v3 runners own session/new.
                         let new_session = if let Some(control) = control_client.as_ref() {
-                            establish_session_v2::<NewSessionResponse>(control, "session/new", &req)
+                            establish_session_v3::<NewSessionResponse>(control, "session/new", &req)
                                 .await?
                         } else {
                             connection.send_request(req).block_task().await?
@@ -1457,13 +1445,9 @@ pub(super) async fn run_connection_task<W, R>(
                 );
             }
 
-            // #2976 Phase B: send session/cancel over the v2 control channel
-            // when the runner owns the turn, else as a crate notification
-            // over the relay. A macro (not a helper fn) so it expands at each
-            // call site with that site's error-handling shape, and yields the
-            // same `Result<(), Error>` the relay send did. Defined after
-            // `acp_session_id` binds because macro_rules! resolves free
-            // identifiers at the definition site, not the call site.
+            // Send cancellation through control v3 when the runner owns the
+            // turn, otherwise through the direct-stdio crate connection. The
+            // macro preserves each callsite's error-handling shape.
             macro_rules! send_session_cancel {
                 () => {{
                     if let Some(control) = control_client.as_ref() {
@@ -1761,15 +1745,10 @@ pub(super) async fn run_connection_task<W, R>(
                         tokio::pin!(silent_orphan_check);
 
                         let prompt_started_at_ms = chrono::Utc::now().timestamp_millis();
-                        // #2976 Phase B: against a v2 runner the turn is
-                        // issued over the control channel (the runner assigns
-                        // the session/prompt id and reports PromptCompleted,
-                        // which the control reader routes into this future);
-                        // otherwise it goes over the relay via the crate
-                        // connection. Both arms resolve to the same
-                        // `Result<PromptResponse, Error>` so the select body
-                        // below is identical. Boxed as a `Pin<Box<dyn
-                        // Future>>` (Unpin) so no `tokio::pin!` is needed.
+                        // Detached v3 runners receive the prompt over control;
+                        // direct stdio uses the crate connection. Both arms
+                        // resolve to the same `Result<PromptResponse, Error>`.
+                        // Boxed as an Unpin future for the select below.
                         let mut prompt_fut: std::pin::Pin<
                             Box<
                                 dyn std::future::Future<
@@ -2673,14 +2652,11 @@ pub(super) async fn run_connection_task<W, R>(
                         // pre-clear id), so open a genuinely fresh session on
                         // the live worker and swap onto its id.
                         //
-                        // Deliberately over the byte relay, NOT the v2
-                        // control channel: the runner's `EstablishSession`
-                        // replays its cached handshake once a session
-                        // exists, which would hand back the old id. The
-                        // relay request reaches the agent directly; the
-                        // runner watches for it and refreshes its own
-                        // handshake cache from the response (see
-                        // `process/runner.rs`).
+                        // Send through the ordinary crate API. On a detached
+                        // runner its synthetic transport maps this request to
+                        // an attachment-scoped AgentCall, bypassing the cached
+                        // EstablishSession handshake. The runner refreshes its
+                        // session cache only if the agent returns a new id.
                         // Use the caller-created shared deadline for
                         // session/new and both config re-application
                         // requests. Queueing time counts, and per-request

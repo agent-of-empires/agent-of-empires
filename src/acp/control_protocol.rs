@@ -1,72 +1,40 @@
-//! Typed control channel between the daemon and the `aoe __acp-runner`
-//! shim, carried on `<id>.control.sock`. As of Phase C (#2977) this is
-//! the ONLY channel: the raw ACP byte relay on `<id>.sock` is retired and
-//! the runner is the sole ACP protocol terminator.
+//! Control protocol v3 between `aoe serve` and `aoe __acp-runner`, carried
+//! over `<id>.control.sock`. The runner is the sole ACP protocol terminator.
 //!
-//! Phase A of #1054 (runner-side ACP protocol termination): the runner
-//! observes the agent's response to the daemon-issued `session/prompt`
-//! request and reports a native turn-complete signal over this channel,
-//! so the daemon fires `Stopped { reason: "prompt_complete" }`
-//! deterministically instead of guessing with the 30s resume-idle
-//! watchdog.
+//! The runner owns initialization, session establishment, prompts, cancellation,
+//! and every JSON-RPC id sent to the agent. Notifications and prompt completion
+//! are persistent across daemon attachments. Reverse calls, forward calls, and
+//! handshake replies are scoped to the attachment that owns their correlation.
 //!
-//! Phase B (#2976): the runner now owns the ACP handshake and the turn
-//! request/response. The daemon drives the handshake inputs over this
-//! channel ([`ControlBody::Initialize`] then [`ControlBody::EstablishSession`]);
-//! the runner runs `initialize` + `session/new|load|fork` against the
-//! agent exactly once, caches the raw results, and returns them as
-//! [`ControlBody::Initialized`] / [`ControlBody::SessionReady`]. On every
-//! later attach it replays those from cache without touching the agent.
-//! Prompts and cancels move here too ([`ControlBody::Prompt`] /
-//! [`ControlBody::Cancel`]); the runner assigns the canonical
-//! `session/prompt` JSON-RPC id and reports the typed
-//! [`ControlBody::PromptCompleted`] outcome.
+//! The runner pre-encodes queued frames and accounts exact wire bytes. Its writer
+//! retains queue ownership until write and flush succeed. This is a best-effort
+//! detach buffer, not durable or exactly-once delivery: a disconnect after kernel
+//! acceptance but before local commit can duplicate a frame on reattach.
 //!
-//! Phase C (#2977) moves the remaining traffic here and retires the relay,
-//! adding two generic correlated lanes carrying opaque JSON-RPC payloads:
+//! Notifications and prompt completion share one FIFO socket, so completion
+//! cannot overtake preceding `session/update` frames.
 //!
-//! - **Reverse** (agent -> daemon): [`ControlBody::ServerCall`] for the
-//!   nine agent-to-client requests (permission, elicitation, fs read/write,
-//!   terminal create/output/wait/kill/release), answered by
-//!   [`ControlBody::ServerResult`] / [`ControlBody::ServerError`]; and
-//!   [`ControlBody::Notify`] for fire-and-forget agent notifications
-//!   (`session/update`, the whole event stream).
-//! - **Forward** (daemon -> agent): [`ControlBody::AgentCall`] for the
-//!   client-to-agent requests the runner does not itself own (`session/set_mode`,
-//!   `session/set_config_option`, `session/delete`, `_session/steering`, and
-//!   a conversation-reset `session/new`), answered by
-//!   [`ControlBody::AgentResult`] / [`ControlBody::AgentError`].
-//!
-//! Because notifications and turn completion now share one FIFO socket and
-//! the runner enqueues them in agent-stdout order, a `PromptCompleted` can
-//! no longer overtake the `session/update` frames that preceded it. That
-//! closes the cross-socket watermark hazard Phase B had to defer.
-//!
-//! Wire format: each frame is a 4-byte big-endian length prefix followed
-//! by that many bytes of JSON (a serialized [`ControlBody`]). Length
-//! framing rather than newline delimiting, so an opaque nested payload
-//! cannot be confused with a newline in the body.
+//! Frames use a 4-byte big-endian length followed by serialized JSON.
+//! Length framing prevents nested payload newlines from becoming delimiters.
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// Bumped when the frame set changes in a wire-incompatible way. The
-/// runner announces it in [`ControlBody::Hello`]; a daemon that does not
-/// recognize the version keeps the legacy resume-idle watchdog rather
-/// than trusting the channel. v2 (#2976) added the runner-owned handshake
-/// and typed prompt/cancel frames; the [`ControlBody::PromptCompleted`]
-/// shape changed, so v1 and v2 are wire-incompatible and the version gate
-/// is what keeps a mixed-version daemon/runner pair from misreading each
-/// other. v3 (#2977) adds the reverse and forward call lanes; a v3 runner no
-/// longer binds `<id>.sock` at all, so a pre-v3 daemon cannot drive it and
-/// the gate is load-bearing rather than merely defensive.
+/// Current wire generation. Both peers validate it before transferring queued
+/// frames; mixed generations are rejected before their frame sets can diverge.
+/// Bump this whenever a wire-incompatible body or semantic contract changes.
 pub const CONTROL_PROTOCOL_VERSION: u32 = 3;
 
-/// Hard cap on a single control frame. Phase A frames are tiny; reject
-/// anything larger as a framing error instead of allocating a huge
-/// buffer for a corrupt length prefix.
-pub const MAX_CONTROL_FRAME_BYTES: u32 = 16 * 1024 * 1024;
+/// Maximum NDJSON frame accepted from the ACP agent. The control channel is
+/// the agent stream's only destination, so both limits must be derived from
+/// one contract rather than accepting payloads the next hop cannot carry.
+pub const MAX_AGENT_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
+/// Hard cap on a single control frame. A control envelope replaces the ACP
+/// JSON-RPC envelope and adds small correlation fields; reserve explicit
+/// headroom so every accepted agent frame remains representable.
+pub const MAX_CONTROL_FRAME_BYTES: u32 = MAX_AGENT_FRAME_BYTES as u32 + 64 * 1024;
 
 /// A single control frame. `kind` tags the variant so the wire form is
 /// self-describing and forward-compatible: an unknown variant fails to
@@ -84,10 +52,8 @@ pub enum ControlBody {
     },
     /// Runner's answer to [`ControlBody::Initialize`]: the raw ACP
     /// `initialize` result (an `InitializeResponse` serialized to JSON).
-    /// Produced by running `initialize` against the agent on the first
-    /// attach and replayed verbatim from cache on every later attach. The
-    /// daemon deserializes it into the crate `InitializeResponse` to drive
-    /// its capability consumers.
+    /// Produced by running `initialize` once. Later attachments receive the
+    /// cached result in a new attachment-scoped reply.
     Initialized { result: serde_json::Value },
     /// Runner's answer to [`ControlBody::EstablishSession`]: the
     /// established ACP session id plus the raw session response result
@@ -102,7 +68,7 @@ pub enum ControlBody {
     /// error, transport failure). Carries the raw JSON-RPC error object
     /// (`{code, message, data?}`) so the daemon can reconstruct the crate
     /// error verbatim and surface the same `AgentStartupError` (including
-    /// `data.details` remediation) it would have on the byte-relay path,
+    /// data.details remediation) it would have on the direct stdio path,
     /// instead of hanging on a handshake that will never complete. A
     /// transport failure with no agent error synthesizes a minimal object.
     HandshakeFailed { error: serde_json::Value },
@@ -229,9 +195,7 @@ impl JsonRpcError {
     }
 }
 
-/// Typed result of a runner-owned turn. Replaces Phase A's
-/// `stop_reason`-only form so an agent error-envelope response is
-/// surfaced as an error rather than collapsed into a silent stop.
+/// Typed result of a runner-owned turn, including agent error envelopes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum PromptOutcome {
@@ -242,7 +206,7 @@ pub enum PromptOutcome {
     /// `data` object is preserved so the daemon can still classify a
     /// rate-limit error (which carries `errorKind` / `resets_at` there).
     Error {
-        code: i64,
+        code: i32,
         message: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         data: Option<serde_json::Value>,
@@ -254,24 +218,29 @@ pub enum PromptOutcome {
 
 /// Encode a frame: 4-byte big-endian length prefix, then the JSON body.
 pub fn encode_frame(body: &ControlBody) -> Result<Vec<u8>> {
-    let json = serde_json::to_vec(body)?;
-    let len = u32::try_from(json.len())
+    let mut buf = Vec::with_capacity(4096);
+    buf.extend_from_slice(&[0; 4]);
+    serde_json::to_writer(&mut buf, body)?;
+    let len = u32::try_from(buf.len() - 4)
         .map_err(|_| anyhow::anyhow!("control frame exceeds u32 length"))?;
     if len > MAX_CONTROL_FRAME_BYTES {
         bail!("control frame {len} bytes exceeds cap {MAX_CONTROL_FRAME_BYTES}");
     }
-    let mut buf = Vec::with_capacity(4 + json.len());
-    buf.extend_from_slice(&len.to_be_bytes());
-    buf.extend_from_slice(&json);
+    buf[..4].copy_from_slice(&len.to_be_bytes());
     Ok(buf)
+}
+
+/// Write a frame that was encoded and size-checked before queue admission.
+pub async fn write_encoded_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &[u8]) -> Result<()> {
+    w.write_all(frame).await?;
+    w.flush().await?;
+    Ok(())
 }
 
 /// Write one frame and flush.
 pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, body: &ControlBody) -> Result<()> {
     let buf = encode_frame(body)?;
-    w.write_all(&buf).await?;
-    w.flush().await?;
-    Ok(())
+    write_encoded_frame(w, &buf).await
 }
 
 /// Read one frame. Returns `Ok(None)` on a clean EOF at a frame boundary
@@ -469,9 +438,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_length_prefix_is_rejected() {
-        // Length prefix past the cap, with no body: must error, not
-        // attempt a multi-gigabyte allocation.
+    async fn frame_bounds_accept_large_agent_payload_and_reject_excess_prefix() {
+        let body = ControlBody::AgentCall {
+            call_id: 1,
+            method: "session/prompt".into(),
+            params: serde_json::json!({"blob": "x".repeat(17 * 1024 * 1024)}),
+        };
+        let encoded = encode_frame(&body).expect("17 MiB agent payload fits the shared cap");
+        assert!(encoded.len() > 17 * 1024 * 1024);
+
         let mut buf = Vec::new();
         buf.extend_from_slice(&(MAX_CONTROL_FRAME_BYTES + 1).to_be_bytes());
         let mut cursor = Cursor::new(buf);

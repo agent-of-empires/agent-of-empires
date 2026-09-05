@@ -177,24 +177,8 @@ pub(super) async fn handle_release_terminal(
         enter_ns,
         "ACP request handler entered"
     );
-    let result = match res.terminals.release(request.terminal_id.0.as_ref()).await {
-        Ok(()) => Ok(ReleaseTerminalResponse::new()),
-        // Releasing a terminal this session already released is success, not
-        // an error. An agent whose release was answered but whose daemon then
-        // disconnected (or which simply retries) can legitimately ask twice,
-        // and a delete that has already happened is not a failure. Scoped to
-        // ids we know were released, so a genuinely bogus id still errors
-        // rather than being masked.
-        Err(crate::acp::terminal_handler::TerminalError::UnknownTerminal(_))
-            if res
-                .terminals
-                .was_released(request.terminal_id.0.as_ref())
-                .await =>
-        {
-            Ok(ReleaseTerminalResponse::new())
-        }
-        Err(e) => Err(agent_client_protocol::util::internal_error(e.to_string())),
-    };
+    res.terminals.release(request.terminal_id.0.as_ref()).await;
+    let result = Ok(ReleaseTerminalResponse::new());
     trace!(
         target: "acp.protocol.tool_dispatch",
         handler = "release_terminal",

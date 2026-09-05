@@ -1061,7 +1061,7 @@ async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
             "stale structured view worker drained; respawning"
         );
         crate::process::worker_registry::mark_restart_pending(&id);
-        crate::process::worker_registry::terminate(&id);
+        crate::process::worker_registry::terminate_and_wait(&id).await;
         state.acp_supervisor.clear_respawn_pending(&id);
     }
 }
@@ -1076,12 +1076,12 @@ enum AdoptDecision {
     FreshSpawn,
     /// Live worker on the current binary: reattach.
     Attach,
-    /// Live worker on an older binary with no in-flight turn: terminate
-    /// now and fresh-spawn on the current binary.
+    /// Live worker on an older binary with no in-flight turn.
     RespawnStaleIdle,
-    /// Live worker on an older binary mid-turn: adopt to keep the turn
-    /// streaming, then respawn at the next idle boundary.
+    /// Live build-stale worker mid-turn: adopt until the turn drains.
     AdoptStaleForDrain,
+    /// Live worker from an incompatible runner generation.
+    ReplaceIncompatibleRunner,
 }
 
 /// Decide whether a session currently pinned in the reconciler's
@@ -1112,16 +1112,10 @@ fn adopt_decision(
 ) -> AdoptDecision {
     if !live {
         AdoptDecision::FreshSpawn
-    } else if build_current && runner_current {
-        AdoptDecision::Attach
     } else if !runner_current {
-        // Draining is impossible across a runner-generation gap: attaching to
-        // the worker is what lets a turn drain, and the control-version gate
-        // refuses a runner of the wrong generation outright, so there is no
-        // connection to stream over. Adopting would just route the session
-        // into the attach-failure path. Replace it now and let the turn die
-        // with it; the alternative is not a preserved turn, only a leaked one.
-        AdoptDecision::RespawnStaleIdle
+        AdoptDecision::ReplaceIncompatibleRunner
+    } else if build_current {
+        AdoptDecision::Attach
     } else if in_flight_turn {
         AdoptDecision::AdoptStaleForDrain
     } else {
@@ -1521,7 +1515,21 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
             // would leave it with nothing to signal and strand the runner plus
             // its whole agent tree with no daemon left to reap it. On a truly
             // dead record it degrades to the same cleanup `delete` did.
-            crate::process::worker_registry::terminate(&id);
+            crate::process::worker_registry::terminate_and_wait(&id).await;
+        } else if decision == AdoptDecision::ReplaceIncompatibleRunner {
+            tracing::info!(
+                target: "acp.supervisor",
+                session = %id,
+                old_runner_version = record.runner_version,
+                new_runner_version = crate::process::worker_registry::RUNNER_VERSION,
+                "replacing incompatible structured view runner"
+            );
+            if in_flight_turn {
+                state
+                    .acp_supervisor
+                    .synthesize_stopped_for_orphan(&id, "runner_protocol_upgraded");
+            }
+            crate::process::worker_registry::terminate_and_wait(&id).await;
         } else if decision == AdoptDecision::RespawnStaleIdle {
             // The runner survived a daemon restart but is executing an
             // older binary (e.g. after `aoe update`) and has no in-flight
@@ -1539,9 +1547,8 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
                 new_runner_version = crate::process::worker_registry::RUNNER_VERSION,
                 "respawning idle stale structured view worker"
             );
-            crate::process::worker_registry::terminate(&id);
+            crate::process::worker_registry::terminate_and_wait(&id).await;
         } else {
-            // Attach or AdoptStaleForDrain: dial the live runner.
             if decision == AdoptDecision::AdoptStaleForDrain {
                 // Only a build-stale current-generation runner reaches this
                 // branch. It can stay attached until the in-flight turn drains,
@@ -1621,7 +1628,7 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
                         session = %id,
                         "attach failed; terminating the worker and falling back to fresh spawn: {e}"
                     );
-                    crate::process::worker_registry::terminate(&id);
+                    crate::process::worker_registry::terminate_and_wait(&id).await;
                 }
                 Err(_) => {
                     tracing::warn!(
@@ -1629,7 +1636,7 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
                         session = %id,
                         "attach timed out after 3s; terminating the worker and falling back to fresh spawn"
                     );
-                    crate::process::worker_registry::terminate(&id);
+                    crate::process::worker_registry::terminate_and_wait(&id).await;
                     return ResumeOutcome::RetryAfterAttachTimeout;
                 }
             }
@@ -2399,18 +2406,14 @@ mod tests {
             // Build-stale only (#1754).
             ((true, false, true, false), RespawnStaleIdle),
             ((true, false, true, true), AdoptStaleForDrain),
-            // Runner-generation-stale (#2977): replaced immediately whether
-            // or not a turn is in flight, because the control-version gate
-            // refuses that runner, so there is no connection for a turn to
-            // drain over. Adopting it would only route the session into the
-            // attach-failure path.
-            ((true, true, false, false), RespawnStaleIdle),
-            ((true, true, false, true), RespawnStaleIdle),
-            // Stale on both axes at once, e.g. an `aoe update` that also
-            // crossed the runner generation. Generation wins: it is the axis
-            // that makes the worker unreachable rather than merely outdated.
-            ((true, false, false, false), RespawnStaleIdle),
-            ((true, false, false, true), RespawnStaleIdle),
+            // Runner-generation-stale: replaced immediately whether or not a
+            // turn is in flight. It cannot speak the current control protocol,
+            // so the daemon records an explicit interruption before reaping it.
+            ((true, true, false, false), ReplaceIncompatibleRunner),
+            ((true, true, false, true), ReplaceIncompatibleRunner),
+            // Generation incompatibility also wins when the build is stale.
+            ((true, false, false, false), ReplaceIncompatibleRunner),
+            ((true, false, false, true), ReplaceIncompatibleRunner),
         ];
         for ((live, build_current, runner_current, in_flight), expected) in cases {
             assert_eq!(

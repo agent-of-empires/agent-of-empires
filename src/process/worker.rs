@@ -283,13 +283,9 @@ pub fn log_path(dir: &Path, id: &str) -> Result<PathBuf> {
     Ok(dir.join(format!("{id}.log")))
 }
 
-/// `<dir>/<id>.control.sock`, the typed control channel that rides
-/// alongside the raw ACP relay `<id>.sock`. Deriving it from the main
-/// socket keeps the runner (which binds it) and the daemon (which dials
-/// it) in agreement without either needing the workers dir: `x.sock`
-/// becomes `x.control.sock`. Session ids are validated (alphanumeric,
-/// `-`, `_`) so they never carry a `.` that would confuse the extension
-/// swap. Phase A of #1054.
+/// `<dir>/<id>.control.sock`, the typed runner control channel. It is derived
+/// from the legacy base path retained in registry records: `x.sock` becomes
+/// `x.control.sock`. Validated session ids cannot confuse the extension swap.
 pub fn control_socket_sibling(main_socket: &Path) -> PathBuf {
     // Guard against self-application: feeding an already-derived control
     // path would silently yield `x.control.control.sock`. All callers pass

@@ -1318,11 +1318,8 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
             // Best-effort socket file removal: a stale inode from the old
             // runner would collide with the new spawn's bind.
-            // terminate_runner_for_session already removed the registry
-            // entry; this cleans up the sockets. Both paths, because #2977
-            // moved the live socket to the control sibling and a v2 runner
-            // binds only that one; leaving it behind is what would actually
-            // collide now. Failures (already gone, no perms) are non-fatal.
+            // The current runner binds the control sibling; remove it and the
+            // legacy base path so either generation can be replaced cleanly.
             if let Ok(socket_path) = crate::process::worker_registry::socket_path_for(session_id) {
                 crate::process::worker_registry::remove_runner_sockets(&socket_path);
             }
@@ -2122,13 +2119,6 @@ impl<S: BroadcastSink> Supervisor<S> {
                                         spawn_config.seed_history_replay = false;
                                     }
                                 }
-                                // Mirror into the on-disk registry so a fresh
-                                // `aoe serve` after a daemon restart issues
-                                // `session/load` instead of `session/new`.
-                                crate::process::worker_registry::update_stored_acp_session_id(
-                                    &session_id,
-                                    Some(acp_session_id),
-                                );
                             }
                             Event::SessionContextReset { reason } => {
                                 let mut guard = workers.lock().await;
@@ -2155,10 +2145,6 @@ impl<S: BroadcastSink> Supervisor<S> {
                                         spawn_config.fork_from = None;
                                     }
                                 }
-                                crate::process::worker_registry::update_stored_acp_session_id(
-                                    &session_id,
-                                    None,
-                                );
                             }
                             _ => {}
                         }
@@ -3045,7 +3031,6 @@ impl<S: BroadcastSink> Supervisor<S> {
             debug!(target: "acp.supervisor", session = %id, "detaching");
             let _ = handle.client.shutdown().await;
             handle.drain_task.abort();
-            crate::process::worker_registry::mark_detached(&id);
         }
     }
 
@@ -3211,7 +3196,6 @@ impl<S: BroadcastSink> Supervisor<S> {
             record.source_profile.clone(),
         )
         .await?;
-        crate::process::worker_registry::mark_attached(&session_id);
 
         let inbound = client
             .take_inbound()
