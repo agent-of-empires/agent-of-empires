@@ -744,6 +744,11 @@ async fn handle_live_ws(
             let outcome: CaptureOutcome;
             #[cfg(unix)]
             let mut grid_frame = false;
+            // Set from the sample itself, not from a later hold check: only the
+            // sampler knows whether the payload it assembled is a half-drawn
+            // synchronized-output frame.
+            #[cfg(unix)]
+            let mut grid_incomplete = false;
             #[cfg(unix)]
             {
                 // The grid serves single-pane windows within its scrollback
@@ -771,7 +776,10 @@ async fn handle_live_ws(
                         })
                         .await
                         {
-                            Ok((content, cursor)) => CaptureOutcome::Frame(content, cursor),
+                            Ok(sample) => {
+                                grid_incomplete = sample.incomplete;
+                                CaptureOutcome::Frame(sample.content, sample.cursor)
+                            }
                             Err(_) => break,
                         }
                     }
@@ -1029,9 +1037,15 @@ async fn handle_live_ws(
                     // Mid-bracket grid (the app is inside a synchronized-output
                     // repaint, or a reseed just copied tmux's half-drawn cells):
                     // wait for the close, which wakes the loop. The hold expires
-                    // on its own if the app never closes the bracket.
+                    // on its own if the app never closes the bracket. A sample
+                    // that reports itself half-drawn is held whatever the hold
+                    // now says: it can have expired, or its bracket closed,
+                    // since the payload was assembled.
                     #[cfg(unix)]
-                    if grid_frame && capture_vt.as_ref().is_some_and(|ch| ch.sync_hold_active()) {
+                    if grid_frame
+                        && (grid_incomplete
+                            || capture_vt.as_ref().is_some_and(|ch| ch.sync_hold_active()))
+                    {
                         stats.sync_held += 1;
                         wait_for_next(
                             &capture_settings,
