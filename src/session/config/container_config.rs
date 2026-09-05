@@ -1340,7 +1340,7 @@ fn refresh_codex_sandbox_hooks(
             return;
         }
     };
-    if let Err(e) = crate::hooks::install_hooks(
+    if let Err(e) = crate::hooks::install_codex_json_hooks(
         &hooks_path,
         &events,
         crate::hooks::HookInstallTarget::Sandbox,
@@ -2167,8 +2167,14 @@ pub(crate) fn build_container_config(
                         });
                 if let Some(settings_file) = settings_file {
                     let result = match hook_cfg.format {
-                        crate::agents::HookFormat::CodexJson
-                        | crate::agents::HookFormat::JsonSettings => crate::hooks::install_hooks(
+                        crate::agents::HookFormat::CodexJson => {
+                            crate::hooks::install_codex_json_hooks(
+                                &settings_file,
+                                &events,
+                                crate::hooks::HookInstallTarget::Sandbox,
+                            )
+                        }
+                        crate::agents::HookFormat::JsonSettings => crate::hooks::install_hooks(
                             &settings_file,
                             &events,
                             crate::hooks::HookInstallTarget::Sandbox,
@@ -5961,6 +5967,33 @@ trusted_hash = "keep"
         );
         assert!(hooks_text.contains("aoe-hooks"));
         crate::hooks::cleanup_hook_status_dir(instance_id);
+    }
+
+    #[test]
+    fn test_refresh_codex_sandbox_hooks_honors_codex_feature_opt_out() {
+        let temp = TempDir::new().unwrap();
+        let profile_config = crate::session::config::Config::default();
+        let mount = AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|mount| mount.tool_name == "codex")
+            .unwrap();
+
+        let writes = [
+            ("hooks-off", "[features]\nhooks = false\n"),
+            ("legacy-hooks-off", "[features]\ncodex_hooks = false\n"),
+            ("hooks-on", "[features]\nhooks = true\n"),
+        ]
+        .map(|(case, config)| {
+            let sandbox_dir = temp.path().join(case);
+            fs::create_dir_all(&sandbox_dir).unwrap();
+            fs::write(sandbox_dir.join("config.toml"), config).unwrap();
+
+            refresh_codex_sandbox_hooks(mount, &sandbox_dir, &profile_config);
+
+            sandbox_dir.join("hooks.json").exists()
+        });
+
+        assert_eq!(writes, [false, false, true]);
     }
 
     #[test]

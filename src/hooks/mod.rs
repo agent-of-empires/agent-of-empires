@@ -757,6 +757,43 @@ pub fn install_hooks(
         Ok(())
     })
 }
+pub(crate) fn install_codex_json_hooks(
+    hooks_path: &Path,
+    events: impl AsRef<[crate::agents::ResolvedHookEvent]>,
+    target: HookInstallTarget,
+) -> Result<()> {
+    let events = events.as_ref();
+    if events.is_empty() {
+        return install_hooks(hooks_path, events, target);
+    }
+
+    let config_path = hooks_path.with_file_name("config.toml");
+    let config = match target {
+        HookInstallTarget::Host => read_codex_config(&config_path, SymlinkPolicy::Follow)?,
+        HookInstallTarget::Sandbox => match std::fs::symlink_metadata(&config_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                toml_edit::DocumentMut::new()
+            }
+            Err(error) => return Err(error).context("Inspecting sandbox Codex config"),
+            Ok(_) => {
+                // Never maps unsafe or unreadable entries to absence; do not opt in on that result.
+                let content = SymlinkPolicy::Never.read(&config_path)?.with_context(|| {
+                    format!(
+                        "Cannot safely read sandbox Codex config {}",
+                        config_path.display()
+                    )
+                })?;
+                content
+                    .parse::<toml_edit::DocumentMut>()
+                    .with_context(|| format!("Failed to parse {}", config_path.display()))?
+            }
+        },
+    };
+    if codex_hooks_feature_is_disabled(&config, &config_path) {
+        return Ok(());
+    }
+    install_hooks(hooks_path, events, target)
+}
 
 pub(super) const CODEX_HOOK_EVENT_NAMES: &[&str] = &[
     "SessionStart",
@@ -2746,6 +2783,45 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
         assert_eq!(content["apiKey"], "test-key");
         assert_eq!(content["model"], "opus");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_json_config_links_are_host_only() {
+        let tmp = TempDir::new().unwrap();
+        let config = tmp.path().join("config.toml");
+        let hooks = tmp.path().join("hooks.json");
+        let linked = tmp.path().join("linked.toml");
+        std::fs::write(&linked, "[features]\nhooks = true\n").unwrap();
+        std::os::unix::fs::symlink(&linked, &config).unwrap();
+
+        assert!(
+            install_codex_json_hooks(&hooks, codex_events(), HookInstallTarget::Sandbox).is_err()
+        );
+        assert!(!hooks.exists());
+        install_codex_json_hooks(&hooks, codex_events(), HookInstallTarget::Host).unwrap();
+        let installed = std::fs::read_to_string(&hooks).unwrap();
+        assert!(installed.contains("aoe-hooks"));
+        assert!(std::fs::symlink_metadata(&config)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(
+            install_codex_json_hooks(&hooks, codex_events(), HookInstallTarget::Sandbox).is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&hooks).unwrap(), installed);
+
+        std::fs::remove_file(&linked).unwrap();
+        assert!(
+            install_codex_json_hooks(&hooks, codex_events(), HookInstallTarget::Sandbox).is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&hooks).unwrap(), installed);
+        std::fs::remove_file(&config).unwrap();
+        std::fs::remove_file(&hooks).unwrap();
+        install_codex_json_hooks(&hooks, codex_events(), HookInstallTarget::Sandbox).unwrap();
+        assert!(std::fs::read_to_string(&hooks)
+            .unwrap()
+            .contains("aoe-hooks"));
     }
 
     #[test]

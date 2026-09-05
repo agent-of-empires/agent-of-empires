@@ -557,7 +557,7 @@ impl Instance {
         };
         let hooks_path =
             generic_host_config_path_for(&self.tool, hook_cfg, &home, session_cfg, &environment);
-        match crate::hooks::install_hooks(
+        match crate::hooks::install_codex_json_hooks(
             &hooks_path,
             events,
             crate::hooks::HookInstallTarget::Host,
@@ -822,6 +822,41 @@ mod tests {
         assert!(hooks.contains("aoe-hooks"));
         assert!(!profile_codex_home.join("hooks.json").exists());
         assert!(!tmp.path().join(".codex").join("hooks.json").exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_codex_host_hook_install_honors_codex_feature_opt_out() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _codex_home_guard = EnvGuard::unset(&["CODEX_HOME"]);
+        let _home_guard = EnvGuard::set(&[("HOME", tmp.path())]);
+        let profile_config = crate::session::config::Config::default();
+        let agent = crate::agents::get_agent("codex").unwrap();
+        let events = crate::agents::resolved_hook_events(agent, &profile_config).unwrap();
+
+        let writes = [
+            ("hooks-off", "[features]\nhooks = false\n"),
+            ("legacy-hooks-off", "[features]\ncodex_hooks = false\n"),
+            ("hooks-on", "[features]\nhooks = true\n"),
+        ]
+        .map(|(case, config)| {
+            let codex_home = tmp.path().join(case);
+            std::fs::create_dir_all(&codex_home).unwrap();
+            std::fs::write(codex_home.join("config.toml"), config).unwrap();
+
+            let mut inst = Instance::new(case, "/tmp/test");
+            inst.tool = "codex".to_string();
+            inst.detect_as = "codex".to_string();
+            inst.pending_host_env = vec![(
+                "CODEX_HOME".to_string(),
+                codex_home.to_string_lossy().into_owned(),
+            )];
+            inst.install_codex_host_hooks(&profile_config.session, &events);
+
+            codex_home.join("hooks.json").exists()
+        });
+
+        assert_eq!(writes, [false, false, true]);
     }
 
     #[test]
@@ -1189,6 +1224,49 @@ agent_status_hooks = false
         inst.ensure_disclosed_host_hook_path(crate::agents::get_agent("gemini"))
             .unwrap();
         inst.install_agent_status_hooks(crate::agents::get_agent("gemini"));
+
+        let content = std::fs::read_to_string(path).unwrap();
+        assert!(content.contains("printf foreign"));
+        assert!(!content.contains("aoe-hooks"));
+        assert!(!inst.identity_publisher_launched);
+    }
+    #[test]
+    #[serial_test::serial]
+    fn disabling_status_hooks_removes_stale_codex_entries_while_codex_hooks_are_disabled() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
+        let _codex_home_guard = EnvGuard::unset(&["CODEX_HOME"]);
+        let _home_guard = EnvGuard::set(&[("HOME", tmp.path())]);
+        acknowledge_hooks();
+
+        let mut inst = Instance::new("codex", "/tmp/test");
+        inst.tool = "codex".to_string();
+        inst.detect_as = "codex".to_string();
+        inst.install_agent_status_hooks(crate::agents::get_agent("codex"));
+        let path = tmp.path().join(".codex/hooks.json");
+        let mut settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        settings["hooks"]["ForeignEvent"] = serde_json::json!([{
+            "hooks": [{"type": "command", "command": "printf foreign"}]
+        }]);
+        std::fs::write(&path, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
+        std::fs::write(
+            tmp.path().join(".codex/config.toml"),
+            "[features]\nhooks = false\n",
+        )
+        .unwrap();
+
+        let profile = "cleanup-disabled-codex-hooks";
+        let profile_dir = crate::session::get_profile_dir(profile).unwrap();
+        std::fs::write(
+            profile_dir.join("config.toml"),
+            "[session]\nagent_status_hooks = false\n",
+        )
+        .unwrap();
+        inst.source_profile = profile.to_string();
+        inst.ensure_disclosed_host_hook_path(crate::agents::get_agent("codex"))
+            .unwrap();
+        inst.install_agent_status_hooks(crate::agents::get_agent("codex"));
 
         let content = std::fs::read_to_string(path).unwrap();
         assert!(content.contains("printf foreign"));
