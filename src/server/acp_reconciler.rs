@@ -29,7 +29,6 @@ use tokio::time::timeout;
 
 use super::session_service::SessionService;
 use super::AppState;
-use crate::acp::supervisor::RespawnReason;
 
 /// Reconciler-side respawn budget. The reconciler is the only respawner
 /// for sessions with no live in-memory handle (fresh spawns and
@@ -1034,7 +1033,7 @@ async fn reap_idle_workers(state: &Arc<AppState>) {
 /// after, which tears down the attached handle and clears `attempted`, so
 /// the resume pass fresh-spawns on the current binary. See #1754.
 async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
-    for (id, reasons) in state.acp_supervisor.respawn_pending_ids() {
+    for id in state.acp_supervisor.respawn_pending_ids() {
         let store = Arc::clone(&state.acp_event_store);
         let id_probe = id.clone();
         let in_flight =
@@ -1058,7 +1057,7 @@ async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
         tracing::info!(
             target: "acp.supervisor",
             session = %id,
-            reasons = ?reasons,
+            reason = "build_stale",
             "stale structured view worker drained; respawning"
         );
         crate::process::worker_registry::mark_restart_pending(&id);
@@ -1099,17 +1098,12 @@ fn should_readopt_orphan_runner(running: bool, has_live_runner: bool) -> bool {
     !running && has_live_runner
 }
 
-/// Two independent staleness axes, either of which means "this worker
-/// cannot serve this daemon indefinitely":
+/// Build and runner staleness require different policies:
 ///
-/// - `build_current`: the runner is executing an older binary (#1754).
-/// - `runner_current`: the runner speaks an older protocol generation
-///   (#2977; a v1 runner binds a byte relay this daemon no longer speaks).
-///
-/// Both get identical treatment, because the safe move is the same either
-/// way: never call a live worker dead, adopt it for the duration of any
-/// in-flight turn, and replace it at the next idle boundary. The reasons are
-/// tracked separately downstream so operators see which one fired.
+/// - A build-stale runner still speaks the current protocol, so an in-flight
+///   turn can drain before the worker is replaced.
+/// - A runner-generation mismatch cannot attach to this daemon at all, so the
+///   worker is replaced immediately even when its record says a turn was active.
 fn adopt_decision(
     live: bool,
     build_current: bool,
@@ -1549,30 +1543,17 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
         } else {
             // Attach or AdoptStaleForDrain: dial the live runner.
             if decision == AdoptDecision::AdoptStaleForDrain {
-                // Build-stale but mid-turn: adopt now so the in-flight
-                // turn keeps streaming, and flag the session so the next
-                // idle boundary respawns it on the current binary instead
-                // of hard-killing the turn. Preserves the #1037
-                // survive-restart contract. See #1754.
+                // Only a build-stale current-generation runner reaches this
+                // branch. It can stay attached until the in-flight turn drains,
+                // then respawn on the current binary without losing the turn.
                 tracing::info!(
                     target: "acp.supervisor",
                     session = %id,
-                    build_stale = !build_current,
-                    runner_stale = !runner_current,
                     old_build = %record.build_version,
                     new_build = crate::build_info::BUILD_VERSION,
-                    old_runner_version = record.runner_version,
-                    new_runner_version = crate::process::worker_registry::RUNNER_VERSION,
-                    "adopting stale structured view worker to drain in-flight turn before respawn"
+                    "adopting build-stale structured view worker to drain in-flight turn before respawn"
                 );
-                let mut reasons = Vec::new();
-                if !build_current {
-                    reasons.push(RespawnReason::BuildStale);
-                }
-                if !runner_current {
-                    reasons.push(RespawnReason::RunnerStale);
-                }
-                state.acp_supervisor.mark_respawn_pending(&id, &reasons);
+                state.acp_supervisor.mark_build_respawn_pending(&id);
             }
             let supervisor = Arc::clone(&state.acp_supervisor);
             let cwd = PathBuf::from(&project_path);

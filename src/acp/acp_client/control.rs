@@ -841,7 +841,7 @@ mod tests {
         );
         assert!(
             !guard.claimed(),
-            "absent control socket must not yield a control client"
+            "absent control socket must not claim the terminal"
         );
         assert!(event_rx.try_recv().is_err());
     }

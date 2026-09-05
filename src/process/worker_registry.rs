@@ -551,6 +551,15 @@ mod tests {
     use serial_test::serial;
     use tempfile::TempDir;
 
+    struct KillOnDrop(std::process::Child);
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     fn with_temp_home<F: FnOnce()>(f: F) {
         // Root under /tmp instead of the default $TMPDIR (which on
         // macOS points into /var/folders/... and blows past the
@@ -954,19 +963,20 @@ mod tests {
         with_temp_home(|| {
             // Its own process group, so the killpg lands on it alone rather
             // than on the test runner.
-            let mut victim = std::process::Command::new("sleep")
-                .arg("60")
-                .process_group(0)
-                .spawn()
-                .expect("spawn stand-in runner");
-
+            let mut victim = KillOnDrop(
+                std::process::Command::new("sleep")
+                    .arg("60")
+                    .process_group(0)
+                    .spawn()
+                    .expect("spawn stand-in runner"),
+            );
             let dir = workers_dir().unwrap();
             let sock = dir.join("v1sess.sock");
             // A v1 runner bound the relay path itself, not the sibling.
             std::fs::write(&sock, b"").unwrap();
             let mut rec = WorkerRecord::new(
                 "v1sess".into(),
-                victim.id(),
+                victim.0.id(),
                 sock.clone(),
                 "aoe-agent".into(),
                 "aoe-agent".into(),
@@ -993,14 +1003,12 @@ mod tests {
 
             // Signalled, not merely forgotten.
             let reaped = (0..40).any(|_| {
-                if matches!(victim.try_wait(), Ok(Some(_))) {
+                if matches!(victim.0.try_wait(), Ok(Some(_))) {
                     return true;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 false
             });
-            let _ = victim.kill();
-            let _ = victim.wait();
             assert!(
                 reaped,
                 "terminate must signal the live v1 runner, not orphan it"

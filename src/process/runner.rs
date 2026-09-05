@@ -746,10 +746,23 @@ struct JsonRpcPeek {
 
 /// Method that gets a semantic `cancelled` outcome on disconnect. Every
 /// other outstanding method is answered with a generic JSON-RPC error
-/// (see `cancel_server_calls`), so no request parks; only this
+/// (see `disconnect_control`), so no request parks; only this
 /// one needs a typed result because its `cancelled` outcome is a normal,
 /// non-error control-flow signal the agent expects.
 const PERMISSION_METHOD: &str = "session/request_permission";
+
+fn disconnected_server_call_outcome(
+    method: &str,
+) -> Result<serde_json::Value, control_protocol::JsonRpcError> {
+    if method == PERMISSION_METHOD {
+        Ok(serde_json::json!({ "outcome": { "outcome": "cancelled" } }))
+    } else {
+        Err(control_protocol::JsonRpcError::new(
+            control_protocol::DAEMON_GONE,
+            "daemon disconnected; request cancelled",
+        ))
+    }
+}
 
 /// The daemon-issued request whose response marks a turn complete. The
 /// runner tracks its id (seen on the daemon to agent path) and surfaces
@@ -772,6 +785,10 @@ const RUNNER_REQUEST_ID_BASE: i64 = 1 << 48;
 /// stopped reading. A timeout is treated as a write failure, so the frame is
 /// requeued for the next attach.
 const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Maximum time a peer may hold the sole accept slot without proving it
+/// speaks the current control protocol.
+const CONTROL_ATTACH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Write a control frame with a bounded deadline. Returns `true` on a
 /// successful write, `false` on a write error or timeout; callers treat
@@ -895,12 +912,13 @@ impl RunnerShared {
         }
     }
 
-    /// Turn an agent-issued request into a `ServerCall`, or refuse it with a
-    /// JSON-RPC error when too many are already outstanding.
+    /// Turn an agent-issued request into a `ServerCall`, or answer it
+    /// immediately when no validated daemon is attached.
     ///
-    /// Refusing rather than evicting matters: the agent is parked on this id,
-    /// so dropping the bookkeeping silently would park it forever. An
-    /// immediate error lets its RPC layer resolve the id and move on.
+    /// The control lock sequences attachment state, pending insertion, and
+    /// queue insertion with `disconnect_control`. A call can therefore be
+    /// either handed to the current daemon or cancelled, never stranded in the
+    /// gap after a disconnect and replayed to the next daemon.
     async fn forward_server_call(
         &self,
         agent_id: serde_json::Value,
@@ -913,45 +931,60 @@ impl RunnerShared {
             .and_then(|mut v| v.get_mut("params").map(std::mem::take))
             .unwrap_or(serde_json::Value::Null);
 
-        let call_id = {
-            let mut pending = self.pending_server_calls.lock().await;
-            if pending.len() >= MAX_OUTSTANDING_REQUESTS {
-                warn!(
-                    target: "acp.runner",
-                    method = %method,
-                    outstanding = pending.len(),
-                    "reverse-call cap reached; refusing the request rather than parking the agent"
-                );
-                drop(pending);
-                self.answer_agent(
-                    agent_stdin,
-                    &agent_id,
-                    Err(control_protocol::JsonRpcError::new(
-                        control_protocol::DAEMON_GONE,
-                        "runner reverse-call capacity exceeded",
-                    )),
-                )
-                .await;
-                return;
-            }
-            let call_id = self.next_call_id.fetch_add(1, Ordering::Relaxed);
-            pending.insert(
-                call_id,
-                PendingServerCall {
-                    agent_id,
-                    method: method.clone(),
-                },
+        let mut channel = self.control.lock().await;
+        if !channel.ready {
+            drop(channel);
+            self.answer_agent(
+                agent_stdin,
+                &agent_id,
+                disconnected_server_call_outcome(&method),
+            )
+            .await;
+            return;
+        }
+
+        let mut pending = self.pending_server_calls.lock().await;
+        if pending.len() >= MAX_OUTSTANDING_REQUESTS {
+            warn!(
+                target: "acp.runner",
+                method = %method,
+                outstanding = pending.len(),
+                "reverse-call cap reached; refusing the request rather than parking the agent"
             );
-            call_id
-        };
-        self.emit_control(ControlBody::ServerCall {
+            drop(pending);
+            drop(channel);
+            self.answer_agent(
+                agent_stdin,
+                &agent_id,
+                Err(control_protocol::JsonRpcError::new(
+                    control_protocol::DAEMON_GONE,
+                    "runner reverse-call capacity exceeded",
+                )),
+            )
+            .await;
+            return;
+        }
+
+        let call_id = self.next_call_id.fetch_add(1, Ordering::Relaxed);
+        pending.insert(
+            call_id,
+            PendingServerCall {
+                agent_id,
+                method: method.clone(),
+            },
+        );
+        channel.queue.push_back(ControlBody::ServerCall {
             call_id,
             method,
             params,
-        })
-        .await;
+        });
+        if channel.queue.len() > MAX_CONTROL_QUEUE {
+            shed_oldest_notify(&mut channel.queue);
+        }
+        drop(pending);
+        drop(channel);
+        self.control_wake.notify_one();
     }
-
     /// Write a JSON-RPC response to an agent-issued request, echoing the
     /// agent's own id verbatim. `outcome` is the daemon's `ServerResult`
     /// value or an error envelope.
@@ -1016,72 +1049,46 @@ impl RunnerShared {
         }
     }
 
-    /// On control disconnect, unblock every reverse call still awaiting an
-    /// answer so the agent's stdio loop never parks on a daemon that is not
-    /// coming back.
+    /// Close the daemon-facing reverse lane and cancel every call it owned.
     ///
-    /// Phase C (#2977) deliberately does NOT replay these. A live
-    /// `session/request_permission` or `elicitation/create` is a UI card, and
-    /// re-presenting one whose daemon is gone races the daemon's own
-    /// attach-time orphan sweep and can leave a duplicate card or an agent
-    /// parked on a card that was swept. Buffered notifications DO replay, via
-    /// the outbound queue, but an outstanding CALL does not: the agent is told
-    /// the daemon went away and may reissue it as a fresh call.
-    /// So `session/request_permission` gets the semantic `cancelled`
-    /// outcome it has always got, and every other method a method-agnostic
-    /// JSON-RPC error its RPC layer can resolve by id without anyone
-    /// guessing a typed result shape.
-    async fn cancel_server_calls(
+    /// Holding the control lock while flipping `ready`, draining pending
+    /// calls, and purging their queued frames makes disconnect atomic with
+    /// `forward_server_call`. Calls observed afterward are answered directly
+    /// and cannot be replayed, including side-effecting `terminal/create`.
+    async fn disconnect_control(
         &self,
         agent_stdin: &Mutex<tokio::process::ChildStdin>,
         session_id: &str,
     ) {
         let drained: Vec<(u64, PendingServerCall)> = {
-            let mut map = self.pending_server_calls.lock().await;
-            map.drain().collect()
+            let mut channel = self.control.lock().await;
+            channel.ready = false;
+            let mut pending = self.pending_server_calls.lock().await;
+            let drained: Vec<_> = pending.drain().collect();
+            let answered: HashSet<u64> = drained.iter().map(|(call_id, _)| *call_id).collect();
+            channel.queue.retain(|frame| match frame {
+                ControlBody::ServerCall { call_id, .. } => !answered.contains(call_id),
+                _ => true,
+            });
+            drained
         };
         if drained.is_empty() {
             return;
         }
-        let answered: HashSet<u64> = drained.iter().map(|(call_id, _)| *call_id).collect();
+
         info!(
             target: "acp.runner",
             session = %session_id,
             count = drained.len(),
             "synthesising responses for reverse calls on control disconnect"
         );
-        // Drop the queued `ServerCall` frames for the ids just answered, so a
-        // reattaching daemon is not handed a request the agent already saw
-        // resolved.
-        //
-        // Only those ids. Purging every queued `ServerCall` would race the
-        // stdout fanout, which runs on another task and can insert a fresh
-        // pending entry plus its frame between the drain above and this
-        // purge: that frame would be dropped while its pending entry
-        // survived, parking the agent on a request no daemon ever sees until
-        // the next disconnect sweeps it.
-        {
-            let mut ch = self.control.lock().await;
-            ch.queue.retain(|f| match f {
-                ControlBody::ServerCall { call_id, .. } => !answered.contains(call_id),
-                _ => true,
-            });
-        }
         for (_, pending) in drained {
-            let outcome = if pending.method == PERMISSION_METHOD {
-                // ACP `RequestPermissionResponse` with the `cancelled`
-                // outcome. The agent SDK unblocks its parked stdio loop on
-                // receipt and either retries on the next user prompt or
-                // surfaces a cancelled-tool-call event upstream.
-                Ok(serde_json::json!({ "outcome": { "outcome": "cancelled" } }))
-            } else {
-                Err(control_protocol::JsonRpcError::new(
-                    control_protocol::DAEMON_GONE,
-                    "daemon disconnected; request cancelled",
-                ))
-            };
             if !self
-                .answer_agent(agent_stdin, &pending.agent_id, outcome)
+                .answer_agent(
+                    agent_stdin,
+                    &pending.agent_id,
+                    disconnected_server_call_outcome(&pending.method),
+                )
                 .await
             {
                 warn!(
@@ -1093,7 +1100,6 @@ impl RunnerShared {
             }
         }
     }
-
     /// Fail every in-flight forward-lane call so a daemon awaiting an
     /// `AgentResult` is not parked on a response the agent will never send.
     /// Runs when the agent dies; a control disconnect leaves them alone,
@@ -1151,12 +1157,6 @@ impl RunnerShared {
     async fn mark_control_ready(&self) {
         self.control.lock().await.ready = true;
         self.control_wake.notify_one();
-    }
-
-    /// Stand the channel down on disconnect. Queued frames are retained for
-    /// the next attach; only the ready flag drops, which parks the writer.
-    async fn clear_control_outbound(&self) {
-        self.control.lock().await.ready = false;
     }
 
     /// Greet a daemon before the queue writer takes ownership of the socket.
@@ -1746,12 +1746,51 @@ async fn handle_control_connection(
     let (mut read_half, write_half) = stream.into_split();
     let mut write_half = Some(write_half);
     if !shared.install_control(&mut write_half, &session_id).await {
-        shared.clear_control_outbound().await;
         return false;
     }
 
-    // The queue writer owns the write half after the greeting. Everything
-    // outbound uses this one FIFO, preserving agent stdout order.
+    let attach = tokio::time::timeout(
+        CONTROL_ATTACH_TIMEOUT,
+        control_protocol::read_frame(&mut read_half),
+    )
+    .await;
+    match attach {
+        Ok(Ok(Some(ControlBody::Attach {
+            control_protocol_version,
+        }))) if control_protocol_version == control_protocol::CONTROL_PROTOCOL_VERSION => {}
+        Ok(Ok(Some(ControlBody::Attach {
+            control_protocol_version,
+        }))) => {
+            warn!(
+                target: "acp.runner",
+                session = %session_id,
+                daemon_version = control_protocol_version,
+                runner_version = control_protocol::CONTROL_PROTOCOL_VERSION,
+                "daemon attached with a mismatched control version; refusing the connection"
+            );
+            return false;
+        }
+        Ok(Ok(Some(frame))) => {
+            warn!(
+                target: "acp.runner",
+                session = %session_id,
+                ?frame,
+                "first daemon frame was not Attach; refusing the connection"
+            );
+            return false;
+        }
+        Ok(Ok(None)) => return false,
+        Ok(Err(error)) => {
+            warn!(target: "acp.runner", session = %session_id, "failed to read Attach: {error}");
+            return false;
+        }
+        Err(_) => {
+            warn!(target: "acp.runner", session = %session_id, "timed out waiting for Attach");
+            return false;
+        }
+    }
+
+    // Only a peer that proved v3 may own the writer or drain the backlog.
     let writer = tokio::spawn(run_control_writer(
         write_half
             .take()
@@ -1866,23 +1905,6 @@ async fn handle_control_connection(
             }
         };
         match body {
-            ControlBody::Attach {
-                control_protocol_version,
-            } => {
-                // Reciprocal version check. The daemon already gated on our
-                // `Hello`, but a daemon that mis-declares here would have us
-                // speak v3 frames at something that cannot read them.
-                if control_protocol_version != control_protocol::CONTROL_PROTOCOL_VERSION {
-                    warn!(
-                        target: "acp.runner",
-                        session = %session_id,
-                        daemon_version = control_protocol_version,
-                        runner_version = control_protocol::CONTROL_PROTOCOL_VERSION,
-                        "daemon attached with a mismatched control version; refusing the connection"
-                    );
-                    break 'connection false;
-                }
-            }
             ControlBody::Initialize { request } => {
                 if handshake_tx
                     .try_send(HandshakeCommand::Initialize(request))
@@ -1949,10 +1971,7 @@ async fn handle_control_connection(
     frame_reader.abort();
     handshake_worker.abort();
     writer.abort();
-    shared.clear_control_outbound().await;
-    // Unblock any reverse call this daemon left unanswered, so the agent's
-    // stdio loop is never parked on a daemon that is gone.
-    shared.cancel_server_calls(&agent_stdin, &session_id).await;
+    shared.disconnect_control(&agent_stdin, &session_id).await;
     terminate_runner
 }
 
@@ -2497,6 +2516,7 @@ mod tests {
     #[tokio::test]
     async fn agent_request_becomes_a_server_call() {
         let (shared, stdin, _child) = shared_with_stdin().await;
+        shared.mark_control_ready().await;
         let req = br#"{"jsonrpc":"2.0","id":"req-1","method":"fs/read_text_file","params":{"path":"/tmp/x"}}
 "#;
         shared.deliver_line(req, &stdin).await;
@@ -2531,13 +2551,14 @@ mod tests {
             ("terminal/create", false),
         ] {
             let (shared, stdin, mut child) = shared_with_stdin().await;
+            shared.mark_control_ready().await;
             let req = format!(
                 "{{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"{method}\",\"params\":{{}}}}\n"
             );
             shared.deliver_line(req.as_bytes(), &stdin).await;
             assert_eq!(shared.pending_server_calls.lock().await.len(), 1);
 
-            shared.cancel_server_calls(&stdin, "s-1").await;
+            shared.disconnect_control(&stdin, "s-1").await;
 
             assert!(
                 shared.pending_server_calls.lock().await.is_empty(),
@@ -2547,26 +2568,46 @@ mod tests {
                 !queued(&shared)
                     .await
                     .iter()
-                    .any(|f| matches!(f, ControlBody::ServerCall { .. })),
+                    .any(|frame| matches!(frame, ControlBody::ServerCall { .. })),
                 "{method}: the queued call must not survive to be replayed"
             );
+            let assert_response = |sent: &serde_json::Value, id: i64| {
+                assert_eq!(sent["id"], serde_json::json!(id), "{method}: id is echoed");
+                if expect_cancelled {
+                    assert_eq!(
+                        sent["result"],
+                        serde_json::json!({"outcome": {"outcome": "cancelled"}}),
+                        "permission gets the semantic cancelled outcome"
+                    );
+                } else {
+                    assert_eq!(
+                        sent["error"]["code"],
+                        serde_json::json!(control_protocol::DAEMON_GONE),
+                        "{method}: gets a method-agnostic error"
+                    );
+                }
+            };
             let written = read_agent_stdin(&mut child).await;
             let sent: serde_json::Value =
                 serde_json::from_str(written.trim()).expect("a response line was written");
-            assert_eq!(sent["id"], serde_json::json!(42), "{method}: id is echoed");
-            if expect_cancelled {
-                assert_eq!(
-                    sent["result"],
-                    serde_json::json!({"outcome": {"outcome": "cancelled"}}),
-                    "permission gets the semantic cancelled outcome"
-                );
-            } else {
-                assert_eq!(
-                    sent["error"]["code"],
-                    serde_json::json!(control_protocol::DAEMON_GONE),
-                    "{method}: gets a method-agnostic error"
-                );
-            }
+            assert_response(&sent, 42);
+
+            // A request emitted after disconnect is cancelled at insertion,
+            // never queued for the next daemon. The terminal/create row proves
+            // a side-effecting call cannot execute twice through replay.
+            let late = format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":43,\"method\":\"{method}\",\"params\":{{}}}}\n"
+            );
+            shared.deliver_line(late.as_bytes(), &stdin).await;
+            assert!(shared.pending_server_calls.lock().await.is_empty());
+            assert!(!queued(&shared)
+                .await
+                .iter()
+                .any(|frame| matches!(frame, ControlBody::ServerCall { .. })));
+            let written = read_agent_stdin(&mut child).await;
+            let sent: serde_json::Value =
+                serde_json::from_str(written.trim()).expect("a detached response line was written");
+            assert_response(&sent, 43);
         }
     }
 
@@ -2576,6 +2617,7 @@ mod tests {
     #[tokio::test]
     async fn reverse_call_cap_refuses_rather_than_parking_the_agent() {
         let (shared, stdin, mut child) = shared_with_stdin().await;
+        shared.mark_control_ready().await;
         for id in 0..MAX_OUTSTANDING_REQUESTS {
             let line = format!(
                 "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"fs/read_text_file\",\"params\":{{}}}}\n"
@@ -2720,6 +2762,7 @@ mod tests {
     #[tokio::test]
     async fn duplicate_answer_for_a_resolved_call_is_dropped() {
         let (shared, stdin, mut child) = shared_with_stdin().await;
+        shared.mark_control_ready().await;
         let req = br#"{"jsonrpc":"2.0","id":3,"method":"fs/read_text_file","params":{}}
 "#;
         shared.deliver_line(req, &stdin).await;

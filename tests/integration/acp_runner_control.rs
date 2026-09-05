@@ -285,6 +285,86 @@ fn write_frame(stream: &mut UnixStream, body: &serde_json::Value) {
     stream.flush().expect("flush frame");
 }
 
+/// A peer cannot consume buffered frames until it proves protocol v3 with
+/// `Attach` as its first frame. A rejected peer must leave the backlog for
+/// the next valid daemon.
+#[test]
+fn runner_validates_attach_before_flushing_backlog() {
+    if cfg!(not(unix)) {
+        return;
+    }
+
+    let scratch = Scratch::new("attach");
+    let home = scratch.0.join("home");
+    let xdg = scratch.0.join("xdg");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&xdg).unwrap();
+
+    let session_id = "sattach1";
+    let workers = app_dir(&home, &xdg).join("acp-workers");
+    let socket = workers.join(format!("{session_id}.sock"));
+    let control = workers.join(format!("{session_id}.control.sock"));
+    let record = workers.join(format!("{session_id}.json"));
+    let script = r#"printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"source":"buffered"}}'; exec cat"#;
+    let _child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_aoe"))
+            .args([
+                "__acp-runner",
+                "--socket",
+                socket.to_str().unwrap(),
+                "--session-id",
+                session_id,
+                "--agent-name",
+                "fake-agent",
+                "--cwd",
+                home.to_str().unwrap(),
+                "--",
+                "/bin/sh",
+                "-c",
+                script,
+            ])
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("AOE_ACP_WATCHDOG_POLL_MS", "150")
+            .spawn()
+            .expect("spawn acp runner"),
+    );
+
+    wait_for(&record, "registry record");
+    wait_for(&control, "control socket");
+
+    let mut rejected = UnixStream::connect(&control).expect("connect rejected peer");
+    rejected
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    assert_eq!(read_frame(&mut rejected)["kind"], "hello");
+    std::thread::sleep(Duration::from_millis(150));
+    write_frame(
+        &mut rejected,
+        &serde_json::json!({"kind": "initialize", "request": {"protocolVersion": 1}}),
+    );
+    let mut prefix = [0u8; 4];
+    assert!(
+        rejected.read_exact(&mut prefix).is_err(),
+        "a non-Attach first frame must not receive or consume buffered traffic"
+    );
+    drop(rejected);
+
+    let mut accepted = UnixStream::connect(&control).expect("connect valid peer");
+    accepted
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    assert_eq!(read_frame(&mut accepted)["kind"], "hello");
+    write_frame(
+        &mut accepted,
+        &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
+    );
+    let buffered = read_frame(&mut accepted);
+    assert_eq!(buffered["kind"], "notify", "got {buffered}");
+    assert_eq!(buffered["method"], "session/update");
+    assert_eq!(buffered["params"]["source"], "buffered");
+}
+
 /// Regression for the deadlock the Phase C lane merge introduced: an agent
 /// that issues a client request while it is answering `session/new`.
 ///
@@ -427,19 +507,19 @@ for line in sys.stdin:
     assert_eq!(ready["acp_session_id"], "sess-dl");
 }
 
-/// Resolve a python3 interpreter for the fake ACP agent, or None to skip.
+/// Resolve python3 through PATH first, retaining the common absolute fallbacks
+/// for stripped-down test environments.
 fn find_python3() -> Option<PathBuf> {
-    for cand in [
-        "/usr/bin/python3",
-        "/opt/homebrew/bin/python3",
-        "/usr/local/bin/python3",
-    ] {
-        let p = PathBuf::from(cand);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    None
+    which::which("python3").ok().or_else(|| {
+        [
+            "/usr/bin/python3",
+            "/opt/homebrew/bin/python3",
+            "/usr/local/bin/python3",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
+    })
 }
 
 #[tokio::test]
