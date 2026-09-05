@@ -1123,6 +1123,26 @@ fn adopt_decision(
     }
 }
 
+/// Publish at most one terminal for an orphaned turn that must be replaced.
+/// An incompatible protocol is the specific cause; every other fresh-spawn
+/// fallback retains the generic restart reason.
+fn publish_orphaned_turn_stop<S: crate::acp::supervisor::BroadcastSink>(
+    supervisor: &crate::acp::supervisor::Supervisor<S>,
+    session_id: &str,
+    decision: AdoptDecision,
+    in_flight_turn: bool,
+) {
+    if !in_flight_turn {
+        return;
+    }
+    let reason = if decision == AdoptDecision::ReplaceIncompatibleRunner {
+        "runner_protocol_upgraded"
+    } else {
+        "orphaned_at_restart"
+    };
+    supervisor.synthesize_stopped_for_orphan(session_id, reason);
+}
+
 /// How often the rate-limit auto-resume pass runs. Reset windows are
 /// minutes to hours, so the 2s reconciler tick would re-probe far more
 /// often than needed; this gates it to a coarse cadence. See #1722.
@@ -1492,9 +1512,12 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
         command,
     } = target;
 
+    // Preserve the reason selected by the registry decision until the single
+    // fresh-spawn terminal publication below.
+    let mut adopt_decision_for_fallback = AdoptDecision::FreshSpawn;
     // Reattach path: if a previous daemon detached a runner for this
     // session and the runner is still alive, dial its socket instead
-    // of spawning a fresh agent. Bounded by the registry probe — no
+    // of spawning a fresh agent. Bounded by the registry probe: no
     // network IO unless we have a live PID + socket on disk.
     if let Ok(Some(record)) = crate::process::worker_registry::load(&id) {
         let build_current = crate::process::worker_registry::is_build_current(&record);
@@ -1505,6 +1528,7 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
             runner_current,
             in_flight_turn,
         );
+        adopt_decision_for_fallback = decision;
         if decision == AdoptDecision::FreshSpawn {
             // Dead PID or missing socket: sweep the orphan registry entry so
             // the fall-through below is a clean fresh spawn.
@@ -1524,11 +1548,6 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
                 new_runner_version = crate::process::worker_registry::RUNNER_VERSION,
                 "replacing incompatible structured view runner"
             );
-            if in_flight_turn {
-                state
-                    .acp_supervisor
-                    .synthesize_stopped_for_orphan(&id, "runner_protocol_upgraded");
-            }
             crate::process::worker_registry::terminate_and_wait(&id).await;
         } else if decision == AdoptDecision::RespawnStaleIdle {
             // The runner survived a daemon restart but is executing an
@@ -1650,11 +1669,12 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
     // complete the in-flight prompt, so its turn is forever orphaned.
     // Publish a synthetic Stopped now so the UI doesn't keep
     // "thinking" after restart.
-    if in_flight_turn {
-        state
-            .acp_supervisor
-            .synthesize_stopped_for_orphan(&id, "orphaned_at_restart");
-    }
+    publish_orphaned_turn_stop(
+        &state.acp_supervisor,
+        &id,
+        adopt_decision_for_fallback,
+        in_flight_turn,
+    );
 
     let resume_target = ResumeTarget {
         id: id.clone(),
@@ -2183,8 +2203,9 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        adopt_decision, rate_limit_resume_at, rate_limit_unknown_reset_retry_at, should_auto_stop,
-        should_readopt_orphan_runner, AdoptDecision, RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES,
+        adopt_decision, publish_orphaned_turn_stop, rate_limit_resume_at,
+        rate_limit_unknown_reset_retry_at, should_auto_stop, should_readopt_orphan_runner,
+        AdoptDecision, RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES,
         RATE_LIMIT_EXHAUSTED_RETRIES_REASON, RATE_LIMIT_MIN_PARK_SECS,
         RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS,
     };
@@ -2424,6 +2445,34 @@ mod tests {
                 "live={live} build_current={build_current} runner_current={runner_current} in_flight={in_flight}"
             );
         }
+    }
+
+    #[test]
+    fn incompatible_replacement_publishes_one_specific_terminal() {
+        #[derive(Default)]
+        struct Sink(std::sync::Mutex<Vec<crate::acp::state::Event>>);
+        impl crate::acp::supervisor::BroadcastSink for Sink {
+            fn publish(&self, _session_id: &str, _seq: u64, event: &crate::acp::state::Event) {
+                self.0.lock().unwrap().push(event.clone());
+            }
+        }
+
+        let sink = std::sync::Arc::new(Sink::default());
+        let supervisor = crate::acp::supervisor::Supervisor::new(std::sync::Arc::clone(&sink));
+        publish_orphaned_turn_stop(
+            &supervisor,
+            "session",
+            AdoptDecision::ReplaceIncompatibleRunner,
+            true,
+        );
+
+        let events = sink.0.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            crate::acp::state::Event::Stopped { reason }
+                if reason == "runner_protocol_upgraded"
+        ));
     }
 
     #[test]

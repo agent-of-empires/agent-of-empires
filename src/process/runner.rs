@@ -80,9 +80,8 @@ const ATTACHED: u64 = 0;
 /// accept loop on connect/disconnect, read by the watchdog.
 type DetachedSince = AtomicU64;
 
-/// Why the runner is tearing down. Drives whether teardown deletes the
-/// registry entry: a superseded runner must NOT delete, since the files
-/// now belong to the fresh runner that replaced it.
+/// Why the abandonment watchdog asked the runner to tear down. Registry
+/// cleanup still checks PID ownership atomically for every reason.
 #[derive(Debug, Clone, Copy)]
 enum WatchdogShutdown {
     /// Our registry record vanished (HOME deleted, or daemon `delete`d it).
@@ -561,15 +560,9 @@ async fn self_terminate_agent_tree(
         "runner abandoned; terminating agent tree"
     );
 
-    // A superseded runner must NOT delete the registry/socket: those files
-    // now belong to the fresh runner that replaced us, and deleting them
-    // would make the new runner's own watchdog see "missing" and cascade.
-    // Every other reason means we still own them (or they're already gone),
-    // so cleanup is safe and clears a stale socket that would confuse
-    // attach.
-    if !matches!(reason, WatchdogShutdown::Superseded) {
-        worker_registry::delete(session_id).ok();
-    }
+    // Teardown can race a replacement after the watchdog's last registry
+    // observation. Delete only while the record still names this runner.
+    worker_registry::delete_if_owned(session_id, own_pid).ok();
 
     // Polite SIGTERM to the agent (node) so a cooperative adapter can
     // flush; the group SIGKILL below is the guarantee.
@@ -1126,10 +1119,9 @@ impl RunnerShared {
                 .into_iter()
                 .filter_map(|id| pending.remove(&id).map(|call| (id, call)))
                 .collect();
-            self.pending_agent_calls
-                .lock()
-                .await
-                .retain(|_, call| call.attachment_id != attachment_id);
+            self.pending_agent_calls.lock().await.retain(|_, call| {
+                call.attachment_id != attachment_id || call.method == "session/new"
+            });
             channel.purge_attachment(attachment_id);
             drained
         };
@@ -2893,12 +2885,13 @@ mod tests {
         assert!(queued(&shared).await.is_empty());
     }
 
-    /// A forward-lane call round-trips: the runner puts its own id on the
-    /// wire, and the agent's response resolves the daemon's `call_id`.
+    /// A conversation reset changes durable runner state even if its daemon
+    /// disconnects before the agent answers. The old daemon's correlation is
+    /// not replayed, but a later attach must inherit the new session id.
     #[tokio::test]
-    async fn forward_call_round_trips_and_reset_refreshes_the_session_cache() {
+    async fn detached_reset_response_refreshes_session_without_replaying_result() {
         let (shared, stdin, mut child) = shared_with_stdin().await;
-        let attachment_id = shared.begin_attachment().await;
+        let old_attachment = shared.begin_attachment().await;
         shared.handshake.lock().await.session = Some((
             "old-session".into(),
             serde_json::json!({"sessionId": "old-session"}),
@@ -2906,7 +2899,7 @@ mod tests {
         shared
             .issue_agent_call(
                 &stdin,
-                attachment_id,
+                old_attachment,
                 77,
                 "session/new",
                 serde_json::json!({"cwd": "/tmp"}),
@@ -2918,21 +2911,56 @@ mod tests {
         assert_eq!(sent["method"], "session/new");
         let req_id = sent["id"].as_i64().expect("runner allocated a numeric id");
 
+        shared
+            .disconnect_control(old_attachment, &stdin, "session")
+            .await;
+        let _new_attachment = shared.begin_attachment().await;
         let resp = format!(
             "{{\"jsonrpc\":\"2.0\",\"id\":{req_id},\"result\":{{\"sessionId\":\"new-session\"}}}}\n"
         );
         shared.deliver_line(resp.as_bytes(), &stdin).await;
 
-        let q = queued(&shared).await;
         assert!(
-            matches!(&q[0], ControlBody::AgentResult { call_id: 77, .. }),
-            "resolves the daemon's call_id: {q:?}"
+            queued(&shared).await.is_empty(),
+            "the detached daemon's AgentResult must not reach its replacement"
         );
         assert_eq!(
             shared.acp_session_id().await.as_deref(),
             Some("new-session"),
-            "a reset session/new refreshes the cache so Cancel addresses the new conversation"
+            "the runner cache must follow the completed reset across reattach"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn watchdog_teardown_preserves_replacement_registry_owner() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let session_id = "watchdog-replacement";
+        let socket = worker_registry::socket_path_for(session_id).unwrap();
+        let control_socket = crate::process::worker::control_socket_sibling(&socket);
+        let _listener = std::os::unix::net::UnixListener::bind(&control_socket).unwrap();
+        worker_registry::save(&WorkerRecord::new(
+            session_id.into(),
+            222,
+            socket,
+            "agent".into(),
+            "agent".into(),
+            PathBuf::from("/repo"),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        ))
+        .unwrap();
+        let mut child = Command::new("sleep").arg("60").spawn().unwrap();
+
+        self_terminate_agent_tree(WatchdogShutdown::RecordMissing, session_id, 111, &mut child)
+            .await;
+
+        assert_eq!(worker_registry::load(session_id).unwrap().unwrap().pid, 222);
+        assert!(control_socket.exists());
     }
 
     /// An agent error envelope on the forward lane surfaces as `AgentError`

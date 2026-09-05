@@ -5,20 +5,20 @@
 //!
 //! 1. `attach` with `in_flight_turn = true` synthesizes
 //!    `Event::Stopped { reason: "reattach_idle" }` after the configured
-//!    grace, since the orphaned upstream `session/prompt` response has
-//!    no daemon-side request id to land against.
+//!    grace when the runner has no activity or completion to replay.
 //!
-//! 2. `attach` with `in_flight_turn = false` does NOT synthesize one —
-//!    the watchdog must stay disarmed when the session was idle.
+//! 2. `attach` with `in_flight_turn = false` does not synthesize one.
+//!
+//! 3. A completion cached while detached preserves its native reason only
+//!    when durable state still marks the turn in flight. A clean client
+//!    shutdown also releases the runner for the next attachment.
 //!
 //! Skipped automatically if `node` is not on PATH.
 //!
 //! Note: the parent `main.rs` only compiles this module under
-//! `cfg(debug_assertions)`. Debug-only because
-//! the watchdog grace is tunable via `AOE_RESUME_IDLE_GRACE_MS` only
-//! under `cfg(debug_assertions)` (see `resume_idle_grace()` in
-//! `src/acp/acp_client/connection.rs`); release builds would wait the full
-//! 10s production default and fail the 3s assertion below.
+//! `cfg(debug_assertions)`. Debug-only because the watchdog grace is tunable
+//! via `AOE_RESUME_IDLE_GRACE_MS` only under `cfg(debug_assertions)`; release
+//! builds would wait the full 10s production default.
 
 use std::time::{Duration, Instant};
 
@@ -238,4 +238,146 @@ async fn socket_transport_round_trips_prompt_via_attach() {
         "shim should echo received: hello over socket via the socket transport"
     );
     assert!(saw_stopped, "shim should emit Stopped at end of turn");
+}
+
+async fn read_typed_control(
+    stream: &mut tokio::net::UnixStream,
+) -> agent_of_empires::acp::control_protocol::ControlBody {
+    use agent_of_empires::acp::control_protocol::{self, ControlBody};
+
+    loop {
+        let frame = control_protocol::read_frame(stream)
+            .await
+            .expect("read control frame")
+            .expect("runner kept control socket open");
+        if !matches!(frame, ControlBody::Notify { .. }) {
+            return frame;
+        }
+    }
+}
+
+async fn replay_completion_after_disconnect(session: &str, in_flight_turn: bool) -> Option<String> {
+    use agent_of_empires::acp::control_protocol::{self, ControlBody};
+
+    let (socket_path, _runner) = spawn_runner_with_shim(session, &[]).await;
+    let control_path = agent_of_empires::process::worker::control_socket_sibling(&socket_path);
+    let mut first = tokio::net::UnixStream::connect(&control_path)
+        .await
+        .expect("connect first daemon");
+    assert!(matches!(
+        control_protocol::read_frame(&mut first).await.unwrap(),
+        Some(ControlBody::Hello { .. })
+    ));
+    control_protocol::write_frame(
+        &mut first,
+        &ControlBody::Attach {
+            control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
+        },
+    )
+    .await
+    .unwrap();
+    control_protocol::write_frame(
+        &mut first,
+        &ControlBody::Initialize {
+            request: serde_json::json!({"protocolVersion": 1}),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_typed_control(&mut first).await,
+        ControlBody::Initialized { .. }
+    ));
+    control_protocol::write_frame(
+        &mut first,
+        &ControlBody::EstablishSession {
+            method: "session/new".into(),
+            request: serde_json::json!({
+                "cwd": std::env::temp_dir(),
+                "mcpServers": [],
+            }),
+        },
+    )
+    .await
+    .unwrap();
+    let acp_session_id = match read_typed_control(&mut first).await {
+        ControlBody::SessionReady { acp_session_id, .. } => acp_session_id,
+        frame => panic!("expected SessionReady, got {frame:?}"),
+    };
+    control_protocol::write_frame(
+        &mut first,
+        &ControlBody::Prompt {
+            request: serde_json::json!({
+                "sessionId": acp_session_id,
+                "prompt": [{"type": "text", "text": "SLOW MAX_TOKENS detached completion"}],
+            }),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        control_protocol::read_frame(&mut first).await.unwrap(),
+        Some(ControlBody::Notify { .. })
+    ));
+    drop(first);
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let mut resumed = AcpClient::attach(
+        socket_path.clone(),
+        std::env::temp_dir(),
+        vec![],
+        acp_session_id.clone(),
+        in_flight_turn,
+        AcpSessionId(session.into()),
+        None,
+        "claude".into(),
+        None,
+    )
+    .await
+    .expect("resume after detached completion");
+    let reason =
+        drain_for_stopped_reason(&mut resumed, Instant::now() + Duration::from_millis(1200)).await;
+    resumed.shutdown().await.expect("shutdown resumed client");
+    let closed = tokio::time::timeout(Duration::from_secs(3), async {
+        while resumed.next_event().await.is_some() {}
+    })
+    .await;
+    assert!(closed.is_ok(), "resumed client detached cleanly");
+
+    let reopened = AcpClient::attach(
+        socket_path,
+        std::env::temp_dir(),
+        vec![],
+        acp_session_id,
+        false,
+        AcpSessionId(session.into()),
+        None,
+        "claude".into(),
+        None,
+    )
+    .await
+    .expect("runner accepts a new daemon after clean shutdown");
+    reopened.shutdown().await.expect("shutdown reopened client");
+    reason
+}
+
+#[tokio::test]
+async fn cached_completion_obeys_durable_in_flight_state_on_attach() {
+    if let Err(reason) = shim_ready() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+
+    let adopted = replay_completion_after_disconnect("cached-completion-live", true).await;
+    assert_eq!(
+        adopted.as_deref(),
+        Some("max_tokens"),
+        "an adopted turn must surface the runner's cached native completion"
+    );
+
+    let durable = replay_completion_after_disconnect("cached-completion-durable", false).await;
+    assert!(
+        durable.is_none(),
+        "an already-durable terminal must suppress the stale cached completion, got {durable:?}"
+    );
 }

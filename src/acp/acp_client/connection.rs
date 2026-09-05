@@ -352,6 +352,7 @@ pub(super) async fn run_connection_task<W, R>(
     // fresh message_id would be misclassified as a restatement. See #2281.
     let agent_msg_dedup_for_block = agent_msg_dedup.clone();
     let control_on_close = control_client.clone();
+    let control_on_exit = control_client.clone();
 
     let result = Client
         .builder()
@@ -1459,12 +1460,10 @@ pub(super) async fn run_connection_task<W, R>(
                 }};
             }
 
-            // Arm the resume-idle watchdog. The agent's response to the
-            // orphaned in-flight `session/prompt` (from the previous
-            // daemon) carries a request id this client never issued and
-            // is dropped silently by the transport. Without this
-            // synthesized Stopped, the UI's "thinking" indicator never
-            // clears until the user manually sends a new prompt.
+            // The runner normally replays PromptCompleted for the adopted
+            // turn. This watchdog is the fallback when neither that completion
+            // nor any further turn activity arrives, so the UI cannot remain
+            // stuck on "thinking" indefinitely.
             if arm_resume_watchdog {
                 let event_tx_for_watchdog = event_tx_for_block.clone();
                 let last_event_at = last_event_at.clone();
@@ -2957,6 +2956,12 @@ pub(super) async fn run_connection_task<W, R>(
                 "ACP connection task ended cleanly"
             );
         }
+    }
+    // A clean client shutdown must detach from a persistent runner too. The
+    // bridge tasks retain socket clones, so dropping this function's Arc alone
+    // cannot release the runner's serial accept loop.
+    if let Some(control) = control_on_exit.as_ref() {
+        control.shutdown();
     }
     // In runner-managed mode (child is None) we deliberately don't kill
     // anything here: the per-worker `aoe __acp-runner` shim owns the

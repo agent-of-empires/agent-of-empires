@@ -573,9 +573,15 @@ impl AcpClient {
         // it before this path; any remaining identity, version, framing, or I/O
         // failure is returned with its original cause.
         let guard = Arc::new(TerminalClaim::new());
-        // Shared with the connection task so the control reader can hand idle
-        // ownership back when it surfaces a waiterless completion (#3190).
-        let prompt_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // The reader can receive a cached completion immediately after Attach,
+        // before the crate handshake task marks the adopted turn separately.
+        let prompt_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(matches!(
+            &mode,
+            ConnectMode::Resume {
+                in_flight_turn: true,
+                ..
+            }
+        )));
         let (control_client, crate_transport) = connect_runner_control_v3(
             &control_path,
             event_tx.clone(),
@@ -652,15 +658,12 @@ impl AcpClient {
     /// the agent doesn't advertise `loadSession`) or double-load against
     /// a busy session.
     ///
-    /// `in_flight_turn = true` tells the connection task that the
-    /// session was mid-prompt when the previous daemon detached. The
-    /// task arms a watchdog that emits a synthetic
-    /// `Event::Stopped { reason: "reattach_idle" }` after
-    /// `RESUME_IDLE_GRACE` of inbound silence, because the agent's
-    /// eventual response to the orphaned `session/prompt` carries a
-    /// request id this client never issued and is dropped silently by
-    /// the underlying transport, leaving the UI otherwise stuck on
-    /// "thinking".
+    /// `in_flight_turn = true` tells the control reader that a cached
+    /// `PromptCompleted` belongs to the adopted turn, so it publishes the
+    /// runner's terminal reason. The connection task also arms a watchdog that
+    /// emits `Event::Stopped { reason: "reattach_idle" }` if neither a
+    /// completion nor further turn activity arrives before
+    /// `RESUME_IDLE_GRACE`, preventing a permanently stuck "thinking" state.
     #[allow(clippy::too_many_arguments)]
     pub async fn attach(
         socket_path: PathBuf,
