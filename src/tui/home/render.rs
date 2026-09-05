@@ -1359,7 +1359,7 @@ impl HomeView {
             .enumerate()
         {
             let abs_idx = i + scroll.scroll_offset;
-            let is_selected = abs_idx == self.cursor;
+            let is_selected = self.is_sidebar_item_selected(item, abs_idx);
             let is_hovered = !is_selected && Some(abs_idx) == hover_idx;
             let is_match =
                 !self.search_matches.is_empty() && self.search_matches.contains(&abs_idx);
@@ -1434,7 +1434,7 @@ impl HomeView {
                 .enumerate()
             {
                 let abs_idx = list_len + sscroll.scroll_offset + i;
-                let is_selected = abs_idx == self.cursor;
+                let is_selected = self.is_sidebar_item_selected(item, abs_idx);
                 let is_hovered = !is_selected && Some(abs_idx) == hover_idx;
                 let is_match =
                     !self.search_matches.is_empty() && self.search_matches.contains(&abs_idx);
@@ -2016,11 +2016,24 @@ impl HomeView {
         }
     }
 
+    pub(super) fn is_sidebar_item_selected(&self, item: &Item, index: usize) -> bool {
+        // A reload can hide the live row while the cursor falls onto a peer.
+        match (&self.live_send, &self.selected_session, item) {
+            (Some(_), Some(selected), Item::Session { id, .. }) => id == selected,
+            (Some(_), Some(_), _) => false,
+            _ => index == self.cursor,
+        }
+    }
+
     /// tmux session name backing the pane the preview currently shows, as a
     /// function of the selected session and view mode (and, for Terminal,
-    /// the host/container sub-mode). `None` when nothing is selected. Drives
+    /// the host/container sub-mode). Live-send pins the pane captured at entry,
+    /// independent of storage-driven selection changes. Drives
     /// `sync_preview_capture_worker`.
     pub(super) fn displayed_pane_tmux_name(&self) -> Option<String> {
+        if let Some(state) = &self.live_send {
+            return Some(state.tmux_name.clone());
+        }
         let id = self.selected_session.as_ref()?;
         let inst = self.get_instance(id)?;
         let name = match &self.view_mode {
@@ -2905,11 +2918,13 @@ impl HomeView {
         // live to capture. Short-circuit every view mode to a calm "Archived"
         // placeholder instead of forking captures that come back empty and
         // surface as "No output available".
-        let selected_archived = self
-            .selected_session
-            .as_ref()
-            .and_then(|id| self.get_instance(id))
-            .is_some_and(|inst| inst.is_archived());
+        let live_send_active = self.live_send.is_some();
+        let selected_archived = !live_send_active
+            && self
+                .selected_session
+                .as_ref()
+                .and_then(|id| self.get_instance(id))
+                .is_some_and(|inst| inst.is_archived());
 
         // A session whose pane is simply gone (killed, exited, server reboot)
         // with no diagnostic detail carries the generic gone-error. Present
@@ -2923,11 +2938,12 @@ impl HomeView {
         // must not hide that pane's output there.
         // A trashed session's pane was also killed (on trash). Same calm
         // placeholder treatment as archived, with a restore hint.
-        let selected_trashed = self
-            .selected_session
-            .as_ref()
-            .and_then(|id| self.get_instance(id))
-            .is_some_and(|inst| inst.is_trashed());
+        let selected_trashed = !live_send_active
+            && self
+                .selected_session
+                .as_ref()
+                .and_then(|id| self.get_instance(id))
+                .is_some_and(|inst| inst.is_trashed());
 
         let selected_stopped = !selected_archived
             && !selected_trashed
@@ -3073,11 +3089,12 @@ impl HomeView {
         match self.view_mode {
             ViewMode::Structured => {
                 // Check if selected session is being created (show hook progress)
-                let is_creating = self
-                    .selected_session
-                    .as_ref()
-                    .and_then(|id| self.get_instance(id))
-                    .is_some_and(|inst| inst.status == Status::Creating);
+                let is_creating = !live_send_active
+                    && self
+                        .selected_session
+                        .as_ref()
+                        .and_then(|id| self.get_instance(id))
+                        .is_some_and(|inst| inst.status == Status::Creating);
 
                 if is_creating {
                     self.render_creating_preview(frame, inner, theme);

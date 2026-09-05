@@ -4286,6 +4286,13 @@ impl HomeView {
                 }
             }
         }
+        if self.flat_items.is_empty() {
+            self.cursor = 0;
+            self.selected_session = None;
+            self.selected_group = None;
+            self.selected_group_profile = None;
+            return;
+        }
         self.cursor = self.cursor.min(self.flat_items.len().saturating_sub(1));
         self.update_selected();
     }
@@ -6213,9 +6220,7 @@ impl HomeView {
                 return;
             }
         }
-        if let Some(reason) = self.live_send_drift_reason(&state) {
-            self.exit_live_send_and_restore_sizing(&state);
-            self.info_dialog = Some(InfoDialog::new("Live send ended", reason));
+        if self.end_live_send_on_drift(&state) {
             return;
         }
         // Ctrl+C reaching this point is forwarded to the agent rather than
@@ -6297,6 +6302,7 @@ impl HomeView {
         if let Some(id) = &live_session_id {
             self.clear_preview_pane_sync(id);
         }
+        self.reseat_cursor_after_rebuild();
         // Preview selections also work outside live mode now, but a
         // live-mode highlight pins to the live-resized pane coords,
         // and exiting reflows the preview back to its normal size.
@@ -6353,6 +6359,15 @@ impl HomeView {
         None
     }
 
+    pub(super) fn end_live_send_on_drift(&mut self, state: &live_send::LiveSendState) -> bool {
+        let Some(reason) = self.live_send_drift_reason(state) else {
+            return false;
+        };
+        self.exit_live_send_and_restore_sizing(state);
+        self.info_dialog = Some(InfoDialog::new("Live send ended", reason));
+        true
+    }
+
     /// Poll the live-send worker's lock-loss flag (set off-thread when
     /// another surface takes the size-owner lock) and exit live mode when
     /// it trips, mirroring the web live view's demote-on-heartbeat. Called
@@ -6380,9 +6395,7 @@ impl HomeView {
         // A dead or renamed session also fails the worker's ownership
         // refresh; prefer the accurate drift message over blaming a
         // takeover that never happened.
-        if let Some(reason) = self.live_send_drift_reason(&state) {
-            self.exit_live_send_and_restore_sizing(&state);
-            self.info_dialog = Some(InfoDialog::new("Live send ended", reason));
+        if self.end_live_send_on_drift(&state) {
             return true;
         }
         // Name the thief where the owner id makes it unambiguous. The web
