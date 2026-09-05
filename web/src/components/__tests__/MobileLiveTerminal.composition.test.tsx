@@ -46,9 +46,11 @@ interface Term {
   sent: () => string[];
 }
 
-function renderTerm(): Term {
+// `accepted` models useLiveTerminal.sendData's contract: false is a keystroke
+// the pane never receives (a confirmed non-owner, or a full pending queue).
+function renderTerm(accepted = true): Term {
   const inputRef = createRef<HTMLTextAreaElement>();
-  const sendData = vi.fn();
+  const sendData = vi.fn(() => accepted);
   render(
     <MobileLiveTerminal
       frame={frame}
@@ -89,7 +91,7 @@ function renderTerm(): Term {
 }
 
 describe("MobileLiveTerminal Android IME word commits", () => {
-  const cases: { name: string; run: (t: Term) => void; sent: string[] }[] = [
+  const cases: { name: string; accepted?: boolean; run: (t: Term) => void; sent: string[] }[] = [
     {
       name: "sends a SwiftKey word once when the composition repeats it",
       // The reporter's trace: "test" typed plainly, composed on space, then " ".
@@ -141,6 +143,38 @@ describe("MobileLiveTerminal Android IME word commits", () => {
       sent: ["t", "e", "s", "t", "s", " "],
     },
     {
+      // A path or token can outrun any fixed cap on the tracked word.
+      name: "strips a word longer than any cap on the tracked run",
+      run: (t) => {
+        const word = "a".repeat(70);
+        t.type(word);
+        t.compose(word);
+        t.type(" ");
+      },
+      sent: [...Array.from({ length: 70 }, () => "a"), " "],
+    },
+    {
+      // Backspacing an emoji must not leave half a surrogate pair behind.
+      name: "tracks a backspace over a non-BMP character",
+      run: (t) => {
+        t.type("hi\u{1F642}");
+        t.input("deleteContentBackward");
+        t.compose("hi");
+      },
+      sent: ["h", "i", "\u{1F642}", "\x7f"],
+    },
+    {
+      // A read-only viewer's keystrokes are dropped, so the pane never got the
+      // word and the composition that follows a take-over must be sent whole.
+      name: "does not record input the pane never received",
+      accepted: false,
+      run: (t) => {
+        t.type("test");
+        t.compose("test");
+      },
+      sent: ["t", "e", "s", "t", "test"],
+    },
+    {
       name: "sends a composed word that does not continue what was typed",
       run: (t) => {
         t.type("a");
@@ -181,7 +215,7 @@ describe("MobileLiveTerminal Android IME word commits", () => {
 
   for (const c of cases) {
     it(c.name, () => {
-      const t = renderTerm();
+      const t = renderTerm(c.accepted);
       c.run(t);
       expect(t.sent()).toEqual(c.sent);
     });

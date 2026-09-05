@@ -126,7 +126,8 @@ export interface MobileLiveTerminalProps {
   setCadence: (fast: boolean) => void;
   enterReading: (rows: number) => void;
   returnToLive: (rows: number) => void;
-  sendData: (data: string) => void;
+  /** Returns whether the pane will receive the data; see useLiveTerminal. */
+  sendData: (data: string) => boolean;
   /** Upload a clipboard image pasted into the pane and resolve to the path
    *  the tmux pane can read (host path, or the container mount for sandboxed
    *  sessions), or null on failure. See #2678. */
@@ -323,12 +324,19 @@ function navigationKeySequence(e: TerminalKeyLike): string | null {
   }
 }
 
-const PLAIN_RUN_MAX = 64;
-
-/** Longest run of non-whitespace at the end of `run + typed`, capped: only the
- *  word still under the caret can be swallowed by a retroactive composition. */
+/** The word under the caret: the run of non-whitespace ending `run + typed`.
+ *  Uncapped, because a shorter run than the IME's own word fails the prefix
+ *  test and lets the whole word through twice. */
 function plainRunAfter(run: string, typed: string): string {
-  return (/\S*$/.exec(run + typed)?.[0] ?? "").slice(-PLAIN_RUN_MAX);
+  return /\S*$/.exec(run + typed)?.[0] ?? "";
+}
+
+/** Drop the last code point, so backspacing a surrogate pair or an emoji does
+ *  not leave half of it in the run and break the prefix test. */
+function dropLastCodePoint(run: string): string {
+  const points = Array.from(run);
+  points.pop();
+  return points.join("");
 }
 
 function specialKeySequence(e: TerminalKeyLike): string | null {
@@ -1146,7 +1154,7 @@ export function MobileLiveTerminal({
       stopMomentum();
       cancelTouchWheelQueue();
       plainRunRef.current = "";
-      sendDataRaw(data);
+      return sendDataRaw(data);
     },
     [sendDataRaw, stopMomentum, cancelTouchWheelQueue],
   );
@@ -1528,6 +1536,9 @@ export function MobileLiveTerminal({
 
   // --- keyboard input -----------------------------------------------------------
   const composingRef = useRef(false);
+  // Returns whether `data` itself reached the pane, so a caller can tell
+  // whether the run may record it. A Ctrl chord sends a control code instead,
+  // and a non-owner's keystrokes are dropped outright.
   const sendKeys = useCallback(
     (data: string) => {
       if (ctrlActiveRef.current && data.length === 1) {
@@ -1535,10 +1546,10 @@ export function MobileLiveTerminal({
         if (code >= 65 && code <= 90) {
           sendData(String.fromCharCode(code - 64));
           clearCtrl();
-          return;
+          return false;
         }
       }
-      sendData(data);
+      return sendData(data);
     },
     [sendData, ctrlActiveRef, clearCtrl],
   );
@@ -1554,7 +1565,7 @@ export function MobileLiveTerminal({
       switch (input.inputType) {
         case "insertText": {
           const data = input.data ?? "";
-          if (data) sendKeys(data);
+          if (data && !sendKeys(data)) break;
           plainRunRef.current = plainRunAfter(run, data);
           break;
         }
@@ -1565,8 +1576,8 @@ export function MobileLiveTerminal({
         case "deleteContentBackward":
           // One character, so the IME's word loses its last one too;
           // `deleteWordBackward` is a separate input type and not forwarded.
-          sendKeys("\x7f");
-          plainRunRef.current = run.slice(0, -1);
+          if (!sendKeys("\x7f")) break;
+          plainRunRef.current = dropLastCodePoint(run);
           break;
         case "insertFromPaste": {
           const text = input.data ?? "";
@@ -1711,11 +1722,10 @@ export function MobileLiveTerminal({
       // The composition may have taken over a word already spelled out as plain
       // edits; only the part the pane has not seen yet is new.
       const rest = run && data.startsWith(run) ? data.slice(run.length) : data;
-      if (rest) sendKeys(rest);
       // The composed word is still the one under the caret, so a second
       // composition over it (a suggestion tap, then the space commit) has to
       // be stripped against everything the pane has of that word.
-      plainRunRef.current = plainRunAfter(run, rest);
+      if (!rest || sendKeys(rest)) plainRunRef.current = plainRunAfter(run, rest);
       if (e.currentTarget instanceof HTMLTextAreaElement) e.currentTarget.value = "";
     },
     [sendKeys],
