@@ -236,9 +236,12 @@ pub fn run_migrations() -> Result<()> {
 }
 
 /// Run all pending migrations, sending [`progress::Event`]s to `reporter` so a
-/// long one (store copies, container probes) reads as work, not a hang. A
-/// still-pending sandbox store move is retried too; it reports only the work
-/// it actually does (copies and their outcome), not what stays pending.
+/// long one (store copies, container probes) reads as work, not a hang.
+///
+/// A still-pending sandbox store move is *not* retried here: v027's rows move
+/// when their session next needs a container, or all at once under
+/// [`run_migrations_announced`] for `aoe migrate`. This path only advances the
+/// schema version and reports the migrations it actually runs.
 pub fn run_migrations_with(reporter: Option<progress::Reporter>) -> Result<()> {
     run_migrations_inner(reporter, false)
 }
