@@ -261,7 +261,7 @@ impl HomeView {
             tips_badge_hovered: false,
             send_message_dialog: None,
             permission_response_dialog: None,
-            pending_permission_response_session: None,
+            pending_permission_response: None,
             pending_send_session: None,
             pending_send_target: live_send::LiveSendTarget::Agent,
             pending_live_send_target: live_send::LiveSendTarget::Agent,
@@ -325,6 +325,9 @@ impl HomeView {
                 .is_some_and(|config| config.app_state.used_system_health),
             daemon_status_poller: crate::tui::daemon_status_poller::DaemonStatusPoller::new(),
             pending_daemon_status_refresh: false,
+            structured_pending_approvals: HashMap::new(),
+            structured_approval_poller: crate::tui::approval_poller::StructuredApprovalPoller::new(
+            ),
             deletion_poller: DeletionPoller::new(),
             stop_poller: StopPoller::new(),
             trash_poller: crate::tui::trash_poller::TrashPoller::new(),

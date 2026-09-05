@@ -3634,3 +3634,62 @@ fn resolve_hook_plan_inherits_trust_across_worktrees() {
         "inherited trust needs no new record"
     );
 }
+#[tokio::test]
+async fn list_sessions_projects_pending_approvals_only_for_running_workers() {
+    use crate::acp::permissions::build_approval;
+    use crate::acp::state::ToolCall;
+    use crate::acp::Event;
+
+    let mut inst = Instance::new("pending-approval", "/tmp/pending-approval");
+    inst.id = "pending-approval".to_string();
+    inst.view = crate::session::View::Structured;
+    let id = inst.id.clone();
+    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+    let approval = build_approval(ToolCall {
+        id: "tool-1".to_string(),
+        name: "shell".to_string(),
+        kind: "execute".to_string(),
+        args_preview: r#"{"command":"echo hello"}"#.to_string(),
+        started_at: chrono::Utc::now(),
+        parent_tool_call_id: None,
+        memory_recall: None,
+        diffs: Vec::new(),
+    });
+    let nonce = approval.nonce.0.clone();
+    state
+        .acp_event_store
+        .record(&id, 1, &Event::ApprovalRequested { approval })
+        .expect("record pending approval");
+
+    // No live worker: the durable log has an unresolved nonce, but the
+    // invariant is that a pending nonce only exists on a running worker.
+    // Projecting it would surface a phantom approval the resolver can only
+    // 404 on, so the gate must keep it hidden.
+    let response = list_sessions(
+        axum::extract::State(state.clone()),
+        axum::extract::Query(ListSessionsQuery { state: None }),
+    )
+    .await;
+    assert!(
+        response.sessions[0].pending_approvals.is_empty(),
+        "a pending approval on a non-running worker must not be projected"
+    );
+
+    // A running worker is the authoritative source; now the approval is
+    // real and carries what the home dialog needs to render.
+    state.acp_supervisor.test_insert_worker(&id).await;
+    let response = list_sessions(
+        axum::extract::State(state),
+        axum::extract::Query(ListSessionsQuery { state: None }),
+    )
+    .await;
+    assert_eq!(
+        response.sessions[0].pending_approvals,
+        vec![PendingApproval {
+            nonce,
+            tool_name: "shell".to_string(),
+            target: "echo hello".to_string(),
+            destructive: false,
+        }]
+    );
+}

@@ -1,6 +1,18 @@
 //! The `SessionResponse` wire model and per-request config resolution.
 
 use super::*;
+/// One unresolved structured (ACP) approval, projected for the home TUI's
+/// permission-response dialog. The TUI resolves the `nonce` through the ACP
+/// resolver and shows `tool_name` / `target` / `destructive` so the user
+/// sees what they are answering without entering the structured view. No
+/// dashboard surface renders this; the web client ignores the field.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct PendingApproval {
+    pub nonce: String,
+    pub tool_name: String,
+    pub target: String,
+    pub destructive: bool,
+}
 
 #[derive(Serialize)]
 pub struct SessionResponse {
@@ -169,6 +181,13 @@ pub struct SessionResponse {
     /// sidebar `Resuming…` chip and the per-session banner in the
     /// structured view. See #1088.
     pub acp_worker_state: crate::acp::supervisor::AcpWorkerState,
+    /// Unresolved structured approvals in request order, projected only for
+    /// live (`running` worker) structured sessions. The TUI uses these to
+    /// route the existing permission-response dialog through the ACP
+    /// resolver and to show what is being approved; no dashboard surface
+    /// renders them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_approvals: Vec<PendingApproval>,
     /// True when this session's agent can run in structured view: a built-in
     /// with an ACP adapter, or a custom agent whose profile config
     /// declares a valid `agent_acp_cmd`. The web terminal view reads
@@ -419,6 +438,7 @@ impl SessionResponse {
                 q
             },
             acp_worker_state,
+            pending_approvals: Vec::new(),
             // Built-in ACP capability is resolved here from a process-wide
             // registry (cheap, no IO). Custom agents depend on profile
             // config; the list and create handlers overlay that without a

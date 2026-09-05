@@ -24,6 +24,21 @@ use serde::Deserialize;
 use crate::session::{Status, View};
 use crate::tui::worker::Worker;
 
+/// One unresolved structured approval as the daemon projects it, mirroring
+/// `/api/sessions`'s `PendingApproval`. Deserialized by name (the daemon can
+/// grow the shape without breaking an older TUI); carries what the home
+/// permission dialog renders so the user sees what they are answering.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub(super) struct PendingApproval {
+    pub nonce: String,
+    #[serde(default)]
+    pub tool_name: String,
+    #[serde(default)]
+    pub target: String,
+    #[serde(default)]
+    pub destructive: bool,
+}
+
 /// One structured row's status as the daemon sees it.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct DaemonStatusUpdate {
@@ -32,6 +47,7 @@ pub(super) struct DaemonStatusUpdate {
     pub last_error: Option<String>,
     pub last_accessed_at: Option<chrono::DateTime<chrono::Utc>>,
     pub idle_entered_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub pending_approvals: Vec<PendingApproval>,
 }
 
 /// Subset of `/api/sessions`'s `SessionResponse` this poller reads.
@@ -57,6 +73,8 @@ struct DaemonSessionRow {
     #[serde(default)]
     idle_entered_at: Option<String>,
     #[serde(default)]
+    pending_approvals: Vec<PendingApproval>,
+    #[serde(default)]
     view: View,
 }
 
@@ -79,6 +97,7 @@ fn structured_updates(rows: Vec<DaemonSessionRow>) -> Vec<DaemonStatusUpdate> {
                 last_error: row.last_error,
                 last_accessed_at: parse_ts(row.last_accessed_at.as_deref()),
                 idle_entered_at: parse_ts(row.idle_entered_at.as_deref()),
+                pending_approvals: row.pending_approvals,
             })
         })
         .collect()
@@ -193,6 +212,7 @@ mod tests {
             last_error: None,
             last_accessed_at: None,
             idle_entered_at: None,
+            pending_approvals: Vec::new(),
             view,
         }
     }
@@ -247,6 +267,12 @@ mod tests {
             last_error: Some("agent failed to start".into()),
             last_accessed_at: Some("2026-07-30T12:00:00Z".into()),
             idle_entered_at: None,
+            pending_approvals: vec![PendingApproval {
+                nonce: "nonce-1".into(),
+                tool_name: "shell".into(),
+                target: "echo hi".into(),
+                destructive: true,
+            }],
             view: View::Structured,
         }]);
         assert_eq!(updates[0].status, Status::Error);
@@ -256,6 +282,15 @@ mod tests {
         );
         assert!(updates[0].last_accessed_at.is_some());
         assert_eq!(updates[0].idle_entered_at, None);
+        assert_eq!(
+            updates[0].pending_approvals,
+            vec![PendingApproval {
+                nonce: "nonce-1".into(),
+                tool_name: "shell".into(),
+                target: "echo hi".into(),
+                destructive: true,
+            }]
+        );
     }
 
     #[test]

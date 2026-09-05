@@ -117,6 +117,35 @@ pub fn is_destructive(tool_name: &str, args_preview: &str) -> bool {
     }
 }
 
+/// One-line "what is being approved" summary for an approval's
+/// `tool_call.args_preview`, keyed off the ACP `tool_call.kind`
+/// (`read`/`edit`/`write`/`delete`/`move` -> path, `execute` -> first
+/// command line). Mirrors the structured view's approval shelf
+/// (`structured_view/render.rs::approval_target`) minus the session
+/// path-root relativization the in-view shelf applies; the home permission
+/// dialog has no path roots, so it shows the raw path. Empty when the kind
+/// carries no obvious target or `args_preview` is not a JSON object.
+pub fn summarize_target(kind: &str, args_preview: &str) -> String {
+    const PATH_KEYS: &[&str] = &["path", "file_path", "filePath", "filename"];
+    const CMD_KEYS: &[&str] = &["command", "cmd", "args"];
+    let obj = match serde_json::from_str::<serde_json::Value>(args_preview) {
+        Ok(serde_json::Value::Object(map)) => map,
+        _ => return String::new(),
+    };
+    let pick = |keys: &[&str]| -> Option<String> {
+        keys.iter()
+            .find_map(|k| obj.get(*k).and_then(|v| v.as_str()))
+            .map(str::to_string)
+    };
+    match kind {
+        "edit" | "write" | "read" | "delete" | "move" => pick(PATH_KEYS).unwrap_or_default(),
+        "execute" => pick(CMD_KEYS)
+            .and_then(|command| command.lines().next().map(str::to_string))
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,5 +169,24 @@ mod tests {
         assert!(!is_destructive("Bash", r#"{"command":"ls -la"}"#));
         assert!(is_destructive("Write", r#"{"path":"/etc/hosts"}"#));
         assert!(!is_destructive("Read", r#"{"path":"/etc/hosts"}"#));
+    }
+
+    #[test]
+    fn summarize_target_maps_kind_to_path_or_command() {
+        let cases = [
+            // kind, args_preview, expected
+            ("read", r#"{"path":"src/foo.rs"}"#, "src/foo.rs"),
+            ("edit", r#"{"file_path":"a/b.rs"}"#, "a/b.rs"),
+            ("write", r#"{"filePath":"c.txt"}"#, "c.txt"),
+            // execute keeps only the first command line
+            ("execute", "{\"command\":\"ls -la\\nrm x\"}", "ls -la"),
+            // unknown kind and non-object args yield no target
+            ("think", r#"{"path":"x"}"#, ""),
+            ("read", "not json", ""),
+            ("read", "{}", ""),
+        ];
+        for (kind, args, expected) in cases {
+            assert_eq!(summarize_target(kind, args), expected, "{kind}/{args}");
+        }
     }
 }

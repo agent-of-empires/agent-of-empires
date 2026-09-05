@@ -27,6 +27,7 @@ fn update(id: &str, status: Status) -> DaemonStatusUpdate {
         last_error: None,
         last_accessed_at: None,
         idle_entered_at: None,
+        pending_approvals: Vec::new(),
     }
 }
 
@@ -43,6 +44,13 @@ fn daemon_status_moves_a_structured_row_off_idle() {
         env.view.get_instance(&id).map(|i| i.status),
         Some(Status::Running),
         "a Running turn on the daemon must move the TUI's pill"
+    );
+    assert_eq!(
+        env.view
+            .get_instance(&id)
+            .and_then(|inst| inst.live_status_baseline),
+        Some(Status::Running),
+        "daemon status updates must carry the structured status baseline"
     );
 }
 

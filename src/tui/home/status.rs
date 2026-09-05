@@ -252,6 +252,14 @@ impl HomeView {
                 for update in updates {
                     self.apply_daemon_status_update(update);
                 }
+                // Drop pending-approval entries for sessions that no longer
+                // exist locally (deleted/trashed rows the daemon stops
+                // listing, so `apply_daemon_status_update` never revisits
+                // them). Otherwise a removed session leaks its entry for the
+                // life of the TUI process.
+                let instances = &self.instances;
+                self.structured_pending_approvals
+                    .retain(|id, _| instances.contains_key(id));
                 self.pending_daemon_status_refresh = false;
                 applied
             }
@@ -292,14 +300,23 @@ impl HomeView {
         use crate::session::Status;
         use crate::tui::status_poller::IdleIntent;
 
-        // One lookup feeds both guards below and the Stopped-lift check.
-        let Some(inst) = self.get_instance(&update.id) else {
-            return;
+        let (is_structured, applies, was_stopped) = match self.get_instance(&update.id) {
+            Some(inst) => (
+                inst.is_structured(),
+                self.daemon_status_applies_to(inst),
+                inst.status == Status::Stopped,
+            ),
+            None => return,
         };
-        if !inst.is_structured() || !self.daemon_status_applies_to(inst) {
+        if !is_structured || !applies {
             return;
         }
-        let was_stopped = inst.status == Status::Stopped;
+        if update.pending_approvals.is_empty() {
+            self.structured_pending_approvals.remove(&update.id);
+        } else {
+            self.structured_pending_approvals
+                .insert(update.id.clone(), update.pending_approvals.clone());
+        }
         // Lift a locally-`Stopped` row before the shared apply path sees it.
         // `apply_status_update`'s guard drops every update whose row is
         // `Stopped`, which is right for tmux rows (nothing but an explicit
@@ -343,6 +360,116 @@ impl HomeView {
             true,
             true,
         );
+    }
+    /// Queue a structured approval response without blocking input handling.
+    pub(super) fn resolve_structured_approval(
+        &mut self,
+        session_id: String,
+        nonce: String,
+        choice: crate::tui::dialogs::PermissionResponseChoice,
+    ) {
+        let decision = Self::approval_decision_wire(choice);
+        self.remove_structured_pending_approval(&session_id, &nonce);
+        self.structured_approval_poller.request_resolve(
+            crate::tui::approval_poller::ApprovalRequest {
+                session_id,
+                nonce,
+                decision,
+            },
+        );
+    }
+
+    /// Map a dialog choice to the ACP wire decision. Pure and standalone so a
+    pub(super) fn approval_decision_wire(
+        choice: crate::tui::dialogs::PermissionResponseChoice,
+    ) -> crate::acp::protocol::ApprovalDecisionWire {
+        use crate::acp::protocol::ApprovalDecisionWire;
+        use crate::tui::dialogs::PermissionResponseChoice;
+        match choice {
+            PermissionResponseChoice::Allow => ApprovalDecisionWire::Allow,
+            PermissionResponseChoice::AllowAlways => ApprovalDecisionWire::AllowAlways,
+            PermissionResponseChoice::Deny => ApprovalDecisionWire::Deny,
+        }
+    }
+
+    /// Apply completed structured approval requests without blocking the TUI.
+    pub fn apply_structured_approval_results(&mut self) -> bool {
+        use crate::tui::approval_poller::StructuredApprovalPoller;
+        use std::sync::mpsc::TryRecvError;
+
+        let mut changed = false;
+        loop {
+            match self.structured_approval_poller.try_recv_result() {
+                Ok(result) => {
+                    changed = true;
+                    self.apply_structured_approval_result(result);
+                }
+                Err(TryRecvError::Empty) => return changed,
+                Err(TryRecvError::Disconnected) => {
+                    tracing::error!(
+                        target: "tui.home",
+                        "structured approval worker gone; respawning a fresh worker",
+                    );
+                    self.structured_approval_poller = StructuredApprovalPoller::new();
+                    return true;
+                }
+            }
+        }
+    }
+
+    fn remove_structured_pending_approval(&mut self, session_id: &str, nonce: &str) {
+        let remove_empty = self
+            .structured_pending_approvals
+            .get_mut(session_id)
+            .is_some_and(|approvals| {
+                approvals.retain(|pending| pending.nonce != nonce);
+                approvals.is_empty()
+            });
+        if remove_empty {
+            self.structured_pending_approvals.remove(session_id);
+        }
+    }
+
+    pub(super) fn apply_structured_approval_result(
+        &mut self,
+        result: crate::tui::approval_poller::ApprovalResult,
+    ) {
+        use crate::tui::approval_poller::ApprovalResolution;
+
+        match result.resolution {
+            // Success: the card is answered, clear it. The optimistic removal
+            // in `resolve_structured_approval` already did this; re-run it in
+            // case a poll tick re-added the nonce between submit and apply.
+            ApprovalResolution::Resolved => {
+                self.remove_structured_pending_approval(&result.session_id, &result.nonce);
+            }
+            // Already resolved elsewhere (dashboard, or the server's
+            // compare-and-set lost the race). Clear it and say so, matching
+            // the structured view's "approval already resolved" feedback
+            // instead of silently dropping it. Guarded so it can't stomp an
+            // info dialog the user is mid-read on.
+            ApprovalResolution::Gone => {
+                self.remove_structured_pending_approval(&result.session_id, &result.nonce);
+                if self.info_dialog.is_none() {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Already Resolved",
+                        "This approval was already answered elsewhere.",
+                    ));
+                }
+            }
+            // Transient failure: leave the card cleared and surface the error.
+            // The still-pending approval will be restored by the next 1 Hz
+            // daemon poll (the server still lists it), so there is no manual
+            // re-insert to couple to request order.
+            ApprovalResolution::Failed(error) => {
+                if self.info_dialog.is_none() {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Respond Failed",
+                        &format!("Failed to resolve approval: {error}"),
+                    ));
+                }
+            }
+        }
     }
 
     /// Apply a single status update from the poller. Extracted from the
