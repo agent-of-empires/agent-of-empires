@@ -180,26 +180,46 @@ fn is_payload_byte(b: u8) -> bool {
 ///
 /// One full-duplex unix socket carries both directions. Unbuffered: direct
 /// `write(2)` per chunk so a keystroke is not stalled behind a stdio buffer.
+/// Drain-barrier probe and acknowledgement exchanged on the forwarder's
+/// control socket. The channel sends [`DRAIN_PROBE`] before installing a
+/// snapshot; the forwarder answers [`DRAIN_ACK`] only between forwarding
+/// iterations, holding nothing, with its stdin queue empty (#3737).
+const DRAIN_PROBE: u8 = b'Q';
+const DRAIN_ACK: u8 = b'D';
+
+/// One unbuffered `read(2)`, retried on `EINTR`, so pane bytes are either
+/// still in the stdin queue (visible to `FIONREAD`) or in the caller's
+/// buffer — never hidden inside a std buffer the snapshot fence cannot
+/// observe.
+fn read_raw(fd: std::os::fd::RawFd, buf: &mut [u8]) -> std::io::Result<usize> {
+    loop {
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if n >= 0 {
+            return Ok(n as usize);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
 pub(crate) fn run_pipe(socket: &str) -> std::io::Result<()> {
     use std::io::Write;
     let sock_r = UnixStream::connect(socket)?;
-    let mut sock_w = sock_r.try_clone()?;
+    let sock_w = sock_r.try_clone()?;
+    // Drain-barrier control connection, sibling of the data socket (`c.sock`
+    // next to `s.sock`). Read-only OSC 52 observers arm this same forwarder
+    // without binding one, so a refused control connection only leaves the
+    // channel's seed fence failing closed; forwarding proceeds regardless.
+    let ctl = socket
+        .rsplit_once('/')
+        .map(|(dir, _)| format!("{dir}/c.sock"))
+        .and_then(|p| UnixStream::connect(p).ok());
 
     // stdin (pane output) -> socket
     let pump_out = std::thread::spawn(move || {
-        let mut stdin = std::io::stdin().lock();
-        let mut buf = [0u8; 8192];
-        loop {
-            match stdin.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if sock_w.write_all(&buf[..n]).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
+        pump_pane_output(libc::STDIN_FILENO, &sock_w, ctl.as_ref());
         let _ = sock_w.shutdown(std::net::Shutdown::Write);
     });
 
@@ -221,6 +241,138 @@ pub(crate) fn run_pipe(socket: &str) -> std::io::Result<()> {
     }
     let _ = pump_out.join();
     Ok(())
+}
+
+/// The forwarding half of [`run_pipe`]: pump pane output from `stdin_fd`
+/// into `sock_w`, servicing drain-barrier requests on `ctl` between
+/// forwarding iterations.
+///
+/// The barrier is the forwarder's leg of the snapshot ordering boundary
+/// (#3737): tmux queues pane output to `pipe-pane` before parsing it into
+/// the pane screen, so a capture can already contain bytes that are still
+/// inside this process — unread on stdin, or read into the buffer but not
+/// yet written to the socket — where no parent-side counter or `FIONREAD`
+/// can see them. A probe is therefore acknowledged only at the top of the
+/// loop, where this thread holds nothing, and only after forwarding the
+/// whole stdin backlog; a probe arriving mid-forward waits out the
+/// iteration, which the channel reads as a timeout and answers with Busy.
+fn pump_pane_output(stdin_fd: std::os::fd::RawFd, sock_w: &UnixStream, ctl: Option<&UnixStream>) {
+    pump_pane_output_with_hook(stdin_fd, sock_w, ctl, &mut || {});
+}
+
+fn pump_pane_output_with_hook<F: FnMut()>(
+    stdin_fd: std::os::fd::RawFd,
+    mut sock_w: &UnixStream,
+    ctl: Option<&UnixStream>,
+    after_read: &mut F,
+) {
+    use std::io::Write;
+    let mut buf = [0u8; 8192];
+    let mut ctl_open = ctl.is_some();
+    loop {
+        let mut fds = [
+            libc::pollfd {
+                fd: stdin_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: match (ctl, ctl_open) {
+                    (Some(c), true) => c.as_raw_fd(),
+                    _ => -1,
+                },
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+        if ready == -1 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if fds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            match read_raw(stdin_fd, &mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    after_read();
+                    if sock_w.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        if ctl_open && fds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            let Some(mut ctl) = ctl else {
+                unreachable!("ctl_open implies ctl")
+            };
+            let mut probe = [0u8; 1];
+            match ctl.read(&mut probe) {
+                Ok(0) => ctl_open = false,
+                Ok(_) => {
+                    // Forward the whole stdin backlog before acknowledging,
+                    // so the acknowledgement covers it: the channel reads
+                    // DRAIN_ACK as "every pane byte this forwarder had is
+                    // now in the socket queue". If the backlog cannot be
+                    // proven empty, stay silent and let the channel time
+                    // out into Busy.
+                    let mut ack = true;
+                    loop {
+                        let mut pending: libc::c_int = 0;
+                        if unsafe { libc::ioctl(stdin_fd, libc::FIONREAD, &mut pending) } != 0 {
+                            ack = false;
+                            break;
+                        }
+                        if pending <= 0 {
+                            break;
+                        }
+                        match read_raw(stdin_fd, &mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                if sock_w.write_all(&buf[..n]).is_err() {
+                                    return;
+                                }
+                            }
+                            Err(_) => {
+                                ack = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ack {
+                        let _ = ctl.write_all(&[DRAIN_ACK]);
+                    }
+                }
+                Err(_) => ctl_open = false,
+            }
+        }
+    }
+}
+
+/// Ask the forwarder to put every byte it already read from `pipe-pane` onto
+/// the data socket. The caller holds the reader's `stream` mutex, so a matching
+/// acknowledgement and an empty `FIONREAD` queue form one snapshot boundary.
+fn drain_forwarder(control: &Mutex<Option<UnixStream>>) -> bool {
+    use std::io::Write;
+
+    let Ok(mut control) = control.lock() else {
+        return false;
+    };
+    let Some(control) = control.as_mut() else {
+        return false;
+    };
+    if control
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .is_err()
+        || control.write_all(&[DRAIN_PROBE]).is_err()
+    {
+        return false;
+    }
+    let mut ack = [0u8; 1];
+    control.read_exact(&mut ack).is_ok() && ack == [DRAIN_ACK]
 }
 
 /// Live channels keyed by tmux session name, held weakly so the entry vanishes
@@ -591,20 +743,67 @@ struct SeedGuard<'a> {
     pipe: Option<&'a UnixStream>,
 }
 
+struct SeedDestination<'a> {
+    parser: &'a Mutex<vt100::Parser>,
+    app_cursor: &'a AtomicBool,
+    grid_gen: &'a AtomicU64,
+}
+
+struct SeedInstallFence<'a> {
+    snapshot: Option<&'a Mutex<()>>,
+    socket: Option<&'a Mutex<Option<UnixStream>>>,
+    control: Option<&'a Mutex<Option<UnixStream>>>,
+}
+
+struct DrainedSeedGuard<'a> {
+    guard: SeedGuard<'a>,
+    control: &'a Mutex<Option<UnixStream>>,
+}
+
 fn seed_parser(
     target: &str,
-    parser: &Mutex<vt100::Parser>,
-    app_cursor: &AtomicBool,
-    grid_gen: &AtomicU64,
+    destination: SeedDestination<'_>,
     size: (u16, u16),
     deadline: &crate::tmux::TmuxCommandDeadline,
     guard: SeedGuard<'_>,
+    fence: SeedInstallFence<'_>,
 ) -> VtRefreshResult {
     let (_, rows) = size;
     let Some(stream) = capture_seed_stream(target, rows, deadline) else {
         return VtRefreshResult::Failed;
     };
-    swap_seeded_parser(parser, app_cursor, grid_gen, None, &stream, size, guard)
+    let (Some(snapshot), Some(socket), Some(control)) =
+        (fence.snapshot, fence.socket, fence.control)
+    else {
+        return swap_seeded_parser(
+            destination.parser,
+            destination.app_cursor,
+            destination.grid_gen,
+            None,
+            &stream,
+            size,
+            guard,
+        );
+    };
+    let Ok(_snapshot) = snapshot.lock() else {
+        return VtRefreshResult::Failed;
+    };
+    let Ok(socket) = socket.lock() else {
+        return VtRefreshResult::Failed;
+    };
+    let guard = SeedGuard {
+        pipe: socket.as_ref(),
+        ..guard
+    };
+    swap_drained_seeded_parser(
+        destination.parser,
+        destination.app_cursor,
+        destination.grid_gen,
+        None,
+        &stream,
+        size,
+        DrainedSeedGuard { guard, control },
+    )
 }
 /// Capture the pane and weave its modes and cursor into one replayable byte
 /// stream, or `None` when the pane could not be captured. Split from the swap
@@ -669,6 +868,31 @@ fn swap_seeded_parser(
     app_cursor.store(p.screen().application_cursor(), Ordering::Relaxed);
     grid_gen.fetch_add(1, Ordering::Relaxed);
     VtRefreshResult::Refreshed
+}
+
+/// Install a snapshot only after the pipe-pane forwarder has acknowledged that
+/// its pre-capture input is visible on the reader socket.
+fn swap_drained_seeded_parser(
+    parser: &Mutex<vt100::Parser>,
+    app_cursor: &AtomicBool,
+    grid_gen: &AtomicU64,
+    since: Option<u64>,
+    stream: &[u8],
+    size: (u16, u16),
+    drained_guard: DrainedSeedGuard<'_>,
+) -> VtRefreshResult {
+    if !drain_forwarder(drained_guard.control) {
+        return VtRefreshResult::Busy;
+    }
+    swap_seeded_parser(
+        parser,
+        app_cursor,
+        grid_gen,
+        since,
+        stream,
+        size,
+        drained_guard.guard,
+    )
 }
 /// How many times [`capture_seed_snapshot`] re-runs the probe/capture/probe
 /// round before settling for its last (possibly raced) snapshot. Each retry
@@ -1192,6 +1416,7 @@ struct ReaderCtx {
     parser: Arc<Mutex<vt100::Parser>>,
     stop: Arc<AtomicBool>,
     seeded: Arc<AtomicBool>,
+    snapshot: Arc<Mutex<()>>,
     stream: Arc<Mutex<Option<UnixStream>>>,
     app_cursor: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
@@ -1216,6 +1441,19 @@ struct ReaderCtx {
     /// from `chunk_seq`: re-seeds bump this too, and the debounce's
     /// first-chunk special case must not see seed bumps.
     grid_gen: Arc<AtomicU64>,
+}
+
+fn run_drain_listener(
+    listener: UnixListener,
+    stop: Arc<AtomicBool>,
+    control: Arc<Mutex<Option<UnixStream>>>,
+) {
+    let Ok((conn, _)) = listener.accept() else {
+        return;
+    };
+    if !stop.load(Ordering::Relaxed) {
+        *control.lock().unwrap() = Some(conn);
+    }
 }
 
 fn stop_and_wake_reader(stop: &AtomicBool, sock_path: &std::path::Path) {
@@ -1243,6 +1481,12 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
     let mut buf = [0u8; 8192];
     let mut osc52 = Osc52Scanner::new();
     while !ctx.stop.load(Ordering::Relaxed) {
+        // A snapshot holds this same mutex from its forwarder drain through
+        // parser replacement. A reader that has received a chunk therefore
+        // settles it before the snapshot can inspect the socket queue.
+        let Ok(_snapshot) = ctx.snapshot.lock() else {
+            break;
+        };
         match conn.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
@@ -1327,9 +1571,15 @@ pub(crate) struct VtChannel {
     /// `name:^.0`, the pane target for tmux commands.
     target: String,
     parser: Arc<Mutex<vt100::Parser>>,
+    /// Serializes socket receipt and snapshot installation without delaying
+    /// keystroke writes on `stream`.
+    snapshot: Arc<Mutex<()>>,
     /// Writable half of the socket, `Some` once the forwarder connects. Shared
     /// with the reader thread, which fills it after `accept`.
     stream: Arc<Mutex<Option<UnixStream>>>,
+    /// Forwarder's separate control socket. A snapshot probes it after the
+    /// capture and before checking the data socket's unread-byte queue.
+    drain: Arc<Mutex<Option<UnixStream>>>,
     /// DECCKM snapshot, refreshed by the reader thread on each grid change.
     app_cursor: Arc<AtomicBool>,
     /// `true` while the forwarder is connected and the reader loop is running.
@@ -1503,7 +1753,9 @@ impl VtChannel {
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK_LINES)));
         let stop = Arc::new(AtomicBool::new(false));
         let seeded = Arc::new(AtomicBool::new(false));
+        let snapshot = Arc::new(Mutex::new(()));
         let stream: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
+        let drain: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
         let app_cursor = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(false));
         let clipboard: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -1517,16 +1769,22 @@ impl VtChannel {
         let n = SOCK_COUNTER.fetch_add(1, Ordering::Relaxed);
         let sock_dir = std::env::temp_dir().join(format!("aoe-vt-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&sock_dir);
-        let setup = || -> Option<(PathBuf, UnixListener)> {
+        let setup = || -> Option<(PathBuf, UnixListener, PathBuf, UnixListener)> {
             std::fs::create_dir_all(&sock_dir).ok()?;
             {
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::set_permissions(&sock_dir, std::fs::Permissions::from_mode(0o700)).ok()?;
             }
             let sock_path = sock_dir.join("s.sock");
-            Some((sock_path.clone(), UnixListener::bind(sock_path).ok()?))
+            let control_path = sock_dir.join("c.sock");
+            Some((
+                sock_path.clone(),
+                UnixListener::bind(sock_path).ok()?,
+                control_path.clone(),
+                UnixListener::bind(control_path).ok()?,
+            ))
         };
-        let Some((sock_path, listener)) = setup() else {
+        let Some((sock_path, listener, control_path, control_listener)) = setup() else {
             let _ = std::fs::remove_dir_all(&sock_dir);
             session.release_vt_owner_with_deadline(&owner, deadline);
             return None;
@@ -1547,6 +1805,7 @@ impl VtChannel {
                 parser: parser.clone(),
                 stop: stop.clone(),
                 seeded: seeded.clone(),
+                snapshot: snapshot.clone(),
                 stream: stream.clone(),
                 app_cursor: app_cursor.clone(),
                 alive: alive.clone(),
@@ -1577,6 +1836,11 @@ impl VtChannel {
             let _ = std::fs::remove_dir_all(&sock_dir);
             return None;
         }
+        let control_stop = stop.clone();
+        let control_drain = drain.clone();
+        std::thread::spawn(move || {
+            run_drain_listener(control_listener, control_stop, control_drain)
+        });
 
         // Wait for the forwarder to actually connect before publishing the
         // channel. `input_mode` treats a live channel as the single-writer and
@@ -1585,10 +1849,11 @@ impl VtChannel {
         // and be dropped instead of falling back to `send-keys`. If the
         // forwarder never connects, tear down and fall back to capture.
         let connect_deadline = Instant::now() + Duration::from_millis(500);
-        while !alive.load(Ordering::Relaxed) {
+        while !alive.load(Ordering::Relaxed) || drain.lock().unwrap().is_none() {
             if Instant::now() >= connect_deadline {
                 tracing::warn!(%target, "vt: forwarder did not connect; falling back to capture");
                 stop_and_wake_reader(&stop, &sock_path);
+                let _ = UnixStream::connect(&control_path);
                 session.release_vt_pipe_owner_with_deadline(&owner, deadline);
                 let _ = reader.join();
                 let _ = std::fs::remove_dir_all(&sock_dir);
@@ -1604,24 +1869,29 @@ impl VtChannel {
         // chunk or return Busy, never dropping the capture-to-install window.
         seeded.store(true, Ordering::Release);
         let expected_chunk_seq = chunk_seq.load(Ordering::Acquire);
-        let initial_seed = {
-            let pipe_guard = stream.lock().ok();
-            seed_parser(
-                &target,
-                &parser,
-                &app_cursor,
-                &grid_gen,
-                (cols, rows),
-                deadline,
-                SeedGuard {
-                    chunk: Some((&chunk_seq, &settled_chunk_seq, expected_chunk_seq)),
-                    pipe: pipe_guard.as_deref().and_then(Option::as_ref),
-                },
-            )
-        };
+        let initial_seed = seed_parser(
+            &target,
+            SeedDestination {
+                parser: &parser,
+                app_cursor: &app_cursor,
+                grid_gen: &grid_gen,
+            },
+            (cols, rows),
+            deadline,
+            SeedGuard {
+                chunk: Some((&chunk_seq, &settled_chunk_seq, expected_chunk_seq)),
+                pipe: None,
+            },
+            SeedInstallFence {
+                snapshot: Some(&snapshot),
+                socket: Some(&stream),
+                control: Some(&drain),
+            },
+        );
         if initial_seed != VtRefreshResult::Refreshed {
             tracing::warn!(%target, "vt: initial seed failed; falling back to capture");
             stop_and_wake_reader(&stop, &sock_path);
+            let _ = UnixStream::connect(&control_path);
             session.release_vt_pipe_owner_with_deadline(&owner, deadline);
             let _ = reader.join();
             let _ = std::fs::remove_dir_all(&sock_dir);
@@ -1640,7 +1910,9 @@ impl VtChannel {
             owner_id: owner,
             target,
             parser,
+            snapshot,
             stream,
+            drain,
             app_cursor,
             alive,
             wakeup,
@@ -1782,17 +2054,25 @@ impl VtChannel {
         let Some(stream) = capture_seed_stream(&self.target, rows, deadline) else {
             return VtRefreshResult::Failed;
         };
-        let pipe_guard = self.stream.lock().ok();
-        let result = swap_seeded_parser(
+        let Ok(_snapshot) = self.snapshot.lock() else {
+            return VtRefreshResult::Failed;
+        };
+        let Ok(pipe_guard) = self.stream.lock() else {
+            return VtRefreshResult::Failed;
+        };
+        let result = swap_drained_seeded_parser(
             &self.parser,
             &self.app_cursor,
             &self.grid_gen,
             since,
             &stream,
             (cols, rows),
-            SeedGuard {
-                chunk: Some((&self.chunk_seq, &self.settled_chunk_seq, expected_chunk_seq)),
-                pipe: pipe_guard.as_deref().and_then(Option::as_ref),
+            DrainedSeedGuard {
+                guard: SeedGuard {
+                    chunk: Some((&self.chunk_seq, &self.settled_chunk_seq, expected_chunk_seq)),
+                    pipe: pipe_guard.as_ref(),
+                },
+                control: &self.drain,
             },
         );
         if result == VtRefreshResult::Refreshed {
@@ -1987,6 +2267,7 @@ impl VtChannel {
         crate::tmux::Session::from_name(&self.name)
             .release_vt_pipe_owner_with_deadline(&self.owner_id, deadline);
         let _ = UnixStream::connect(&self.sock_path);
+        let _ = UnixStream::connect(self.sock_dir.join("c.sock"));
         if let Some(reader) = self.reader.lock().unwrap().take() {
             let _ = reader.join();
         }
@@ -2482,14 +2763,21 @@ mod tests {
         assert_eq!(
             seed_parser(
                 "aoe_test_missing_seed",
-                &parser,
-                &app_cursor,
-                &grid_gen,
+                SeedDestination {
+                    parser: &parser,
+                    app_cursor: &app_cursor,
+                    grid_gen: &grid_gen,
+                },
                 (80, 24),
                 &deadline,
                 SeedGuard {
                     chunk: None,
                     pipe: None,
+                },
+                SeedInstallFence {
+                    snapshot: None,
+                    socket: None,
+                    control: None,
                 },
             ),
             VtRefreshResult::Failed,
@@ -2746,7 +3034,9 @@ mod tests {
             owner_id: new_pipe_owner_id(),
             target: format!("{name}:^.0"),
             parser: Arc::new(Mutex::new(vt100::Parser::new(4, 20, SCROLLBACK_LINES))),
+            snapshot: Arc::new(Mutex::new(())),
             stream: Arc::new(Mutex::new(None)),
+            drain: Arc::new(Mutex::new(None)),
             app_cursor: Arc::new(AtomicBool::new(false)),
             alive: alive.clone(),
             wakeup: Arc::new(Mutex::new(None)),
@@ -3003,6 +3293,7 @@ mod tests {
             parser: Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0))),
             stop: stop.clone(),
             seeded: Arc::new(AtomicBool::new(true)),
+            snapshot: Arc::new(Mutex::new(())),
             stream: Arc::new(Mutex::new(None)),
             app_cursor: Arc::new(AtomicBool::new(false)),
             alive: Arc::new(AtomicBool::new(false)),
@@ -3052,6 +3343,7 @@ mod tests {
             parser: parser.clone(),
             stop: stop.clone(),
             seeded: Arc::new(AtomicBool::new(true)),
+            snapshot: Arc::new(Mutex::new(())),
             stream: Arc::new(Mutex::new(None)),
             app_cursor: app_cursor.clone(),
             alive: Arc::new(AtomicBool::new(false)),
@@ -3193,6 +3485,71 @@ mod tests {
     }
 
     #[test]
+    fn forwarder_read_barrier_blocks_snapshot_installation() {
+        use std::io::{Read, Write};
+        use std::sync::mpsc;
+
+        let (pane_reader, mut pane_writer) = UnixStream::pair().expect("pane pair");
+        let (mut reader, forwarder) = UnixStream::pair().expect("data pair");
+        let (parent_control, forwarder_control) = UnixStream::pair().expect("control pair");
+        let (read_tx, read_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let forwarder_thread = std::thread::spawn(move || {
+            let mut pause_once = true;
+            pump_pane_output_with_hook(
+                pane_reader.as_raw_fd(),
+                &forwarder,
+                Some(&forwarder_control),
+                &mut || {
+                    if pause_once {
+                        pause_once = false;
+                        read_tx.send(()).expect("signal forwarder read");
+                        resume_rx.recv().expect("resume forwarder");
+                    }
+                },
+            );
+        });
+
+        pane_writer
+            .write_all(b"FORWARDER-MARKER")
+            .expect("queue pane output");
+        read_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("forwarder must pause after reading pane output");
+
+        let parser = Mutex::new(vt100::Parser::new(6, 40, 0));
+        let app_cursor = AtomicBool::new(false);
+        let grid_gen = AtomicU64::new(0);
+        let control = Mutex::new(Some(parent_control));
+        assert_eq!(
+            swap_drained_seeded_parser(
+                &parser,
+                &app_cursor,
+                &grid_gen,
+                None,
+                b"FORWARDER-MARKER\r\n",
+                (40, 6),
+                DrainedSeedGuard {
+                    guard: SeedGuard {
+                        chunk: None,
+                        pipe: Some(&reader),
+                    },
+                    control: &control,
+                },
+            ),
+            VtRefreshResult::Busy,
+            "a snapshot must stand down while the forwarder owns a captured byte"
+        );
+
+        resume_tx.send(()).expect("resume forwarder");
+        let mut forwarded = [0; b"FORWARDER-MARKER".len()];
+        reader.read_exact(&mut forwarded).expect("forwarded marker");
+        assert_eq!(&forwarded, b"FORWARDER-MARKER");
+        drop(pane_writer);
+        forwarder_thread.join().expect("forwarder exits");
+    }
+
+    #[test]
     fn grid_content_preserves_color() {
         // SGR 31 (red fg) on "X" must round-trip as an SGR escape, not a bare
         // cursor move, so colour survives into the preview.
@@ -3248,6 +3605,7 @@ mod tests {
             stop: stop.clone(),
             // Seeded upfront: this test has no capture-pane seed to wait for.
             seeded: Arc::new(AtomicBool::new(true)),
+            snapshot: Arc::new(Mutex::new(())),
             stream,
             app_cursor: Arc::new(AtomicBool::new(false)),
             alive: alive.clone(),
@@ -3406,6 +3764,7 @@ mod tests {
             parser: parser.clone(),
             stop: stop.clone(),
             seeded: Arc::new(AtomicBool::new(true)),
+            snapshot: Arc::new(Mutex::new(())),
             stream: Arc::new(Mutex::new(None)),
             app_cursor: Arc::new(AtomicBool::new(false)),
             alive: alive.clone(),
@@ -3541,6 +3900,7 @@ mod tests {
             stop: stop.clone(),
             // Seeded upfront: this test has no capture-pane seed to wait for.
             seeded: Arc::new(AtomicBool::new(true)),
+            snapshot: Arc::new(Mutex::new(())),
             stream: Arc::new(Mutex::new(None)),
             app_cursor: Arc::new(AtomicBool::new(false)),
             alive: Arc::new(AtomicBool::new(false)),
@@ -3655,14 +4015,18 @@ mod tests {
         let seeded = Arc::new(AtomicBool::new(false));
         let parser = Arc::new(Mutex::new(vt100::Parser::new(6, 40, 0)));
         let clipboard: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let snapshot = Arc::new(Mutex::new(()));
+        let stream = Arc::new(Mutex::new(None));
+        let app_cursor = Arc::new(AtomicBool::new(false));
         let chunk_seq = Arc::new(AtomicU64::new(0));
         let settled_chunk_seq = Arc::new(AtomicU64::new(0));
         let ctx = ReaderCtx {
             parser: parser.clone(),
             stop: stop.clone(),
             seeded: seeded.clone(),
-            stream: Arc::new(Mutex::new(None)),
-            app_cursor: Arc::new(AtomicBool::new(false)),
+            snapshot: snapshot.clone(),
+            stream: stream.clone(),
+            app_cursor: app_cursor.clone(),
             alive: Arc::new(AtomicBool::new(false)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: clipboard.clone(),
@@ -3725,7 +4089,45 @@ mod tests {
             1,
             "a queued chunk must remain unsettled until it mutates the parser"
         );
+        let (swap_tx, swap_rx) = std::sync::mpsc::channel();
+        let swap_parser = parser.clone();
+        let swap_snapshot = snapshot.clone();
+        let swap_stream = stream.clone();
+        let swap_cursor = app_cursor.clone();
+        let swap_grid_gen = grid_gen.clone();
+        let swap_chunk_seq = chunk_seq.clone();
+        let swap_settled_chunk_seq = settled_chunk_seq.clone();
+        let swap = std::thread::spawn(move || {
+            let _snapshot = swap_snapshot.lock().expect("reader fence");
+            let pipe = swap_stream.lock().expect("socket clone");
+            let result = swap_seeded_parser(
+                &swap_parser,
+                &swap_cursor,
+                &swap_grid_gen,
+                None,
+                b"POST-SEED-OUTPUT\r\n",
+                (40, 6),
+                SeedGuard {
+                    chunk: Some((&swap_chunk_seq, &swap_settled_chunk_seq, 1)),
+                    pipe: pipe.as_ref(),
+                },
+            );
+            swap_tx.send(result).expect("report seed result");
+        });
+        assert!(
+            swap_rx.recv_timeout(Duration::from_millis(30)).is_err(),
+            "snapshot must wait for a reader that has received but not parsed a chunk"
+        );
+        stop.store(true, Ordering::Relaxed);
         drop(parser_guard);
+        assert_eq!(
+            swap_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("seed result"),
+            VtRefreshResult::Busy,
+            "a snapshot must not replace the parser behind a received chunk"
+        );
+        swap.join().expect("snapshot exits");
         while settled_chunk_seq.load(Ordering::Acquire) < 2 {
             assert!(Instant::now() < deadline, "post-seed chunk never settled");
             std::thread::sleep(Duration::from_millis(2));
