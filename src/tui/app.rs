@@ -1854,6 +1854,17 @@ impl App {
                 needs_full_refresh = true;
             }
 
+            let store_move = self.home.poll_store_move();
+            if store_move.changed {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+            if let Some(action) = store_move.resume {
+                self.execute_action(action, terminal)?;
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
             if let Some(session_id) = self.home.apply_creation_results() {
                 self.dispatch_new_session_attach(&session_id, terminal)?;
                 // A structured session routes the post-create attach into
@@ -2177,7 +2188,12 @@ impl App {
         if self.update_status.as_ref().is_some_and(|s| s.is_expired()) {
             self.update_status = None;
         }
-        let status_text = self.update_status.as_ref().map(|s| s.text.as_str());
+        let store_move_line = self.home.store_move_status_line();
+        let status_text = self
+            .update_status
+            .as_ref()
+            .map(|s| s.text.as_str())
+            .or(store_move_line.as_deref());
         // Only hand the renderer the image banner when it's actually the active
         // one; while a pull is in flight `image_banner_active` is false, so the
         // banner can't re-render under the "pulling…" toast and clobber itself
@@ -3677,6 +3693,13 @@ impl App {
                 }
             }
 
+            if instance.is_sandboxed()
+                && self
+                    .defer_to_store_move(session_id, Action::AttachSession(session_id.to_string()))
+            {
+                return Ok(());
+            }
+
             // Get terminal size to pass to tmux session creation
             // This ensures the session starts at the correct size instead of 80x24 default
             let size = crate::terminal::get_size();
@@ -3771,6 +3794,22 @@ impl App {
         Ok(())
     }
 
+    /// If launching `session_id` would first copy its sandbox store, start
+    /// that copy on the worker and come back to `resume` once it is done,
+    /// returning `true`. The copy can take minutes; the status line narrates
+    /// it meanwhile.
+    fn defer_to_store_move(&mut self, session_id: &str, resume: Action) -> bool {
+        if !self.home.needs_store_move_before_launch(session_id) {
+            return false;
+        }
+        if !self.home.begin_store_move(session_id, Some(resume)) {
+            self.update_status = Some(UpdateStatus::transient(
+                "another agent store move is still in progress".into(),
+            ));
+        }
+        true
+    }
+
     fn attach_terminal(
         &mut self,
         session_id: &str,
@@ -3790,6 +3829,12 @@ impl App {
             TerminalMode::Container if instance.is_sandboxed() => {
                 let container_session = instance.container_terminal_tmux_session()?;
                 if !container_session.exists() || container_session.is_pane_dead() {
+                    if self.defer_to_store_move(
+                        session_id,
+                        Action::AttachTerminal(session_id.to_string(), mode),
+                    ) {
+                        return Ok(());
+                    }
                     if container_session.exists() {
                         let _ = container_session.kill();
                     }

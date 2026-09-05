@@ -23,6 +23,7 @@ mod restart_poller;
 pub mod settings;
 mod status_poller;
 mod stop_poller;
+mod store_move_poller;
 pub(crate) mod structured_view;
 pub(crate) mod styles;
 mod trash_poller;
@@ -232,9 +233,9 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
     // current step and the elapsed time, and keeps the notices a migration
     // emits (what is being moved, how to defer it) on screen. Unconditional
     // because the spinner writes nothing until a migration reports something,
-    // so the schema-current path costs nothing. Note this covers the startup
-    // pass only: v027's store move now runs from the container path, which
-    // has no reporter installed and so draws nothing here.
+    // so the schema-current path costs nothing. This covers the startup pass
+    // only: v027's per-session store move runs from a launch, on the store
+    // move poller, and narrates itself on the home status line.
     {
         let console = std::sync::Arc::new(std::sync::Mutex::new(
             migrations::progress::ConsoleProgress::default(),

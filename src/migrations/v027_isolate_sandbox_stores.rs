@@ -259,7 +259,12 @@ pub fn run() -> Result<()> {
 /// every startup until no pre-v2 row remains, then becomes a cheap read.
 /// `announce` narrates pending rows (see [`ANNOUNCE`]).
 pub(crate) fn reconcile_pending(announce: bool) -> Result<()> {
-    reconcile_scoped(announce, None)
+    reconcile_scoped(
+        announce,
+        None,
+        &batched_running_probe(announce),
+        &reap_migrated_container,
+    )
 }
 
 /// Move the store of one session, for the start that is about to launch it.
@@ -268,13 +273,34 @@ pub(crate) fn reconcile_pending(announce: bool) -> Result<()> {
 /// so a machine with many parked or idle sessions does not pay for all of them
 /// on one launch.
 pub(crate) fn migrate_instance(id: &str) -> Result<()> {
-    reconcile_scoped(false, Some(id))
+    reconcile_scoped(
+        false,
+        Some(id),
+        &batched_running_probe(false),
+        &reap_migrated_container,
+    )
+}
+
+/// [`migrate_instance`] with the container probes injected, so a test can
+/// drive the launch-time move end to end with no container runtime.
+#[cfg(test)]
+pub(crate) fn migrate_instance_with(
+    id: &str,
+    is_running: &RunningProbe<'_>,
+    reap: &ReapProbe<'_>,
+) -> Result<()> {
+    reconcile_scoped(false, Some(id), is_running, reap)
 }
 
 /// `only` scopes the move to a single instance; `announce` both narrates and
 /// selects the bulk path, so a bare `aoe` start reports what is pending
 /// without copying while `aoe migrate` moves everything eligible.
-fn reconcile_scoped(announce: bool, only: Option<&str>) -> Result<()> {
+fn reconcile_scoped(
+    announce: bool,
+    only: Option<&str>,
+    is_running: &RunningProbe<'_>,
+    reap: &ReapProbe<'_>,
+) -> Result<()> {
     let app_dir = crate::session::get_app_dir()?;
     if !transition_may_be_pending(&app_dir)? {
         return Ok(());
@@ -290,8 +316,8 @@ fn reconcile_scoped(announce: bool, only: Option<&str>) -> Result<()> {
     run_in(
         &app_dir,
         &home,
-        &batched_running_probe(announce),
-        &reap_migrated_container,
+        is_running,
+        reap,
         defer_requested() || (!announce && only.is_none()),
         announce,
         only,
@@ -438,14 +464,14 @@ fn try_acquire_cohort_lock(
 }
 
 #[cfg(test)]
-type CopyGate = Box<dyn Fn(&Path)>;
+pub(crate) type CopyGate = Box<dyn Fn(&Path)>;
 
 #[cfg(test)]
 thread_local! {
-    /// A test's hold on the copy phase: called with each root about to be
+    /// A test's hold on the copy phase: called once per root about to be
     /// copied, before its first `publish_store`, on the thread running the
     /// pass, with only that root's cohort lock held.
-    static COPY_GATE: std::cell::RefCell<Option<CopyGate>> =
+    pub(crate) static COPY_GATE: std::cell::RefCell<Option<CopyGate>> =
         const { std::cell::RefCell::new(None) };
 }
 

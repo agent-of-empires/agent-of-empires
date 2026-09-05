@@ -165,19 +165,30 @@ impl ConsoleProgress {
         }
     }
 
-    /// The current activity, or `None` when no migration is running.
+    /// The current activity under the migration's label, or `None` when no
+    /// migration is running.
     pub fn status_line(&self) -> Option<String> {
+        let activity = self.activity()?;
+        Some(if self.step.is_empty() {
+            format!("{} {activity}", self.label)
+        } else {
+            format!("{}: {activity}", self.label)
+        })
+    }
+
+    /// The current step, its latest progress and the elapsed time, for a
+    /// renderer with a label of its own.
+    pub fn activity(&self) -> Option<String> {
         let started = self.started?;
-        let mut line = self.label.clone();
-        if !self.step.is_empty() {
-            line.push_str(": ");
-            line.push_str(&self.step);
-        }
+        let mut line = self.step.clone();
         if !self.detail.is_empty() {
             line.push_str(", ");
             line.push_str(&self.detail);
         }
-        line.push_str(&format!(" ({})", format_elapsed(started.elapsed())));
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(&format!("({})", format_elapsed(started.elapsed())));
         Some(line)
     }
 
@@ -377,6 +388,10 @@ mod tests {
             position: 1,
             total: 1,
         });
+        assert!(console
+            .status_line()
+            .unwrap()
+            .starts_with("Data migration v27 (isolate_sandbox_stores) ("));
         console.apply(Event::Step("copying store 1/2".into()));
         console.apply(Event::Progress("120 files, 4.0 MB".into()));
         let line = console.status_line().unwrap();
