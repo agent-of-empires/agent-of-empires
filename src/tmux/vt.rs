@@ -1587,6 +1587,37 @@ struct SampleCache {
     cursor: PaneCursor,
 }
 
+/// One [`VtChannel::sample`] result and whether it may be published.
+pub(crate) struct VtSample {
+    pub(crate) content: String,
+    pub(crate) cursor: Option<PaneCursor>,
+    /// True when `content` was serialized from a grid inside an unclosed
+    /// synchronized-output bracket, i.e. a half-drawn frame. Decided under the
+    /// same parser lock that assembled `content`, so a caller's publish
+    /// decision describes the state the payload came from; a later
+    /// [`VtChannel::sync_hold_active`] call can see an expired hold or an
+    /// entirely different bracket.
+    pub(crate) incomplete: bool,
+}
+
+impl VtSample {
+    fn whole(content: String, cursor: Option<PaneCursor>) -> Self {
+        Self {
+            content,
+            cursor,
+            incomplete: false,
+        }
+    }
+}
+
+/// One [`VtChannel::sample_rows_padded_with_deadline`] result: the visible grid
+/// as display rows, plus the same publishability [`VtSample`] carries.
+pub(crate) struct VtRowsSample {
+    pub(crate) rows: Vec<String>,
+    pub(crate) cursor: PaneCursor,
+    pub(crate) incomplete: bool,
+}
+
 impl VtChannel {
     /// Get the shared channel for `session`, arming a new one if none is live.
     /// Returns `None` if tmux is too old or the pane is gone or any tmux/socket
@@ -2023,7 +2054,7 @@ impl VtChannel {
     /// the TUI scroll and the web's virtual scroll spacer need real history
     /// here, not just the visible screen.
     #[cfg(test)]
-    pub(crate) fn sample(&self, max_lines: usize) -> (String, Option<PaneCursor>) {
+    pub(crate) fn sample(&self, max_lines: usize) -> VtSample {
         let deadline = crate::tmux::TmuxCommandDeadline::new();
         self.sample_with_deadline(max_lines, &deadline)
     }
@@ -2032,7 +2063,7 @@ impl VtChannel {
         &self,
         max_lines: usize,
         deadline: &crate::tmux::TmuxCommandDeadline,
-    ) -> (String, Option<PaneCursor>) {
+    ) -> VtSample {
         // Both fork tmux and take the parser lock themselves, so they run
         // before this sampler takes it.
         self.reconcile_grid(deadline);
@@ -2041,7 +2072,7 @@ impl VtChannel {
         let rows = self.rows.load(Ordering::Relaxed);
         let mut p = match self.parser.lock() {
             Ok(p) => p,
-            Err(_) => return (String::new(), None),
+            Err(_) => return VtSample::whole(String::new(), None),
         };
         // Read both under the parser lock, which is where the reader applies a
         // chunk and bumps the generation, and where it releases a bracket. The
@@ -2055,7 +2086,7 @@ impl VtChannel {
                 // Mid-bracket the grid is a half-drawn frame: serve the last
                 // complete one instead. The reader wakes viewers on close.
                 if same_window && (c.grid_gen == grid_gen || incomplete) {
-                    return (c.content.clone(), Some(c.cursor));
+                    return VtSample::whole(c.content.clone(), Some(c.cursor));
                 }
             }
         }
@@ -2077,7 +2108,11 @@ impl VtChannel {
                 });
             }
         }
-        (content, Some(cursor))
+        VtSample {
+            content,
+            cursor: Some(cursor),
+            incomplete,
+        }
     }
 
     /// Sample the VISIBLE grid as `want_rows` rows padded to `want_cols`
@@ -2096,7 +2131,7 @@ impl VtChannel {
         &self,
         want_cols: u16,
         want_rows: u16,
-    ) -> Option<(Vec<String>, PaneCursor)> {
+    ) -> Option<VtRowsSample> {
         let deadline = crate::tmux::TmuxCommandDeadline::new();
         self.sample_rows_padded_with_deadline(want_cols, want_rows, &deadline)
     }
@@ -2106,7 +2141,7 @@ impl VtChannel {
         want_cols: u16,
         want_rows: u16,
         deadline: &crate::tmux::TmuxCommandDeadline,
-    ) -> Option<(Vec<String>, PaneCursor)> {
+    ) -> Option<VtRowsSample> {
         self.reconcile_grid(deadline);
         self.refresh_owner_heartbeat(deadline);
         let cols = self.cols.load(Ordering::Relaxed);
@@ -2115,6 +2150,10 @@ impl VtChannel {
         let want_rows = want_rows.max(1);
 
         let p = self.parser.lock().ok()?;
+        // Read under the lock that renders these rows, like the scrollback
+        // sampler: a composite spliced from a half-drawn pane 0 tears the same
+        // way a whole-window frame does.
+        let incomplete = self.signals.frame_incomplete();
         let screen = p.screen();
         let readable_cols = cols.min(want_cols);
         let out = (0..want_rows)
@@ -2135,7 +2174,11 @@ impl VtChannel {
             .collect();
         let cursor = cursor_from_screen(screen, rows, cols);
         drop(p);
-        Some((out, cursor))
+        Some(VtRowsSample {
+            rows: out,
+            cursor,
+            incomplete,
+        })
     }
 
     /// A receiver that fires on every publishable grid change, OSC 52 write, and
@@ -3093,7 +3136,9 @@ mod tests {
             .process(b"hello\r\nworld\r\n\x1b[41mfilled");
 
         // Exact rectangle.
-        let (rows, cursor) = ch.sample_rows_padded(20, 4).expect("sample");
+        let sample = ch.sample_rows_padded(20, 4).expect("sample");
+        let (rows, cursor) = (sample.rows, sample.cursor);
+        assert!(!sample.incomplete, "no bracket open: publishable");
         assert_eq!(rows.len(), 4);
         for (i, r) in rows.iter().enumerate() {
             assert_eq!(
@@ -3108,7 +3153,7 @@ mod tests {
         assert!(cursor.position_reliable);
 
         // Narrower and shorter than the grid: truncate, never overflow.
-        let (rows, _) = ch.sample_rows_padded(6, 2).expect("sample");
+        let rows = ch.sample_rows_padded(6, 2).expect("sample").rows;
         assert_eq!(rows.len(), 2);
         for r in &rows {
             assert_eq!(crate::tmux::utils::strip_ansi(r).chars().count(), 6);
@@ -3117,7 +3162,7 @@ mod tests {
         // Taller than the grid (tmux says the pane grew before the grid caught
         // up): the extra rows are blank filler at the right width, not rows
         // borrowed from elsewhere.
-        let (rows, _) = ch.sample_rows_padded(10, 6).expect("sample");
+        let rows = ch.sample_rows_padded(10, 6).expect("sample").rows;
         assert_eq!(rows.len(), 6);
         for (i, r) in rows.iter().enumerate() {
             let plain = crate::tmux::utils::strip_ansi(r);
@@ -3126,6 +3171,15 @@ mod tests {
                 assert!(plain.trim().is_empty(), "row {i} should be filler: {r:?}");
             }
         }
+
+        // Mid-bracket the rows are a half-drawn repaint. A composite splices
+        // them into the window next to panes captured whole, so the sample says
+        // so and the preview keeps the frame it has.
+        ch.signals.begin_hold();
+        let held = ch.sample_rows_padded(20, 4).expect("sample");
+        assert!(held.incomplete, "mid-bracket rows are not publishable");
+        ch.signals.end_hold();
+        assert!(!ch.sample_rows_padded(20, 4).expect("sample").incomplete);
     }
 
     #[test]
@@ -3204,13 +3258,13 @@ mod tests {
 
         ch.parser.lock().unwrap().process(b"one");
         ch.grid_gen.fetch_add(1, Ordering::Relaxed);
-        let (first, _) = ch.sample(4);
+        let first = ch.sample(4).content;
         assert!(first.contains("one"), "fresh assembly:\n{first:?}");
 
         // Advance the parser WITHOUT bumping gen: the cache must still serve
         // the old frame (this is what makes an idle pane's cadence cheap).
         ch.parser.lock().unwrap().process(b" two");
-        let (cached, _) = ch.sample(4);
+        let cached = ch.sample(4).content;
         assert!(
             !cached.contains("two"),
             "same generation must serve the cached assembly:\n{cached:?}"
@@ -3218,14 +3272,14 @@ mod tests {
 
         // Bump gen (what the reader does per chunk): fresh assembly.
         ch.grid_gen.fetch_add(1, Ordering::Relaxed);
-        let (fresh, _) = ch.sample(4);
+        let fresh = ch.sample(4).content;
         assert!(
             fresh.contains("two"),
             "bumped generation must reassemble:\n{fresh:?}"
         );
 
         // A different window size also misses the cache.
-        let (wider, _) = ch.sample(3);
+        let wider = ch.sample(3).content;
         assert!(wider.contains("two"), "window change must reassemble");
     }
 
@@ -4240,25 +4294,65 @@ mod tests {
         ch.parser.lock().unwrap().process(b"before");
         ch.grid_gen.fetch_add(1, Ordering::Relaxed);
         let deadline = crate::tmux::TmuxCommandDeadline::new();
-        let (first, _) = ch.sample_with_deadline(4, &deadline);
+        let first = ch.sample_with_deadline(4, &deadline).content;
         assert!(first.contains("before"));
 
         // Output lands inside a bracket: the sample must not follow it yet.
         ch.signals.begin_hold();
         ch.parser.lock().unwrap().process(b"\r\x1b[Kafter");
         ch.grid_gen.fetch_add(1, Ordering::Relaxed);
-        let (held, _) = ch.sample_with_deadline(4, &deadline);
+        let held = ch.sample_with_deadline(4, &deadline).content;
         assert_eq!(
             held, first,
             "mid-bracket sample serves the last complete frame"
         );
 
         ch.signals.end_hold();
-        let (fresh, _) = ch.sample_with_deadline(4, &deadline);
+        let fresh = ch.sample_with_deadline(4, &deadline).content;
         assert!(
             fresh.contains("after"),
             "closing the bracket publishes the new frame"
         );
         assert!(!fresh.contains("before"));
+    }
+
+    #[test]
+    fn sample_reports_a_mid_bracket_cache_miss_as_incomplete() {
+        // The single-entry cache serves the last complete frame only for the
+        // window it was assembled for. A second viewer at a different window
+        // misses it and can only serialize the grid, which mid-bracket is half
+        // drawn: that payload must carry its own "do not publish", because the
+        // caller's later hold check can see an expired hold or a closed
+        // bracket and would publish the tear.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (ch, _alive) = dummy_channel("aoe-vt-partial-test", dir.path());
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        ch.parser.lock().unwrap().process(b"whole");
+        ch.grid_gen.fetch_add(1, Ordering::Relaxed);
+        let cached = ch.sample_with_deadline(4, &deadline);
+        assert!(cached.content.contains("whole"));
+        assert!(!cached.incomplete);
+
+        // A repaint opens a bracket and only its first half has been applied.
+        ch.signals.begin_hold();
+        ch.parser.lock().unwrap().process(b"\r\x1b[Kpart");
+        ch.grid_gen.fetch_add(1, Ordering::Relaxed);
+
+        let hit = ch.sample_with_deadline(4, &deadline);
+        assert_eq!(hit.content, cached.content, "cache hit stays whole");
+        assert!(!hit.incomplete);
+
+        let miss = ch.sample_with_deadline(3, &deadline);
+        assert!(miss.content.contains("part"), "cache miss reassembles");
+        assert!(miss.incomplete, "a mid-bracket assembly is not publishable");
+
+        // The bracket closing after the sample does not make that payload
+        // publishable: completeness travels with it.
+        ch.signals.end_hold();
+        assert!(miss.incomplete);
+
+        let after = ch.sample_with_deadline(3, &deadline);
+        assert!(!after.incomplete, "a closed bracket publishes again");
+        assert!(after.content.contains("part"));
     }
 }
