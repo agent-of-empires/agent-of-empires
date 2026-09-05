@@ -157,6 +157,25 @@ fn reap_migrated_container(id: &str) -> Result<bool> {
     }
 }
 
+/// What this pass may do with one row's store.
+///
+/// Every sandboxed row becomes a `Target` whatever its disposition, because
+/// the liveness gate reasons over whole cohorts: a member missing from its
+/// cohort is a member the gate never asks about, and its peers' store is then
+/// published while that session is still writing to it. Three reviews of this
+/// migration found that same defect three times, each from a different filter
+/// applied before cohorts were assembled. Eligibility is therefore a property
+/// of the target and never a filter on the rows that build one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Disposition {
+    /// Copy and publish this store once the cohort is quiescent.
+    Move,
+    /// Leave this row on the shared store: it is parked, or this pass was
+    /// scoped to a different cohort. It is still a cohort member, so it is
+    /// still asked about, and it still holds its source against retirement.
+    Hold,
+}
+
 #[derive(Clone)]
 struct Target {
     registry: usize,
@@ -165,6 +184,7 @@ struct Target {
     shared: PathBuf,
     private: PathBuf,
     cleanup_root: PathBuf,
+    disposition: Disposition,
 }
 
 struct Registry {
@@ -194,8 +214,10 @@ pub(crate) fn reconcile_pending(announce: bool) -> Result<()> {
 }
 
 /// Move the store of one session, for the start that is about to launch it.
-/// Every other pending row is left alone, so a machine with many parked or
-/// idle sessions pays for the one it is opening instead of all of them.
+/// The cohort sharing that session's store moves with it, since the cohort is
+/// the unit the liveness gate reasons about; every other cohort is left alone,
+/// so a machine with many parked or idle sessions does not pay for all of them
+/// on one launch.
 pub(crate) fn migrate_instance(id: &str) -> Result<()> {
     reconcile_scoped(false, Some(id))
 }
@@ -322,6 +344,8 @@ fn run_in(
     }
     let mut targets = Vec::new();
     let mut affected_rows = BTreeSet::new();
+    // Rows this pass will not copy but must still count as cohort members,
+    // so the liveness fold below asks about them before publishing a store.
     let mut known_sources = BTreeSet::new();
     let mut cleanup_roots = BTreeSet::new();
     let mut needs_registry_write = false;
@@ -411,9 +435,9 @@ fn run_in(
                 }
                 continue;
             }
-            if row_is_parked(row) && only != Some(id.as_str()) {
+            let parked = row_is_parked(row) && only != Some(id.as_str());
+            if parked {
                 defer_source_retirement = true;
-                continue;
             }
             let Some(tool) = row.get("tool").and_then(Value::as_str) else {
                 defer_source_retirement = true;
@@ -504,7 +528,10 @@ fn run_in(
                     Some(source.clone())
                 }
             }));
-            if stored_plans.is_none() {
+            // A parked row is carried only as a cohort member; it publishes
+            // nothing this pass, so it gets neither the drift checkpoint nor
+            // the pending stamp.
+            if stored_plans.is_none() && !parked {
                 set_transition_paths(row, &plans);
                 needs_registry_write = true;
             }
@@ -515,11 +542,18 @@ fn run_in(
                 continue;
             }
             let pending_generation = if old_private { 0 } else { 1 };
-            if generation != u64::from(pending_generation) {
+            if !parked && generation != u64::from(pending_generation) {
                 set_generation(row, pending_generation);
                 needs_registry_write = true;
             }
-            affected_rows.insert((registry_index, row_index));
+            if !parked {
+                affected_rows.insert((registry_index, row_index));
+            }
+            let disposition = if parked {
+                Disposition::Hold
+            } else {
+                Disposition::Move
+            };
             targets.extend(plans.into_iter().map(|(shared, private)| {
                 let cleanup_root = if old_private {
                     shared.parent().unwrap_or(&shared).to_path_buf()
@@ -530,6 +564,7 @@ fn run_in(
                     registry: registry_index,
                     row: row_index,
                     id: id.clone(),
+                    disposition,
                     shared,
                     private,
                     cleanup_root,
@@ -545,29 +580,37 @@ fn run_in(
             .or_default()
             .push(target);
     }
-    // Scope by cohort, never by row. A cohort is every session sharing one
-    // legacy store, and the liveness gate below asks about all of them before
-    // any copy: a store a peer is still writing to must not be published.
-    // Dropping the peers from the cohort instead would leave that fold asking
-    // only about the session being started, and copy the store mid-write.
-    let mut scoped_out_rows: BTreeSet<(usize, usize)> = BTreeSet::new();
+    // Scoping demotes; it never removes. A cohort not named by this pass keeps
+    // every member and every member keeps its place in the liveness fold, so
+    // the gate still asks about sessions this pass will not touch. Dropping
+    // them instead is what let an earlier revision copy a store out from under
+    // a live peer.
     if let Some(wanted) = only {
         let selected: BTreeSet<PathBuf> = cohorts
             .iter()
             .filter(|(_, cohort)| cohort.iter().any(|target| target.id == wanted))
             .map(|(shared, _)| shared.clone())
             .collect();
-        cohorts.retain(|shared, cohort| {
-            let keep = selected.contains(shared);
-            if !keep {
-                // Another session's cohort. It still holds its shared source,
-                // so nothing may retire underneath it this pass.
-                defer_source_retirement = true;
-                scoped_out_rows.extend(cohort.iter().map(|t| (t.registry, t.row)));
+        for (shared, cohort) in cohorts.iter_mut() {
+            if selected.contains(shared) {
+                continue;
             }
-            keep
-        });
+            // Another session's cohort: it still holds its shared source, so
+            // nothing may retire underneath it this pass.
+            defer_source_retirement = true;
+            for target in cohort.iter_mut() {
+                target.disposition = Disposition::Hold;
+            }
+        }
     }
+    // The rows this pass will actually publish. Derived from the targets, so a
+    // row cannot be marked ready without a target that says it may move.
+    let movable_rows: BTreeSet<(usize, usize)> = cohorts
+        .values()
+        .flatten()
+        .filter(|target| target.disposition == Disposition::Move)
+        .map(|target| (target.registry, target.row))
+        .collect();
     if announce && defer_stores && !affected_rows.is_empty() {
         progress::notice(format!(
             "{DEFER_ENV} is set: {} sandboxed session(s) keep their shared agent store for now; \
@@ -598,10 +641,14 @@ fn run_in(
         sync_parent(&journal)?;
     }
 
-    let mut ready_rows = affected_rows.clone();
-    for key in &scoped_out_rows {
-        ready_rows.remove(key);
-    }
+    // Intersect rather than subtract: a row is publishable only if a target
+    // says so, so no future filter can leave a row stamped current whose store
+    // was never copied.
+    let mut ready_rows: BTreeSet<(usize, usize)> = affected_rows
+        .iter()
+        .filter(|key| movable_rows.contains(key))
+        .copied()
+        .collect();
     let mut pending = Vec::new();
     let mut blocked_roots = BTreeSet::new();
     let mut orphan_blocked_roots = BTreeSet::new();
@@ -709,7 +756,11 @@ fn run_in(
         }
     }
 
-    let total_targets: usize = cohorts.values().map(Vec::len).sum();
+    let total_targets: usize = cohorts
+        .values()
+        .flatten()
+        .filter(|target| target.disposition == Disposition::Move)
+        .count();
     let mut copied_targets = 0usize;
     for (shared, cohort) in &cohorts {
         let ids: BTreeSet<&str> = cohort.iter().map(|target| target.id.as_str()).collect();
@@ -732,6 +783,14 @@ fn run_in(
             continue;
         }
         for target in cohort {
+            // A parked row is here only so the fold above could ask about it.
+            // Copying its store is the cost this skip exists to avoid.
+            if target.disposition == Disposition::Hold {
+                // Held members are asked about by the fold above but publish
+                // nothing, and their source stays put.
+                defer_source_retirement = true;
+                continue;
+            }
             copied_targets += 1;
             if copied_targets == 1 {
                 // Said once, right before the first copy: this is the part
@@ -817,10 +876,21 @@ fn run_in(
             .flatten()
             .filter(|target| &target.cleanup_root == root)
             .collect();
+        // Every member under this root must have published, held members
+        // included: a held row still reads this source, so retiring it would
+        // leave that session with no store to open.
+        //
+        // The `Move` clause is deliberately redundant. A held target never
+        // reaches `affected_rows`, so it can never be in `ready_rows`, and
+        // `defer_source_retirement` is set for it besides. It is written here
+        // anyway because this is the line that decides to delete a store, and
+        // it should say what it requires rather than inherit it from two
+        // places several hundred lines up.
         let all_ready = !related.is_empty()
-            && related
-                .iter()
-                .all(|target| ready_rows.contains(&(target.registry, target.row)));
+            && related.iter().all(|target| {
+                target.disposition == Disposition::Move
+                    && ready_rows.contains(&(target.registry, target.row))
+            });
         if !defer_source_retirement && !blocked_roots.contains(root) && all_ready {
             progress::step(format!("retiring shared agent store {}", root.display()));
             retire_legacy(root)?;
@@ -2418,6 +2488,117 @@ gemini = "{}"
         assert!(
             legacy.exists(),
             "the still-parked peer must keep the shared source"
+        );
+    }
+
+    /// A parked row is skipped for copying, not for the liveness question.
+    /// `archive` does not stop the container, and `aoe send` starts an
+    /// archived session without unparking it, so a parked peer can be writing
+    /// the shared store while an unparked peer is started. Dropping it from
+    /// the cohort would publish that store mid-write, at generation 2.
+    #[test]
+    #[serial_test::serial]
+    fn a_live_parked_peer_blocks_its_cohort() {
+        for scoped in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+            let app = crate::session::get_app_dir().unwrap();
+            let home = dirs::home_dir().unwrap();
+            let legacy = home.join(".gemini/sandbox");
+            fs::create_dir_all(&legacy).unwrap();
+            fs::write(legacy.join("data"), b"data").unwrap();
+            let rows = serde_json::json!([
+                {"id":"1111111111111111","tool":"gemini","sandbox_info":{"enabled":true}},
+                {"id":"2222222222222222","tool":"gemini","sandbox_info":{"enabled":true},
+                 "archived_at":"2026-09-05T00:00:00Z"}
+            ]);
+            fs::write(
+                app.join("sessions.json"),
+                serde_json::to_vec(&rows).unwrap(),
+            )
+            .unwrap();
+
+            let live_peer = |id: &str| Ok(id == "2222222222222222");
+            if scoped {
+                run_in_only(&app, &home, &live_peer, "1111111111111111").unwrap();
+            } else {
+                run_in(&app, &home, &live_peer).unwrap();
+            }
+
+            assert!(
+                !home.join(".gemini/sandbox-v2/1111111111111111").exists(),
+                "scoped={scoped}: a live archived peer must block the copy"
+            );
+            let rows: Value =
+                serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
+            assert_ne!(
+                rows[0]["sandbox_store_generation"], 2,
+                "scoped={scoped}: a blocked row must not be stamped current"
+            );
+            assert!(
+                legacy.exists(),
+                "scoped={scoped}: the shared source must survive"
+            );
+
+            // Once the parked peer stops, the same pass moves the unparked row
+            // and still leaves the parked one on the shared store.
+            if scoped {
+                run_in_only(&app, &home, &|_| Ok(false), "1111111111111111").unwrap();
+            } else {
+                run_in(&app, &home, &|_| Ok(false)).unwrap();
+            }
+            assert_eq!(
+                fs::read(home.join(".gemini/sandbox-v2/1111111111111111/data")).unwrap(),
+                b"data",
+                "scoped={scoped}: the unparked row must move once the peer stops"
+            );
+            assert!(
+                !home.join(".gemini/sandbox-v2/2222222222222222").exists(),
+                "scoped={scoped}: the parked peer must not be copied"
+            );
+            assert!(
+                legacy.exists(),
+                "scoped={scoped}: the parked peer still holds the shared source"
+            );
+        }
+    }
+
+    /// A scoped pass must not retire a cleanup root a scoped-out cohort still
+    /// lives under. Codex sessions each own a child of one shared root, so
+    /// dropping `defer_source_retirement` in the cohort filter would quarantine
+    /// and delete every other codex session's store.
+    #[test]
+    #[serial_test::serial]
+    fn a_scoped_pass_holds_the_root_a_scoped_out_cohort_lives_under() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        let home = dirs::home_dir().unwrap();
+        let root = home.join(".codex/sandbox");
+        fs::create_dir_all(root.join("1111111111111111")).unwrap();
+        fs::write(root.join("1111111111111111/data"), b"one").unwrap();
+        fs::create_dir_all(root.join("2222222222222222")).unwrap();
+        fs::write(root.join("2222222222222222/data"), b"two").unwrap();
+        let rows = serde_json::json!([
+            {"id":"1111111111111111","tool":"codex","sandbox_info":{"enabled":true}},
+            {"id":"2222222222222222","tool":"codex","sandbox_info":{"enabled":true}}
+        ]);
+        fs::write(
+            app.join("sessions.json"),
+            serde_json::to_vec(&rows).unwrap(),
+        )
+        .unwrap();
+
+        run_in_only(&app, &home, &|_| Ok(false), "1111111111111111").unwrap();
+
+        assert_eq!(
+            fs::read(root.join("2222222222222222/data")).unwrap(),
+            b"two",
+            "a scoped-out cohort's shared store must survive the pass"
+        );
+        assert_eq!(
+            fs::read(home.join(".codex/sandbox-v2/1111111111111111/data")).unwrap(),
+            b"one"
         );
     }
 

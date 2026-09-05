@@ -233,11 +233,10 @@ pub enum Commands {
     /// Update aoe to the latest release
     Update(UpdateArgs),
 
-    /// Run pending data migrations now, showing progress. Startup reports a
-    /// pending sandbox store move without performing it, and a session moves
-    /// its own store when it starts, so use this to move every eligible store
-    /// at once. Trashed and archived sessions are skipped; they move when
-    /// started, restored or unarchived.
+    /// Run pending data migrations now, showing progress. A sandboxed session
+    /// moves its own agent store when it starts; use this to move every
+    /// eligible store at once instead. Trashed and archived sessions are
+    /// skipped; they move when started, restored or unarchived.
     Migrate,
 
     /// Generate shell completions

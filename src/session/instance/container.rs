@@ -172,7 +172,7 @@ impl Instance {
 
         if self.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION {
             anyhow::bail!(
-                "sandbox store transition is pending for {}; stop all legacy sandbox peers and restart AoE before relaunching it",
+                "sandbox store transition is pending for {}; stop the other sandboxed sessions sharing this agent's store, then relaunch it or run `aoe migrate`",
                 self.id
             );
         }
