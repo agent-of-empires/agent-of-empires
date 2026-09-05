@@ -479,14 +479,20 @@ fn json_to_list(current: &Value) -> Vec<String> {
 
 /// Built-in agents that can run a one-shot rename (a `oneshot_flag`) AND are
 /// installed on this host. The smart-rename agent picker offers only these, so
-/// a user cannot pick an agent the one-shot would just fail on. Detection uses
-/// the per-agent availability check directly to avoid the `Config::load` side
+/// a user cannot pick an agent the one-shot would just fail on. Probed in one
+/// batch (and served from the process-wide memo that startup warms) rather
+/// than per agent: field rebuilds are frequent, and a per-agent probe paid a
+/// login shell for every not-installed agent. Avoids the `Config::load` side
 /// effects of `AvailableTools::detect()`.
 fn installed_oneshot_agents() -> Vec<String> {
-    crate::agents::oneshot_capable_names()
+    let defs: Vec<&crate::agents::AgentDef> = crate::agents::oneshot_capable_names()
         .into_iter()
-        .filter(|name| crate::agents::get_agent(name).is_some_and(crate::tmux::is_agent_available))
-        .map(|name| name.to_string())
+        .filter_map(crate::agents::get_agent)
+        .collect();
+    let available = crate::tmux::probe_agents_available(&defs);
+    defs.iter()
+        .filter(|d| available.contains(d.name))
+        .map(|d| d.name.to_string())
         .collect()
 }
 

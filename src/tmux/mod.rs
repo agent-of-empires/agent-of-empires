@@ -1572,6 +1572,104 @@ impl Drop for PaneMetaCacheGuard {
     }
 }
 
+/// Test-only owner for a held [`AGENT_PROBE_LOCK`] guard plus the worker that
+/// is blocked on it. `Drop` releases the lock and then joins, so a panicking
+/// assertion cannot detach the worker and let it clear the memo after
+/// [`AgentAvailabilityGuard`] has restored it. Declare it after that guard so
+/// it drops first.
+#[cfg(test)]
+pub(crate) struct BlockedProbeWorker<'a> {
+    guard: Option<std::sync::MutexGuard<'a, ()>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(test)]
+impl<'a> BlockedProbeWorker<'a> {
+    pub(crate) fn new(
+        guard: std::sync::MutexGuard<'a, ()>,
+        handle: std::thread::JoinHandle<()>,
+    ) -> Self {
+        Self {
+            guard: Some(guard),
+            handle: Some(handle),
+        }
+    }
+
+    /// Release the lock and wait for the worker, so assertions after this run
+    /// against a settled memo. Idempotent; `Drop` is then a no-op.
+    pub(crate) fn release_and_join(&mut self) {
+        drop(self.guard.take());
+        if let Some(handle) = self.handle.take() {
+            handle.join().expect("probe worker");
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for BlockedProbeWorker<'_> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Test-only RAII guard for tests that seed [`AGENT_AVAILABILITY`] into a known
+/// state. Same shape and reason as [`SessionCacheGuard`]: the memo is
+/// process-global, so a mid-test panic must not leak a seeded entry into a
+/// later test and make it order-dependent. Pair with `#[serial_test::serial]`.
+#[cfg(test)]
+pub(crate) struct AgentAvailabilityGuard {
+    prev: Option<HashMap<String, bool>>,
+}
+
+#[cfg(test)]
+impl AgentAvailabilityGuard {
+    pub(crate) fn capture() -> Self {
+        Self {
+            prev: AGENT_AVAILABILITY
+                .read()
+                .expect("agent availability lock")
+                .clone(),
+        }
+    }
+
+    /// Seed one memoized answer, as a completed probe would have published it.
+    pub(crate) fn seed(&self, agent: &str, available: bool) {
+        if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
+            cache
+                .get_or_insert_with(HashMap::new)
+                .insert(agent.to_string(), available);
+        }
+    }
+
+    /// Clear the memo, as `invalidate_agent_availability` does.
+    pub(crate) fn clear(&self) {
+        if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
+            *cache = None;
+        }
+    }
+
+    /// Whether the memo currently holds any answer.
+    pub(crate) fn is_populated(&self) -> bool {
+        AGENT_AVAILABILITY
+            .read()
+            .ok()
+            .and_then(|c| c.as_ref().map(|m| !m.is_empty()))
+            .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+impl Drop for AgentAvailabilityGuard {
+    fn drop(&mut self) {
+        if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
+            *cache = self.prev.take();
+        }
+    }
+}
+
 /// How long a [`SESSION_CACHE`] snapshot is trusted before a lookup must
 /// force a fresh `refresh_session_cache()` call.
 const CACHE_TTL: Duration = Duration::from_secs(2);
@@ -2265,11 +2363,116 @@ fn login_shell_probe(agents: &[&crate::agents::AgentDef]) -> std::collections::H
         .unwrap_or_default()
 }
 
-pub(crate) fn is_agent_available(agent: &crate::agents::AgentDef) -> bool {
-    match agent_available_direct(agent) {
-        Some(available) => available,
-        None => login_shell_probe(&[agent]).contains(agent.name),
+/// Process-wide memo of agent availability, keyed by agent name. A probe costs
+/// a `which` fork and, when that misses, a share of a login shell (0.5-2.5s),
+/// so re-probing on every settings field rebuild made `Settings > Agents` and
+/// every keystroke in `Settings > Search` pay seconds. Startup's
+/// `AvailableTools::detect` warms every built-in agent, so later callers hit
+/// the memo. The Recheck action clears it via
+/// [`invalidate_agent_availability`].
+static AGENT_AVAILABILITY: RwLock<Option<HashMap<String, bool>>> = RwLock::new(None);
+
+/// Serializes cache population so a set of concurrent cold callers costs one
+/// login shell between them rather than one each. `GET /api/agents` runs
+/// `AvailableTools::detect` in `spawn_blocking`, so a dashboard with several
+/// tabs open can issue simultaneous probes; the TUI's settings rebuild can
+/// land in the same window. Held only around the probe, never around a read.
+static AGENT_PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Drop the memoized availability results so the next probe re-runs. Called
+/// when the user explicitly asks for a recheck (they just installed an agent).
+///
+/// Takes `AGENT_PROBE_LOCK` first so an in-flight probe cannot republish its
+/// pre-install results after the clear. Without that, Recheck
+/// (`invalidate` then `detect`) could observe a probe that started before the
+/// install finish writing in between, find the memo populated, skip its own
+/// probe, and report the freshly installed agent as still unavailable, which
+/// is the one thing Recheck exists to prevent. The wait is bounded by the
+/// probe already running, and the caller is about to pay for a probe anyway.
+///
+/// Lock order matches `probe_agents_available` (probe lock, then the memo), so
+/// the two cannot deadlock.
+pub fn invalidate_agent_availability() {
+    let _probe_guard = AGENT_PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
+        *cache = None;
     }
+}
+
+/// Names from `agents` that the memo already answers, plus the ones it does
+/// not know about yet. Split under a single read lock.
+fn partition_cached_agents<'a>(
+    agents: &[&'a crate::agents::AgentDef],
+) -> (HashSet<String>, Vec<&'a crate::agents::AgentDef>) {
+    let mut found = HashSet::new();
+    let mut uncached = Vec::new();
+    let cache = AGENT_AVAILABILITY.read().ok();
+    let cached = cache.as_ref().and_then(|c| c.as_ref());
+    for agent in agents {
+        match cached.and_then(|c| c.get(agent.name)) {
+            Some(true) => {
+                found.insert(agent.name.to_string());
+            }
+            Some(false) => {}
+            None => uncached.push(*agent),
+        }
+    }
+    (found, uncached)
+}
+
+/// Availability for `agents`, memoized across calls and batched so the whole
+/// uncached set costs at most ONE login shell. Returns the subset of names
+/// that resolved.
+pub(crate) fn probe_agents_available(
+    agents: &[&crate::agents::AgentDef],
+) -> std::collections::HashSet<String> {
+    let (mut found, uncached) = partition_cached_agents(agents);
+    if uncached.is_empty() {
+        return found;
+    }
+
+    // Serialize the probe itself, then re-read the memo: a caller that queued
+    // behind another's login shell wants that shell's answer, not a second
+    // shell of its own. A poisoned lock is not a reason to skip the probe, so
+    // take the guard either way.
+    let _probe_guard = AGENT_PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (already_found, uncached) = partition_cached_agents(&uncached);
+    found.extend(already_found);
+    if uncached.is_empty() {
+        return found;
+    }
+
+    // Pass 1 is cheap per agent (`which` / a version run on the inherited
+    // PATH); only the inconclusive rest goes to the batched login-shell probe.
+    let mut results: Vec<(&str, bool)> = Vec::new();
+    let mut needs_shell: Vec<&crate::agents::AgentDef> = Vec::new();
+    for agent in uncached {
+        match agent_available_direct(agent) {
+            Some(ok) => results.push((agent.name, ok)),
+            None => needs_shell.push(agent),
+        }
+    }
+    let shell_found = login_shell_probe(&needs_shell);
+    for agent in needs_shell {
+        results.push((agent.name, shell_found.contains(agent.name)));
+    }
+
+    if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
+        let map = cache.get_or_insert_with(HashMap::new);
+        for (name, ok) in &results {
+            map.insert((*name).to_string(), *ok);
+        }
+    }
+    for (name, ok) in results {
+        if ok {
+            found.insert(name.to_string());
+        }
+    }
+    found
+}
+
+pub(crate) fn is_agent_available(agent: &crate::agents::AgentDef) -> bool {
+    probe_agents_available(&[agent]).contains(agent.name)
 }
 
 #[derive(Debug, Clone)]
@@ -2279,26 +2482,17 @@ pub struct AvailableTools {
 
 impl AvailableTools {
     pub fn detect() -> Self {
-        // Two passes so the whole roster costs at most ONE login shell.
-        // Pass 1 is cheap per agent (`which` / a version run on the
-        // inherited PATH); only the inconclusive rest goes to the batched
-        // login-shell probe. The previous per-agent login shells made TUI
-        // startup scale at ~1-2.5s per not-installed agent.
+        // One batched, memoized probe for the whole roster: at most one login
+        // shell, and every later per-agent caller (the settings pickers) reads
+        // the memo this warms. Per-agent login shells made TUI startup scale
+        // at ~1-2.5s per not-installed agent.
         let agents = crate::agents::AGENTS;
-        let mut direct_ok = vec![false; agents.len()];
-        let mut needs_shell: Vec<&crate::agents::AgentDef> = Vec::new();
-        for (i, agent) in agents.iter().enumerate() {
-            match agent_available_direct(agent) {
-                Some(ok) => direct_ok[i] = ok,
-                None => needs_shell.push(agent),
-            }
-        }
-        let shell_found = login_shell_probe(&needs_shell);
+        let refs: Vec<&crate::agents::AgentDef> = agents.iter().collect();
+        let found = probe_agents_available(&refs);
         let mut available: Vec<String> = agents
             .iter()
-            .enumerate()
-            .filter(|(i, a)| direct_ok[*i] || shell_found.contains(a.name))
-            .map(|(_, a)| a.name.to_string())
+            .filter(|a| found.contains(a.name))
+            .map(|a| a.name.to_string())
             .collect();
 
         // Append user-defined custom agents (always considered available since the
@@ -2337,6 +2531,97 @@ impl AvailableTools {
 
 #[cfg(test)]
 mod tests {
+    /// Recheck must not race an in-flight probe. `invalidate` has to wait for
+    /// the probe holding `AGENT_PROBE_LOCK` to publish and then clear, or that
+    /// probe's pre-install results survive the clear, the following `detect`
+    /// finds the memo populated, skips its own probe, and reports a freshly
+    /// installed agent as still missing.
+    ///
+    /// Ordering is asserted through a channel rather than a sleep loop, so the
+    /// thread is known to have reached the call before anything is claimed
+    /// about it: an unscheduled thread blocks the first `recv` instead of
+    /// silently satisfying a "still populated" poll.
+    #[test]
+    #[serial_test::serial]
+    fn invalidate_agent_availability_waits_for_an_in_flight_probe() {
+        let memo = AgentAvailabilityGuard::capture();
+        memo.seed(crate::agents::AGENTS[0].name, false);
+        assert!(memo.is_populated(), "seeded memo");
+
+        // Stand in for a probe mid-login-shell: holds the probe lock, has not
+        // written its results yet. Declared after `memo` so it drops first,
+        // joining the worker before the memo is restored even on a panic.
+        let (tx, rx) = std::sync::mpsc::channel::<&'static str>();
+        let mut worker = BlockedProbeWorker::new(
+            AGENT_PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner()),
+            std::thread::spawn(move || {
+                tx.send("entered").expect("test receiver alive");
+                invalidate_agent_availability();
+                tx.send("returned").expect("test receiver alive");
+            }),
+        );
+
+        // Blocks until the thread is definitely running, so the assertion
+        // below cannot pass merely because it never got scheduled.
+        assert_eq!(rx.recv().expect("thread started"), "entered");
+
+        // The probe still holds the lock, so invalidation cannot complete.
+        // This is the assertion: without the lock acquisition it returns
+        // immediately and "returned" arrives well inside the window.
+        assert!(
+            matches!(
+                rx.recv_timeout(std::time::Duration::from_millis(200)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "invalidate completed without waiting for the in-flight probe"
+        );
+        assert!(
+            memo.is_populated(),
+            "and the memo still stands while it waits"
+        );
+
+        worker.release_and_join();
+        assert_eq!(rx.recv().expect("invalidate completes"), "returned");
+        assert!(
+            !memo.is_populated(),
+            "invalidate must clear once the in-flight probe releases the lock"
+        );
+    }
+
+    /// The memo re-read that makes queueing behind another caller's login
+    /// shell free. `probe_agents_available` partitions once before taking
+    /// `AGENT_PROBE_LOCK` and again after; without the second partition a
+    /// waiter would run its own shell for agents the holder just resolved.
+    #[test]
+    #[serial_test::serial]
+    fn partition_cached_agents_reads_the_memo_so_a_queued_prober_reprobes_nothing() {
+        // Two real built-ins, so the names line up with what the memo keys on.
+        let defs: Vec<&crate::agents::AgentDef> = crate::agents::AGENTS.iter().take(2).collect();
+        let (a, b) = (defs[0].name, defs[1].name);
+
+        let memo = AgentAvailabilityGuard::capture();
+        memo.clear();
+
+        // Empty memo: nothing is answered, everything needs a probe.
+        let (found, uncached) = partition_cached_agents(&defs);
+        assert!(found.is_empty());
+        assert_eq!(uncached.len(), 2);
+
+        // Stand in for the lock holder having just published its results, one
+        // available and one not, so both polarities are covered.
+        memo.seed(a, true);
+        memo.seed(b, false);
+
+        let (found, uncached) = partition_cached_agents(&defs);
+        assert!(
+            uncached.is_empty(),
+            "a memoized answer, either polarity, must not be re-probed"
+        );
+        assert_eq!(found.len(), 1);
+        assert!(found.contains(a), "an available agent is reported found");
+        assert!(!found.contains(b), "an absent agent is answered, not found");
+    }
+
     use super::test_helpers::TmuxTestSession;
     use super::*;
 
