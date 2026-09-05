@@ -47,7 +47,7 @@ import { SwitchAgentModal } from "./SwitchAgentModal";
 import { Markdown } from "./Markdown";
 import { isQueuedPromptLong, queuedStripLayout } from "./queuedPromptsLayout";
 import { StartupErrorScreen } from "./StartupErrorScreen";
-import { pickWorkerStoppedVariant } from "./workerStoppedBanner";
+import { pickWorkerStoppedVariant, showWorkerStoppingBanner } from "./workerStoppedBanner";
 import { BackgroundAgentsContext } from "./backgroundAgentsContext";
 import { AsyncSubagentCard, SubagentCard, ToolCard, ToolGroupCard, TodoGroupCard } from "./ToolCards";
 import { DiffCommentsUserCard } from "../diff/comments/DiffCommentsUserCard";
@@ -751,6 +751,7 @@ function AcpChrome({
           trashedAt,
           archivedAt,
           snoozedUntil,
+          workerStopping: acpWorkerState === "stopping",
         });
         if (variant === "trashed") {
           return <TrashedWorkerStoppedBanner sessionId={sessionId} onRestore={onRestore} />;
@@ -774,7 +775,7 @@ function AcpChrome({
         !state.workerStopped &&
         !state.workerRestarting &&
         (state.lastSeq === 0 ? <SpawningBanner /> : <WorkerResumingBanner />)}
-      {acpWorkerState === "stopping" && !state.startupError && <WorkerStoppingBanner />}
+      {showWorkerStoppingBanner({ acpWorkerState, startupError: state.startupError }) && <WorkerStoppingBanner />}
       {state.nextWakeupAt &&
         !state.turnActive &&
         !state.startupError &&

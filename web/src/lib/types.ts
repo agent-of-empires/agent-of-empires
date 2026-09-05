@@ -132,7 +132,7 @@ export interface SessionResponse {
    *  its durable event-store park. Absent when not parked. Drives the
    *  sidebar badge, replacing the browser-side mirror that went stale when
    *  a session resumed with no tab open (#3514). */
-  rate_limit?: RateLimitInfo | null;
+  rate_limit?: RateLimitInfo;
   /** Whether `[acp] rate_limit_auto_resume` is on for the session's
    *  profile, so the rate-limit banner can say whether the park ends by
    *  itself. */

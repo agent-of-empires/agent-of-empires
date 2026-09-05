@@ -34,6 +34,22 @@ pub fn is_pid_alive(_pid: u32) -> bool {
     false
 }
 
+/// Like `is_pid_alive`, but `EPERM` counts as dead: a pid this daemon
+/// cannot signal belongs to another user, so it is not a runner of ours
+/// (a reused pid). Teardown proofs use this so a stale record cannot pin
+/// a session on someone else's process.
+#[cfg(unix)]
+pub fn is_pid_alive_and_ours(pid: u32) -> bool {
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+    kill(Pid::from_raw(pid as i32), None).is_ok()
+}
+
+#[cfg(not(unix))]
+pub fn is_pid_alive_and_ours(_pid: u32) -> bool {
+    false
+}
+
 /// Ask the kernel which process is listening on this Unix domain socket
 /// by connecting and reading the peer's credentials. Returns `Some(pid)`
 /// if the path resolves to a live UDS with a valid peer, `None` otherwise

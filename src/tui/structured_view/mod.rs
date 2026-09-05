@@ -898,6 +898,18 @@ async fn handle_terminal_event(
                         .filter(|_| pending.choice_list)
                         .cloned()
                     else {
+                        if pending.choice_list {
+                            set_toast(
+                                state,
+                                toast_deadline,
+                                format!(
+                                    "no option {}: this question has {}",
+                                    index + 1,
+                                    pending.options.len()
+                                ),
+                                ToastKind::Info,
+                            );
+                        }
                         return Ok(false);
                     };
                     (

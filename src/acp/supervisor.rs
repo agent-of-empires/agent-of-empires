@@ -12,7 +12,7 @@
 //! is published so the UI can surface "session crashed" instead of
 //! going silent. A connection that fails before it establishes a session
 //! is not respawned here: its own `AgentStartupError` is the diagnosis,
-//! and the reconciler retries on its cadence and budget.
+//! and the reconciler retries it on its cadence under its own budget.
 //!
 //! Producer side: `Supervisor::spawn(session_id, config)` creates an
 //! AcpClient and a background task that drains its events.
@@ -296,9 +296,7 @@ pub trait BroadcastSink: Send + Sync + 'static {
 /// How this supervisor acquired the worker. Drives both reap (which
 /// kinds the user-stop poller treats as runner-managed) and respawn
 /// (only `Runner` carries a `SpawnConfig` and participates in the
-/// restart budget). Replaces an older `spawn_config: Option<...>` plus
-/// `socket_path.is_some()` filter that conflated "runner-managed" with
-/// "auto-respawnable" and missed attached workers in both filters.
+/// restart budget).
 enum WorkerKind {
     /// Fresh spawn owned by this daemon. Watchdog respawns on crash
     /// within `MAX_RESPAWNS_IN_WINDOW`. Boxed because `SpawnConfig` is
@@ -451,6 +449,10 @@ pub struct Supervisor<S: BroadcastSink> {
     /// Used to clear every red X after a global adapter install without a
     /// per-session manual restart. See #2109.
     force_respawn: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Sessions whose worker failed before establishing a session. The
+    /// drain task drops such a worker without a respawn; the reconciler
+    /// drains this set each tick and re-arms the ids under its budget.
+    startup_failures: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Cap on concurrently-running workers, snapshotted from
     /// `[acp] max_concurrent_workers` at startup. Enforced in
     /// `spawn`; new workers past the cap return `CapacityFull`.
@@ -767,6 +769,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             build_respawn_pending: Arc::new(std::sync::Mutex::new(HashSet::new())),
             incompatible_binaries: Arc::new(std::sync::Mutex::new(HashMap::new())),
             force_respawn: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            startup_failures: Arc::new(std::sync::Mutex::new(HashSet::new())),
             max_concurrent_workers,
         }
     }
@@ -830,6 +833,21 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// them as fresh. See #2109.
     pub fn take_respawn_requests(&self) -> Vec<String> {
         let mut set = lock_recover(&self.force_respawn);
+        let ids = set.iter().cloned().collect();
+        set.clear();
+        ids
+    }
+
+    /// What the drain task records for a worker that failed before
+    /// establishing a session.
+    #[cfg(test)]
+    pub(crate) fn note_startup_failure(&self, session_id: &str) {
+        lock_recover(&self.startup_failures).insert(session_id.to_string());
+    }
+
+    /// Drain the startup failures recorded since the last tick.
+    pub fn take_startup_failures(&self) -> Vec<String> {
+        let mut set = lock_recover(&self.startup_failures);
         let ids = set.iter().cloned().collect();
         set.clear();
         ids
@@ -1513,6 +1531,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             guard.remove(session_id);
         }
         lock_recover(&self.lifecycle).forget(session_id);
+        lock_recover(&self.startup_failures).remove(session_id);
     }
 
     /// Pre-populate `next_seqs` from `(session_id, max_seq)` pairs.
@@ -2127,6 +2146,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         let process_control = Arc::clone(&self.process_control);
         let launcher = Arc::clone(&self.launcher);
         let notify = Arc::clone(&self.worker_notify);
+        let startup_failures = Arc::clone(&self.startup_failures);
         crate::task_util::spawn_supervised(
             "supervisor.drain",
             crate::task_util::PanicPolicy::Log,
@@ -2148,7 +2168,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                     // crash: the message it published is the diagnosis, so
                     // it is not respawned here where the restart budget
                     // would replace that message within seconds. The
-                    // reconciler retries on its own cadence and budget.
+                    // reconciler re-arms it under its own budget instead.
                     let mut established = false;
                     let mut startup_failed = false;
                     while let Some(event) = inbound.recv().await {
@@ -2252,6 +2272,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                             session = %session_id,
                             "startup failed before a session was established; leaving the retry to the reconciler"
                         );
+                        lock_recover(&startup_failures).insert(session_id.clone());
                         drop_handle(&lease).await;
                         return;
                     }
@@ -5583,6 +5604,15 @@ cursor-acp-bridge = "agent acp"
                 "{id}: the handle must be dropped"
             );
             assert_eq!(sup.worker_state(id).await, AcpWorkerState::Absent, "{id}");
+            assert_eq!(
+                sup.take_startup_failures(),
+                if established {
+                    Vec::<String>::new()
+                } else {
+                    vec![id.to_string()]
+                },
+                "{id}: only a startup failure is handed to the reconciler"
+            );
             let frames = sink.frames.lock().unwrap();
             let crash_messages = frames
                 .iter()

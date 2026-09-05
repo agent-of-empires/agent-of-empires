@@ -244,6 +244,13 @@ pub async fn reconcile_acp_workers(
     for id in state.acp_supervisor.take_respawn_requests() {
         forget_session_budget(&id, attempted, parked, respawn_history, capacity_deferred);
     }
+    // A worker that failed before establishing a session was dropped by the
+    // drain task without a respawn. Re-arm it under the ordinary budget so
+    // a persistent failure still parks (#1945) while the diagnosis it
+    // published stays on screen until then.
+    for id in state.acp_supervisor.take_startup_failures() {
+        attempted.remove(&id);
+    }
 
     // Idle auto-stop (#1689). Cadence-gated to IDLE_REAP_INTERVAL so the
     // batched activity query does not run on every 2s tick. Runs BEFORE
@@ -386,6 +393,11 @@ pub async fn reconcile_acp_workers(
     ) in raw_targets
     {
         if attempted.contains(&id) {
+            // A marker is left alone while the stopped runner is still being
+            // proven dead; it is honored once the session is absent.
+            if state.acp_supervisor.worker_state(&id).await == AcpWorkerState::Stopping {
+                continue;
+            }
             // A restart marker that arrives after the reaper already ran. `aoe
             // session add-project` (#3103) stops the worker first and only asks
             // for the restart once the moved workspace is durable, precisely so
@@ -2940,6 +2952,56 @@ mod tests {
         assert!(
             crate::process::worker_registry::peek_restart_marker("s-late-marker").is_none(),
             "the marker must be consumed by the tick, not left to poison a later stop"
+        );
+    }
+
+    /// A worker that failed before establishing a session is re-armed by the
+    /// next tick under the ordinary budget: the resume runs (the bogus agent
+    /// fails fast and records one startup error) and the attempt is counted
+    /// rather than the budget being wiped.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_startup_failure_rearms_the_pinned_session_under_budget() {
+        let (state, _home, _project) = capacity_test_state("s-startup-failed").await;
+
+        let mut attempted = HashSet::new();
+        let mut respawn_history: HashMap<String, Vec<Instant>> = HashMap::new();
+        let mut parked = HashSet::new();
+        let mut capacity_deferred = HashSet::new();
+
+        // The state a completed resume leaves behind, then the drain task's
+        // verdict on the connection it produced.
+        attempted.insert("s-startup-failed".to_string());
+        respawn_history.insert("s-startup-failed".to_string(), vec![Instant::now()]);
+        state
+            .acp_supervisor
+            .note_startup_failure("s-startup-failed");
+
+        run_tick(
+            &state,
+            &mut attempted,
+            &mut respawn_history,
+            &mut parked,
+            &mut capacity_deferred,
+        )
+        .await;
+
+        assert_eq!(
+            state
+                .acp_event_store
+                .replay_from("s-startup-failed", 0)
+                .len(),
+            1,
+            "the re-armed session must be resumed by the tick"
+        );
+        assert_eq!(
+            respawn_history["s-startup-failed"].len(),
+            2,
+            "the attempt is counted against the existing budget"
+        );
+        assert!(
+            state.acp_supervisor.take_startup_failures().is_empty(),
+            "the tick consumes the record"
         );
     }
 

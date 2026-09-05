@@ -1591,7 +1591,7 @@ Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 * `history` — Print the persisted transcript for an agent session
 * `status` — Print live status for an agent session: highest/lowest seq, and whether the on-disk retention window has truncated history
 * `prompt` — Send a prompt to an agent session's agent
-* `approve` — Resolve a pending approval (default: allow). Use --always for a session-scoped allow-list entry, --deny to refuse the request
+* `approve` — Resolve a pending approval (default: allow). Use --always for a session-scoped allow-list entry, --deny to refuse the request, and --option to answer a request that lists choices
 * `cancel` — Cancel the in-flight prompt for an agent session
 * `tail` — Stream the agent broadcast for a session to stdout as JSON lines (one frame per line). Press Ctrl-C to stop
 * `attach` — Open the TUI structured view directly for a known session id. Combine with `AOE_DAEMON_URL` (+ `AOE_DAEMON_TOKEN`) to attach across machines without going through the home session list
@@ -1731,7 +1731,7 @@ Send a prompt to an agent session's agent
 
 ## `aoe acp approve`
 
-Resolve a pending approval (default: allow). Use --always for a session-scoped allow-list entry, --deny to refuse the request
+Resolve a pending approval (default: allow). Use --always for a session-scoped allow-list entry, --deny to refuse the request, and --option to answer a request that lists choices
 
 **Usage:** `aoe acp approve [OPTIONS] <SESSION> <NONCE>`
 
@@ -1744,6 +1744,7 @@ Resolve a pending approval (default: allow). Use --always for a session-scoped a
 
 * `--always` — Allow this kind of operation for the rest of the session
 * `--deny` — Refuse the request
+* `--option <ID>` — Answer with this option id, from the request's option list (see `aoe acp tail`). A choice list resolved without one is dismissed
 
 
 

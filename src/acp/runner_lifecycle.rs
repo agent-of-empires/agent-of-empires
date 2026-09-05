@@ -131,25 +131,9 @@ pub trait ProcessControl: Send + Sync + 'static {
 pub struct SystemProcessControl;
 
 impl ProcessControl for SystemProcessControl {
-    /// Liveness for teardown. Differs from `worker::is_pid_alive` on `EPERM`:
-    /// a pid this daemon cannot signal belongs to another user, so it is
-    /// not our runner (a reused pid), and holding the session on it would
-    /// pin it in `stopping` until restart. pid 0 addresses the caller's own
-    /// group and is never a runner.
+    /// pid 0 addresses the caller's own group and is never a runner.
     fn is_alive(&self, pid: u32) -> bool {
-        if pid == 0 {
-            return false;
-        }
-        #[cfg(unix)]
-        {
-            use nix::sys::signal::kill;
-            use nix::unistd::Pid;
-            kill(Pid::from_raw(pid as i32), None).is_ok()
-        }
-        #[cfg(not(unix))]
-        {
-            false
-        }
+        pid != 0 && crate::process::worker::is_pid_alive_and_ours(pid)
     }
 
     fn terminate_group(&self, pid: u32) {

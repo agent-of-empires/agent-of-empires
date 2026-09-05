@@ -116,18 +116,23 @@ pub enum AcpCommands {
         text: String,
     },
     /// Resolve a pending approval (default: allow). Use --always for a
-    /// session-scoped allow-list entry, --deny to refuse the request.
+    /// session-scoped allow-list entry, --deny to refuse the request, and
+    /// --option to answer a request that lists choices.
     Approve {
         /// Acp session id.
         session: String,
         /// Approval nonce, as printed in the pending-approval banner.
         nonce: String,
         /// Allow this kind of operation for the rest of the session.
-        #[arg(long, conflicts_with = "deny")]
+        #[arg(long, conflicts_with_all = ["deny", "option"])]
         always: bool,
         /// Refuse the request.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "option")]
         deny: bool,
+        /// Answer with this option id, from the request's option list (see
+        /// `aoe acp tail`). A choice list resolved without one is dismissed.
+        #[arg(long, value_name = "ID")]
+        option: Option<String>,
     },
     /// Cancel the in-flight prompt for an agent session.
     Cancel {
@@ -199,7 +204,8 @@ pub async fn run(command: AcpCommands) -> Result<()> {
             nonce,
             always,
             deny,
-        } => approve(&session, &nonce, always, deny).await,
+            option,
+        } => approve(&session, &nonce, always, deny, option).await,
         AcpCommands::Cancel { session } => cancel(&session).await,
         AcpCommands::Tail { session, since } => tail(&session, since).await,
         AcpCommands::Attach { session } => attach(&session).await,
@@ -1095,7 +1101,13 @@ async fn prompt(session: &str, text: &str) -> Result<()> {
     Ok(())
 }
 
-async fn approve(session: &str, nonce: &str, always: bool, deny: bool) -> Result<()> {
+async fn approve(
+    session: &str,
+    nonce: &str,
+    always: bool,
+    deny: bool,
+    option: Option<String>,
+) -> Result<()> {
     let decision = match (always, deny) {
         (_, true) => ApprovalDecisionWire::Deny,
         (true, false) => ApprovalDecisionWire::AllowAlways,
@@ -1103,11 +1115,15 @@ async fn approve(session: &str, nonce: &str, always: bool, deny: bool) -> Result
     };
     let endpoint = require_daemon().await?;
     let client = HttpClient::new(endpoint)?;
+    let label = match &option {
+        Some(id) => format!("{decision:?} (option {id})"),
+        None => format!("{decision:?}"),
+    };
     client
-        .resolve_approval(session, nonce, decision, None)
+        .resolve_approval(session, nonce, decision, option)
         .await
         .map_err(map_http)?;
-    println!("approval {nonce} -> {decision:?}");
+    println!("approval {nonce} -> {label}");
     Ok(())
 }
 

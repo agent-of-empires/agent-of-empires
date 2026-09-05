@@ -2,9 +2,8 @@
 // parked. The server maps the rate-limited stop to Idle, so the sidebar
 // status glyph alone can't tell it apart from a normal idle session.
 // After navigating back to the dashboard, the session row must carry a
-// rate-limited indicator (Hourglass + reset time) sourced from the same
-// persisted acp-state mirror the queued-prompt badge reads. See
-// #1715.
+// rate-limited indicator (Hourglass + reset time) sourced from the
+// session payload's rate-limit fields. See #1715 and #3514.
 //
 // The fake ACP agent returns session/prompt as a `rate_limit` JSON-RPC
 // error (errorKind "rate_limit") after forwarding the reset epoch the way
@@ -90,7 +89,7 @@ base("sidebar row shows a rate-limited indicator after a park", async ({ page },
     await page.goto(serve.baseUrl);
 
     // The row for session A carries the rate-limited indicator, read from
-    // the persisted client-only rate-limit state.
+    // the session payload.
     await expect(page.getByTitle(/Rate-limited/i)).toBeVisible({
       timeout: 15_000,
     });
