@@ -609,14 +609,40 @@ fn shorten_path(path: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Pins `$HOME` so the read inside `shorten_path` cannot see a value another
+    /// test set. `isolate_home` holds the process-global env lock for the guard's
+    /// lifetime and restores `$HOME` on Drop, before the tempdir is deleted.
+    ///
+    /// Pinning also gives these cases something to assert: each was wrapped in
+    /// `if let Some(home)`, so an unset `$HOME` passed all four without running
+    /// an assertion.
     #[test]
-    fn test_shorten_path_with_home() {
-        if let Some(home) = dirs::home_dir() {
-            if let Some(home_str) = home.to_str() {
-                let path = format!("{}/projects/myapp", home_str);
-                let shortened = shorten_path(&path);
-                assert_eq!(shortened, "~/projects/myapp");
-            }
+    #[serial_test::serial]
+    fn shorten_path_abbreviates_home() {
+        let home = tempfile::TempDir::new().expect("temp home");
+        let _home = crate::session::test_support::isolate_home(home.path());
+        let home_str = home.path().to_str().expect("utf-8 temp home");
+
+        for (case, path, expect) in [
+            (
+                "a path under home",
+                format!("{home_str}/projects/myapp"),
+                "~/projects/myapp",
+            ),
+            ("home itself", home_str.to_string(), "~"),
+            // A sibling whose name merely starts with the home path.
+            (
+                "a similar prefix",
+                format!("{home_str}extra/not/home"),
+                "~extra/not/home",
+            ),
+            (
+                "a trailing slash",
+                format!("{home_str}/projects/"),
+                "~/projects/",
+            ),
+        ] {
+            assert_eq!(shorten_path(&path), expect, "{case}");
         }
     }
 
@@ -625,16 +651,6 @@ mod tests {
         let path = "/tmp/some/path";
         let shortened = shorten_path(path);
         assert_eq!(shortened, "/tmp/some/path");
-    }
-
-    #[test]
-    fn test_shorten_path_exact_home() {
-        if let Some(home) = dirs::home_dir() {
-            if let Some(home_str) = home.to_str() {
-                let shortened = shorten_path(home_str);
-                assert_eq!(shortened, "~");
-            }
-        }
     }
 
     #[test]
@@ -649,28 +665,6 @@ mod tests {
         let path = "";
         let shortened = shorten_path(path);
         assert_eq!(shortened, "");
-    }
-
-    #[test]
-    fn test_shorten_path_similar_prefix_not_home() {
-        if let Some(home) = dirs::home_dir() {
-            if let Some(home_str) = home.to_str() {
-                let path = format!("{}extra/not/home", home_str);
-                let shortened = shorten_path(&path);
-                assert_eq!(shortened, "~extra/not/home");
-            }
-        }
-    }
-
-    #[test]
-    fn test_shorten_path_preserves_trailing_slash() {
-        if let Some(home) = dirs::home_dir() {
-            if let Some(home_str) = home.to_str() {
-                let path = format!("{}/projects/", home_str);
-                let shortened = shorten_path(&path);
-                assert_eq!(shortened, "~/projects/");
-            }
-        }
     }
 
     // Single source of truth for the preview split. These pin down the row

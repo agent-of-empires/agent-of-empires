@@ -446,11 +446,18 @@ mod tests {
         assert!(!looks_like_git_url("git@host: /path"));
     }
 
+    /// Pins `$HOME` so the read inside `expand_tilde` cannot see a value another
+    /// test set. `isolate_home` holds the process-global env lock for the guard's
+    /// lifetime and restores `$HOME` on Drop, before the tempdir is deleted;
+    /// `#[serial]` alone does not exclude the writers that go through the guard.
     #[test]
+    #[serial_test::serial]
     fn expand_tilde_expands_home() {
-        let home = dirs::home_dir().expect("home dir");
-        assert_eq!(expand_tilde("~/foo"), home.join("foo"));
-        assert_eq!(expand_tilde("~"), home);
+        let home = tempfile::TempDir::new().expect("temp home");
+        let _home = crate::session::test_support::isolate_home(home.path());
+
+        assert_eq!(expand_tilde("~/foo"), home.path().join("foo"));
+        assert_eq!(expand_tilde("~"), home.path());
     }
 
     #[test]
