@@ -1,5 +1,6 @@
 use super::container_interface::{docker_env_args, ContainerConfig, RunFlag};
 use super::error::{sanitize_stderr, DockerError, Result};
+use std::collections::HashSet;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -720,6 +721,28 @@ impl RuntimeBase {
     ///
     /// This is a no-op on runtimes that don't support named volumes (e.g. Apple Container).
     pub fn remove_named_ignore_volumes(&self, prefix: &str) -> Result<()> {
+        self.remove_named_ignore_volumes_where(prefix, |_| true)
+    }
+
+    /// Remove the named ignore volumes under `prefix` that are in `names`.
+    ///
+    /// The targeted counterpart to [`Self::remove_named_ignore_volumes`], for reclaiming
+    /// the volumes a worktree move stranded. `names` is an allowlist, so a volume the
+    /// caller did not name is never touched; see
+    /// [`DockerContainer::remove_stranded_named_ignore_volumes`](crate::containers::DockerContainer::remove_stranded_named_ignore_volumes).
+    pub fn remove_named_ignore_volumes_in(
+        &self,
+        prefix: &str,
+        names: &HashSet<&str>,
+    ) -> Result<()> {
+        self.remove_named_ignore_volumes_where(prefix, |name| names.contains(name))
+    }
+
+    fn remove_named_ignore_volumes_where(
+        &self,
+        prefix: &str,
+        select: impl Fn(&str) -> bool,
+    ) -> Result<()> {
         if !self.supports_named_volumes {
             return Ok(());
         }
@@ -742,12 +765,7 @@ impl RuntimeBase {
         }
 
         let stdout = String::from_utf8_lossy(&list_output.stdout);
-        // Filter in Rust to exact prefix match (docker's --filter is substring-based).
-        let names: Vec<&str> = stdout
-            .lines()
-            .map(str::trim)
-            .filter(|n| !n.is_empty() && n.starts_with(prefix))
-            .collect();
+        let names = selected_named_ignore_volumes(&stdout, prefix, select);
 
         if names.is_empty() {
             return Ok(());
@@ -805,6 +823,22 @@ impl RuntimeBase {
         command.args(&args);
         self.probe_output_with_timeout(&mut command, RUNTIME_EXEC_TIMEOUT)
     }
+}
+
+/// Pick the volumes to remove out of a `volume ls -q` listing.
+///
+/// Re-filters on the prefix in Rust because docker's `--filter name=` is a substring
+/// match, so `aoe-vi-sess1-` also lists `aoe-vi-sess10-...`.
+fn selected_named_ignore_volumes<'a>(
+    listing: &'a str,
+    prefix: &str,
+    select: impl Fn(&str) -> bool,
+) -> Vec<&'a str> {
+    listing
+        .lines()
+        .map(str::trim)
+        .filter(|n| !n.is_empty() && n.starts_with(prefix) && select(n))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1634,6 +1668,57 @@ mod tests {
         assert_eq!(p_indices.len(), 2);
         assert_eq!(args[p_indices[0] + 1], "3000:3000");
         assert_eq!(args[p_indices[1] + 1], "5432:5432");
+    }
+
+    #[test]
+    fn selected_named_ignore_volumes_never_reaches_outside_the_prefix() {
+        // The reporter's own listing (#3742): a sibling-worktree layout whose
+        // session moved from otari-worktrees/905 to otari-worktrees/rev-912.
+        // The hash suffixes are real `named_volume_for` output, kept literal on
+        // purpose: `DefaultHasher` is not stable across Rust releases, and a bump
+        // that changed it would orphan every existing named volume, so these
+        // constants are the canary for that.
+        const MAIN: &str = "aoe-vi-sess1-workspace-otari-target-8ec07926d6b0";
+        const PRE_MOVE: &str = "aoe-vi-sess1-workspace-otari-worktrees-905-target-31ddd0322290";
+        const POST_MOVE: &str =
+            "aoe-vi-sess1-workspace-otari-worktrees-rev-912-target-873cf2685e47";
+
+        let moved = format!("{MAIN}\n{PRE_MOVE}\n{POST_MOVE}\n");
+        // docker's `--filter name=` is a substring match, so a listing under
+        // `aoe-vi-sess1-` can carry a longer session id this prefix must not claim.
+        let other_session =
+            format!("{PRE_MOVE}\naoe-vi-sess10-workspace-a-target-c8c9b4754ab1\n\n");
+
+        // `None` selects everything, the shape the session-deletion sweep uses.
+        let cases = [
+            (
+                // The reclaim: only the name the caller computed for the moved path,
+                // never the main repo's volume or the one the new container mounts.
+                "an allowlist of one stranded name",
+                moved.as_str(),
+                Some(HashSet::from([PRE_MOVE])),
+                vec![PRE_MOVE],
+            ),
+            (
+                "the deletion sweep",
+                moved.as_str(),
+                None::<HashSet<&str>>,
+                vec![MAIN, PRE_MOVE, POST_MOVE],
+            ),
+            (
+                "a longer session id in the listing",
+                other_session.as_str(),
+                None,
+                vec![PRE_MOVE],
+            ),
+        ];
+
+        for (case, listing, allowed, expected) in cases {
+            let selected = selected_named_ignore_volumes(listing, "aoe-vi-sess1-", |name| {
+                allowed.as_ref().is_none_or(|names| names.contains(name))
+            });
+            assert_eq!(selected, expected, "{case}");
+        }
     }
 
     #[test]

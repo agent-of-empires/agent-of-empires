@@ -233,6 +233,10 @@ pub enum Commands {
     /// Update aoe to the latest release
     Update(UpdateArgs),
 
+    /// Run pending data migrations now, showing progress. Startup runs them
+    /// too; use this after deferring one with AOE_DEFER_SANDBOX_MIGRATION=1.
+    Migrate,
+
     /// Generate shell completions
     Completion {
         /// Shell to generate completions for
@@ -278,6 +282,7 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
     "acp",
     "uninstall",
     "update",
+    "migrate",
     "completion",
 ];
 
@@ -328,6 +333,7 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         Commands::ExtractSessionId(_) => return None,
         Commands::Uninstall(_) => "uninstall",
         Commands::Update(_) => "update",
+        Commands::Migrate => "migrate",
         Commands::Completion { .. } => "completion",
     })
 }

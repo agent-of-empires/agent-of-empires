@@ -128,6 +128,12 @@ By default, `volume_ignores` paths are mounted as **anonymous volumes** (`volume
 
 To fix this on macOS, set `volume_ignores_strategy = "named"`. This mounts each `volume_ignores` path as a **deterministic named Docker/Podman volume** stored entirely inside the Docker VM, bypassing VirtioFS. Named volumes are explicitly removed when the session is deleted.
 
+A volume's name is derived from its mount path, so moving a session's worktree changes it. The recreated container starts from an empty cache for the paths that moved, and the volumes those paths left behind are removed the next time the session starts.
+
+Moving a worktree therefore costs the cache in both directions: move it back and the volumes from the first location are already gone, so that side rebuilds cold too.
+
+The reclaim covers the paths that moved with the worktree, and nothing else. A volume orphaned any other way is left alone, because AoE cannot tell it apart from a cache you are still using: dropping an entry from `volume_ignores`, switching back to `"anonymous"`, or attaching a repo to a multi-repo workspace all strand a volume without a move it can recognize. Neither is anything already orphaned, including the leftovers from a move the session has since restarted after, so a volume that has been sitting there stays. To find what is left over, list them with `docker volume ls -q --filter name=aoe-vi-` and remove what you recognize; `docker volume prune` skips named volumes unless you pass `-a`.
+
 ```toml
 [sandbox]
 volume_ignores = ["node_modules", ".venv", "target"]
@@ -286,6 +292,32 @@ aoe add --sandbox-image my-sandbox:latest .
 
 > Building a custom image and using structured view? Install the agent's ACP
 > adapter in the image too, or the handshake fails.
+
+## Per-session agent stores
+
+Each sandboxed session gets its own agent store on the host: a copy of the
+agent's config and history under `sandbox-v2/<instance-id>` inside the agent's config directory
+(for example `~/.claude/sandbox-v2/<id>`). The container mounts that copy at
+the agent's usual config path, so credentials, hooks and conversation history
+belong to one session and `aoe` can resume the right conversation.
+
+Sessions created before this layout shared one agent store per agent (for
+example `~/.claude/sandbox`). The first `aoe` start after upgrading moves them:
+it copies the shared store into a private directory for every sandboxed session,
+removes each session's stopped container so the next launch mounts the copy,
+and deletes the shared store once every session that used it has moved (the
+private copies are the data from then on). Startup prints what it is copying
+and how long it has been running. A large store copied for many sessions can take minutes; a
+session whose container is still running is skipped and moved on a later start,
+after it stops.
+
+To start without waiting, quit and set `AOE_DEFER_SANDBOX_MIGRATION=1` for that
+launch. Sessions then keep using the shared store, and the move is retried on
+the next start without the variable, or on demand with:
+
+```bash
+aoe migrate
+```
 
 ## Worktrees and Sandboxing
 
