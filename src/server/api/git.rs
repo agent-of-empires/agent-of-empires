@@ -446,15 +446,15 @@ mod tests {
         assert!(!looks_like_git_url("git@host: /path"));
     }
 
-    /// `#[serial]` because this reads `$HOME`, which the suite's many
-    /// `set_var("HOME", ...)` tests mutate. `#[serial]` only excludes other
-    /// `#[serial]` tests, so a parallel reader races every one of those writers;
-    /// pinning `$HOME` here is what makes the two reads below agree.
+    /// Reads `$HOME` twice, once here and once inside `expand_tilde`, so a
+    /// concurrent writer between them makes the two disagree. `isolate_home`
+    /// holds the process-global env lock for the guard's lifetime and restores
+    /// `$HOME` on Drop, before the tempdir is deleted.
     #[test]
     #[serial_test::serial]
     fn expand_tilde_expands_home() {
         let home = tempfile::TempDir::new().expect("temp home");
-        std::env::set_var("HOME", home.path());
+        let _home = crate::session::test_support::isolate_home(home.path());
 
         assert_eq!(expand_tilde("~/foo"), home.path().join("foo"));
         assert_eq!(expand_tilde("~"), home.path());

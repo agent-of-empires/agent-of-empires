@@ -609,18 +609,19 @@ fn shorten_path(path: &str) -> String {
 mod tests {
     use super::*;
 
-    /// `#[serial]` because these read `$HOME`, which the suite's many
-    /// `set_var("HOME", ...)` tests mutate. `#[serial]` only excludes other
-    /// `#[serial]` tests, so a parallel reader races every one of those writers:
-    /// the test reads `$HOME` once and `shorten_path` reads it again, and a write
-    /// landing between the two makes them disagree. Pinning `$HOME` also gives
-    /// these cases something to assert; previously an unset `$HOME` made all four
-    /// pass without running an assertion.
+    /// Each case reads `$HOME` twice, once here and once inside `shorten_path`,
+    /// so a concurrent writer between them makes the two disagree. `isolate_home`
+    /// holds the process-global env lock for the guard's lifetime and restores
+    /// `$HOME` on Drop, before the tempdir is deleted.
+    ///
+    /// Pinning `$HOME` also gives these cases something to assert: each was
+    /// wrapped in `if let Some(home)`, so an unset `$HOME` passed all four
+    /// without running an assertion.
     #[test]
     #[serial_test::serial]
     fn shorten_path_abbreviates_home() {
         let home = tempfile::TempDir::new().expect("temp home");
-        std::env::set_var("HOME", home.path());
+        let _home = crate::session::test_support::isolate_home(home.path());
         let home_str = home.path().to_str().expect("utf-8 temp home");
 
         for (case, path, expect) in [
