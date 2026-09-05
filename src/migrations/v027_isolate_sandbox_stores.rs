@@ -65,18 +65,42 @@ fn copied_file(bytes: u64) {
 /// could not be asked; the per-startup reconcile passes `false` so a machine
 /// whose runtime is down is not told the same thing on every command.
 fn batched_running_probe(announce: bool) -> impl Fn(&str) -> Result<bool> {
-    let batch: std::sync::OnceLock<std::collections::HashMap<String, bool>> =
-        std::sync::OnceLock::new();
+    batched_running_probe_with(
+        crate::containers::batch_container_states,
+        probe_container_running,
+        announce,
+    )
+}
+
+/// [`batched_running_probe`] over an injected listing and per-row inspect.
+///
+/// The listing answers only where it is certain. Its `paused` and
+/// `restarting` are live, as inspect's `State.Running` would say, since the
+/// container still holds its mounts and a non-forced removal would refuse
+/// it; a transitional or unrecognised state is inspected rather than read as
+/// stopped, so a new runtime state can only cost a subprocess, never a copy
+/// out from under a live agent.
+fn batched_running_probe_with(
+    batch: impl Fn() -> std::collections::HashMap<String, crate::containers::ContainerState>,
+    inspect: impl Fn(&str) -> Result<(bool, bool)>,
+    announce: bool,
+) -> impl Fn(&str) -> Result<bool> {
+    let states: std::sync::OnceLock<
+        std::collections::HashMap<String, crate::containers::ContainerState>,
+    > = std::sync::OnceLock::new();
     let runtime_noticed = std::cell::Cell::new(false);
     move |id: &str| {
-        let states = batch.get_or_init(|| {
+        let states = states.get_or_init(|| {
             progress::step("checking which sandbox containers are running");
-            crate::containers::batch_container_health()
+            batch()
         });
-        if let Some(running) = states.get(&crate::containers::DockerContainer::generate_name(id)) {
-            return Ok(*running);
+        if let Some(live) = states
+            .get(&crate::containers::DockerContainer::generate_name(id))
+            .and_then(|state| state.is_live())
+        {
+            return Ok(live);
         }
-        let (running, unanswered) = probe_container_running(id)?;
+        let (running, unanswered) = inspect(id)?;
         if unanswered && announce && !runtime_noticed.replace(true) {
             progress::notice(
                 "container runtime unavailable; sandboxed sessions keep their shared agent store until their containers can be checked",
@@ -1624,6 +1648,54 @@ mod tests {
         assert!(!runtime_cannot_answer(&DockerError::RemoveFailed(
             "container is running".to_string()
         )));
+    }
+
+    /// The batch listing decides only where inspect would agree with it:
+    /// paused and restarting are live, exited and created are stopped, and
+    /// everything else (a transitional state, a container it did not list)
+    /// goes to the per-row inspect, which answers fail-closed.
+    #[test]
+    fn batched_probe_keeps_live_semantics_and_inspects_the_rest() {
+        use crate::containers::{ContainerState, DockerContainer};
+        let listing: std::collections::HashMap<String, ContainerState> = [
+            ("running", ContainerState::Running),
+            ("paused", ContainerState::Paused),
+            ("restarting", ContainerState::Restarting),
+            ("exited", ContainerState::Exited),
+            ("created", ContainerState::Created),
+            ("removing", ContainerState::Other),
+        ]
+        .into_iter()
+        .map(|(id, state)| (DockerContainer::generate_name(id), state))
+        .collect();
+        let batches = std::cell::Cell::new(0);
+        let inspected = std::cell::RefCell::new(Vec::new());
+        let probe = batched_running_probe_with(
+            || {
+                batches.set(batches.get() + 1);
+                listing.clone()
+            },
+            |id| {
+                inspected.borrow_mut().push(id.to_string());
+                // Inspect stands in for an unreachable runtime: unknown reads live.
+                Ok((true, true))
+            },
+            false,
+        );
+        let cases = [
+            ("running", true),
+            ("paused", true),
+            ("restarting", true),
+            ("exited", false),
+            ("created", false),
+            ("removing", true),
+            ("missing", true),
+        ];
+        for (id, live) in cases {
+            assert_eq!(probe(id).unwrap(), live, "{id}");
+        }
+        assert_eq!(batches.get(), 1, "one listing per pass");
+        assert_eq!(*inspected.borrow(), ["removing", "missing"]);
     }
 
     /// A machine whose container runtime is absent or unreachable must still

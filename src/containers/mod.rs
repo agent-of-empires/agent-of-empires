@@ -13,7 +13,7 @@ pub use container_interface::{
     ContainerConfig, EnvEntry, NamedVolumeMount, RunPolicy, VolumeMount,
 };
 use error::Result;
-pub use runtime::ContainerRuntime;
+pub use runtime::{ContainerRuntime, ContainerState};
 
 /// Returns the CLI binary name for the configured container runtime.
 pub fn runtime_binary() -> &'static str {
@@ -50,6 +50,21 @@ pub fn batch_container_health() -> HashMap<String, bool> {
         count = map.len(),
         duration_ms = start.elapsed().as_millis() as u64,
         "batch container health fetched",
+    );
+    map
+}
+
+/// The listed state of every aoe sandbox container, in a single subprocess
+/// call. See [`ContainerRuntime::batch_container_states`] for what an absent
+/// name means.
+pub fn batch_container_states() -> HashMap<String, ContainerState> {
+    let start = std::time::Instant::now();
+    let map = get_container_runtime().batch_container_states("aoe-sandbox-");
+    tracing::debug!(
+        target: "containers.runtime",
+        count = map.len(),
+        duration_ms = start.elapsed().as_millis() as u64,
+        "batch container states fetched",
     );
     map
 }
