@@ -7,18 +7,25 @@
 //   - Destructive: "Allow" requires an 800ms hold (haptic on touch),
 //     swipe is reserved for dismiss-only and never approves.
 //
+// A `choice` approval is a third shape: the daemon classified the
+// agent's options as a list of answers rather than a permission
+// vocabulary (`is_choice_list` in src/acp/approvals.rs), so the card
+// renders those labels and posts back the picked option_id. Destructive
+// chrome still wins the header, but not the action area: holding cannot
+// express which answer was meant.
+//
 // Optimistic state shows a spinner until the server's broadcast removes
 // the approval from AcpState.pendingApprovals.
 
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, Check, ChevronDown, Shield, X } from "lucide-react";
+import { AlertTriangle, Check, ChevronDown, MessageCircleQuestion, Shield, X } from "lucide-react";
 import type { Approval, ApprovalDecision } from "../../lib/acpTypes";
 import { useServerDown, OFFLINE_TITLE } from "../../lib/connectionState";
 import { hasArgsBody, humanizePermissionTitle, parseJsonObject, previewFromArgs } from "../../lib/acpArgs";
 
 interface Props {
   approval: Approval;
-  onResolve: (decision: ApprovalDecision) => Promise<void>;
+  onResolve: (decision: ApprovalDecision, optionId?: string) => Promise<void>;
 }
 
 const LONG_PRESS_MS = 800;
@@ -31,11 +38,15 @@ export function ApprovalCard({ approval, onResolve }: Props) {
   const progressTimer = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const raw = approval.tool_call.args_preview;
+  const options = approval.options ?? [];
+  // Without labels there is nothing to render, so fall back to the trio.
+  const isChoice = approval.choice === true && options.length > 0;
   // Benign approvals collapse to a one-line preview so the queue stays
   // scannable; destructive ones default expanded so the full command is
   // in view before a hold-to-allow. Either way the toggle stays under
   // user control and nothing re-expands it on plan approval. See #1767.
-  const [expanded, setExpanded] = useState(approval.destructive);
+  // An answer list defaults expanded too: its args carry the question.
+  const [expanded, setExpanded] = useState(approval.destructive || isChoice);
   const preview = useMemo(() => previewFromArgs(raw), [raw]);
   const canExpand = useMemo(() => hasArgsBody(raw), [raw]);
   const showEmptyArgsState = raw.trim() === "";
@@ -49,10 +60,10 @@ export function ApprovalCard({ approval, onResolve }: Props) {
   }, []);
 
   const submit = useCallback(
-    async (decision: ApprovalDecision) => {
+    async (decision: ApprovalDecision, optionId?: string) => {
       setPhase("submitting");
       try {
-        await onResolve(decision);
+        await onResolve(decision, optionId);
       } catch {
         setPhase("rolled-back");
       }
@@ -101,7 +112,9 @@ export function ApprovalCard({ approval, onResolve }: Props) {
         approval.destructive ? "border-rose-900/60 bg-rose-950/20" : "border-brand-700/40 bg-brand-700/5",
       ].join(" ")}
       role="alertdialog"
-      aria-label={`Approval needed: ${humanizePermissionTitle(approval.tool_call.name)}`}
+      aria-label={`${isChoice && !approval.destructive ? "Question" : "Approval needed"}: ${humanizePermissionTitle(
+        approval.tool_call.name,
+      )}`}
     >
       <Header
         type={canExpand ? "button" : undefined}
@@ -114,6 +127,8 @@ export function ApprovalCard({ approval, onResolve }: Props) {
       >
         {approval.destructive ? (
           <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-rose-400" />
+        ) : isChoice ? (
+          <MessageCircleQuestion className="h-3.5 w-3.5 shrink-0 text-brand-500" />
         ) : (
           <Shield className="h-3.5 w-3.5 shrink-0 text-brand-500" />
         )}
@@ -123,7 +138,7 @@ export function ApprovalCard({ approval, onResolve }: Props) {
             approval.destructive ? "text-rose-400" : "text-brand-500",
           ].join(" ")}
         >
-          {approval.destructive ? "Destructive action" : "Approval needed"}
+          {approval.destructive ? "Destructive action" : isChoice ? "Question" : "Approval needed"}
         </span>
         <span className="shrink-0 font-mono text-xs text-text-secondary">
           {humanizePermissionTitle(approval.tool_call.name)}
@@ -146,8 +161,29 @@ export function ApprovalCard({ approval, onResolve }: Props) {
       )}
       {offline && <p className="px-3 pt-2 text-status-error text-xs">{OFFLINE_TITLE}</p>}
 
-      <div className="flex items-stretch gap-1.5 p-2">
-        {approval.destructive ? (
+      {isChoice && (
+        <div className="flex flex-col gap-1.5 p-2">
+          {options.map((option) => (
+            <button
+              key={option.option_id}
+              type="button"
+              className={[
+                "w-full rounded-md border border-surface-700 bg-surface-800",
+                "px-3 py-2 text-left text-xs font-medium text-text-primary break-words",
+                "hover:border-brand-600/60 hover:bg-brand-700/10",
+                phase === "submitting" ? "cursor-wait opacity-60" : "",
+              ].join(" ")}
+              disabled={offline || phase === "submitting"}
+              onClick={() => void submit("Allow", option.option_id)}
+            >
+              {option.name}
+            </button>
+          ))}
+        </div>
+      )}
+
+      <div className={["flex items-stretch gap-1.5 p-2", isChoice ? "pt-0" : ""].join(" ")}>
+        {isChoice ? null : approval.destructive ? (
           <button
             type="button"
             className={[
@@ -221,7 +257,7 @@ export function ApprovalCard({ approval, onResolve }: Props) {
           onClick={() => void submit("Deny")}
         >
           <X className="h-3.5 w-3.5" />
-          Deny
+          {isChoice ? "Dismiss" : "Deny"}
         </button>
       </div>
     </div>

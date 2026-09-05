@@ -888,9 +888,21 @@ async fn handle_terminal_event(
             else {
                 return Ok(false);
             };
+            // The agent asked a question through the option list, so an
+            // allow-shaped decision has no single answer: open the picker
+            // and let the user choose a label. Deny still denies (it maps
+            // to a reject option, or cancels when the agent offered
+            // none). See #3741.
+            if pending.choice
+                && !pending.options.is_empty()
+                && !matches!(decision, ApprovalDecisionWire::Deny)
+            {
+                state.choice = Some(approval_option_picker(&pending));
+                return Ok(false);
+            }
             match state
                 .http
-                .resolve_approval(&state.session_id, &pending.nonce, decision)
+                .resolve_approval(&state.session_id, &pending.nonce, decision, None)
                 .await
             {
                 Ok(()) => {
@@ -1209,9 +1221,28 @@ fn question_picker(
     }
 }
 
-/// Accept the open choice picker's highlighted option: set the mode, or
-/// record the answer and advance the elicitation flow (POSTing the
-/// accumulated answers once the last question is picked).
+/// Build the option picker for a permission request whose options carry
+/// a question. Rows are `(option_id, name)`; accepting POSTs the chosen
+/// `option_id`. See #3741.
+fn approval_option_picker(pending: &reducer::PendingApproval) -> ChoicePicker {
+    ChoicePicker {
+        title: format!(" {} (Enter=pick · Esc=dismiss) ", pending.title),
+        options: pending
+            .options
+            .iter()
+            .map(|o| (o.option_id.clone(), o.name.clone()))
+            .collect(),
+        selected: 0,
+        purpose: ChoicePurpose::Approval {
+            nonce: pending.nonce.clone(),
+        },
+    }
+}
+
+/// Accept the open choice picker's highlighted option: set the mode,
+/// answer a permission question, or record the answer and advance the
+/// elicitation flow (POSTing the accumulated answers once the last
+/// question is picked).
 async fn accept_choice(state: &mut StructuredViewState, toast_deadline: &mut Option<Instant>) {
     use crate::acp::elicitations::AnswerValue;
 
@@ -1244,6 +1275,51 @@ async fn accept_choice(state: &mut StructuredViewState, toast_deadline: &mut Opt
                 );
             }
         },
+        // `value` is the option_id the agent offered; the server checks
+        // it still belongs to the pending request.
+        ChoicePurpose::Approval { nonce } => {
+            match state
+                .http
+                .resolve_approval(
+                    &state.session_id,
+                    &nonce,
+                    ApprovalDecisionWire::Allow,
+                    Some(value),
+                )
+                .await
+            {
+                // Clear locally now; the ApprovalResolved broadcast also
+                // clears it, but the seq dedupe can swallow that.
+                Ok(()) => {
+                    state.transcript.resolve_approval_locally(&nonce);
+                    state.reconcile_selection();
+                    set_toast(
+                        state,
+                        toast_deadline,
+                        format!("answered {label}"),
+                        ToastKind::Info,
+                    );
+                }
+                Err(HttpError::ApprovalGone) => {
+                    state.transcript.resolve_approval_locally(&nonce);
+                    state.reconcile_selection();
+                    set_toast(
+                        state,
+                        toast_deadline,
+                        "question already answered".into(),
+                        ToastKind::Info,
+                    );
+                }
+                Err(e) => {
+                    set_toast(
+                        state,
+                        toast_deadline,
+                        format!("approval failed: {e}"),
+                        ToastKind::Error,
+                    );
+                }
+            }
+        }
         ChoicePurpose::Elicitation {
             nonce,
             field_key,
@@ -1889,6 +1965,8 @@ mod tests {
                 kind: "read".into(),
                 args: r#"{"path":"src/lib.rs"}"#.into(),
                 destructive: false,
+                options: Vec::new(),
+                choice: false,
             });
         state.reconcile_selection();
         assert_eq!(state.focus, Focus::Approval);
@@ -1897,6 +1975,43 @@ mod tests {
 
         assert_eq!(composer_text(&state), "draft for later");
         assert_eq!(state.focus, Focus::Approval);
+    }
+
+    /// A question option list becomes a picker whose rows submit the
+    /// agent's own `option_id`, not an allow-once guess. See #3741.
+    #[test]
+    fn approval_option_picker_submits_the_agents_option_ids() {
+        use crate::acp::approvals::{ApprovalOption, ApprovalOptionKind};
+        let pending = reducer::PendingApproval {
+            nonce: "approval-1".into(),
+            title: "Pick a plan".into(),
+            kind: "other".into(),
+            args: "{}".into(),
+            destructive: false,
+            options: ["Alpha", "Bravo"]
+                .iter()
+                .enumerate()
+                .map(|(i, name)| ApprovalOption {
+                    option_id: format!("choice-{i}"),
+                    name: (*name).into(),
+                    kind: ApprovalOptionKind::AllowOnce,
+                })
+                .collect(),
+            choice: true,
+        };
+        let picker = approval_option_picker(&pending);
+        assert!(picker.title.contains("Pick a plan"));
+        assert_eq!(
+            picker.options,
+            vec![
+                ("choice-0".to_string(), "Alpha".to_string()),
+                ("choice-1".to_string(), "Bravo".to_string()),
+            ]
+        );
+        match picker.purpose {
+            ChoicePurpose::Approval { nonce } => assert_eq!(nonce, "approval-1"),
+            _ => panic!("expected approval purpose"),
+        }
     }
 
     #[test]
@@ -2027,7 +2142,7 @@ mod tests {
                 assert!(remaining.is_empty());
                 assert!(answers.is_empty());
             }
-            ChoicePurpose::Mode | ChoicePurpose::OpenLink => {
+            ChoicePurpose::Mode | ChoicePurpose::OpenLink | ChoicePurpose::Approval { .. } => {
                 panic!("expected elicitation purpose")
             }
         }
@@ -2090,7 +2205,7 @@ mod tests {
                 assert_eq!(remaining.len(), 1);
                 assert_eq!(remaining[0].field_key, "question_1");
             }
-            ChoicePurpose::Mode | ChoicePurpose::OpenLink => {
+            ChoicePurpose::Mode | ChoicePurpose::OpenLink | ChoicePurpose::Approval { .. } => {
                 panic!("expected elicitation purpose")
             }
         }

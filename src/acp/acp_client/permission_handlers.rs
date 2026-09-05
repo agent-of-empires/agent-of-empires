@@ -2,7 +2,7 @@
 //! from the approval policy or by asking the user.
 
 use crate::acp::agent_profiles;
-use crate::acp::approvals::{ApprovalDecision, Nonce};
+use crate::acp::approvals::{ApprovalDecision, ApprovalOption, ApprovalOptionKind, Nonce};
 use crate::acp::elicitations::{parse_elicitation, ElicitationOutcome};
 use crate::acp::permissions::build_approval;
 use crate::acp::state::{Event, ToolCall};
@@ -23,13 +23,51 @@ use super::pending::{
 use super::tool_context::{permission_raw_input_with_context, ToolContextCache};
 use super::tool_output::{preview_optional_args, tool_kind_str};
 
+/// Normalize the agent's option list for the approval card. Unknown
+/// future kinds are dropped rather than guessed at, so a client never
+/// offers a button whose meaning we cannot map back.
+pub(super) fn approval_options(
+    options: &[agent_client_protocol::schema::v1::PermissionOption],
+) -> Vec<ApprovalOption> {
+    options
+        .iter()
+        .filter_map(|o| {
+            let kind = match o.kind {
+                PermissionOptionKind::AllowOnce => ApprovalOptionKind::AllowOnce,
+                PermissionOptionKind::AllowAlways => ApprovalOptionKind::AllowAlways,
+                PermissionOptionKind::RejectOnce => ApprovalOptionKind::RejectOnce,
+                PermissionOptionKind::RejectAlways => ApprovalOptionKind::RejectAlways,
+                _ => return None,
+            };
+            Some(ApprovalOption {
+                option_id: o.option_id.0.to_string(),
+                name: o.name.clone(),
+                kind,
+            })
+        })
+        .collect()
+}
+
 /// Translate the user's decision into the matching option_id from the
-/// list the agent offered. Falls back gracefully if the agent didn't
-/// offer the preferred kind.
+/// list the agent offered.
+///
+/// `requested` is an `option_id` the client picked off the agent's own
+/// labels (`is_choice_list`). It is authoritative: an id matching
+/// nothing means a stale card, and answering it by kind would send an
+/// option the user did not pick, so it resolves to `None` and the caller
+/// cancels. Without one, the decision picks by kind, falling back
+/// gracefully if the agent didn't offer the preferred kind.
 pub(super) fn pick_option_id(
     options: &[agent_client_protocol::schema::v1::PermissionOption],
     decision: ApprovalDecision,
+    requested: Option<&str>,
 ) -> Option<agent_client_protocol::schema::v1::PermissionOptionId> {
+    if let Some(requested) = requested {
+        return options
+            .iter()
+            .find(|o| o.option_id.0.as_ref() == requested)
+            .map(|o| o.option_id.clone());
+    }
     let preferred_kinds = match decision {
         ApprovalDecision::Allow => &[
             PermissionOptionKind::AllowOnce,
@@ -55,6 +93,26 @@ pub(super) fn pick_option_id(
         }
     }
     None
+}
+
+/// The decision an option actually stands for. A card that answered by
+/// `option_id` sends an allow-shaped decision alongside it, so without
+/// this a reject-kind option would be recorded (and broadcast) as an
+/// allow and leave the tool card running. Returns `None` for a kind the
+/// protocol added after us; the caller then keeps the client's decision.
+fn decision_for_option(
+    options: &[agent_client_protocol::schema::v1::PermissionOption],
+    option_id: &agent_client_protocol::schema::v1::PermissionOptionId,
+) -> Option<ApprovalDecision> {
+    let kind = options.iter().find(|o| &o.option_id == option_id)?.kind;
+    match kind {
+        PermissionOptionKind::AllowOnce => Some(ApprovalDecision::Allow),
+        PermissionOptionKind::AllowAlways => Some(ApprovalDecision::AllowAlways),
+        PermissionOptionKind::RejectOnce | PermissionOptionKind::RejectAlways => {
+            Some(ApprovalDecision::Deny)
+        }
+        _ => None,
+    }
 }
 
 /// Close a permission-request tool card with a terminal error row when
@@ -144,7 +202,7 @@ pub(super) async fn handle_permission_request(
             tool_call: tool_call.clone(),
         })
         .await;
-    let approval = build_approval(tool_call);
+    let approval = build_approval(tool_call, approval_options(&request.options));
     let nonce = approval.nonce.clone();
 
     let (resolve_tx, resolve_rx) = oneshot::channel::<ApprovalResolutionMessage>();
@@ -193,8 +251,21 @@ pub(super) async fn handle_permission_request(
     // a foreign `#[non_exhaustive]` enum it doesn't fully own.
     let (outcome, outcome_label): (RequestPermissionOutcome, &'static str) = match resolve_rx.await
     {
-        Ok(ApprovalResolutionMessage::Decision { decision }) => {
-            if let Some(option_id) = pick_option_id(&request.options, decision) {
+        Ok(ApprovalResolutionMessage::Decision {
+            decision,
+            option_id: requested,
+        }) => {
+            if let Some(option_id) =
+                pick_option_id(&request.options, decision, requested.as_deref())
+            {
+                // An option the client named outranks the decision it sent
+                // with it: the option is what the user actually pressed.
+                let decision = match requested {
+                    Some(_) => {
+                        decision_for_option(&request.options, &option_id).unwrap_or(decision)
+                    }
+                    None => decision,
+                };
                 // Surface the resolution to UI clients via the typed event channel.
                 let _ = event_tx
                     .send(Event::ApprovalResolved {
@@ -216,7 +287,7 @@ pub(super) async fn handle_permission_request(
             } else {
                 warn!(
                     target: "acp.protocol",
-                    "agent did not offer a {decision:?}-compatible option; cancelling"
+                    "no option matched (decision {decision:?}, requested {requested:?}); cancelling"
                 );
                 // No compatible option: the agent gets Cancelled, but the
                 // user still acted, so clear the approval card and close
@@ -355,7 +426,7 @@ mod tests {
                 PermissionOptionKind::RejectOnce,
             ),
         ];
-        let id = pick_option_id(&options, ApprovalDecision::Allow).unwrap();
+        let id = pick_option_id(&options, ApprovalDecision::Allow, None).unwrap();
         assert_eq!(id.0.as_ref(), "yes");
     }
 
@@ -369,7 +440,109 @@ mod tests {
         )];
         // We asked for Allow (prefers AllowOnce); the agent only offered
         // AllowAlways. Falls back gracefully.
-        let id = pick_option_id(&options, ApprovalDecision::Allow).unwrap();
+        let id = pick_option_id(&options, ApprovalDecision::Allow, None).unwrap();
         assert_eq!(id.0.as_ref(), "always");
+    }
+
+    /// A question option list (pi's `ask_user_question`): every option is
+    /// `allow_once`, so answering by kind would always send the first
+    /// one. The client's picked id wins, and an id that belongs to no
+    /// option resolves to nothing rather than to a guess. See #3741.
+    #[test]
+    fn requested_option_id_wins_over_kind_order() {
+        use agent_client_protocol::schema::v1::{PermissionOption, PermissionOptionId};
+        let options: Vec<_> = ["Alpha", "Bravo", "Charlie", "Delta"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                PermissionOption::new(
+                    PermissionOptionId::new(format!("choice-{i}")),
+                    *name,
+                    PermissionOptionKind::AllowOnce,
+                )
+            })
+            .collect();
+
+        let picked =
+            pick_option_id(&options, ApprovalDecision::Allow, Some("choice-2")).expect("picked");
+        assert_eq!(picked.0.as_ref(), "choice-2");
+
+        assert!(pick_option_id(&options, ApprovalDecision::Allow, Some("choice-9")).is_none());
+
+        // Without a picked id the kind-order fallback still answers with
+        // the first allow_once, which is the bug the picker avoids.
+        let fallback = pick_option_id(&options, ApprovalDecision::Allow, None).expect("fallback");
+        assert_eq!(fallback.0.as_ref(), "choice-0");
+    }
+
+    /// The card sends an allow-shaped decision beside the option id, so
+    /// the recorded decision has to come from the option itself.
+    #[test]
+    fn decision_follows_the_picked_option_not_the_sent_decision() {
+        use agent_client_protocol::schema::v1::{PermissionOption, PermissionOptionId};
+        let options = vec![
+            PermissionOption::new(
+                PermissionOptionId::new("yes"),
+                "Yes",
+                PermissionOptionKind::AllowOnce,
+            ),
+            PermissionOption::new(
+                PermissionOptionId::new("forever"),
+                "Always",
+                PermissionOptionKind::AllowAlways,
+            ),
+            PermissionOption::new(
+                PermissionOptionId::new("no"),
+                "No",
+                PermissionOptionKind::RejectOnce,
+            ),
+        ];
+        for (id, expected) in [
+            ("yes", ApprovalDecision::Allow),
+            ("forever", ApprovalDecision::AllowAlways),
+            ("no", ApprovalDecision::Deny),
+        ] {
+            let picked = PermissionOptionId::new(id);
+            assert_eq!(
+                decision_for_option(&options, &picked),
+                Some(expected),
+                "{id}"
+            );
+        }
+        let missing = PermissionOptionId::new("gone");
+        assert_eq!(decision_for_option(&options, &missing), None);
+    }
+
+    #[test]
+    fn approval_options_normalize_kinds_in_order() {
+        use agent_client_protocol::schema::v1::{PermissionOption, PermissionOptionId};
+        let options = vec![
+            PermissionOption::new(
+                PermissionOptionId::new("yes"),
+                "Yes",
+                PermissionOptionKind::AllowOnce,
+            ),
+            PermissionOption::new(
+                PermissionOptionId::new("no"),
+                "No",
+                PermissionOptionKind::RejectOnce,
+            ),
+        ];
+        let normalized = approval_options(&options);
+        assert_eq!(
+            normalized,
+            vec![
+                ApprovalOption {
+                    option_id: "yes".into(),
+                    name: "Yes".into(),
+                    kind: ApprovalOptionKind::AllowOnce,
+                },
+                ApprovalOption {
+                    option_id: "no".into(),
+                    name: "No".into(),
+                    kind: ApprovalOptionKind::RejectOnce,
+                },
+            ]
+        );
     }
 }

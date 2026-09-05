@@ -35,7 +35,12 @@ pub(super) enum PendingResolver {
 /// Message sent over the resolver oneshot to unblock the parked
 /// `on_receive_request` callback.
 pub(super) enum ApprovalResolutionMessage {
-    Decision { decision: ApprovalDecision },
+    Decision {
+        decision: ApprovalDecision,
+        /// An `option_id` the client picked off the agent's own labels,
+        /// rather than the Allow / Always / Deny trio.
+        option_id: Option<String>,
+    },
     Cancelled,
 }
 

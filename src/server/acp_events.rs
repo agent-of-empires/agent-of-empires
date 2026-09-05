@@ -1782,7 +1782,7 @@ mod tests {
         );
         assert_eq!(
             derive_acp_status(&Event::ApprovalRequested {
-                approval: build_approval(tool_call.clone()),
+                approval: build_approval(tool_call.clone(), Vec::new()),
             }),
             Some(StatusIntent::Set(Status::Waiting))
         );

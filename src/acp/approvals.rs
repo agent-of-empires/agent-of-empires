@@ -70,6 +70,46 @@ pub enum ApprovalDecision {
     Cancelled,
 }
 
+/// One option the agent offered on `session/request_permission`, kept in
+/// the order it sent them. ACP puts no constraint on `name`, so an agent
+/// can use the option list to ask a question rather than to gate a tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalOption {
+    pub option_id: String,
+    pub name: String,
+    pub kind: ApprovalOptionKind,
+}
+
+/// Mirror of ACP `PermissionOptionKind`, owned here so the wire type the
+/// clients see does not depend on the protocol crate's enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalOptionKind {
+    AllowOnce,
+    AllowAlways,
+    RejectOnce,
+    RejectAlways,
+}
+
+/// True when the offered options are a list of answers rather than an
+/// allow/deny vocabulary, so clients must render the labels and send back
+/// the picked `option_id`.
+///
+/// The test is that every option shares one kind, and there are at least
+/// two. Allow / Always / Deny addresses an option by its kind, so a list
+/// with no kind to distinguish its entries carries no permission
+/// semantics at all: the names are the whole content. pi's
+/// `ask_user_question` arrives as N `allow_once` options.
+///
+/// Repeated kinds alone are deliberately not enough. Real permission
+/// vocabularies do repeat one: gemini offers two `allow_always` options
+/// for an MCP tool ("all server tools" and "this tool") beside
+/// `allow_once` and `reject_once`, and that is still an approval, not a
+/// question. Those keep the trio. See #3741.
+pub fn is_choice_list(options: &[ApprovalOption]) -> bool {
+    options.len() > 1 && options.iter().all(|o| o.kind == options[0].kind)
+}
+
 /// A pending or resolved approval for a tool call. Held in
 /// `AcpState::pending_approvals` until it is resolved through
 /// `apply_event(Event::ApprovalResolved { ... })`.
@@ -80,6 +120,14 @@ pub struct Approval {
     /// True for tools the structured view considers destructive (rm -rf,
     /// `git push --force`, etc.). Mobile UI requires long-press for these.
     pub destructive: bool,
+    /// Options the agent offered. Empty for approvals replayed from an
+    /// event log written before #3741.
+    #[serde(default)]
+    pub options: Vec<ApprovalOption>,
+    /// `is_choice_list(&options)`, resolved server-side so the TUI and the
+    /// web dashboard cannot disagree about which cards are answer lists.
+    #[serde(default)]
+    pub choice: bool,
     pub requested_at: DateTime<Utc>,
     pub resolved: Option<ResolvedApproval>,
 }
@@ -128,6 +176,94 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(a.0.len(), NONCE_BYTES * 2);
         assert!(a.0.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn choice_list_needs_every_option_to_share_one_kind() {
+        let option = |id: &str, kind| ApprovalOption {
+            option_id: id.into(),
+            name: id.into(),
+            kind,
+        };
+        let cases = [
+            ("empty", vec![], false),
+            (
+                "single option",
+                vec![option("once", ApprovalOptionKind::AllowOnce)],
+                false,
+            ),
+            (
+                "permission vocabulary",
+                vec![
+                    option("once", ApprovalOptionKind::AllowOnce),
+                    option("always", ApprovalOptionKind::AllowAlways),
+                    option("no", ApprovalOptionKind::RejectOnce),
+                ],
+                false,
+            ),
+            (
+                // gemini's MCP confirmation: a repeated kind, but still a
+                // permission vocabulary, so it keeps the trio.
+                "gemini mcp",
+                vec![
+                    option("proceed_always_server", ApprovalOptionKind::AllowAlways),
+                    option("proceed_always_tool", ApprovalOptionKind::AllowAlways),
+                    option("proceed_once", ApprovalOptionKind::AllowOnce),
+                    option("cancel", ApprovalOptionKind::RejectOnce),
+                ],
+                false,
+            ),
+            (
+                "pi confirm",
+                vec![
+                    option("yes", ApprovalOptionKind::AllowOnce),
+                    option("no", ApprovalOptionKind::RejectOnce),
+                ],
+                false,
+            ),
+            (
+                "pi two-option question",
+                vec![
+                    option("choice-0", ApprovalOptionKind::AllowOnce),
+                    option("choice-1", ApprovalOptionKind::AllowOnce),
+                ],
+                true,
+            ),
+            (
+                "pi four-option question",
+                vec![
+                    option("choice-0", ApprovalOptionKind::AllowOnce),
+                    option("choice-1", ApprovalOptionKind::AllowOnce),
+                    option("choice-2", ApprovalOptionKind::AllowOnce),
+                    option("choice-3", ApprovalOptionKind::AllowOnce),
+                ],
+                true,
+            ),
+        ];
+        for (name, options, expected) in cases {
+            assert_eq!(is_choice_list(&options), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn approval_without_options_field_deserializes() {
+        // Event logs written before #3741 carry no options.
+        let legacy = serde_json::json!({
+            "nonce": "abc",
+            "tool_call": {
+                "id": "tc",
+                "name": "Bash",
+                "kind": "execute",
+                "args_preview": "{}",
+                "started_at": "2026-01-01T00:00:00Z",
+            },
+            "destructive": false,
+            "requested_at": "2026-01-01T00:00:00Z",
+            "resolved": null,
+        });
+        let approval: Approval = serde_json::from_value(legacy).expect("legacy approval");
+        assert!(approval.options.is_empty());
+        assert!(!approval.choice);
     }
 
     #[test]

@@ -2648,6 +2648,8 @@ mod tests {
                         nonce: crate::acp::approvals::Nonce("n-1".to_string()),
                         tool_call: tool_call("t-approval"),
                         destructive: false,
+                        options: Vec::new(),
+                        choice: false,
                         requested_at: Utc::now(),
                         resolved: None,
                     },
