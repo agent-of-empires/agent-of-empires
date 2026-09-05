@@ -307,7 +307,8 @@ pub(super) async fn connect_runner_control_v3(
     let reader_shim_write = shim_write.clone();
     let reader_correlation = correlation.clone();
     tokio::spawn(async move {
-        loop {
+        async {
+            loop {
             match control_protocol::read_frame(&mut read_half).await {
                 Ok(Some(
                     frame @ (ControlBody::Initialized { .. }
@@ -445,6 +446,14 @@ pub(super) async fn connect_runner_control_v3(
                 }
             }
         }
+        }
+        .await;
+        reader_completion
+            .lock()
+            .expect("completion mutex poisoned")
+            .take();
+        let mut shim_write = reader_shim_write.lock().await;
+        let _ = shim_write.shutdown().await;
     });
 
     // Pump the other direction: everything the crate connection writes to
@@ -788,6 +797,70 @@ mod tests {
         response.push(b'\n');
         write.write_all(&response).await.unwrap();
         fake.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn runner_control_eof_closes_transport_and_cancels_prompt() {
+        use crate::acp::control_protocol::{self, ControlBody};
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+        use tokio::net::UnixListener;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let main_socket = tmp.path().join("eof.sock");
+        let control = crate::process::worker::control_socket_sibling(&main_socket);
+        let listener = UnixListener::bind(&control).unwrap();
+        let fake = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (mut read, mut write) = stream.into_split();
+            control_protocol::write_frame(
+                &mut write,
+                &ControlBody::Hello {
+                    control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
+                    session_id: "eof".into(),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                control_protocol::read_frame(&mut read).await.unwrap(),
+                Some(ControlBody::Attach { .. })
+            ));
+            assert!(matches!(
+                control_protocol::read_frame(&mut read).await.unwrap(),
+                Some(ControlBody::Prompt { .. })
+            ));
+        });
+
+        let (client, crate_side) = connect_runner_control_v3(
+            &control,
+            mpsc::channel::<Event>(1).0,
+            "eof".into(),
+            Arc::new(TerminalClaim::new()),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+        let completion = client.prompt(serde_json::json!({})).await;
+        fake.await.unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), completion)
+                .await
+                .expect("prompt completion must resolve after control EOF")
+                .is_err(),
+            "control EOF must cancel the in-flight prompt"
+        );
+        let (mut crate_read, _crate_write) = tokio::io::split(crate_side);
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), crate_read.read(&mut byte))
+                .await
+                .expect("crate transport must observe control EOF")
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

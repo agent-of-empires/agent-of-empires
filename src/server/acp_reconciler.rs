@@ -1560,7 +1560,6 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
                     new_build = crate::build_info::BUILD_VERSION,
                     "adopting build-stale structured view worker to drain in-flight turn before respawn"
                 );
-                state.acp_supervisor.mark_build_respawn_pending(&id);
             }
             let supervisor = Arc::clone(&state.acp_supervisor);
             let cwd = PathBuf::from(&project_path);
@@ -1581,6 +1580,9 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
             .await;
             match attach_res {
                 Ok(Ok(())) => {
+                    if decision == AdoptDecision::AdoptStaleForDrain {
+                        state.acp_supervisor.mark_build_respawn_pending(&id);
+                    }
                     tracing::info!(
                         target: "acp.supervisor",
                         session = %id,

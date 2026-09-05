@@ -1304,9 +1304,9 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
             Err(e) => return Err(e),
         }
-        // Poll for the runner subprocess to exit so its socket file
-        // releases. ~deadline/100ms tick; usually claude-agent-acp dies
-        // in <500ms once SIGTERM lands.
+        // Poll for the runner subprocess to exit before allowing its process
+        // group to overlap a replacement. ~deadline/100ms tick; usually
+        // claude-agent-acp dies in <500ms once SIGTERM lands.
         #[cfg(unix)]
         if let Some(pid) = pid_before {
             let start = std::time::Instant::now();
@@ -1316,28 +1316,17 @@ impl<S: BroadcastSink> Supervisor<S> {
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
-            // Best-effort socket file removal: a stale inode from the old
-            // runner would collide with the new spawn's bind.
-            // The current runner binds the control sibling; remove it and the
-            // legacy base path so either generation can be replaced cleanly.
-            if let Ok(socket_path) = crate::process::worker_registry::socket_path_for(session_id) {
-                crate::process::worker_registry::remove_runner_sockets(&socket_path);
-            }
         }
-        // Acp currently runs over Unix sockets only; reaching this
-        // function on a non-Unix host means somebody added a non-Unix
-        // backend without porting the PID-wait + socket-cleanup above.
-        // Warn loudly so the gap is visible in the log rather than
-        // silently returning Ok and leaking a stale socket. Mirrors the
-        // precedent at the agent_unresponsive escalation site below.
+        // Acp currently runs over Unix sockets only; reaching this function
+        // on a non-Unix host means somebody added a backend without porting
+        // the PID wait above. Warn rather than silently skipping it.
         #[cfg(not(unix))]
         {
             let _ = pid_before;
             tracing::warn!(
                 target: "acp.supervisor",
                 session = %session_id,
-                "shutdown_and_wait called on non-Unix host; PID-wait and \
-                 socket cleanup are unimplemented for this platform"
+                "shutdown_and_wait called on non-Unix host; PID wait is unimplemented for this platform"
             );
         }
         Ok(())
@@ -2167,23 +2156,23 @@ impl<S: BroadcastSink> Supervisor<S> {
                     // CANCEL_ESCALATION_GRACE while a prompt was in flight.
                     // The runner subprocess is still alive but wedged on a
                     // tool call the agent never cancelled, and the next
-                    // `AcpClient::spawn` reuses the same UNIX socket path
-                    // (`<workers_dir>/<session_id>.sock`), so a respawn
-                    // before the old runner exits either binds against a
-                    // collided socket or reconnects to the wedged process.
+                    // `AcpClient::spawn` reuses the same session id, so a
+                    // respawn before the old runner exits can overlap the
+                    // wedged process group.
                     //
                     // Sequence here:
                     //   1. SIGTERM the old PID.
-                    //   2. Poll for PID death + socket file removal (cap 3s).
-                    //   3. SIGKILL if the wedged runner is still alive past
-                    //      the SIGTERM grace.
-                    //   4. Best-effort `remove_file` on the socket so the
-                    //      respawn binds cleanly.
+                    //   2. Poll for PID death (cap 3s).
+                    //   3. SIGKILL if it survives the grace.
+                    //
+                    // The replacement runner removes stale socket paths just
+                    // before bind. Cleanup after this wait would instead risk
+                    // unlinking a replacement that another spawn published.
                     //
                     // Do NOT call `terminate_runner_for_session` here: that
-                    // helper deletes the worker_registry entry, which
-                    // makes `restart_decision` interpret it as a
-                    // user-initiated stop and skip the respawn. See #1196.
+                    // helper deletes the worker_registry entry, which makes
+                    // `restart_decision` interpret it as a user-initiated stop
+                    // and skip the respawn. See #1196.
                     if agent_unresponsive {
                         #[cfg(unix)]
                         {
@@ -2238,13 +2227,6 @@ impl<S: BroadcastSink> Supervisor<S> {
                                     tokio::time::sleep(Duration::from_millis(200)).await;
                                 }
                             }
-                            if let Ok(socket_path) =
-                                crate::process::worker_registry::socket_path_for(&session_id)
-                            {
-                                crate::process::worker_registry::remove_runner_sockets(
-                                    &socket_path,
-                                );
-                            }
                         }
                         // Acp's runner transport is UNIX-socket-only today
                         // (see `worker_registry::socket_path_for`), so a
@@ -2255,7 +2237,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                             warn!(
                                 target: "acp.supervisor",
                                 session = %session_id,
-                                "agent_unresponsive escalation on non-unix: wedged runner kill not implemented; respawn may collide on the runner socket"
+                                "agent_unresponsive escalation on non-unix: wedged runner kill not implemented; respawn may overlap the live process"
                             );
                         }
                     }
@@ -5505,6 +5487,121 @@ cursor-acp-bridge = "agent acp"
             "no poll must run when registry is missing, elapsed={:?}",
             start.elapsed()
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn shutdown_and_wait_preserves_replacement_control_socket() {
+        use std::os::unix::process::CommandExt;
+
+        struct KillOnDrop(std::process::Child);
+
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let tmp = tempfile::TempDir::with_prefix_in("aoe-supervisor-", "/tmp").unwrap();
+        let xdg = tmp.path().join(".config");
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", tmp.path().as_os_str()),
+            ("XDG_CONFIG_HOME", xdg.as_os_str()),
+        ]);
+        let ready = tmp.path().join("old-runner-ready");
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                r#"trap '' TERM; printf ready > "$1"; exec sleep 60"#,
+                "sh",
+            ])
+            .arg(&ready)
+            .process_group(0);
+        let old = KillOnDrop(command.spawn().expect("spawn old runner stand-in"));
+        let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !ready.exists() {
+            assert!(
+                tokio::time::Instant::now() < ready_deadline,
+                "old runner stand-in did not become ready"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let session_id = "sw-replacement-socket";
+        let socket_path = crate::process::worker_registry::socket_path_for(session_id).unwrap();
+        let control_path = crate::process::worker::control_socket_sibling(&socket_path);
+        let old_record = crate::process::worker_registry::WorkerRecord::new(
+            session_id.into(),
+            old.0.id(),
+            socket_path.clone(),
+            "claude-agent-acp".into(),
+            "claude-code".into(),
+            tmp.path().to_path_buf(),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        crate::process::worker_registry::save(&old_record).unwrap();
+
+        let sink = VecSink::new();
+        let sup = Supervisor::new(sink);
+        insert_stdio_worker(&sup, session_id).await;
+        let replacement_session = session_id.to_string();
+        let replacement_socket = socket_path.clone();
+        let replacement_control = control_path.clone();
+        let replacement_cwd = tmp.path().to_path_buf();
+        let replacement = tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                if crate::process::worker_registry::load(&replacement_session)
+                    .unwrap()
+                    .is_none()
+                {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "old registry record was not removed"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let listener = tokio::net::UnixListener::bind(&replacement_control).unwrap();
+            let record = crate::process::worker_registry::WorkerRecord::new(
+                replacement_session,
+                std::process::id(),
+                replacement_socket,
+                "claude-agent-acp".into(),
+                "claude-code".into(),
+                replacement_cwd,
+                None,
+                vec![],
+                vec![],
+                None,
+                None,
+            );
+            crate::process::worker_registry::save(&record).unwrap();
+            listener
+        });
+
+        sup.shutdown_and_wait(session_id, Duration::from_millis(300))
+            .await
+            .unwrap();
+        let listener = tokio::time::timeout(Duration::from_secs(1), replacement)
+            .await
+            .expect("replacement must publish during shutdown wait")
+            .unwrap();
+        assert!(
+            control_path.exists(),
+            "old runner cleanup removed the replacement control socket"
+        );
+
+        drop(listener);
+        crate::process::worker_registry::delete_if_owned(session_id, std::process::id()).unwrap();
     }
 
     /// Reversible teardown must keep the agent transcript resumable, so
