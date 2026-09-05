@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
@@ -584,6 +585,12 @@ fn refresh_commits_geometry(result: VtRefreshResult) -> bool {
     result == VtRefreshResult::Refreshed
 }
 
+#[derive(Clone, Copy)]
+struct SeedGuard<'a> {
+    chunk: Option<(&'a AtomicU64, &'a AtomicU64, u64)>,
+    pipe: Option<&'a UnixStream>,
+}
+
 fn seed_parser(
     target: &str,
     parser: &Mutex<vt100::Parser>,
@@ -591,21 +598,13 @@ fn seed_parser(
     grid_gen: &AtomicU64,
     size: (u16, u16),
     deadline: &crate::tmux::TmuxCommandDeadline,
-    chunk_guard: Option<(&AtomicU64, &AtomicU64, u64)>,
+    guard: SeedGuard<'_>,
 ) -> VtRefreshResult {
     let (_, rows) = size;
     let Some(stream) = capture_seed_stream(target, rows, deadline) else {
         return VtRefreshResult::Failed;
     };
-    swap_seeded_parser(
-        parser,
-        app_cursor,
-        grid_gen,
-        None,
-        &stream,
-        size,
-        chunk_guard,
-    )
+    swap_seeded_parser(parser, app_cursor, grid_gen, None, &stream, size, guard)
 }
 /// Capture the pane and weave its modes and cursor into one replayable byte
 /// stream, or `None` when the pane could not be captured. Split from the swap
@@ -628,13 +627,21 @@ fn capture_seed_stream(
 /// consumption (#3617). `capture_seed_stream` forks tmux, so `run_reader` can
 /// take the parser lock first and apply a chunk that the snapshot does not
 /// contain; replacing the parser would then drop that chunk from both grids.
-/// Generation changes fence applied chunks, while the received/settled pair
-/// also fences a chunk queued on this parser lock.
+/// Generation changes fence applied chunks, the received/settled pair fences a
+/// chunk queued on this parser lock, and `FIONREAD` fences bytes the reader has
+/// not claimed yet.
 ///
 /// A raced swap is abandoned rather than retried inline: the old parser holds
 /// the newer output, so leaving it alone is the safe side, and the caller
 /// reseeds again on its own cadence. `since` of `None` disables only the
 /// generation guard for callers whose current grid is stale by definition.
+fn pipe_has_unread_bytes(pipe: &UnixStream) -> bool {
+    let mut unread = 0;
+    // FIONREAD writes one c_int through this valid pointer without consuming
+    // the socket's receive queue.
+    unsafe { libc::ioctl(pipe.as_raw_fd(), libc::FIONREAD, &mut unread) != 0 || unread > 0 }
+}
+
 fn swap_seeded_parser(
     parser: &Mutex<vt100::Parser>,
     app_cursor: &AtomicBool,
@@ -642,16 +649,17 @@ fn swap_seeded_parser(
     since: Option<u64>,
     stream: &[u8],
     size: (u16, u16),
-    chunk_guard: Option<(&AtomicU64, &AtomicU64, u64)>,
+    guard: SeedGuard<'_>,
 ) -> VtRefreshResult {
     let Ok(mut p) = parser.lock() else {
         return VtRefreshResult::Failed;
     };
     if since.is_some_and(|generation| generation != grid_gen.load(Ordering::Relaxed))
-        || chunk_guard.is_some_and(|(received, settled, expected)| {
+        || guard.chunk.is_some_and(|(received, settled, expected)| {
             received.load(Ordering::Acquire) != expected
                 || settled.load(Ordering::Acquire) != expected
         })
+        || guard.pipe.is_some_and(pipe_has_unread_bytes)
     {
         return VtRefreshResult::Busy;
     }
@@ -1592,20 +1600,26 @@ impl VtChannel {
         // Mark the reader live before capture. Chunks observed before this point
         // are represented by the later snapshot; chunks observed after it are
         // applied to the parser and advance the guard before waiting on its lock.
-        // The seed therefore either includes each chunk or returns Busy, never
-        // dropping the capture-to-install window.
+        // The sequence and socket-queue guards therefore either cover each
+        // chunk or return Busy, never dropping the capture-to-install window.
         seeded.store(true, Ordering::Release);
         let expected_chunk_seq = chunk_seq.load(Ordering::Acquire);
-        if seed_parser(
-            &target,
-            &parser,
-            &app_cursor,
-            &grid_gen,
-            (cols, rows),
-            deadline,
-            Some((&chunk_seq, &settled_chunk_seq, expected_chunk_seq)),
-        ) != VtRefreshResult::Refreshed
-        {
+        let initial_seed = {
+            let pipe_guard = stream.lock().ok();
+            seed_parser(
+                &target,
+                &parser,
+                &app_cursor,
+                &grid_gen,
+                (cols, rows),
+                deadline,
+                SeedGuard {
+                    chunk: Some((&chunk_seq, &settled_chunk_seq, expected_chunk_seq)),
+                    pipe: pipe_guard.as_deref().and_then(Option::as_ref),
+                },
+            )
+        };
+        if initial_seed != VtRefreshResult::Refreshed {
             tracing::warn!(%target, "vt: initial seed failed; falling back to capture");
             stop_and_wake_reader(&stop, &sock_path);
             session.release_vt_pipe_owner_with_deadline(&owner, deadline);
@@ -1768,6 +1782,7 @@ impl VtChannel {
         let Some(stream) = capture_seed_stream(&self.target, rows, deadline) else {
             return VtRefreshResult::Failed;
         };
+        let pipe_guard = self.stream.lock().ok();
         let result = swap_seeded_parser(
             &self.parser,
             &self.app_cursor,
@@ -1775,7 +1790,10 @@ impl VtChannel {
             since,
             &stream,
             (cols, rows),
-            Some((&self.chunk_seq, &self.settled_chunk_seq, expected_chunk_seq)),
+            SeedGuard {
+                chunk: Some((&self.chunk_seq, &self.settled_chunk_seq, expected_chunk_seq)),
+                pipe: pipe_guard.as_deref().and_then(Option::as_ref),
+            },
         );
         if result == VtRefreshResult::Refreshed {
             self.clear_drift();
@@ -2432,7 +2450,10 @@ mod tests {
                 None,
                 b"STALE-SNAPSHOT",
                 (80, 24),
-                Some((&chunk_seq, &settled_chunk_seq, 0)),
+                SeedGuard {
+                    chunk: Some((&chunk_seq, &settled_chunk_seq, 0)),
+                    pipe: None,
+                },
             ),
             VtRefreshResult::Busy,
         );
@@ -2444,7 +2465,10 @@ mod tests {
                 None,
                 b"STALE-SNAPSHOT",
                 (80, 24),
-                Some((&chunk_seq, &settled_chunk_seq, 1)),
+                SeedGuard {
+                    chunk: Some((&chunk_seq, &settled_chunk_seq, 1)),
+                    pipe: None,
+                },
             ),
             VtRefreshResult::Busy,
             "a seed must not overtake a read waiting on the parser"
@@ -2463,7 +2487,10 @@ mod tests {
                 &grid_gen,
                 (80, 24),
                 &deadline,
-                None,
+                SeedGuard {
+                    chunk: None,
+                    pipe: None,
+                },
             ),
             VtRefreshResult::Failed,
         );
@@ -3058,7 +3085,10 @@ mod tests {
                 Some(since),
                 &seed,
                 (80, 24),
-                Some((&chunk_seq, &settled_chunk_seq, 0)),
+                SeedGuard {
+                    chunk: Some((&chunk_seq, &settled_chunk_seq, 0)),
+                    pipe: None,
+                },
             ),
             VtRefreshResult::Busy,
             "swap must stand down once a chunk has landed"
@@ -3080,7 +3110,10 @@ mod tests {
                 Some(quiet),
                 &seed,
                 (80, 24),
-                Some((&chunk_seq, &settled_chunk_seq, expected_chunk_seq,)),
+                SeedGuard {
+                    chunk: Some((&chunk_seq, &settled_chunk_seq, expected_chunk_seq)),
+                    pipe: None,
+                },
             ),
             VtRefreshResult::Refreshed,
             "an unraced swap must apply the snapshot"
@@ -3094,6 +3127,69 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         drop(conn);
         let _ = reader.join();
+    }
+
+    #[test]
+    fn unread_pipe_chunk_blocks_snapshot_replay() {
+        use std::io::{Read, Write};
+
+        let (mut reader, mut writer) = UnixStream::pair().expect("pipe pair");
+        writer.write_all(b"UNREAD-MARKER").expect("queue output");
+
+        let parser = Mutex::new(vt100::Parser::new(24, 80, 0));
+        let app_cursor = AtomicBool::new(false);
+        let grid_gen = AtomicU64::new(0);
+        let chunk_seq = AtomicU64::new(0);
+        let settled_chunk_seq = AtomicU64::new(0);
+        let seed_state = PaneSeedState {
+            cursor_x: b"UNREAD-MARKER".len() as u16,
+            ..PaneSeedState::default()
+        };
+        let seed = assemble_seed_stream(b"UNREAD-MARKER\n", &seed_state, 24);
+
+        assert_eq!(
+            swap_seeded_parser(
+                &parser,
+                &app_cursor,
+                &grid_gen,
+                None,
+                &seed,
+                (80, 24),
+                SeedGuard {
+                    chunk: Some((&chunk_seq, &settled_chunk_seq, 0)),
+                    pipe: Some(&reader),
+                },
+            ),
+            VtRefreshResult::Busy,
+            "a snapshot must not overtake output still queued in the pipe",
+        );
+
+        let mut unread = [0; b"UNREAD-MARKER".len()];
+        reader.read_exact(&mut unread).expect("drain output");
+        parser.lock().unwrap().process(&unread);
+
+        assert_eq!(
+            swap_seeded_parser(
+                &parser,
+                &app_cursor,
+                &grid_gen,
+                None,
+                &seed,
+                (80, 24),
+                SeedGuard {
+                    chunk: Some((&chunk_seq, &settled_chunk_seq, 0)),
+                    pipe: Some(&reader),
+                },
+            ),
+            VtRefreshResult::Refreshed,
+            "a drained pipe allows the snapshot to install",
+        );
+
+        let contents = parser.lock().unwrap().screen().contents();
+        assert!(
+            contents.matches("UNREAD-MARKER").count() == 1,
+            "the unread pipe chunk must be applied exactly once:\n{contents:?}"
+        );
     }
 
     #[test]
