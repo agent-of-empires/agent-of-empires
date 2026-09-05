@@ -100,7 +100,7 @@ options and a digit answers with that option; `a` and `Shift+A` are
 refused there, since neither names a choice. The web card renders the
 same list with a Dismiss button in place of Deny.
 
-**Focus isolation.** Approval keys (`a`/`Shift+A`/`d`) only resolve when
+**Focus isolation.** Approval keys (`a`/`Shift+A`/`d` and the digits) only resolve when
 the approval card has focus. Typing "always allow" into the composer
 will never approve a pending tool; the composer captures every
 keystroke.

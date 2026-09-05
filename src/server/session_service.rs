@@ -1515,21 +1515,11 @@ impl SessionService {
         Ok(guard)
     }
 
-    /// Ownership check alone, for callers that must not touch a session
-    /// they do not own before admission.
-    pub(crate) async fn admit_turn_for(
-        &self,
-        caller: &SessionCaller,
-        id: &str,
-    ) -> Result<(), TurnAdmissionError> {
-        self.admits_turn(caller, id).await
-    }
-
     /// May `caller` open a turn on `id`? Existence plus, for a plugin, the
     /// immutable ownership gate: a plugin may act only on a session it
     /// created. Decided before any live state is folded, so a foreign session
     /// answers `not_owner` whatever it is currently doing (#3685).
-    async fn admits_turn(
+    pub(crate) async fn admits_turn(
         &self,
         caller: &SessionCaller,
         id: &str,

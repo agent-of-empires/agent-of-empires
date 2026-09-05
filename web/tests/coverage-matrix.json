@@ -1534,7 +1534,7 @@
       "kind": "vitest",
       "risk": "medium",
       "specs": ["src/components/acp/workerStoppedBanner.test.ts"],
-      "components": ["web/src/components/acp/StructuredView.tsx"]
+      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "session.workspace-delete",

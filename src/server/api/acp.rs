@@ -331,6 +331,13 @@ fn supervisor_error_response(context: &str, err: &SupervisorError) -> axum::resp
             format!("worker_not_ready: {context}: {err}"),
         )
             .into_response(),
+        // The handshake itself hit the provider limit; the session is parked
+        // on it, which is the outcome the caller sees in the payload.
+        SupervisorError::Acp(AcpError::RateLimited(_)) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("rate_limited: {context}: {err}"),
+        )
+            .into_response(),
         SupervisorError::Acp(_)
         | SupervisorError::InvalidAgentCommand(_)
         | SupervisorError::SpawnCancelled(_) => (

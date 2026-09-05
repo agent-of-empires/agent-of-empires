@@ -4227,15 +4227,12 @@ mod tests {
         assert!(store.latest_status_event("s-2").is_none());
     }
 
-    /// A rate-limit park must not be hidden from `latest_status_event` by a
-    /// trailing activity event, or the auto-resume logic would try to resume
-    /// a quota-blocked session. `latest_seed_status_event` is free to move on
-    /// (the sidebar shows the resumed work), but the park query stays put.
-    /// See #1722, #2625.
-    /// The durable park (#3514): only a prompt, an agent switch or a stop for
-    /// another reason ends it. A failed resume's `AgentStartupError`, the
-    /// auto-resume breadcrumb and approvals leave it in place, so the reaper
-    /// keeps its schedule instead of being disarmed for the session's life.
+    /// The durable park (#1722, #2625, #3514): only a prompt, an agent switch
+    /// or a stop for another reason ends it. Trailing activity, a failed
+    /// resume's `AgentStartupError`, the auto-resume breadcrumb and approvals
+    /// leave it in place, so the reaper keeps its schedule instead of being
+    /// disarmed for the session's life. `latest_seed_status_event` is free to
+    /// move on (the sidebar shows the resumed work); the park query stays put.
     #[test]
     fn rate_limit_park_survives_everything_but_a_real_continuation() {
         let (_tmp, store) = open_store(1000);

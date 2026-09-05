@@ -111,6 +111,13 @@ pub enum AdapterError {
     NpmFailed(String),
     #[error("adapter binary `{0}` missing after install")]
     BinaryMissing(String),
+    #[error("`{adapter}` needs Node {major}.{minor} or newer to run its sources; found {found}")]
+    NodeTooOld {
+        adapter: String,
+        major: u32,
+        minor: u32,
+        found: String,
+    },
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -213,6 +220,14 @@ pub fn install(app_dir: &Path, node: &ResolvedNode, binary: &str) -> Result<(), 
     if installation_is_current(app_dir, binary) {
         info!(target: "acp.adapters", adapter = binary, "already current; nothing to install");
         return Ok(());
+    }
+    if !adapter.sources.is_empty() && !crate::acp::node::supports_strip_types(&node.version) {
+        return Err(AdapterError::NodeTooOld {
+            adapter: binary.to_string(),
+            major: crate::acp::node::MIN_NODE_MAJOR,
+            minor: crate::acp::node::MIN_NODE_MINOR,
+            found: node.version.clone(),
+        });
     }
 
     let parent = bundled_adapters_dir(app_dir);

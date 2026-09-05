@@ -375,8 +375,10 @@ fn doctor_version_issue(
 /// reporter and the plain listing so the #1017 fallback semantics have
 /// one definition.
 fn bundled_copy_installed(binary: &str) -> bool {
-    crate::session::get_app_dir()
-        .is_ok_and(|app_dir| crate::acp::adapters::bundled_adapter_bin(&app_dir, binary).is_some())
+    crate::session::get_app_dir().is_ok_and(|app_dir| {
+        crate::acp::adapters::bundled_adapter_bin(&app_dir, binary).is_some()
+            && !crate::acp::adapters::installed_copy_is_stale(&app_dir, binary)
+    })
 }
 
 /// Resolve whether `gate`'s adapter would miss its version floor at

@@ -574,14 +574,16 @@ fn pick_native_config_dir(
     if !reads_claude_config_dir {
         return None;
     }
-    let non_empty = |dir: std::path::PathBuf| (!dir.as_os_str().is_empty()).then_some(dir);
+    // A relative value would resolve against the daemon's working directory
+    // here and the agent's there; it is not a directory both can agree on.
+    let usable = |dir: std::path::PathBuf| dir.is_absolute().then_some(dir);
     session_env
         .iter()
         .rev()
         .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
         .map(|(_, value)| std::path::PathBuf::from(value))
-        .and_then(non_empty)
-        .or_else(|| daemon_env.map(std::path::PathBuf::from).and_then(non_empty))
+        .and_then(usable)
+        .or_else(|| daemon_env.map(std::path::PathBuf::from).and_then(usable))
 }
 
 /// Convert a map of raw server entries, skipping (with a warning) any entry that
@@ -854,6 +856,14 @@ mod tests {
                 env(&[("CLAUDE_CONFIG_DIR", "/profile")]),
                 daemon.clone(),
                 Some(p("/profile")),
+            ),
+            (
+                "a relative session value is ignored like an empty one",
+                None,
+                true,
+                env(&[("CLAUDE_CONFIG_DIR", "relative/dir")]),
+                daemon.clone(),
+                Some(p("/daemon")),
             ),
             (
                 "before_session value applied last wins",

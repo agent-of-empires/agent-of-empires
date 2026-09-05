@@ -217,24 +217,7 @@ pub(super) async fn handle_permission_request(
             decision,
             option_id,
         }) => {
-            // An explicit option (a choice-list answer, #3741) wins over kind
-            // matching, which would otherwise return the first option of a
-            // list whose entries all share one kind.
-            let by_id = option_id.and_then(|id| {
-                request
-                    .options
-                    .iter()
-                    .find(|o| o.option_id.0.as_ref() == id)
-                    .map(|o| o.option_id.clone())
-            });
-            // A choice list answered without naming an option (a client that
-            // only knows the trio) is cancelled: kind matching would hand
-            // the agent whichever choice came first.
-            let chosen = match by_id {
-                Some(id) => Some(id),
-                None if choice_list => None,
-                None => pick_option_id(&request.options, decision),
-            };
+            let chosen = select_option(&request.options, decision, option_id, choice_list);
             if let Some(option_id) = chosen {
                 // Surface the resolution to UI clients via the typed event channel.
                 let _ = event_tx
@@ -377,9 +360,106 @@ pub(super) async fn handle_elicitation_request(
     responder.respond(response)
 }
 
+/// The option a resolution selects. An explicit option (a choice-list
+/// answer, #3741) wins over kind matching, which would otherwise return the
+/// first option of a list whose entries all share one kind. A choice list
+/// answered without naming an option (a client that only knows the trio)
+/// selects nothing and is cancelled.
+fn select_option(
+    options: &[agent_client_protocol::schema::v1::PermissionOption],
+    decision: ApprovalDecision,
+    option_id: Option<String>,
+    choice_list: bool,
+) -> Option<agent_client_protocol::schema::v1::PermissionOptionId> {
+    let by_id = option_id.and_then(|id| {
+        options
+            .iter()
+            .find(|o| o.option_id.0.as_ref() == id)
+            .map(|o| o.option_id.clone())
+    });
+    match by_id {
+        Some(id) => Some(id),
+        None if choice_list => None,
+        None => pick_option_id(options, decision),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn select_option_honors_an_explicit_answer_and_cancels_an_unanswered_list() {
+        use agent_client_protocol::schema::v1::{PermissionOption, PermissionOptionId};
+        let choices = vec![
+            PermissionOption::new(
+                PermissionOptionId::new("red"),
+                "Red",
+                PermissionOptionKind::AllowOnce,
+            ),
+            PermissionOption::new(
+                PermissionOptionId::new("blue"),
+                "Blue",
+                PermissionOptionKind::AllowOnce,
+            ),
+        ];
+        type Case = (
+            &'static str,
+            ApprovalDecision,
+            Option<&'static str>,
+            bool,
+            Option<&'static str>,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "explicit option wins",
+                ApprovalDecision::Allow,
+                Some("blue"),
+                true,
+                Some("blue"),
+            ),
+            (
+                "choice list without an option cancels",
+                ApprovalDecision::Allow,
+                None,
+                true,
+                None,
+            ),
+            (
+                "deny on a choice list cancels",
+                ApprovalDecision::Deny,
+                None,
+                true,
+                None,
+            ),
+            (
+                "unknown option on a choice list cancels",
+                ApprovalDecision::Allow,
+                Some("green"),
+                true,
+                None,
+            ),
+            (
+                "trio request falls back to kind",
+                ApprovalDecision::Allow,
+                None,
+                false,
+                Some("red"),
+            ),
+            (
+                "unknown option on a trio request falls back to kind",
+                ApprovalDecision::Allow,
+                Some("green"),
+                false,
+                Some("red"),
+            ),
+        ];
+        for (label, decision, option_id, choice_list, expected) in cases {
+            let chosen =
+                select_option(&choices, decision, option_id.map(String::from), choice_list);
+            assert_eq!(chosen.as_ref().map(|id| id.0.as_ref()), expected, "{label}");
+        }
+    }
 
     #[test]
     fn pick_option_id_finds_allow_once() {

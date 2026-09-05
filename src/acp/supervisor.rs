@@ -1318,6 +1318,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         // unreadable at the I/O layer, so an unreadable record no longer
         // collapses into a silent-skip. See #2102.
         let pid_before = crate::process::worker_registry::pid_source_for(session_id);
+        let start = std::time::Instant::now();
         match self.shutdown(session_id).await {
             Ok(()) => {}
             Err(SupervisorError::UnknownSession(_)) => {
@@ -1325,6 +1326,25 @@ impl<S: BroadcastSink> Supervisor<S> {
                 return Ok(());
             }
             Err(e) => return Err(e),
+        }
+        // A stop that landed on an in-flight resume is honored by that
+        // resume; a spawn issued before it settles would be refused as
+        // already present. Wait for the session to leave the lease.
+        loop {
+            let notified = self.worker_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !matches!(
+                self.worker_state(session_id).await,
+                AcpWorkerState::Resuming | AcpWorkerState::Stopping
+            ) {
+                break;
+            }
+            let remaining = deadline.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            let _ = tokio::time::timeout(remaining, notified).await;
         }
         // Poll for the runner subprocess to exit so its socket file
         // releases. ~deadline/100ms tick; usually claude-agent-acp dies
@@ -2038,8 +2058,10 @@ impl<S: BroadcastSink> Supervisor<S> {
 
     /// The table refused to install a worker that was already built. On a
     /// cancel the stop that arrived mid-resume now owns teardown through
-    /// this lease; on a stale lease nothing owns the runner, so it is
-    /// killed best-effort rather than left detached and reattachable.
+    /// this lease and is published as that stop, so a turn the runner was
+    /// adopting closes in the UI; on a stale lease nothing owns the runner,
+    /// so it is killed best-effort rather than left detached and
+    /// reattachable.
     async fn retire_refused_install(
         &self,
         lease: &Lease,
@@ -2057,7 +2079,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                     "resume cancelled by a concurrent shutdown; runner torn down"
                 );
                 self.settle(lease, settlement);
-                SupervisorError::SpawnCancelled(session_id.to_string())
+                self.publish_next(session_id, &Event::Stopped { reason });
             }
             InstallError::Stale => {
                 warn!(
@@ -2065,9 +2087,9 @@ impl<S: BroadcastSink> Supervisor<S> {
                     session = %session_id,
                     "resume completed under a stale lease; runner torn down"
                 );
-                SupervisorError::AlreadyRunning(session_id.to_string())
             }
         }
+        SupervisorError::SpawnCancelled(session_id.to_string())
     }
 
     fn settle(&self, lease: &Lease, settlement: Settlement) {
@@ -2101,6 +2123,9 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// respawn only when no newer generation has been admitted since it was
     /// written; anything else is stale authority and is discarded.
     pub fn take_late_restart_marker(&self, session_id: &str) -> bool {
+        if !crate::process::worker_registry::restart_marker_present(session_id) {
+            return false;
+        }
         let Some(marker) = crate::process::worker_registry::peek_restart_marker(session_id) else {
             crate::process::worker_registry::clear_restart_marker(session_id);
             return false;
@@ -6587,6 +6612,47 @@ cursor-acp-bridge = "agent acp"
     /// Late spawn cancellation: the shutdown wins, and the runner the late
     /// spawn built is proven dead and its record settled before the epoch
     /// is released, so the next resume is admitted against a clean slate.
+    /// `shutdown_and_wait` returns only once a cancelled resume has settled,
+    /// so the spawn a caller issues next (agent switch, project move) is
+    /// admitted instead of refused as already present.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn shutdown_and_wait_outlasts_a_cancelled_resume() {
+        let _home = isolate_home();
+        let control = Arc::new(FakeProcessControl::default());
+        control.alive(4343);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let sup = Arc::new(
+            Supervisor::new(VecSink::new())
+                .with_process_control(control.clone())
+                .with_launcher(gated_launcher(entered.clone(), gate.clone(), 4343)),
+        );
+        let spawner = {
+            let sup = Arc::clone(&sup);
+            tokio::spawn(async move { sup.spawn(spawn_request("s-wait")).await })
+        };
+        entered.notified().await;
+
+        let waiter = {
+            let sup = Arc::clone(&sup);
+            tokio::spawn(async move {
+                sup.shutdown_and_wait("s-wait", Duration::from_secs(5))
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished(), "must wait for the resume to settle");
+        gate.notify_one();
+
+        waiter.await.unwrap().expect("cancel is a soft success");
+        assert_eq!(sup.worker_state("s-wait").await, AcpWorkerState::Absent);
+        assert!(matches!(
+            spawner.await.unwrap(),
+            Err(SupervisorError::SpawnCancelled(_))
+        ));
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn shutdown_during_spawn_tears_down_the_late_runner() {
@@ -6595,8 +6661,9 @@ cursor-acp-bridge = "agent acp"
         control.alive(4242);
         let entered = Arc::new(tokio::sync::Notify::new());
         let gate = Arc::new(tokio::sync::Notify::new());
+        let sink = VecSink::new();
         let sup = Arc::new(
-            Supervisor::new(VecSink::new())
+            Supervisor::new(sink.clone())
                 .with_process_control(control.clone())
                 .with_launcher(gated_launcher(entered.clone(), gate.clone(), 4242)),
         );
@@ -6624,6 +6691,13 @@ cursor-acp-bridge = "agent acp"
             control.signals()
         );
         assert!(!control.is_alive(4242));
+        assert!(
+            sink.frames.lock().unwrap().iter().any(|(id, _, ev)| {
+                id == "s-late"
+                    && matches!(ev, Event::Stopped { reason } if reason == "user_stopped")
+            }),
+            "the honored stop must be published so an adopted turn closes"
+        );
         assert!(
             crate::process::worker_registry::load("s-late")
                 .unwrap()

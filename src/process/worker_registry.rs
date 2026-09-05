@@ -198,6 +198,12 @@ pub fn mark_restart_pending(session_id: &str, generation: u64) {
 
 /// Generation named by the marker, without consuming it. `None` when
 /// there is no marker or it names no generation.
+/// Whether a restart marker file exists, malformed or not. One stat, for
+/// the reconciler's per-tick probe of pinned sessions.
+pub fn restart_marker_present(session_id: &str) -> bool {
+    restart_marker_path(session_id).is_ok_and(|p| p.exists())
+}
+
 pub fn peek_restart_marker(session_id: &str) -> Option<u64> {
     let path = restart_marker_path(session_id).ok()?;
     crate::process::worker::read_restart_marker(&path)
