@@ -631,6 +631,13 @@ fn run_in(
              the move is retried on a later start or with `aoe migrate`.",
             affected_rows.len()
         ));
+    } else if !announce && only.is_none() {
+        // A bare start copies nothing, so without this it would also say
+        // nothing, and the first later launch would pay for a move the user
+        // was never warned about.
+        if let Some(notice) = pending_work_notice(affected_rows.len(), held_row_count) {
+            progress::notice(notice);
+        }
     }
     if !needs_registry_write
         && cohorts.is_empty()
@@ -950,7 +957,7 @@ fn run_in(
         progress::notice(match (left, held_row_count) {
             (0, 0) => format!("{done} sandboxed session(s) now use private agent stores."),
             (0, held) => format!(
-                "{done} sandboxed session(s) now use private agent stores. {held} trashed or archived session(s) stay on the shared store; each moves when it is started, or restore or unarchive it and run `aoe migrate`."
+                "{done} sandboxed session(s) now use private agent stores. {held} trashed or archived session(s) stay on the shared agent store; each moves when it is started, or restore or unarchive it and run `aoe migrate`."
             ),
             (left, 0) => format!(
                 "{done} sandboxed session(s) moved to private agent stores, {left} still pending; the move resumes on a later start or with `aoe migrate`."
@@ -974,6 +981,23 @@ fn run_in(
         sync_parent(&journal)?;
     }
     Ok(())
+}
+
+/// The one line a bare start says about work it left pending: `movable`
+/// rows move on their next launch or under `aoe migrate`, and `held` ones
+/// (trashed or archived) only once they are launched or brought back. A
+/// held-only backlog says nothing: nothing the user can do now clears it,
+/// and a line on every command that never goes away is noise.
+fn pending_work_notice(movable: usize, held: usize) -> Option<String> {
+    match (movable, held) {
+        (0, _) => None,
+        (movable, 0) => Some(format!(
+            "{movable} sandboxed session(s) still use the shared agent store; each moves when it is next started, or run `aoe migrate` to move them now."
+        )),
+        (movable, held) => Some(format!(
+            "{movable} sandboxed session(s) still use the shared agent store, plus {held} trashed or archived; each moves when it is next started, or run `aoe migrate` to move the {movable} now."
+        )),
+    }
 }
 
 fn transition_paths(row: &Value) -> Result<Option<Vec<(PathBuf, PathBuf)>>> {
@@ -1774,6 +1798,82 @@ mod tests {
         let pending: Value =
             serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
         assert_eq!(pending[0]["sandbox_store_generation"], 1);
+    }
+
+    /// A bare start defers every copy, so its only output is the count of
+    /// what it left pending: movable rows, with held (trashed or archived)
+    /// rows counted beside them. A held-only backlog and a machine with
+    /// nothing pending both say nothing.
+    #[test]
+    #[serial_test::serial]
+    fn a_bare_start_reports_pending_rows_without_copying() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        let home = dirs::home_dir().unwrap();
+        fs::create_dir_all(&app).unwrap();
+        fs::create_dir_all(home.join(".gemini/sandbox/history")).unwrap();
+        fs::write(home.join(".gemini/sandbox/history/id.json"), b"legacy").unwrap();
+        let movable = |id: &str| serde_json::json!({"id": id, "tool": "gemini", "sandbox_info": {"enabled": true}});
+        let held = |id: &str| {
+            serde_json::json!({"id": id, "tool": "gemini", "sandbox_info": {"enabled": true},
+                "archived_at": "2026-09-05T00:00:00Z"})
+        };
+        let current = serde_json::json!({"id": "cccccccccccccccc", "tool": "gemini",
+            "sandbox_info": {"enabled": true}, "sandbox_store_generation": 2});
+        let cases: [(&str, Vec<Value>, Option<&str>); 4] = [
+            ("movable only", vec![movable("aaaaaaaaaaaaaaaa"), movable("bbbbbbbbbbbbbbbb")],
+                Some("2 sandboxed session(s) still use the shared agent store; each moves")),
+            ("held only", vec![held("aaaaaaaaaaaaaaaa")], None),
+            ("mixed", vec![movable("aaaaaaaaaaaaaaaa"), held("bbbbbbbbbbbbbbbb"), current.clone()],
+                Some("1 sandboxed session(s) still use the shared agent store, plus 1 trashed or archived")),
+            ("nothing pending", vec![current.clone()], None),
+        ];
+        for (name, rows, expected) in cases {
+            let _ = fs::remove_file(app.join(JOURNAL));
+            fs::write(
+                app.join("sessions.json"),
+                serde_json::to_vec(&rows).unwrap(),
+            )
+            .unwrap();
+            let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = events.clone();
+            let guard = progress::install(Some(std::sync::Arc::new(move |event| {
+                sink.lock().unwrap().push(event)
+            })));
+            super::run_in(
+                &app,
+                &home,
+                &|_| panic!("a bare start must not probe containers"),
+                &|_| panic!("a bare start must not reap containers"),
+                true,
+                false,
+                None,
+            )
+            .unwrap();
+            drop(guard);
+            let notices: Vec<String> = events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|event| match event {
+                    progress::Event::Notice(line) => Some(line.clone()),
+                    _ => None,
+                })
+                .collect();
+            match expected {
+                Some(expected) => {
+                    assert_eq!(notices.len(), 1, "{name}: {notices:?}");
+                    assert!(notices[0].contains(expected), "{name}: {notices:?}");
+                    assert!(notices[0].contains("aoe migrate"), "{name}: {notices:?}");
+                }
+                None => assert!(notices.is_empty(), "{name}: {notices:?}"),
+            }
+            assert!(
+                !home.join(".gemini/sandbox-v2").exists(),
+                "{name}: a bare start must not copy"
+            );
+        }
     }
 
     #[test]
