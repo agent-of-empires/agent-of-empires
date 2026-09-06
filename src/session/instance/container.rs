@@ -138,6 +138,7 @@ impl Instance {
                 ),
             }
         }
+        self.warn_legacy_agent_config_mounts();
         let _transition_lock =
             if self.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION {
                 Some(crate::session::acquire_storage_shared_flock(
@@ -315,6 +316,35 @@ impl Instance {
         container_config::compute_volume_paths(Path::new(&self.project_path), &self.project_path)
             .map(|(_, wd)| wd)
             .unwrap_or_else(|_| "/workspace".to_string())
+    }
+
+    fn warn_legacy_agent_config_mounts(&self) {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        let Ok(config) =
+            crate::session::config::profile_config::resolve_config(&self.effective_profile())
+        else {
+            return;
+        };
+        let Some(directory) = config.session.agent_config_dir_for(&self.tool, &home) else {
+            return;
+        };
+        if let Some(entry) = config.sandbox.extra_volumes.iter().find(|entry| {
+            entry
+                .split_once(':')
+                .is_some_and(|(source, _)| Path::new(source).starts_with(&directory))
+        }) {
+            tracing::warn!(
+                target: "session.profile",
+                agent = %self.tool,
+                agent_config_dir = %directory.display(),
+                extra_volume = %entry,
+                "sandbox.extra_volumes includes a source in the declared agent_config_dir tree; \
+                 manual agent-config mounts may bypass per-session isolation and staged folder trust. \
+                 Remove manual agent-config mounts and, inside the sandbox, preserve AoE-provided config-dir variables"
+            );
+        }
     }
 
     pub(super) fn build_container_config(&self) -> Result<crate::containers::ContainerConfig> {
@@ -508,5 +538,129 @@ mod tests {
         let pinned = "/workspace/myrepo-worktrees/contexec".to_string();
         inst.sandbox_info.as_mut().unwrap().container_workdir = Some(pinned.clone());
         assert_eq!(inst.container_workdir(), pinned);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
+    fn legacy_agent_config_mount_warns_once_for_selected_profile_and_agent() {
+        use std::fs;
+        use std::sync::Mutex;
+
+        let home = tempfile::TempDir::new().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+        let (_hooks, _, _hook_dir) = crate::hooks::test_support::BaseGuard::ready();
+        let profile = "sandbox-store-diagnostic";
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(profile);
+        let app_dir = crate::session::get_app_dir().unwrap();
+        fs::write(
+            app_dir.join("config.toml"),
+            r#"
+[session.custom_agents]
+claude-personal = "claude"
+[session.agent_detect_as]
+claude-personal = "claude"
+[session.agent_config_dir]
+claude-personal = "~/.claude-global"
+"#,
+        )
+        .unwrap();
+        let profile_path =
+            crate::session::config::profile_config::get_profile_config_path(profile).unwrap();
+        fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+        let declared = home.path().join("account");
+        let legacy = declared.join("sandbox");
+        fs::create_dir_all(&legacy).unwrap();
+        let legacy_json = r#"{"hasCompletedOnboarding":true}"#;
+        fs::write(legacy.join(".claude.json"), legacy_json).unwrap();
+        let source = declared.display();
+        let cases = [
+            (
+                "descendants",
+                "claude-personal",
+                vec![
+                    format!("{source}/sandbox:/root/legacy-account"),
+                    format!("{source}/templates:/templates:ro"),
+                ],
+                1,
+            ),
+            (
+                "root",
+                "claude-personal",
+                vec![format!("{source}:/account")],
+                1,
+            ),
+            (
+                "boundaries",
+                "claude-personal",
+                vec![
+                    format!("{source}-other:/root/.claude"),
+                    format!("/outside:{source}/sandbox"),
+                    format!("{source}/sandbox"),
+                ],
+                0,
+            ),
+            (
+                "other-agent",
+                "another-agent",
+                vec![format!("{source}/sandbox:/root/legacy-account")],
+                0,
+            ),
+        ];
+        let mut instance = Instance::new("diagnostic", home.path().to_str().unwrap());
+        instance.tool = "claude-personal".to_string();
+        instance.source_profile = profile.to_string();
+        instance.sandbox_info = Some(SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "diagnostic".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        });
+        for (case, declared_agent, entries, expected) in cases {
+            fs::write(
+                &profile_path,
+                format!(
+                    "[session.agent_config_dir]\n{declared_agent} = \"~/account\"\n[sandbox]\nextra_volumes = {entries:?}\n"
+                ),
+            )
+            .unwrap();
+            let log_path = home.path().join(format!("{case}.log"));
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .without_time()
+                .with_ansi(false)
+                .with_writer(Mutex::new(fs::File::create(&log_path).unwrap()))
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                instance.warn_legacy_agent_config_mounts();
+                if case == "descendants" {
+                    // Preparing the config again must not duplicate the diagnostic.
+                    for _ in 0..2 {
+                        instance.build_container_config().unwrap();
+                    }
+                }
+            });
+            let logs = fs::read_to_string(log_path).unwrap();
+            let warnings: Vec<_> = logs.lines().collect();
+            assert_eq!(warnings.len(), expected, "{case}: {logs}");
+            if expected == 1 {
+                let warning = warnings[0];
+                assert!(warning.contains("WARN") && warning.contains("session.profile"));
+                assert!(warning.contains("agent=claude-personal"), "{warning}");
+                assert!(
+                    warning.contains(&format!("agent_config_dir={source}")),
+                    "{warning}"
+                );
+                assert!(warning.contains(&entries[0]), "{warning}");
+            }
+        }
+        assert_eq!(
+            fs::read_to_string(legacy.join(".claude.json")).unwrap(),
+            legacy_json
+        );
     }
 }

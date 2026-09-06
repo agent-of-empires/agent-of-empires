@@ -301,6 +301,20 @@ agent's config and history under `sandbox-v2/<instance-id>` inside the agent's c
 the agent's usual config path, so credentials, hooks and conversation history
 belong to one session and `aoe` can resume the right conversation.
 
+**Upgrading wrappers with `agent_config_dir`:** older configurations manually
+mounted `<dir>/sandbox` through `sandbox.extra_volumes`. AoE now mounts
+`<dir>/sandbox-v2/<instance-id>` itself and supplies the agent's config-dir
+environment. The store migration does not rewrite wrappers or manual mounts.
+Remove manual agent-config mounts from `extra_volumes` and, inside the sandbox,
+let the wrapper preserve AoE's config-dir variables (for example,
+`CLAUDE_CONFIG_DIR`). Keep host-only account selection outside the sandbox.
+A wrapper that overwrites these variables can read the old store instead of
+the prepared one, without its seeded folder-trust record, even if the old
+mount uses a different container path. AoE warns once per container preparation
+when an extra-volume source is the declared config directory or a child of it;
+this signals a risk, not proof that the wrapper reads that mount. See
+[One CLI, two accounts](configuration.md#one-cli-two-accounts).
+
 Sessions created before this layout shared one agent store per agent (for
 example `~/.claude/sandbox`). Each one moves when you start it: AoE copies the
 shared store into that session's private directory, removes its stopped
