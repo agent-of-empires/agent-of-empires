@@ -1,4 +1,4 @@
-//! Integration tests for the runner's control-only v4 transport.
+//! Integration tests for the runner's control-only v3 transport.
 //!
 //! The scenarios spawn real `aoe __acp-runner` processes with deterministic
 //! stand-in agents and exercise framed handshake, forward-lane, reverse-lane,
@@ -124,7 +124,7 @@ fn read_frame(stream: &mut UnixStream) -> serde_json::Value {
     serde_json::from_slice(&body).expect("parse frame json")
 }
 
-/// The v4 core loop over real sockets and framing: an
+/// The v3 core loop over real sockets and framing: an
 /// agent-issued request reaches the daemon as a `ServerCall`, and the
 /// daemon's `ServerResult` reaches the agent as a JSON-RPC response echoing
 /// the agent's own id.
@@ -179,7 +179,7 @@ fn runner_proxies_agent_requests_over_the_control_channel() {
     // #2977: the relay socket is retired, so the runner must NOT create it.
     assert!(
         !socket.exists(),
-        "a v4 runner must not bind the retired raw socket at {}",
+        "a v3 runner must not bind the retired raw socket at {}",
         socket.display()
     );
 
@@ -188,11 +188,11 @@ fn runner_proxies_agent_requests_over_the_control_channel() {
     let hello = read_frame(&mut ctl);
     assert_eq!(hello["kind"], "hello", "first control frame is Hello");
     assert_eq!(hello["session_id"], session_id);
-    assert_eq!(hello["control_protocol_version"], 4);
+    assert_eq!(hello["control_protocol_version"], 3);
 
     write_frame(
         &mut ctl,
-        &serde_json::json!({"kind": "attach", "control_protocol_version": 4}),
+        &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
     );
 
     // Drive an agent-to-client request through cat. `fs/read_text_file` goes
@@ -397,7 +397,7 @@ for line in sys.stdin:
     assert_eq!(read_frame(&mut stalled)["kind"], "hello");
     write_frame(
         &mut stalled,
-        &serde_json::json!({"kind": "attach", "control_protocol_version": 4}),
+        &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
     );
     std::thread::sleep(Duration::from_millis(2500));
 
@@ -408,7 +408,7 @@ for line in sys.stdin:
     assert_eq!(read_frame(&mut accepted)["kind"], "hello");
     write_frame(
         &mut accepted,
-        &serde_json::json!({"kind": "attach", "control_protocol_version": 4}),
+        &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
     );
     let buffered = read_frame(&mut accepted);
     assert_eq!(buffered["kind"], "notify", "got {buffered}");
@@ -523,7 +523,7 @@ for line in sys.stdin:
     assert_eq!(read_frame(&mut ctl)["kind"], "hello");
     write_frame(
         &mut ctl,
-        &serde_json::json!({"kind": "attach", "control_protocol_version": 4}),
+        &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
     );
     write_frame(
         &mut ctl,
@@ -584,7 +584,7 @@ for line in sys.stdin:
     assert_eq!(read_frame(&mut resumed)["kind"], "hello");
     write_frame(
         &mut resumed,
-        &serde_json::json!({"kind": "attach", "control_protocol_version": 4}),
+        &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
     );
     assert_eq!(
         read_typed_frame(&mut resumed),
@@ -700,7 +700,7 @@ for line in sys.stdin:
     wait_for(&control, "old control socket");
     assert!(
         !socket.exists(),
-        "a v4 runner must not bind the retired raw socket at {}",
+        "a v3 runner must not bind the retired raw socket at {}",
         socket.display()
     );
     let old_agent_pid = wait_for_u32(&agent_pid_file, "old agent pid");
@@ -770,7 +770,7 @@ for line in sys.stdin:
     assert_eq!(read_frame(&mut ctl)["kind"], "hello");
     write_frame(
         &mut ctl,
-        &serde_json::json!({"kind": "attach", "control_protocol_version": 4}),
+        &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
     );
     write_frame(
         &mut ctl,
@@ -821,7 +821,7 @@ for line in sys.stdin:
     drop(replacement);
 }
 
-/// The runner owns the ACP handshake. Drive it as a v4
+/// The runner owns the ACP handshake. Drive it as a v3
 /// daemon over the control channel across two attaches and assert the
 /// agent is handshaken (initialize + session/new) exactly once, that the
 /// second attach replays the cache without touching the agent, and that a
@@ -914,7 +914,7 @@ for line in sys.stdin:
     wait_for(&record, "registry record");
     wait_for(&control, "control socket");
 
-    let v4 = serde_json::json!(4);
+    let v3 = serde_json::json!(3);
 
     // --- First attach: the runner runs the handshake against the agent. ---
     {
@@ -922,11 +922,11 @@ for line in sys.stdin:
         ctl.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         let hello = read_frame(&mut ctl);
         assert_eq!(hello["kind"], "hello");
-        assert_eq!(hello["control_protocol_version"], v4);
+        assert_eq!(hello["control_protocol_version"], v3);
 
         write_frame(
             &mut ctl,
-            &serde_json::json!({"kind": "attach", "control_protocol_version": 4}),
+            &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
         );
         write_frame(
             &mut ctl,
@@ -963,7 +963,7 @@ for line in sys.stdin:
 
         write_frame(
             &mut ctl,
-            &serde_json::json!({"kind": "attach", "control_protocol_version": 4}),
+            &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
         );
         let replayed = read_typed_frame(&mut ctl);
         assert_eq!(replayed["kind"], "prompt_completed");
@@ -1070,7 +1070,7 @@ fn runner_load_uses_requested_id_and_caches_response() {
         assert_eq!(read_frame(&mut ctl)["kind"], "hello");
         write_frame(
             &mut ctl,
-            &serde_json::json!({"kind": "attach", "control_protocol_version": 4}),
+            &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
         );
         write_frame(
             &mut ctl,
@@ -1097,7 +1097,7 @@ fn runner_load_uses_requested_id_and_caches_response() {
         assert_eq!(read_frame(&mut ctl)["kind"], "hello");
         write_frame(
             &mut ctl,
-            &serde_json::json!({"kind": "attach", "control_protocol_version": 4}),
+            &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
         );
         write_frame(
             &mut ctl,
@@ -1236,7 +1236,7 @@ for line in sys.stdin:
 
     write_frame(
         &mut ctl,
-        &serde_json::json!({"kind": "attach", "control_protocol_version": 4}),
+        &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
     );
     write_frame(
         &mut ctl,

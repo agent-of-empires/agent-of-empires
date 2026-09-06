@@ -110,7 +110,7 @@ impl AcpError {
     }
 }
 
-/// Build a crate error for a control v4 handshake failure.
+/// Build a crate error for a control v3 handshake failure.
 pub(super) fn acp_internal_error(message: String) -> agent_client_protocol::Error {
     let mut err = agent_client_protocol::Error::internal_error();
     err.message = message;

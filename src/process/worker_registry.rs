@@ -33,14 +33,14 @@ use crate::util::now_secs;
 pub use crate::process::worker::{is_pid_alive, validate_id as validate_session_id};
 
 /// Generation of the runner protocol and ownership semantics this daemon speaks.
-/// Generation 4 adds cache-only session resume after outstanding resets settle.
+/// Generation 3 terminates ACP in the runner over the control-only transport.
 /// Earlier generations cannot be attached safely.
 ///
 /// This is deliberately separate from `is_record_live`: a wrong-generation
 /// process is still live and must be reaped before its replacement starts.
 /// Build-stale workers of the current generation remain attachable and may
 /// drain an in-flight turn before replacement.
-pub const RUNNER_VERSION: u32 = 4;
+pub const RUNNER_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerRecord {

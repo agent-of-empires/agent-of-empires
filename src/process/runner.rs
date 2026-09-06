@@ -2,7 +2,7 @@
 //! subprocess and outlives `aoe serve`.
 //!
 //! The detached runner writes its registry record, spawns a stdio-only ACP
-//! agent, and exposes the framed v4 protocol on `<session_id>.control.sock`.
+//! agent, and exposes the framed v3 protocol on `<session_id>.control.sock`.
 //! It owns the ACP handshake, forwards both RPC directions, buffers outbound
 //! control frames while detached, and accepts the next daemon connection
 //! without restarting an established agent session.
@@ -1880,7 +1880,7 @@ async fn await_handshake_or_control_loss<T>(
     }
 }
 
-/// Handle one v4 control-channel attachment. Reads directly from the socket,
+/// Handle one v3 control-channel attachment. Reads directly from the socket,
 /// which applies transport backpressure instead of treating a valid burst as a
 /// protocol failure. The writer is supervised in every socket-read wait, so a
 /// stalled peer releases the serial accept slot when its write deadline fires.

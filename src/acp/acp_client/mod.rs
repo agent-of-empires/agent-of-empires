@@ -76,7 +76,7 @@ use tracing::Instrument;
 
 use self::commands::{ClientCmd, ConnectMode};
 use self::connection::run_connection_task;
-use self::control::{connect_runner_control_v4, ShutdownControlOnDrop};
+use self::control::{connect_runner_control_v3, ShutdownControlOnDrop};
 use self::delete::ACP_SESSION_DELETE_TIMEOUT;
 use self::handshake::wait_for_handshake;
 use self::lifecycle::TerminalClaim;
@@ -521,7 +521,7 @@ impl AcpClient {
     ) -> Result<Self, AcpError> {
         // As of #2977 the control socket is the only one a runner binds, so
         // that is what the daemon dials. The wait for it to appear happens
-        // inside `connect_runner_control_v4` below rather than here: probing
+        // inside `connect_runner_control_v3` below rather than here: probing
         // with a throwaway connection would look to the runner like a daemon
         // attaching and immediately detaching, churning its attach
         // bookkeeping and running a spurious disconnect sweep.
@@ -582,7 +582,7 @@ impl AcpClient {
                 ..
             }
         )));
-        let (control_client, crate_transport) = connect_runner_control_v4(
+        let (control_client, crate_transport) = connect_runner_control_v3(
             &control_path,
             event_tx.clone(),
             session_label.clone(),

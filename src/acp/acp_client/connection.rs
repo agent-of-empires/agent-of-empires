@@ -32,7 +32,7 @@ use super::config_options::{
     config_options_event, dispatch_set_config_option, dispatch_set_mode, mode_config_id,
     thought_level_config_id, ConfigOptionDispatchPurpose,
 };
-use super::control::{establish_session_v4, prompt_outcome_to_response, DaemonControlClient};
+use super::control::{establish_session_v3, prompt_outcome_to_response, DaemonControlClient};
 use super::delete::handle_delete_session_cmd;
 use super::errors::{acp_internal_error, AcpError, IncompatibleAgentError};
 use super::fs_handlers::{handle_read_text_file, handle_write_text_file};
@@ -147,7 +147,7 @@ pub(super) async fn run_connection_task<W, R>(
     // watchdogs stand down. Direct stdio creates its own guard.
     external_terminal_guard: Option<Arc<TerminalClaim>>,
     external_prompt_in_flight: Option<Arc<std::sync::atomic::AtomicBool>>,
-    // Control protocol v4 client for detached runners. The runner owns the
+    // Control protocol v3 client for detached runners. The runner owns the
     // handshake and prompt; the synthetic crate transport maps all remaining
     // ACP requests and notifications onto the same typed control socket.
     // Direct stdio has no control client and speaks ACP on its process pipes.
@@ -778,7 +778,7 @@ pub(super) async fn run_connection_task<W, R>(
         )
         .connect_with(transport, |connection: ConnectionTo<Agent>| async move {
             info!(target: "acp.protocol", session = %session_label, "initializing ACP agent");
-            // A detached v4 runner owns `initialize` and caches its result, so
+            // A detached v3 runner owns `initialize` and caches its result, so
             // the daemon requests it over the control channel. Direct stdio
             // sends the same request through the crate connection.
             let init: InitializeResponse = if let Some(control) = control_client.as_ref() {
@@ -992,10 +992,10 @@ pub(super) async fn run_connection_task<W, R>(
                         );
                         let req = ForkSessionRequest::new(parent.clone(), agent_cwd.clone())
                             .mcp_servers(mcp_servers.clone());
-                        // Detached v4 runners own session creation; direct stdio
+                        // Detached v3 runners own session creation; direct stdio
                         // sends the request through the crate connection.
                         let fork_result = if let Some(control) = control_client.as_ref() {
-                            establish_session_v4::<ForkSessionResponse>(
+                            establish_session_v3::<ForkSessionResponse>(
                                 control,
                                 "session/fork",
                                 &req,
@@ -1140,9 +1140,9 @@ pub(super) async fn run_connection_task<W, R>(
                             }
                             let req = LoadSessionRequest::new(stored.clone(), agent_cwd.clone())
                                 .mcp_servers(mcp_servers.clone());
-                            // Detached v4 runners own session/load.
+                            // Detached v3 runners own session/load.
                             let load_result = if let Some(control) = control_client.as_ref() {
-                                establish_session_v4::<LoadSessionResponse>(
+                                establish_session_v3::<LoadSessionResponse>(
                                     control,
                                     "session/load",
                                     &req,
@@ -1251,9 +1251,9 @@ pub(super) async fn run_connection_task<W, R>(
                         );
                         let req =
                             NewSessionRequest::new(agent_cwd.clone()).mcp_servers(mcp_servers);
-                        // Detached v4 runners own session/new.
+                        // Detached v3 runners own session/new.
                         let new_session = if let Some(control) = control_client.as_ref() {
-                            establish_session_v4::<NewSessionResponse>(control, "session/new", &req)
+                            establish_session_v3::<NewSessionResponse>(control, "session/new", &req)
                                 .await?
                         } else {
                             connection.send_request(req).block_task().await?
@@ -1435,7 +1435,7 @@ pub(super) async fn run_connection_task<W, R>(
                 );
             }
 
-            // Send cancellation through control v4 when the runner owns the
+            // Send cancellation through control v3 when the runner owns the
             // turn, otherwise through the direct-stdio crate connection. The
             // macro preserves each callsite's error-handling shape.
             macro_rules! send_session_cancel {
@@ -1733,7 +1733,7 @@ pub(super) async fn run_connection_task<W, R>(
                         tokio::pin!(silent_orphan_check);
 
                         let prompt_started_at_ms = chrono::Utc::now().timestamp_millis();
-                        // Detached v4 runners receive the prompt over control;
+                        // Detached v3 runners receive the prompt over control;
                         // direct stdio uses the crate connection. Both arms
                         // resolve to the same `Result<PromptResponse, Error>`.
                         // Boxed as an Unpin future for the select below.

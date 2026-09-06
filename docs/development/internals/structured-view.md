@@ -10,7 +10,7 @@ Workers run as detached `aoe __acp-runner` processes that outlive the daemon. `a
 
 Each runner registers at `<app_dir>/acp-workers/<session_id>.json` (PID, socket path, cached ACP session id, `build_version`, `runner_version`); the same dir holds the per-session `.control.sock` and `.log` (runner stderr drain). `aoe ps --acp --dead` lists them.
 
-The runner is the ACP protocol terminator. It owns the handshake, the turn, and every JSON-RPC id on the agent stdin; the daemon uses length-framed control protocol v4 over `<session_id>.control.sock`. The legacy `<session_id>.sock` remains only as a path derivation base and a liveness probe for generation 1 records.
+The runner is the ACP protocol terminator. It owns the handshake, the turn, and every JSON-RPC id on the agent stdin; the daemon uses length-framed control protocol v3 over `<session_id>.control.sock`. The legacy `<session_id>.sock` remains only as a path derivation base and a liveness probe for generation 1 records.
 
 Because notifications and turn completion now share one ordered channel, a turn's terminal event can no longer overtake the chunks that preceded it, which was possible while the two travelled over separate sockets.
 

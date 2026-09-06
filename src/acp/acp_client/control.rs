@@ -1,4 +1,4 @@
-//! The v4 runner control socket: connecting, establishing a session, and
+//! The v3 runner control socket: connecting, establishing a session, and
 //! routing ACP frames over it.
 
 use crate::acp::control_protocol::{self, ControlBody};
@@ -28,7 +28,7 @@ impl Drop for ShutdownControlOnDrop {
         }
     }
 }
-/// Bidirectional client for a v4 runner control socket. The runner owns the
+/// Bidirectional client for a v3 runner control socket. The runner owns the
 /// handshake and turn; the daemon drives them over this channel.
 ///
 /// `initialize` / `session/*` responses arrive sequentially on
@@ -224,9 +224,9 @@ impl DaemonControlClient {
     }
 }
 
-/// Dial and validate one v4 runner control socket. Retry only startup races;
+/// Dial and validate one v3 runner control socket. Retry only startup races;
 /// preserve all permanent I/O, framing, identity, and version failures.
-pub(super) async fn connect_runner_control_v4(
+pub(super) async fn connect_runner_control_v3(
     control_path: &std::path::Path,
     event_tx: mpsc::Sender<Event>,
     session_label: String,
@@ -296,7 +296,7 @@ pub(super) async fn connect_runner_control_v4(
     info!(
         target: "acp.protocol",
         session = %session_label,
-        "runner control channel v4 attached; runner owns the ACP protocol"
+        "runner control channel v3 attached; runner owns the ACP protocol"
     );
 
     // The crate connection's synthetic transport. `crate_side` is handed to
@@ -662,12 +662,12 @@ pub(super) fn control_outcome_reason(
     }
 }
 
-/// Drive a session-creation request over control protocol v4 and
+/// Drive a session-creation request over control protocol v3 and
 /// deserialize the runner's cached result into the crate response type,
 /// so each `session/new|load|fork` site's `Result<Resp, Error>` matches
 /// the crate `send_request` path it replaces (including the failure path:
 /// the runner-forwarded agent error propagates verbatim).
-pub(super) async fn establish_session_v4<Resp: serde::de::DeserializeOwned>(
+pub(super) async fn establish_session_v3<Resp: serde::de::DeserializeOwned>(
     control: &DaemonControlClient,
     method: &str,
     request: &impl serde::Serialize,
@@ -681,7 +681,7 @@ pub(super) async fn establish_session_v4<Resp: serde::de::DeserializeOwned>(
 
 /// Adapt a runner-reported [`PromptOutcome`](control_protocol::PromptOutcome)
 /// into the `Result<PromptResponse, Error>` the prompt loop already
-/// consumes, so the loop body is identical for control v4 and direct stdio.
+/// consumes, so the loop body is identical for control v3 and direct stdio.
 /// A completed turn maps to its `StopReason`; an agent
 /// error-envelope reconstructs a crate `Error` (preserving `data` so
 /// `classify_rate_limit_error` still recognizes a rate limit); an aborted
@@ -779,7 +779,7 @@ mod tests {
         });
 
         let (event_tx, _) = mpsc::channel::<Event>(1);
-        let (_, crate_side) = connect_runner_control_v4(
+        let (_, crate_side) = connect_runner_control_v3(
             &control,
             event_tx,
             "oversize".into(),
@@ -847,7 +847,7 @@ mod tests {
             ));
         });
 
-        let (client, crate_side) = connect_runner_control_v4(
+        let (client, crate_side) = connect_runner_control_v3(
             &control,
             mpsc::channel::<Event>(1).0,
             "eof".into(),
@@ -946,7 +946,7 @@ mod tests {
         // Set, as a stranded prompt loop would leave it: the reader must hand
         // idle ownership back when it surfaces the waiterless completion.
         let prompt_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let client = connect_runner_control_v4(
+        let client = connect_runner_control_v3(
             &crate::process::worker::control_socket_sibling(&main_socket),
             event_tx,
             "s".into(),
@@ -954,7 +954,7 @@ mod tests {
             prompt_in_flight.clone(),
         )
         .await
-        .expect("v4 control client")
+        .expect("v3 control client")
         .0;
 
         let ev = tokio::time::timeout(std::time::Duration::from_secs(5), event_rx.recv())
@@ -1010,7 +1010,7 @@ mod tests {
         });
 
         let (event_tx, mut event_rx) = mpsc::channel::<Event>(8);
-        let (client, _) = connect_runner_control_v4(
+        let (client, _) = connect_runner_control_v3(
             &control,
             event_tx,
             "rate".into(),
@@ -1068,7 +1068,7 @@ mod tests {
 
         let (event_tx, mut event_rx) = mpsc::channel::<Event>(8);
         let guard = Arc::new(TerminalClaim::new());
-        let client = connect_runner_control_v4(
+        let client = connect_runner_control_v3(
             &crate::process::worker::control_socket_sibling(&main_socket),
             event_tx,
             "s".into(),
@@ -1121,7 +1121,7 @@ mod tests {
 
         let (event_tx, mut event_rx) = mpsc::channel::<Event>(8);
         let guard = Arc::new(TerminalClaim::new());
-        let client = connect_runner_control_v4(
+        let client = connect_runner_control_v3(
             &crate::process::worker::control_socket_sibling(&main_socket),
             event_tx,
             "s".into(),
@@ -1151,7 +1151,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let control = tmp.path().join("x".repeat(200));
         let (event_tx, _event_rx) = mpsc::channel::<Event>(1);
-        let result = connect_runner_control_v4(
+        let result = connect_runner_control_v3(
             &control,
             event_tx,
             "s".into(),
