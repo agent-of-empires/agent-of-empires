@@ -658,6 +658,7 @@ async fn list_sessions_shares_config_resolution_across_overlays() {
 #[tokio::test]
 #[serial_test::serial]
 async fn list_sessions_state_filter() {
+    let _guard = crate::session::test_support::isolate_app_dir();
     let mut live = Instance::new("live", "/tmp/scope-live");
     live.id = "scope-live".to_string();
     let mut trashed = Instance::new("trashed", "/tmp/scope-trashed");
@@ -673,9 +674,15 @@ async fn list_sessions_state_filter() {
         archived.clone(),
     ]);
 
-    let ids = |envelope: &SessionsEnvelope| -> Vec<String> {
-        envelope.sessions.iter().map(|s| s.id.clone()).collect()
-    };
+    async fn ids(response: Json<SessionsEnvelope>) -> Vec<String> {
+        let response = response.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let envelope: crate::daemon::SessionsEnvelope = serde_json::from_slice(&body).unwrap();
+        envelope.sessions.into_iter().map(|s| s.id).collect()
+    }
 
     let all = list_sessions(
         axum::extract::State(state.clone()),
@@ -683,9 +690,8 @@ async fn list_sessions_state_filter() {
     )
     .await;
     assert_eq!(
-        ids(&all).len(),
-        3,
-        "no param stays unfiltered (back-compat)"
+        ids(all).await,
+        ["scope-live", "scope-trashed", "scope-archived"]
     );
 
     let live_only = list_sessions(
@@ -695,7 +701,7 @@ async fn list_sessions_state_filter() {
         }),
     )
     .await;
-    assert_eq!(ids(&live_only), vec!["scope-live".to_string()]);
+    assert_eq!(ids(live_only).await, ["scope-live"]);
 
     let trashed_only = list_sessions(
         axum::extract::State(state.clone()),
@@ -704,7 +710,7 @@ async fn list_sessions_state_filter() {
         }),
     )
     .await;
-    assert_eq!(ids(&trashed_only), vec!["scope-trashed".to_string()]);
+    assert_eq!(ids(trashed_only).await, ["scope-trashed"]);
 
     let explicit_all = list_sessions(
         axum::extract::State(state),
@@ -713,7 +719,10 @@ async fn list_sessions_state_filter() {
         }),
     )
     .await;
-    assert_eq!(ids(&explicit_all).len(), 3);
+    assert_eq!(
+        ids(explicit_all).await,
+        ["scope-live", "scope-trashed", "scope-archived"]
+    );
 }
 
 #[tokio::test]

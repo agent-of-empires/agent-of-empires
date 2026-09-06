@@ -117,13 +117,9 @@ async fn serve_once(wire_response: Vec<u8>) -> (String, tokio::task::JoinHandle<
 
         let request = String::from_utf8(request).unwrap();
         let mut lines = request.split("\r\n");
-        let target = lines
-            .next()
-            .unwrap()
-            .split_ascii_whitespace()
-            .nth(1)
-            .unwrap()
-            .to_string();
+        let mut request_line = lines.next().unwrap().split_ascii_whitespace();
+        assert_eq!(request_line.next(), Some("GET"));
+        let target = request_line.next().unwrap().to_string();
         let headers = lines
             .take_while(|line| !line.is_empty())
             .filter_map(|line| line.split_once(':'))
