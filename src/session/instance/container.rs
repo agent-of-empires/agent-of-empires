@@ -542,6 +542,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    #[serial_test::serial(hook_base)]
     fn legacy_agent_config_mount_warns_once_for_selected_profile_and_agent() {
         use std::fs;
         use std::sync::Mutex;
