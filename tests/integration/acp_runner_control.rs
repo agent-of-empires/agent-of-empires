@@ -573,7 +573,10 @@ for line in sys.stdin:
         &mut ctl,
         &serde_json::json!({"kind": "prompt", "request": {"sessionId": "sess-dl", "prompt": []}}),
     );
+    let started = read_typed_frame(&mut ctl);
+    assert_eq!(started["kind"], "prompt_started");
     let completion = read_typed_frame(&mut ctl);
+    assert_eq!(completion["prompt_req_id"], started["prompt_req_id"]);
     assert_eq!(completion["kind"], "prompt_completed");
     drop(ctl);
 
@@ -948,7 +951,10 @@ for line in sys.stdin:
             &mut ctl,
             &serde_json::json!({"kind": "prompt", "request": {"sessionId": "sess-fake-1", "prompt": []}}),
         );
+        let started = read_typed_frame(&mut ctl);
+        assert_eq!(started["kind"], "prompt_started");
         let completed = read_typed_frame(&mut ctl);
+        assert_eq!(completed["prompt_req_id"], started["prompt_req_id"]);
         assert_eq!(completed["kind"], "prompt_completed");
         assert_eq!(completed["outcome"]["status"], "completed");
         assert_eq!(completed["outcome"]["stop_reason"], "end_turn");
@@ -1415,4 +1421,145 @@ for line in sys.stdin:
     resumed.shutdown().await.unwrap();
     assert_eq!(assigned.as_deref(), Some("session-2"));
     assert_eq!(addressed.as_deref(), Some("session-2:new-count=2"));
+}
+
+#[tokio::test]
+async fn resumed_prompt_completes_only_for_its_own_runner_request() {
+    use agent_of_empires::acp::state::Event;
+
+    let Some(python3) = find_python3() else {
+        return;
+    };
+    for old_first in [true, false] {
+        let scratch = Scratch::new(if old_first {
+            "prompt-old-first"
+        } else {
+            "prompt-new-first"
+        });
+        let home = scratch.0.join("home");
+        let xdg = scratch.0.join("xdg");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&xdg).unwrap();
+        let received = scratch.0.join("old-received");
+        let agent = scratch.0.join("agent.py");
+        std::fs::write(
+            &agent,
+            r#"import json, sys, pathlib
+received = pathlib.Path(sys.argv[1])
+old_first = sys.argv[2] == "true"
+old = None
+count = 0
+def reply(req, reason):
+    print(json.dumps({"jsonrpc":"2.0","id":req["id"],"result":{"stopReason":reason}}), flush=True)
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    if method == "initialize":
+        result = {"protocolVersion":1,"agentCapabilities":{}}
+    elif method == "session/new":
+        result = {"sessionId":"prompt-session"}
+    elif method == "session/prompt":
+        count += 1
+        if count == 1:
+            old = msg
+            received.write_text("received")
+        elif count == 2:
+            responses = [(old, "cancelled"), (msg, "max_tokens")]
+            for req, reason in responses if old_first else reversed(responses):
+                reply(req, reason)
+        else:
+            reply(msg, "end_turn")
+        continue
+    elif method == "session/cancel":
+        continue
+    else:
+        raise RuntimeError("unexpected method: " + str(method))
+    print(json.dumps({"jsonrpc":"2.0","id":msg["id"],"result":result}), flush=True)
+"#,
+        )
+        .unwrap();
+        let session = "prompt-correlation";
+        let socket = scratch.0.join(format!("{session}.sock"));
+        let control = agent_of_empires::process::worker::control_socket_sibling(&socket);
+        let _runner = KillOnDrop(
+            Command::new(env!("CARGO_BIN_EXE_aoe"))
+                .args([
+                    "__acp-runner",
+                    "--socket",
+                    socket.to_str().unwrap(),
+                    "--session-id",
+                    session,
+                    "--agent-name",
+                    "review-agent",
+                    "--cwd",
+                    home.to_str().unwrap(),
+                    "--",
+                    python3.to_str().unwrap(),
+                    agent.to_str().unwrap(),
+                    received.to_str().unwrap(),
+                    if old_first { "true" } else { "false" },
+                ])
+                .env("HOME", &home)
+                .env("XDG_CONFIG_HOME", &xdg)
+                .spawn()
+                .unwrap(),
+        );
+        wait_for(&control, "control socket");
+        let mut first = UnixStream::connect(&control).unwrap();
+        first
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        assert_eq!(read_frame(&mut first)["kind"], "hello");
+        write_frame(
+            &mut first,
+            &serde_json::json!({"kind":"attach","control_protocol_version":3}),
+        );
+        write_frame(
+            &mut first,
+            &serde_json::json!({"kind":"initialize","request":{"protocolVersion":1}}),
+        );
+        assert_eq!(read_typed_frame(&mut first)["kind"], "initialized");
+        write_frame(
+            &mut first,
+            &serde_json::json!({"kind":"establish_session","method":"session/new","request":{"cwd":home,"mcpServers":[]}}),
+        );
+        assert_eq!(read_typed_frame(&mut first)["kind"], "session_ready");
+        write_frame(
+            &mut first,
+            &serde_json::json!({"kind":"prompt","request":{"sessionId":"prompt-session","prompt":[]}}),
+        );
+        assert_eq!(read_typed_frame(&mut first)["kind"], "prompt_started");
+        wait_for(&received, "old prompt received by agent");
+        drop(first);
+
+        let mut resumed = AcpClient::attach(
+            socket,
+            home,
+            vec![],
+            "prompt-session".into(),
+            true,
+            AcpSessionId(session.into()),
+            None,
+            "review-agent".into(),
+            None,
+        )
+        .await
+        .unwrap();
+        for prompt in ["new prompt", "following prompt"] {
+            resumed.send_prompt(prompt, &[]).await.unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Event::Stopped { reason } =
+                    tokio::time::timeout_at(deadline, resumed.next_event())
+                        .await
+                        .expect("prompt completion deadline")
+                        .expect("event channel closed")
+                {
+                    assert_eq!(reason, "prompt_complete", "old_first={old_first}, {prompt}");
+                    break;
+                }
+            }
+        }
+        resumed.shutdown().await.unwrap();
+    }
 }

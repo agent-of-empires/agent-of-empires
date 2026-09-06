@@ -32,15 +32,28 @@ impl Drop for ShutdownControlOnDrop {
 /// handshake and turn; the daemon drives them over this channel.
 ///
 /// `initialize` / `session/*` responses arrive sequentially on
-/// `handshake_rx`; a turn's `PromptCompleted` is routed to the oneshot in
-/// `completion` when a prompt is awaiting, else (an adopted turn on a
-/// mid-flight resume, where this daemon never issued the prompt) the reader
-/// CAS-claims the terminal guard and fires `Stopped` so the UI clears.
+/// `handshake_rx`; `PromptStarted` binds the local waiter to the runner's
+/// canonical request id, and only its matching `PromptCompleted` resolves it.
+/// Until this attachment issues a local prompt, a waiterless completion can
+/// finish an adopted turn by claiming the terminal guard and firing `Stopped`.
 pub(super) struct DaemonControlClient {
     write: Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
     handshake_rx: Mutex<mpsc::Receiver<ControlBody>>,
-    completion: Arc<std::sync::Mutex<Option<oneshot::Sender<control_protocol::PromptOutcome>>>>,
+    completion: Arc<std::sync::Mutex<PromptCompletion>>,
     raw_fd: RawFd,
+}
+
+enum PromptCompletion {
+    Adopted,
+    Pending {
+        // No completion may resolve this waiter before its attachment-scoped
+        // acknowledgement arrives, including retained history read during send.
+        prompt_req_id: Option<i64>,
+        tx: oneshot::Sender<control_protocol::PromptOutcome>,
+    },
+    // Keep local ownership after delivery: a retained completion can arrive
+    // before the prompt loop receives its outcome and clears prompt_in_flight.
+    LocalIdle,
 }
 
 /// Correlation state for the control-channel transport shim (#2977).
@@ -180,41 +193,44 @@ impl DaemonControlClient {
         }
     }
 
+    /// Transfer terminal ownership before the command loop arms a local turn.
+    pub(super) fn supersede_adopted_turn(&self) {
+        let mut completion = self.completion.lock().expect("completion mutex poisoned");
+        if matches!(*completion, PromptCompletion::Adopted) {
+            *completion = PromptCompletion::LocalIdle;
+        }
+    }
+
     /// Issue a turn: register the completion oneshot, send the `Prompt`
     /// frame, and return the receiver the prompt loop awaits. The runner
-    /// assigns the `session/prompt` id and reports `PromptCompleted`.
+    /// assigns the `session/prompt` id in `PromptStarted` before completing it.
     pub(super) async fn prompt(
         &self,
         request: serde_json::Value,
     ) -> oneshot::Receiver<control_protocol::PromptOutcome> {
         let (tx, rx) = oneshot::channel();
-        let displaced = self
-            .completion
-            .lock()
-            .expect("completion mutex poisoned")
-            .replace(tx);
-        // Installing over an unresolved waiter drops the previous prompt's
-        // receiver, so that turn's loop sees `Err -> Aborted` instead of its
-        // real outcome. It should be impossible (one prompt is in flight at a
-        // time) which is exactly why it is worth a line when it happens: a
-        // stranded prompt future is the leading suspect for a session that
-        // keeps rendering Running with no terminal event. See #3190.
-        if displaced.is_some() {
-            warn!(
-                target: "acp.protocol",
-                "installing a prompt completion waiter over an unresolved one"
-            );
-        } else {
-            debug!(target: "acp.protocol", "prompt completion waiter installed");
+        {
+            let mut completion = self.completion.lock().expect("completion mutex poisoned");
+            if matches!(*completion, PromptCompletion::Pending { .. }) {
+                let _ = tx.send(control_protocol::PromptOutcome::Error {
+                    code: control_protocol::INTERNAL_ERROR as i32,
+                    message: "a local prompt is already awaiting completion".into(),
+                    data: None,
+                });
+                return rx;
+            }
+            *completion = PromptCompletion::Pending {
+                prompt_req_id: None,
+                tx,
+            };
         }
+        debug!(target: "acp.protocol", "prompt completion waiter installed");
         if self.send(ControlBody::Prompt { request }).await.is_err() {
             // Write failed: drop the parked sender so `rx` resolves to Err ->
             // Aborted immediately instead of hanging until the cancel /
             // orphan watchdog eventually unwedges the turn.
-            self.completion
-                .lock()
-                .expect("completion mutex poisoned")
-                .take();
+            *self.completion.lock().expect("completion mutex poisoned") =
+                PromptCompletion::LocalIdle;
         }
         rx
     }
@@ -313,9 +329,7 @@ pub(super) async fn connect_runner_control_v3(
 
     let reader_prompt_in_flight = prompt_in_flight.clone();
     let (hs_tx, hs_rx) = mpsc::channel::<ControlBody>(8);
-    let completion: Arc<
-        std::sync::Mutex<Option<oneshot::Sender<control_protocol::PromptOutcome>>>,
-    > = Arc::new(std::sync::Mutex::new(None));
+    let completion = Arc::new(std::sync::Mutex::new(PromptCompletion::Adopted));
     let reader_completion = completion.clone();
     let reader_session = session_label.clone();
     let reader_shim_write = shim_write.clone();
@@ -333,56 +347,66 @@ pub(super) async fn connect_runner_control_v3(
                         return;
                     }
                 }
-                Ok(Some(ControlBody::PromptCompleted { outcome, .. })) => {
-                    let waiter = reader_completion
-                        .lock()
-                        .expect("completion mutex poisoned")
-                        .take();
+                Ok(Some(ControlBody::PromptStarted { prompt_req_id })) => {
+                    let mut completion = reader_completion.lock().expect("completion mutex poisoned");
+                    if let PromptCompletion::Pending { prompt_req_id: id @ None, .. } = &mut *completion {
+                        *id = Some(prompt_req_id);
+                    }
+                }
+                Ok(Some(ControlBody::PromptCompleted { prompt_req_id, outcome })) => {
+                    let waiter = {
+                        let mut completion = reader_completion.lock().expect("completion mutex poisoned");
+                        match &*completion {
+                            PromptCompletion::Pending { prompt_req_id: Some(id), .. } if *id == prompt_req_id => {
+                                match std::mem::replace(&mut *completion, PromptCompletion::LocalIdle) {
+                                    PromptCompletion::Pending { tx, .. } => Some(tx),
+                                    _ => unreachable!(),
+                                }
+                            }
+                            PromptCompletion::Adopted => {
+                                // Serialize this decision with local turn activation:
+                                // retained history must never clear a new turn's flag.
+                                if !reader_prompt_in_flight.swap(false, AtomicOrdering::Relaxed) {
+                                    debug!(
+                                        target: "acp.protocol",
+                                        session = %reader_session,
+                                        "ignoring replayed PromptCompleted for a durable terminal"
+                                    );
+                                    continue;
+                                }
+                                if !terminal_claim.claim() {
+                                    warn!(
+                                        target: "acp.protocol",
+                                        session = %reader_session,
+                                        "runner reported PromptCompleted after the turn terminal was claimed"
+                                    );
+                                    continue;
+                                }
+                                None
+                            }
+                            _ => continue,
+                        }
+                    };
                     if let Some(tx) = waiter {
                         let _ = tx.send(outcome);
                     } else {
-                        // A waiterless completion belongs to an adopted turn
-                        // only when durable history still marks a prompt in
-                        // flight. A retained runner completion also replays
-                        // after the daemon already committed the terminal;
-                        // that case must be ignored rather than published
-                        // twice. Clearing the flag first hands idle ownership
-                        // back before any terminal event is emitted.
-                        let was_in_flight =
-                            reader_prompt_in_flight.swap(false, AtomicOrdering::Relaxed);
-                        if !was_in_flight {
-                            debug!(
-                                target: "acp.protocol",
-                                session = %reader_session,
-                                "ignoring replayed PromptCompleted for a durable terminal"
-                            );
-                            continue;
-                        }
-                        if terminal_claim.claim() {
-                            debug!(
-                                target: "acp.protocol",
-                                session = %reader_session,
-                                "runner reported PromptCompleted for an adopted turn"
-                            );
-                            let reason = match prompt_outcome_to_response(outcome.clone()) {
-                                Err(error) => {
-                                    if let Some(info) = classify_rate_limit_error(&error, None) {
-                                        let _ = event_tx.send(Event::RateLimit { info }).await;
-                                        "rate_limited".to_string()
-                                    } else {
-                                        control_outcome_reason(&outcome)
-                                    }
+                        debug!(
+                            target: "acp.protocol",
+                            session = %reader_session,
+                            "runner reported PromptCompleted for an adopted turn"
+                        );
+                        let reason = match prompt_outcome_to_response(outcome.clone()) {
+                            Err(error) => {
+                                if let Some(info) = classify_rate_limit_error(&error, None) {
+                                    let _ = event_tx.send(Event::RateLimit { info }).await;
+                                    "rate_limited".to_string()
+                                } else {
+                                    control_outcome_reason(&outcome)
                                 }
-                                Ok(_) => control_outcome_reason(&outcome),
-                            };
-                            let _ = event_tx.send(Event::Stopped { reason }).await;
-                        } else {
-                            warn!(
-                                target: "acp.protocol",
-                                session = %reader_session,
-                                "runner reported PromptCompleted after the turn terminal was claimed"
-                            );
-                        }
+                            }
+                            Ok(_) => control_outcome_reason(&outcome),
+                        };
+                        let _ = event_tx.send(Event::Stopped { reason }).await;
                     }
                 }
                 // #2977 reverse lane: an agent-to-client request. Injected
@@ -462,10 +486,7 @@ pub(super) async fn connect_runner_control_v3(
         }
         }
         .await;
-        reader_completion
-            .lock()
-            .expect("completion mutex poisoned")
-            .take();
+        *reader_completion.lock().expect("completion mutex poisoned") = PromptCompletion::LocalIdle;
         let mut shim_write = reader_shim_write.lock().await;
         let _ = shim_write.shutdown().await;
     });
@@ -720,6 +741,219 @@ pub(super) fn prompt_outcome_to_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct PromptControlPeer {
+        client: Arc<DaemonControlClient>,
+        peer: tokio::net::UnixStream,
+        transport: tokio::io::BufReader<tokio::io::DuplexStream>,
+        events: mpsc::Receiver<Event>,
+        terminal: Arc<TerminalClaim>,
+        in_flight: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for PromptControlPeer {
+        fn drop(&mut self) {
+            self.client.shutdown();
+        }
+    }
+
+    impl PromptControlPeer {
+        async fn new() -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            let socket = tmp.path().join("prompt.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let terminal = Arc::new(TerminalClaim::new());
+            let in_flight = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let (event_tx, events) = mpsc::channel(8);
+            let (client, peer) = tokio::join!(
+                connect_runner_control_v3(
+                    &socket,
+                    event_tx,
+                    "prompt".into(),
+                    terminal.clone(),
+                    in_flight.clone(),
+                ),
+                async {
+                    let (mut peer, _) = listener.accept().await.unwrap();
+                    control_protocol::write_frame(
+                        &mut peer,
+                        &ControlBody::Hello {
+                            control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
+                            session_id: "prompt".into(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    assert!(matches!(
+                        control_protocol::read_frame(&mut peer).await.unwrap(),
+                        Some(ControlBody::Attach { .. })
+                    ));
+                    peer
+                }
+            );
+            let (client, transport) = client.unwrap();
+            Self {
+                client,
+                peer,
+                transport: tokio::io::BufReader::new(transport),
+                events,
+                terminal,
+                in_flight,
+            }
+        }
+
+        async fn send(&mut self, frame: ControlBody) {
+            control_protocol::write_frame(&mut self.peer, &frame)
+                .await
+                .unwrap();
+        }
+
+        async fn prompt(&mut self) -> oneshot::Receiver<control_protocol::PromptOutcome> {
+            let rx = self.client.prompt(serde_json::json!({})).await;
+            assert!(matches!(
+                control_protocol::read_frame(&mut self.peer).await.unwrap(),
+                Some(ControlBody::Prompt { .. })
+            ));
+            rx
+        }
+
+        async fn completed(&mut self, prompt_req_id: i64, reason: &str) {
+            self.send(ControlBody::PromptCompleted {
+                prompt_req_id,
+                outcome: control_protocol::PromptOutcome::Completed {
+                    stop_reason: Some(reason.into()),
+                },
+            })
+            .await;
+        }
+
+        // The reader forwards Notify only after handling every preceding frame.
+        // This is a deterministic barrier, not a sleep-based absence assertion.
+        async fn drain(&mut self) {
+            use tokio::io::AsyncBufReadExt;
+            self.send(ControlBody::Notify {
+                method: "test/barrier".into(),
+                params: serde_json::json!({}),
+            })
+            .await;
+            let mut line = String::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                self.transport.read_line(&mut line),
+            )
+            .await
+            .expect("control reader must reach the notification barrier")
+            .unwrap();
+            let notification: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(notification["method"], "test/barrier");
+        }
+
+        fn assert_local_terminal_ownership(&mut self) {
+            assert!(self.in_flight.load(AtomicOrdering::Relaxed));
+            assert!(!self.terminal.claimed());
+            assert!(matches!(
+                self.events.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn historical_completion_old_first_preserves_local_waiter() {
+        let mut peer = PromptControlPeer::new().await;
+        let mut completion = peer.prompt().await;
+
+        // History can be read after registration but before the runner assigns
+        // the new ID. It must not be mistaken for an adopted completion either.
+        peer.completed(7, "cancelled").await;
+        peer.drain().await;
+        assert!(matches!(
+            completion.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        peer.assert_local_terminal_ownership();
+
+        peer.send(ControlBody::PromptStarted { prompt_req_id: 9 })
+            .await;
+        peer.completed(7, "cancelled").await;
+        peer.drain().await;
+        assert!(matches!(
+            completion.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        peer.assert_local_terminal_ownership();
+
+        peer.completed(9, "end_turn").await;
+        peer.drain().await;
+        assert_eq!(
+            completion.await.unwrap(),
+            control_protocol::PromptOutcome::Completed {
+                stop_reason: Some("end_turn".into()),
+            }
+        );
+        peer.assert_local_terminal_ownership();
+    }
+
+    #[tokio::test]
+    async fn historical_completion_new_first_preserves_local_terminal_ownership() {
+        let mut peer = PromptControlPeer::new().await;
+        let completion = peer.prompt().await;
+        peer.send(ControlBody::PromptStarted { prompt_req_id: 9 })
+            .await;
+        peer.completed(9, "end_turn").await;
+        peer.completed(7, "cancelled").await;
+        peer.drain().await;
+        // Deliberately do not receive the local result or clear the turn flag
+        // until both frames have been handled: old history cannot claim it.
+        peer.assert_local_terminal_ownership();
+        assert_eq!(
+            completion.await.unwrap(),
+            control_protocol::PromptOutcome::Completed {
+                stop_reason: Some("end_turn".into()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_local_prompt_preserves_first_waiter_and_sends_no_prompt() {
+        let mut peer = PromptControlPeer::new().await;
+        let completion = peer.prompt().await;
+        let mut duplicate = peer
+            .client
+            .prompt(serde_json::json!({"duplicate": true}))
+            .await;
+        assert!(matches!(
+            duplicate.try_recv().unwrap(),
+            control_protocol::PromptOutcome::Error { code, .. } if i64::from(code) == control_protocol::INTERNAL_ERROR
+        ));
+        peer.client.cancel().await;
+        // Cancel follows the duplicate call on the same writer. Seeing it next
+        // proves the rejected call never sent an additional Prompt frame.
+        assert!(matches!(
+            control_protocol::read_frame(&mut peer.peer).await.unwrap(),
+            Some(ControlBody::Cancel)
+        ));
+        peer.send(ControlBody::PromptStarted { prompt_req_id: 9 })
+            .await;
+        peer.completed(9, "cancelled").await;
+        peer.drain().await;
+        assert_eq!(
+            completion.await.unwrap(),
+            control_protocol::PromptOutcome::Completed {
+                stop_reason: Some("cancelled".into()),
+            }
+        );
+        peer.assert_local_terminal_ownership();
+    }
+
+    #[tokio::test]
+    async fn local_activation_rejects_history_before_waiter_registration() {
+        let mut peer = PromptControlPeer::new().await;
+        peer.client.supersede_adopted_turn();
+        peer.completed(7, "cancelled").await;
+        peer.drain().await;
+        peer.assert_local_terminal_ownership();
+    }
 
     /// An oversized reverse response resolves the runner call with a bounded
     /// error and leaves the same control connection usable for the next call.

@@ -4,7 +4,8 @@
 //! The runner owns initialization, session establishment, prompts, cancellation,
 //! and every JSON-RPC id sent to the agent. Notifications and prompt completion
 //! are persistent across daemon attachments. Reverse calls, forward calls, and
-//! handshake replies are scoped to the attachment that owns their correlation.
+//! handshake replies and prompt-start acknowledgements are scoped to the
+//! attachment that owns their correlation.
 //!
 //! The runner pre-encodes queued frames and accounts exact wire bytes. Its writer
 //! retains queue ownership until write and flush succeed. This is a best-effort
@@ -72,6 +73,11 @@ pub enum ControlBody {
     /// instead of hanging on a handshake that will never complete. A
     /// transport failure with no agent error synthesizes a minimal object.
     HandshakeFailed { error: serde_json::Value },
+    /// The runner assigned the canonical JSON-RPC id for this attachment's
+    /// [`ControlBody::Prompt`]. Queued before writing `session/prompt` to the
+    /// agent, so its completion cannot overtake this correlation. Unlike
+    /// completion, this acknowledgement is never replayed on a later attach.
+    PromptStarted { prompt_req_id: i64 },
     /// The runner observed the agent's response to the `session/prompt`
     /// request it issued. `prompt_req_id` is the JSON-RPC id the runner
     /// assigned. `outcome` is the typed turn result.
@@ -136,7 +142,8 @@ pub enum ControlBody {
     ResumeSession,
     /// Run a turn. `request` is the ACP `session/prompt` params
     /// (`PromptRequest`); the runner assigns the canonical JSON-RPC id and
-    /// tracks the response.
+    /// acknowledges it with [`ControlBody::PromptStarted`] and tracks the
+    /// response.
     Prompt { request: serde_json::Value },
     /// Cancel the in-flight turn (maps to a `session/cancel` notification).
     Cancel,
@@ -341,6 +348,7 @@ mod tests {
             ControlBody::Prompt {
                 request: serde_json::json!({"sessionId": "sess-1", "prompt": []}),
             },
+            ControlBody::PromptStarted { prompt_req_id: 42 },
             ControlBody::Cancel,
         ] {
             assert_eq!(roundtrip(body.clone()), body);

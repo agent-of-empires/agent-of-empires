@@ -661,6 +661,7 @@ enum DeliveryScope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueuedKind {
     Notify,
+    PromptStarted,
     PromptCompleted,
     Handshake,
     ServerCall,
@@ -1332,15 +1333,27 @@ impl RunnerShared {
 
     /// Issue a runner-owned `session/prompt` to the agent. The response is
     /// detected asynchronously by the stdout fanout (via `prompt_requests`),
-    /// which fires `PromptCompleted`. Returns the assigned request id, or
-    /// None if the write failed.
+    /// which fires `PromptCompleted`. Enqueue the attachment's `PromptStarted`
+    /// before the agent can answer. Returns the assigned request id, or None
+    /// if the attachment is gone or the write failed.
     async fn agent_prompt(
         &self,
         agent_stdin: &Mutex<tokio::process::ChildStdin>,
+        attachment_id: u64,
         params: serde_json::Value,
     ) -> Option<i64> {
-        self.clear_prompt_completion().await;
         let id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
+        if !self
+            .enqueue(
+                DeliveryScope::Attachment(attachment_id),
+                QueuedKind::PromptStarted,
+                ControlBody::PromptStarted { prompt_req_id: id },
+            )
+            .await
+        {
+            return None;
+        }
+        self.clear_prompt_completion().await;
         self.prompt_requests.lock().await.insert(id);
         let req = serde_json::json!({
             "jsonrpc": "2.0",
@@ -2115,7 +2128,25 @@ async fn handle_control_connection(
                 }
             }
             ControlBody::Prompt { request } => {
-                if shared.agent_prompt(&agent_stdin, request).await.is_none() {
+                let prompt = shared.agent_prompt(&agent_stdin, attachment_id, request);
+                tokio::pin!(prompt);
+                let prompt_id = tokio::select! {
+                    result = &mut writer => {
+                        writer_finished = true;
+                        if let Err(error) = result {
+                            warn!(target: "acp.runner", session = %session_id, "control writer task failed: {error}");
+                        }
+                        // Release admission backpressure without cancelling an
+                        // in-progress NDJSON write to the agent. Full correlation
+                        // cleanup below may itself need the agent stdin lock.
+                        shared.control.lock().await.purge_attachment(attachment_id);
+                        shared.control_space.notify_waiters();
+                        let _ = prompt.await;
+                        break 'connection false;
+                    }
+                    result = &mut prompt => result,
+                };
+                if prompt_id.is_none() {
                     warn!(target: "acp.runner", session = %session_id, "prompt write to agent failed");
                 }
             }
@@ -2663,8 +2694,9 @@ mod tests {
     #[tokio::test]
     async fn prompt_response_queues_completed_control_event() {
         let (shared, stdin, _child) = shared_with_stdin().await;
+        let attachment_id = shared.begin_attachment().await;
         let id = shared
-            .agent_prompt(&stdin, serde_json::json!({"sessionId": "s"}))
+            .agent_prompt(&stdin, attachment_id, serde_json::json!({"sessionId": "s"}))
             .await
             .expect("prompt written");
         assert!(shared.prompt_requests.lock().await.contains(&id));
@@ -2677,12 +2709,15 @@ mod tests {
         assert!(shared.prompt_requests.lock().await.is_empty());
         assert_eq!(
             queued(&shared).await,
-            vec![ControlBody::PromptCompleted {
-                prompt_req_id: id,
-                outcome: PromptOutcome::Completed {
-                    stop_reason: Some("end_turn".into()),
+            vec![
+                ControlBody::PromptStarted { prompt_req_id: id },
+                ControlBody::PromptCompleted {
+                    prompt_req_id: id,
+                    outcome: PromptOutcome::Completed {
+                        stop_reason: Some("end_turn".into()),
+                    },
                 },
-            }]
+            ]
         );
     }
 
@@ -2693,8 +2728,9 @@ mod tests {
     #[tokio::test]
     async fn notifications_stay_ahead_of_the_completion_that_followed_them() {
         let (shared, stdin, _child) = shared_with_stdin().await;
+        let attachment_id = shared.begin_attachment().await;
         let id = shared
-            .agent_prompt(&stdin, serde_json::json!({"sessionId": "s"}))
+            .agent_prompt(&stdin, attachment_id, serde_json::json!({"sessionId": "s"}))
             .await
             .expect("prompt written");
 
@@ -2710,10 +2746,61 @@ mod tests {
         shared.deliver_line(resp.as_bytes(), &stdin).await;
 
         let q = queued(&shared).await;
-        assert_eq!(q.len(), 3, "two notifies then the completion: {q:?}");
-        assert!(matches!(q[0], ControlBody::Notify { .. }));
-        assert!(matches!(q[1], ControlBody::Notify { .. }));
-        assert!(matches!(q[2], ControlBody::PromptCompleted { .. }));
+        assert!(matches!(q.as_slice(), [
+            ControlBody::PromptStarted { prompt_req_id: started_id },
+            ControlBody::Notify { .. },
+            ControlBody::Notify { .. },
+            ControlBody::PromptCompleted { prompt_req_id: completed_id, .. },
+        ] if *started_id == id && *completed_id == id));
+    }
+
+    #[tokio::test]
+    async fn prompt_start_precedes_agent_write_and_is_not_replayed() {
+        let (shared, stdin, mut child) = shared_with_stdin().await;
+        let attachment_id = shared.begin_attachment().await;
+        let stdin_guard = stdin.lock().await;
+        let prompt =
+            shared.agent_prompt(&stdin, attachment_id, serde_json::json!({"sessionId": "s"}));
+        tokio::pin!(prompt);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(prompt.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let frames = queued(&shared).await;
+        let [ControlBody::PromptStarted { prompt_req_id }] = frames.as_slice() else {
+            panic!(
+                "prompt correlation must be queued while the agent write is blocked: {frames:?}"
+            );
+        };
+        drop(stdin_guard);
+        assert_eq!(prompt.await, Some(*prompt_req_id));
+        let written = read_agent_stdin(&mut child).await;
+        let request: serde_json::Value = serde_json::from_str(written.trim()).unwrap();
+        assert_eq!(request["id"], *prompt_req_id);
+        assert_eq!(request["method"], PROMPT_METHOD);
+
+        shared.disconnect_control(attachment_id, &stdin, "s").await;
+        let _new_attachment = shared.begin_attachment().await;
+        let response = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{prompt_req_id},\"result\":{{\"stopReason\":\"end_turn\"}}}}\n"
+        );
+        shared.deliver_line(response.as_bytes(), &stdin).await;
+        assert_eq!(
+            queued(&shared).await,
+            vec![ControlBody::PromptCompleted {
+                prompt_req_id: *prompt_req_id,
+                outcome: PromptOutcome::Completed {
+                    stop_reason: Some("end_turn".into()),
+                },
+            }],
+            "only the durable completion may reach the replacement attachment"
+        );
+        assert!(shared
+            .agent_prompt(&stdin, attachment_id, serde_json::json!({}))
+            .await
+            .is_none());
+        assert!(read_agent_stdin(&mut child).await.is_empty());
     }
 
     /// An agent-issued request becomes a `ServerCall` with a stable id, and

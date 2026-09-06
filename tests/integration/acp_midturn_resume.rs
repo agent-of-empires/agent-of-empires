@@ -317,6 +317,10 @@ async fn replay_completion_after_disconnect(session: &str, in_flight_turn: bool)
     .unwrap();
     assert!(matches!(
         control_protocol::read_frame(&mut first).await.unwrap(),
+        Some(ControlBody::PromptStarted { .. })
+    ));
+    assert!(matches!(
+        control_protocol::read_frame(&mut first).await.unwrap(),
         Some(ControlBody::Notify { .. })
     ));
     drop(first);

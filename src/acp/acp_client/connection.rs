@@ -1625,6 +1625,9 @@ pub(super) async fn run_connection_task<W, R>(
                 };
                 match cmd {
                     Some(ClientCmd::Prompt(blocks)) => {
+                        if let Some(control) = control_client.as_ref() {
+                            control.supersede_adopted_turn();
+                        }
                         // Scope the agent-message deduper to one turn: a new
                         // prompt starts a fresh assistant block, so forget any
                         // block left open by the prior turn. See #2281.
