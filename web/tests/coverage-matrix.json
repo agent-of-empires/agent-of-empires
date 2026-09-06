@@ -1152,6 +1152,13 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.context-resume",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/sidebar-context-resume.spec.ts"],
+      "components": ["web/src/lib/types.ts", "web/src/components/WorkspaceSidebar.tsx", "web/src/App.tsx"]
+    },
+    {
       "id": "sessions.fork",
       "kind": "vitest",
       "risk": "high",

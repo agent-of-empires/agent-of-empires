@@ -11,7 +11,7 @@ import {
 } from "react";
 import { Puzzle } from "lucide-react";
 import { useMatch, useNavigate, useSearchParams } from "react-router-dom";
-import { IDLE_DECAY_WINDOW_MS, isSessionActive } from "./lib/session";
+import { IDLE_DECAY_WINDOW_MS } from "./lib/session";
 import { diffSelectionStale } from "./lib/diffSelection";
 import { useSessions } from "./hooks/useSessions";
 import { useDashboardPresence } from "./hooks/useDashboardPresence";
@@ -91,7 +91,7 @@ import {
 import type { DeleteSessionOptions, ServerAbout } from "./lib/api";
 import { getClientCapabilities } from "./lib/clientCapabilities";
 import { normalizeProjectPathKey } from "./lib/registeredProjects";
-import { IdleDecayWindowContext, parseIdleDecayWindowMs, useIdleDecayWindowMs } from "./lib/idleDecay";
+import { IdleDecayWindowContext, parseIdleDecayWindowMs } from "./lib/idleDecay";
 import { parseUnreadIndicatorEnabled, UnreadIndicatorContext, useUnreadIndicatorEnabled } from "./lib/unreadIndicator";
 import { parseSessionRowTagMode, SessionRowTagContext, type SessionRowTagMode } from "./lib/sessionRowTag";
 import { parseSessionColorsEnabled, SessionColorsContext } from "./lib/sessionColors";
@@ -320,7 +320,6 @@ function AppContent({
 
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
-  const idleDecayWindowMs = useIdleDecayWindowMs();
   const { settings: webSettings } = useWebSettings();
   const sessionMatch = useMatch("/session/:sessionId");
   const settingsRootMatch = useMatch("/settings");
@@ -956,11 +955,10 @@ function AppContent({
     [navigate, workspaces, focusAgentInput, isCoarse, transitionKeyboardProxy, webSettings.autoOpenKeyboard],
   );
 
-  const handleSelectWorkspace = (workspaceId: string) => {
+  const handleSelectWorkspace = (workspaceId: string, sessionId: string | null) => {
     const ws = workspaces.find((w) => w.id === workspaceId);
     if (ws) {
-      const running = ws.sessions.find((s) => isSessionActive(s, idleDecayWindowMs));
-      const picked = running ?? ws.sessions[0] ?? null;
+      const picked = ws.sessions.find((s) => s.id === sessionId);
       if (picked) {
         transitionKeyboardProxy(picked.id);
         navigate(`/session/${encodeURIComponent(picked.id)}`);

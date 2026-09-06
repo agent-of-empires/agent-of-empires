@@ -57,7 +57,15 @@ import {
 } from "@dnd-kit/core";
 import { SortableContext, useSortable, verticalListSortingStrategy, arrayMove } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import type { ProjectInfo, RepoGroup, SessionResponse, SessionStatus, Workspace } from "../lib/types";
+import type {
+  ContextResumeAvailability,
+  ContextResumeUnavailableReason,
+  ProjectInfo,
+  RepoGroup,
+  SessionResponse,
+  SessionStatus,
+  Workspace,
+} from "../lib/types";
 import { ProjectsSection } from "./ProjectsSection";
 import type { SidebarAxis } from "../lib/sidebarAxis";
 import {
@@ -330,7 +338,7 @@ interface Props {
   activeId: string | null;
   open: boolean;
   onToggle: () => void;
-  onSelect: (workspaceId: string) => void;
+  onSelect: (workspaceId: string, sessionId: string | null) => void;
   onToggleGroup: (groupId: string) => void;
   onUpdateRepoAppearance: (repoId: string, update: RepoAppearanceUpdate) => void;
   onNew: () => void;
@@ -441,6 +449,31 @@ function loadSunkExpanded(): boolean {
   const raw = safeGetItem(SUNK_EXPANDED_KEY);
   if (raw === "true") return true;
   return false;
+}
+
+const CONTEXT_RESUME_UNAVAILABLE_DETAIL: Record<ContextResumeUnavailableReason, string> = {
+  agent_unsupported: "this agent has no verified native resume path",
+  sandbox_unsupported: "the sandbox has no authoritative resume target",
+  command_unsupported: "the launch command hides the agent behind a launcher",
+  forced_fresh: "the next launch was explicitly reset",
+  invalid_target: "the saved resume target is invalid",
+  fork_pending: "the requested fork has not completed",
+  previous_failure: "the previous resume attempt failed",
+  no_target: "no resume target has been captured",
+};
+
+function ContextResumeBadge({ availability }: { availability: ContextResumeAvailability | undefined }) {
+  if (availability?.state !== "unavailable") return null;
+  const detail = CONTEXT_RESUME_UNAVAILABLE_DETAIL[availability.reason];
+  const title = detail ? `Context resume unavailable: ${detail}` : "Context resume unavailable";
+  return (
+    <span
+      title={title}
+      className="inline-flex shrink-0 items-center rounded border border-status-warning/40 bg-status-warning/10 px-1 py-0 text-[10px] font-mono font-medium text-text-primary"
+    >
+      ctx:no
+    </span>
+  );
 }
 
 /** One-line sidebar affordance showing plan progress for structured view
@@ -573,11 +606,16 @@ function TrashMenu({
 }: {
   trashedWorkspaces: Workspace[];
   readOnly?: boolean;
-  onOpen: (workspaceId: string, e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }) => void;
+  onOpen: (
+    workspaceId: string,
+    e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean },
+    sessionId: string | null,
+  ) => void;
   onRestore: (sessionIds: string[]) => void;
   onDelete: (workspaceId: string) => void;
   onEmptyTrash: () => void;
 }) {
+  const idleDecayWindowMs = useIdleDecayWindowMs();
   const [open, setOpen] = useState(false);
   const [confirmEmpty, setConfirmEmpty] = useState(false);
   const [panelPosition, setPanelPosition] = useState<{ left: number; bottom: number; width: number } | null>(null);
@@ -735,7 +773,9 @@ function TrashMenu({
                             type="button"
                             onClick={() => {
                               setOpen(false);
-                              onOpen(ws.id, { metaKey: false, ctrlKey: false, shiftKey: false });
+                              const target =
+                                ws.sessions.find((s) => isSessionActive(s, idleDecayWindowMs)) ?? ws.sessions[0];
+                              onOpen(ws.id, { metaKey: false, ctrlKey: false, shiftKey: false }, target?.id ?? null);
                             }}
                             data-testid="sidebar-trash-open"
                             className="inline-flex h-7 items-center rounded-md border border-surface-700/50 px-2.5 text-[12px] font-medium text-text-secondary hover:border-surface-600 hover:bg-surface-700/40 hover:text-text-primary cursor-pointer transition-colors"
@@ -846,7 +886,11 @@ function SortableSessionRow({
   workspace: Workspace;
   isActive: boolean;
   isSelected: boolean;
-  onActivate: (e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }) => void;
+  onActivate: (
+    workspaceId: string,
+    e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean },
+    sessionId: string | null,
+  ) => void;
   onDelete?: (workspaceId: string) => void;
   onStop?: (workspaceId: string) => void;
   onStart?: (workspaceId: string) => void;
@@ -992,7 +1036,11 @@ export const SessionRow = memo(function SessionRow({
   // Row click. The parent interprets the modifier keys (plain navigates,
   // Cmd/Ctrl toggles, Shift ranges), so the row forwards the event up rather
   // than navigating directly. See #1724.
-  onActivate: (e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }) => void;
+  onActivate: (
+    workspaceId: string,
+    e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean },
+    sessionId: string | null,
+  ) => void;
   onDelete?: (workspaceId: string) => void;
   onStop?: (workspaceId: string) => void;
   onStart?: (workspaceId: string) => void;
@@ -1043,6 +1091,7 @@ export const SessionRow = memo(function SessionRow({
   // rare; pick the first structured view session in the workspace.
   const acpSession = workspace.sessions.find((s) => s.view === "structured");
   const runningSession = workspace.sessions.find((s) => isSessionActive(s, idleDecayWindowMs));
+  const navigationSession = runningSession ?? firstSession;
   const singleSession = workspace.sessions.length === 1;
   const sessionTitle = firstSession?.title.trim() ?? "";
   const branchLabel = workspace.branch ?? null;
@@ -1101,7 +1150,7 @@ export const SessionRow = memo(function SessionRow({
         ? "needs attention (error)"
         : "needs your attention";
   const sessionId = firstSession?.id;
-  const navigationSessionId = runningSession?.id ?? firstSession?.id ?? null;
+  const navigationSessionId = navigationSession?.id ?? null;
   const sessionPath = navigationSessionId ? `/session/${encodeURIComponent(navigationSessionId)}` : "/";
   const isDeleting = sessionStatus === "Deleting";
   // Compact rail: keep status glyph + color dot + truncated title, drop the
@@ -1535,7 +1584,7 @@ export const SessionRow = memo(function SessionRow({
           // decides navigate vs. select. Always preventDefault so a modifier
           // click builds the selection instead of following the href.
           e.preventDefault();
-          onActivate(e);
+          onActivate(workspace.id, e, navigationSessionId);
         }}
         onContextMenu={handleContextMenu}
         onTouchStart={handleTouchStart}
@@ -1662,6 +1711,7 @@ export const SessionRow = memo(function SessionRow({
                       <span>{formatSnoozeRemainingShort(effectiveSnoozedUntil)}</span>
                     </span>
                   )}
+                  <ContextResumeBadge availability={navigationSession?.context_resume} />
                   {firstSession?.view === "structured" && firstSession.acp_worker_state === "resuming" && (
                     <span
                       title="Structured view worker is resuming"
@@ -3616,17 +3666,15 @@ export function WorkspaceSidebar({
   // `ng.repo` unchanged); only the flat header and nested subgroups need it.
   const groupById = useMemo(() => new Map(groups.map((g) => [g.id, g])), [groups]);
 
-  // Interpret a row click: plain click clears the selection and navigates
-  // (today's behavior), modifier clicks build the selection instead. The row
-  // has already guarded button / deleting / drag, and called preventDefault.
+  // Selection uses workspace identity; navigation uses the rendered row's session.
   const handleRowActivate = useCallback(
-    (workspaceId: string, e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }) => {
+    (workspaceId: string, e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }, sessionId: string | null) => {
       // Read-only: ignore modifier gestures entirely and always navigate, so
       // no hidden selection state can build up.
       if (readOnly) {
         dispatchSelection({ type: "clear" });
         setOptimisticActive({ id: workspaceId, fromActiveId: activeId });
-        onSelect(workspaceId);
+        onSelect(workspaceId, sessionId);
         return;
       }
       const intent = classifyClick(e);
@@ -3634,7 +3682,7 @@ export function WorkspaceSidebar({
         case "navigate":
           dispatchSelection({ type: "navigate", id: workspaceId });
           setOptimisticActive({ id: workspaceId, fromActiveId: activeId });
-          onSelect(workspaceId);
+          onSelect(workspaceId, sessionId);
           break;
         case "toggle":
           dispatchSelection({ type: "toggle", id: workspaceId });
@@ -3967,7 +4015,7 @@ export function WorkspaceSidebar({
                                     workspace={v.workspace}
                                     isActive={v.workspace.id === displayedActiveId}
                                     isSelected={!readOnly && selection.selectedIds.has(v.workspace.id)}
-                                    onActivate={(e) => handleRowActivate(v.workspace.id, e)}
+                                    onActivate={handleRowActivate}
                                     onDelete={onDeleteSession}
                                     onStop={onStopSession}
                                     onStart={onStartSession}
@@ -4076,7 +4124,7 @@ export function WorkspaceSidebar({
                                 workspace={v.workspace}
                                 isActive={v.workspace.id === displayedActiveId}
                                 isSelected={!readOnly && selection.selectedIds.has(v.workspace.id)}
-                                onActivate={(e) => handleRowActivate(v.workspace.id, e)}
+                                onActivate={handleRowActivate}
                                 onDelete={onDeleteSession}
                                 onStop={onStopSession}
                                 onStart={onStartSession}
@@ -4153,7 +4201,7 @@ export function WorkspaceSidebar({
                                 workspace={v.workspace}
                                 isActive={v.workspace.id === displayedActiveId}
                                 isSelected={!readOnly && selection.selectedIds.has(v.workspace.id)}
-                                onActivate={(e) => handleRowActivate(v.workspace.id, e)}
+                                onActivate={handleRowActivate}
                                 onDelete={onDeleteSession}
                                 onStop={onStopSession}
                                 onStart={onStartSession}
@@ -4239,7 +4287,7 @@ export function WorkspaceSidebar({
                       workspace={v.workspace}
                       isActive={v.workspace.id === displayedActiveId}
                       isSelected={!readOnly && selection.selectedIds.has(v.workspace.id)}
-                      onActivate={(e) => handleRowActivate(v.workspace.id, e)}
+                      onActivate={handleRowActivate}
                       onDelete={onDeleteSession}
                       onStop={onStopSession}
                       onStart={onStartSession}
