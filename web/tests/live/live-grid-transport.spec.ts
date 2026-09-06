@@ -14,7 +14,7 @@ import { join } from "node:path";
 import { writeFileSync, chmodSync, mkdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { test, expect } from "../helpers/liveTest";
-import { spawnAoeServe, resolveAoeBinary, type SpawnOptions } from "../helpers/aoeServe";
+import { spawnAoeServe, resolveAoeBinary, type ServeHandle, type SpawnOptions } from "../helpers/aoeServe";
 import { clickSidebarSession, openMobileSidebar } from "../helpers/sidebar";
 
 /** The server announces its transport on the first frame. Fail here rather
@@ -33,6 +33,59 @@ async function expectGridTransport(page: Page) {
     })
     .not.toBeNull();
   expect(await transport(), "the VT grid armed; a snapshot fallback cannot hold a repaint").toBe("grid");
+}
+
+async function expectTransport(page: Page, expected: "grid" | "snapshot") {
+  await expect
+    .poll(
+      async () => {
+        const text = (await page.locator("[data-live-debug]").textContent()) ?? "";
+        return /transport=(\w+)/.exec(text)?.[1] ?? null;
+      },
+      { timeout: 30_000, message: `server switched to ${expected} transport` },
+    )
+    .toBe(expected);
+}
+
+async function paneGeometry(serve: ServeHandle): Promise<{ cols: number; rows: number }> {
+  let geometry: { cols: number; rows: number } | undefined;
+  await expect
+    .poll(
+      () => {
+        const result = spawnSync(
+          "tmux",
+          ["-S", serve.tmuxSocket, "list-panes", "-a", "-F", "#{pane_width} #{pane_height}"],
+          { env: serve.env, encoding: "utf8" },
+        );
+        const [cols, rows] = result.stdout.trim().split(/\s+/).map(Number);
+        if (result.status === 0 && cols && rows) geometry = { cols, rows };
+        return geometry;
+      },
+      { timeout: 15_000, message: "isolated tmux pane exposed its geometry" },
+    )
+    .toBeDefined();
+  return geometry!;
+}
+
+async function holdClientResize(page: Page) {
+  await page.addInitScript(() => {
+    const original = WebSocket.prototype.send;
+    (window as Window & { __pinLiveResize?: boolean }).__pinLiveResize = true;
+    WebSocket.prototype.send = function (data: string | ArrayBufferLike | Blob | ArrayBufferView) {
+      (window as Window & { __liveTestSocket?: WebSocket }).__liveTestSocket = this;
+      if (typeof data === "string") {
+        try {
+          const message = JSON.parse(data) as { type?: string };
+          if (message.type === "resize" && (window as Window & { __pinLiveResize?: boolean }).__pinLiveResize) {
+            return;
+          }
+        } catch {
+          // Non-control text frames pass through unchanged.
+        }
+      }
+      return original.call(this, data);
+    };
+  });
 }
 
 function seedTool(title: string, script: string): SpawnOptions["seedFn"] {
@@ -71,6 +124,13 @@ i=0
 while true; do i=$((i+1)); echo "patch line $i"; sleep 0.15; done
 `;
 
+const CLIPBOARD_AFTER_INPUT = `#!/bin/bash
+printf 'CLIPBOARD_READY\\n'
+IFS= read -r -n 1 _
+printf '\\e]52;c;YWZ0ZXItcmVzaXpl\\a'
+while true; do sleep 1; done
+`;
+
 test("synchronized-output brackets publish whole frames only", async ({ browser }, testInfo) => {
   test.setTimeout(90_000);
   const serve = await spawnAoeServe({
@@ -82,6 +142,7 @@ test("synchronized-output brackets publish whole frames only", async ({ browser 
   try {
     const ctx = await browser.newContext({ ...devices["iPhone 13"] });
     const page = await ctx.newPage();
+    await holdClientResize(page);
     await page.goto(`${serve.baseUrl}/?livedebug=1`);
     await openMobileSidebar(page);
     await clickSidebarSession(page, "sync-app");
@@ -118,6 +179,50 @@ test("synchronized-output brackets publish whole frames only", async ({ browser 
     );
     expect(result.frames, "the app kept repainting during the sample window").toBeGreaterThan(3);
     expect(result.torn, "no sample showed a half-drawn repaint").toEqual([]);
+    await expectTransport(page, "grid");
+  } finally {
+    await serve.stop();
+  }
+});
+
+test("resize fallback keeps OSC 52 forwarding on the same WebSocket", async ({ browser }, testInfo) => {
+  test.setTimeout(90_000);
+  const serve = await spawnAoeServe({
+    authMode: "none",
+    workerIndex: testInfo.workerIndex,
+    parallelIndex: testInfo.parallelIndex,
+    seedFn: seedTool("clipboard-fallback", CLIPBOARD_AFTER_INPUT),
+  });
+  try {
+    const ctx = await browser.newContext({ ...devices["iPhone 13"] });
+    await ctx.grantPermissions(["clipboard-read", "clipboard-write"]);
+    const page = await ctx.newPage();
+    await holdClientResize(page);
+    await page.goto(`${serve.baseUrl}/?livedebug=1`);
+    await openMobileSidebar(page);
+    await clickSidebarSession(page, "clipboard-fallback");
+    await page.locator("[data-live-terminal]").waitFor({ state: "visible", timeout: 15_000 });
+    await expectGridTransport(page);
+    const geometry = await paneGeometry(serve);
+    await page.evaluate(() => {
+      (window as Window & { __pinLiveResize?: boolean }).__pinLiveResize = false;
+    });
+
+    await page.evaluate(({ cols, rows }) => {
+      const socket = (window as Window & { __liveTestSocket?: WebSocket }).__liveTestSocket;
+      if (!socket) throw new Error("live WebSocket was not captured");
+      socket.send(JSON.stringify({ type: "resize", cols: cols + 1, rows }));
+    }, geometry);
+    await expectTransport(page, "snapshot");
+
+    await page.locator("[data-live-terminal]").click();
+    await page.keyboard.type("c");
+    await expect
+      .poll(() => page.evaluate(() => navigator.clipboard.readText()), {
+        timeout: 30_000,
+        message: "OSC 52 emitted after retirement reached the same viewer",
+      })
+      .toBe("after-resize");
   } finally {
     await serve.stop();
   }
@@ -134,6 +239,7 @@ test("a streaming agent is delivered as row patches after the first frame", asyn
   try {
     const ctx = await browser.newContext({ ...devices["iPhone 13"] });
     const page = await ctx.newPage();
+    await holdClientResize(page);
     await page.goto(`${serve.baseUrl}/?livedebug=1`);
     await openMobileSidebar(page);
     await clickSidebarSession(page, "patch-stream");
