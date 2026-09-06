@@ -1905,6 +1905,14 @@ process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
         assert!(restarted.apply_session_flags(&mut command, "test").unwrap());
         assert_eq!(command, format!("prime-agent --resume {parent_id}"));
 
+        let profile = restarted.effective_profile();
+        let storage = crate::session::storage::Storage::new_unwatched(&profile).unwrap();
+        storage
+            .update(|instances, _| {
+                instances.push(restarted.clone());
+                Ok(())
+            })
+            .unwrap();
         let prepared = restarted.prepare_launch_command().unwrap();
         assert!(prepared.command.as_deref().unwrap().contains(parent_id));
         let newer_id = "018f47a6-7b80-7cc3-98a2-37b5f486b2a3";
@@ -1934,6 +1942,32 @@ process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
             .unwrap();
         assert_eq!(restarted.agent_session_id.as_deref(), Some(newer_id));
         assert!(prepared.command.as_deref().unwrap().contains(newer_id));
+        let _ = restarted.persist_session_id(
+            &profile,
+            prepared.expected_prior_sid.as_deref(),
+            prepared.expected_prior_intent.clone(),
+        );
+        assert_eq!(
+            storage.load().unwrap()[0].agent_session_id.as_deref(),
+            Some(newer_id)
+        );
+        assert_eq!(restarted.agent_session_id.as_deref(), Some(newer_id));
+        storage
+            .update(|instances, _| {
+                instances[0].agent_session_id = Some(child_id.to_string());
+                Ok(())
+            })
+            .unwrap();
+        let _ = restarted.persist_session_id(
+            &profile,
+            prepared.expected_prior_sid.as_deref(),
+            prepared.expected_prior_intent,
+        );
+        assert_eq!(
+            storage.load().unwrap()[0].agent_session_id.as_deref(),
+            Some(child_id)
+        );
+        assert_eq!(restarted.agent_session_id.as_deref(), Some(child_id));
     }
     #[test]
     fn clearing_the_conversation_drops_its_transcript_path() {

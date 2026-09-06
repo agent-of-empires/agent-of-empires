@@ -384,13 +384,18 @@ impl Instance {
     /// Rebuild a restart command if the quiesced Prime pane published a newer root.
     pub(super) fn refresh_prepared_prime_launch_after_quiescence(
         &mut self,
-        prepared: PreparedLaunch,
+        mut prepared: PreparedLaunch,
     ) -> Result<PreparedLaunch> {
         if self.absorb_published_prime_session() {
-            self.prepare_launch_command()
-        } else {
-            Ok(prepared)
+            // Refresh launch data without changing the durable CAS baseline.
+            (
+                prepared.command,
+                prepared.is_existing,
+                prepared.omp_capture_plan,
+                prepared.launch_env,
+            ) = self.build_launch_command()?;
         }
+        Ok(prepared)
     }
 
     /// Construct the command only after hook execution has completed. Keeping
