@@ -577,8 +577,8 @@ impl HomeView {
 
     /// Storage-only reload: profile rediscovery + per-profile load + tree
     /// rebuild + cursor restore. Skips the status-hook config-cache refresh,
-    /// which is driven by the full `reload()` path. Used by the watcher-
-    /// driven tick.
+    /// which is driven by the full `reload()` path. Used by watcher and
+    /// live-send heartbeat ticks.
     pub(in crate::tui) fn reload_storage_only(&mut self) -> anyhow::Result<()> {
         use crate::session::list_profiles;
 
@@ -749,14 +749,29 @@ impl HomeView {
             self.cursor = self.flat_items.len() - 1;
         }
 
+        // Storage rebuilds and search re-scoring must not move the live-send
+        // selection. Teardown reconciles it with the latest projection.
+        let preserve_live_selection = self.live_send.as_ref().is_some_and(|state| {
+            prev_selected_session.as_deref() == Some(state.session_id.as_str())
+        });
+
         if self.search_active && !self.search_query.value().is_empty() {
-            self.update_search();
+            if preserve_live_selection {
+                self.refresh_search_matches();
+            } else {
+                self.update_search();
+            }
         } else if !self.search_matches.is_empty() {
             // Recalculate match indices without moving the cursor
             self.refresh_search_matches();
         }
 
-        self.update_selected();
+        if !preserve_live_selection {
+            self.update_selected();
+        }
+        if let Some(state) = self.live_send.clone() {
+            self.end_live_send_on_drift(&state);
+        }
         Ok(())
     }
 
@@ -829,13 +844,11 @@ impl HomeView {
     ///   recorded for the same acknowledged burst). The ack latch
     ///   stays in place; the user is not re-notified for the same
     ///   ongoing burst.
-    /// * No-op: nothing failing, body unchanged, or an unrelated
-    ///   dialog (a `Watcher Warning` from `rewire_after_profile_delete`,
-    ///   or a profile create/delete `Error`) occupies the slot. In
-    ///   the foreign-dialog case the ack latch stays armed so the
-    ///   next tick can present once the foreign dialog is dismissed.
+    /// * No-op: live-send active, nothing failing, body unchanged, or an
+    ///   unrelated dialog occupies the slot. While live or another dialog is
+    ///   open, the ack latch stays armed so a later tick can present it.
     pub(in crate::tui) fn try_present_reload_failure_dialog(&mut self) -> bool {
-        if !self.reload_failure_state.has_any_failure() {
+        if self.live_send.is_some() || !self.reload_failure_state.has_any_failure() {
             return false;
         }
         let title = RELOAD_FAILED_TITLE;

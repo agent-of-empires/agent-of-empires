@@ -703,25 +703,45 @@ fn full_render_pipeline_captures_copy_text_after_finalize() {
     // Drives the actual render path: render seeds the text-view
     // snapshot, the drag handlers map against it, and
     // paint_preview_selection captures the selected lines from the
-    // parsed cache into `preview_copy_text` for the app loop to drain.
+    // parsed cache into preview_copy_text for the app loop to drain.
     use crate::tui::styles::load_theme;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    let mut env = create_test_env_empty();
+    let mut env = create_test_env_with_sessions(1);
     let backend = TestBackend::new(80, 24);
     let mut terminal = Terminal::new(backend).unwrap();
     let theme = load_theme("empire");
+    let session_id = env
+        .view
+        .selected_session
+        .clone()
+        .expect("fixture must select its session");
+    let title = env
+        .view
+        .get_instance(&session_id)
+        .expect("selected instance")
+        .title
+        .clone();
+    let tmux_name = env
+        .view
+        .displayed_pane_tmux_name()
+        .expect("selected pane target");
+    env.view.live_send = Some(LiveSendState {
+        session_id: session_id.clone(),
+        title,
+        tmux_name: tmux_name.clone(),
+        target: crate::tui::home::live_send::LiveSendTarget::Agent,
+        exit_chords: Vec::new(),
+        leader: None,
+    });
 
-    // Stub the preview cache so render_preview has known content to
-    // paint and to back the copy.
     env.view.preview_cache.content = "alpha beta gamma\nsecond line\nthird line\n".to_string();
     env.view.preview_cache.dimensions = (80, 24);
     env.view.preview_cache.captured_lines = 3;
-    env.view.preview_cache.session_id = Some("fake-id".to_string());
+    env.view.preview_cache.session_id = Some(session_id);
+    env.view.preview_cache.capture_target = Some(tmux_name);
 
-    // First render seeds preview_text_view + paints content. We need
-    // that before the drag handlers can map the cursor.
     terminal
         .draw(|f| {
             let area = f.area();
@@ -736,32 +756,20 @@ fn full_render_pipeline_captures_copy_text_after_finalize() {
         "render should have parsed scrollback into the text view"
     );
 
-    // Install live-send so handle_drag_start claims the preview click.
-    env.view.live_send = Some(LiveSendState {
-        session_id: "fake-id".to_string(),
-        title: "fake".to_string(),
-        tmux_name: "aoe_test_full_pipeline".to_string(),
-        target: crate::tui::home::live_send::LiveSendTarget::Agent,
-        exit_chords: Vec::new(),
-        leader: None,
-    });
-
-    // Find a row in the output pane that actually carries text.
     let initial_buf = terminal.backend().buffer().clone();
-    let mut content_row = None;
+    let mut content_cell = None;
     for r in pane.y..pane.bottom() {
         let mut row_text = String::new();
         for c in pane.x..pane.right() {
             row_text.push_str(initial_buf[(c, r)].symbol());
         }
-        if row_text.trim().chars().any(|ch| ch.is_alphabetic()) {
-            content_row = Some(r);
+        if let Some(offset) = row_text.find("alpha") {
+            content_cell = Some((pane.x + offset as u16, r));
             break;
         }
     }
-    let row = content_row.expect("preview must paint some text");
-    let start_col = pane.x;
-    let end_col = pane.right() - 1;
+    let (start_col, row) = content_cell.expect("preview must paint seeded cache text");
+    let end_col = start_col + "alpha".len() as u16 - 1;
     assert!(env.view.handle_drag_start(start_col, row));
     assert!(env.view.handle_drag_move(end_col, row));
     assert!(env.view.handle_drag_end());
@@ -770,9 +778,6 @@ fn full_render_pipeline_captures_copy_text_after_finalize() {
         "drag_end should arm a pending capture"
     );
 
-    // The render that paints the finalized highlight is where the
-    // capture happens: it reads the selected lines from the parsed
-    // cache and stashes the string for the app loop to drain.
     terminal
         .draw(|f| {
             let area = f.area();
@@ -788,8 +793,5 @@ fn full_render_pipeline_captures_copy_text_after_finalize() {
         .view
         .take_preview_copy_text()
         .expect("render should have captured selection text");
-    assert!(
-        copied.contains("alpha"),
-        "captured text should include the first content row; got {copied:?}"
-    );
+    assert_eq!(copied, "alpha");
 }

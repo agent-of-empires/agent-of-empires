@@ -310,6 +310,220 @@ async fn reload_storage_only_keeps_disk_watch_scoped_in_single_profile_mode() {
     );
 }
 
+#[tokio::test]
+#[serial]
+async fn reload_storage_only_preserves_live_send_state_while_adding_peer_row() {
+    let temp = TempDir::new().expect("tempdir");
+    let _home = isolate_home(temp.path());
+
+    let live = FileWatchService::new().expect("live svc");
+    let writer = Storage::new("live-refresh", live.clone()).expect("writer");
+    let mut active = Instance::new("active-live", "/tmp/active-live");
+    active.source_profile = "live-refresh".to_string();
+    let active_id = active.id.clone();
+    writer
+        .update(|instances, _groups| {
+            instances.push(active);
+            Ok(())
+        })
+        .expect("seed active row");
+
+    let mut view = HomeView::new(
+        Some("live-refresh".to_string()),
+        crate::tmux::AvailableTools::with_tools(&["claude"]),
+        live.clone(),
+    )
+    .expect("HomeView::new");
+    view.cursor = view
+        .flat_items
+        .iter()
+        .position(
+            |item| matches!(item, crate::session::Item::Session { id, .. } if id == &active_id),
+        )
+        .expect("active row in flat items");
+    view.update_selected();
+
+    let tmux_name = crate::tmux::Session::resolve_name(&active_id, "active-live");
+    view.live_send = Some(super::live_send::LiveSendState {
+        session_id: active_id.clone(),
+        title: "active-live".to_string(),
+        tmux_name: tmux_name.clone(),
+        target: super::live_send::LiveSendTarget::Agent,
+        exit_chords: super::live_send::parse_chord_list(super::live_send::DEFAULT_EXIT_CHORD),
+        leader: None,
+    });
+    view.pending_paste = Some("queued paste".to_string());
+    view.preview_capture_target = Some(tmux_name.clone());
+    view.live_send_last_resize = Some((100, 30));
+    view.trashed_section_collapsed = true;
+    view.search_active = true;
+    view.search_query = tui_input::Input::new("peer-added".to_string());
+
+    writer
+        .update(|instances, _groups| {
+            instances
+                .iter_mut()
+                .find(|inst| inst.id == active_id)
+                .expect("active row on disk")
+                .trash();
+            let mut peer = Instance::new("peer-added", "/tmp/peer-added");
+            peer.source_profile = "live-refresh".to_string();
+            instances.push(peer);
+            Ok(())
+        })
+        .expect("peer write");
+
+    view.reload_storage_only().expect("storage-only reload");
+
+    assert!(view
+        .instances
+        .values()
+        .any(|inst| inst.title == "peer-added"));
+    assert!(
+        view.get_instance(&active_id)
+            .is_some_and(Instance::is_trashed),
+        "storage mirror must consume the active row mutation"
+    );
+    assert!(
+        !view.flat_items.iter().any(
+            |item| matches!(item, crate::session::Item::Session { id, .. } if id == &active_id)
+        ),
+        "precondition: the active row moved under the collapsed trash shelf"
+    );
+    assert_eq!(view.selected_session.as_deref(), Some(active_id.as_str()));
+    assert_eq!(view.pending_paste.as_deref(), Some("queued paste"));
+    assert_eq!(
+        view.preview_capture_target.as_deref(),
+        Some(tmux_name.as_str())
+    );
+    assert_eq!(view.live_send_last_resize, Some((100, 30)));
+    assert_eq!(
+        view.displayed_pane_tmux_name().as_deref(),
+        Some(tmux_name.as_str()),
+        "preview capture must stay pinned to the live-send pane"
+    );
+    let peer_index = view
+        .flat_items
+        .iter()
+        .position(|item| {
+            matches!(item, crate::session::Item::Session { id, .. }
+                if view.get_instance(id).is_some_and(|inst| inst.title == "peer-added"))
+        })
+        .expect("peer row remains visible");
+    assert!(
+        view.search_matches.contains(&peer_index),
+        "reload must still refresh search matches without moving live selection"
+    );
+    assert!(
+        !view.is_sidebar_item_selected(&view.flat_items[peer_index], peer_index),
+        "cursor fallback must not visibly retarget selection during live-send"
+    );
+    let state = view.live_send.as_ref().expect("live-send remains active");
+    assert_eq!(state.session_id, active_id);
+    assert_eq!(state.title, "active-live");
+    assert_eq!(state.tmux_name, tmux_name);
+    assert_eq!(state.target, super::live_send::LiveSendTarget::Agent);
+}
+
+#[tokio::test]
+#[serial]
+async fn reload_storage_only_ends_live_send_when_active_row_is_removed() {
+    let temp = TempDir::new().expect("tempdir");
+    let _home = isolate_home(temp.path());
+
+    let live = FileWatchService::new().expect("live svc");
+    let writer = Storage::new("live-refresh", live.clone()).expect("writer");
+    let active = Instance::new("active-live", "/tmp/active-live");
+    let active_id = active.id.clone();
+    let peer = Instance::new("peer", "/tmp/peer");
+    let peer_id = peer.id.clone();
+    writer
+        .update(|instances, _groups| {
+            instances.extend([active, peer]);
+            Ok(())
+        })
+        .expect("seed rows");
+
+    let mut view = HomeView::new(
+        Some("live-refresh".to_string()),
+        crate::tmux::AvailableTools::with_tools(&["claude"]),
+        live,
+    )
+    .expect("HomeView::new");
+    view.cursor = view
+        .flat_items
+        .iter()
+        .position(
+            |item| matches!(item, crate::session::Item::Session { id, .. } if id == &active_id),
+        )
+        .expect("active row in flat items");
+    view.update_selected();
+    view.live_send = Some(super::live_send::LiveSendState {
+        session_id: active_id.clone(),
+        title: "active-live".to_string(),
+        tmux_name: "aoe_test_removed_live_refresh".to_string(),
+        target: super::live_send::LiveSendTarget::Agent,
+        exit_chords: super::live_send::parse_chord_list(super::live_send::DEFAULT_EXIT_CHORD),
+        leader: None,
+    });
+
+    writer
+        .update(|instances, _groups| {
+            instances.retain(|instance| instance.id != active_id);
+            Ok(())
+        })
+        .expect("remove active row");
+
+    view.reload_storage_only().expect("storage-only reload");
+
+    assert!(view.get_instance(&active_id).is_none());
+    assert!(
+        view.live_send.is_none(),
+        "deleted target must end live-send"
+    );
+    assert_eq!(
+        view.info_dialog.as_ref().map(|dialog| dialog.title()),
+        Some("Live send ended")
+    );
+    assert_eq!(view.selected_session.as_deref(), Some(peer_id.as_str()));
+}
+
+#[tokio::test]
+#[serial]
+async fn reload_failure_dialog_waits_until_live_send_exits() {
+    let temp = TempDir::new().expect("tempdir");
+    let _home = isolate_home(temp.path());
+
+    let live = FileWatchService::new().expect("live svc");
+    let mut view = HomeView::new(
+        Some("live-failure".to_string()),
+        crate::tmux::AvailableTools::with_tools(&["claude"]),
+        live,
+    )
+    .expect("HomeView::new");
+    view.live_send = Some(super::live_send::LiveSendState {
+        session_id: "active".to_string(),
+        title: "active".to_string(),
+        tmux_name: "aoe_test_live_failure".to_string(),
+        target: super::live_send::LiveSendTarget::Agent,
+        exit_chords: super::live_send::parse_chord_list(super::live_send::DEFAULT_EXIT_CHORD),
+        leader: None,
+    });
+    view.reload_failure_state
+        .record_storage(&Err::<(), _>(anyhow::anyhow!("disk unreadable")));
+
+    assert!(!view.try_present_reload_failure_dialog());
+    assert!(view.info_dialog.is_none());
+    assert!(view.reload_failure_state.has_unacknowledged_failure());
+
+    view.live_send = None;
+    assert!(view.try_present_reload_failure_dialog());
+    assert_eq!(
+        view.info_dialog.as_ref().map(|dialog| dialog.title()),
+        Some("Reload Failed")
+    );
+}
+
 /// Locks the single-profile-mode scoping invariant for
 /// `rewire_after_profile_delete`. In `aoe --profile X` mode
 /// `can_delete_selected` requires `!p.is_active`, so the deleted
