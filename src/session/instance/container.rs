@@ -138,6 +138,7 @@ impl Instance {
                 ),
             }
         }
+        self.warn_legacy_agent_config_mounts();
         let _transition_lock =
             if self.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION {
                 Some(crate::session::acquire_storage_shared_flock(
@@ -315,6 +316,35 @@ impl Instance {
         container_config::compute_volume_paths(Path::new(&self.project_path), &self.project_path)
             .map(|(_, wd)| wd)
             .unwrap_or_else(|_| "/workspace".to_string())
+    }
+
+    fn warn_legacy_agent_config_mounts(&self) {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        let Ok(config) =
+            crate::session::config::profile_config::resolve_config(&self.effective_profile())
+        else {
+            return;
+        };
+        let Some(directory) = config.session.agent_config_dir_for(&self.tool, &home) else {
+            return;
+        };
+        if let Some(entry) = config.sandbox.extra_volumes.iter().find(|entry| {
+            entry
+                .split_once(':')
+                .is_some_and(|(source, _)| Path::new(source).starts_with(&directory))
+        }) {
+            tracing::warn!(
+                target: "session.profile",
+                agent = %self.tool,
+                agent_config_dir = %directory.display(),
+                extra_volume = %entry,
+                "sandbox.extra_volumes includes a source in the declared agent_config_dir tree; \
+                 manual agent-config mounts may bypass per-session isolation and staged folder trust. \
+                 Remove manual agent-config mounts and, inside the sandbox, preserve AoE-provided config-dir variables"
+            );
+        }
     }
 
     pub(super) fn build_container_config(&self) -> Result<crate::containers::ContainerConfig> {
