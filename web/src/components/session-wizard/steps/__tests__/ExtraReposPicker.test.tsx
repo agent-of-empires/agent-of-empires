@@ -2,20 +2,25 @@
 //
 // Tests for ExtraReposPicker: the wizard step that lets the user attach
 // additional repos to a multi-repo session. Cover the loading -> loaded
-// transition, toggling registered projects, free-text add (including the
-// dedupe / primary-path guards), removal chips, and the resulting onChange
-// payloads.
+// transition, the shared search-over-saved-and-recent picker (#3743),
+// free-text add (including the dedupe / primary-path guards), removal
+// chips, and the resulting onChange payloads.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import { ExtraReposPicker } from "../ExtraReposPicker";
 import type { ProjectInfo } from "../../../../lib/types";
+import type { RecentProjectEntry } from "../../../../lib/api";
 
 const fetchProjects = vi.fn();
+const fetchSessions = vi.fn();
+const fetchRecentProjects = vi.fn();
 const fetchBranches = vi.fn();
 vi.mock("../../../../lib/api", () => ({
   fetchProjects: () => fetchProjects(),
+  fetchSessions: () => fetchSessions(),
+  fetchRecentProjects: () => fetchRecentProjects(),
   fetchBranches: (...args: unknown[]) => fetchBranches(...args),
 }));
 
@@ -26,10 +31,9 @@ const PROJECTS: ProjectInfo[] = [
 ];
 
 // `basesEnabled` defaults to false so the per-repo base inputs (#3329) stay out
-// of the way of this file's concern, repo selection. Several assertions here
-// reach for the first `input[type="text"]`, which is the free-text path field.
-// The base fields have their own coverage in
-// `session-wizard/__tests__/ExtraReposPicker.perRepoBase.test.tsx`.
+// of the way of this file's concern, repo selection. The free-text path field
+// is looked up by placeholder, not position, because the shared search box
+// (#3743) also renders a text input above it.
 function setup(overrides?: { selectedPaths?: string[]; primaryPath?: string; basesEnabled?: boolean }) {
   const onChange = vi.fn();
   const onRepoBasesChange = vi.fn();
@@ -46,15 +50,23 @@ function setup(overrides?: { selectedPaths?: string[]; primaryPath?: string; bas
   return { ...utils, onChange, onRepoBasesChange };
 }
 
-function projectButton(container: HTMLElement, name: string): HTMLButtonElement | undefined {
-  return Array.from(container.querySelectorAll("button")).find(
-    (b) => b.querySelector(".font-mono")?.textContent === name,
-  ) as HTMLButtonElement | undefined;
+function projectRow(container: HTMLElement, name: string): HTMLButtonElement | undefined {
+  return Array.from(container.querySelectorAll("button")).find((b) => b.textContent?.includes(name)) as
+    | HTMLButtonElement
+    | undefined;
+}
+
+function freeTextInput(): HTMLInputElement {
+  return screen.getByPlaceholderText("/path/to/another/repo");
 }
 
 beforeEach(() => {
   fetchProjects.mockReset();
   fetchProjects.mockResolvedValue(PROJECTS);
+  fetchSessions.mockReset();
+  fetchSessions.mockResolvedValue({ sessions: [], workspace_ordering: [] });
+  fetchRecentProjects.mockReset();
+  fetchRecentProjects.mockResolvedValue({ projects: [] });
 });
 
 afterEach(() => {
@@ -62,13 +74,13 @@ afterEach(() => {
 });
 
 describe("ExtraReposPicker", () => {
-  it("hides the primary repo and lists the other registered projects once loaded", async () => {
+  it("hides the primary repo and lists the other saved projects once loaded", async () => {
     const { container } = setup();
-    await waitFor(() => expect(container.textContent).toContain("Registered projects"));
-    expect(projectButton(container, "alpha")).toBeTruthy();
-    expect(projectButton(container, "beta")).toBeTruthy();
+    await waitFor(() => expect(container.textContent).toContain("Saved projects"));
+    expect(projectRow(container, "alpha")).toBeTruthy();
+    expect(projectRow(container, "beta")).toBeTruthy();
     // Primary is filtered out of the pickable list.
-    expect(projectButton(container, "primary")).toBeFalsy();
+    expect(projectRow(container, "primary")).toBeFalsy();
   });
 
   it("shows the none summary when nothing is selected", () => {
@@ -76,22 +88,17 @@ describe("ExtraReposPicker", () => {
     expect(container.textContent).toContain("none");
   });
 
-  it("selecting a registered project adds its path via onChange", async () => {
+  it("selecting a saved project adds its path via onChange", async () => {
     const { container, onChange } = setup({ selectedPaths: [] });
-    await waitFor(() => expect(projectButton(container, "alpha")).toBeTruthy());
-    fireEvent.click(projectButton(container, "alpha")!);
+    await waitFor(() => expect(projectRow(container, "alpha")).toBeTruthy());
+    fireEvent.click(projectRow(container, "alpha")!);
     expect(onChange).toHaveBeenCalledWith(["/repos/alpha"]);
   });
 
   it("clicking an already-selected project deselects it", async () => {
     const { container, onChange } = setup({ selectedPaths: ["/repos/alpha"] });
-    await waitFor(() => expect(projectButton(container, "alpha")).toBeTruthy());
-    // Click the registered-project toggle (title is the full path and it
-    // carries a scope label), not the chip's remove button.
-    const toggle = Array.from(container.querySelectorAll("button")).find(
-      (b) => b.getAttribute("title") === "/repos/alpha" && b.textContent?.includes("alpha"),
-    )!;
-    fireEvent.click(toggle);
+    await waitFor(() => expect(projectRow(container, "alpha")).toBeTruthy());
+    fireEvent.click(projectRow(container, "alpha")!);
     expect(onChange).toHaveBeenCalledWith([]);
   });
 
@@ -116,18 +123,17 @@ describe("ExtraReposPicker", () => {
 
   it("Add button is disabled until the free-text input has content", async () => {
     const { container } = setup();
-    await waitFor(() => expect(container.textContent).toContain("Registered projects"));
+    await waitFor(() => expect(container.textContent).toContain("Saved projects"));
     const addBtn = Array.from(container.querySelectorAll("button")).find((b) => b.textContent?.trim() === "Add")!;
     expect(addBtn.disabled).toBe(true);
-    const input = container.querySelector<HTMLInputElement>('input[type="text"]')!;
-    fireEvent.change(input, { target: { value: "/new/repo" } });
+    fireEvent.change(freeTextInput(), { target: { value: "/new/repo" } });
     expect(addBtn.disabled).toBe(false);
   });
 
   it("free-text Add appends a trimmed path and clears the input", async () => {
     const { container, onChange } = setup({ selectedPaths: ["/repos/alpha"] });
-    await waitFor(() => expect(container.textContent).toContain("Registered projects"));
-    const input = container.querySelector<HTMLInputElement>('input[type="text"]')!;
+    await waitFor(() => expect(container.textContent).toContain("Saved projects"));
+    const input = freeTextInput();
     fireEvent.change(input, { target: { value: "  /new/repo  " } });
     const addBtn = Array.from(container.querySelectorAll("button")).find((b) => b.textContent?.trim() === "Add")!;
     fireEvent.click(addBtn);
@@ -137,8 +143,8 @@ describe("ExtraReposPicker", () => {
 
   it("Enter in the free-text input adds the path", async () => {
     const { container, onChange } = setup({ selectedPaths: [] });
-    await waitFor(() => expect(container.textContent).toContain("Registered projects"));
-    const input = container.querySelector<HTMLInputElement>('input[type="text"]')!;
+    await waitFor(() => expect(container.textContent).toContain("Saved projects"));
+    const input = freeTextInput();
     fireEvent.change(input, { target: { value: "/typed/repo" } });
     fireEvent.keyDown(input, { key: "Enter" });
     expect(onChange).toHaveBeenCalledWith(["/typed/repo"]);
@@ -146,8 +152,8 @@ describe("ExtraReposPicker", () => {
 
   it("ignores a duplicate free-text path but still clears the input", async () => {
     const { container, onChange } = setup({ selectedPaths: ["/repos/alpha"] });
-    await waitFor(() => expect(container.textContent).toContain("Registered projects"));
-    const input = container.querySelector<HTMLInputElement>('input[type="text"]')!;
+    await waitFor(() => expect(container.textContent).toContain("Saved projects"));
+    const input = freeTextInput();
     fireEvent.change(input, { target: { value: "/repos/alpha" } });
     const addBtn = Array.from(container.querySelectorAll("button")).find((b) => b.textContent?.trim() === "Add")!;
     fireEvent.click(addBtn);
@@ -157,8 +163,8 @@ describe("ExtraReposPicker", () => {
 
   it("ignores a free-text path equal to the primary path", async () => {
     const { container, onChange } = setup({ primaryPath: "/repos/primary", selectedPaths: [] });
-    await waitFor(() => expect(container.textContent).toContain("Registered projects"));
-    const input = container.querySelector<HTMLInputElement>('input[type="text"]')!;
+    await waitFor(() => expect(container.textContent).toContain("Saved projects"));
+    const input = freeTextInput();
     fireEvent.change(input, { target: { value: "/repos/primary" } });
     const addBtn = Array.from(container.querySelectorAll("button")).find((b) => b.textContent?.trim() === "Add")!;
     fireEvent.click(addBtn);
@@ -166,10 +172,31 @@ describe("ExtraReposPicker", () => {
     expect(input.value).toBe("");
   });
 
-  it("shows the empty-projects hint when no projects are registered", async () => {
+  it("shows the empty-projects hint when there is nothing saved or recent", async () => {
     fetchProjects.mockResolvedValue([]);
     const { container } = setup();
     await waitFor(() => expect(container.textContent).toContain("No registered projects yet"));
     expect(container.textContent).toContain("aoe project add");
+  });
+
+  // #3743: extra repos should be just as searchable as the main project step.
+  it("filters the saved list by name via the shared search box", async () => {
+    const { container } = setup();
+    await waitFor(() => expect(projectRow(container, "alpha")).toBeTruthy());
+    const search = screen.getByLabelText("Search projects");
+    fireEvent.change(search, { target: { value: "bet" } });
+    expect(projectRow(container, "beta")).toBeTruthy();
+    expect(projectRow(container, "alpha")).toBeFalsy();
+  });
+
+  it("lists recent projects alongside saved projects and can select one", async () => {
+    const recents: RecentProjectEntry[] = [
+      { path: "/repos/gamma", display_name: "gamma", tool: "claude", last_used_at: "2025-09-20T00:00:00+00:00" },
+    ];
+    fetchRecentProjects.mockResolvedValue({ projects: recents });
+    const { container, onChange } = setup();
+    await waitFor(() => expect(projectRow(container, "gamma")).toBeTruthy());
+    fireEvent.click(projectRow(container, "gamma")!);
+    expect(onChange).toHaveBeenCalledWith(["/repos/gamma"]);
   });
 });

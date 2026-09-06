@@ -837,7 +837,9 @@
         "web/src/components/session-wizard/steps/Toggle.tsx",
         "web/src/components/session-wizard/steps/ExtraReposPicker.tsx",
         "web/src/components/session-wizard/steps/ProjectStep.tsx",
-        "web/src/components/session-wizard/steps/SessionStep.tsx"
+        "web/src/components/session-wizard/steps/SessionStep.tsx",
+        "web/src/components/session-wizard/steps/projectPicker.ts",
+        "web/src/components/session-wizard/steps/ProjectSearchList.tsx"
       ]
     },
     {
@@ -2963,7 +2965,9 @@
       "components": [
         "web/src/components/session-wizard/steps/ExtraReposPicker.tsx",
         "web/src/components/session-wizard/steps/ProjectStep.tsx",
-        "web/src/components/session-wizard/SessionWizard.tsx"
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/steps/projectPicker.ts",
+        "web/src/components/session-wizard/steps/ProjectSearchList.tsx"
       ]
     },
     {
@@ -3277,7 +3281,11 @@
       "kind": "mocked-playwright",
       "risk": "medium",
       "specs": ["tests/wizard-extra-repos.spec.ts"],
-      "components": ["web/src/components/session-wizard/steps/ExtraReposPicker.tsx"]
+      "components": [
+        "web/src/components/session-wizard/steps/ExtraReposPicker.tsx",
+        "web/src/components/session-wizard/steps/projectPicker.ts",
+        "web/src/components/session-wizard/steps/ProjectSearchList.tsx"
+      ]
     },
     {
       "id": "story.wizard-creating-banner",

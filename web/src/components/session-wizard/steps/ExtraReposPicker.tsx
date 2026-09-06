@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
-import type { ProjectInfo } from "../../../lib/types";
-import { fetchBranches, fetchProjects, type BranchInfo } from "../../../lib/api";
+import { fetchBranches, type BranchInfo } from "../../../lib/api";
+import { ProjectSearchList } from "./ProjectSearchList";
+import { useProjectPicker } from "./projectPicker";
 
 interface Props {
   primaryPath: string;
@@ -95,16 +96,11 @@ export function ExtraReposPicker({
   onRepoBasesChange,
   basesEnabled,
 }: Props) {
-  const [projects, setProjects] = useState<ProjectInfo[]>([]);
-  const [loading, setLoading] = useState(true);
   const [freeText, setFreeText] = useState("");
 
-  useEffect(() => {
-    fetchProjects().then((p) => {
-      setProjects(p);
-      setLoading(false);
-    });
-  }, []);
+  // Hide the primary repo from the picker so users can't accidentally
+  // duplicate it (the builder rejects duplicate repo names).
+  const { loading, saved, recent, query, setQuery, filteredSaved, filteredRecent } = useProjectPicker([primaryPath]);
 
   const setRepoBase = (path: string, base: string) => {
     const next = { ...repoBases };
@@ -112,10 +108,6 @@ export function ExtraReposPicker({
     else delete next[path];
     onRepoBasesChange(next);
   };
-
-  // Hide the primary repo from the picker so users can't accidentally
-  // duplicate it (the builder rejects duplicate repo names).
-  const pickable = projects.filter((p) => p.path !== primaryPath);
 
   const isSelected = (path: string) => selectedPaths.includes(path);
 
@@ -159,8 +151,9 @@ export function ExtraReposPicker({
       {selectedPaths.length > 0 && (
         <div className="flex flex-col gap-1.5 mb-3">
           {selectedPaths.map((path) => {
-            const known = projects.find((p) => p.path === path);
-            const label = known?.name || path.split("/").filter(Boolean).pop() || path;
+            const known = saved.find((p) => p.path === path);
+            const recentMatch = recent.find((r) => r.path === path);
+            const label = known?.name || recentMatch?.displayName || path.split("/").filter(Boolean).pop() || path;
             return (
               <div key={path} className="flex items-center gap-1.5">
                 <span
@@ -191,31 +184,20 @@ export function ExtraReposPicker({
         </div>
       )}
 
-      {!loading && pickable.length > 0 && (
+      {!loading && (saved.length > 0 || recent.length > 0) && (
         <div className="mb-3">
-          <p className="text-[10px] uppercase tracking-wider text-text-dim mb-1.5">Registered projects</p>
-          <div className="flex flex-wrap gap-1.5">
-            {pickable.map((p) => (
-              <button
-                key={p.path}
-                type="button"
-                onClick={() => toggle(p.path)}
-                className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-md text-[12px] cursor-pointer transition-colors ${
-                  isSelected(p.path)
-                    ? "bg-brand-600/20 border border-brand-600/40 text-text-primary"
-                    : "bg-surface-900 border border-surface-700/40 text-text-secondary hover:border-surface-700"
-                }`}
-                title={p.path}
-              >
-                <span className="font-mono">{p.name}</span>
-                <span className="text-[9px] uppercase text-text-dim">{p.scope}</span>
-              </button>
-            ))}
-          </div>
+          <ProjectSearchList
+            query={query}
+            onQueryChange={setQuery}
+            filteredSaved={filteredSaved}
+            filteredRecent={filteredRecent}
+            isSelected={isSelected}
+            onSelect={toggle}
+          />
         </div>
       )}
 
-      {!loading && pickable.length === 0 && projects.length === 0 && (
+      {!loading && saved.length === 0 && recent.length === 0 && (
         <p className="text-[11px] text-text-dim mb-3">
           No registered projects yet. Add one with{" "}
           <code className="text-text-secondary">aoe project add &lt;path&gt;</code> or via the Projects page.
