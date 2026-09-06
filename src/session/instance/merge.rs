@@ -148,6 +148,11 @@ impl Instance {
             self.status = src.status;
             self.last_accessed_at = self.last_accessed_at.max(src.last_accessed_at);
             self.idle_entered_at = src.idle_entered_at;
+            // A snapshot taken before a peer archived the row carries a
+            // pre-archive observation of a pane that no longer exists.
+            if self.is_archived() {
+                self.settle_archived_status();
+            }
         }
         // Launch-config fields are TUI-authoritative and only mutated after
         // creation by the restart dialog (engine / command / args swap). They
@@ -282,6 +287,13 @@ impl Instance {
         self.lifecycle_generation = patch.lifecycle_generation;
         self.status = patch.status;
         self.idle_entered_at = patch.idle_entered_at;
+        // A patch decided from a pane observed before a concurrent archive
+        // landed is stale by construction: the archive tore the tmux down.
+        // Writing its Running/Waiting verbatim would resurrect the frozen
+        // pending-permission row the archived poll guard settles.
+        if self.is_archived() {
+            self.settle_archived_status();
+        }
         let Some(incoming) = patch.last_accessed_at else {
             return;
         };
@@ -437,6 +449,13 @@ impl Instance {
         if self.archived_at.is_some() {
             self.snoozed_until = None;
         }
+        // archive(): a row whose tmux archive tore down (#1868) cannot hold a
+        // live-interaction status. `status` has no splice arm above, so the
+        // Idle that `archive()` settled on `post` never travels here on its
+        // own; settle disk's own copy instead, whichever writer archived it.
+        if self.is_archived() {
+            self.settle_archived_status();
+        }
     }
 }
 
@@ -463,6 +482,47 @@ mod tests {
         let mut disk2 = pre2.clone();
         disk2.merge_user_action_diff(&pre2, &post2);
         assert!(!disk2.unread);
+    }
+
+    #[test]
+    fn test_merge_user_action_diff_archive_settles_live_status_on_disk() {
+        // The TUI archives through this splice, which deliberately has no
+        // `status` arm, so the Idle that `archive()` settled in memory never
+        // reaches disk on its own. The disk row must still leave the merge
+        // settled: an archived row has no tmux behind it, so a persisted
+        // Waiting is a pending-permission row nothing can clear.
+        for status in [Status::Running, Status::Waiting, Status::Starting] {
+            let mut pre = Instance::new("t", "/tmp");
+            pre.status = status;
+            let mut post = pre.clone();
+            post.archive();
+            // A peer refreshed the disk row's status after `pre` was read.
+            let mut disk = pre.clone();
+            disk.status = Status::Waiting;
+            disk.merge_user_action_diff(&pre, &post);
+            assert!(disk.archived_at.is_some());
+            assert_eq!(
+                disk.status,
+                Status::Idle,
+                "{status:?} archived through the user-action splice must settle on disk"
+            );
+        }
+        // A resting status survives the same archive.
+        let mut pre = Instance::new("t", "/tmp");
+        pre.status = Status::Error;
+        let mut post = pre.clone();
+        post.archive();
+        let mut disk = pre.clone();
+        disk.merge_user_action_diff(&pre, &post);
+        assert_eq!(disk.status, Status::Error);
+        // A row the diff leaves unarchived keeps its live status untouched.
+        let mut pre = Instance::new("t", "/tmp");
+        pre.status = Status::Waiting;
+        let mut post = pre.clone();
+        post.title = "renamed".to_string();
+        let mut disk = pre.clone();
+        disk.merge_user_action_diff(&pre, &post);
+        assert_eq!(disk.status, Status::Waiting);
     }
 
     #[test]
@@ -1144,6 +1204,43 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_passive_status_patch_settles_live_status_on_archived_row() {
+        // A poll tick that observed the pane before a concurrent archive
+        // landed flushes its patch after it. The archive already tore the
+        // tmux down, so the observation is stale by construction; writing
+        // it verbatim would resurrect the frozen-Waiting row the archive
+        // guard settles, and nothing would revisit it until the next tick.
+        for status in [Status::Running, Status::Waiting, Status::Starting] {
+            let mut disk = Instance::new("session", "/tmp/test");
+            disk.status = Status::Idle;
+            disk.archived_at = Some(Utc::now());
+            let patch = PassiveStatusPatch {
+                lifecycle_generation: 0,
+                status,
+                idle_entered_at: None,
+                last_accessed_at: None,
+            };
+            disk.merge_passive_status_patch(&disk.id.clone(), &patch);
+            assert_eq!(
+                disk.status,
+                Status::Idle,
+                "{status:?} from a stale poll must not land on an archived row"
+            );
+        }
+        // Unarchived rows still take the live status verbatim.
+        let mut disk = Instance::new("session", "/tmp/test");
+        disk.status = Status::Idle;
+        let patch = PassiveStatusPatch {
+            lifecycle_generation: 0,
+            status: Status::Waiting,
+            idle_entered_at: None,
+            last_accessed_at: None,
+        };
+        disk.merge_passive_status_patch(&disk.id.clone(), &patch);
+        assert_eq!(disk.status, Status::Waiting);
+    }
+
+    #[test]
     fn test_merge_passive_status_patch_never_fabricates_last_accessed_at() {
         // The source Instance was never touched by a user (last_accessed_at
         // itself None); the patch must preserve that rather than fabricate
@@ -1406,6 +1503,27 @@ mod tests {
 
         assert_eq!(stored.status, Status::Running);
         assert_eq!(stored.idle_entered_at, src.idle_entered_at);
+    }
+
+    #[test]
+    fn test_merge_from_tui_settles_live_status_on_archived_row() {
+        // `save()` folds a TUI snapshot's status onto disk. When a peer
+        // archived the row in between, the snapshot's Running/Waiting is a
+        // pre-archive observation of a pane that no longer exists.
+        for status in [Status::Running, Status::Waiting, Status::Starting] {
+            let mut stored = Instance::new("session", "/tmp/test");
+            stored.status = Status::Idle;
+            stored.archived_at = Some(Utc::now());
+            let mut src = Instance::new("session", "/tmp/test");
+            src.id = stored.id.clone();
+            src.status = status;
+            stored.merge_from_tui(&src);
+            assert_eq!(
+                stored.status,
+                Status::Idle,
+                "{status:?} from a stale TUI snapshot must not land on an archived row"
+            );
+        }
     }
 
     #[test]

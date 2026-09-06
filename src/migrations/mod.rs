@@ -36,12 +36,13 @@ mod v024_backfill_detect_as;
 mod v025_reenable_confirm_delete;
 mod v026_repoint_acp_default_agent;
 pub(crate) mod v027_isolate_sandbox_stores;
+mod v028_clear_archived_live_status;
 
 use anyhow::Result;
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 27;
+const CURRENT_VERSION: u32 = 28;
 const VERSION_FILE: &str = ".schema_version";
 
 struct Migration {
@@ -185,6 +186,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 27,
         name: "isolate_sandbox_stores",
         run: v027_isolate_sandbox_stores::run,
+    },
+    Migration {
+        version: 28,
+        name: "clear_archived_live_status",
+        run: v028_clear_archived_live_status::run,
     },
 ];
 

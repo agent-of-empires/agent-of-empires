@@ -196,7 +196,15 @@ impl Instance {
         // re-probes a row whose tmux is gone by design; this keeps
         // archive/unarchive status-preserving. Rows already persisted as Error
         // by a pre-fix build are cleaned up once by the v016 migration.
+        //
+        // Status-preserving stops at live-interaction statuses: with the tmux
+        // gone by design, a persisted Running/Waiting/Starting is a lie, and a
+        // frozen Waiting renders as a pending-permission row forever. Settle
+        // those to Idle (same resting state v016/v028 choose) before
+        // returning, so a row archived by an older build heals on the next
+        // poll instead of only at the one-shot migration.
         if self.is_archived() {
+            self.settle_archived_status();
             return;
         }
 
@@ -661,6 +669,34 @@ mod tests {
         );
         // No capture recorded yet: nothing to date the stamp against.
         assert!(!skip_capture(Some(100), Some(100), None, false, false));
+    }
+
+    #[test]
+    fn archived_row_with_frozen_live_status_settles_to_idle_on_poll() {
+        // A row archived by a build that predates archive()'s status degrade
+        // arrives here still claiming Waiting. The archived short-circuit
+        // must settle it rather than preserve the lie (a pending-permission
+        // row with no pane behind it), and must not probe tmux to do so.
+        for status in [Status::Running, Status::Waiting, Status::Starting] {
+            let mut inst = Instance::new("test", "/tmp/test");
+            inst.status = status;
+            inst.archived_at = Some(Utc::now());
+            inst.update_status_with_metadata(None, None);
+            assert_eq!(inst.status, Status::Idle, "{status:?} must settle");
+        }
+        // Resting statuses on an archived row stay put.
+        for status in [
+            Status::Idle,
+            Status::Stopped,
+            Status::Error,
+            Status::Unknown,
+        ] {
+            let mut inst = Instance::new("test", "/tmp/test");
+            inst.status = status;
+            inst.archived_at = Some(Utc::now());
+            inst.update_status_with_metadata(None, None);
+            assert_eq!(inst.status, status, "{status:?} should survive the poll");
+        }
     }
 
     #[test]
@@ -1139,25 +1175,28 @@ mod tests {
         // concurrent archives through merge_user_action_diff's touched arm.
         //
         // Archiving short-circuits update_status_with_metadata_inner before
-        // it touches `status` (see the `is_archived()` guard), which lets
-        // this test fully control the "detected" status for two
-        // independent calls without a real tmux session.
+        // it probes tmux (see the `is_archived()` guard), which lets this
+        // test fully control the "detected" status for two independent calls
+        // without a real tmux session. The lever must be a resting status:
+        // the guard now settles live-interaction statuses
+        // (Running/Waiting/Starting) to Idle, so Unknown stands in as the
+        // preserved non-idle state.
         let mut inst = Instance::new("test", "/tmp/test");
         inst.archive();
         inst.live_status_baseline = Some(Status::Idle);
-        inst.status = Status::Running;
+        inst.status = Status::Unknown;
         let user_touch = Some(Utc::now() - chrono::Duration::hours(2));
         inst.last_accessed_at = user_touch;
 
         inst.update_status_with_metadata(None, None);
         assert_eq!(
             inst.status,
-            Status::Running,
-            "archived guard preserves status"
+            Status::Unknown,
+            "archived guard preserves resting status"
         );
         assert_eq!(inst.idle_entered_at, None, "non-idle transition clears it");
         assert_eq!(inst.last_accessed_at, user_touch);
-        assert_eq!(inst.live_status_baseline, Some(Status::Running));
+        assert_eq!(inst.live_status_baseline, Some(Status::Unknown));
 
         inst.status = Status::Idle;
         inst.update_status_with_metadata(None, None);

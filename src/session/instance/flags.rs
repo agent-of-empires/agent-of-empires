@@ -91,11 +91,35 @@ impl Instance {
     /// the user just sunk produces contradictory state, and the web
     /// sidebar's tier comparator already assumes the server enforces a
     /// single active triage state (see `sidebarSort.ts` in #1581).
+    ///
+    /// Archiving tears down the session's tmux (#1868), so a live-interaction
+    /// status (Running/Waiting/Starting) cannot be true of an archived row.
+    /// Left in place, a frozen `Waiting` keeps rendering as a
+    /// pending-permission row forever — the status poller deliberately never
+    /// touches archived rows (#2206), so nothing else can clear it. Degrade
+    /// those statuses to Idle here, matching where v016 settles archived rows.
     pub fn archive(&mut self) {
         self.archived_at = Some(Utc::now());
         self.favorited_at = None;
         self.snoozed_until = None;
         self.pinned_at = None;
+        self.settle_archived_status();
+    }
+
+    /// Idle is the resting state an archived row can truthfully claim; see
+    /// `archive`. Shared with the status poller's archived short-circuit (so
+    /// a row frozen by an older build heals in memory without waiting for the
+    /// one-shot v028 migration) and with the three disk-write merges that can
+    /// land a status or an archive on a row (`merge_user_action_diff`,
+    /// `merge_passive_status_patch`, `merge_from_tui`), so a stale
+    /// pre-archive observation cannot re-freeze it.
+    pub(crate) fn settle_archived_status(&mut self) {
+        if matches!(
+            self.status,
+            Status::Running | Status::Waiting | Status::Starting
+        ) {
+            self.status = Status::Idle;
+        }
     }
 
     pub fn unarchive(&mut self) {
@@ -801,5 +825,34 @@ mod tests {
         inst.status = Status::Idle;
         inst.idle_entered_at = None;
         assert!(!inst.has_recent_activity(window));
+    }
+    #[test]
+    fn archive_settles_live_interaction_status_to_idle() {
+        for status in [Status::Running, Status::Waiting, Status::Starting] {
+            let mut inst = Instance::new("test", "/tmp/test");
+            inst.status = status;
+            inst.archive();
+            assert!(inst.is_archived());
+            assert_eq!(
+                inst.status,
+                Status::Idle,
+                "{status:?} cannot be true of a row whose tmux archive tore down"
+            );
+        }
+    }
+
+    #[test]
+    fn archive_leaves_resting_statuses_alone() {
+        for status in [
+            Status::Idle,
+            Status::Stopped,
+            Status::Error,
+            Status::Unknown,
+        ] {
+            let mut inst = Instance::new("test", "/tmp/test");
+            inst.status = status;
+            inst.archive();
+            assert_eq!(inst.status, status, "{status:?} should survive archive");
+        }
     }
 }
