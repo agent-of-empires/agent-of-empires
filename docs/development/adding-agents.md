@@ -92,7 +92,9 @@ Cursor uses version 1 `.cursor/hooks.json`, with direct command entries under `h
 
 ### Codex (`hooks.json`)
 
-The generic JSON payload above, written to `hooks.json` in Codex's config dir rather than to a settings file: set `hook_config: Some(AgentHookConfig { settings_rel_path: ".codex/hooks.json", format: HookFormat::CodexJson, ... })`. `codex_hooks_json_path_in()` resolves `CODEX_HOME` (else `~/.codex`) and the generic `install_hooks()` writes it. Codex status weighs the hook write against its manifest rules by declared priority, so a prompt on screen outranks a `running` write.
+The generic JSON payload above is written to `hooks.json` in Codex's config directory rather than to a settings file. Set `hook_config: Some(AgentHookConfig { settings_rel_path: ".codex/hooks.json", format: HookFormat::CodexJson, ... })`. `codex_hooks_json_path_in()` resolves `CODEX_HOME` or falls back to `~/.codex`. `install_codex_json_hooks()` checks the adjacent `config.toml` feature opt-out before delegating to the generic JSON installer. Empty-event cleanup still removes existing AoE entries while preserving user hooks when the Codex feature is disabled.
+
+Host configuration links are supported. Sandbox installation refuses linked or unreadable configuration files without following them; only a genuinely absent configuration retains the default opt-in behavior.
 
 Codex's separate `config.toml` stores `[hooks.state]` trust data and `[features].hooks = false`; its mutations are serialized with `config.toml.lock` and committed by atomic replacement. `install_codex_hooks_with_preserved_state()` / `uninstall_codex_hooks()` exist only for the v015/v017/v018 migrations that repair or strip hooks AoE once wrote there. Do not point `settings_rel_path` at `config.toml`.
 
