@@ -3129,7 +3129,7 @@ mod tests {
     #[tokio::test]
     async fn drain_queued_prompts_wakes_a_dormant_session_with_a_queue() {
         use super::drain_queued_prompts;
-        use crate::acp::state::QueuedPromptEntry;
+        use crate::daemon::QueuedPromptEntry;
         use crate::server::test_support::build_test_app_state;
         use crate::session::{Instance, Status, View};
 
@@ -3312,15 +3312,14 @@ mod tests {
             if has_queue {
                 let mut instances = state.instances.write().await;
                 let inst = instances.iter_mut().find(|i| i.id == id).unwrap();
-                inst.queued_prompts
-                    .push(crate::acp::state::QueuedPromptEntry {
-                        id: "q-1".to_string(),
-                        seq: 1,
-                        text: "typed while the session was parked".to_string(),
-                        attachments: Vec::new(),
-                        created_at: chrono::Utc::now().to_rfc3339(),
-                        origin_device: None,
-                    });
+                inst.queued_prompts.push(crate::daemon::QueuedPromptEntry {
+                    id: "q-1".to_string(),
+                    seq: 1,
+                    text: "typed while the session was parked".to_string(),
+                    attachments: Vec::new(),
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                    origin_device: None,
+                });
             }
 
             // The state a live daemon is in: the cap parked this session and

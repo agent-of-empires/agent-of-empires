@@ -17,6 +17,7 @@ mod home_isolation;
 
 mod config_merge;
 mod config_wiring;
+mod daemon_client;
 mod diff_integration;
 mod group_persistence;
 mod hidden_env_batch;

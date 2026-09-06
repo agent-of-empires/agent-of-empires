@@ -20,7 +20,7 @@ use serde::Deserialize;
 
 use super::acp::{read_only_block, validate_attachments};
 use crate::acp::protocol::PromptAttachmentUpload;
-use crate::acp::state::PromptAttachmentRef;
+use crate::daemon::PromptAttachmentRef;
 use crate::server::session_service::EditQueuedOutcome;
 use crate::server::AppState;
 
@@ -163,7 +163,7 @@ pub(super) async fn buffer_and_enqueue(
     blobs: &[crate::acp::event_store::AttachmentBlob],
     origin_device: Option<String>,
     created_at: String,
-) -> Result<crate::acp::state::QueuedPromptEntry, (StatusCode, String)> {
+) -> Result<crate::daemon::QueuedPromptEntry, (StatusCode, String)> {
     // Per-session buffer cap: reject rather than let an undrained queue grow
     // without bound. Re-enqueuing the same id replaces its blobs, so subtract
     // what this prompt already holds before checking headroom.

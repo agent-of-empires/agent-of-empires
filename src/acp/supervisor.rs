@@ -38,6 +38,7 @@ use super::agent_registry::{AgentRegistry, AgentSpec};
 use super::approvals::{ApprovalDecision, Nonce};
 use super::elicitations::{ElicitationOutcome, ElicitationResolution};
 use super::state::{AcpSessionId, Event, RateLimitInfo};
+use crate::daemon::AcpWorkerState;
 use crate::session::SandboxInfo;
 
 /// Maximum number of post-startup respawns within `RESTART_WINDOW`.
@@ -335,24 +336,6 @@ fn replace_worker_client(
 /// the client-side `applyEvent` dedupe then turned into a silent
 /// loss of the agent's first message after a retry.
 type SeqMap = std::sync::Mutex<HashMap<String, u64>>;
-
-/// Public lifecycle state for a structured view worker, surfaced via
-/// `SessionResponse.acp_worker_state` so the sidebar + structured view
-/// can show a "Resuming…" affordance while the reconciler is mid-spawn
-/// or mid-attach. Deliberately not persisted to the structured view event log:
-/// daemon lifecycle is ephemeral, transcript replay should not carry
-/// it. See #1088.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AcpWorkerState {
-    /// No worker for this session and no resume in flight.
-    Absent,
-    /// A spawn or attach is in progress; the UI shows the "Resuming…"
-    /// banner + sidebar chip.
-    Resuming,
-    /// Worker is online and reachable.
-    Running,
-}
 
 /// Which code path put a reservation into `pending_resumes`. The UI
 /// treats both as `Resuming`; the supervisor only uses the kind for
@@ -1430,7 +1413,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 self.sink.delete_attachments_for_seq(session_id, seq);
                 return disposition;
             }
-            refs.push(crate::acp::state::PromptAttachmentRef {
+            refs.push(crate::daemon::PromptAttachmentRef {
                 id: blob.id.clone(),
                 kind: blob.kind,
                 mime_type: blob.mime_type.clone(),

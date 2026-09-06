@@ -1181,7 +1181,7 @@ impl EventStore {
     pub fn rate_limited_turn_prompt(
         &self,
         session_id: &str,
-    ) -> Option<(String, Vec<crate::acp::state::PromptAttachmentRef>)> {
+    ) -> Option<(String, Vec<crate::daemon::PromptAttachmentRef>)> {
         let conn = match self.conn.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
@@ -1851,7 +1851,7 @@ impl EventStore {
             .filter_map(|(id, kind, mime_type, name, data)| {
                 Some(AttachmentBlob {
                     id,
-                    kind: crate::acp::state::PromptAttachmentKind::from_tag(&kind)?,
+                    kind: crate::daemon::PromptAttachmentKind::from_tag(&kind)?,
                     mime_type,
                     name,
                     data,
@@ -2108,7 +2108,7 @@ fn seed_budget_from_log(
 /// `PromptAttachmentRef` is what rides in the event log.
 pub struct AttachmentBlob {
     pub id: String,
-    pub kind: crate::acp::state::PromptAttachmentKind,
+    pub kind: crate::daemon::PromptAttachmentKind,
     pub mime_type: String,
     pub name: Option<String>,
     pub data: Vec<u8>,
@@ -2388,7 +2388,7 @@ mod tests {
     fn img_blob(id: &str) -> AttachmentBlob {
         AttachmentBlob {
             id: id.to_string(),
-            kind: crate::acp::state::PromptAttachmentKind::Image,
+            kind: crate::daemon::PromptAttachmentKind::Image,
             mime_type: "image/png".into(),
             name: Some("shot.png".into()),
             data: vec![0x89, 0x50, 0x4E, 0x47, 1, 2, 3],
@@ -2399,9 +2399,9 @@ mod tests {
         Event::UserPromptSent {
             prompt_id: None,
             text: "look at this".into(),
-            attachments: vec![crate::acp::state::PromptAttachmentRef {
+            attachments: vec![crate::daemon::PromptAttachmentRef {
                 id: id.to_string(),
-                kind: crate::acp::state::PromptAttachmentKind::Image,
+                kind: crate::daemon::PromptAttachmentKind::Image,
                 mime_type: "image/png".into(),
                 name: Some("shot.png".into()),
                 size: 7,
@@ -3458,9 +3458,9 @@ mod tests {
     #[test]
     fn rate_limited_turn_prompt_preserves_attachments() {
         let (_tmp, store) = open_store(1000);
-        let att = crate::acp::state::PromptAttachmentRef {
+        let att = crate::daemon::PromptAttachmentRef {
             id: "att-1".into(),
-            kind: crate::acp::state::PromptAttachmentKind::Image,
+            kind: crate::daemon::PromptAttachmentKind::Image,
             mime_type: "image/png".into(),
             name: Some("shot.png".into()),
             size: 42,

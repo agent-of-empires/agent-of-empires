@@ -121,12 +121,22 @@ macro_rules! require_tmux {
 }
 pub(crate) use require_tmux;
 
-pub fn node_available() -> bool {
-    Command::new("node")
-        .arg("--version")
+/// Resolve Node before the daemon drops host launcher state. PATH shims such as
+/// Volta can recurse when invoked inside the worker's filtered environment.
+fn node_executable() -> Option<PathBuf> {
+    let output = Command::new("node")
+        .args(["-p", "process.execPath"])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
+    path.is_file().then_some(path)
+}
+
+pub fn node_available() -> bool {
+    node_executable().is_some()
 }
 
 /// Skip the calling test if Node.js is not installed. Acp e2e tests
@@ -461,21 +471,8 @@ last_seen_version = "{}"
             "fake ACP agent not found at {}",
             fake_agent.display()
         );
-        let node = Command::new("node")
-            .args(["-p", "process.execPath"])
-            .output()
-            .expect("resolve Node executable");
-        assert!(
-            node.status.success(),
-            "node could not resolve process.execPath: {}",
-            String::from_utf8_lossy(&node.stderr)
-        );
-        let node = String::from_utf8(node.stdout)
-            .expect("Node executable path is UTF-8")
-            .trim()
-            .to_string();
-        assert!(!node.is_empty(), "node returned an empty process.execPath");
         let debug_log = app_dir_in(self.home_dir.path()).join("fake-acp.log");
+        let node = node_executable().expect("resolve Node.js executable");
         // Bake the fork-fail knob into the shim (not the daemon env) so it
         // survives the daemon's env_clear + allowlist when spawning the worker.
         let fork_fail_line = if self.acp_fork_fail {
@@ -495,7 +492,7 @@ last_seen_version = "{}"
             debug_log.display(),
             fork_fail_line,
             capture_line,
-            node,
+            node.display(),
             fake_agent.display(),
         );
         for name in ["claude", "claude-agent-acp", "aoe-agent"] {

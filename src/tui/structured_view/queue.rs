@@ -1,7 +1,7 @@
 //! TUI mirror of the daemon-owned prompt queue. Snapshots refresh at turn
 //! boundaries and on reconnect; optimistic edits reconcile on the next refresh.
 
-use crate::acp::state::QueuedPromptEntry;
+use crate::daemon::QueuedPromptEntry;
 
 /// Local mirror of the daemon-owned prompt queue, ordered by ascending `seq`.
 #[derive(Debug, Default)]

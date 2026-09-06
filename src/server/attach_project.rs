@@ -119,7 +119,7 @@ pub(crate) async fn attach_project(
             inst.source_profile.clone(),
             matches!(
                 state.acp_supervisor.worker_state(id).await,
-                crate::acp::supervisor::AcpWorkerState::Running
+                crate::daemon::AcpWorkerState::Running
             ),
         )
     };

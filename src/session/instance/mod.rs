@@ -367,12 +367,12 @@ pub struct Instance {
     /// pre-existing rows deserialising unchanged, so no migration is needed.
     /// Only the structured-view resume path populates it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub pending_initial_turn_attachments: Vec<crate::acp::state::PromptAttachmentRef>,
+    pub pending_initial_turn_attachments: Vec<crate::daemon::PromptAttachmentRef>,
 
     /// Server-owned follow-ups, ordered by `QueuedPromptEntry::seq`. Persisted
     /// here so the daemon can drain them without a connected client.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub queued_prompts: Vec<crate::acp::state::QueuedPromptEntry>,
+    pub queued_prompts: Vec<crate::daemon::QueuedPromptEntry>,
 
     /// Monotonic counter for `QueuedPromptEntry::seq`, so ordering is stable
     /// even after rows drain or are removed. Never reused within a session.

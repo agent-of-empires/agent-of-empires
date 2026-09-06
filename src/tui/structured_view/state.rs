@@ -16,7 +16,7 @@ use super::slash;
 use crate::acp::client::{DaemonEndpoint, HttpClient, PluginCommandView, WsHandle};
 use crate::acp::session_paths::SessionPathRoots;
 use crate::acp::state::AvailableCommand;
-use crate::acp::state::QueuedPromptEntry;
+use crate::daemon::QueuedPromptEntry;
 use crate::plugin::ui_state::{Notification, UiSnapshot};
 use crate::tui::plugin_ui;
 

@@ -6,6 +6,7 @@
 //! `apply_event`. This eliminates the two-writer race condition that v3's
 //! sketch had.
 
+use crate::daemon::PromptAttachmentRef;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -617,90 +618,6 @@ pub struct DiffComment {
     pub created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
-}
-
-/// Which ACP `ContentBlock` an attachment maps to. The string form
-/// (`"image"` / `"audio"` / `"resource"`) is the wire contract shared
-/// with the web composer and the prompt-request DTO in `protocol.rs`,
-/// so renaming a variant breaks the build on both sides rather than
-/// silently dropping attachments.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PromptAttachmentKind {
-    Image,
-    Audio,
-    Resource,
-}
-
-impl PromptAttachmentKind {
-    /// Stable lowercase tag, matching the serde wire form. Used by the
-    /// attachment store to persist the kind as a TEXT column.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            PromptAttachmentKind::Image => "image",
-            PromptAttachmentKind::Audio => "audio",
-            PromptAttachmentKind::Resource => "resource",
-        }
-    }
-
-    /// Parse the lowercase tag written by [`Self::as_str`], for reading the kind
-    /// back out of the attachment store's TEXT column. `None` on an unknown
-    /// tag (a corrupt or forward-version row), so the caller can skip it.
-    pub fn from_tag(tag: &str) -> Option<Self> {
-        match tag {
-            "image" => Some(PromptAttachmentKind::Image),
-            "audio" => Some(PromptAttachmentKind::Audio),
-            "resource" => Some(PromptAttachmentKind::Resource),
-            _ => None,
-        }
-    }
-}
-
-/// Replay-side view of one prompt attachment. Carries metadata only,
-/// never the bytes: the decoded blob lives in the `acp_attachments`
-/// table keyed by `(session_id, id)` and is fetched lazily over
-/// `GET /acp/attachments/{id}`. Keeping bytes out of the event log
-/// is what stops `event_json` (and every WS replay frame) from bloating
-/// to megabytes per screenshot. See #1000 / #965.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PromptAttachmentRef {
-    pub id: String,
-    pub kind: PromptAttachmentKind,
-    pub mime_type: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    /// Decoded byte length, for the UI to show a size hint without
-    /// fetching the blob.
-    pub size: u64,
-}
-
-/// One entry in a session's server-owned prompt queue: a follow-up the
-/// user lined up while a turn was busy. The daemon is the source of truth
-/// (persisted on the `Instance`), so the queue survives a client reload or
-/// a closed PWA and drains on turn-end with no tab open.
-///
-/// Attachments carry metadata only, exactly like [`PromptAttachmentRef`]
-/// on a live prompt: the bytes live in the event store's pending-attachment
-/// table keyed by `(session_id, prompt_id, attachment_id)` (outside the
-/// seq-keyed retention prune, since a queued prompt has no event seq yet) and
-/// are reloaded at drain time, so a queued screenshot does not bloat the
-/// session file.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct QueuedPromptEntry {
-    /// Client-minted stable id, unchanged across edits. Doubles as the
-    /// optimistic-echo reconcile key on the client.
-    pub id: String,
-    /// Server-assigned monotonic order; the queue drains by ascending `seq`.
-    pub seq: u64,
-    pub text: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub attachments: Vec<PromptAttachmentRef>,
-    /// RFC3339 enqueue time, for retention and provenance.
-    pub created_at: String,
-    /// Which device enqueued it, for multi-device provenance. `None` for
-    /// rows migrated from a pre-server-queue client localStorage.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub origin_device: Option<String>,
 }
 
 /// Terminal park reason the reconciler publishes when rate-limit auto-resume
