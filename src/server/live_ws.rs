@@ -386,8 +386,8 @@ fn clipboard_forward_enabled(
 }
 
 #[cfg(unix)]
-fn needs_capture_osc52(clipboard_forward: bool, has_osc52: bool, vt_retired: bool) -> bool {
-    clipboard_forward && !has_osc52 && vt_retired
+fn needs_capture_osc52(clipboard_forward: bool, has_live_osc52: bool, vt_inactive: bool) -> bool {
+    clipboard_forward && !has_live_osc52 && vt_inactive
 }
 
 /// Connection-lifetime deflate stream for frame messages (module doc, `caps`).
@@ -982,9 +982,17 @@ async fn handle_live_ws(
                     }
                     #[cfg(unix)]
                     {
+                        if capture_osc52
+                            .as_ref()
+                            .is_some_and(|source| !source.is_alive())
+                        {
+                            capture_osc52 = None;
+                        }
                         if needs_capture_osc52(
                             clipboard_forward,
-                            capture_osc52.is_some(),
+                            capture_osc52
+                                .as_ref()
+                                .is_some_and(|source| source.is_alive()),
                             capture_vt
                                 .as_ref()
                                 .is_some_and(|channel| !channel.is_alive()),
@@ -1003,14 +1011,16 @@ async fn handle_live_ws(
                                 osc52_seen = source.clipboard_sequence();
                             }
                         }
-                        let clipboard = match (capture_osc52.as_ref(), capture_vt.as_ref()) {
-                            (Some(source), _) => {
+                        let vt_clipboard = capture_vt
+                            .as_ref()
+                            .and_then(|channel| channel.clipboard_after(&mut vt_clipboard_seen));
+                        let clipboard = vt_clipboard.or_else(|| match capture_osc52.as_ref() {
+                            Some(source) => {
                                 source.refresh_owner_heartbeat();
                                 source.clipboard_after(&mut osc52_seen)
                             }
-                            (None, Some(ch)) => ch.clipboard_after(&mut vt_clipboard_seen),
-                            (None, None) => None,
-                        };
+                            None => None,
+                        });
                         if clipboard_forward && capture_settings.is_owner.load(Ordering::Relaxed) {
                             if let Some(text) = clipboard {
                                 if capture_tx

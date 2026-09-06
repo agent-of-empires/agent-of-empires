@@ -15,7 +15,7 @@ use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -911,6 +911,52 @@ pub(crate) enum VtRefreshResult {
     Retired,
     Failed,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum VtLifecycle {
+    /// The pipe was armed but its reader has not connected yet.
+    Starting,
+    /// The reader is connected and the grid may be sampled.
+    Live,
+    /// A reseed boundary intentionally moved all viewers to capture-only.
+    Retired,
+    /// The forwarder disconnected and callers may try to recover.
+    Failed,
+}
+
+impl VtLifecycle {
+    fn load(state: &AtomicU8) -> Self {
+        match state.load(Ordering::Acquire) {
+            x if x == Self::Live as u8 => Self::Live,
+            x if x == Self::Retired as u8 => Self::Retired,
+            x if x == Self::Failed as u8 => Self::Failed,
+            _ => Self::Starting,
+        }
+    }
+
+    fn store(self, state: &AtomicU8) {
+        state.store(self as u8, Ordering::Release);
+    }
+
+    fn fail_unless_retired(state: &AtomicU8) {
+        let mut current = state.load(Ordering::Acquire);
+        loop {
+            if current == Self::Retired as u8 || current == Self::Failed as u8 {
+                return;
+            }
+            match state.compare_exchange_weak(
+                current,
+                Self::Failed as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(next) => current = next,
+            }
+        }
+    }
+}
 #[derive(Clone, Copy)]
 struct SeedGuard<'a> {
     chunk: Option<(&'a AtomicU64, &'a AtomicU64, u64)>,
@@ -1601,7 +1647,7 @@ struct ReaderCtx {
     snapshot: Arc<Mutex<()>>,
     stream: Arc<Mutex<Option<UnixStream>>>,
     app_cursor: Arc<AtomicBool>,
-    alive: Arc<AtomicBool>,
+    lifecycle: Arc<AtomicU8>,
     wakeup: Arc<Mutex<Option<ChangeWakeup>>>,
     /// Latest decoded OSC 52 clipboard write from the pane, awaiting a
     /// consumer (see [`VtChannel::take_clipboard`]). Single-slot: a newer
@@ -1658,6 +1704,7 @@ fn stop_and_wake_reader(stop: &AtomicBool, sock_path: &std::path::Path) {
 /// pipe EOF, socket error, or `stop`.
 fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
     let Ok((conn, _)) = listener.accept() else {
+        VtLifecycle::fail_unless_retired(&ctx.lifecycle);
         return;
     };
     // Publish the writable half so input dispatch can reach the pane.
@@ -1666,7 +1713,7 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
     }
     // The forwarder is connected: the channel is now the live
     // single-writer. `acquire` is blocked until this flips.
-    ctx.alive.store(true, Ordering::Relaxed);
+    VtLifecycle::Live.store(&ctx.lifecycle);
     let mut buf = [0u8; 8192];
     let mut osc52 = Osc52Scanner::new();
     let mut sync = SyncOutputScanner::new();
@@ -1790,7 +1837,7 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
     // Reader is exiting (pipe EOF / socket error / stop): the
     // forwarder is gone, so the channel is no longer the live
     // single-writer. Input dispatch and capture both fall back.
-    ctx.alive.store(false, Ordering::Relaxed);
+    VtLifecycle::fail_unless_retired(&ctx.lifecycle);
     // Wake parked viewers so they observe the death promptly
     // instead of waiting out their heartbeat sleep.
     ctx.signals.end_hold();
@@ -1813,12 +1860,9 @@ pub(crate) struct VtChannel {
     stream: Arc<Mutex<Option<UnixStream>>>,
     /// DECCKM snapshot, refreshed by the reader thread on each grid change.
     app_cursor: Arc<AtomicBool>,
-    /// `true` while the forwarder is connected and the reader loop is running.
-    /// Set once `accept` publishes the writable half; cleared when the reader
-    /// exits (pipe EOF / socket error). `acquire` only returns after this goes
-    /// true, so a live channel is the single-writer; once it clears, input and
-    /// capture both fall back to the legacy tmux path instead of black-holing.
-    alive: Arc<AtomicBool>,
+    /// Shared reader lifecycle. Retirement remains distinct from failure so
+    /// every viewer honors capture-only while legitimate disconnects recover.
+    lifecycle: Arc<AtomicU8>,
     /// Slot for one in-process poller's wakeup (the TUI capture worker).
     /// The reader thread pokes it on each grid change and on death; last
     /// registration wins (one capture worker per process, so a slot rather
@@ -1892,6 +1936,10 @@ struct SampleCache {
 }
 
 impl VtChannel {
+    pub(crate) fn lifecycle_for_session(session: &str) -> Option<VtLifecycle> {
+        lookup(session).map(|channel| channel.lifecycle())
+    }
+
     /// Get the shared channel for `session`, arming a new one if none is live.
     /// Returns `None` if tmux is too old or the pane is gone or any tmux/socket
     /// step fails; callers then use the legacy capture/send-keys path. The
@@ -1907,16 +1955,14 @@ impl VtChannel {
         session: &str,
         deadline: &crate::tmux::TmuxCommandDeadline,
     ) -> Option<Arc<VtChannel>> {
-        // Only a LIVE registry entry is reusable. A dead one (its pane was
-        // killed and the tmux session recreated under the same name, e.g. a
-        // session restart) must not be handed out: a viewer that received it
-        // would sit on the capture fallback forever, and by holding the Arc
-        // it would keep the corpse registered for the next viewer to trip
-        // over. Arming fresh replaces the registry entry; the dead channel's
-        // Drop leaves the replacement alone (its own weak no longer
-        // upgrades).
-        if let Some(ch) = lookup(session).filter(|c| c.is_alive()) {
-            return Some(ch);
+        // Reuse only a live entry. Failure permits recovery, while retirement
+        // suppresses rearming until the viewers holding that generation drop.
+        if let Some(ch) = lookup(session) {
+            match ch.lifecycle() {
+                VtLifecycle::Live => return Some(ch),
+                VtLifecycle::Retired => return None,
+                VtLifecycle::Starting | VtLifecycle::Failed => {}
+            }
         }
         // Serialize arming per session: take (or create) this session's arm
         // lock, then re-check the registry under it, so the loser of a
@@ -1931,23 +1977,18 @@ impl VtChannel {
             .clone();
         let result = {
             let _armed = arm_lock.lock().unwrap();
-            if let Some(ch) = lookup(session).filter(|c| c.is_alive()) {
-                Some(ch)
+            if let Some(ch) = lookup(session) {
+                match ch.lifecycle() {
+                    VtLifecycle::Live => Some(ch),
+                    VtLifecycle::Retired => None,
+                    VtLifecycle::Starting | VtLifecycle::Failed => {
+                        Self::arm_and_register(session, deadline)
+                    }
+                }
             } else {
                 // No `?` here: an arm failure must still fall through to the
                 // prune below, or failed sessions would pile up in ARM_LOCKS.
-                Self::arm(session, deadline).map(|ch| {
-                    let ch = Arc::new(ch);
-                    // With arms serialized, no live competitor can exist
-                    // here; insert replaces at most a dead entry (whose Drop
-                    // leaves the replacement alone, since its own weak no
-                    // longer upgrades).
-                    REGISTRY
-                        .lock()
-                        .unwrap()
-                        .insert(session.to_string(), Arc::downgrade(&ch));
-                    ch
-                })
+                Self::arm_and_register(session, deadline)
             }
         };
         // Drop finished arm locks so the map tracks in-flight arms only. Our
@@ -1959,6 +2000,20 @@ impl VtChannel {
             .unwrap()
             .retain(|_, l| Arc::strong_count(l) > 1);
         result
+    }
+
+    fn arm_and_register(
+        session: &str,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> Option<Arc<VtChannel>> {
+        Self::arm(session, deadline).map(|channel| {
+            let channel = Arc::new(channel);
+            REGISTRY
+                .lock()
+                .unwrap()
+                .insert(session.to_string(), Arc::downgrade(&channel));
+            channel
+        })
     }
 
     fn arm(name: &str, deadline: &crate::tmux::TmuxCommandDeadline) -> Option<Self> {
@@ -1999,7 +2054,7 @@ impl VtChannel {
         let stream: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
         let drain: Arc<Mutex<DrainControl>> = Arc::new(Mutex::new(DrainControl::default()));
         let app_cursor = Arc::new(AtomicBool::new(false));
-        let alive = Arc::new(AtomicBool::new(false));
+        let lifecycle = Arc::new(AtomicU8::new(VtLifecycle::Starting as u8));
         let clipboard: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         // Bind the socket inside an owner-only (0700) directory so other users
         // on a shared host cannot connect to the pane channel and capture
@@ -2051,7 +2106,7 @@ impl VtChannel {
                 snapshot: snapshot.clone(),
                 stream: stream.clone(),
                 app_cursor: app_cursor.clone(),
-                alive: alive.clone(),
+                lifecycle: lifecycle.clone(),
                 wakeup: wakeup.clone(),
                 clipboard: clipboard.clone(),
                 chunk_seq: chunk_seq.clone(),
@@ -2093,7 +2148,9 @@ impl VtChannel {
         // and be dropped instead of falling back to `send-keys`. If the
         // forwarder never connects, tear down and fall back to capture.
         let connect_deadline = Instant::now() + Duration::from_millis(500);
-        while !alive.load(Ordering::Relaxed) || drain.lock().unwrap().stream.is_none() {
+        while VtLifecycle::load(&lifecycle) != VtLifecycle::Live
+            || drain.lock().unwrap().stream.is_none()
+        {
             if Instant::now() >= connect_deadline {
                 tracing::warn!(%target, "vt: forwarder did not connect; falling back to capture");
                 stop_and_wake_reader(&stop, &sock_path);
@@ -2179,7 +2236,7 @@ impl VtChannel {
             parser,
             stream,
             app_cursor,
-            alive,
+            lifecycle,
             wakeup,
             clipboard,
             chunk_seq,
@@ -2302,7 +2359,11 @@ impl VtChannel {
     /// parser would replay that output when tmux flushes it, so consumers must
     /// use the capture-only fallback instead.
     fn retire_live_channel(&self, deadline: &crate::tmux::TmuxCommandDeadline) -> VtRefreshResult {
-        self.alive.store(false, Ordering::Relaxed);
+        match self.lifecycle() {
+            VtLifecycle::Retired => return VtRefreshResult::Retired,
+            VtLifecycle::Starting | VtLifecycle::Failed => return VtRefreshResult::Failed,
+            VtLifecycle::Live => VtLifecycle::Retired.store(&self.lifecycle),
+        }
         self.shutdown_with_deadline(deadline);
         VtRefreshResult::Retired
     }
@@ -2498,7 +2559,11 @@ impl VtChannel {
     /// `false` so input and capture fall back to the legacy tmux path instead
     /// of writing into a dead socket or sampling a frozen grid.
     pub(crate) fn is_alive(&self) -> bool {
-        self.alive.load(Ordering::Relaxed)
+        self.lifecycle() == VtLifecycle::Live
+    }
+
+    pub(crate) fn lifecycle(&self) -> VtLifecycle {
+        VtLifecycle::load(&self.lifecycle)
     }
 
     /// Take the newest OSC 52 clipboard write the pane has emitted since the
@@ -3310,10 +3375,9 @@ mod tests {
         assert_ne!(base, parse_seed_state("0 0 0 0 10 20 0 0 100 40 80"));
     }
 
-    /// A hand-built channel (no tmux, no forwarder) for registry / sample
-    /// tests. `alive` starts false; flip it via the returned handle.
-    fn dummy_channel(name: &str, dir: &std::path::Path) -> (Arc<VtChannel>, Arc<AtomicBool>) {
-        let alive = Arc::new(AtomicBool::new(false));
+    /// A hand-built channel (no tmux, no forwarder) for registry / sample tests.
+    fn dummy_channel(name: &str, dir: &std::path::Path) -> (Arc<VtChannel>, Arc<AtomicU8>) {
+        let lifecycle = Arc::new(AtomicU8::new(VtLifecycle::Starting as u8));
         let ch = Arc::new(VtChannel {
             name: name.to_string(),
             owner_id: new_pipe_owner_id(),
@@ -3321,7 +3385,7 @@ mod tests {
             parser: Arc::new(Mutex::new(vt100::Parser::new(4, 20, SCROLLBACK_LINES))),
             stream: Arc::new(Mutex::new(None)),
             app_cursor: Arc::new(AtomicBool::new(false)),
-            alive: alive.clone(),
+            lifecycle: lifecycle.clone(),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
             chunk_seq: Arc::new(AtomicU64::new(0)),
@@ -3341,14 +3405,14 @@ mod tests {
             pending_drift: Mutex::new(None),
             last_owner_hb: Mutex::new(Instant::now()),
         });
-        (ch, alive)
+        (ch, lifecycle)
     }
 
     #[test]
     fn authoritative_refresh_retires_live_channel_before_snapshot() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (channel, alive) = dummy_channel("aoe_test_vt_fallback", dir.path());
-        alive.store(true, Ordering::Relaxed);
+        let (channel, lifecycle) = dummy_channel("aoe_test_vt_fallback", dir.path());
+        VtLifecycle::Live.store(&lifecycle);
         channel.stop.store(true, Ordering::Relaxed);
 
         let deadline = crate::tmux::TmuxCommandDeadline::with_timeout(Duration::ZERO);
@@ -3361,6 +3425,44 @@ mod tests {
             !channel.is_alive(),
             "consumers must fall back to capture-only after an authoritative refresh"
         );
+        assert_eq!(channel.lifecycle(), VtLifecycle::Retired);
+        VtLifecycle::fail_unless_retired(&lifecycle);
+        assert_eq!(
+            channel.lifecycle(),
+            VtLifecycle::Retired,
+            "reader shutdown must not erase intentional retirement",
+        );
+    }
+
+    #[test]
+    fn retired_registry_entry_suppresses_rearming_until_its_viewers_drop() {
+        let name = format!("aoe_test_vt_retired_{}", std::process::id());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (channel, lifecycle) = dummy_channel(&name, dir.path());
+        VtLifecycle::Retired.store(&lifecycle);
+        REGISTRY
+            .lock()
+            .unwrap()
+            .insert(name.clone(), Arc::downgrade(&channel));
+
+        assert!(VtChannel::acquire(&name).is_none());
+        assert_eq!(
+            VtChannel::lifecycle_for_session(&name),
+            Some(VtLifecycle::Retired),
+        );
+        assert!(
+            !ARM_LOCKS.lock().unwrap().contains_key(&name),
+            "a retired channel must not enter the arm path",
+        );
+
+        REGISTRY.lock().unwrap().remove(&name);
+    }
+
+    #[test]
+    fn reader_failure_does_not_look_like_intentional_retirement() {
+        let lifecycle = AtomicU8::new(VtLifecycle::Live as u8);
+        VtLifecycle::fail_unless_retired(&lifecycle);
+        assert_eq!(VtLifecycle::load(&lifecycle), VtLifecycle::Failed);
     }
 
     #[test]
@@ -3599,7 +3701,7 @@ mod tests {
             snapshot: Arc::new(Mutex::new(())),
             stream: Arc::new(Mutex::new(None)),
             app_cursor: Arc::new(AtomicBool::new(false)),
-            alive: Arc::new(AtomicBool::new(false)),
+            lifecycle: Arc::new(AtomicU8::new(VtLifecycle::Starting as u8)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
             chunk_seq: Arc::new(AtomicU64::new(0)),
@@ -3630,7 +3732,7 @@ mod tests {
         let sock = dir.path().join("s.sock");
         let listener = UnixListener::bind(&sock).expect("bind");
         let stop = Arc::new(AtomicBool::new(false));
-        let alive = Arc::new(AtomicBool::new(false));
+        let lifecycle = Arc::new(AtomicU8::new(VtLifecycle::Starting as u8));
         let snapshot = Arc::new(Mutex::new(()));
         let snapshot_guard = snapshot.lock().expect("hold snapshot before reader starts");
         let ctx = ReaderCtx {
@@ -3640,7 +3742,7 @@ mod tests {
             snapshot: snapshot.clone(),
             stream: Arc::new(Mutex::new(None)),
             app_cursor: Arc::new(AtomicBool::new(false)),
-            alive: alive.clone(),
+            lifecycle: lifecycle.clone(),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
             chunk_seq: Arc::new(AtomicU64::new(0)),
@@ -3653,7 +3755,7 @@ mod tests {
         let reader = std::thread::spawn(move || run_reader(listener, ctx));
         let conn = UnixStream::connect(&sock).expect("connect");
         let deadline = Instant::now() + Duration::from_secs(1);
-        while !alive.load(Ordering::Relaxed) {
+        while VtLifecycle::load(&lifecycle) != VtLifecycle::Live {
             assert!(Instant::now() < deadline, "reader never connected");
             std::thread::sleep(Duration::from_millis(2));
         }
@@ -3678,7 +3780,7 @@ mod tests {
         let sock = dir.path().join("s.sock");
         let listener = UnixListener::bind(&sock).expect("bind");
         let stop = Arc::new(AtomicBool::new(false));
-        let alive = Arc::new(AtomicBool::new(false));
+        let lifecycle = Arc::new(AtomicU8::new(VtLifecycle::Starting as u8));
         let stream = Arc::new(Mutex::new(None));
         let ctx = ReaderCtx {
             parser: Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0))),
@@ -3687,7 +3789,7 @@ mod tests {
             snapshot: Arc::new(Mutex::new(())),
             stream: stream.clone(),
             app_cursor: Arc::new(AtomicBool::new(false)),
-            alive: alive.clone(),
+            lifecycle: lifecycle.clone(),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
             chunk_seq: Arc::new(AtomicU64::new(0)),
@@ -3700,7 +3802,7 @@ mod tests {
         let reader = std::thread::spawn(move || run_reader(listener, ctx));
         let mut peer = UnixStream::connect(&sock).expect("connect");
         let deadline = Instant::now() + Duration::from_secs(1);
-        while !alive.load(Ordering::Relaxed) {
+        while VtLifecycle::load(&lifecycle) != VtLifecycle::Live {
             assert!(Instant::now() < deadline, "reader never connected");
             std::thread::sleep(Duration::from_millis(2));
         }
@@ -3770,7 +3872,7 @@ mod tests {
             snapshot: Arc::new(Mutex::new(())),
             stream: Arc::new(Mutex::new(None)),
             app_cursor: app_cursor.clone(),
-            alive: Arc::new(AtomicBool::new(false)),
+            lifecycle: Arc::new(AtomicU8::new(VtLifecycle::Starting as u8)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
             chunk_seq: chunk_seq.clone(),
@@ -4130,7 +4232,7 @@ mod tests {
         let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
         let stop = Arc::new(AtomicBool::new(false));
         let stream: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
-        let alive = Arc::new(AtomicBool::new(false));
+        let lifecycle = Arc::new(AtomicU8::new(VtLifecycle::Starting as u8));
         let wakeup_slot: Arc<Mutex<Option<ChangeWakeup>>> = Arc::new(Mutex::new(None));
         let ctx = ReaderCtx {
             parser: parser.clone(),
@@ -4140,7 +4242,7 @@ mod tests {
             snapshot: Arc::new(Mutex::new(())),
             stream,
             app_cursor: Arc::new(AtomicBool::new(false)),
-            alive: alive.clone(),
+            lifecycle: lifecycle.clone(),
             wakeup: wakeup_slot.clone(),
             clipboard: Arc::new(Mutex::new(None)),
             chunk_seq: Arc::new(AtomicU64::new(0)),
@@ -4291,7 +4393,7 @@ mod tests {
         let listener = UnixListener::bind(&sock).expect("bind");
         let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
         let stop = Arc::new(AtomicBool::new(false));
-        let alive = Arc::new(AtomicBool::new(false));
+        let lifecycle = Arc::new(AtomicU8::new(VtLifecycle::Starting as u8));
         let clipboard: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let ctx = ReaderCtx {
             parser: parser.clone(),
@@ -4300,7 +4402,7 @@ mod tests {
             snapshot: Arc::new(Mutex::new(())),
             stream: Arc::new(Mutex::new(None)),
             app_cursor: Arc::new(AtomicBool::new(false)),
-            alive: alive.clone(),
+            lifecycle: lifecycle.clone(),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: clipboard.clone(),
             chunk_seq: Arc::new(AtomicU64::new(0)),
@@ -4437,7 +4539,7 @@ mod tests {
             snapshot: Arc::new(Mutex::new(())),
             stream: Arc::new(Mutex::new(None)),
             app_cursor: Arc::new(AtomicBool::new(false)),
-            alive: Arc::new(AtomicBool::new(false)),
+            lifecycle: Arc::new(AtomicU8::new(VtLifecycle::Starting as u8)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
             chunk_seq,
@@ -4562,7 +4664,7 @@ mod tests {
             snapshot: snapshot.clone(),
             stream: stream.clone(),
             app_cursor: app_cursor.clone(),
-            alive: Arc::new(AtomicBool::new(false)),
+            lifecycle: Arc::new(AtomicU8::new(VtLifecycle::Starting as u8)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: clipboard.clone(),
             chunk_seq: chunk_seq.clone(),
@@ -4914,7 +5016,7 @@ mod tests {
             snapshot: Arc::new(Mutex::new(())),
             stream: Arc::new(Mutex::new(None)),
             app_cursor: Arc::new(AtomicBool::new(false)),
-            alive: Arc::new(AtomicBool::new(false)),
+            lifecycle: Arc::new(AtomicU8::new(VtLifecycle::Starting as u8)),
             wakeup: Arc::new(Mutex::new(Some(wakeup.clone()))),
             clipboard: Arc::new(Mutex::new(None)),
             chunk_seq: Arc::new(AtomicU64::new(0)),
