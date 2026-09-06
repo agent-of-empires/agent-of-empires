@@ -1,11 +1,14 @@
 /* eslint-disable react-refresh/only-export-components */
-import { useEffect, useMemo, useState } from "react";
-import { fetchSessions, fetchRecentProjects, fetchProjects, cloneRepo } from "../../../lib/api";
-import type { RecentProjectEntry } from "../../../lib/api";
-import type { AgentInfo, ClaudeSessionSummary, ProjectInfo, SessionResponse } from "../../../lib/types";
+import { useState } from "react";
+import { cloneRepo } from "../../../lib/api";
+import type { AgentInfo, ClaudeSessionSummary } from "../../../lib/types";
 import { DirectoryBrowser } from "../../DirectoryBrowser";
 import { ExtraReposPicker } from "./ExtraReposPicker";
 import { ClaudeSessionPicker } from "./ClaudeSessionPicker";
+import { ProjectSearchList } from "./ProjectSearchList";
+import { useProjectPicker } from "./projectPicker";
+
+export { collectRecentProjects, mergeRecentProjects, splitSavedAndRecent } from "./projectPicker";
 
 interface WizardData {
   path: string;
@@ -54,10 +57,6 @@ function Toggle({
 
 type Tab = "recent" | "browse" | "clone" | "import";
 
-/** How many recents render when the search box is empty. The search itself is
- *  not capped; see the filteredRecent memo. */
-const RECENT_CAP = 6;
-
 interface Props {
   data: WizardData;
   onChange: (field: string, value: unknown) => void;
@@ -67,113 +66,16 @@ interface Props {
   agents?: AgentInfo[];
 }
 
-interface RecentProject {
-  path: string;
-  displayName: string;
-  lastAccessedAt: string | null;
-  tool: string;
-  sessionCount: number;
-}
-
-export function collectRecentProjects(sessions: SessionResponse[]): RecentProject[] {
-  const map = new Map<string, RecentProject>();
-  for (const s of sessions) {
-    // Scratch sessions live in transient `<app_dir>/scratch/<id>/`
-    // directories that get deleted with the session (unless the user opts
-    // in to keeping the dir). They must not appear in the Recent list,
-    // where they would be re-selectable as a project.
-    if (s.scratch) continue;
-    // Multi-repo workspaces collapse to a single `main_repo_path` here, so
-    // picking one from Recent would start a plain single-repo session and
-    // silently drop the other repos. The project step cannot reconstruct a
-    // workspace from one path, so keep them out of the list entirely.
-    if (s.workspace_repos.length > 0) continue;
-    // Normalize the trailing slash before keying, mirroring the backend's
-    // dedup convention (`src/session/instance/tmux_session.rs` is_duplicate_session and
-    // `src/server/api/sessions/list.rs` workspace_id_for_session both
-    // `trim_end_matches('/')`). Without this, `/foo/bar` and `/foo/bar/`
-    // become two separate entries with split session counts. The `|| "/"`
-    // keeps the filesystem root from collapsing to an empty string.
-    const raw = s.main_repo_path || s.project_path;
-    if (!raw) continue;
-    const path = raw.replace(/\/+$/, "") || "/";
-    const existing = map.get(path);
-    const ts = s.last_accessed_at ?? s.created_at ?? null;
-    if (existing) {
-      existing.sessionCount++;
-      if ((ts ?? "") > (existing.lastAccessedAt ?? "")) {
-        existing.lastAccessedAt = ts;
-        existing.tool = s.tool;
-      }
-    } else {
-      map.set(path, {
-        path,
-        displayName: path.split("/").filter(Boolean).pop() || path,
-        lastAccessedAt: ts,
-        tool: s.tool,
-        sessionCount: 1,
-      });
-    }
-  }
-  return Array.from(map.values()).sort((a, b) => (b.lastAccessedAt ?? "").localeCompare(a.lastAccessedAt ?? ""));
-}
-
-// Fold the persisted recent-projects store (projects whose sessions are gone,
-// #2141) into the live session-derived list. Session-derived entries win on a
-// normalized-path collision, so an active project keeps its real session count
-// and freshness; persisted-only projects are appended with a zero count. The
-// merged list is sorted newest-first; the caller still slices to the visible
-// cap.
-export function mergeRecentProjects(sessionDerived: RecentProject[], persisted: RecentProjectEntry[]): RecentProject[] {
-  const byPath = new Map<string, RecentProject>();
-  for (const r of sessionDerived) byPath.set(r.path, r);
-  for (const p of persisted) {
-    const path = p.path.replace(/\/+$/, "") || "/";
-    if (byPath.has(path)) continue;
-    byPath.set(path, {
-      path,
-      displayName: p.display_name || path.split("/").filter(Boolean).pop() || path,
-      lastAccessedAt: p.last_used_at,
-      tool: p.tool,
-      sessionCount: 0,
-    });
-  }
-  return Array.from(byPath.values()).sort((a, b) => (b.lastAccessedAt ?? "").localeCompare(a.lastAccessedAt ?? ""));
-}
-
-/** Saved projects are a curated registry (#2140); recents are derived from
- *  live sessions and the persisted recent-projects store. A path can be in
- *  both. Drop it from recents so it renders once, in the Saved section.
- *  Path keys are normalized the same way the recents are (trailing slashes
- *  trimmed, root kept as "/") so `/foo/bar` and `/foo/bar/` match across the
- *  two sources. */
-export function splitSavedAndRecent(
-  saved: ProjectInfo[],
-  recent: RecentProject[],
-): { saved: ProjectInfo[]; recent: RecentProject[] } {
-  const norm = (p: string) => p.replace(/\/+$/, "") || "/";
-  const savedPaths = new Set(saved.map((s) => norm(s.path)));
-  return { saved, recent: recent.filter((r) => !savedPaths.has(norm(r.path))) };
-}
-
-function timeAgo(ts: string | null): string {
-  if (!ts) return "";
-  const diff = Date.now() - new Date(ts).getTime();
-  const mins = Math.floor(diff / 60000);
-  if (mins < 1) return "just now";
-  if (mins < 60) return `${mins}m ago`;
-  const hours = Math.floor(mins / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  return `${days}d ago`;
-}
-
 export function ProjectStep({ data, onChange, initialTab, agents = [] }: Props) {
-  const [recent, setRecent] = useState<RecentProject[]>([]);
-  const [saved, setSaved] = useState<ProjectInfo[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [activeTab, setActiveTab] = useState<Tab>(initialTab ?? "recent");
-  const [query, setQuery] = useState("");
+  // `manualTab` is null until the user (or a select-and-jump action like
+  // Browse/Clone) picks a tab explicitly. Until then the active tab is
+  // derived: Recent while loading or when there is something to pick, Browse
+  // once loading settles with nothing saved or recent. This avoids an effect
+  // just to flip to Browse once the picker data arrives.
+  const [manualTab, setManualTab] = useState<Tab | null>(initialTab ?? null);
+  const { loading, query, setQuery, filteredSaved, filteredRecent, hasPicks } = useProjectPicker();
+  const activeTab: Tab = manualTab ?? (!loading && !hasPicks ? "browse" : "recent");
+  const setActiveTab = setManualTab;
 
   // Clone state
   const [cloneUrl, setCloneUrl] = useState("");
@@ -183,42 +85,6 @@ export function ProjectStep({ data, onChange, initialTab, agents = [] }: Props) 
   const [cloning, setCloning] = useState(false);
   const [cloneError, setCloneError] = useState<string | null>(null);
   const [showAdvanced, setShowAdvanced] = useState(false);
-
-  useEffect(() => {
-    Promise.all([fetchSessions(), fetchRecentProjects(), fetchProjects()]).then(
-      ([envelope, recentEnvelope, savedProjects]) => {
-        const sessionDerived = envelope ? collectRecentProjects(envelope.sessions) : [];
-        const merged = mergeRecentProjects(sessionDerived, recentEnvelope?.projects ?? []);
-        const split = splitSavedAndRecent(savedProjects, merged);
-        setSaved(split.saved);
-        setRecent(split.recent);
-        // Default to Browse only when there is nothing to pick from either
-        // source; a user with saved projects but no recents should still
-        // land on the Recent tab.
-        if (split.saved.length === 0 && split.recent.length === 0 && !initialTab) {
-          setActiveTab("browse");
-        }
-        setLoading(false);
-      },
-    );
-  }, [initialTab]);
-
-  // #3461: with no query, recents stay capped so the tab reads as a short
-  // "jump back in" list. A query searches the whole merged list instead, so a
-  // project sitting below the cap is still reachable by typing.
-  const filteredRecent = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return recent.slice(0, RECENT_CAP);
-    return recent.filter((r) => r.path.toLowerCase().includes(q) || r.displayName.toLowerCase().includes(q));
-  }, [recent, query]);
-
-  const filteredSaved = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return saved;
-    return saved.filter((s) => s.path.toLowerCase().includes(q) || s.name.toLowerCase().includes(q));
-  }, [saved, query]);
-
-  const hasPicks = recent.length > 0 || saved.length > 0;
 
   // A selected path that already shows up as a (border-highlighted) saved or
   // recent row needs no separate "Selected project" box; that would just
@@ -360,89 +226,19 @@ export function ProjectStep({ data, onChange, initialTab, agents = [] }: Props) 
           )}
 
           {/* Recent projects tab: saved (curated registry) on top, then
-              session-derived and persisted recents below. */}
+              session-derived and persisted recents below. #3461: type-to-filter
+              over the whole saved + recent list, so a project below the recent
+              cap is reachable without falling back to Browse. */}
           {!loading && activeTab === "recent" && hasPicks && (
-            <div className="flex flex-col gap-4">
-              {/* #3461: type-to-filter over the whole saved + recent list, so
-                  a project below RECENT_CAP is reachable without falling back
-                  to Browse. */}
-              <input
-                type="text"
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                placeholder="Search projects by name or path"
-                aria-label="Search projects"
-                className="w-full px-3 py-2.5 text-sm bg-surface-900 border border-surface-700/40 rounded-md text-text-primary placeholder:text-text-dim focus:outline-none focus:border-brand-600"
-              />
-
-              {filteredSaved.length === 0 && filteredRecent.length === 0 && (
-                <p className="text-sm text-text-dim">No projects match that search. Try the Browse tab.</p>
-              )}
-
-              {filteredSaved.length > 0 && (
-                <div className="flex flex-col gap-1.5">
-                  <p className="text-[10px] font-mono uppercase tracking-wider text-text-dim">Saved projects</p>
-                  {filteredSaved.map((s) => (
-                    <button
-                      key={`saved:${s.scope}:${s.path}`}
-                      type="button"
-                      onClick={() => onChange("path", s.path)}
-                      className={`flex items-center gap-3 px-3 py-2.5 rounded-md border transition-colors text-left cursor-pointer ${
-                        data.path === s.path
-                          ? "border-brand-600 bg-surface-900"
-                          : "border-surface-700/40 bg-surface-900 hover:border-surface-700 hover:bg-surface-850"
-                      }`}
-                    >
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2">
-                          <span className="text-sm font-medium text-text-primary truncate">{s.name}</span>
-                          <span className="text-[10px] font-mono text-text-dim shrink-0">{s.scope}</span>
-                        </div>
-                        <div className="flex items-center gap-2 mt-0.5">
-                          <span className="font-mono text-[11px] text-text-dim truncate">{s.path}</span>
-                        </div>
-                      </div>
-                    </button>
-                  ))}
-                </div>
-              )}
-
-              {filteredRecent.length > 0 && (
-                <div className="flex flex-col gap-1.5">
-                  {filteredSaved.length > 0 && (
-                    <p className="text-[10px] font-mono uppercase tracking-wider text-text-dim">Recent</p>
-                  )}
-                  {filteredRecent.map((r) => (
-                    <button
-                      key={r.path}
-                      type="button"
-                      onClick={() => onChange("path", r.path)}
-                      className={`flex items-center gap-3 px-3 py-2.5 rounded-md border transition-colors text-left cursor-pointer ${
-                        data.path === r.path
-                          ? "border-brand-600 bg-surface-900"
-                          : "border-surface-700/40 bg-surface-900 hover:border-surface-700 hover:bg-surface-850"
-                      }`}
-                    >
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2">
-                          <span className="text-sm font-medium text-text-primary truncate">{r.displayName}</span>
-                          <span className="text-[10px] font-mono text-text-dim shrink-0">{r.tool}</span>
-                        </div>
-                        <div className="flex items-center gap-2 mt-0.5">
-                          <span className="font-mono text-[11px] text-text-dim truncate">{r.path}</span>
-                        </div>
-                      </div>
-                      <div className="flex flex-col items-end shrink-0 gap-0.5">
-                        <span className="text-[10px] text-text-dim">{timeAgo(r.lastAccessedAt)}</span>
-                        <span className="text-[10px] text-text-dim">
-                          {r.sessionCount} session{r.sessionCount !== 1 ? "s" : ""}
-                        </span>
-                      </div>
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
+            <ProjectSearchList
+              query={query}
+              onQueryChange={setQuery}
+              filteredSaved={filteredSaved}
+              filteredRecent={filteredRecent}
+              isSelected={(path) => data.path === path}
+              onSelect={(path) => onChange("path", path)}
+              emptyMessage="No projects match that search. Try the Browse tab."
+            />
           )}
 
           {/* Browse tab */}
