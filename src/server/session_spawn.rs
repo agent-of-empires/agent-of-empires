@@ -278,10 +278,11 @@ pub(crate) async fn spawn_structured_session(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
-            // Explicit request wins, else the per-agent default; effort is keyed
-            // on the resolved model. Same single-source resolver the spawn path
-            // uses; persist the model here so the composer shows it and the
-            // session stays pinned to it. See resolve_spawn_model_effort.
+            // A profile pin wins, else the explicit request, else the per-agent
+            // default; effort is keyed on the resolved model. Same single-source
+            // resolver the spawn path uses; persist the model here so the
+            // composer shows it and the session stays on it. See
+            // resolve_spawn_model_effort.
             // Persist only an EXPLICIT effort, never the resolved default:
             // `acp_effort` is a pin, and `None` means "inherit whatever the
             // configured default resolves to at spawn time". Snapshotting the

@@ -341,6 +341,45 @@ async fn admit_and_create(
         });
     }
 
+    // A profile pin (`acp.acp_defaults.<agent>.pin_model`) is authoritative
+    // for every session created under this profile. The spawn resolver
+    // (`resolve_spawn_model_effort`) applies it regardless, so refuse a
+    // request naming another model here, at the creation boundary, instead of
+    // recording that model as the session's explicit choice and silently
+    // launching the pin. Config resolution reads files; keep it off the
+    // runtime thread like the canonicalization below.
+    let requested_model = req
+        .model_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(model) = requested_model {
+        let profile = deps.profile.clone();
+        let agent_id = req.agent_id.clone();
+        let pinned = tokio::task::spawn_blocking(move || {
+            crate::session::config::profile_config::resolve_config_or_warn(&profile)
+                .acp
+                .pinned_model_for(&agent_id)
+        })
+        .await
+        .map_err(|e| DispatchError::internal(format!("resolve profile config: {e}")))?;
+        if let Some(pinned) = pinned.filter(|pinned| pinned != model) {
+            return Err(DispatchError {
+                code: codes::INVALID_PARAMS,
+                message: format!(
+                    "model {model:?} is refused: profile {:?} pins {:?} to {pinned:?}",
+                    deps.profile, req.agent_id
+                ),
+                data: Some(serde_json::json!({
+                    "kind": "model_pinned",
+                    "agent_id": req.agent_id,
+                    "model_id": model,
+                    "pinned_model": pinned,
+                })),
+            });
+        }
+    }
+
     // Model must be advertised when the catalog is discovered; with an
     // undiscovered catalog it passes through and the adapter arbitrates.
     if let (Some(model), Some(entry)) = (req.model_id.as_deref(), entry) {
@@ -796,6 +835,70 @@ mod tests {
         .await
         .expect_err("scratch + extra repos must be refused");
         assert_eq!(err.code, codes::INVALID_PARAMS);
+    }
+
+    /// A profile pin (`acp.acp_defaults.<agent>.pin_model`) is authoritative
+    /// at the creation boundary: a `model_id` naming any other model is refused
+    /// with a typed error carrying the pin, instead of being forwarded as the
+    /// explicit session model and silently replaced at spawn. The pinned model
+    /// itself, and an omitted model, pass the gate.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn create_refuses_a_model_off_the_profile_pin() {
+        use crate::session::test_support::isolate_app_dir;
+        let _tmp = isolate_app_dir();
+        let config_path = crate::session::get_app_dir()
+            .expect("isolated app dir")
+            .join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[acp.acp_defaults.claude]\nmodel = \"claude-pinned\"\npin_model = true\n",
+        )
+        .expect("write pinned config");
+        let (deps, _dir) = test_deps(Vec::new());
+        let ctx = ctx_with(&["session.create"]);
+
+        let err = dispatch(
+            &deps,
+            &ctx,
+            "sessions.create",
+            &serde_json::json!({
+                "agent_id": "claude",
+                "project_path": "/tmp",
+                "model_id": "claude-other",
+            }),
+        )
+        .await
+        .expect_err("a model off the pin must be refused");
+        assert_eq!(err.code, codes::INVALID_PARAMS);
+        assert_eq!(kind(&err), "model_pinned");
+        let data = err.data.expect("typed error data");
+        assert_eq!(data["agent_id"], "claude");
+        assert_eq!(data["model_id"], "claude-other");
+        assert_eq!(data["pinned_model"], "claude-pinned");
+
+        // The pin itself and an omitted model get past the gate: the request
+        // then reaches project-path canonicalization, which fails on a path
+        // that does not exist, so nothing is spawned and the error names the
+        // path rather than the pin.
+        for params in [
+            serde_json::json!({
+                "agent_id": "claude",
+                "project_path": "/nonexistent/aoe-pin-gate",
+                "model_id": "claude-pinned",
+            }),
+            serde_json::json!({
+                "agent_id": "claude",
+                "project_path": "/nonexistent/aoe-pin-gate",
+            }),
+        ] {
+            let err = dispatch(&deps, &ctx, "sessions.create", &params)
+                .await
+                .expect_err("a missing project path is refused");
+            assert_eq!(err.code, codes::INVALID_PARAMS, "{params}");
+            assert_ne!(kind(&err), "model_pinned", "{params}");
+            assert!(err.message.contains("project_path"), "{}", err.message);
+        }
     }
 
     /// A registry-unknown `agent_id` never spawns anything (the probe bails on

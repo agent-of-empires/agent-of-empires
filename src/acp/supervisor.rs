@@ -1751,9 +1751,11 @@ impl<S: BroadcastSink> Supervisor<S> {
 
         // Resolve the per-agent structured-view defaults once, at this single
         // spawn choke point, so CLI create, reconciler respawn, and web create
-        // all honor the same model/effort/mode defaults. An explicit
-        // per-request model or effort wins; otherwise the configured default
-        // fills in. Mode has no per-request override today.
+        // all honor the same model/effort/mode defaults and the same pin. A
+        // pinned model wins over everything (so a persisted pre-pin model
+        // cannot launch off it on respawn); otherwise an explicit per-request
+        // model or effort wins and the configured default fills in. Mode has
+        // no per-request override today.
         // ponytail: resolve here instead of threading model/effort/mode through
         // every SpawnRequest site; revisit if explicit per-request values land.
         let acp_defaults = resolved_cfg.acp.acp_defaults_for(&agent);

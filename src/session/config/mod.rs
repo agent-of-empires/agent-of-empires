@@ -1488,6 +1488,18 @@ pub struct AcpAgentDefaults {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 
+    /// Make `model` a pin instead of a default. Off (the default), `model`
+    /// only fills in when a request names none and an explicit request wins.
+    /// On, every structured-view spawn for this agent runs on `model`:
+    /// [`resolve_spawn_model_effort`] replaces any other value, plugin
+    /// `sessions.create` refuses one (`model_pinned`), and the plugin settings
+    /// model picker offers only the pin. Governs creation and (re)spawn; a
+    /// running session's live model switch is a separate control. Meaningless
+    /// without a non-empty `model`. Global/profile only, like the rest of
+    /// `acp`: a repo config cannot set or clear it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pin_model: bool,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
 
@@ -1507,6 +1519,7 @@ pub struct AcpAgentDefaults {
 impl AcpAgentDefaults {
     pub fn is_empty(&self) -> bool {
         self.model.as_deref().is_none_or(str::is_empty)
+            && !self.pin_model
             && self.effort.as_deref().is_none_or(str::is_empty)
             && self.mode.as_deref().is_none_or(str::is_empty)
             && self.effort_by_model.is_empty()
@@ -1516,6 +1529,16 @@ impl AcpAgentDefaults {
     /// blank value never overrides the agent's own default at spawn.
     pub fn model(&self) -> Option<String> {
         self.model.clone().filter(|value| !value.is_empty())
+    }
+
+    /// The pinned model: `model` when `pin_model` is on and the value is
+    /// non-empty, else `None`. A plain default never reads as a pin.
+    pub fn pinned_model(&self) -> Option<String> {
+        if self.pin_model {
+            self.model()
+        } else {
+            None
+        }
     }
 
     /// Default mode, with empty strings treated as unset (mirrors
@@ -1561,24 +1584,41 @@ impl AcpConfig {
             .get(agent)
             .filter(|defaults| !defaults.is_empty())
     }
+
+    /// The model `agent` is pinned to, if its structured-view entry sets
+    /// `pin_model` with a non-empty `model`. The one source every creation
+    /// surface (spawn resolver, plugin `sessions.create`, the settings model
+    /// picker) reads the pin from; see [`AcpAgentDefaults::pinned_model`].
+    pub fn pinned_model_for(&self, agent: &str) -> Option<String> {
+        self.acp_defaults_for(agent)
+            .and_then(|defaults| defaults.pinned_model())
+    }
 }
 
-/// Resolve the model + effort a structured-view spawn should use: an explicit
-/// per-request value (trimmed, non-empty) always wins, otherwise the per-agent
-/// structured-view default. Effort is keyed on the resolved model so a
-/// per-model override in `effort_by_model` applies to a defaulted model too.
+/// Resolve the model + effort a structured-view spawn should use. A pinned
+/// model (`pin_model`) wins over everything; otherwise an explicit per-request
+/// value (trimmed, non-empty) wins, and the per-agent structured-view default
+/// fills an absent one. Effort is keyed on the resolved model so a per-model
+/// override in `effort_by_model` applies to a defaulted or pinned model too;
+/// the pin is on the model only, so an explicit effort is still honored.
 ///
 /// Single source for every spawn path (CLI create, reconciler respawn, web
-/// create); see `AcpConfig::acp_defaults_for`.
+/// and plugin create); see `AcpConfig::acp_defaults_for`. Because the pin is
+/// applied here, a request carrying another model (a stored plugin setting
+/// that predates the pin, a persisted `agent_model` on respawn) cannot launch
+/// off it through any of those paths; plugin `sessions.create` additionally
+/// refuses such a request up front so the caller learns about the pin.
 pub fn resolve_spawn_model_effort(
     defaults: Option<&AcpAgentDefaults>,
     req_model: Option<String>,
     req_effort: Option<String>,
 ) -> (Option<String>, Option<String>) {
-    let model = req_model
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .or_else(|| defaults.and_then(|d| d.model()));
+    let model = defaults.and_then(|d| d.pinned_model()).or_else(|| {
+        req_model
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .or_else(|| defaults.and_then(|d| d.model()))
+    });
     let effort = req_effort
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -4576,6 +4616,7 @@ mod tests {
             AcpAgentDefaults {
                 model: Some("openai/gpt-5.5".to_string()),
                 effort: Some("high".to_string()),
+                pin_model: true,
                 ..Default::default()
             },
         );
@@ -4597,6 +4638,7 @@ mod tests {
             Some(&AcpAgentDefaults {
                 model: Some("openai/gpt-5.5".to_string()),
                 effort: Some("high".to_string()),
+                pin_model: true,
                 ..Default::default()
             }),
             "acp_defaults should survive roundtrip"
@@ -4717,6 +4759,55 @@ mod tests {
             .effort_by_model
             .insert("gpt-5".to_string(), "high".to_string());
         assert!(!with_map.is_empty());
+
+        let with_pin = AcpAgentDefaults {
+            pin_model: true,
+            ..Default::default()
+        };
+        assert!(!with_pin.is_empty());
+    }
+
+    #[test]
+    fn acp_defaults_pinned_model_needs_both_the_flag_and_a_model() {
+        let mut defaults = AcpAgentDefaults {
+            model: Some("openai/gpt-5.5".to_string()),
+            ..Default::default()
+        };
+        // A plain default is not a pin.
+        assert_eq!(defaults.pinned_model(), None);
+        defaults.pin_model = true;
+        assert_eq!(defaults.pinned_model().as_deref(), Some("openai/gpt-5.5"));
+        // The flag alone pins nothing: a blank model is unset, as everywhere.
+        defaults.model = Some(String::new());
+        assert_eq!(defaults.pinned_model(), None);
+        defaults.model = None;
+        assert_eq!(defaults.pinned_model(), None);
+    }
+
+    #[test]
+    fn acp_config_pinned_model_for_ignores_a_plain_default() {
+        let mut config = AcpConfig::default();
+        config.acp_defaults.insert(
+            "opencode".to_string(),
+            AcpAgentDefaults {
+                model: Some("openai/gpt-5.5".to_string()),
+                ..Default::default()
+            },
+        );
+        config.acp_defaults.insert(
+            "claude".to_string(),
+            AcpAgentDefaults {
+                model: Some("claude-x".to_string()),
+                pin_model: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(config.pinned_model_for("opencode"), None);
+        assert_eq!(
+            config.pinned_model_for("claude").as_deref(),
+            Some("claude-x")
+        );
+        assert_eq!(config.pinned_model_for("gemini"), None);
     }
 
     #[test]
@@ -4835,6 +4926,41 @@ mod tests {
         let (model, effort) = resolve_spawn_model_effort(None, None, None);
         assert_eq!(model, None);
         assert_eq!(effort, None);
+    }
+
+    #[test]
+    fn resolve_spawn_model_effort_pin_replaces_an_explicit_request() {
+        let mut defaults = AcpAgentDefaults {
+            model: Some("openai/gpt-5.5".to_string()),
+            effort: Some("low".to_string()),
+            pin_model: true,
+            ..Default::default()
+        };
+        defaults
+            .effort_by_model
+            .insert("openai/gpt-5.5".to_string(), "high".to_string());
+        // The request names another model: the pin wins, and the per-model
+        // effort is keyed on the pin rather than on the request.
+        let (model, effort) =
+            resolve_spawn_model_effort(Some(&defaults), Some("anthropic/claude".to_string()), None);
+        assert_eq!(model.as_deref(), Some("openai/gpt-5.5"));
+        assert_eq!(effort.as_deref(), Some("high"));
+        // The pin is on the model only; an explicit effort is still honored.
+        let (model, effort) = resolve_spawn_model_effort(
+            Some(&defaults),
+            Some("anthropic/claude".to_string()),
+            Some("medium".to_string()),
+        );
+        assert_eq!(model.as_deref(), Some("openai/gpt-5.5"));
+        assert_eq!(effort.as_deref(), Some("medium"));
+        // With no request at all the pin fills in like a default would.
+        let (model, _) = resolve_spawn_model_effort(Some(&defaults), None, None);
+        assert_eq!(model.as_deref(), Some("openai/gpt-5.5"));
+        // Without the flag the same entry is a default: the request wins.
+        defaults.pin_model = false;
+        let (model, _) =
+            resolve_spawn_model_effort(Some(&defaults), Some("anthropic/claude".to_string()), None);
+        assert_eq!(model.as_deref(), Some("anthropic/claude"));
     }
 
     #[test]
