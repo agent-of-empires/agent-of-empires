@@ -18,8 +18,8 @@ use crate::session::config::{GroupByMode, RowTagMode, SortOrder};
 use crate::session::{Item, Status};
 use crate::tui::components::preview::{self, CachedPreview};
 use crate::tui::components::{
-    format_scroll_indicator, set_prefixed_input_cursor_position, truncate_to_width, HelpOverlay,
-    Preview,
+    format_scroll_indicator, prefix_within_width, set_prefixed_input_cursor_position,
+    truncate_to_width, HelpOverlay, Preview,
 };
 use crate::tui::responsive;
 use crate::tui::styles::{has_min_contrast, Theme};
@@ -578,15 +578,6 @@ fn push_shelf_error_lines(
     }
 }
 
-/// Compact display code for a profile name, used by the per-row profile tag
-/// in all-profiles view where the full name is too wide.
-///
-/// Hyphen/underscore-delimited names collapse to their segment initials
-/// (`forit-backup` becomes `fb`); single-segment names take their first three
-/// chars (`default` becomes `def`). Always lowercased, capped at four chars.
-/// The mapping is per-name and deterministic, so two profiles that collapse to
-/// the same code render identically; the full name still shows in a filtered
-/// view's list title and in the New/Restart dialogs.
 /// Per-row tag content plus the mode's max content width. The renderer
 /// right-pads `content` to `max_width` so the bracket span is fixed-width
 /// across rows (`[fb  ]` vs `[def ]`), keeping the activity column from
@@ -600,8 +591,14 @@ pub(crate) struct RowTag {
 const BRANCH_TAG_WIDTH: usize = 12;
 
 impl RowTag {
+    /// The bracketed tag, right-padded to `max_width` terminal cells. Padding
+    /// is measured by display width, not `char` count, so a wide glyph
+    /// (`界`, two cells) or a combining mark (zero cells) in the content still
+    /// yields a bracket span of exactly `max_width + 2` cells.
     pub fn rendered(&self) -> String {
-        format!("[{:<width$}]", self.content, width = self.max_width)
+        let used = unicode_width::UnicodeWidthStr::width(self.content.as_str());
+        let pad = self.max_width.saturating_sub(used);
+        format!("[{}{}]", self.content, " ".repeat(pad))
     }
 }
 
@@ -701,21 +698,44 @@ fn branch_tag_content(branch: &str, max_width: usize) -> Option<String> {
     }
 }
 
+/// Compact display code for a profile name, used by the per-row profile tag
+/// in all-profiles view where the full name is too wide.
+///
+/// Hyphen/underscore-delimited names keep a short lead segment (at most
+/// three grapheme clusters) whole and append the first cluster of each
+/// remaining segment, so sibling profiles that share an initial stay
+/// distinguishable at a glance (`gna-main` becomes `gnam`, `bsc-main` and
+/// `bso-main` become `bscm` and `bsom`, `wma-work` becomes `wmaw`); a longer
+/// lead contributes its initial only (`forit-backup` becomes `fb`).
+/// Single-segment names take their first three clusters (`default` becomes
+/// `def`). The code is lowercased and then cut to four terminal cells on a
+/// cluster boundary, measured as a string the way [`RowTag::rendered`]
+/// measures it, so a case expansion (`İ`), a wide glyph (`界`) or an emoji
+/// sequence (`♥️`, `🤝🏽`) never pushes the fixed-width tag past
+/// [`RowTag::max_width`]. The mapping is per-name and deterministic, so two
+/// profiles that collapse to the same code render identically; the full name
+/// still shows in a filtered view's list title and in the New/Restart dialogs.
 pub(crate) fn profile_short_code(profile: &str) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    const MAX_CELLS: usize = 4;
     let segments: Vec<&str> = profile
         .split(['-', '_'])
         .filter(|s| !s.is_empty())
         .collect();
     let code: String = match segments.as_slice() {
         [] => String::new(),
-        [single] => single.chars().take(3).collect(),
-        many => many
-            .iter()
-            .filter_map(|s| s.chars().next())
-            .take(4)
-            .collect(),
+        [single] => single.graphemes(true).take(3).collect(),
+        [lead, rest @ ..] => {
+            let mut code: String = if lead.graphemes(true).count() <= 3 {
+                (*lead).to_string()
+            } else {
+                lead.graphemes(true).take(1).collect()
+            };
+            code.extend(rest.iter().filter_map(|s| s.graphemes(true).next()));
+            code
+        }
     };
-    code.to_lowercase()
+    prefix_within_width(&code.to_lowercase(), MAX_CELLS).to_string()
 }
 
 /// Format a timestamp as a compact relative age (e.g. `3m`, `2h`, `4d`, `2mo`).
@@ -4789,7 +4809,19 @@ mod tests {
     fn profile_short_code_multi_segment_takes_initials() {
         assert_eq!(profile_short_code("forit-backup"), "fb");
         assert_eq!(profile_short_code("pivot-main"), "pm");
-        assert_eq!(profile_short_code("wma-work"), "ww");
+        assert_eq!(profile_short_code("connect_airlines-work"), "caw");
+    }
+
+    #[test]
+    fn profile_short_code_keeps_short_lead_segment_whole() {
+        assert_eq!(profile_short_code("gna-main"), "gnam");
+        assert_eq!(profile_short_code("bsc-main"), "bscm");
+        assert_eq!(profile_short_code("bso-main"), "bsom");
+        assert_eq!(profile_short_code("RAS-Main"), "rasm");
+        assert_eq!(profile_short_code("aoe-fiw"), "aoef");
+        assert_eq!(profile_short_code("wma-work"), "wmaw");
+        assert_eq!(profile_short_code("p9-main"), "p9m");
+        assert_eq!(profile_short_code("bp-main"), "bpm");
     }
 
     #[test]
@@ -4801,6 +4833,68 @@ mod tests {
     #[test]
     fn profile_short_code_caps_at_four_chars() {
         assert_eq!(profile_short_code("a-b-c-d-e-f"), "abcd");
+    }
+
+    /// The four-cell cap is enforced after lowercasing and by display width:
+    /// `İ` lowercases to `i` + a combining dot (two scalars, one cell) and
+    /// `界` is one scalar but two cells; neither may widen the tag.
+    #[test]
+    fn profile_short_code_caps_by_display_width_after_lowercasing() {
+        use unicode_width::UnicodeWidthStr;
+        let expanded = profile_short_code("İab-main");
+        assert_eq!(expanded, "i\u{307}abm");
+        assert_eq!(expanded.width(), 4);
+        assert_eq!(profile_short_code("界界界-main"), "界界");
+        assert_eq!(profile_short_code("界界界-main").width(), 4);
+        assert_eq!(profile_short_code("界-main"), "界m");
+        assert_eq!(profile_short_code("x界-main"), "x界m");
+        assert_eq!(profile_short_code("界界界界"), "界界");
+        for name in ["İİİİ-main", "界界界界-main", "İ界-x-y-z", "ÀÉÎ-main"] {
+            assert!(
+                profile_short_code(name).width() <= 4,
+                "{name:?} -> {:?} exceeds four cells",
+                profile_short_code(name)
+            );
+        }
+    }
+
+    /// `UnicodeWidthChar` is not additive across an emoji sequence: `♥` plus
+    /// VS16 measures 1 + 0 per scalar but 2 as a string, and a skin tone
+    /// measures 2 alone but 0 once joined to its base. The cap has to measure
+    /// grapheme-aligned prefixes as a string, the way `RowTag::rendered()`
+    /// does, or the tag over- or under-fills.
+    #[test]
+    fn profile_short_code_measures_width_across_grapheme_clusters() {
+        use unicode_width::UnicodeWidthStr;
+        // Per-scalar sum admits `a` (1 + 0 + 2 + 1 = 4) but the string is 5 cells.
+        assert_eq!(
+            profile_short_code("\u{2665}\u{fe0f}界-a"),
+            "\u{2665}\u{fe0f}界"
+        );
+        // Per-scalar sum (2 + 2) rejects `m`, yet `🤝🏽m` is 3 cells.
+        assert_eq!(
+            profile_short_code("\u{1f91d}\u{1f3fd}-main"),
+            "\u{1f91d}\u{1f3fd}m"
+        );
+        // A segment's initial is its first cluster, so the VS16 that keeps
+        // the heart in emoji presentation travels with it.
+        assert_eq!(
+            profile_short_code("x-\u{2665}\u{fe0f}"),
+            "x\u{2665}\u{fe0f}"
+        );
+        for name in [
+            "\u{2665}\u{fe0f}\u{2665}\u{fe0f}\u{2665}\u{fe0f}",
+            "\u{1f91d}\u{1f3fd}-a-b-c-d",
+            "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}-main",
+            "क्ष-main",
+        ] {
+            let code = profile_short_code(name);
+            assert!(
+                code.width() <= 4,
+                "{name:?} -> {code:?} is {} cells",
+                code.width()
+            );
+        }
     }
 
     #[test]
@@ -5011,11 +5105,33 @@ mod tests {
 
     #[test]
     fn row_tag_content_fits_within_max_width() {
-        // RowTag.rendered() right-pads to max_width via `{:<width$}` —
-        // if content ever exceeds max_width the format width is ignored
-        // and the bracket span jitters. profile_short_code's documented
-        // cap of 4 is the tightest case to spot-check.
-        assert!(profile_short_code("forit-backup-extra").len() <= 4);
+        // RowTag.rendered() right-pads to max_width by display width; if
+        // content ever exceeds max_width the pad is zero and the bracket
+        // span jitters. profile_short_code's documented cap of 4 cells is
+        // the tightest case to spot-check.
+        use unicode_width::UnicodeWidthStr;
+        assert!(profile_short_code("forit-backup-extra").width() <= 4);
+        assert!(profile_short_code("界界界-main").width() <= 4);
+    }
+
+    /// Padding is display-width-aware: a two-cell glyph counts as two.
+    #[test]
+    fn row_tag_rendered_pads_by_display_width() {
+        let wide = RowTag {
+            content: "界界".to_string(),
+            max_width: 4,
+        };
+        assert_eq!(wide.rendered(), "[界界]");
+        let one_wide = RowTag {
+            content: "界m".to_string(),
+            max_width: 4,
+        };
+        assert_eq!(one_wide.rendered(), "[界m ]");
+        let combining = RowTag {
+            content: "i\u{307}abm".to_string(),
+            max_width: 4,
+        };
+        assert_eq!(combining.rendered(), "[i\u{307}abm]");
     }
 
     #[test]

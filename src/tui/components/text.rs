@@ -6,7 +6,6 @@
 /// "" when `max_width` is 0 (the text gets sacrificed entirely so
 /// whatever fixed content it competes with wins).
 pub fn truncate_to_width(text: &str, max_width: usize) -> String {
-    use unicode_segmentation::UnicodeSegmentation;
     use unicode_width::UnicodeWidthStr;
     if max_width == 0 {
         return String::new();
@@ -15,34 +14,61 @@ pub fn truncate_to_width(text: &str, max_width: usize) -> String {
         return text.to_string();
     }
     // Reserve one cell for the ellipsis.
-    let budget = max_width.saturating_sub(1);
-    let mut out = String::new();
-    // Step by grapheme cluster, and measure the accumulated prefix rather than
-    // summing per-piece widths. Both matter, for different reasons.
-    //
-    // Clusters, because a `char` is not a display unit: cutting mid-cluster
-    // leaves a dangling combining mark ("क्" out of "क्ष") or strips a VS16 so
-    // the base glyph flips from emoji to text presentation.
-    //
-    // Accumulated measurement, because `UnicodeWidthStr::width` resolves those
-    // clusters, so "\u{26a0}\u{fe0f}" is 2 cells while its chars sum to 1.
-    // Summing over-admits and returns a string wider than the budget, breaking
-    // the promise above (and underflowing any caller that subtracts the result
-    // from a remaining budget).
-    for g in text.graphemes(true) {
-        out.push_str(g);
-        if UnicodeWidthStr::width(out.as_str()) > budget {
-            out.truncate(out.len() - g.len());
-            break;
-        }
-    }
+    let mut out = prefix_within_width(text, max_width.saturating_sub(1)).to_string();
     out.push('\u{2026}');
     out
 }
 
+/// The longest prefix of `text` that fits in `max_width` display cells,
+/// with no ellipsis. Steps by grapheme cluster and measures the accumulated
+/// prefix rather than summing per-piece widths. Both matter, for different
+/// reasons.
+///
+/// Clusters, because a `char` is not a display unit: cutting mid-cluster
+/// leaves a dangling combining mark ("क्" out of "क्ष") or strips a VS16 so
+/// the base glyph flips from emoji to text presentation.
+///
+/// Accumulated measurement, because `UnicodeWidthStr::width` resolves those
+/// clusters, so "\u{26a0}\u{fe0f}" is 2 cells while its chars sum to 1 and
+/// "\u{1f91d}\u{1f3fd}" is 2 cells while its chars sum to 4. Summing
+/// over-admits the first (a string wider than the budget, which underflows
+/// any caller that subtracts the result from a remaining budget) and
+/// under-admits the second.
+pub fn prefix_within_width(text: &str, max_width: usize) -> &str {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    let mut end = 0;
+    for (start, g) in text.grapheme_indices(true) {
+        if UnicodeWidthStr::width(&text[..start + g.len()]) > max_width {
+            break;
+        }
+        end = start + g.len();
+    }
+    &text[..end]
+}
+
 #[cfg(test)]
 mod tests {
-    use super::truncate_to_width;
+    use super::{prefix_within_width, truncate_to_width};
+
+    #[test]
+    fn prefix_within_width_measures_clusters_as_a_string() {
+        // No ellipsis, and a prefix that fits comes back whole.
+        assert_eq!(prefix_within_width("abc", 4), "abc");
+        assert_eq!(prefix_within_width("abcdef", 4), "abcd");
+        assert_eq!(prefix_within_width("abc", 0), "");
+        // Per-scalar widths sum to 4 but the string is 5 cells: drop `a`.
+        assert_eq!(
+            prefix_within_width("\u{2665}\u{fe0f}界a", 4),
+            "\u{2665}\u{fe0f}界"
+        );
+        // Per-scalar widths sum to 5 but the skin-tone cluster is 2 cells:
+        // keep `m`.
+        assert_eq!(
+            prefix_within_width("\u{1f91d}\u{1f3fd}m", 4),
+            "\u{1f91d}\u{1f3fd}m"
+        );
+    }
 
     #[test]
     fn truncate_to_width_passthrough_when_fits() {

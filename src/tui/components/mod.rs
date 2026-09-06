@@ -19,7 +19,7 @@ pub use dir_picker::{DirPicker, DirPickerResult};
 pub use help::HelpOverlay;
 pub use list_picker::{ListPicker, ListPickerResult};
 pub use preview::{format_scroll_indicator, Preview};
-pub use text::truncate_to_width;
+pub use text::{prefix_within_width, truncate_to_width};
 pub(crate) use text_input::{focused_input_spans, input_scroll, visible_slice};
 pub use text_input::{
     longest_common_prefix, render_text_field, render_text_field_with_ghost,
