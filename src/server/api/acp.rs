@@ -1985,6 +1985,10 @@ pub async fn acp_enable(
     if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
+    // Serialize the synchronous view transition with disable and with the
+    // deferred worker spawn below.
+    let inst_lock = state.instance_lock(&id).await;
+    let transition_guard = inst_lock.lock().await;
     let (mut instance, profile) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id).cloned() else {
@@ -2129,6 +2133,9 @@ pub async fn acp_enable(
                 slot.status = crate::session::Status::Idle;
                 slot.lifecycle_generation = lifecycle_generation;
                 slot.acp_load_session_capable = None;
+                state
+                    .mutation_epoch
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
         }
     }
@@ -2185,11 +2192,24 @@ pub async fn acp_enable(
     );
     let tool_for_spawn = instance.tool.clone();
     let state_for_spawn = state.clone();
+    let inst_lock_for_spawn = inst_lock.clone();
     tokio::spawn(async move {
-        let inst_lock = state_for_spawn.instance_lock(&session_id).await;
-        let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
+        // The HTTP response deliberately does not wait for container setup, but
+        // the deferred spawn still belongs to this view transition. Holding the
+        // session lock through spawn prevents a following disable from tearing
+        // down first and then being undone by this late task.
+        let _transition_guard = inst_lock_for_spawn.lock().await;
+        let still_structured = state_for_spawn
+            .instances
+            .read()
+            .await
+            .iter()
+            .any(|candidate| candidate.id == session_id && candidate.is_structured());
+        if !still_structured {
+            return;
+        }
+        let sandbox_info = match crate::acp::sandbox::ensure_container_for_session_locked(
             &state_for_spawn.instances,
-            &inst_lock,
             &session_id,
             false,
         )
@@ -2235,6 +2255,7 @@ pub async fn acp_enable(
             supervisor.publish_startup_error(&session_id, message);
         }
     });
+    drop(transition_guard);
 
     Json(ViewSwitchResponse {
         session_id: id,
@@ -2287,15 +2308,57 @@ pub async fn acp_disable(
     };
 
     if !instance.is_structured() {
-        return Json(ViewSwitchResponse {
-            session_id: id,
-            view: crate::session::View::Terminal,
-        })
-        .into_response();
+        // A reload may have installed a pre-enable terminal snapshot in the
+        // cache. Confirm the durable row before taking the idempotent path, or
+        // disable can return success while leaving the structured worker live.
+        let id_for_load = id.clone();
+        let profile_for_load = profile.clone();
+        let file_watch_for_load = state.file_watch.clone();
+        let persisted = tokio::task::spawn_blocking(
+            move || -> anyhow::Result<Option<crate::session::Instance>> {
+                let storage = crate::session::Storage::new(&profile_for_load, file_watch_for_load)?;
+                Ok(storage
+                    .load()?
+                    .into_iter()
+                    .find(|candidate| candidate.id == id_for_load))
+            },
+        )
+        .await;
+        match persisted {
+            Ok(Ok(Some(durable))) if durable.is_structured() => {
+                instance = super::super::reload::merge_runtime_fields(instance, durable);
+            }
+            Ok(Ok(Some(_))) => {
+                return Json(ViewSwitchResponse {
+                    session_id: id,
+                    view: crate::session::View::Terminal,
+                })
+                .into_response();
+            }
+            Ok(Ok(None)) => {
+                return (StatusCode::NOT_FOUND, "session not found").into_response();
+            }
+            Ok(Err(error)) => {
+                tracing::error!(target: "acp.switch", session = %id, "load before disable: {error:#}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to read session state",
+                )
+                    .into_response();
+            }
+            Err(join_error) => {
+                tracing::error!(target: "acp.switch", session = %id, "load before disable panicked: {join_error}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to read session state",
+                )
+                    .into_response();
+            }
+        }
     }
 
-    // A real acp -> terminal transition is now committed (the idempotent
-    // already-terminal case returned above).
+    // The idempotent already-terminal case returned above; commit the real
+    // ACP-to-terminal transition before worker teardown.
 
     // Decide whether this swap can preserve context. Resolve the ACTIVE
     // structured-view adapter (switch_acp_agent can point agent_name away
@@ -2314,33 +2377,6 @@ pub async fn acp_disable(
     let keep_context = crate::agents::acp_transcript_cli_resumable(&instance.tool, &acp_agent)
         && instance.acp_session_id.is_some();
 
-    // Tear down the acp worker. `shutdown` preserves the agent's on-disk
-    // transcript (no session/delete) so the terminal can resume it;
-    // `shutdown_and_delete` releases it for the destructive path. UnknownSession
-    // is fine, the supervisor may not have a worker if startup never completed.
-    // See #1710.
-    let shutdown_result = if keep_context {
-        state.acp_supervisor.shutdown(&id).await
-    } else {
-        state.acp_supervisor.shutdown_and_delete(&id).await
-    };
-    match shutdown_result {
-        Ok(()) | Err(SupervisorError::UnknownSession(_)) => {}
-        Err(e) => {
-            tracing::warn!(target: "acp.switch", session = %id, "shutdown structured view failed: {e}");
-        }
-    }
-    // Drop per-session bookkeeping so a future re-enable starts a
-    // fresh conversation (seq counter from 1, empty replay buffer).
-    // Without this, the next acp_enable's first event would
-    // collide on a stale seq with the buffer entry from this
-    // conversation, and the client-side dedupe would silently eat it.
-    state.acp_supervisor.forget_session(&id);
-    // Drop the structured-view event projection either way: on keep-context,
-    // the terminal `claude --resume` reprints the conversation itself, so the
-    // tmux pane does not need the AoE event replay, and terminal turns would
-    // otherwise leave it stale. See #2252.
-    state.acp_event_store.delete_session(&id);
     if keep_context {
         tracing::debug!(
             target: "acp.switch",
@@ -2371,43 +2407,30 @@ pub async fn acp_disable(
     // structured_view, so it will create a fresh tmux session and run
     // the agent CLI in the pane.
     //
-    // The on-disk and in-memory updates mutate ONLY the fields this handler
-    // owns (view, acp_session_id, import_pending, and on keep-context the
-    // resume target agent_session_id + resume_intent), copied from the
-    // mutated in-memory `instance` so all three copies stay in sync.
-    // Wholesale replacement with a pre-lock snapshot would clobber
-    // concurrent writes to other fields made by the status poll loop or
-    // other handlers between the snapshot and the lock acquisition.
+    // Persist the fields this handler owns before mirroring them into memory.
+    // The epoch bump under the instances lock rejects any reload whose disk
+    // snapshot predates this view transition.
     let persist_acp_session_id = instance.acp_session_id.clone();
     let persist_import_pending = instance.import_pending;
     let persist_agent_session_id = instance.agent_session_id.clone();
     let persist_resume_intent = instance.resume_intent.clone();
-    {
-        let mut instances = state.instances.write().await;
-        if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
-            slot.view = crate::session::View::Terminal;
-            slot.acp_load_session_capable = None;
-            slot.acp_session_id = persist_acp_session_id.clone();
-            slot.import_pending = persist_import_pending;
-            if keep_context {
-                slot.agent_session_id = persist_agent_session_id.clone();
-                slot.resume_intent = persist_resume_intent.clone();
-            }
-        }
-    }
+    let disk_acp_session_id = persist_acp_session_id.clone();
+    let disk_import_pending = persist_import_pending;
+    let disk_agent_session_id = persist_agent_session_id.clone();
+    let disk_resume_intent = persist_resume_intent.clone();
     let id_for_save = id.clone();
     let profile_for_save = profile.clone();
     let file_watch_for_save = state.file_watch.clone();
     let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let storage = crate::session::Storage::new(&profile_for_save, file_watch_for_save)?;
         storage.update(|all, _groups| {
-            if let Some(slot) = all.iter_mut().find(|i| i.id == id_for_save) {
+            if let Some(slot) = all.iter_mut().find(|candidate| candidate.id == id_for_save) {
                 slot.view = crate::session::View::Terminal;
-                slot.acp_session_id = persist_acp_session_id.clone();
-                slot.import_pending = persist_import_pending;
+                slot.acp_session_id = disk_acp_session_id.clone();
+                slot.import_pending = disk_import_pending;
                 if keep_context {
-                    slot.agent_session_id = persist_agent_session_id.clone();
-                    slot.resume_intent = persist_resume_intent.clone();
+                    slot.agent_session_id = disk_agent_session_id.clone();
+                    slot.resume_intent = disk_resume_intent.clone();
                 }
             }
             Ok(())
@@ -2424,6 +2447,44 @@ pub async fn acp_disable(
             tracing::error!(target: "acp.switch", "save task panicked after disable: {join_err}");
         }
     }
+    {
+        let mut instances = state.instances.write().await;
+        if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
+            slot.view = crate::session::View::Terminal;
+            slot.acp_load_session_capable = None;
+            slot.acp_session_id = persist_acp_session_id;
+            slot.import_pending = persist_import_pending;
+            if keep_context {
+                slot.agent_session_id = persist_agent_session_id;
+                slot.resume_intent = persist_resume_intent;
+            }
+            state
+                .mutation_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    // Commit the desired view before removing the worker. Supervisor shutdown
+    // removes its worker entry before transport teardown completes; leaving the
+    // row structured in that window lets the reconciler spawn a replacement.
+    // `shutdown` preserves the transcript for the resumable path, while
+    // `shutdown_and_delete` releases it for the destructive path.
+    let shutdown_result = if keep_context {
+        state.acp_supervisor.shutdown(&id).await
+    } else {
+        state.acp_supervisor.shutdown_and_delete(&id).await
+    };
+    match shutdown_result {
+        Ok(()) | Err(SupervisorError::UnknownSession(_)) => {}
+        Err(e) => {
+            tracing::warn!(target: "acp.switch", session = %id, "shutdown structured view failed: {e}");
+        }
+    }
+    // A future re-enable needs a fresh sequence and replay buffer. The tmux
+    // pane reprints a preserved conversation, so neither path keeps the ACP
+    // event projection.
+    state.acp_supervisor.forget_session(&id);
+    state.acp_event_store.delete_session(&id);
 
     let start_result = tokio::task::spawn_blocking(move || instance.start()).await;
     match start_result {

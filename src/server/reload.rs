@@ -287,21 +287,14 @@ pub(super) fn skip_tmux_decision_for_structured(inst: &mut Instance) -> bool {
 //    acceptable.
 // 8. Every caller must read `state.mutation_epoch` BEFORE its disk read and
 //    pass that value as `read_epoch`. `fresh` is a snapshot of
-//    `sessions.json`, and `*current = merged` below replaces
-//    `state.instances` wholesale, so a membership change that commits
-//    between the read and this call would otherwise be undone. It cuts both
-//    ways. A delete: the removed row is still in `fresh` and comes straight
-//    back. A create: the new row is absent from `fresh`, and since `merged`
-//    is built exclusively from `fresh`, the wholesale replace drops the row
-//    the create just put in `state.instances`, so `GET /api/sessions` loses
-//    it until the next tick re-reads disk. The epoch check drops such a
-//    reload rather than applying either. Dropping ids missing from
-//    `prior_by_id` is NOT an alternative; that is also how a session
-//    created by another process (the CLI, a peer daemon) legitimately
-//    enters `state.instances`. The comparison happens under the
-//    `state.instances` write lock, and both the delete and the create bump
-//    under that same lock, so they are ordered against each other; comparing
-//    before taking the lock reopens the race one lock acquisition later.
+//    `sessions.json`, so a committed membership or view transition that lands
+//    between that read and this call makes the snapshot unsafe. A wholesale
+//    replace could resurrect or drop a row, while a per-id merge could restore
+//    the previous execution backend and make a subsequent enable or disable
+//    take the wrong idempotent path. The comparison and every epoch bump happen
+//    under the `state.instances` write lock, after the durable mutation lands.
+//    This closes the check-then-act race while preserving externally created
+//    rows when the epoch still matches.
 
 /// Reload `state.instances` by merging caller-supplied `fresh` against the
 /// prior in-memory snapshot per id, then reapplying the acp overlay.
@@ -351,21 +344,12 @@ pub(crate) async fn reload_state_instances_from_disk(
 
     let mut current = state.instances.write().await;
 
-    // Invariant 8: `fresh` predates a committed create or delete, so folding it
-    // in would put a removed row back, or drop a created one. Drop the whole
-    // reload rather than filter it: the next poll tick re-reads disk 2s from
-    // now and converges, and both mutations are rare enough (each one is a
-    // user action) that losing one tick of status updates costs nothing.
+    // Invariant 8: `fresh` predates a committed membership or view transition.
+    // Applying it could restore the wrong row set or execution backend, so drop
+    // the whole reload. The next tick re-reads disk and converges.
     //
-    // Read under the `instances` write lock, and before `drain_from` empties
-    // `current`, so this is atomic against the mutation. Checking before
-    // taking the lock leaves a hole: a reload could pass the check, park on
-    // the lock, let a delete take the lock, remove the row and bump, then wake
-    // and write its stale snapshot over the removal. Symmetrically for a
-    // create, whose row is missing from the stale snapshot entirely. Both
-    // mutations bump inside the same lock scope for the same reason. No memory ordering closes that gap; it
-    // is a check-then-act race, so the check has to happen under the lock that
-    // orders the two writers.
+    // Compare under the `instances` write lock. Guarded mutations bump under
+    // that same lock after persistence, closing the check-then-act race.
     let current_epoch = state
         .mutation_epoch
         .load(std::sync::atomic::Ordering::SeqCst);
@@ -374,7 +358,7 @@ pub(crate) async fn reload_state_instances_from_disk(
             target: "server.file_watch",
             read_epoch,
             current_epoch,
-            "dropping a disk reload whose snapshot predates a session create or delete"
+            "dropping a disk reload whose snapshot predates a session lifecycle mutation"
         );
         return;
     }
