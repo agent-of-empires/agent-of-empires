@@ -1,10 +1,12 @@
 //! Migration v027: move shared sandbox stores to the private v2 layout.
 //!
 //! A live legacy cohort remains readable until it stops. Stopped cohorts are
-//! copied under a global transition lock, synced, atomically published, and
-//! switched by their durable generation field. Staging directories, the
-//! journal, and the legacy quarantine exist only while that bounded transition
-//! is pending; the committed state keeps only `sandbox-v2/<instance>`.
+//! planned under a global transition lock, copied under a per-root cohort lock
+//! so unrelated registry writes carry on, then synced, atomically published
+//! under the transition lock again, and switched by their durable generation
+//! field. Staging directories, the journal, and the legacy quarantine exist
+//! only while that bounded transition is pending; the committed state keeps
+//! only `sandbox-v2/<instance>`.
 
 use super::progress;
 use anyhow::{bail, Context, Result};
@@ -65,18 +67,65 @@ fn copied_file(bytes: u64) {
 /// could not be asked; the per-startup reconcile passes `false` so a machine
 /// whose runtime is down is not told the same thing on every command.
 fn batched_running_probe(announce: bool) -> impl Fn(&str) -> Result<bool> {
-    let batch: std::sync::OnceLock<std::collections::HashMap<String, bool>> =
-        std::sync::OnceLock::new();
+    batched_running_probe_with(
+        crate::containers::batch_container_states,
+        probe_container_running,
+        announce,
+    )
+}
+
+thread_local! {
+    /// Bumped by [`refresh_liveness`]; a batched probe lists again when it
+    /// no longer matches the epoch its snapshot was taken under.
+    static LIVENESS_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Invalidate the container listing a batched probe on this thread cached,
+/// so its next answer asks the runtime again. Publishing calls this because
+/// the copy before it ran without the transition lock, and a container may
+/// have come up meanwhile.
+fn refresh_liveness() {
+    LIVENESS_EPOCH.with(|epoch| epoch.set(epoch.get() + 1));
+}
+
+/// [`batched_running_probe`] over an injected listing and per-row inspect.
+///
+/// The listing answers only where it is certain. Its `paused` and
+/// `restarting` are live, as inspect's `State.Running` would say, since the
+/// container still holds its mounts and a non-forced removal would refuse
+/// it; a transitional or unrecognised state is inspected rather than read as
+/// stopped, so a new runtime state can only cost a subprocess, never a copy
+/// out from under a live agent.
+fn batched_running_probe_with(
+    batch: impl Fn() -> std::collections::HashMap<String, crate::containers::ContainerState>,
+    inspect: impl Fn(&str) -> Result<(bool, bool)>,
+    announce: bool,
+) -> impl Fn(&str) -> Result<bool> {
+    let snapshot: std::cell::RefCell<
+        Option<(
+            u64,
+            std::collections::HashMap<String, crate::containers::ContainerState>,
+        )>,
+    > = std::cell::RefCell::new(None);
     let runtime_noticed = std::cell::Cell::new(false);
     move |id: &str| {
-        let states = batch.get_or_init(|| {
+        let epoch = LIVENESS_EPOCH.with(std::cell::Cell::get);
+        let mut snapshot = snapshot.borrow_mut();
+        if !matches!(&*snapshot, Some((at, _)) if *at == epoch) {
             progress::step("checking which sandbox containers are running");
-            crate::containers::batch_container_health()
-        });
-        if let Some(running) = states.get(&crate::containers::DockerContainer::generate_name(id)) {
-            return Ok(*running);
+            *snapshot = Some((epoch, batch()));
         }
-        let (running, unanswered) = probe_container_running(id)?;
+        let listed = snapshot
+            .as_ref()
+            .and_then(|(_, states)| {
+                states.get(&crate::containers::DockerContainer::generate_name(id))
+            })
+            .and_then(|state| state.is_live());
+        drop(snapshot);
+        if let Some(live) = listed {
+            return Ok(live);
+        }
+        let (running, unanswered) = inspect(id)?;
         if unanswered && announce && !runtime_noticed.replace(true) {
             progress::notice(
                 "container runtime unavailable; sandboxed sessions keep their shared agent store until their containers can be checked",
@@ -210,7 +259,12 @@ pub fn run() -> Result<()> {
 /// every startup until no pre-v2 row remains, then becomes a cheap read.
 /// `announce` narrates pending rows (see [`ANNOUNCE`]).
 pub(crate) fn reconcile_pending(announce: bool) -> Result<()> {
-    reconcile_scoped(announce, None)
+    reconcile_scoped(
+        announce,
+        None,
+        &batched_running_probe(announce),
+        &reap_migrated_container,
+    )
 }
 
 /// Move the store of one session, for the start that is about to launch it.
@@ -219,13 +273,34 @@ pub(crate) fn reconcile_pending(announce: bool) -> Result<()> {
 /// so a machine with many parked or idle sessions does not pay for all of them
 /// on one launch.
 pub(crate) fn migrate_instance(id: &str) -> Result<()> {
-    reconcile_scoped(false, Some(id))
+    reconcile_scoped(
+        false,
+        Some(id),
+        &batched_running_probe(false),
+        &reap_migrated_container,
+    )
+}
+
+/// [`migrate_instance`] with the container probes injected, so a test can
+/// drive the launch-time move end to end with no container runtime.
+#[cfg(test)]
+pub(crate) fn migrate_instance_with(
+    id: &str,
+    is_running: &RunningProbe<'_>,
+    reap: &ReapProbe<'_>,
+) -> Result<()> {
+    reconcile_scoped(false, Some(id), is_running, reap)
 }
 
 /// `only` scopes the move to a single instance; `announce` both narrates and
 /// selects the bulk path, so a bare `aoe` start reports what is pending
 /// without copying while `aoe migrate` moves everything eligible.
-fn reconcile_scoped(announce: bool, only: Option<&str>) -> Result<()> {
+fn reconcile_scoped(
+    announce: bool,
+    only: Option<&str>,
+    is_running: &RunningProbe<'_>,
+    reap: &ReapProbe<'_>,
+) -> Result<()> {
     let app_dir = crate::session::get_app_dir()?;
     if !transition_may_be_pending(&app_dir)? {
         return Ok(());
@@ -241,8 +316,8 @@ fn reconcile_scoped(announce: bool, only: Option<&str>) -> Result<()> {
     run_in(
         &app_dir,
         &home,
-        &batched_running_probe(announce),
-        &reap_migrated_container,
+        is_running,
+        reap,
         defer_requested() || (!announce && only.is_none()),
         announce,
         only,
@@ -317,22 +392,117 @@ fn run_in(
 ) -> Result<()> {
     progress::step("reading session registries");
     fs::create_dir_all(app_dir)?;
-    let _lock = crate::session::acquire_storage_flock(app_dir, LOCK)?;
-    let registry_paths = registry_paths(app_dir)?;
-    let mut registry_dirs: Vec<PathBuf> = registry_paths
+    // A scoped pass that finds its cohort mid-transition in another process
+    // waits for that pass and looks again; the row is then usually current.
+    for _ in 0..SCOPED_RETRIES {
+        match run_pass(
+            app_dir,
+            home,
+            is_running,
+            reap,
+            defer_stores,
+            announce,
+            only,
+        )? {
+            PassOutcome::Done => return Ok(()),
+            PassOutcome::WaitFor(root) => {
+                progress::step(format!(
+                    "waiting for another process to finish moving {}",
+                    root.display()
+                ));
+                drop(acquire_cohort_lock(app_dir, &root)?);
+                refresh_liveness();
+            }
+        }
+    }
+    tracing::warn!(
+        "v027 giving up on {} after {SCOPED_RETRIES} waits; it stays on its shared store for now",
+        only.unwrap_or("this pass")
+    );
+    Ok(())
+}
+
+/// How many times a scoped pass looks again after waiting for another
+/// process's transition of its cohort.
+const SCOPED_RETRIES: usize = 3;
+
+/// A pass that finished, or one that found the named root mid-transition in
+/// another process and, being scoped to a row under it, must wait for that
+/// process before looking again.
+enum PassOutcome {
+    Done,
+    WaitFor(PathBuf),
+}
+
+/// The lock a pass holds on one legacy root while it copies and publishes the
+/// stores under it. Per root rather than global so the copy, which can take
+/// minutes, blocks neither registry writes in any profile nor moves under
+/// other roots; the transition lock covers only planning and publishing.
+///
+/// Lock order is cohort, then transition, then registry. A holder of the
+/// transition lock therefore never waits for a cohort lock: `run_pass` only
+/// tries it, and leaves a busy root pending.
+fn cohort_lock_name(root: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(root.as_os_str().as_encoded_bytes());
+    let hex: String = digest[..8]
         .iter()
-        .filter_map(|path| path.parent())
-        .map(|dir| fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()))
+        .map(|byte| format!("{byte:02x}"))
         .collect();
-    registry_dirs.sort();
-    registry_dirs.dedup();
-    let _registry_locks: Vec<crate::session::StorageFlock> = registry_dirs
-        .iter()
-        .map(|dir| {
-            crate::session::acquire_storage_flock(dir, crate::session::STORAGE_LOCK_FILENAME)
-        })
-        .collect::<Result<_>>()?;
-    let mut registries = load_registry_paths(registry_paths)?;
+    format!(".v027-cohort-{hex}.lock")
+}
+
+fn acquire_cohort_lock(app_dir: &Path, root: &Path) -> Result<crate::session::StorageFlock> {
+    crate::session::acquire_storage_flock(app_dir, &cohort_lock_name(root))
+}
+
+fn try_acquire_cohort_lock(
+    app_dir: &Path,
+    root: &Path,
+) -> Result<Option<crate::session::StorageFlock>> {
+    crate::session::try_acquire_storage_flock(app_dir, &cohort_lock_name(root))
+}
+
+#[cfg(test)]
+pub(crate) type CopyGate = Box<dyn Fn(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    /// A test's hold on the copy phase: called once per root about to be
+    /// copied, before its first `publish_store`, on the thread running the
+    /// pass, with only that root's cohort lock held.
+    pub(crate) static COPY_GATE: std::cell::RefCell<Option<CopyGate>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn copy_gate(root: &Path) {
+    #[cfg(test)]
+    COPY_GATE.with(|gate| {
+        if let Some(gate) = gate.borrow().as_ref() {
+            gate(root);
+        }
+    });
+    #[cfg(not(test))]
+    let _ = root;
+}
+
+/// One pass over the registries: plan under the transition and registry
+/// locks, copy under the cohort locks alone, then reacquire the former,
+/// revalidate the plan against the registries as they are now, and publish.
+fn run_pass(
+    app_dir: &Path,
+    home: &Path,
+    is_running: &RunningProbe<'_>,
+    reap: &ReapProbe<'_>,
+    defer_stores: bool,
+    announce: bool,
+    only: Option<&str>,
+) -> Result<PassOutcome> {
+    let mut transition_lock = Some(crate::session::acquire_storage_flock(app_dir, LOCK)?);
+    let planned_paths = registry_paths(app_dir)?;
+    let registry_dirs = registry_dirs_of(&planned_paths);
+    let mut registry_locks = Some(lock_registry_dirs(&registry_dirs)?);
+    let mut registries = load_registry_paths(planned_paths)?;
     let journal = app_dir.join(JOURNAL);
     match fs::read(&journal) {
         Ok(bytes) => {
@@ -350,58 +520,7 @@ fn run_in(
     let mut cleanup_roots = BTreeSet::new();
     let mut needs_registry_write = false;
     let mut defer_source_retirement = false;
-    let mut row_ids_by_root: BTreeMap<PathBuf, BTreeSet<std::ffi::OsString>> = BTreeMap::new();
-
-    for registry in &registries {
-        let profile = profile_for_registry(app_dir, &registry.path);
-        let Some(rows) = registry.value.as_array() else {
-            continue;
-        };
-        let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
-        for row in rows {
-            if !row
-                .pointer("/sandbox_info/enabled")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            let (Some(id), Some(tool)) = (
-                row.get("id").and_then(Value::as_str),
-                row.get("tool").and_then(Value::as_str),
-            ) else {
-                continue;
-            };
-            if crate::session::validate_instance_id(id).is_err() {
-                continue;
-            }
-            let detect_as = row
-                .get("detect_as")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .or_else(|| config.session.agent_detect_as.get(tool).map(String::as_str));
-            let Some(agent) = crate::agents::get_agent(tool)
-                .or_else(|| detect_as.and_then(crate::agents::get_agent))
-            else {
-                continue;
-            };
-            let declared = config.session.agent_config_dir_for(tool, home);
-            for (source, _) in
-                crate::session::config::container_config::sandbox_store_migration_paths(
-                    agent.name,
-                    home,
-                    declared.as_deref(),
-                    id,
-                )?
-            {
-                let root = fs::canonicalize(&source).unwrap_or(source);
-                row_ids_by_root
-                    .entry(root)
-                    .or_default()
-                    .insert(std::ffi::OsString::from(id));
-            }
-        }
-    }
+    let row_ids_by_root = collect_row_ids_by_root(&registries, app_dir, home)?;
 
     for (registry_index, registry) in registries.iter_mut().enumerate() {
         let profile = profile_for_registry(app_dir, &registry.path);
@@ -631,13 +750,20 @@ fn run_in(
              the move is retried on a later start or with `aoe migrate`.",
             affected_rows.len()
         ));
+    } else if !announce && only.is_none() {
+        // A bare start copies nothing, so without this it would also say
+        // nothing, and the first later launch would pay for a move the user
+        // was never warned about.
+        if let Some(notice) = pending_work_notice(affected_rows.len(), held_row_count) {
+            progress::notice(notice);
+        }
     }
     if !needs_registry_write
         && cohorts.is_empty()
         && known_sources.iter().all(|source| !source.exists())
         && !journal.exists()
     {
-        return Ok(());
+        return Ok(PassOutcome::Done);
     }
     if needs_registry_write {
         for registry in &registries {
@@ -694,6 +820,7 @@ fn run_in(
     // Codex already used per-instance legacy children before this migration.
     // Preserve an unregistered child independently instead of overlaying it
     // into a registered peer or deleting it with the parent.
+    let mut orphan_plan: Vec<(PathBuf, PathBuf, Vec<std::ffi::OsString>)> = Vec::new();
     for root in &private_roots {
         let mut row_ids: BTreeSet<std::ffi::OsString> = row_ids_by_root
             .get(root)
@@ -728,12 +855,63 @@ fn run_in(
             }
             continue;
         };
-        for orphan in excluded_by_root
+        let orphans: Vec<std::ffi::OsString> = excluded_by_root
             .get(root)
             .into_iter()
             .flatten()
             .filter(|id| !row_ids.contains(*id))
-        {
+            .cloned()
+            .collect();
+        if !orphans.is_empty() {
+            orphan_plan.push((root.clone(), destination_parent.clone(), orphans));
+        }
+    }
+
+    // The copies below run without the transition and registry locks, so a
+    // root's transition is serialised by its own lock instead. Tried, not
+    // waited for: see `cohort_lock_name`. A busy root is another process's
+    // transition in flight; it stays pending here, and a pass scoped to a row
+    // under it waits for that process and looks again.
+    let mut copy_roots: BTreeSet<PathBuf> = cohorts
+        .values()
+        .flatten()
+        .filter(|target| target.disposition == Disposition::Move)
+        .map(|target| target.cleanup_root.clone())
+        .collect();
+    copy_roots.extend(orphan_plan.iter().map(|(root, _, _)| root.clone()));
+    let mut cohort_locks = Vec::new();
+    let mut busy_roots = BTreeSet::new();
+    if !defer_stores {
+        for root in &copy_roots {
+            match try_acquire_cohort_lock(app_dir, root)? {
+                Some(lock) => cohort_locks.push(lock),
+                None => {
+                    busy_roots.insert(root.clone());
+                    blocked_roots.insert(root.clone());
+                }
+            }
+        }
+        // Copies must not hold the transition lock: `Storage::update` takes
+        // it shared in every profile, so a copy under it stalls unrelated
+        // session and group writes for its whole duration.
+        registry_locks = None;
+        transition_lock = None;
+    }
+    let wait_for = only.and_then(|wanted| {
+        cohorts
+            .values()
+            .flatten()
+            .find(|target| target.id == wanted && busy_roots.contains(&target.cleanup_root))
+            .map(|target| target.cleanup_root.clone())
+    });
+
+    let mut gated_roots = BTreeSet::new();
+    for (root, destination_parent, orphans) in &orphan_plan {
+        if busy_roots.contains(root) {
+            orphan_blocked_roots.insert(root.clone());
+            continue;
+        }
+        for orphan in orphans {
             let id = orphan.to_string_lossy();
             let source = root.join(orphan);
             let metadata = fs::symlink_metadata(&source)?;
@@ -751,6 +929,9 @@ fn run_in(
                 continue;
             }
             progress::step(format!("copying unregistered store {}", source.display()));
+            if gated_roots.insert(root.clone()) {
+                copy_gate(root);
+            }
             publish_store(
                 &source,
                 &destination_parent.join(orphan),
@@ -776,8 +957,20 @@ fn run_in(
         .filter(|target| target.disposition == Disposition::Move)
         .count();
     let mut copied_targets = 0usize;
+    // Cohorts this pass copied, to be asked about once more before publishing.
+    let mut copied_cohorts: Vec<&PathBuf> = Vec::new();
     for (shared, cohort) in &cohorts {
         let ids: BTreeSet<&str> = cohort.iter().map(|target| target.id.as_str()).collect();
+        let busy = cohort
+            .iter()
+            .any(|target| busy_roots.contains(&target.cleanup_root));
+        if busy {
+            for target in cohort {
+                ready_rows.remove(&(target.registry, target.row));
+            }
+            pending.push(shared.to_string_lossy().into_owned());
+            continue;
+        }
         let live = defer_stores
             || ids.iter().try_fold(false, |live, id| {
                 is_running(id).map(|running| live || running)
@@ -824,6 +1017,9 @@ fn run_in(
             let excluded = excluded_by_root
                 .get(&target.cleanup_root)
                 .context("missing cleanup-root exclusions")?;
+            if gated_roots.insert(target.cleanup_root.clone()) {
+                copy_gate(&target.cleanup_root);
+            }
             publish_store(
                 shared,
                 &target.private,
@@ -831,6 +1027,87 @@ fn run_in(
                 (shared != &target.cleanup_root).then_some(target.cleanup_root.as_path()),
                 shared == &target.cleanup_root,
             )?;
+        }
+        if cohort
+            .iter()
+            .any(|target| target.disposition == Disposition::Move)
+        {
+            copied_cohorts.push(shared);
+        }
+    }
+
+    // Publish under the locks the plan was made under. The registries may
+    // have changed meanwhile, so re-read them and publish only rows that still
+    // carry the plan, into the documents as they are now; and ask about
+    // liveness again, since a container may have come up during the copy.
+    if transition_lock.is_none() {
+        transition_lock = Some(crate::session::acquire_storage_flock(app_dir, LOCK)?);
+        // A profile created during the copy is locked too, since every
+        // registry read below is written back.
+        let fresh_paths = registry_paths(app_dir)?;
+        let mut dirs = registry_dirs_of(&fresh_paths);
+        dirs.extend(registry_dirs.iter().cloned());
+        dirs.sort();
+        dirs.dedup();
+        registry_locks = Some(lock_registry_dirs(&dirs)?);
+    }
+    let _held = (transition_lock, registry_locks, cohort_locks);
+    refresh_liveness();
+    let mut fresh = load_registries(app_dir)?;
+    let fresh_ids_by_root = collect_row_ids_by_root(&fresh, app_dir, home)?;
+    for root in &cleanup_roots {
+        let planned = row_ids_by_root.get(root);
+        let arrived = fresh_ids_by_root
+            .get(root)
+            .into_iter()
+            .flatten()
+            .any(|id| !planned.is_some_and(|planned| planned.contains(id)));
+        if arrived {
+            tracing::warn!(
+                "v027 keeping {}: a session started reading it during the copy",
+                root.display()
+            );
+            blocked_roots.insert(root.clone());
+        }
+    }
+    let mut published_rows: BTreeMap<(usize, usize), (usize, usize)> = BTreeMap::new();
+    for key in std::mem::take(&mut ready_rows) {
+        match locate_planned_row(&registries, &fresh, key) {
+            Some(fresh_key) => {
+                published_rows.insert(key, fresh_key);
+                ready_rows.insert(key);
+            }
+            None => {
+                for target in cohorts
+                    .values()
+                    .flatten()
+                    .filter(|target| (target.registry, target.row) == key)
+                {
+                    tracing::warn!(
+                        "v027 leaving {} pending: its row changed during the copy",
+                        target.id
+                    );
+                    blocked_roots.insert(target.cleanup_root.clone());
+                }
+            }
+        }
+    }
+    for shared in copied_cohorts {
+        let cohort = &cohorts[shared];
+        let live = cohort.iter().try_fold(false, |live, target| {
+            is_running(&target.id).map(|running| live || running)
+        })?;
+        if live {
+            for target in cohort {
+                if ready_rows.remove(&(target.registry, target.row)) {
+                    tracing::warn!(
+                        "v027 leaving {} pending: its container came up during the copy",
+                        target.id
+                    );
+                }
+                blocked_roots.insert(target.cleanup_root.clone());
+            }
+            pending.push(shared.to_string_lossy().into_owned());
         }
     }
 
@@ -913,8 +1190,9 @@ fn run_in(
         }
     }
 
-    for &(registry, row) in &ready_rows {
-        if let Some(value) = registries[registry]
+    for key in &ready_rows {
+        let (registry, row) = published_rows[key];
+        if let Some(value) = fresh[registry]
             .value
             .as_array_mut()
             .and_then(|rows| rows.get_mut(row))
@@ -925,7 +1203,7 @@ fn run_in(
             );
         }
     }
-    for registry in &mut registries {
+    for registry in &mut fresh {
         if let Some(rows) = registry.value.as_array_mut() {
             for row in rows {
                 if row.get("sandbox_store_generation").and_then(Value::as_u64)
@@ -938,7 +1216,7 @@ fn run_in(
             }
         }
     }
-    for registry in &registries {
+    for registry in &fresh {
         let bytes = serde_json::to_vec_pretty(&registry.value)?;
         crate::session::atomic_write(&registry.path, &bytes)?;
         sync_parent(&registry.path)?;
@@ -950,7 +1228,7 @@ fn run_in(
         progress::notice(match (left, held_row_count) {
             (0, 0) => format!("{done} sandboxed session(s) now use private agent stores."),
             (0, held) => format!(
-                "{done} sandboxed session(s) now use private agent stores. {held} trashed or archived session(s) stay on the shared store; each moves when it is started, or restore or unarchive it and run `aoe migrate`."
+                "{done} sandboxed session(s) now use private agent stores. {held} trashed or archived session(s) stay on the shared agent store; each moves when it is started, or restore or unarchive it and run `aoe migrate`."
             ),
             (left, 0) => format!(
                 "{done} sandboxed session(s) moved to private agent stores, {left} still pending; the move resumes on a later start or with `aoe migrate`."
@@ -973,7 +1251,135 @@ fn run_in(
         crate::session::atomic_write(&journal, &serde_json::to_vec(&pending)?)?;
         sync_parent(&journal)?;
     }
-    Ok(())
+    Ok(match wait_for {
+        Some(root) => PassOutcome::WaitFor(root),
+        None => PassOutcome::Done,
+    })
+}
+
+fn registry_dirs_of(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = paths
+        .iter()
+        .filter_map(|path| path.parent())
+        .map(|dir| fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()))
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+fn lock_registry_dirs(dirs: &[PathBuf]) -> Result<Vec<crate::session::StorageFlock>> {
+    dirs.iter()
+        .map(|dir| {
+            crate::session::acquire_storage_flock(dir, crate::session::STORAGE_LOCK_FILENAME)
+        })
+        .collect()
+}
+
+/// Every legacy source each sandboxed row reads, by canonical root. The plan
+/// is made from one snapshot and publication checks another: a root that
+/// gained a reader in between is not retired.
+fn collect_row_ids_by_root(
+    registries: &[Registry],
+    app_dir: &Path,
+    home: &Path,
+) -> Result<BTreeMap<PathBuf, BTreeSet<std::ffi::OsString>>> {
+    let mut row_ids_by_root: BTreeMap<PathBuf, BTreeSet<std::ffi::OsString>> = BTreeMap::new();
+    for registry in registries {
+        let profile = profile_for_registry(app_dir, &registry.path);
+        let Some(rows) = registry.value.as_array() else {
+            continue;
+        };
+        let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
+        for row in rows {
+            if !row
+                .pointer("/sandbox_info/enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let (Some(id), Some(tool)) = (
+                row.get("id").and_then(Value::as_str),
+                row.get("tool").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            if crate::session::validate_instance_id(id).is_err() {
+                continue;
+            }
+            let detect_as = row
+                .get("detect_as")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .or_else(|| config.session.agent_detect_as.get(tool).map(String::as_str));
+            let Some(agent) = crate::agents::get_agent(tool)
+                .or_else(|| detect_as.and_then(crate::agents::get_agent))
+            else {
+                continue;
+            };
+            let declared = config.session.agent_config_dir_for(tool, home);
+            for (source, _) in
+                crate::session::config::container_config::sandbox_store_migration_paths(
+                    agent.name,
+                    home,
+                    declared.as_deref(),
+                    id,
+                )?
+            {
+                let root = fs::canonicalize(&source).unwrap_or(source);
+                row_ids_by_root
+                    .entry(root)
+                    .or_default()
+                    .insert(std::ffi::OsString::from(id));
+            }
+        }
+    }
+    Ok(row_ids_by_root)
+}
+
+/// Where the planned row `key` (a registry and row index into `planned`) is
+/// in `fresh`, if it is still there with the plan this pass copied under: the
+/// same id, the same pending generation and the same transition paths.
+/// Looked up by registry path and row id, since a concurrent write may have
+/// reordered rows or added a registry.
+fn locate_planned_row(
+    planned: &[Registry],
+    fresh: &[Registry],
+    key: (usize, usize),
+) -> Option<(usize, usize)> {
+    let registry = planned.get(key.0)?;
+    let row = registry.value.as_array()?.get(key.1)?;
+    let id = row.get("id").and_then(Value::as_str)?;
+    let fresh_index = fresh
+        .iter()
+        .position(|candidate| candidate.path == registry.path)?;
+    let fresh_row_index = fresh[fresh_index]
+        .value
+        .as_array()?
+        .iter()
+        .position(|candidate| candidate.get("id").and_then(Value::as_str) == Some(id))?;
+    let fresh_row = &fresh[fresh_index].value[fresh_row_index];
+    let same = |field: &str| row.get(field) == fresh_row.get(field);
+    (same("sandbox_store_generation") && same("sandbox_store_transition_paths"))
+        .then_some((fresh_index, fresh_row_index))
+}
+
+/// The one line a bare start says about work it left pending: `movable`
+/// rows move on their next launch or under `aoe migrate`, and `held` ones
+/// (trashed or archived) only once they are launched or brought back. A
+/// held-only backlog says nothing: nothing the user can do now clears it,
+/// and a line on every command that never goes away is noise.
+fn pending_work_notice(movable: usize, held: usize) -> Option<String> {
+    match (movable, held) {
+        (0, _) => None,
+        (movable, 0) => Some(format!(
+            "{movable} sandboxed session(s) still use the shared agent store; each moves when it is next started, or run `aoe migrate` to move them now."
+        )),
+        (movable, held) => Some(format!(
+            "{movable} sandboxed session(s) still use the shared agent store, plus {held} trashed or archived; each moves when it is next started, or run `aoe migrate` to move the {movable} now."
+        )),
+    }
 }
 
 fn transition_paths(row: &Value) -> Result<Option<Vec<(PathBuf, PathBuf)>>> {
@@ -1602,6 +2008,54 @@ mod tests {
         )));
     }
 
+    /// The batch listing decides only where inspect would agree with it:
+    /// paused and restarting are live, exited and created are stopped, and
+    /// everything else (a transitional state, a container it did not list)
+    /// goes to the per-row inspect, which answers fail-closed.
+    #[test]
+    fn batched_probe_keeps_live_semantics_and_inspects_the_rest() {
+        use crate::containers::{ContainerState, DockerContainer};
+        let listing: std::collections::HashMap<String, ContainerState> = [
+            ("running", ContainerState::Running),
+            ("paused", ContainerState::Paused),
+            ("restarting", ContainerState::Restarting),
+            ("exited", ContainerState::Exited),
+            ("created", ContainerState::Created),
+            ("removing", ContainerState::Other),
+        ]
+        .into_iter()
+        .map(|(id, state)| (DockerContainer::generate_name(id), state))
+        .collect();
+        let batches = std::cell::Cell::new(0);
+        let inspected = std::cell::RefCell::new(Vec::new());
+        let probe = batched_running_probe_with(
+            || {
+                batches.set(batches.get() + 1);
+                listing.clone()
+            },
+            |id| {
+                inspected.borrow_mut().push(id.to_string());
+                // Inspect stands in for an unreachable runtime: unknown reads live.
+                Ok((true, true))
+            },
+            false,
+        );
+        let cases = [
+            ("running", true),
+            ("paused", true),
+            ("restarting", true),
+            ("exited", false),
+            ("created", false),
+            ("removing", true),
+            ("missing", true),
+        ];
+        for (id, live) in cases {
+            assert_eq!(probe(id).unwrap(), live, "{id}");
+        }
+        assert_eq!(batches.get(), 1, "one listing per pass");
+        assert_eq!(*inspected.borrow(), ["removing", "missing"]);
+    }
+
     /// A machine whose container runtime is absent or unreachable must still
     /// complete startup. The row stays pending and its legacy source survives,
     /// so the pass that can reach the runtime finishes the transition.
@@ -1774,6 +2228,82 @@ mod tests {
         let pending: Value =
             serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
         assert_eq!(pending[0]["sandbox_store_generation"], 1);
+    }
+
+    /// A bare start defers every copy, so its only output is the count of
+    /// what it left pending: movable rows, with held (trashed or archived)
+    /// rows counted beside them. A held-only backlog and a machine with
+    /// nothing pending both say nothing.
+    #[test]
+    #[serial_test::serial]
+    fn a_bare_start_reports_pending_rows_without_copying() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        let home = dirs::home_dir().unwrap();
+        fs::create_dir_all(&app).unwrap();
+        fs::create_dir_all(home.join(".gemini/sandbox/history")).unwrap();
+        fs::write(home.join(".gemini/sandbox/history/id.json"), b"legacy").unwrap();
+        let movable = |id: &str| serde_json::json!({"id": id, "tool": "gemini", "sandbox_info": {"enabled": true}});
+        let held = |id: &str| {
+            serde_json::json!({"id": id, "tool": "gemini", "sandbox_info": {"enabled": true},
+                "archived_at": "2026-09-05T00:00:00Z"})
+        };
+        let current = serde_json::json!({"id": "cccccccccccccccc", "tool": "gemini",
+            "sandbox_info": {"enabled": true}, "sandbox_store_generation": 2});
+        let cases: [(&str, Vec<Value>, Option<&str>); 4] = [
+            ("movable only", vec![movable("aaaaaaaaaaaaaaaa"), movable("bbbbbbbbbbbbbbbb")],
+                Some("2 sandboxed session(s) still use the shared agent store; each moves")),
+            ("held only", vec![held("aaaaaaaaaaaaaaaa")], None),
+            ("mixed", vec![movable("aaaaaaaaaaaaaaaa"), held("bbbbbbbbbbbbbbbb"), current.clone()],
+                Some("1 sandboxed session(s) still use the shared agent store, plus 1 trashed or archived")),
+            ("nothing pending", vec![current.clone()], None),
+        ];
+        for (name, rows, expected) in cases {
+            let _ = fs::remove_file(app.join(JOURNAL));
+            fs::write(
+                app.join("sessions.json"),
+                serde_json::to_vec(&rows).unwrap(),
+            )
+            .unwrap();
+            let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = events.clone();
+            let guard = progress::install(Some(std::sync::Arc::new(move |event| {
+                sink.lock().unwrap().push(event)
+            })));
+            super::run_in(
+                &app,
+                &home,
+                &|_| panic!("a bare start must not probe containers"),
+                &|_| panic!("a bare start must not reap containers"),
+                true,
+                false,
+                None,
+            )
+            .unwrap();
+            drop(guard);
+            let notices: Vec<String> = events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|event| match event {
+                    progress::Event::Notice(line) => Some(line.clone()),
+                    _ => None,
+                })
+                .collect();
+            match expected {
+                Some(expected) => {
+                    assert_eq!(notices.len(), 1, "{name}: {notices:?}");
+                    assert!(notices[0].contains(expected), "{name}: {notices:?}");
+                    assert!(notices[0].contains("aoe migrate"), "{name}: {notices:?}");
+                }
+                None => assert!(notices.is_empty(), "{name}: {notices:?}"),
+            }
+            assert!(
+                !home.join(".gemini/sandbox-v2").exists(),
+                "{name}: a bare start must not copy"
+            );
+        }
     }
 
     #[test]
@@ -2849,6 +3379,336 @@ gemini = "{}"
         );
         assert!(!destination.join(peer).join(orphan).exists());
         assert!(!root.exists());
+    }
+
+    /// A registry row shaped like a real `Instance`, so `Storage::update`
+    /// can load the registry it sits in.
+    fn instance_row(id: &str) -> Value {
+        let mut row = serde_json::to_value(crate::session::Instance::new(id, "/tmp")).unwrap();
+        row["id"] = id.into();
+        row["tool"] = "gemini".into();
+        // A fresh `Instance` is born on the current generation; this one
+        // still reads the shared store.
+        row["sandbox_store_generation"] = 0.into();
+        row["sandbox_info"] = serde_json::json!({
+            "enabled": true,
+            "image": "img",
+            "container_name": format!("aoe-sandbox-{id}"),
+        });
+        row
+    }
+
+    /// Run a full pass on its own thread, paused inside its first copy until
+    /// `release` is sent; `paused` reports when it is. The pass holds only its
+    /// cohort lock while paused.
+    fn paused_pass(
+        app: &Path,
+        home: &Path,
+    ) -> (
+        std::thread::JoinHandle<Result<()>>,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        paused_pass_with(app, home, false)
+    }
+
+    /// `live_after_gate` makes every container read as running once the
+    /// copy has been released, as if one came up during the copy.
+    fn paused_pass_with(
+        app: &Path,
+        home: &Path,
+        live_after_gate: bool,
+    ) -> (
+        std::thread::JoinHandle<Result<()>>,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let app = app.to_path_buf();
+        let home = home.to_path_buf();
+        let pass = std::thread::spawn(move || {
+            let live = std::rc::Rc::new(std::cell::Cell::new(false));
+            let gate_live = live.clone();
+            COPY_GATE.with(|gate| {
+                *gate.borrow_mut() = Some(Box::new(move |_: &Path| {
+                    paused_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    gate_live.set(live_after_gate);
+                }));
+            });
+            super::run_in(
+                &app,
+                &home,
+                &|_| Ok(live.get()),
+                &|_| Ok(true),
+                false,
+                true,
+                None,
+            )
+        });
+        (pass, paused_rx, release_tx)
+    }
+
+    /// The copy runs without the transition lock, so publication re-reads
+    /// the registries and asks about liveness again. Each guard, alone: a
+    /// row that lost its plan is not published, a root that gained a reader
+    /// is not retired, and a container that came up keeps its cohort
+    /// pending.
+    #[test]
+    #[serial_test::serial]
+    fn publication_revalidates_what_changed_during_the_copy() {
+        enum Case {
+            RowGone,
+            NewReader,
+            ContainerUp,
+        }
+        for case in [Case::RowGone, Case::NewReader, Case::ContainerUp] {
+            let temp = tempfile::tempdir().unwrap();
+            let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+            let app = crate::session::get_app_dir().unwrap();
+            let home = dirs::home_dir().unwrap();
+            fs::create_dir_all(&app).unwrap();
+            fs::create_dir_all(home.join(".gemini/sandbox/history")).unwrap();
+            fs::write(home.join(".gemini/sandbox/history/id.json"), b"legacy").unwrap();
+            fs::write(
+                app.join("sessions.json"),
+                format!("[{}]", row("1111111111111111")),
+            )
+            .unwrap();
+            let (pass, paused, release) =
+                paused_pass_with(&app, &home, matches!(case, Case::ContainerUp));
+            paused
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the pass reached its copy");
+            match case {
+                Case::RowGone => fs::write(app.join("sessions.json"), b"[]").unwrap(),
+                Case::NewReader => {
+                    // Appended beside the checkpointed row, as a writer
+                    // holding the registry lock would.
+                    let mut rows: Value =
+                        serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap())
+                            .unwrap();
+                    rows.as_array_mut()
+                        .unwrap()
+                        .push(serde_json::from_str(&row("2222222222222222")).unwrap());
+                    fs::write(
+                        app.join("sessions.json"),
+                        serde_json::to_vec(&rows).unwrap(),
+                    )
+                    .unwrap();
+                }
+                Case::ContainerUp => {}
+            }
+            release.send(()).unwrap();
+            pass.join().unwrap().unwrap();
+
+            let rows: Value =
+                serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
+            assert!(
+                home.join(".gemini/sandbox/history/id.json").is_file(),
+                "the shared source must survive"
+            );
+            match case {
+                Case::RowGone => {
+                    assert_eq!(rows.as_array().unwrap().len(), 0, "the deletion stands");
+                }
+                Case::NewReader => {
+                    assert_eq!(
+                        rows[0]["sandbox_store_generation"], 2,
+                        "the planned row publishes"
+                    );
+                    assert_ne!(rows[1]["sandbox_store_generation"], 2, "the newcomer waits");
+                }
+                Case::ContainerUp => {
+                    assert_eq!(
+                        rows[0]["sandbox_store_generation"], 1,
+                        "a live cohort stays pending"
+                    );
+                    assert!(app.join(JOURNAL).is_file());
+                }
+            }
+        }
+    }
+
+    fn wait_finished<T>(handle: &std::thread::JoinHandle<T>, what: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !handle.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what} did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// The copy runs without the transition and registry locks, so session
+    /// and group writes in every profile go through while it is in flight,
+    /// and the publish that follows lands on the registry as those writes
+    /// left it rather than on the snapshot the plan was made from.
+    #[test]
+    #[serial_test::serial]
+    fn registries_stay_writable_while_a_store_copies() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        let home = dirs::home_dir().unwrap();
+        fs::create_dir_all(home.join(".gemini/sandbox/history")).unwrap();
+        fs::write(home.join(".gemini/sandbox/history/id.json"), b"legacy").unwrap();
+        let alpha = app.join("profiles/alpha/sessions.json");
+        let beta = app.join("profiles/beta/sessions.json");
+        fs::create_dir_all(alpha.parent().unwrap()).unwrap();
+        fs::create_dir_all(beta.parent().unwrap()).unwrap();
+        fs::write(
+            &alpha,
+            serde_json::to_vec(&vec![instance_row("1111111111111111")]).unwrap(),
+        )
+        .unwrap();
+        fs::write(&beta, b"[]").unwrap();
+
+        let (pass, paused, release) = paused_pass(&app, &home);
+        paused
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the pass reached its copy");
+
+        let writes = {
+            let (alpha, beta) = (alpha.clone(), beta.clone());
+            std::thread::spawn(move || {
+                let write = |profile: &str, path: PathBuf, title: &str| {
+                    crate::session::Storage::new_for_test_path(profile, path).update(
+                        |instances, _| {
+                            match instances.first_mut() {
+                                Some(first) => first.title = title.to_string(),
+                                None => {
+                                    instances.push(crate::session::Instance::new(title, "/tmp"))
+                                }
+                            }
+                            Ok(())
+                        },
+                    )
+                };
+                (
+                    write("alpha", alpha, "renamed mid-copy"),
+                    write("beta", beta, "beta row"),
+                )
+            })
+        };
+        wait_finished(&writes, "storage writes during the copy");
+        let (alpha_write, beta_write) = writes.join().unwrap();
+        alpha_write.unwrap();
+        beta_write.unwrap();
+
+        release.send(()).unwrap();
+        pass.join().unwrap().unwrap();
+
+        let alpha_rows: Value = serde_json::from_slice(&fs::read(&alpha).unwrap()).unwrap();
+        assert_eq!(alpha_rows[0]["title"], "renamed mid-copy");
+        assert_eq!(alpha_rows[0]["sandbox_store_generation"], 2);
+        assert!(alpha_rows[0]
+            .get("sandbox_store_transition_paths")
+            .is_none());
+        let beta_rows: Value = serde_json::from_slice(&fs::read(&beta).unwrap()).unwrap();
+        assert_eq!(beta_rows[0]["title"], "beta row");
+        assert_eq!(
+            fs::read(home.join(".gemini/sandbox-v2/1111111111111111/history/id.json")).unwrap(),
+            b"legacy"
+        );
+        assert!(!home.join(".gemini/sandbox").exists());
+        assert!(!app.join(JOURNAL).exists());
+    }
+
+    /// Two passes over one cohort cannot both copy and publish it. A full pass
+    /// that finds the root held elsewhere leaves it pending and copies
+    /// nothing; a pass scoped to a member waits for the holder and then finds
+    /// the row current, so the store is copied exactly once.
+    #[test]
+    #[serial_test::serial]
+    fn competing_passes_on_one_cohort_publish_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        let home = dirs::home_dir().unwrap();
+        fs::create_dir_all(&app).unwrap();
+        fs::create_dir_all(home.join(".gemini/sandbox/history")).unwrap();
+        fs::write(home.join(".gemini/sandbox/history/id.json"), b"legacy").unwrap();
+        fs::write(
+            app.join("sessions.json"),
+            format!("[{},{}]", row("1111111111111111"), row("2222222222222222")),
+        )
+        .unwrap();
+
+        let (holder, paused, release) = paused_pass(&app, &home);
+        paused
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the holder reached its copy");
+
+        let copies = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting_pass = |only: Option<&'static str>| {
+            let (app, home, copies) = (app.clone(), home.clone(), copies.clone());
+            std::thread::spawn(move || {
+                COPY_GATE.with(|gate| {
+                    *gate.borrow_mut() = Some(Box::new(move |_: &Path| {
+                        copies.fetch_add(1, Ordering::Relaxed);
+                    }));
+                });
+                super::run_in(
+                    &app,
+                    &home,
+                    &|_| Ok(false),
+                    &|_| Ok(true),
+                    false,
+                    true,
+                    only,
+                )
+            })
+        };
+
+        // A full pass gets its turn at the transition lock, sees the root is
+        // busy, and returns without copying while the holder is still paused.
+        let full = counting_pass(None);
+        wait_finished(&full, "a full pass beside a held cohort");
+        full.join().unwrap().unwrap();
+        assert_eq!(copies.load(Ordering::Relaxed), 0);
+        let rows: Value =
+            serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
+        assert_eq!(rows[0]["sandbox_store_generation"], 1, "nothing published");
+
+        // A scoped pass waits for the holder instead of copying beside it.
+        let scoped = counting_pass(Some("1111111111111111"));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !scoped.is_finished(),
+            "a scoped pass must wait for the holder"
+        );
+        assert_eq!(copies.load(Ordering::Relaxed), 0);
+
+        release.send(()).unwrap();
+        holder.join().unwrap().unwrap();
+        wait_finished(&scoped, "the scoped pass after the holder finished");
+        scoped.join().unwrap().unwrap();
+        assert_eq!(
+            copies.load(Ordering::Relaxed),
+            0,
+            "the holder's copy was the only one"
+        );
+
+        let rows: Value =
+            serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
+        assert_eq!(rows[0]["sandbox_store_generation"], 2);
+        assert_eq!(rows[1]["sandbox_store_generation"], 2);
+        for id in ["1111111111111111", "2222222222222222"] {
+            assert_eq!(
+                fs::read(
+                    home.join(".gemini/sandbox-v2")
+                        .join(id)
+                        .join("history/id.json")
+                )
+                .unwrap(),
+                b"legacy"
+            );
+        }
+        assert!(!home.join(".gemini/sandbox").exists());
+        assert!(!app.join(JOURNAL).exists());
     }
 
     #[test]

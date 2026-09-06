@@ -82,6 +82,34 @@ impl Instance {
         environment
     }
 
+    /// Whether this session still reads the shared sandbox store, so its next
+    /// container launch first copies that store; see [`Self::move_sandbox_store`].
+    pub fn sandbox_store_move_pending(&self) -> bool {
+        self.is_sandboxed()
+            && self.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION
+    }
+
+    /// Move this session's sandbox store into the private layout, narrating
+    /// the copy to `reporter`. `Ok(false)` means the container is up, so the
+    /// store cannot move yet and nothing was attempted. The row is read back
+    /// from disk by the caller, not here: the TUI's copy lives in its own
+    /// mirror.
+    ///
+    /// A running container is worth skipping outright: its cohort cannot
+    /// move while it is up, so the pass is guaranteed to refuse, and it is
+    /// not free, since planning takes the v027 lock and every registry's
+    /// storage lock, on which `Storage::update` waits.
+    pub fn move_sandbox_store(
+        &self,
+        reporter: Option<crate::migrations::progress::Reporter>,
+    ) -> Result<bool> {
+        if DockerContainer::from_session_id(&self.id).is_running()? {
+            return Ok(false);
+        }
+        crate::migrations::migrate_sandbox_store_for_with(&self.id, reporter)?;
+        Ok(true)
+    }
+
     pub fn get_container_for_instance(&mut self) -> Result<containers::DockerContainer> {
         let detect_as = self.effective_detect_as().into_owned();
         let image = self
@@ -94,21 +122,15 @@ impl Instance {
         // Charge the sandbox store move to the session that needs it, at the
         // one chokepoint every entry point shares: tmux launches, ACP
         // structured sessions and a bare container terminal all arrive here.
-        // It must stay above the shared flock below, which `run_in` takes
-        // exclusively. A failure leaves the row on its shared store for a
-        // later attempt rather than blocking the launch.
-        //
-        // A running container is the one case worth skipping outright: its
-        // cohort cannot move while it is up, so the pass is guaranteed to
-        // refuse, and it is not free. `run_in` takes the v027 lock and every
-        // registry's storage lock exclusively, and `Storage::update` waits on
-        // the first of those, so attaching to a live legacy session would
-        // stall writes in every AoE process to reach a foregone conclusion.
-        if self.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION
-            && !container.is_running()?
-        {
-            match crate::migrations::migrate_sandbox_store_for(&self.id) {
-                Ok(()) => self.reconcile_from_disk(),
+        // The TUI runs it ahead of time on a worker so this is a no-op there;
+        // see `tui::store_move_poller`. It must stay above the shared flock
+        // below, which the move takes exclusively to plan and publish. A
+        // failure leaves the row on its shared store for a later attempt
+        // rather than blocking the launch.
+        if self.sandbox_store_move_pending() {
+            match self.move_sandbox_store(Some(crate::migrations::progress::tracing_reporter())) {
+                Ok(true) => self.reconcile_from_disk(),
+                Ok(false) => {}
                 Err(error) => tracing::warn!(
                     session_id = %self.id,
                     %error,

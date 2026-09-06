@@ -143,8 +143,8 @@ pub use recovery::HookTimeoutScope;
 pub use scope::SessionScope;
 pub(crate) use storage::{
     acquire_session_title_lock, acquire_storage_flock, acquire_storage_shared_flock, atomic_write,
-    read_file_no_follow, replace_file_no_follow, resolve_symlink_chain, GroupMovePlan,
-    StorageFlock, STORAGE_LOCK_FILENAME,
+    read_file_no_follow, replace_file_no_follow, resolve_symlink_chain, try_acquire_storage_flock,
+    GroupMovePlan, StorageFlock, STORAGE_LOCK_FILENAME,
 };
 pub use storage::{
     load_recent_projects, load_workspace_ordering, recent_project_entry_for, record_recent_project,

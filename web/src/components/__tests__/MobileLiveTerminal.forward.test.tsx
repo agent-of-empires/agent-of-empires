@@ -232,11 +232,12 @@ describe("MobileLiveTerminal wheel forwarding", () => {
 
   it("gears a touch drag up by the forward touch gain", () => {
     const { scroller, forwardWheel } = renderTerm(frame({ altScreen: true, mouse: true, mouseSgr: true }));
-    // lineH = 14 * 1.2 = 16.8px: a 34px drag produces two notches with the
-    // small assist, but only the first leaves immediately. The second drains
-    // on the next animation frame to avoid a delayed remote redraw jumping.
+    // lineH = 14 * 1.2 = 16.8px, so 14px of finger travel is short of a line
+    // and reaches one notch only because of the assist; ungeared it would
+    // round to nothing. A drag this small fits in one burst and leaves at
+    // once (pacing across bursts is covered in the alt-screen spec).
     fireEvent.touchStart(scroller, { touches: [{ clientX: 100, clientY: 300 } as Touch] });
-    fireEvent.touchMove(scroller, { touches: [{ clientX: 100, clientY: 266 } as Touch] });
+    fireEvent.touchMove(scroller, { touches: [{ clientX: 100, clientY: 286 } as Touch] });
     expect(forwardWheel).toHaveBeenCalledTimes(1);
   });
 

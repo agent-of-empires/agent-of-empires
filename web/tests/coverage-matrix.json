@@ -149,6 +149,27 @@
       "components": ["web/src/hooks/useLiveTerminal.ts", "web/src/components/MobileLiveTerminal.tsx"]
     },
     {
+      "id": "terminal.live-grid-transport",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/live-grid-transport.spec.ts"],
+      "components": ["web/src/components/MobileLiveTerminal.tsx", "web/src/hooks/useLiveTerminal.ts"]
+    },
+    {
+      "id": "terminal.live-row-patches",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/hooks/useLiveTerminal.patch.test.ts"],
+      "components": ["web/src/hooks/useLiveTerminal.ts"]
+    },
+    {
+      "id": "terminal.live-alt-screen-scroll",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/components/__tests__/MobileLiveTerminal.altScreen.test.tsx"],
+      "components": ["web/src/components/MobileLiveTerminal.tsx"]
+    },
+    {
       "id": "terminal.live-line-wrap-units",
       "kind": "vitest",
       "risk": "high",

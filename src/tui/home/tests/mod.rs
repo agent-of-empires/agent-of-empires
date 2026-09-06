@@ -42,6 +42,7 @@ mod search;
 mod settings_scroll_wiring;
 mod stacked_single_seam;
 mod status_rows_menu;
+mod store_move;
 
 fn setup_test_home(temp: &TempDir) -> AppDirGuard {
     isolate_app_dir_at(temp.path())

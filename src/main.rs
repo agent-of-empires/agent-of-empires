@@ -396,8 +396,16 @@ async fn run(
     // TUI mode handles migrations with a spinner. CLI commands report progress
     // on stderr only when a migration actually does work, so a quick command
     // stays quiet and a long store move never looks like a hang.
+    // Hidden machine-spawned subcommands get no reporter, so nothing lands in
+    // a detached worker's redirected stderr; see the `command_name` gate below.
     if cli.command.is_some() {
-        migrations::run_migrations_with(Some(cli::migrate::stderr_reporter()))?;
+        let reporter = cli
+            .command
+            .as_ref()
+            .and_then(cli::command_name)
+            .is_some()
+            .then(cli::migrate::stderr_reporter);
+        migrations::run_migrations_with(reporter)?;
     }
 
     // Surface config diagnostics on stderr for user-visible CLI commands

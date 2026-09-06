@@ -6,15 +6,16 @@ import { createFrameInflater, supportsFrameDeflate, type FrameInflater } from ".
 import { MAX_RETRIES, retryDelayMs } from "../lib/wsBackoff";
 import { reportTelemetrySeen } from "../lib/api";
 
-// Capture-snapshot live view transport (mobile). Mirrors the TUI's
-// live-send model: the server polls `tmux capture-pane` and pushes ANSI
-// snapshot frames; we send raw input bytes back, plus control messages
-// for resize / capture-window / cadence. No xterm, no PTY attach; the
-// component renders frames as DOM text and scrolls natively. See
-// src/server/live_ws.rs for the protocol. When the browser supports it,
-// the client advertises `caps.deflate` and frames arrive as a compressed
-// binary stream (lib/frameStream.ts) instead of JSON text; both paths
-// feed the same handler.
+// Live view transport. The server renders the pane (from its in-process
+// VT grid for the agent surface, from `tmux capture-pane` snapshots for the
+// paired shells) and pushes ANSI rows; we send raw input bytes back, plus
+// control messages for resize / capture-window / cadence. No xterm, no PTY
+// attach; the component renders rows as DOM text and scrolls natively. See
+// src/server/live_ws.rs for the protocol. The client advertises `caps`:
+// `patch` so unchanged rows are not re-sent (a `patch` message carries the
+// changed rows plus how far the window slid), and `deflate` where the
+// browser can inflate the compressed binary stream (lib/frameStream.ts);
+// every path feeds the same handler.
 
 /** Mirrors CLOSE_CODE_PTY_DEAD in src/server/pane.rs. */
 const CLOSE_CODE_PTY_DEAD = 4001;
@@ -36,8 +37,30 @@ export interface LivePaneRect {
   top?: number;
 }
 
+/** Wire counters for the `?livedebug=1` overlay. Carried on the store
+ *  snapshot alongside the frame they were counted with, so they cost no
+ *  renders of their own. */
+export interface LiveStats {
+  /** Full frames received. */
+  frames: number;
+  /** Row patches received. */
+  patches: number;
+  /** Bytes received on the socket (compressed when deflate is on). */
+  wireBytes: number;
+  /** Resyncs requested after a patch missed its base. */
+  resyncs: number;
+}
+
 export interface LiveFrame {
   content: string;
+  /** Rows of `content` without the terminating newline; the component
+   *  renders from this when present so a patch never re-splits the window. */
+  lines?: string[];
+  /** Server sequence of the message that produced this frame. */
+  seq?: number;
+  /** `performance.now()` when the message arrived; drives the debug overlay's
+   *  arrival-to-paint latency. */
+  receivedAt?: number;
   /** Pane height in rows; the content's last `rows` lines are the live
    *  screen. 0 if the pane geometry probe failed. */
   rows: number;
@@ -83,6 +106,11 @@ export interface LiveTerminalState {
    * Until then input is buffered and the UI must not present a takeover
    * banner as though another viewer had been confirmed. */
   ownerKnown: boolean;
+  /** Which transport is producing frames, once the server has said. The
+   *  capture fallback cannot suppress a half-drawn repaint, so a torn screen
+   *  means something different on each, and only the server knows which. */
+  transport: "grid" | "snapshot" | null;
+  stats: LiveStats;
 }
 
 const INITIAL_STATE: LiveTerminalState = {
@@ -94,6 +122,8 @@ const INITIAL_STATE: LiveTerminalState = {
   reading: false,
   isOwner: false,
   ownerKnown: false,
+  transport: null,
+  stats: { frames: 0, patches: 0, wireBytes: 0, resyncs: 0 },
 };
 
 export function useLiveTerminal(
@@ -178,6 +208,9 @@ export function useLiveTerminal(
     setState(() => INITIAL_STATE);
 
     let disposed = false;
+    // Wire counters for this session, carried across reconnects and
+    // published with each frame (see LiveStats).
+    const stats: LiveStats = { frames: 0, patches: 0, wireBytes: 0, resyncs: 0 };
     // Inflater for the compressed frame stream, one per live connection
     // (its deflate dictionary is connection-scoped on the server side).
     let inflater: FrameInflater | null = null;
@@ -244,23 +277,30 @@ export function useLiveTerminal(
           ws.send(JSON.stringify({ type: "window", lines: desired.window }));
         }
         ws.send(JSON.stringify({ type: "cadence", fast: desired.fast }));
-        // Advertise the compressed frame stream where the browser can
-        // inflate it; the server keeps sending JSON text otherwise (and
-        // old servers ignore the unknown message type).
-        if (supportsFrameDeflate()) {
-          ws.send(JSON.stringify({ type: "caps", deflate: true }));
-        }
+        // Advertise row patches, and the compressed frame stream where the
+        // browser can inflate it; the server keeps sending full JSON text
+        // frames otherwise (and old servers ignore the unknown message type).
+        ws.send(JSON.stringify({ type: "caps", deflate: supportsFrameDeflate(), patch: true }));
         // Preserve the selector's gesture-bound first burst, but do not flush
         // it yet: the resize that establishes size ownership may still be in
         // flight, especially when a native TUI currently owns the pane.
       };
 
       let hasReceivedData = false;
+      // Sequence of the last frame or patch applied; a patch whose `base`
+      // differs asks for a full frame once and is dropped.
+      let lastSeq: number | null = null;
+      let resyncPending = false;
       const handleMessageText = (text: string) => {
         if (wsRef.current !== ws) return;
         let msg: {
           type?: string;
+          grid?: boolean;
           content?: string;
+          seq?: number;
+          base?: number;
+          shift?: number;
+          lines?: [number, string][];
           text?: string;
           rows?: number;
           history?: number;
@@ -285,20 +325,52 @@ export function useLiveTerminal(
           if (owner) flushPendingInput();
           return;
         }
+        if (msg.type === "transport") {
+          const transport = msg.grid ? "grid" : "snapshot";
+          setState((prev) => (prev.transport === transport ? prev : { ...prev, transport }));
+          return;
+        }
         if (msg.type === "clipboard") {
           if (typeof msg.text !== "string" || msg.text.length === 0) return;
           handleClipboard(msg.text);
           return;
         }
-        if (msg.type !== "frame") return;
+        if (msg.type !== "frame" && msg.type !== "patch") return;
         if (!hasReceivedData) {
           // First frame proves the capture loop is alive end-to-end;
           // only now reset the retry budget (mirrors useTerminal).
           hasReceivedData = true;
           retryCountRef.current = 0;
         }
+        let content: string;
+        let lines: string[];
+        if (msg.type === "patch") {
+          const prev = storeRef.current!.snapshot.frame;
+          if (prev?.lines == null || lastSeq == null || msg.base !== lastSeq) {
+            // Continuity lost (a dropped message, or a patch before any full
+            // frame): ask for a full frame once, ignore patches until it lands.
+            if (!resyncPending) {
+              resyncPending = true;
+              stats.resyncs += 1;
+              ws.send(JSON.stringify({ type: "resync" }));
+            }
+            return;
+          }
+          lines = applyPatch(prev.lines, msg.shift ?? 0, msg.lines ?? []);
+          content = lines.join("\n") + "\n";
+          stats.patches += 1;
+        } else {
+          content = msg.content ?? "";
+          lines = frameLines(content);
+          resyncPending = false;
+          stats.frames += 1;
+        }
+        lastSeq = msg.seq ?? null;
         const incoming: LiveFrame = {
-          content: msg.content ?? "",
+          content,
+          lines,
+          seq: msg.seq,
+          receivedAt: performance.now(),
           rows: msg.rows ?? 0,
           history: msg.history ?? 0,
           cursor: msg.cursor ?? null,
@@ -325,14 +397,17 @@ export function useLiveTerminal(
           retryCount: retryCountRef.current,
           retryCountdown: 0,
           frame: incoming,
+          stats: { ...stats },
         }));
       };
 
       ws.onmessage = (event: MessageEvent) => {
         if (wsRef.current !== ws) return;
         if (typeof event.data === "string") {
+          stats.wireBytes += event.data.length;
           handleMessageText(event.data);
         } else if (event.data instanceof ArrayBuffer) {
+          stats.wireBytes += event.data.byteLength;
           // Compressed frame stream, built lazily on the first binary
           // message. A corrupt stream is unrecoverable mid-connection, so
           // its error path drops the socket and lets the retry machinery
@@ -561,4 +636,28 @@ export function useLiveTerminal(
     claim,
     maxRetries: MAX_RETRIES,
   };
+}
+
+/** Rows of a frame's content. Every row, including the last, is newline
+ *  terminated, so the trailing empty piece is not a row. */
+export function frameLines(content: string): string[] {
+  const lines = content.split("\n");
+  if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
+  return lines;
+}
+
+/** Apply a server row patch: the window slid up by `shift` rows (history
+ *  grew), so drop that many from the top, pad the bottom, then replace the
+ *  listed rows. Out-of-range indices are ignored rather than growing the
+ *  window; the server's next full frame corrects any drift. */
+export function applyPatch(prev: readonly string[], shift: number, changed: readonly [number, string][]): string[] {
+  const n = prev.length;
+  const k = Math.max(0, Math.min(n, Math.trunc(shift)));
+  // Pad from `prev` itself rather than allocating by a wire-supplied length,
+  // so the result can never be longer than the window it replaces.
+  const next = prev.slice(k).concat(prev.slice(0, k).map(() => ""));
+  for (const [i, row] of changed) {
+    if (i >= 0 && i < n) next[i] = row;
+  }
+  return next;
 }

@@ -3,6 +3,7 @@
 mod app;
 mod attach_project_poller;
 mod attached_status_hooks;
+mod boot_spinner;
 pub(crate) mod clipboard;
 mod components;
 mod creation_poller;
@@ -22,6 +23,7 @@ mod restart_poller;
 pub mod settings;
 mod status_poller;
 mod stop_poller;
+mod store_move_poller;
 pub(crate) mod structured_view;
 pub(crate) mod styles;
 mod trash_poller;
@@ -56,7 +58,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::prelude::*;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 
 use crate::migrations;
 
@@ -230,12 +232,11 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
     // Run pending migrations with a spinner that names the migration, its
     // current step and the elapsed time, and keeps the notices a migration
     // emits (what is being moved, how to defer it) on screen. Unconditional
-    // because the spinner draws nothing until a migration reports it has
-    // started, so the schema-current path costs nothing. Note this covers the
-    // startup pass only: v027's store move now runs from the container path,
-    // which has no reporter installed and so draws nothing here.
+    // because the spinner writes nothing until a migration reports something,
+    // so the schema-current path costs nothing. This covers the startup pass
+    // only: v027's per-session store move runs from a launch, on the store
+    // move poller, and narrates itself on the home status line.
     {
-        const SPINNER_FRAMES: &[char] = &['◐', '◓', '◑', '◒'];
         let console = std::sync::Arc::new(std::sync::Mutex::new(
             migrations::progress::ConsoleProgress::default(),
         ));
@@ -253,37 +254,20 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
         tokio::pin!(migration_handle);
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(120));
         let mut frame = 0usize;
-        let draw = |frame: usize, console: &mut migrations::progress::ConsoleProgress| {
-            print!("\r\x1b[2K");
-            for line in console.take_lines() {
-                println!("  {line}");
-            }
-            if let Some(status) = console.status_line() {
-                // One row only: the erase above cannot reach a wrapped line.
-                let width = crate::terminal::get_size().map_or(80, |(w, _)| w as usize);
-                let line = format!(
-                    "  {} {status}",
-                    SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]
-                );
-                print!("{}", migrations::progress::fit_width(&line, width));
-            }
-            let _ = io::stdout().flush();
-        };
+        let mut spinner = boot_spinner::BootSpinner::default();
         loop {
             tokio::select! {
                 result = &mut migration_handle => {
                     let mut console = console.lock().unwrap_or_else(|e| e.into_inner());
-                    print!("\r\x1b[2K");
-                    for line in console.take_lines() {
-                        println!("  {line}");
-                    }
-                    let _ = io::stdout().flush();
+                    let _ = spinner.finish(&mut io::stdout(), &mut console);
                     drop(console);
                     result??;
                     break;
                 }
                 _ = tick.tick() => {
-                    draw(frame, &mut console.lock().unwrap_or_else(|e| e.into_inner()));
+                    let width = crate::terminal::get_size().map_or(80, |(w, _)| w as usize);
+                    let mut console = console.lock().unwrap_or_else(|e| e.into_inner());
+                    let _ = spinner.draw(&mut io::stdout(), &mut console, frame, width);
                     frame += 1;
                 }
             }

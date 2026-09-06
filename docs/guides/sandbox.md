@@ -307,8 +307,10 @@ shared store into that session's private directory, removes its stopped
 container so the next launch mounts the copy, and deletes the shared store once
 every session that used it has moved (the private copies are the data from then
 on). A large store takes a while, so the first start of a session is slower
-than usual. A session whose container is still running is skipped and moved on
-a later start, after it stops. Trashed and archived sessions stay on the shared
+than usual; the TUI shows the copy's progress on its status line and opens the
+session once it is done, and a plain `aoe` start says how many sessions still
+have the move ahead of them. A session whose container is still running is
+skipped and moved on a later start, after it stops. Trashed and archived sessions stay on the shared
 store. Starting one moves it; restoring or unarchiving alone does not, so run
 `aoe migrate` afterwards if you want it moved before its next start.
 
