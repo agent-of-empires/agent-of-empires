@@ -143,7 +143,7 @@ describe("WorkspaceSidebar Trash control (#2489, #2512)", () => {
     expect(screen.getByTestId("sidebar-trash-purge").textContent).toContain("Delete");
 
     fireEvent.click(screen.getByTestId("sidebar-trash-open"));
-    expect(props.onSelect).toHaveBeenCalledWith("trashed-ws");
+    expect(props.onSelect).toHaveBeenCalledWith("trashed-ws", "s1");
     expect(screen.queryByTestId("sidebar-trash-menu")).toBeNull();
 
     fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));

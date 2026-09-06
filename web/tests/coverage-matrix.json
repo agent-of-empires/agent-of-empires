@@ -1135,7 +1135,7 @@
       "kind": "mocked-playwright",
       "risk": "medium",
       "specs": ["tests/sidebar-context-resume.spec.ts"],
-      "components": ["web/src/lib/types.ts", "web/src/components/WorkspaceSidebar.tsx"]
+      "components": ["web/src/lib/types.ts", "web/src/components/WorkspaceSidebar.tsx", "web/src/App.tsx"]
     },
     {
       "id": "sessions.fork",

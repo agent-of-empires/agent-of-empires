@@ -7,6 +7,7 @@ interface MockSession {
   title: string;
   context_resume?: ContextResumeAvailability | { state: string; reason?: string };
   project_path?: string;
+  group_path?: string;
   branch?: string | null;
   status?: SessionStatus;
 }
@@ -20,7 +21,7 @@ async function mockApis(page: Page, sessions: MockSession[]) {
         sessions: sessions.map((session) => ({
           ...session,
           project_path: session.project_path ?? `/tmp/${session.id}`,
-          group_path: "",
+          group_path: session.group_path ?? "",
           tool: "claude",
           status: session.status ?? "Idle",
           yolo_mode: false,
@@ -101,3 +102,42 @@ test("uses the active session for a multi-session workspace badge and navigation
   await workspaceLink.click();
   await expect(page).toHaveURL(new RegExp("/session/running$"));
 });
+
+for (const axis of ["group", "repo+group"]) {
+  test(`keeps the badge and activation on the same ${axis} slice`, async ({ page }) => {
+    await page.addInitScript((axis) => localStorage.setItem("aoe-sidebar-axis", axis), axis);
+    await page.route("**/api/app-state/web-ui-state", (route) => route.fulfill({ json: { "aoe-sidebar-axis": axis } }));
+    await mockApis(page, [
+      {
+        id: "idle",
+        title: "Idle session",
+        project_path: "/tmp/shared",
+        branch: "shared",
+        group_path: "A",
+        status: "Stopped",
+        context_resume: { state: "unavailable", reason: "no_target" },
+      },
+      {
+        id: "running",
+        title: "Running session",
+        project_path: "/tmp/shared",
+        branch: "shared",
+        group_path: "B",
+        status: "Running",
+        context_resume: { state: "available" },
+      },
+    ]);
+    await page.goto("/");
+    const row = page.locator('a[href="/session/idle"]');
+    await expect(row).toContainText("ctx:no");
+    await row.click({ modifiers: ["Control"] });
+    await expect(page).toHaveURL(new RegExp("/$"));
+    await expect(row).toHaveAttribute("data-selected", "true");
+    await row.click();
+    await expect(page).toHaveURL(new RegExp("/session/idle$"));
+    await page.goto("/");
+    await row.focus();
+    await page.keyboard.press("Enter");
+    await expect(page).toHaveURL(new RegExp("/session/idle$"));
+  });
+}
