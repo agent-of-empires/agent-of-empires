@@ -52,7 +52,10 @@ fn parse_prime_agent_launch_options(words: &[String]) -> Option<PrimeAgentLaunch
             "--" => break,
             "--no-session" => options.no_session = true,
             "--mode" => {
-                options.mode = Some(words.get(index + 1)?.clone());
+                let mode = words.get(index + 1)?;
+                if matches!(mode.as_str(), "text" | "json" | "rpc" | "acp" | "daemon") {
+                    options.mode = Some(mode.clone());
+                }
                 index += 1;
             }
             "--cwd" | "--session-dir" => {
@@ -1564,6 +1567,12 @@ mod tests {
             .unwrap();
         assert_eq!(plan.session_dir, Path::new("sessions"));
 
+        inst.extra_args = "--mode daemon --mode invalid".to_string();
+        assert!(inst
+            .prime_agent_capture_plan_with(&config, store.clone())
+            .is_none());
+        inst.extra_args.clear();
+
         std::fs::write(
             store.join("settings.json"),
             serde_json::json!({"sessionDir": "~/.prime/agent/global"}).to_string(),
@@ -1583,6 +1592,14 @@ mod tests {
             .prime_agent_capture_plan_with(&config, store.clone())
             .unwrap();
         assert_eq!(plan.session_dir, Path::new("project"));
+
+        config
+            .anonymous_volumes
+            .push("/workspace/project/.prime".to_string());
+        assert!(inst
+            .prime_agent_capture_plan_with(&config, store.clone())
+            .is_none());
+        config.anonymous_volumes.clear();
         std::fs::write(store.join("settings.json"), "{").unwrap();
         let plan = inst
             .prime_agent_capture_plan_with(&config, store.clone())
