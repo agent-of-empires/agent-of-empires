@@ -54,8 +54,9 @@ pub(super) fn reset_fake_spawn_config(
         agent_key: "codex".into(),
         tool: "codex".into(),
         spec: AgentSpec {
-            command: script.to_string_lossy().into_owned(),
-            args: vec![],
+            // Read the fixture as data instead of executing a newly written inode.
+            command: "/bin/sh".into(),
+            args: vec![script.to_string_lossy().into_owned()],
             description: "scripted reset fake".into(),
             env_allowlist: None,
         },
