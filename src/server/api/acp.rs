@@ -1973,7 +1973,14 @@ fn resolve_structured_seed(
         seed_history_replay: import_pending,
     }
 }
-
+fn adopt_persisted_structured_instance(
+    cached: crate::session::Instance,
+    mut persisted: crate::session::Instance,
+    source_profile: &str,
+) -> crate::session::Instance {
+    persisted.source_profile = source_profile.to_owned();
+    super::super::reload::merge_runtime_fields(cached, persisted)
+}
 pub async fn acp_enable(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1985,6 +1992,16 @@ pub async fn acp_enable(
     if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
+    if !state
+        .instances
+        .read()
+        .await
+        .iter()
+        .any(|inst| inst.id == id)
+    {
+        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    }
+
     // Serialize the synchronous view transition with disable and with the
     // deferred worker spawn below.
     let inst_lock = state.instance_lock(&id).await;
@@ -2326,7 +2343,7 @@ pub async fn acp_disable(
         .await;
         match persisted {
             Ok(Ok(Some(durable))) if durable.is_structured() => {
-                instance = super::super::reload::merge_runtime_fields(instance, durable);
+                instance = adopt_persisted_structured_instance(instance, durable, &profile);
             }
             Ok(Ok(Some(_))) => {
                 return Json(ViewSwitchResponse {
@@ -3966,6 +3983,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn acp_enable_missing_session_does_not_create_instance_lock() {
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+
+        let response = acp_enable(State(state.clone()), Path("missing".to_string()))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(state.instance_locks.read().await.is_empty());
+    }
+
+    #[test]
+    fn persisted_disable_adoption_keeps_nondefault_launch_profile() {
+        let mut cached = crate::session::Instance::new("t", "/tmp");
+        cached.source_profile = "work".to_string();
+        let mut persisted = cached.clone();
+        persisted.source_profile.clear();
+        persisted.view = crate::session::View::Structured;
+
+        let adopted = adopt_persisted_structured_instance(cached, persisted, "work");
+
+        assert_eq!(adopted.effective_profile(), "work");
     }
 
     #[tokio::test]
