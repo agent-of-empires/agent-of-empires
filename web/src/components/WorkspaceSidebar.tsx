@@ -886,7 +886,11 @@ function SortableSessionRow({
   workspace: Workspace;
   isActive: boolean;
   isSelected: boolean;
-  onActivate: (e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }, sessionId: string | null) => void;
+  onActivate: (
+    workspaceId: string,
+    e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean },
+    sessionId: string | null,
+  ) => void;
   onDelete?: (workspaceId: string) => void;
   onStop?: (workspaceId: string) => void;
   onStart?: (workspaceId: string) => void;
@@ -1032,7 +1036,11 @@ export const SessionRow = memo(function SessionRow({
   // Row click. The parent interprets the modifier keys (plain navigates,
   // Cmd/Ctrl toggles, Shift ranges), so the row forwards the event up rather
   // than navigating directly. See #1724.
-  onActivate: (e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }, sessionId: string | null) => void;
+  onActivate: (
+    workspaceId: string,
+    e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean },
+    sessionId: string | null,
+  ) => void;
   onDelete?: (workspaceId: string) => void;
   onStop?: (workspaceId: string) => void;
   onStart?: (workspaceId: string) => void;
@@ -1576,7 +1584,7 @@ export const SessionRow = memo(function SessionRow({
           // decides navigate vs. select. Always preventDefault so a modifier
           // click builds the selection instead of following the href.
           e.preventDefault();
-          onActivate(e, navigationSessionId);
+          onActivate(workspace.id, e, navigationSessionId);
         }}
         onContextMenu={handleContextMenu}
         onTouchStart={handleTouchStart}
@@ -4007,7 +4015,7 @@ export function WorkspaceSidebar({
                                     workspace={v.workspace}
                                     isActive={v.workspace.id === displayedActiveId}
                                     isSelected={!readOnly && selection.selectedIds.has(v.workspace.id)}
-                                    onActivate={(e, sessionId) => handleRowActivate(v.workspace.id, e, sessionId)}
+                                    onActivate={handleRowActivate}
                                     onDelete={onDeleteSession}
                                     onStop={onStopSession}
                                     onStart={onStartSession}
@@ -4116,7 +4124,7 @@ export function WorkspaceSidebar({
                                 workspace={v.workspace}
                                 isActive={v.workspace.id === displayedActiveId}
                                 isSelected={!readOnly && selection.selectedIds.has(v.workspace.id)}
-                                onActivate={(e, sessionId) => handleRowActivate(v.workspace.id, e, sessionId)}
+                                onActivate={handleRowActivate}
                                 onDelete={onDeleteSession}
                                 onStop={onStopSession}
                                 onStart={onStartSession}
@@ -4193,7 +4201,7 @@ export function WorkspaceSidebar({
                                 workspace={v.workspace}
                                 isActive={v.workspace.id === displayedActiveId}
                                 isSelected={!readOnly && selection.selectedIds.has(v.workspace.id)}
-                                onActivate={(e, sessionId) => handleRowActivate(v.workspace.id, e, sessionId)}
+                                onActivate={handleRowActivate}
                                 onDelete={onDeleteSession}
                                 onStop={onStopSession}
                                 onStart={onStartSession}
@@ -4279,7 +4287,7 @@ export function WorkspaceSidebar({
                       workspace={v.workspace}
                       isActive={v.workspace.id === displayedActiveId}
                       isSelected={!readOnly && selection.selectedIds.has(v.workspace.id)}
-                      onActivate={(e, sessionId) => handleRowActivate(v.workspace.id, e, sessionId)}
+                      onActivate={handleRowActivate}
                       onDelete={onDeleteSession}
                       onStop={onStopSession}
                       onStart={onStartSession}
