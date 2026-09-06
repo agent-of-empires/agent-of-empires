@@ -770,6 +770,7 @@ fn authoritative_capture_due(
 enum AuthoritativeRefreshAction {
     None,
     Schedule(std::time::Duration),
+    CaptureOnly,
 }
 
 fn authoritative_refresh_action(
@@ -778,6 +779,9 @@ fn authoritative_refresh_action(
 ) -> AuthoritativeRefreshAction {
     match (due, result) {
         (false, _) => AuthoritativeRefreshAction::None,
+        (true, Some(crate::tmux::vt::VtRefreshResult::Retired)) => {
+            AuthoritativeRefreshAction::CaptureOnly
+        }
         // Busy still consumed an authoritative capture attempt. Defer the
         // next one so continuous output cannot turn self-heal into a fork loop.
         (
@@ -1338,6 +1342,12 @@ impl LiveCaptureWorker {
             // worker also falls back to capture for that pane.
             #[cfg(unix)]
             let mut vt_source: Option<std::sync::Arc<crate::tmux::vt::VtChannel>> = None;
+            // A healthy grid may intentionally retire when an authoritative
+            // snapshot would cross tmux's unfenceable pipe queue. That is not
+            // a broken forwarder: this target stays on capture until retarget
+            // or an explicit VT setting reset.
+            #[cfg(unix)]
+            let mut vt_capture_only = false;
             // Terminal snapshots do not include raw OSC 52 escapes. When VT is
             // intentionally off for a terminal pane, this observer restores
             // clipboard forwarding without constructing a grid or seed.
@@ -1438,6 +1448,7 @@ impl LiveCaptureWorker {
                     #[cfg(unix)]
                     {
                         stale_vt.extend(vt_source.take());
+                        vt_capture_only = false;
                         last_vt_arm = None;
                         arm_after = Some(std::time::Instant::now() + CHANNEL_ARM_SETTLE);
                         next_authoritative_capture = None;
@@ -1484,6 +1495,7 @@ impl LiveCaptureWorker {
                 #[cfg(unix)]
                 if !vt_enabled {
                     shutdown_vt_source(&mut vt_source, &command_deadline);
+                    vt_capture_only = false;
                     last_vt_arm = None;
                     next_authoritative_capture = None;
                 }
@@ -1574,12 +1586,14 @@ impl LiveCaptureWorker {
                     let forward_empty = forward_empty_policy || !live_cell.load(Ordering::Relaxed);
                     #[cfg(unix)]
                     let (capture, cursor_now) = if vt_enabled {
-                        if channel_arm_due(
-                            arm_after,
-                            vt_source.is_some() || pending_vt_arm.is_some(),
-                            last_vt_arm,
-                            std::time::Instant::now(),
-                        ) {
+                        if !vt_capture_only
+                            && channel_arm_due(
+                                arm_after,
+                                vt_source.is_some() || pending_vt_arm.is_some(),
+                                last_vt_arm,
+                                std::time::Instant::now(),
+                            )
+                        {
                             last_vt_arm = Some(std::time::Instant::now());
                             pending_vt_arm = Some(PendingArm::spawn(
                                 name.clone(),
@@ -1617,6 +1631,11 @@ impl LiveCaptureWorker {
                             AuthoritativeRefreshAction::Schedule(after) => {
                                 next_authoritative_capture =
                                     Some(std::time::Instant::now() + after);
+                            }
+                            AuthoritativeRefreshAction::CaptureOnly => {
+                                vt_capture_only = true;
+                                shutdown_vt_source(&mut vt_source, &command_deadline);
+                                next_authoritative_capture = None;
                             }
                         }
                         match vt_source.as_ref() {
@@ -3808,6 +3827,11 @@ mod tests {
                 true,
                 Some(VtRefreshResult::Refreshed),
                 AuthoritativeRefreshAction::Schedule(AUTHORITATIVE_CAPTURE_INTERVAL),
+            ),
+            (
+                true,
+                Some(VtRefreshResult::Retired),
+                AuthoritativeRefreshAction::CaptureOnly,
             ),
             (
                 true,

@@ -908,6 +908,7 @@ fn lf_to_crlf(raw: &[u8]) -> Vec<u8> {
 pub(crate) enum VtRefreshResult {
     Refreshed,
     Busy,
+    Retired,
     Failed,
 }
 #[derive(Clone, Copy)]
@@ -2144,7 +2145,9 @@ impl VtChannel {
                 },
             );
             match seed_result {
-                VtRefreshResult::Refreshed | VtRefreshResult::Failed => break,
+                VtRefreshResult::Refreshed | VtRefreshResult::Retired | VtRefreshResult::Failed => {
+                    break
+                }
                 VtRefreshResult::Busy => {}
             }
         }
@@ -2301,7 +2304,7 @@ impl VtChannel {
     fn retire_live_channel(&self, deadline: &crate::tmux::TmuxCommandDeadline) -> VtRefreshResult {
         self.alive.store(false, Ordering::Relaxed);
         self.shutdown_with_deadline(deadline);
-        VtRefreshResult::Busy
+        VtRefreshResult::Retired
     }
 
     /// Retire the live grid for authoritative capture fallback even when cursor
@@ -3351,7 +3354,7 @@ mod tests {
         let deadline = crate::tmux::TmuxCommandDeadline::with_timeout(Duration::ZERO);
         assert_eq!(
             channel.refresh_authoritatively(&deadline),
-            VtRefreshResult::Busy,
+            VtRefreshResult::Retired,
             "a live channel must stand down instead of installing an unfenceable snapshot"
         );
         assert!(

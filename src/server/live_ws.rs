@@ -385,6 +385,11 @@ fn clipboard_forward_enabled(
     !read_only && mode != crate::session::config::TmuxSettingMode::Disabled
 }
 
+#[cfg(unix)]
+fn needs_capture_osc52(clipboard_forward: bool, has_osc52: bool, vt_retired: bool) -> bool {
+    clipboard_forward && !has_osc52 && vt_retired
+}
+
 /// Connection-lifetime deflate stream for frame messages (module doc, `caps`).
 /// One raw-deflate stream sync-flushed per frame, so every binary WS message
 /// is immediately decodable while the compression dictionary carries across
@@ -692,7 +697,7 @@ async fn handle_live_ws(
     let capture_tmux = tmux_name.clone();
     let capture_owner = owner_id.clone();
     #[cfg(unix)]
-    let capture_osc52 = osc52;
+    let mut capture_osc52 = osc52;
     #[cfg(unix)]
     let capture_vt = vt.clone();
     let capture_task = tokio::spawn(async move {
@@ -702,6 +707,8 @@ async fn handle_live_ws(
             .map_or(0, |source| source.clipboard_sequence());
         #[cfg(unix)]
         let mut vt_clipboard_seen = capture_vt.as_ref().map_or(0, |ch| ch.clipboard_sequence());
+        #[cfg(unix)]
+        let mut next_osc52_arm = None;
         // This connection's own change receiver: every viewer of the shared
         // grid gets one, so a change wakes all of them.
         #[cfg(unix)]
@@ -975,6 +982,27 @@ async fn handle_live_ws(
                     }
                     #[cfg(unix)]
                     {
+                        if needs_capture_osc52(
+                            clipboard_forward,
+                            capture_osc52.is_some(),
+                            capture_vt
+                                .as_ref()
+                                .is_some_and(|channel| !channel.is_alive()),
+                        ) && next_osc52_arm.is_none_or(|at| std::time::Instant::now() >= at)
+                        {
+                            next_osc52_arm =
+                                Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+                            let name = capture_tmux.clone();
+                            capture_osc52 = tokio::task::spawn_blocking(move || {
+                                crate::tmux::vt::Osc52Channel::acquire(&name)
+                            })
+                            .await
+                            .ok()
+                            .flatten();
+                            if let Some(source) = capture_osc52.as_ref() {
+                                osc52_seen = source.clipboard_sequence();
+                            }
+                        }
                         let clipboard = match (capture_osc52.as_ref(), capture_vt.as_ref()) {
                             (Some(source), _) => {
                                 source.refresh_owner_heartbeat();
@@ -1637,6 +1665,15 @@ mod tests {
         // A read-only viewer performed no action; its clipboard stays its own.
         assert!(!clipboard_forward_enabled(TmuxSettingMode::Auto, true));
         assert!(!clipboard_forward_enabled(TmuxSettingMode::Enabled, true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retired_grid_switches_clipboard_observation_to_capture() {
+        assert!(needs_capture_osc52(true, false, true));
+        assert!(!needs_capture_osc52(true, true, true));
+        assert!(!needs_capture_osc52(false, false, true));
+        assert!(!needs_capture_osc52(true, false, false));
     }
 
     #[test]
