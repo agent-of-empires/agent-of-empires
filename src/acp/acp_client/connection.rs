@@ -32,7 +32,7 @@ use super::config_options::{
     config_options_event, dispatch_set_config_option, dispatch_set_mode, mode_config_id,
     thought_level_config_id, ConfigOptionDispatchPurpose,
 };
-use super::control::{establish_session_v3, prompt_outcome_to_response, DaemonControlClient};
+use super::control::{establish_session_v4, prompt_outcome_to_response, DaemonControlClient};
 use super::delete::handle_delete_session_cmd;
 use super::errors::{acp_internal_error, AcpError, IncompatibleAgentError};
 use super::fs_handlers::{handle_read_text_file, handle_write_text_file};
@@ -147,7 +147,7 @@ pub(super) async fn run_connection_task<W, R>(
     // watchdogs stand down. Direct stdio creates its own guard.
     external_terminal_guard: Option<Arc<TerminalClaim>>,
     external_prompt_in_flight: Option<Arc<std::sync::atomic::AtomicBool>>,
-    // Control protocol v3 client for detached runners. The runner owns the
+    // Control protocol v4 client for detached runners. The runner owns the
     // handshake and prompt; the synthetic crate transport maps all remaining
     // ACP requests and notifications onto the same typed control socket.
     // Direct stdio has no control client and speaks ACP on its process pipes.
@@ -778,7 +778,7 @@ pub(super) async fn run_connection_task<W, R>(
         )
         .connect_with(transport, |connection: ConnectionTo<Agent>| async move {
             info!(target: "acp.protocol", session = %session_label, "initializing ACP agent");
-            // A detached v3 runner owns `initialize` and caches its result, so
+            // A detached v4 runner owns `initialize` and caches its result, so
             // the daemon requests it over the control channel. Direct stdio
             // sends the same request through the crate connection.
             let init: InitializeResponse = if let Some(control) = control_client.as_ref() {
@@ -932,30 +932,19 @@ pub(super) async fn run_connection_task<W, R>(
                     acp_session_id: stored,
                     in_flight_turn: _,
                 } => {
-                    // INVARIANT: Resume mode MUST NOT send `session/new`
-                    // or `session/load`. This is the load-bearing trick
-                    // that makes mid-turn continuity work across
-                    // `aoe serve --stop` + `aoe serve`. Do not "fix" it
-                    // by adding either call here.
-                    //
-                    // Why: the runner kept the agent process alive
-                    // across the daemon restart, so the ACP session is
-                    // still loaded in the agent's memory and addressable
-                    // via its original id. `session/load` would either
-                    // fail (agents that advertise loadSession=false) or
-                    // double-load against a still-busy session and
-                    // replay the entire transcript at the user.
-                    // `session/new` would split context onto a new id
-                    // the in-flight `session/prompt` doesn't address,
-                    // silently orphaning the turn the user is waiting
-                    // on. See issue #1037 and the
-                    // `tests/acp_midturn_resume.rs` integration
-                    // coverage.
+                    // Resume must not send ACP load/new: the agent still owns
+                    // the live session. A preceding daemon's reset may commit
+                    // after our registry snapshot, so await the runner's cache.
+                    let stored = if let Some(control) = control_client.as_ref() {
+                        control.resume_session().await?
+                    } else {
+                        stored
+                    };
                     info!(
                         target: "acp.protocol",
                         session = %session_label,
                         stored_id = %stored,
-                        "resume mode: reusing existing acp session id without handshake"
+                        "resume mode: reusing runner session without agent load/new"
                     );
                     // Emit AcpSessionAssigned so the frontend reducer
                     // clears any sticky startupError/lastError from the
@@ -1003,10 +992,10 @@ pub(super) async fn run_connection_task<W, R>(
                         );
                         let req = ForkSessionRequest::new(parent.clone(), agent_cwd.clone())
                             .mcp_servers(mcp_servers.clone());
-                        // Detached v3 runners own session creation; direct stdio
+                        // Detached v4 runners own session creation; direct stdio
                         // sends the request through the crate connection.
                         let fork_result = if let Some(control) = control_client.as_ref() {
-                            establish_session_v3::<ForkSessionResponse>(
+                            establish_session_v4::<ForkSessionResponse>(
                                 control,
                                 "session/fork",
                                 &req,
@@ -1151,9 +1140,9 @@ pub(super) async fn run_connection_task<W, R>(
                             }
                             let req = LoadSessionRequest::new(stored.clone(), agent_cwd.clone())
                                 .mcp_servers(mcp_servers.clone());
-                            // Detached v3 runners own session/load.
+                            // Detached v4 runners own session/load.
                             let load_result = if let Some(control) = control_client.as_ref() {
-                                establish_session_v3::<LoadSessionResponse>(
+                                establish_session_v4::<LoadSessionResponse>(
                                     control,
                                     "session/load",
                                     &req,
@@ -1262,9 +1251,9 @@ pub(super) async fn run_connection_task<W, R>(
                         );
                         let req =
                             NewSessionRequest::new(agent_cwd.clone()).mcp_servers(mcp_servers);
-                        // Detached v3 runners own session/new.
+                        // Detached v4 runners own session/new.
                         let new_session = if let Some(control) = control_client.as_ref() {
-                            establish_session_v3::<NewSessionResponse>(control, "session/new", &req)
+                            establish_session_v4::<NewSessionResponse>(control, "session/new", &req)
                                 .await?
                         } else {
                             connection.send_request(req).block_task().await?
@@ -1446,7 +1435,7 @@ pub(super) async fn run_connection_task<W, R>(
                 );
             }
 
-            // Send cancellation through control v3 when the runner owns the
+            // Send cancellation through control v4 when the runner owns the
             // turn, otherwise through the direct-stdio crate connection. The
             // macro preserves each callsite's error-handling shape.
             macro_rules! send_session_cancel {
@@ -1744,7 +1733,7 @@ pub(super) async fn run_connection_task<W, R>(
                         tokio::pin!(silent_orphan_check);
 
                         let prompt_started_at_ms = chrono::Utc::now().timestamp_millis();
-                        // Detached v3 runners receive the prompt over control;
+                        // Detached v4 runners receive the prompt over control;
                         // direct stdio uses the crate connection. Both arms
                         // resolve to the same `Result<PromptResponse, Error>`.
                         // Boxed as an Unpin future for the select below.

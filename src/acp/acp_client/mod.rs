@@ -76,7 +76,7 @@ use tracing::Instrument;
 
 use self::commands::{ClientCmd, ConnectMode};
 use self::connection::run_connection_task;
-use self::control::{connect_runner_control_v3, ShutdownControlOnDrop};
+use self::control::{connect_runner_control_v4, ShutdownControlOnDrop};
 use self::delete::ACP_SESSION_DELETE_TIMEOUT;
 use self::handshake::wait_for_handshake;
 use self::lifecycle::TerminalClaim;
@@ -521,7 +521,7 @@ impl AcpClient {
     ) -> Result<Self, AcpError> {
         // As of #2977 the control socket is the only one a runner binds, so
         // that is what the daemon dials. The wait for it to appear happens
-        // inside `connect_runner_control_v3` below rather than here: probing
+        // inside `connect_runner_control_v4` below rather than here: probing
         // with a throwaway connection would look to the runner like a daemon
         // attaching and immediately detaching, churning its attach
         // bookkeeping and running a spurious disconnect sweep.
@@ -582,7 +582,7 @@ impl AcpClient {
                 ..
             }
         )));
-        let (control_client, crate_transport) = connect_runner_control_v3(
+        let (control_client, crate_transport) = connect_runner_control_v4(
             &control_path,
             event_tx.clone(),
             session_label.clone(),
@@ -648,9 +648,10 @@ impl AcpClient {
 
     /// Reattach to an already-running structured view worker over its unix
     /// socket. Used by `aoe serve` startup when a registry entry has a
-    /// live PID and an existing socket file; we connect, send only the
-    /// (idempotent) ACP `initialize` request, and reuse the existing
-    /// `stored_acp_session_id` directly. We deliberately do NOT issue
+    /// live PID and an existing socket file; we replay `initialize`, then
+    /// request the runner's committed session identity with `ResumeSession`.
+    /// A reset still awaiting the agent must settle before that identity is
+    /// published. We deliberately do NOT issue
     /// `session/new` or `session/load`: the agent process is still
     /// running (the runner kept it alive across `aoe serve --stop`) and
     /// the session is already loaded in its memory, so re-sending those

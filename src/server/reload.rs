@@ -341,6 +341,52 @@ pub(crate) async fn reload_state_instances_from_disk(
     // inside `spawn_blocking`.
     let suppressed_ids =
         crate::session::recovery::snapshot_recently_restarted(&state.recently_restarted);
+    // Repair is a view transition too. Reserve its session before taking the
+    // instances lock, and keep that reservation through its deferred disk write.
+    // A busy enable/disable owns the desired view; skip it rather than repairing
+    // the temporary terminal-row/live-runner state during teardown.
+    let terminal_ids: std::collections::HashSet<&str> = if live_worker_records.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        fresh
+            .iter()
+            .filter(|row| !row.is_structured())
+            .map(|row| row.id.as_str())
+            .collect()
+    };
+    let mut repair_records = Vec::new();
+    let mut repair_guards = Vec::new();
+    for (record, _) in live_worker_records {
+        if !terminal_ids.contains(record.session_id.as_str()) {
+            continue;
+        }
+        let lock = state.instance_lock(&record.session_id).await;
+        let Ok(guard) = lock.try_lock_owned() else {
+            continue;
+        };
+        // The caller may have sampled this runner before disable finished.
+        // Revalidate its owner under the transition lock, using its latest
+        // stored conversation id rather than the earlier registry snapshot.
+        let Ok(Some(current)) = crate::process::worker_registry::load(&record.session_id) else {
+            continue;
+        };
+        if current.pid != record.pid
+            || current.started_at != record.started_at
+            || !crate::process::worker_registry::is_record_live(&current)
+        {
+            continue;
+        }
+        let Some(acp_session_id) = current
+            .stored_acp_session_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        repair_records.push((current, acp_session_id));
+        repair_guards.push(guard);
+    }
 
     let mut current = state.instances.write().await;
 
@@ -402,14 +448,14 @@ pub(crate) async fn reload_state_instances_from_disk(
         merged.push(row);
     }
 
-    let repairs = repair_structured_rows_from_live_workers(&mut merged, live_worker_records);
+    let repairs = repair_structured_rows_from_live_workers(&mut merged, repair_records);
 
     apply_acp_overlay_inplace(&prior_by_id, &mut merged);
 
     *current = merged;
     drop(current);
 
-    persist_structured_row_repairs(state, repairs);
+    persist_structured_row_repairs(state, repairs, repair_guards);
 }
 
 /// Apply the acp status / timestamps overlay to `merged`, sourcing
@@ -450,6 +496,102 @@ pub(super) fn apply_acp_overlay_inplace(prior_by_id: &PriorById, merged: &mut [I
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    fn live_repair_fixture() -> (Arc<AppState>, Instance, LiveStructuredWorkerRecord, Storage) {
+        let mut row = Instance::new("repair-transition", "/tmp/repo");
+        row.source_profile = "repair-transition".into();
+        let storage = Storage::new_unwatched(&row.source_profile).unwrap();
+        storage
+            .update(|instances, _| {
+                instances.push(row.clone());
+                Ok(())
+            })
+            .unwrap();
+        let socket = crate::process::worker_registry::socket_path_for(&row.id).unwrap();
+        crate::process::worker_registry::touch_live_socket(&socket);
+        let record = crate::process::worker_registry::WorkerRecord::new(
+            row.id.clone(),
+            std::process::id(),
+            socket,
+            "codex-acp".into(),
+            "codex".into(),
+            "/tmp/repo".into(),
+            None,
+            vec![],
+            vec![],
+            Some("agent-session".into()),
+            Some(row.source_profile.clone()),
+        );
+        crate::process::worker_registry::save(&record).unwrap();
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        (state, row, (record, "agent-session".into()), storage)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reload_repair_does_not_undo_terminal_transition_during_teardown() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let (state, row, record, storage) = live_repair_fixture();
+        // Disable committed terminal view, but session/delete is still running.
+        let lock = state.instance_lock(&row.id).await;
+        let _transition = lock.lock().await;
+        state
+            .mutation_epoch
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        reload_state_instances_from_disk(
+            &state,
+            vec![row],
+            vec![record],
+            StatusSource::DiskOnly,
+            1,
+        )
+        .await;
+        assert!(!state.instances.read().await[0].is_structured());
+        assert!(!storage.load().unwrap()[0].is_structured());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reload_repair_rejects_a_registry_sample_retired_after_the_disk_read() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let (state, row, record, storage) = live_repair_fixture();
+        // The reload sampled the runner during teardown; disable finished
+        // before this reload could acquire the transition lock.
+        crate::process::worker_registry::delete_if_owned(&row.id, std::process::id()).unwrap();
+        reload_state_instances_from_disk(
+            &state,
+            vec![row],
+            vec![record],
+            StatusSource::DiskOnly,
+            0,
+        )
+        .await;
+        assert!(!state.instances.read().await[0].is_structured());
+        assert!(!storage.load().unwrap()[0].is_structured());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reload_repair_commits_before_a_following_terminal_transition() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let (state, row, record, storage) = live_repair_fixture();
+        let lock = state.instance_lock(&row.id).await;
+        reload_state_instances_from_disk(
+            &state,
+            vec![row.clone()],
+            vec![record],
+            StatusSource::DiskOnly,
+            0,
+        )
+        .await;
+        assert!(state.instances.read().await[0].is_structured());
+        // The following view transition must observe the durable repair,
+        // rather than race an older queued structured write.
+        let _transition = tokio::time::timeout(std::time::Duration::from_secs(2), lock.lock())
+            .await
+            .expect("repair persistence must finish");
+        assert!(storage.load().unwrap()[0].is_structured());
+    }
 
     /// A structured row as the poll loop finds it mid-phantom: disk says `Idle`,
     /// the live acp status is `Error` because the worker died with

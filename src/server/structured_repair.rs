@@ -104,6 +104,7 @@ pub(super) fn repair_structured_rows_from_live_workers(
 pub(super) fn persist_structured_row_repairs(
     state: &Arc<AppState>,
     repairs: Vec<StructuredRowRepair>,
+    repair_guards: Vec<tokio::sync::OwnedMutexGuard<()>>,
 ) {
     if repairs.is_empty() {
         return;
@@ -115,6 +116,9 @@ pub(super) fn persist_structured_row_repairs(
         "server.reload.persist_repairs",
         crate::task_util::PanicPolicy::Log,
         async move {
+            // Keep view transitions behind the repair until its durable write
+            // (or rollback) finishes; otherwise a queued repair can undo disable.
+            let _repair_guards = repair_guards;
             let mut by_profile: std::collections::HashMap<String, Vec<StructuredRowRepair>> =
                 std::collections::HashMap::new();
             for repair in repairs {

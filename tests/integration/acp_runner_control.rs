@@ -1,4 +1,4 @@
-//! Integration tests for the runner's control-only v3 transport.
+//! Integration tests for the runner's control-only v4 transport.
 //!
 //! The scenarios spawn real `aoe __acp-runner` processes with deterministic
 //! stand-in agents and exercise framed handshake, forward-lane, reverse-lane,
@@ -124,7 +124,7 @@ fn read_frame(stream: &mut UnixStream) -> serde_json::Value {
     serde_json::from_slice(&body).expect("parse frame json")
 }
 
-/// The v3 core loop over real sockets and framing: an
+/// The v4 core loop over real sockets and framing: an
 /// agent-issued request reaches the daemon as a `ServerCall`, and the
 /// daemon's `ServerResult` reaches the agent as a JSON-RPC response echoing
 /// the agent's own id.
@@ -179,7 +179,7 @@ fn runner_proxies_agent_requests_over_the_control_channel() {
     // #2977: the relay socket is retired, so the runner must NOT create it.
     assert!(
         !socket.exists(),
-        "a v3 runner must not bind the retired raw socket at {}",
+        "a v4 runner must not bind the retired raw socket at {}",
         socket.display()
     );
 
@@ -188,11 +188,11 @@ fn runner_proxies_agent_requests_over_the_control_channel() {
     let hello = read_frame(&mut ctl);
     assert_eq!(hello["kind"], "hello", "first control frame is Hello");
     assert_eq!(hello["session_id"], session_id);
-    assert_eq!(hello["control_protocol_version"], 3);
+    assert_eq!(hello["control_protocol_version"], 4);
 
     write_frame(
         &mut ctl,
-        &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
+        &serde_json::json!({"kind": "attach", "control_protocol_version": 4}),
     );
 
     // Drive an agent-to-client request through cat. `fs/read_text_file` goes
@@ -397,7 +397,7 @@ for line in sys.stdin:
     assert_eq!(read_frame(&mut stalled)["kind"], "hello");
     write_frame(
         &mut stalled,
-        &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
+        &serde_json::json!({"kind": "attach", "control_protocol_version": 4}),
     );
     std::thread::sleep(Duration::from_millis(2500));
 
@@ -408,7 +408,7 @@ for line in sys.stdin:
     assert_eq!(read_frame(&mut accepted)["kind"], "hello");
     write_frame(
         &mut accepted,
-        &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
+        &serde_json::json!({"kind": "attach", "control_protocol_version": 4}),
     );
     let buffered = read_frame(&mut accepted);
     assert_eq!(buffered["kind"], "notify", "got {buffered}");
@@ -523,7 +523,7 @@ for line in sys.stdin:
     assert_eq!(read_frame(&mut ctl)["kind"], "hello");
     write_frame(
         &mut ctl,
-        &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
+        &serde_json::json!({"kind": "attach", "control_protocol_version": 4}),
     );
     write_frame(
         &mut ctl,
@@ -584,7 +584,7 @@ for line in sys.stdin:
     assert_eq!(read_frame(&mut resumed)["kind"], "hello");
     write_frame(
         &mut resumed,
-        &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
+        &serde_json::json!({"kind": "attach", "control_protocol_version": 4}),
     );
     assert_eq!(
         read_typed_frame(&mut resumed),
@@ -700,7 +700,7 @@ for line in sys.stdin:
     wait_for(&control, "old control socket");
     assert!(
         !socket.exists(),
-        "a v3 runner must not bind the retired raw socket at {}",
+        "a v4 runner must not bind the retired raw socket at {}",
         socket.display()
     );
     let old_agent_pid = wait_for_u32(&agent_pid_file, "old agent pid");
@@ -770,7 +770,7 @@ for line in sys.stdin:
     assert_eq!(read_frame(&mut ctl)["kind"], "hello");
     write_frame(
         &mut ctl,
-        &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
+        &serde_json::json!({"kind": "attach", "control_protocol_version": 4}),
     );
     write_frame(
         &mut ctl,
@@ -821,7 +821,7 @@ for line in sys.stdin:
     drop(replacement);
 }
 
-/// The runner owns the ACP handshake. Drive it as a v3
+/// The runner owns the ACP handshake. Drive it as a v4
 /// daemon over the control channel across two attaches and assert the
 /// agent is handshaken (initialize + session/new) exactly once, that the
 /// second attach replays the cache without touching the agent, and that a
@@ -914,7 +914,7 @@ for line in sys.stdin:
     wait_for(&record, "registry record");
     wait_for(&control, "control socket");
 
-    let v3 = serde_json::json!(3);
+    let v4 = serde_json::json!(4);
 
     // --- First attach: the runner runs the handshake against the agent. ---
     {
@@ -922,11 +922,11 @@ for line in sys.stdin:
         ctl.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         let hello = read_frame(&mut ctl);
         assert_eq!(hello["kind"], "hello");
-        assert_eq!(hello["control_protocol_version"], v3);
+        assert_eq!(hello["control_protocol_version"], v4);
 
         write_frame(
             &mut ctl,
-            &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
+            &serde_json::json!({"kind": "attach", "control_protocol_version": 4}),
         );
         write_frame(
             &mut ctl,
@@ -963,7 +963,7 @@ for line in sys.stdin:
 
         write_frame(
             &mut ctl,
-            &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
+            &serde_json::json!({"kind": "attach", "control_protocol_version": 4}),
         );
         let replayed = read_typed_frame(&mut ctl);
         assert_eq!(replayed["kind"], "prompt_completed");
@@ -1070,7 +1070,7 @@ fn runner_load_uses_requested_id_and_caches_response() {
         assert_eq!(read_frame(&mut ctl)["kind"], "hello");
         write_frame(
             &mut ctl,
-            &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
+            &serde_json::json!({"kind": "attach", "control_protocol_version": 4}),
         );
         write_frame(
             &mut ctl,
@@ -1097,7 +1097,7 @@ fn runner_load_uses_requested_id_and_caches_response() {
         assert_eq!(read_frame(&mut ctl)["kind"], "hello");
         write_frame(
             &mut ctl,
-            &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
+            &serde_json::json!({"kind": "attach", "control_protocol_version": 4}),
         );
         write_frame(
             &mut ctl,
@@ -1236,7 +1236,7 @@ for line in sys.stdin:
 
     write_frame(
         &mut ctl,
-        &serde_json::json!({"kind": "attach", "control_protocol_version": 3}),
+        &serde_json::json!({"kind": "attach", "control_protocol_version": 4}),
     );
     write_frame(
         &mut ctl,
@@ -1257,4 +1257,162 @@ for line in sys.stdin:
         "native binary failed to launch"
     );
     assert_eq!(failed["error"]["code"], -32603);
+}
+
+/// The replacement daemon must wait for an already-sent reset and use its
+/// committed identity, without loading or creating another agent session.
+#[tokio::test]
+async fn resumed_client_uses_reset_committed_after_reattach() {
+    use agent_of_empires::acp::control_protocol::{self, ControlBody};
+    use agent_of_empires::acp::state::Event;
+
+    let Some(python3) = find_python3() else {
+        return;
+    };
+    let scratch = Scratch::new("reset-resume");
+    let home = scratch.0.join("home");
+    let xdg = scratch.0.join("xdg");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&xdg).unwrap();
+    let received = scratch.0.join("reset-received");
+    let release = scratch.0.join("release-reset");
+    let agent = scratch.0.join("agent.py");
+    std::fs::write(&agent, r#"import json, sys, pathlib, time
+received, release = map(pathlib.Path, sys.argv[1:])
+count = 0
+sid = None
+def send(msg):
+    print(json.dumps(msg), flush=True)
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    if method == "initialize":
+        result = {"protocolVersion":1,"agentCapabilities":{}}
+    elif method == "session/new":
+        count += 1
+        if count == 2:
+            received.write_text("received")
+            while not release.exists(): time.sleep(0.01)
+        sid = "session-" + str(count)
+        result = {"sessionId":sid}
+    elif method == "session/prompt":
+        actual = msg["params"]["sessionId"]
+        send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":sid,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":actual + ":new-count=" + str(count)}}}})
+        result = {"stopReason":"end_turn"}
+    else:
+        raise RuntimeError("unexpected agent method: " + str(method))
+    send({"jsonrpc":"2.0","id":msg["id"],"result":result})
+"#).unwrap();
+    let session = "reset-resume";
+    let socket = scratch.0.join(format!("{session}.sock"));
+    let control = agent_of_empires::process::worker::control_socket_sibling(&socket);
+    let _runner = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_aoe"))
+            .args([
+                "__acp-runner",
+                "--socket",
+                socket.to_str().unwrap(),
+                "--session-id",
+                session,
+                "--agent-name",
+                "review-agent",
+                "--cwd",
+                home.to_str().unwrap(),
+                "--",
+                python3.to_str().unwrap(),
+                agent.to_str().unwrap(),
+                received.to_str().unwrap(),
+                release.to_str().unwrap(),
+            ])
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .spawn()
+            .unwrap(),
+    );
+    wait_for(&control, "control socket");
+    let mut first = tokio::net::UnixStream::connect(&control).await.unwrap();
+    assert!(matches!(
+        control_protocol::read_frame(&mut first).await.unwrap(),
+        Some(ControlBody::Hello { .. })
+    ));
+    control_protocol::write_frame(
+        &mut first,
+        &ControlBody::Attach {
+            control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
+        },
+    )
+    .await
+    .unwrap();
+    control_protocol::write_frame(
+        &mut first,
+        &ControlBody::Initialize {
+            request: serde_json::json!({"protocolVersion":1}),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        control_protocol::read_frame(&mut first).await.unwrap(),
+        Some(ControlBody::Initialized { .. })
+    ));
+    control_protocol::write_frame(
+        &mut first,
+        &ControlBody::EstablishSession {
+            method: "session/new".into(),
+            request: serde_json::json!({"cwd":home,"mcpServers":[]}),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        control_protocol::read_frame(&mut first).await.unwrap(),
+        Some(ControlBody::SessionReady { .. })
+    ));
+    control_protocol::write_frame(
+        &mut first,
+        &ControlBody::AgentCall {
+            call_id: 77,
+            method: "session/new".into(),
+            params: serde_json::json!({"cwd":home,"mcpServers":[]}),
+        },
+    )
+    .await
+    .unwrap();
+    wait_for(&received, "agent received reset");
+    drop(first);
+
+    let mut resumed = AcpClient::attach(
+        socket,
+        home,
+        vec![],
+        "session-1".into(),
+        false,
+        AcpSessionId(session.into()),
+        None,
+        "review-agent".into(),
+        None,
+    )
+    .await
+    .unwrap();
+    // Initialization has replayed on the replacement connection. Release the
+    // old daemon's reset only now, then verify what the consumer addresses.
+    std::fs::write(&release, "release").unwrap();
+    resumed.send_prompt("after reset", &[]).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut assigned = None;
+    let mut addressed = None;
+    while assigned.is_none() || addressed.is_none() {
+        match tokio::time::timeout_at(deadline, resumed.next_event())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Event::AcpSessionAssigned { acp_session_id } => assigned = Some(acp_session_id),
+            Event::AgentMessageChunk { text } => addressed = Some(text),
+            _ => {}
+        }
+    }
+    resumed.shutdown().await.unwrap();
+    assert_eq!(assigned.as_deref(), Some("session-2"));
+    assert_eq!(addressed.as_deref(), Some("session-2:new-count=2"));
 }

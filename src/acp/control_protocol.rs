@@ -1,4 +1,4 @@
-//! Control protocol v3 between `aoe serve` and `aoe __acp-runner`, carried
+//! Control protocol v4 between `aoe serve` and `aoe __acp-runner`, carried
 //! over `<id>.control.sock`. The runner is the sole ACP protocol terminator.
 //!
 //! The runner owns initialization, session establishment, prompts, cancellation,
@@ -24,7 +24,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// Current wire generation. Both peers validate it before transferring queued
 /// frames; mixed generations are rejected before their frame sets can diverge.
 /// Bump this whenever a wire-incompatible body or semantic contract changes.
-pub const CONTROL_PROTOCOL_VERSION: u32 = 3;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 4;
 
 /// Maximum NDJSON frame accepted from the ACP agent. The control channel is
 /// the agent stream's only destination, so both limits must be derived from
@@ -131,6 +131,9 @@ pub enum ControlBody {
         method: String,
         request: serde_json::Value,
     },
+    /// Return the established session without sending an ACP load/new request.
+    /// Waits for an already-sent conversation reset to commit first.
+    ResumeSession,
     /// Run a turn. `request` is the ACP `session/prompt` params
     /// (`PromptRequest`); the runner assigns the canonical JSON-RPC id and
     /// tracks the response.
@@ -345,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_lane_frames_roundtrip() {
+    fn v4_lane_frames_roundtrip() {
         for body in [
             ControlBody::ServerCall {
                 call_id: 1,

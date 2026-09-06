@@ -152,6 +152,10 @@ pub async fn spawn_runner_with_shim(
     for (k, v) in env {
         cmd.env(k, v);
     }
+    // Preseeded sessions need one initial load before testing a later attach.
+    if env.iter().any(|(key, _)| *key == "SHIM_PRESEED_SESSION_ID") {
+        cmd.env("SHIM_LOAD_SESSION", "1");
+    }
     let child = cmd.spawn().expect("spawn acp runner");
 
     // The runner binds the control socket before spawning the agent, so its
@@ -164,6 +168,69 @@ pub async fn spawn_runner_with_shim(
             control.display()
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // Resume attaches to an established runner, not merely a preseeded agent.
+    // Prime the runner cache exactly as the original daemon would have done.
+    {
+        use agent_of_empires::acp::control_protocol::{self, ControlBody};
+        let mut initial = tokio::net::UnixStream::connect(&control).await.unwrap();
+        assert!(matches!(
+            control_protocol::read_frame(&mut initial).await.unwrap(),
+            Some(ControlBody::Hello { .. })
+        ));
+        control_protocol::write_frame(
+            &mut initial,
+            &ControlBody::Attach {
+                control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
+            },
+        )
+        .await
+        .unwrap();
+        control_protocol::write_frame(
+            &mut initial,
+            &ControlBody::Initialize {
+                request: serde_json::json!({"protocolVersion": 1}),
+            },
+        )
+        .await
+        .unwrap();
+        loop {
+            match control_protocol::read_frame(&mut initial).await.unwrap() {
+                Some(ControlBody::Initialized { .. }) => break,
+                Some(ControlBody::Notify { .. }) => {}
+                frame => panic!("initial initialize failed: {frame:?}"),
+            }
+        }
+        let preseed = env
+            .iter()
+            .find(|(key, _)| *key == "SHIM_PRESEED_SESSION_ID");
+        let (method, request) = match preseed {
+            Some((_, id)) => (
+                "session/load",
+                serde_json::json!({"sessionId": id, "cwd": home, "mcpServers": []}),
+            ),
+            None => (
+                "session/new",
+                serde_json::json!({"cwd": home, "mcpServers": []}),
+            ),
+        };
+        control_protocol::write_frame(
+            &mut initial,
+            &ControlBody::EstablishSession {
+                method: method.into(),
+                request,
+            },
+        )
+        .await
+        .unwrap();
+        loop {
+            match control_protocol::read_frame(&mut initial).await.unwrap() {
+                Some(ControlBody::SessionReady { .. }) => break,
+                Some(ControlBody::Notify { .. }) => {}
+                frame => panic!("initial session establishment failed: {frame:?}"),
+            }
+        }
     }
 
     (

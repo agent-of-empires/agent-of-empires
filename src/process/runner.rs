@@ -2,7 +2,7 @@
 //! subprocess and outlives `aoe serve`.
 //!
 //! The detached runner writes its registry record, spawns a stdio-only ACP
-//! agent, and exposes the framed v3 protocol on `<session_id>.control.sock`.
+//! agent, and exposes the framed v4 protocol on `<session_id>.control.sock`.
 //! It owns the ACP handshake, forwards both RPC directions, buffers outbound
 //! control frames while detached, and accepts the next daemon connection
 //! without restarting an established agent session.
@@ -18,7 +18,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -615,6 +615,9 @@ struct RunnerShared {
     next_call_id: AtomicU64,
     /// Agent-bound requests issued for a specific daemon attachment.
     pending_agent_calls: Mutex<HashMap<i64, PendingAgentCall>>,
+    /// Sent resets remain authoritative until their response is committed.
+    pending_resets: AtomicUsize,
+    reset_finished: tokio::sync::Notify,
     /// Registry ownership used to commit session identity before success.
     registry_owner: Option<(String, u32)>,
     /// A durability failure makes further runner state unsafe to expose.
@@ -837,6 +840,8 @@ impl RunnerShared {
             pending_server_calls: Mutex::new(HashMap::new()),
             next_call_id: AtomicU64::new(1),
             pending_agent_calls: Mutex::new(HashMap::new()),
+            pending_resets: AtomicUsize::new(0),
+            reset_finished: tokio::sync::Notify::new(),
             registry_owner,
             fatal: AtomicBool::new(false),
             fatal_wake: tokio::sync::Notify::new(),
@@ -929,6 +934,9 @@ impl RunnerShared {
                         error,
                     },
                 };
+                if pending.method == "session/new" {
+                    self.finish_reset();
+                }
                 self.enqueue(
                     DeliveryScope::Attachment(pending.attachment_id),
                     QueuedKind::AgentReply,
@@ -1164,6 +1172,9 @@ impl RunnerShared {
             "failing in-flight forward calls; agent is gone"
         );
         for pending in drained {
+            if pending.method == "session/new" {
+                self.finish_reset();
+            }
             self.enqueue(
                 DeliveryScope::Attachment(pending.attachment_id),
                 QueuedKind::AgentReply,
@@ -1410,6 +1421,36 @@ impl RunnerShared {
         Ok(cached)
     }
 
+    fn finish_reset(&self) {
+        self.pending_resets.fetch_sub(1, Ordering::AcqRel);
+        self.reset_finished.notify_waiters();
+    }
+
+    /// Resolve a reattach against the agent state, not a stale registry snapshot.
+    /// The accept loop cannot admit another daemon until all requests from the
+    /// preceding attachment have been registered, so its sent resets are visible
+    /// here. Keep their count live through persistence and cache replacement.
+    async fn resume_session(&self) -> Result<(String, serde_json::Value), serde_json::Value> {
+        loop {
+            let finished = self.reset_finished.notified();
+            if self.pending_resets.load(Ordering::Acquire) == 0 {
+                if self.fatal.load(Ordering::Acquire) {
+                    return Err(transport_error(
+                        "runner session state could not be committed",
+                    ));
+                }
+                return self
+                    .handshake
+                    .lock()
+                    .await
+                    .session
+                    .clone()
+                    .ok_or_else(|| transport_error("runner has no established session to resume"));
+            }
+            finished.await;
+        }
+    }
+
     /// The ACP session id the runner established, if any.
     async fn acp_session_id(&self) -> Option<String> {
         self.handshake
@@ -1431,6 +1472,9 @@ impl RunnerShared {
         params: serde_json::Value,
     ) {
         let req_id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
+        if method == "session/new" {
+            self.pending_resets.fetch_add(1, Ordering::AcqRel);
+        }
         self.pending_agent_calls.lock().await.insert(
             req_id,
             PendingAgentCall {
@@ -1446,7 +1490,13 @@ impl RunnerShared {
             "params": params,
         });
         if !self.write_agent_line(agent_stdin, &request).await {
-            self.pending_agent_calls.lock().await.remove(&req_id);
+            if let Some(pending) = self.pending_agent_calls.lock().await.remove(&req_id) {
+                if pending.method == "session/new" {
+                    self.finish_reset();
+                }
+            } else {
+                return; // The agent already answered while the write was finishing.
+            }
             self.enqueue(
                 DeliveryScope::Attachment(attachment_id),
                 QueuedKind::AgentReply,
@@ -1808,6 +1858,7 @@ async fn run_control_writer(
 
 enum HandshakeCommand {
     Initialize(serde_json::Value),
+    ResumeSession,
     EstablishSession {
         method: String,
         request: serde_json::Value,
@@ -1829,7 +1880,7 @@ async fn await_handshake_or_control_loss<T>(
     }
 }
 
-/// Handle one v3 control-channel attachment. Reads directly from the socket,
+/// Handle one v4 control-channel attachment. Reads directly from the socket,
 /// which applies transport backpressure instead of treating a valid burst as a
 /// protocol failure. The writer is supervised in every socket-read wait, so a
 /// stalled peer releases the serial accept slot when its write deadline fires.
@@ -1941,6 +1992,23 @@ async fn handle_control_connection(
                         }
                     }
                 }
+                HandshakeCommand::ResumeSession => {
+                    let Some(result) = await_handshake_or_control_loss(
+                        &mut control_closed,
+                        handshake_shared.resume_session(),
+                    )
+                    .await
+                    else {
+                        return;
+                    };
+                    match result {
+                        Ok((acp_session_id, result)) => ControlBody::SessionReady {
+                            acp_session_id,
+                            result,
+                        },
+                        Err(error) => ControlBody::HandshakeFailed { error },
+                    }
+                }
                 HandshakeCommand::EstablishSession { method, request } => {
                     let Some(result) = await_handshake_or_control_loss(
                         &mut control_closed,
@@ -1996,6 +2064,23 @@ async fn handle_control_connection(
         match body {
             ControlBody::Initialize { request } => {
                 let send = handshake_tx.send(HandshakeCommand::Initialize(request));
+                tokio::pin!(send);
+                let sent = tokio::select! {
+                    result = &mut writer => {
+                        writer_finished = true;
+                        if let Err(error) = result {
+                            warn!(target: "acp.runner", session = %session_id, "control writer task failed: {error}");
+                        }
+                        false
+                    }
+                    result = &mut send => result.is_ok(),
+                };
+                if !sent {
+                    break 'connection false;
+                }
+            }
+            ControlBody::ResumeSession => {
+                let send = handshake_tx.send(HandshakeCommand::ResumeSession);
                 tokio::pin!(send);
                 let sent = tokio::select! {
                     result = &mut writer => {
