@@ -27,7 +27,7 @@ use crate::session::capture::{
     capture_omp_session_id, codex_poll_fn_sandboxed_store, gemini_poll_fn_sandboxed_store,
     generate_session_uuid, hermes_poll_fn_sandboxed_store, is_valid_session_id,
     kimi_poll_fn_sandboxed_store, omp_host_routing_environment, omp_poll_fn, omp_poll_fn_sandboxed,
-    omp_sandbox_launch_marker, prime_agent_poll_fn_sandboxed_store, reject_omp_secret_args,
+    omp_sandbox_launch_marker, prime_agent_poll_fn_sandboxed, reject_omp_secret_args,
     resolve_omp_store_layout, resolve_omp_store_layout_in_container_with_environment,
     resolve_omp_store_layout_with_environment, try_capture_omp_session_id_in_container,
     validate_omp_capture_metadata, validated_session_id, OmpCaptureMetadata, OmpCapturePlan,
@@ -40,10 +40,11 @@ mod hooks;
 mod kill;
 mod launch_command;
 
-/// The extension AoE loads into Pi so a pane publishes its own conversation.
-/// Written to the app dir for a host launch and into the Pi sandbox dir for a
-/// container one.
-pub(crate) const PI_SESSION_EXTENSION: &str = include_str!("../../../assets/pi/aoe-session-id.js");
+/// Identity extension shared by supported agents. AoE writes it to the app
+/// directory for host launches and into the agent's private sandbox bind for
+/// container launches.
+pub(crate) const SESSION_IDENTITY_EXTENSION: &str =
+    include_str!("../../../assets/session/aoe-session-id.js");
 mod lifecycle;
 mod merge;
 mod omp;
@@ -102,12 +103,13 @@ pub(crate) enum TerminalContextResume {
     ForkPending,
     PreviousFailure,
 }
-pub(crate) use types::{
-    PiSidecarSource, PriorToolSession, ResumeIntent, SandboxStoreTransitionPath,
-};
 pub use types::{
     PluginCreateIdempotency, SandboxInfo, TerminalInfo, View, WorkspaceInfo, WorkspaceRepo,
     WorktreeInfo,
+};
+pub(crate) use types::{
+    PrimeAgentCapturePlan, PriorToolSession, ResumeIntent, SandboxStoreTransitionPath,
+    SessionSidecarSource,
 };
 
 // Re-exported so each submodule can reach its siblings through `use super::*`.

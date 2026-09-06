@@ -40,8 +40,8 @@ fn apply_yolo_mode(cmd: &mut String, yolo: &crate::agents::YoloMode, is_sandboxe
 /// Write the Pi session-id extension into the app dir and return its path.
 ///
 /// Rewritten when the content differs so an upgrade ships its own version.
-pub(super) fn pi_extension_path() -> Result<PathBuf> {
-    const SOURCE: &str = crate::session::instance::PI_SESSION_EXTENSION;
+pub(super) fn session_identity_extension_path() -> Result<PathBuf> {
+    const SOURCE: &str = crate::session::instance::SESSION_IDENTITY_EXTENSION;
     let root = crate::session::get_app_dir()?;
     let rel = Path::new("agent-extensions").join("pi-aoe-session-id.js");
     let path = root.join(&rel);
@@ -381,6 +381,23 @@ impl Instance {
         })
     }
 
+    /// Rebuild a restart command if the quiesced Prime pane published a newer root.
+    pub(super) fn refresh_prepared_prime_launch_after_quiescence(
+        &mut self,
+        mut prepared: PreparedLaunch,
+    ) -> Result<PreparedLaunch> {
+        if self.absorb_published_prime_session() {
+            // Refresh launch data without changing the durable CAS baseline.
+            (
+                prepared.command,
+                prepared.is_existing,
+                prepared.omp_capture_plan,
+                prepared.launch_env,
+            ) = self.build_launch_command()?;
+        }
+        Ok(prepared)
+    }
+
     /// Construct the command only after hook execution has completed. Keeping
     /// this phase hook-free prevents a revalidation retry from replaying user
     /// code while the lifecycle lock is held.
@@ -453,16 +470,16 @@ impl Instance {
                 }
             }
 
-            // Pi publishes its conversation from inside the container through
-            // the same extension, reaching the instance dir and the extension
-            // file by bind-mount (see `container_config`).
-            self.pi_extension_launched = false;
-            let pi_extension = self.pi_extension_launch();
-            if let Some((ref flag, _)) = pi_extension {
-                // Empty for a container: the extension is discovered there
-                // rather than named on the command line.
+            let extension_backend = self.resolved_capture_backend();
+            let identity_extension = self.identity_extension_launch();
+            let extension_configured = identity_extension.is_some();
+            self.pi_extension_launched = extension_configured
+                && extension_backend == Some(crate::agents::SessionCaptureBackend::Pi);
+            if extension_backend == Some(crate::agents::SessionCaptureBackend::PrimeAgent) {
+                self.identity_publisher_launched = extension_configured;
+            }
+            if let Some((ref flag, _)) = identity_extension {
                 tool_cmd.push_str(flag);
-                self.pi_extension_launched = true;
             }
             let is_existing = self.apply_session_flags(&mut tool_cmd, "sandboxed")?;
             apply_agent_launch_env(&mut tool_cmd, agent);
@@ -492,11 +509,32 @@ impl Instance {
                 shell_escape(&profile),
                 shell_escape(&self.id)
             ));
-            if let Some((_, ref env)) = pi_extension {
+            if let Some(&(key, expected)) = agent.and_then(|agent| {
+                agent
+                    .container_env
+                    .iter()
+                    .find(|(key, _)| *key == "PRIME_AGENT_CODING_AGENT_DIR")
+            }) {
+                env_info
+                    .docker_args
+                    .push_str(&format!(" -e {key}={}", shell_escape(expected)));
+            }
+            if let Some((_, ref env)) = identity_extension {
                 // `KEY=VALUE ` from the host form, passed as a docker `-e`.
                 env_info
                     .docker_args
                     .push_str(&format!(" -e {}", shell_escape(env.trim())));
+            }
+            if extension_configured {
+                let root_only = matches!(
+                    extension_backend.and_then(|backend| backend.identity_publisher()),
+                    Some(crate::agents::SessionIdentityPublisher::Extension { root_only: true })
+                );
+                env_info.docker_args.push_str(if root_only {
+                    " -e AOE_SESSION_ROOT_ONLY=1"
+                } else {
+                    " -e AOE_SESSION_ROOT_ONLY=0"
+                });
             }
             let env_part = format!("{} ", env_info.docker_args);
             let raw_command = container.exec_command(Some(&env_part), &tool_cmd);
@@ -562,14 +600,14 @@ impl Instance {
         &mut self,
         agent: Option<&'static crate::agents::AgentDef>,
     ) -> Result<(Option<String>, bool, Option<OmpCapturePlan>)> {
-        let pi_extension = self.pi_extension_launch();
-        self.build_host_command_with_pi_extension(agent, pi_extension)
+        let identity_extension = self.identity_extension_launch();
+        self.build_host_command_with_identity_extension(agent, identity_extension)
     }
 
-    fn build_host_command_with_pi_extension(
+    fn build_host_command_with_identity_extension(
         &mut self,
         agent: Option<&'static crate::agents::AgentDef>,
-        pi_extension: Option<(String, String)>,
+        identity_extension: Option<(String, String)>,
     ) -> Result<(Option<String>, bool, Option<OmpCapturePlan>)> {
         // Resolve after `on_launch`. The snapshot is checked inside the
         // profile environment assignment scope executed by the login shell;
@@ -583,9 +621,10 @@ impl Instance {
         // A verified direct Pi command publishes through the same extension
         // whether it came from the built-in command or an exact alias.
         self.pi_extension_launched = false;
-        if let Some((_, ref env)) = pi_extension {
+        if let Some((_, ref env)) = identity_extension {
             env_prefix.push_str(env);
             self.pi_extension_launched = true;
+            env_prefix.push_str("AOE_SESSION_ROOT_ONLY=0 ");
         }
         let env_prefix = env_prefix;
 
@@ -593,7 +632,7 @@ impl Instance {
             match crate::agents::get_agent(&self.tool) {
                 Some(a) => {
                     let mut cmd = a.launch_base_command();
-                    if let Some((ref flag, _)) = pi_extension {
+                    if let Some((ref flag, _)) = identity_extension {
                         cmd.push_str(flag);
                     }
                     if !self.extra_args.is_empty() {
@@ -630,7 +669,7 @@ impl Instance {
             }
         } else {
             let mut cmd = self.command.clone();
-            if let Some((ref flag, _)) = pi_extension {
+            if let Some((ref flag, _)) = identity_extension {
                 cmd.push_str(flag);
             }
             if !self.extra_args.is_empty() {
@@ -680,7 +719,7 @@ mod tests {
             container_id: None,
             image: "test:latest".to_string(),
             container_name: "aoe-pi-argv".to_string(),
-            extra_env: None,
+            extra_env: Some(vec!["AOE_SESSION_ROOT_ONLY=1".to_string()]),
             custom_instruction: None,
             container_workdir: Some("/workspace".to_string()),
             before_start_env: Vec::new(),
@@ -692,7 +731,7 @@ mod tests {
         let cmd = cmd.expect("a command");
         assert!(
             cmd.contains(&format!(
-                "AOE_PI_SESSION_ID_FILE={}/{}/session_id",
+                "AOE_SESSION_ID_FILE={}/{}/session_id",
                 crate::session::config::container_config::PI_SIDECAR_DIR_IN_CONTAINER,
                 inst.id
             )),
@@ -701,6 +740,10 @@ mod tests {
         assert!(
             !cmd.contains(" -e /") || !cmd.contains("aoe-session-id.js"),
             "no `-e` path may reach a container launch: {cmd}"
+        );
+        assert!(
+            cmd.contains(" -e AOE_SESSION_ROOT_ONLY=0"),
+            "the launch override must keep Pi out of Prime-only mode: {cmd}"
         );
     }
 
@@ -730,12 +773,14 @@ mod tests {
             before_start_env: Vec::new(),
         });
 
-        let (flag, env) = inst.pi_extension_launch().expect("sandboxed pi publishes");
+        let (flag, env) = inst
+            .identity_extension_launch()
+            .expect("sandboxed pi publishes");
         assert!(flag.is_empty(), "no `-e` may reach a container launch");
         assert_eq!(
             env.trim(),
             format!(
-                "AOE_PI_SESSION_ID_FILE={}/{}/session_id",
+                "AOE_SESSION_ID_FILE={}/{}/session_id",
                 crate::session::config::container_config::PI_SIDECAR_DIR_IN_CONTAINER,
                 inst.id
             )
@@ -753,18 +798,19 @@ mod tests {
         let agent = inst.resolved_agent();
 
         let (command, _, _) = inst
-            .build_host_command_with_pi_extension(
+            .build_host_command_with_identity_extension(
                 agent,
                 Some((
                     " -e '/tmp/pi-aoe-session-id.js'".to_string(),
-                    "AOE_PI_SESSION_ID_FILE='/tmp/pi-session-id' ".to_string(),
+                    "AOE_SESSION_ID_FILE='/tmp/pi-session-id' ".to_string(),
                 )),
             )
             .unwrap();
         let command = command.unwrap();
 
         assert!(command.contains(" -e "), "missing Pi extension: {command}");
-        assert!(command.contains("AOE_PI_SESSION_ID_FILE="));
+        assert!(command.contains("AOE_SESSION_ID_FILE="));
+        assert!(command.contains("AOE_SESSION_ROOT_ONLY=0"));
         assert!(inst.pi_extension_launched);
     }
 
@@ -779,12 +825,12 @@ mod tests {
         inst.command = "echo not-pi".to_string();
         let agent = inst.resolved_agent();
 
-        assert!(inst.pi_extension_launch().is_none());
+        assert!(inst.identity_extension_launch().is_none());
         let (command, _, _) = inst.build_host_command(agent).unwrap();
         let command = command.unwrap();
 
         assert!(!command.contains("pi-aoe-session-id.js"));
-        assert!(!command.contains("AOE_PI_SESSION_ID_FILE="));
+        assert!(!command.contains("AOE_SESSION_ID_FILE="));
         assert!(!inst.pi_extension_launched);
     }
 

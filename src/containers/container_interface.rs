@@ -160,13 +160,13 @@ impl ContainerConfig {
             .collect()
     }
 
-    pub(crate) fn path_is_mounted(
+    pub(crate) fn host_path_for_container_path(
         &self,
-        host_path: &std::path::Path,
         container_path: &std::path::Path,
         writable: bool,
-    ) -> bool {
-        self.volumes
+    ) -> Option<std::path::PathBuf> {
+        let (volume, relative) = self
+            .volumes
             .iter()
             .filter_map(|volume| {
                 container_path
@@ -174,11 +174,45 @@ impl ContainerConfig {
                     .ok()
                     .map(|relative| (volume, relative))
             })
-            .max_by_key(|(volume, _)| volume.container_path.len())
-            .is_some_and(|(volume, relative)| {
-                (!writable || !volume.read_only)
-                    && std::path::Path::new(&volume.host_path).join(relative) == host_path
+            .max_by_key(|(volume, _)| {
+                std::path::Path::new(&volume.container_path)
+                    .components()
+                    .count()
+            })?;
+        let bind_depth = std::path::Path::new(&volume.container_path)
+            .components()
+            .count();
+        let shadow_depth = self
+            .anonymous_volumes
+            .iter()
+            .map(String::as_str)
+            .chain(
+                self.named_ignore_volumes
+                    .iter()
+                    .map(|volume| volume.container_path.as_str()),
+            )
+            .filter_map(|mounted| {
+                container_path
+                    .strip_prefix(std::path::Path::new(mounted))
+                    .ok()
+                    .map(|_| std::path::Path::new(mounted).components().count())
             })
+            .max();
+        // Ignore volumes own their subtree and are emitted after equal bind destinations.
+        if shadow_depth.is_some_and(|depth| depth >= bind_depth) || (writable && volume.read_only) {
+            return None;
+        }
+        Some(std::path::Path::new(&volume.host_path).join(relative))
+    }
+
+    pub(crate) fn path_is_mounted(
+        &self,
+        host_path: &std::path::Path,
+        container_path: &std::path::Path,
+        writable: bool,
+    ) -> bool {
+        self.host_path_for_container_path(container_path, writable)
+            .is_some_and(|mapped| mapped == host_path)
     }
 
     pub(crate) fn uses_default_container_home(&self) -> bool {
@@ -331,6 +365,38 @@ mod tests {
         assert!(
             !argv.iter().any(|a| a.contains("literal_should_be_skipped")),
             "duplicate key's value leaked into argv"
+        );
+    }
+
+    #[test]
+    fn container_path_mapping_respects_shadow_volumes() {
+        let mut config = ContainerConfig::default();
+        config.volumes.push(VolumeMount {
+            host_path: "/host/project".to_string(),
+            container_path: "/workspace/project".to_string(),
+            read_only: false,
+        });
+        let source = std::path::Path::new("/workspace/project/src/lib.rs");
+        assert_eq!(
+            config.host_path_for_container_path(source, false),
+            Some(std::path::PathBuf::from("/host/project/src/lib.rs"))
+        );
+
+        let settings = std::path::Path::new("/workspace/project/.prime/agent/settings.json");
+        config
+            .anonymous_volumes
+            .push("/workspace/project/.prime".to_string());
+        assert_eq!(config.host_path_for_container_path(settings, false), None);
+
+        config.anonymous_volumes.clear();
+        config.named_ignore_volumes.push(NamedVolumeMount {
+            volume_name: "aoe-prime-shadow".to_string(),
+            container_path: "/workspace/project/.prime".to_string(),
+        });
+        assert_eq!(config.host_path_for_container_path(settings, false), None);
+        assert_eq!(
+            config.host_path_for_container_path(source, false),
+            Some(std::path::PathBuf::from("/host/project/src/lib.rs"))
         );
     }
 }

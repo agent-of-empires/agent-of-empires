@@ -412,11 +412,20 @@ mod tests {
     }
 }
 
-/// Where a Pi pane publishes its conversation. Sandboxed panes write into the
-/// config bind; host panes into the per-instance hook directory. Kept distinct
-/// so an unresolvable sandbox path cannot read as "use the host one".
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PiSidecarSource {
+pub(crate) struct PrimeAgentCapturePlan {
+    pub(crate) store: PathBuf,
+    pub(crate) session_dir: PathBuf,
+    pub(crate) container_session_dir: PathBuf,
+    pub(crate) container_cwd: String,
+}
+
+/// Where a Pi or Prime pane publishes its conversation. Sandboxed panes write
+/// into an instance-private bind; host panes into the per-instance hook
+/// directory. Kept distinct so an unresolvable sandbox path cannot read as
+/// "use the host one".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SessionSidecarSource {
     HostHooks,
     SandboxDir(std::path::PathBuf),
 }

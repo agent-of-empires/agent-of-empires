@@ -221,7 +221,7 @@ impl Instance {
         let skipped_failed_resume_sid = self.apply_resume_policy(resume_policy);
         self.apply_fresh_launch_intent();
 
-        let prepared = match self.prepare_launch_command() {
+        let mut prepared = match self.prepare_launch_command() {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.fail_reserved_launch(&storage, &error, false);
@@ -231,6 +231,7 @@ impl Instance {
         let result = (|| {
             if restart {
                 self.kill_clean_locked()?;
+                prepared = self.refresh_prepared_prime_launch_after_quiescence(prepared)?;
             }
             let launch_outcome = self.spawn_prepared_launch(size, &profile, prepared)?;
             let outcome =
