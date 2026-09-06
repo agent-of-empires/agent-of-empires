@@ -748,11 +748,11 @@ impl IntroDialog {
         // lines explaining what the mode feels like, when to pick it, and
         // how to come back out. Title indent is 2 columns (marker + space);
         // body indent is 6 columns so the body reads as nested under the
-        // title. Tmux's detach key uses the user's actual prefix
-        // (`tmux_prefix_display()`), so the hint is correct on a
-        // remapped-prefix setup.
+        // title. The tmux hint uses the user's actual prefix and the key
+        // that undoes this process's attach path (`attach_return_key()`).
         let prefix = crate::tmux::tmux_prefix_display();
-        let tmux_back = format!("      tmux pane. {prefix} then d comes back to aoe.");
+        let key = crate::tmux::attach_return_key();
+        let tmux_back = format!("      tmux pane. {prefix} then {key} comes back to aoe.");
         let options = [
             (
                 AttachMode::LiveSend,

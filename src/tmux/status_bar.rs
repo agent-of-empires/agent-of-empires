@@ -71,9 +71,7 @@ pub fn apply_status_bar(
     set_session_option(
         session_name,
         "status-left",
-        &format!(
-            " #[fg={accent},bold]#S#[fg={fg},nobold] \u{2502} #[fg={hint}]{prefix} d#[fg={hint}] to detach ",
-        ),
+        &status_left_format(prefix, &accent, &fg, &hint),
     )?;
     // Sized past the longest name aoe generates rather than to this one: `#S`
     // expands when tmux paints, so a session renamed after this write (smart
@@ -83,6 +81,21 @@ pub fn apply_status_bar(
     set_session_option(session_name, "status-left-length", "200")?;
 
     Ok(())
+}
+
+/// `status-left`: the session name and the key that takes the client back to
+/// aoe. tmux picks the key per client when it paints: a client that arrived
+/// by `switch-client` (the TUI running inside tmux) has a `client_last_session`
+/// and returns to it with `prefix L`; one that arrived by `attach-session` has
+/// none and leaves with `prefix d`. A destroyed last session clears the
+/// variable, so the hint falls back to detach.
+fn status_left_format(prefix: &str, accent: &str, fg: &str, hint: &str) -> String {
+    format!(
+        " #[fg={accent},bold]#S#[fg={fg},nobold] \u{2502} #[fg={hint}]{prefix} \
+         #{{?client_last_session,{switch} back to aoe,{detach} to detach}} ",
+        switch = crate::tmux::utils::SWITCH_BACK_KEY,
+        detach = crate::tmux::utils::DETACH_KEY,
+    )
 }
 
 /// Remove a session-scoped option override so the global value applies.
@@ -305,6 +318,15 @@ mod tests {
     #[test]
     fn test_color_to_tmux_non_rgb_fallback() {
         assert_eq!(color_to_tmux(Color::Red), "default");
+    }
+
+    #[test]
+    fn status_left_hint_follows_the_clients_attach_path() {
+        assert_eq!(
+            status_left_format("Ctrl+b", "#111111", "#222222", "#333333"),
+            " #[fg=#111111,bold]#S#[fg=#222222,nobold] \u{2502} #[fg=#333333]Ctrl+b \
+             #{?client_last_session,L back to aoe,d to detach} "
+        );
     }
 
     #[test]

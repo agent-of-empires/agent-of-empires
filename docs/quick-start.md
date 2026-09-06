@@ -56,7 +56,7 @@ A **group** is unrelated to projects. It is a label you assign to existing sessi
 
 Select a session and press `Enter` to attach. You're now inside a tmux session running your AI agent (Claude Code by default).
 
-To return to the TUI, press **`Ctrl+b d`** (the standard tmux detach shortcut).
+To return to the TUI, press **`Ctrl+b d`** (the standard tmux detach shortcut). If aoe itself runs inside tmux, attaching switches your client to the agent's session instead and **`Ctrl+b L`** switches back; the status bar shows whichever applies.
 
 ## Use the Terminal View
 

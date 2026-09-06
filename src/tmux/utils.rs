@@ -332,6 +332,28 @@ pub fn is_pane_running_shell(session_name: &str) -> bool {
     )
 }
 
+/// Stock tmux keys, under the prefix, that take a client out of a session:
+/// `L` is `switch-client -l`, `d` is `detach-client`.
+pub(crate) const SWITCH_BACK_KEY: &str = "L";
+pub(crate) const DETACH_KEY: &str = "d";
+
+/// Whether this process runs inside a tmux client. Attaching from inside is a
+/// `switch-client` of that client; from outside it is a fresh `attach-session`.
+pub(crate) fn inside_tmux() -> bool {
+    std::env::var("TMUX").is_ok()
+}
+
+/// The key that brings the client back to aoe after this process attaches in
+/// tmux mode: `prefix L` undoes a `switch-client`, `prefix d` ends an
+/// `attach-session`.
+pub fn attach_return_key() -> &'static str {
+    if inside_tmux() {
+        SWITCH_BACK_KEY
+    } else {
+        DETACH_KEY
+    }
+}
+
 /// Returns the tmux prefix key formatted for display (e.g. "Ctrl+a", "Ctrl+b").
 /// Reads `tmux show-option -gv prefix` once on first call and caches the
 /// result; falls back to "Ctrl+b" if tmux is unavailable or the option can't

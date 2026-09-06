@@ -24,7 +24,7 @@ pub use status_detection::{
 };
 pub use terminal_session::{kill_all_terminals_for_id, ContainerTerminalSession, TerminalSession};
 pub use tool_session::{kill_all_tool_sessions_for_id, ToolSession};
-pub use utils::tmux_prefix_display;
+pub use utils::{attach_return_key, tmux_prefix_display};
 
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
