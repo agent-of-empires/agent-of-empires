@@ -287,21 +287,14 @@ pub(super) fn skip_tmux_decision_for_structured(inst: &mut Instance) -> bool {
 //    acceptable.
 // 8. Every caller must read `state.mutation_epoch` BEFORE its disk read and
 //    pass that value as `read_epoch`. `fresh` is a snapshot of
-//    `sessions.json`, and `*current = merged` below replaces
-//    `state.instances` wholesale, so a membership change that commits
-//    between the read and this call would otherwise be undone. It cuts both
-//    ways. A delete: the removed row is still in `fresh` and comes straight
-//    back. A create: the new row is absent from `fresh`, and since `merged`
-//    is built exclusively from `fresh`, the wholesale replace drops the row
-//    the create just put in `state.instances`, so `GET /api/sessions` loses
-//    it until the next tick re-reads disk. The epoch check drops such a
-//    reload rather than applying either. Dropping ids missing from
-//    `prior_by_id` is NOT an alternative; that is also how a session
-//    created by another process (the CLI, a peer daemon) legitimately
-//    enters `state.instances`. The comparison happens under the
-//    `state.instances` write lock, and both the delete and the create bump
-//    under that same lock, so they are ordered against each other; comparing
-//    before taking the lock reopens the race one lock acquisition later.
+//    `sessions.json`, so a committed membership or view transition that lands
+//    between that read and this call makes the snapshot unsafe. A wholesale
+//    replace could resurrect or drop a row, while a per-id merge could restore
+//    the previous execution backend and make a subsequent enable or disable
+//    take the wrong idempotent path. The comparison and every epoch bump happen
+//    under the `state.instances` write lock, after the durable mutation lands.
+//    This closes the check-then-act race while preserving externally created
+//    rows when the epoch still matches.
 
 /// Reload `state.instances` by merging caller-supplied `fresh` against the
 /// prior in-memory snapshot per id, then reapplying the acp overlay.
@@ -348,24 +341,61 @@ pub(crate) async fn reload_state_instances_from_disk(
     // inside `spawn_blocking`.
     let suppressed_ids =
         crate::session::recovery::snapshot_recently_restarted(&state.recently_restarted);
+    // Repair is a view transition too. Reserve its session before taking the
+    // instances lock, and keep that reservation through its deferred disk write.
+    // A busy enable/disable owns the desired view; skip it rather than repairing
+    // the temporary terminal-row/live-runner state during teardown.
+    let terminal_ids: std::collections::HashSet<&str> = if live_worker_records.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        fresh
+            .iter()
+            .filter(|row| !row.is_structured())
+            .map(|row| row.id.as_str())
+            .collect()
+    };
+    let mut repair_records = Vec::new();
+    let mut repair_guards = Vec::new();
+    for (record, _) in live_worker_records {
+        if !terminal_ids.contains(record.session_id.as_str()) {
+            continue;
+        }
+        let lock = state.instance_lock(&record.session_id).await;
+        let Ok(guard) = lock.try_lock_owned() else {
+            continue;
+        };
+        // The caller may have sampled this runner before disable finished.
+        // Revalidate its owner under the transition lock, using its latest
+        // stored conversation id rather than the earlier registry snapshot.
+        let Ok(Some(current)) = crate::process::worker_registry::load(&record.session_id) else {
+            continue;
+        };
+        if current.pid != record.pid
+            || current.started_at != record.started_at
+            || !crate::process::worker_registry::is_record_live(&current)
+        {
+            continue;
+        }
+        let Some(acp_session_id) = current
+            .stored_acp_session_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        repair_records.push((current, acp_session_id));
+        repair_guards.push(guard);
+    }
 
     let mut current = state.instances.write().await;
 
-    // Invariant 8: `fresh` predates a committed create or delete, so folding it
-    // in would put a removed row back, or drop a created one. Drop the whole
-    // reload rather than filter it: the next poll tick re-reads disk 2s from
-    // now and converges, and both mutations are rare enough (each one is a
-    // user action) that losing one tick of status updates costs nothing.
+    // Invariant 8: `fresh` predates a committed membership or view transition.
+    // Applying it could restore the wrong row set or execution backend, so drop
+    // the whole reload. The next tick re-reads disk and converges.
     //
-    // Read under the `instances` write lock, and before `drain_from` empties
-    // `current`, so this is atomic against the mutation. Checking before
-    // taking the lock leaves a hole: a reload could pass the check, park on
-    // the lock, let a delete take the lock, remove the row and bump, then wake
-    // and write its stale snapshot over the removal. Symmetrically for a
-    // create, whose row is missing from the stale snapshot entirely. Both
-    // mutations bump inside the same lock scope for the same reason. No memory ordering closes that gap; it
-    // is a check-then-act race, so the check has to happen under the lock that
-    // orders the two writers.
+    // Compare under the `instances` write lock. Guarded mutations bump under
+    // that same lock after persistence, closing the check-then-act race.
     let current_epoch = state
         .mutation_epoch
         .load(std::sync::atomic::Ordering::SeqCst);
@@ -374,7 +404,7 @@ pub(crate) async fn reload_state_instances_from_disk(
             target: "server.file_watch",
             read_epoch,
             current_epoch,
-            "dropping a disk reload whose snapshot predates a session create or delete"
+            "dropping a disk reload whose snapshot predates a session lifecycle mutation"
         );
         return;
     }
@@ -418,14 +448,14 @@ pub(crate) async fn reload_state_instances_from_disk(
         merged.push(row);
     }
 
-    let repairs = repair_structured_rows_from_live_workers(&mut merged, live_worker_records);
+    let repairs = repair_structured_rows_from_live_workers(&mut merged, repair_records);
 
     apply_acp_overlay_inplace(&prior_by_id, &mut merged);
 
     *current = merged;
     drop(current);
 
-    persist_structured_row_repairs(state, repairs);
+    persist_structured_row_repairs(state, repairs, repair_guards);
 }
 
 /// Apply the acp status / timestamps overlay to `merged`, sourcing
@@ -466,6 +496,102 @@ pub(super) fn apply_acp_overlay_inplace(prior_by_id: &PriorById, merged: &mut [I
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    fn live_repair_fixture() -> (Arc<AppState>, Instance, LiveStructuredWorkerRecord, Storage) {
+        let mut row = Instance::new("repair-transition", "/tmp/repo");
+        row.source_profile = "repair-transition".into();
+        let storage = Storage::new_unwatched(&row.source_profile).unwrap();
+        storage
+            .update(|instances, _| {
+                instances.push(row.clone());
+                Ok(())
+            })
+            .unwrap();
+        let socket = crate::process::worker_registry::socket_path_for(&row.id).unwrap();
+        crate::process::worker_registry::touch_live_socket(&socket);
+        let record = crate::process::worker_registry::WorkerRecord::new(
+            row.id.clone(),
+            std::process::id(),
+            socket,
+            "codex-acp".into(),
+            "codex".into(),
+            "/tmp/repo".into(),
+            None,
+            vec![],
+            vec![],
+            Some("agent-session".into()),
+            Some(row.source_profile.clone()),
+        );
+        crate::process::worker_registry::save(&record).unwrap();
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        (state, row, (record, "agent-session".into()), storage)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reload_repair_does_not_undo_terminal_transition_during_teardown() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let (state, row, record, storage) = live_repair_fixture();
+        // Disable committed terminal view, but session/delete is still running.
+        let lock = state.instance_lock(&row.id).await;
+        let _transition = lock.lock().await;
+        state
+            .mutation_epoch
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        reload_state_instances_from_disk(
+            &state,
+            vec![row],
+            vec![record],
+            StatusSource::DiskOnly,
+            1,
+        )
+        .await;
+        assert!(!state.instances.read().await[0].is_structured());
+        assert!(!storage.load().unwrap()[0].is_structured());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reload_repair_rejects_a_registry_sample_retired_after_the_disk_read() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let (state, row, record, storage) = live_repair_fixture();
+        // The reload sampled the runner during teardown; disable finished
+        // before this reload could acquire the transition lock.
+        crate::process::worker_registry::delete_if_owned(&row.id, std::process::id()).unwrap();
+        reload_state_instances_from_disk(
+            &state,
+            vec![row],
+            vec![record],
+            StatusSource::DiskOnly,
+            0,
+        )
+        .await;
+        assert!(!state.instances.read().await[0].is_structured());
+        assert!(!storage.load().unwrap()[0].is_structured());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reload_repair_commits_before_a_following_terminal_transition() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let (state, row, record, storage) = live_repair_fixture();
+        let lock = state.instance_lock(&row.id).await;
+        reload_state_instances_from_disk(
+            &state,
+            vec![row.clone()],
+            vec![record],
+            StatusSource::DiskOnly,
+            0,
+        )
+        .await;
+        assert!(state.instances.read().await[0].is_structured());
+        // The following view transition must observe the durable repair,
+        // rather than race an older queued structured write.
+        let _transition = tokio::time::timeout(std::time::Duration::from_secs(2), lock.lock())
+            .await
+            .expect("repair persistence must finish");
+        assert!(storage.load().unwrap()[0].is_structured());
+    }
 
     /// A structured row as the poll loop finds it mid-phantom: disk says `Idle`,
     /// the live acp status is `Error` because the worker died with

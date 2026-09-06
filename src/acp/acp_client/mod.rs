@@ -76,7 +76,7 @@ use tracing::Instrument;
 
 use self::commands::{ClientCmd, ConnectMode};
 use self::connection::run_connection_task;
-use self::control::{connect_runner_control_v2, ShutdownControlOnDrop};
+use self::control::{connect_runner_control_v3, ShutdownControlOnDrop};
 use self::delete::ACP_SESSION_DELETE_TIMEOUT;
 use self::handshake::wait_for_handshake;
 use self::lifecycle::TerminalClaim;
@@ -84,9 +84,9 @@ use self::pending::{
     ApprovalResolutionMessage, ElicitationResolutionMessage, PendingResolver, PendingResponders,
 };
 use self::reset::{SESSION_RESET_IN_TASK_TIMEOUT, SESSION_RESET_TIMEOUT};
+use self::runner::spawn_runner_detached;
 #[cfg(debug_assertions)]
 use self::runner::take_injected_fresh_handshake_failure;
-use self::runner::{runner_socket_deadline, spawn_runner_detached, wait_for_socket};
 use self::spawn::spawn_subprocess;
 
 /// Top-level ACP client. Owns the subprocess lifetime and pumps events
@@ -340,7 +340,7 @@ impl AcpClient {
             // runner's whole process group and clear its stale entry/socket
             // before binding the replacement. No-op when there is no live
             // prior runner. See #1689.
-            crate::process::worker_registry::terminate(&session_id.0);
+            crate::process::worker_registry::terminate_and_wait(&session_id.0).await;
             spawn_runner_detached(&config, &socket_path, session_id.0.clone(), runner_sandbox)?;
             return Self::connect_via_socket(
                 socket_path,
@@ -519,11 +519,13 @@ impl AcpClient {
         default_mode: Option<String>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<Self, AcpError> {
-        // Poll for the runner to finish binding the socket. The runner
-        // binds before it spawns the agent so this is usually fast (a
-        // few ms) but bound the wait so a wedged runner returns a typed
-        // error instead of parking the supervisor.
-        let stream = wait_for_socket(&socket_path, runner_socket_deadline()).await?;
+        // As of #2977 the control socket is the only one a runner binds, so
+        // that is what the daemon dials. The wait for it to appear happens
+        // inside `connect_runner_control_v3` below rather than here: probing
+        // with a throwaway connection would look to the runner like a daemon
+        // attaching and immediately detaching, churning its attach
+        // bookkeeping and running a spurious disconnect sweep.
+        let control_path = crate::process::worker::control_socket_sibling(&socket_path);
         // #1890 regression hook (debug-only): simulate a fresh-spawn whose
         // daemon-side handshake fails after the runner is already up and
         // registered. Dropping the socket closes the daemon's end cleanly; the
@@ -533,13 +535,10 @@ impl AcpClient {
         // and budgeted by the env var so only the first spawn trips.
         #[cfg(debug_assertions)]
         if matches!(mode, ConnectMode::Fresh { .. }) && take_injected_fresh_handshake_failure() {
-            drop(stream);
             return Err(AcpError::Spawn(
                 "injected fresh-handshake failure (AOE_ACP_TEST_FAIL_FIRST_HANDSHAKES)".into(),
             ));
         }
-        let (read_half, write_half) = stream.into_split();
-        let transport = ByteStreams::new(write_half.compat_write(), read_half.compat());
 
         let mut roots = vec![cwd.clone()];
         roots.extend(additional_dirs);
@@ -562,27 +561,44 @@ impl AcpClient {
         let pending_for_task = pending_responders.clone();
         let expected_agent = ExpectedAgent::from_command(&install_binary);
 
-        // #2976 Phase B: dial the runner's sibling control socket. A v2
-        // runner returns a control client the connection task uses to drive
-        // the handshake and every turn (the runner owns the ACP client side
-        // now). The shared terminal guard lets the client's reader deliver
-        // an adopted turn's completion on a mid-flight resume, so the
-        // resume-idle / between-prompt watchdogs stand down. An absent or
-        // older (v1) runner returns None: the task falls back to the
-        // byte-relay handshake and, for a mid-flight resume, the resume-idle
-        // watchdog (guard left None so it still fires).
+        // #2977: dial the control socket, which is now the whole transport.
+        // The returned duplex is what the crate connection speaks over: the
+        // runner owns the handshake, the turn, and every JSON-RPC id toward
+        // the agent, and the shim translates the rest. The shared terminal
+        // guard lets the client's reader deliver an adopted turn's completion
+        // on a mid-flight resume, so the resume-idle / between-prompt
+        // watchdogs stand down.
+        //
+        // An incompatible runner cannot attach. The reconciler normally reaps
+        // it before this path; any remaining identity, version, framing, or I/O
+        // failure is returned with its original cause.
         let guard = Arc::new(TerminalClaim::new());
-        // Shared with the connection task so the control reader can hand idle
-        // ownership back when it surfaces a waiterless completion (#3190).
-        let prompt_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let control_client = connect_runner_control_v2(
-            &socket_path,
+        // The reader can receive a cached completion immediately after Attach,
+        // before the crate handshake task marks the adopted turn separately.
+        let prompt_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(matches!(
+            &mode,
+            ConnectMode::Resume {
+                in_flight_turn: true,
+                ..
+            }
+        )));
+        let (control_client, crate_transport) = connect_runner_control_v3(
+            &control_path,
             event_tx.clone(),
             session_label.clone(),
             guard.clone(),
             prompt_in_flight.clone(),
         )
-        .await;
+        .await
+        .map_err(|error| {
+            AcpError::Spawn(format!(
+                "runner control attach failed at {}: {error:#}",
+                control_path.display()
+            ))
+        })?;
+        let control_client = Some(control_client);
+        let (read_half, write_half) = tokio::io::split(crate_transport);
+        let transport = ByteStreams::new(write_half.compat_write(), read_half.compat());
         let external_terminal_guard = control_client.as_ref().map(|_| guard);
         let external_prompt_in_flight = control_client.as_ref().map(|_| prompt_in_flight);
         let mut handshake_control = ShutdownControlOnDrop(control_client.clone());
@@ -632,9 +648,10 @@ impl AcpClient {
 
     /// Reattach to an already-running structured view worker over its unix
     /// socket. Used by `aoe serve` startup when a registry entry has a
-    /// live PID and an existing socket file; we connect, send only the
-    /// (idempotent) ACP `initialize` request, and reuse the existing
-    /// `stored_acp_session_id` directly. We deliberately do NOT issue
+    /// live PID and an existing socket file; we replay `initialize`, then
+    /// request the runner's committed session identity with `ResumeSession`.
+    /// A reset still awaiting the agent must settle before that identity is
+    /// published. We deliberately do NOT issue
     /// `session/new` or `session/load`: the agent process is still
     /// running (the runner kept it alive across `aoe serve --stop`) and
     /// the session is already loaded in its memory, so re-sending those
@@ -642,15 +659,12 @@ impl AcpClient {
     /// the agent doesn't advertise `loadSession`) or double-load against
     /// a busy session.
     ///
-    /// `in_flight_turn = true` tells the connection task that the
-    /// session was mid-prompt when the previous daemon detached. The
-    /// task arms a watchdog that emits a synthetic
-    /// `Event::Stopped { reason: "reattach_idle" }` after
-    /// `RESUME_IDLE_GRACE` of inbound silence, because the agent's
-    /// eventual response to the orphaned `session/prompt` carries a
-    /// request id this client never issued and is dropped silently by
-    /// the underlying transport, leaving the UI otherwise stuck on
-    /// "thinking".
+    /// `in_flight_turn = true` tells the control reader that a cached
+    /// `PromptCompleted` belongs to the adopted turn, so it publishes the
+    /// runner's terminal reason. The connection task also arms a watchdog that
+    /// emits `Event::Stopped { reason: "reattach_idle" }` if neither a
+    /// completion nor further turn activity arrives before
+    /// `RESUME_IDLE_GRACE`, preventing a permanently stuck "thinking" state.
     #[allow(clippy::too_many_arguments)]
     pub async fn attach(
         socket_path: PathBuf,

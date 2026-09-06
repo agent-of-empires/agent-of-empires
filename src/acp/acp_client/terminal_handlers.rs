@@ -6,7 +6,7 @@ use agent_client_protocol::schema::v1::{
     ReleaseTerminalRequest, ReleaseTerminalResponse, TerminalId, TerminalOutputRequest,
     TerminalOutputResponse, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
 };
-use agent_client_protocol::Responder;
+
 use tracing::trace;
 
 use super::fs_handlers::enter_timestamp_ns;
@@ -14,9 +14,8 @@ use super::SessionResources;
 
 pub(super) async fn handle_create_terminal(
     request: CreateTerminalRequest,
-    responder: Responder<CreateTerminalResponse>,
     res: SessionResources,
-) -> agent_client_protocol::Result<()> {
+) -> Result<CreateTerminalResponse, agent_client_protocol::Error> {
     let enter_ns = enter_timestamp_ns();
     trace!(
         target: "acp.protocol.tool_dispatch",
@@ -29,7 +28,7 @@ pub(super) async fn handle_create_terminal(
     let cwd = request.cwd.clone().unwrap_or_else(|| res.cwd.clone());
     // Sandbox the cwd: must be inside session roots.
     if let Err(e) = res.fs_policy.resolve_inside(&cwd) {
-        let r = responder.respond_with_error(agent_client_protocol::util::internal_error(format!(
+        let r = Err(agent_client_protocol::util::internal_error(format!(
             "terminal cwd outside session roots: {e}"
         )));
         trace!(
@@ -60,10 +59,8 @@ pub(super) async fn handle_create_terminal(
         )
         .await
     {
-        Ok(id) => responder.respond(CreateTerminalResponse::new(TerminalId::new(id))),
-        Err(e) => {
-            responder.respond_with_error(agent_client_protocol::util::internal_error(e.to_string()))
-        }
+        Ok(id) => Ok(CreateTerminalResponse::new(TerminalId::new(id))),
+        Err(e) => Err(agent_client_protocol::util::internal_error(e.to_string())),
     };
     trace!(
         target: "acp.protocol.tool_dispatch",
@@ -85,9 +82,8 @@ pub(super) fn build_exit_status(
 
 pub(super) async fn handle_terminal_output(
     request: TerminalOutputRequest,
-    responder: Responder<TerminalOutputResponse>,
     res: SessionResources,
-) -> agent_client_protocol::Result<()> {
+) -> Result<TerminalOutputResponse, agent_client_protocol::Error> {
     let enter_ns = enter_timestamp_ns();
     trace!(
         target: "acp.protocol.tool_dispatch",
@@ -99,14 +95,10 @@ pub(super) async fn handle_terminal_output(
     let result = match res.terminals.output(request.terminal_id.0.as_ref()).await {
         Ok(out) => {
             let combined = format!("{}{}", out.stdout, out.stderr);
-            responder.respond(
-                TerminalOutputResponse::new(combined, false)
-                    .exit_status(build_exit_status(out.exit_code)),
-            )
+            Ok(TerminalOutputResponse::new(combined, false)
+                .exit_status(build_exit_status(out.exit_code)))
         }
-        Err(e) => {
-            responder.respond_with_error(agent_client_protocol::util::internal_error(e.to_string()))
-        }
+        Err(e) => Err(agent_client_protocol::util::internal_error(e.to_string())),
     };
     trace!(
         target: "acp.protocol.tool_dispatch",
@@ -120,9 +112,8 @@ pub(super) async fn handle_terminal_output(
 
 pub(super) async fn handle_wait_for_terminal_exit(
     request: WaitForTerminalExitRequest,
-    responder: Responder<WaitForTerminalExitResponse>,
     res: SessionResources,
-) -> agent_client_protocol::Result<()> {
+) -> Result<WaitForTerminalExitResponse, agent_client_protocol::Error> {
     let enter_ns = enter_timestamp_ns();
     trace!(
         target: "acp.protocol.tool_dispatch",
@@ -135,12 +126,10 @@ pub(super) async fn handle_wait_for_terminal_exit(
     // the time `create_and_run` returns. So `output()` immediately yields
     // the captured exit status.
     let result = match res.terminals.output(request.terminal_id.0.as_ref()).await {
-        Ok(out) => responder.respond(WaitForTerminalExitResponse::new(build_exit_status(
+        Ok(out) => Ok(WaitForTerminalExitResponse::new(build_exit_status(
             out.exit_code,
         ))),
-        Err(e) => {
-            responder.respond_with_error(agent_client_protocol::util::internal_error(e.to_string()))
-        }
+        Err(e) => Err(agent_client_protocol::util::internal_error(e.to_string())),
     };
     trace!(
         target: "acp.protocol.tool_dispatch",
@@ -154,9 +143,8 @@ pub(super) async fn handle_wait_for_terminal_exit(
 
 pub(super) async fn handle_kill_terminal(
     request: KillTerminalRequest,
-    responder: Responder<KillTerminalResponse>,
     _res: SessionResources,
-) -> agent_client_protocol::Result<()> {
+) -> Result<KillTerminalResponse, agent_client_protocol::Error> {
     let enter_ns = enter_timestamp_ns();
     trace!(
         target: "acp.protocol.tool_dispatch",
@@ -166,7 +154,7 @@ pub(super) async fn handle_kill_terminal(
         "ACP request handler entered"
     );
     // One-shot terminals are already finished; kill is a no-op.
-    let result = responder.respond(KillTerminalResponse::new());
+    let result = Ok(KillTerminalResponse::new());
     trace!(
         target: "acp.protocol.tool_dispatch",
         handler = "kill_terminal",
@@ -179,9 +167,8 @@ pub(super) async fn handle_kill_terminal(
 
 pub(super) async fn handle_release_terminal(
     request: ReleaseTerminalRequest,
-    responder: Responder<ReleaseTerminalResponse>,
     res: SessionResources,
-) -> agent_client_protocol::Result<()> {
+) -> Result<ReleaseTerminalResponse, agent_client_protocol::Error> {
     let enter_ns = enter_timestamp_ns();
     trace!(
         target: "acp.protocol.tool_dispatch",
@@ -190,12 +177,8 @@ pub(super) async fn handle_release_terminal(
         enter_ns,
         "ACP request handler entered"
     );
-    let result = match res.terminals.release(request.terminal_id.0.as_ref()).await {
-        Ok(()) => responder.respond(ReleaseTerminalResponse::new()),
-        Err(e) => {
-            responder.respond_with_error(agent_client_protocol::util::internal_error(e.to_string()))
-        }
-    };
+    res.terminals.release(request.terminal_id.0.as_ref()).await;
+    let result = Ok(ReleaseTerminalResponse::new());
     trace!(
         target: "acp.protocol.tool_dispatch",
         handler = "release_terminal",

@@ -585,7 +585,9 @@ async function handlePrompt(params, client) {
     },
   });
 
-  return { stopReason: "end_turn" };
+  return {
+    stopReason: userText.includes("MAX_TOKENS") ? "max_tokens" : "end_turn",
+  };
 }
 
 function handleCancel() {

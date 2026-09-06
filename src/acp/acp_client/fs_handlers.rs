@@ -4,7 +4,7 @@
 use agent_client_protocol::schema::v1::{
     ReadTextFileRequest, ReadTextFileResponse, WriteTextFileRequest, WriteTextFileResponse,
 };
-use agent_client_protocol::Responder;
+
 use std::sync::Arc;
 use tracing::{trace, warn};
 
@@ -59,9 +59,8 @@ where
 
 pub(super) async fn handle_read_text_file(
     request: ReadTextFileRequest,
-    responder: Responder<ReadTextFileResponse>,
     res: SessionResources,
-) -> agent_client_protocol::Result<()> {
+) -> Result<ReadTextFileResponse, agent_client_protocol::Error> {
     // Issue #1147: parallel-tool-call diagnostics. The `enter_ns` value is a
     // monotonic ns-since-process-start counter; if the model dispatches N
     // tool calls in parallel, the entries should interleave (close `enter_ns`
@@ -104,11 +103,9 @@ pub(super) async fn handle_read_text_file(
             } else {
                 content
             };
-            responder.respond(ReadTextFileResponse::new(sliced))
+            Ok(ReadTextFileResponse::new(sliced))
         }
-        Err(e) => {
-            responder.respond_with_error(agent_client_protocol::util::internal_error(e.to_string()))
-        }
+        Err(e) => Err(agent_client_protocol::util::internal_error(e.to_string())),
     };
     trace!(
         target: "acp.protocol.tool_dispatch",
@@ -122,9 +119,8 @@ pub(super) async fn handle_read_text_file(
 
 pub(super) async fn handle_write_text_file(
     request: WriteTextFileRequest,
-    responder: Responder<WriteTextFileResponse>,
     res: SessionResources,
-) -> agent_client_protocol::Result<()> {
+) -> Result<WriteTextFileResponse, agent_client_protocol::Error> {
     let enter_ns = enter_timestamp_ns();
     trace!(
         target: "acp.protocol.tool_dispatch",
@@ -145,10 +141,8 @@ pub(super) async fn handle_write_text_file(
     })
     .await;
     let result = match write_outcome {
-        Ok(()) => responder.respond(WriteTextFileResponse::new()),
-        Err(e) => {
-            responder.respond_with_error(agent_client_protocol::util::internal_error(e.to_string()))
-        }
+        Ok(()) => Ok(WriteTextFileResponse::new()),
+        Err(e) => Err(agent_client_protocol::util::internal_error(e.to_string())),
     };
     trace!(
         target: "acp.protocol.tool_dispatch",

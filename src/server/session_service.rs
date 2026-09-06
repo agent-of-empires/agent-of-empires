@@ -2203,10 +2203,12 @@ mod tests {
     /// uses: it makes `wait_for_worker` park exactly as it does mid-respawn,
     /// with no process, sandbox, or agent involved.
     #[tokio::test]
+    #[serial_test::serial]
     async fn the_queue_drain_frees_instance_lock_while_it_waits_for_a_resuming_worker() {
         use crate::acp::supervisor::{ResumeKind, ResumeReservationOutcome};
         use std::time::Duration;
 
+        let _home = crate::session::test_support::isolate_app_dir();
         let mut inst = Instance::new("queue-3621", "/tmp/aoe-3621-drain");
         inst.id = "sess-3621".to_string();
         inst.view = crate::session::View::Structured;
