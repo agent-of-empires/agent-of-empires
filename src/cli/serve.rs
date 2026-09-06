@@ -898,6 +898,13 @@ pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
         return restart_daemon().await;
     }
 
+    // A fresh start files its sessions under `profile`; the lifecycle verbs
+    // above never read it, so a stale `AGENT_OF_EMPIRES_PROFILE` can always
+    // stop or inspect a running daemon. Refuse an unknown name before any
+    // other validation or side effect (PID file, port bind) so a bare
+    // `-p typo` never mints a stray profile (#148).
+    crate::session::require_known_profile(profile)?;
+
     // Resolve CityHall mode once: the `--cityhall` flag and the
     // `AOE_CITYHALL_MODE` env var are equivalent. `main` already seeded the env
     // var from the flag (before the tokio worker pool), so this is a pure read
@@ -2208,5 +2215,100 @@ mod tests {
         launch.auth_mode = AuthMode::Token;
         launch.remote = false;
         assert!(!launch_needs_passphrase(&launch));
+    }
+
+    /// Argument-level coverage of the #148 auto-mint guard: parse a real
+    /// argv and dispatch it the way `main` does, so the test pins which
+    /// `serve` shapes consume `--profile` rather than a hand-built args
+    /// struct.
+    mod profile_guard {
+        use super::super::run;
+        use crate::cli::{Cli, Commands};
+        use clap::Parser;
+        use serial_test::serial;
+        use std::path::PathBuf;
+
+        fn dispatch_argv(argv: &[&str]) -> (String, super::super::ServeArgs) {
+            let cli = Cli::try_parse_from(argv).expect("argv parses");
+            let profile = cli.profile.unwrap_or_default();
+            match cli.command {
+                Some(Commands::Serve(args)) => (profile, args),
+                _ => panic!("expected a serve invocation"),
+            }
+        }
+
+        /// Isolated app dir with one real profile, so the guard is armed
+        /// (an empty `profiles/` is the first-run exemption).
+        fn armed_profiles_dir() -> (crate::session::test_support::AppDirGuard, PathBuf) {
+            let guard = crate::session::test_support::isolate_app_dir();
+            let profiles = crate::session::get_app_dir().unwrap().join("profiles");
+            std::fs::create_dir_all(profiles.join("real")).unwrap();
+            (guard, profiles)
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn lifecycle_verbs_never_consult_the_profile() {
+            let (_guard, profiles) = armed_profiles_dir();
+            for verb in ["--stop", "--status", "--restart"] {
+                let (profile, args) = dispatch_argv(&["aoe", "serve", verb, "-p", "ghost-profile"]);
+                // No daemon runs in the isolated dir, so each verb reports
+                // that; what matters is that the report is about the daemon,
+                // never about the profile, so a stale AGENT_OF_EMPIRES_PROFILE
+                // can always stop or inspect a running daemon.
+                if let Err(e) = run(&profile, args).await {
+                    let msg = e.to_string();
+                    assert!(
+                        !msg.contains("does not exist") && !msg.contains("aoe profile create"),
+                        "`serve {verb}` must not check the profile, got: {msg}"
+                    );
+                }
+                assert!(
+                    !profiles.join("ghost-profile").exists(),
+                    "`serve {verb}` must not mint profiles/ghost-profile"
+                );
+            }
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn fresh_start_refuses_unknown_profile_before_any_side_effect() {
+            let (_guard, profiles) = armed_profiles_dir();
+            // `--behind-proxy` without `--allowed-host` is refused by the
+            // argument validation that runs right after the guard, so the
+            // start can never reach a port bind in this test; the guard has
+            // to win that race for an unknown profile.
+            let (profile, args) =
+                dispatch_argv(&["aoe", "serve", "--behind-proxy", "-p", "ghost-profile"]);
+            let msg = run(&profile, args)
+                .await
+                .expect_err("unknown profile must refuse a fresh start")
+                .to_string();
+            assert!(
+                msg.contains("Profile 'ghost-profile' does not exist")
+                    && msg.contains("aoe profile create ghost-profile"),
+                "expected the unknown-profile error first, got: {msg}"
+            );
+            assert!(!profiles.join("ghost-profile").exists());
+            assert!(
+                !super::super::pid_file_path().unwrap().exists(),
+                "a refused start must leave no PID file behind"
+            );
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn fresh_start_lets_a_known_profile_through_to_argument_validation() {
+            let (_guard, _profiles) = armed_profiles_dir();
+            let (profile, args) = dispatch_argv(&["aoe", "serve", "--behind-proxy", "-p", "real"]);
+            let msg = run(&profile, args)
+                .await
+                .expect_err("--behind-proxy without --allowed-host is refused")
+                .to_string();
+            assert!(
+                msg.contains("--behind-proxy requires --allowed-host"),
+                "a known profile must reach the next validation, got: {msg}"
+            );
+        }
     }
 }

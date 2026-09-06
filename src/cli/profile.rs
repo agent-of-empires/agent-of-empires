@@ -15,7 +15,8 @@ pub enum ProfileCommands {
     /// Create a new profile
     #[command(alias = "new")]
     Create {
-        /// Profile name
+        /// Profile name: letters, digits, `_` and `-` only, at most 64
+        /// characters; `all` is reserved
         name: String,
     },
 
@@ -31,7 +32,7 @@ pub enum ProfileCommands {
     Rename {
         /// Current profile name
         old_name: String,
-        /// New profile name
+        /// New profile name (same rules as `aoe profile create`)
         new_name: String,
     },
 
@@ -76,7 +77,9 @@ pub async fn run(profile: &str, command: Option<ProfileCommands>) -> Result<()> 
 }
 
 async fn list_profiles() -> Result<()> {
-    let profiles = session::list_profiles()?;
+    // Picker order (`default` last); resolution below still uses the plain
+    // enumeration through `resolve_default_profile`.
+    let profiles = session::list_profiles_for_display()?;
 
     if profiles.is_empty() {
         println!("No profiles found.");

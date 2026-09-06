@@ -168,7 +168,7 @@ Run without arguments to launch the TUI dashboard.
 
 ###### **Options:**
 
-* `-p`, `--profile <PROFILE>` — Profile to use (separate workspace with its own sessions)
+* `-p`, `--profile <PROFILE>` — Profile to use (separate workspace with its own sessions). Must name an existing profile: an unknown name is refused, not created; make one with `aoe profile create`
 * `--daemon-url <DAEMON_URL>` — Attach to a remote agent daemon instead of using the local session list. Equivalent to setting `AOE_DAEMON_URL`; pair with `AOE_DAEMON_TOKEN` for the bearer token. Only meaningful at the no-subcommand `aoe` invocation (the TUI dashboard); ignored otherwise
 
 
@@ -979,7 +979,7 @@ Create a new profile
 
 ###### **Arguments:**
 
-* `<NAME>` — Profile name
+* `<NAME>` — Profile name: letters, digits, `_` and `-` only, at most 64 characters; `all` is reserved
 
 
 
@@ -1004,7 +1004,7 @@ Rename a profile
 ###### **Arguments:**
 
 * `<OLD_NAME>` — Current profile name
-* `<NEW_NAME>` — New profile name
+* `<NEW_NAME>` — New profile name (same rules as `aoe profile create`)
 
 
 

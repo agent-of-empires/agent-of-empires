@@ -11,7 +11,7 @@ use crate::session::config::repo_config;
 use crate::session::config::{
     load_config, update_app_state, update_config, GroupByMode, SortOrder,
 };
-use crate::session::{list_profiles, Item, Status};
+use crate::session::{list_profiles_for_display, Item, Status};
 use crate::tui::app::Action;
 use crate::tui::dialogs::ServeAction;
 use crate::tui::dialogs::{
@@ -2985,7 +2985,8 @@ impl HomeView {
             let current_profile = self
                 .profile_for_cursor(self.cursor)
                 .unwrap_or_else(|| self.config_profile());
-            let profiles = list_profiles().unwrap_or_else(|_| vec![current_profile.clone()]);
+            let profiles =
+                list_profiles_for_display().unwrap_or_else(|_| vec![current_profile.clone()]);
             let mut dialog = NewSessionDialog::new(
                 self.available_tools.clone(),
                 existing_groups,
@@ -3273,7 +3274,8 @@ impl HomeView {
         let current_profile = self
             .profile_for_cursor(self.cursor)
             .unwrap_or_else(|| self.config_profile());
-        let profiles = list_profiles().unwrap_or_else(|_| vec![current_profile.clone()]);
+        let profiles =
+            list_profiles_for_display().unwrap_or_else(|_| vec![current_profile.clone()]);
         let mut dialog = NewSessionDialog::new(
             self.available_tools.clone(),
             existing_groups,
@@ -5039,7 +5041,8 @@ impl HomeView {
         let existing_groups: Vec<String> =
             self.all_groups().iter().map(|g| g.path.clone()).collect();
         let current_profile = self.config_profile();
-        let profiles = list_profiles().unwrap_or_else(|_| vec![current_profile.clone()]);
+        let profiles =
+            list_profiles_for_display().unwrap_or_else(|_| vec![current_profile.clone()]);
         self.new_dialog = Some(NewSessionDialog::new(
             self.available_tools.clone(),
             existing_groups,
@@ -5249,7 +5252,8 @@ impl HomeView {
                 .as_ref()
                 .map(|w| (w.branch.clone(), w.main_repo_path.clone()));
 
-            let profiles = list_profiles().unwrap_or_else(|_| vec![current_profile.clone()]);
+            let profiles =
+                list_profiles_for_display().unwrap_or_else(|_| vec![current_profile.clone()]);
             let existing_groups: Vec<String> =
                 self.all_groups().iter().map(|g| g.path.clone()).collect();
             let mut dialog = RenameDialog::new(
@@ -5281,7 +5285,8 @@ impl HomeView {
                 .selected_group_profile
                 .clone()
                 .unwrap_or_else(|| self.config_profile());
-            let profiles = list_profiles().unwrap_or_else(|_| vec![current_profile.clone()]);
+            let profiles =
+                list_profiles_for_display().unwrap_or_else(|_| vec![current_profile.clone()]);
             // Duplicate-name validation is per-profile (rename_selected_group
             // checks only the target profile's tree), so the dialog's existing
             // names must be scoped to this group's profile too. Spanning all
@@ -6024,7 +6029,8 @@ impl HomeView {
         let current_tool = inst.tool.clone();
         let current_command = inst.command.clone();
         let current_extra_args = inst.extra_args.clone();
-        let profiles = list_profiles().unwrap_or_else(|_| vec![current_profile.clone()]);
+        let profiles =
+            list_profiles_for_display().unwrap_or_else(|_| vec![current_profile.clone()]);
         let tools: Vec<String> = self.available_tools.available_list().to_vec();
         self.restart_dialog = Some(RestartDialog::new(
             &current_title,

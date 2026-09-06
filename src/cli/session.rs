@@ -445,7 +445,10 @@ async fn set_color_session(profile: &str, args: SetColorArgs) -> Result<()> {
         other => Some(other.to_string()),
     };
 
-    let storage = Storage::new_unwatched(profile)?;
+    // Patching an existing session never needs to create the profile; an
+    // unknown name is refused (#148) instead of vivified and then failing
+    // on the missing session.
+    let storage = Storage::open_unwatched(profile)?;
     let (title, color) = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
             inst.set_color(new_color.clone())
@@ -3077,6 +3080,36 @@ mod set_color_tests {
         // The rejected write must not have touched disk.
         let loaded = storage.load().unwrap();
         assert_eq!(loaded.iter().find(|i| i.id == id).unwrap().color, None);
+    }
+
+    /// `session set-color -p <unknown>` is a read-then-patch on an existing
+    /// store: it must refuse an unknown profile the way the other session
+    /// verbs do, not vivify `profiles/<unknown>/` and then fail on the
+    /// missing session (#148).
+    #[tokio::test]
+    #[serial]
+    async fn set_color_refuses_unknown_profile_without_vivifying_it() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let profiles = crate::session::get_app_dir().unwrap().join("profiles");
+        std::fs::create_dir_all(profiles.join("real")).unwrap();
+
+        let result = set_color_session(
+            "ghost-profile",
+            SetColorArgs {
+                identifier: "whatever".to_string(),
+                color: "red".to_string(),
+            },
+        )
+        .await;
+        let msg = result.expect_err("unknown profile must error").to_string();
+        assert!(
+            msg.contains("does not exist"),
+            "expected the unknown-profile error, got: {msg}"
+        );
+        assert!(
+            !profiles.join("ghost-profile").exists(),
+            "set-color must not mint profiles/ghost-profile"
+        );
     }
 }
 

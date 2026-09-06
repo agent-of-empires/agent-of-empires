@@ -575,4 +575,54 @@ mod tests {
             );
         }
     }
+
+    /// Argument-level pin for the #148 auto-mint guard: `list --all`
+    /// enumerates every profile and never consumes `--profile`, so a stale
+    /// or mistyped `-p` must not block it; the single-profile form goes
+    /// through `Storage::open_unwatched`, which refuses an unknown name.
+    mod profile_guard {
+        use crate::cli::{Cli, Commands};
+        use clap::Parser;
+        use serial_test::serial;
+
+        fn dispatch_argv(argv: &[&str]) -> (String, super::super::ListArgs) {
+            let cli = Cli::try_parse_from(argv).expect("argv parses");
+            let profile = cli.profile.unwrap_or_default();
+            match cli.command {
+                Some(Commands::List(args)) => (profile, args),
+                _ => panic!("expected a list invocation"),
+            }
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn list_all_ignores_an_unknown_profile() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let profiles = crate::session::get_app_dir().unwrap().join("profiles");
+            std::fs::create_dir_all(profiles.join("real")).unwrap();
+
+            let (profile, args) =
+                dispatch_argv(&["aoe", "list", "--all", "--json", "-p", "ghost-profile"]);
+            super::super::run(&profile, args)
+                .await
+                .expect("`list --all` never consults --profile");
+            assert!(!profiles.join("ghost-profile").exists());
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn list_single_profile_refuses_an_unknown_profile() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let profiles = crate::session::get_app_dir().unwrap().join("profiles");
+            std::fs::create_dir_all(profiles.join("real")).unwrap();
+
+            let (profile, args) = dispatch_argv(&["aoe", "list", "--json", "-p", "ghost-profile"]);
+            let msg = super::super::run(&profile, args)
+                .await
+                .expect_err("unknown profile must refuse `list`")
+                .to_string();
+            assert!(msg.contains("does not exist"), "got: {msg}");
+            assert!(!profiles.join("ghost-profile").exists());
+        }
+    }
 }

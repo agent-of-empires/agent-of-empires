@@ -7,9 +7,9 @@ mod render;
 use tui_input::Input;
 
 use crate::session::{
-    list_profiles, load_profile_config, load_repo_config, merge_configs, profile_to_repo_config,
-    repo_config_to_profile, save_profile_config, save_repo_config, update_app_state, update_config,
-    Config, ProfileConfig, RepoConfig,
+    list_profiles_for_display, load_profile_config, load_repo_config, merge_configs,
+    profile_to_repo_config, repo_config_to_profile, save_profile_config, save_repo_config,
+    sort_profiles_for_display, update_app_state, update_config, Config, ProfileConfig, RepoConfig,
 };
 use crate::tui::dialogs::CustomInstructionDialog;
 
@@ -322,7 +322,9 @@ impl SettingsView {
             .map(repo_config_to_profile)
             .unwrap_or_default();
 
-        let mut available_profiles = match list_profiles() {
+        // The profile-scope cycler is a picker, so it takes picker order
+        // (`default` last).
+        let mut available_profiles = match list_profiles_for_display() {
             Ok(p) => p,
             Err(e) => {
                 tracing::debug!(target: "tui.settings", "Failed to list profiles: {e}");
@@ -331,7 +333,7 @@ impl SettingsView {
         };
         if !available_profiles.contains(&profile.to_string()) {
             available_profiles.push(profile.to_string());
-            available_profiles.sort();
+            sort_profiles_for_display(&mut available_profiles);
         }
 
         let categories = Self::categories_for_scope(SettingsScope::Global);

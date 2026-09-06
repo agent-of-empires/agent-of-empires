@@ -178,6 +178,13 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         bail!("--interactive requires a terminal; pass --title for non-interactive naming");
     }
 
+    // `add` files the new session under `profile`, and `Storage::new_unwatched`
+    // below vivifies the profile directory to do so. An unknown name is
+    // refused here, before any other argument is validated, so a bare
+    // `-p typo` never mints a stray profile (#148); profiles are created only
+    // by `aoe profile create`.
+    crate::session::require_known_profile(profile)?;
+
     // Scratch sessions have no project path; the scratch directory is
     // provisioned below once we know the instance id. Reject an
     // explicitly-passed path loudly so `aoe add /some/repo --scratch` does
@@ -1783,5 +1790,74 @@ mod tests {
     fn empty_merged_falls_back_to_hardcoded() {
         let image = resolve_sandbox_image(None, "", HARDCODED);
         assert_eq!(image, HARDCODED);
+    }
+
+    /// Argument-level coverage of the #148 auto-mint guard on `add`, the
+    /// one CLI verb that files a session under `--profile` (the vivify
+    /// point is `Storage::new_unwatched` in `run`).
+    mod profile_guard {
+        use crate::cli::{Cli, Commands};
+        use clap::Parser;
+        use serial_test::serial;
+
+        fn dispatch_argv(argv: &[&str]) -> (String, super::super::AddArgs) {
+            let cli = Cli::try_parse_from(argv).expect("argv parses");
+            let profile = cli.profile.unwrap_or_default();
+            match cli.command {
+                Some(Commands::Add(args)) => (profile, *args),
+                _ => panic!("expected an add invocation"),
+            }
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn add_refuses_unknown_profile_before_vivifying_it() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let profiles = crate::session::get_app_dir().unwrap().join("profiles");
+            std::fs::create_dir_all(profiles.join("real")).unwrap();
+
+            // A path that does not exist keeps the run short of any tmux
+            // work even if the guard were missing; the assertion is on WHICH
+            // error answers, so the profile check has to come first.
+            let (profile, args) = dispatch_argv(&[
+                "aoe",
+                "add",
+                "/nonexistent/aoe-add-path",
+                "-p",
+                "ghost-profile",
+            ]);
+            let msg = super::super::run(&profile, args)
+                .await
+                .expect_err("unknown profile must refuse `add`")
+                .to_string();
+            assert!(
+                msg.contains("Profile 'ghost-profile' does not exist")
+                    && msg.contains("aoe profile create ghost-profile"),
+                "expected the unknown-profile error first, got: {msg}"
+            );
+            assert!(
+                !profiles.join("ghost-profile").exists(),
+                "`add -p <unknown>` must not mint profiles/ghost-profile"
+            );
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn add_lets_a_known_profile_through_to_path_validation() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let profiles = crate::session::get_app_dir().unwrap().join("profiles");
+            std::fs::create_dir_all(profiles.join("real")).unwrap();
+
+            let (profile, args) =
+                dispatch_argv(&["aoe", "add", "/nonexistent/aoe-add-path", "-p", "real"]);
+            let msg = super::super::run(&profile, args)
+                .await
+                .expect_err("the missing path is refused")
+                .to_string();
+            assert!(
+                msg.contains("Path does not exist"),
+                "a known profile must reach path validation, got: {msg}"
+            );
+        }
     }
 }

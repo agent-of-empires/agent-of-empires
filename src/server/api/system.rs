@@ -1138,7 +1138,9 @@ pub async fn list_profiles(State(state): State<Arc<AppState>>) -> Json<Vec<Profi
         } else {
             active_profile
         };
-        let profiles = crate::session::list_profiles().unwrap_or_default();
+        // Picker order for the web profile list (`default` last); `active`
+        // above came from the plain enumeration, so resolution is unaffected.
+        let profiles = crate::session::list_profiles_for_display().unwrap_or_default();
         profiles
             .into_iter()
             .map(|name| {
