@@ -2910,6 +2910,13 @@
       "components": ["web/src/components/settings/SchemaSection.tsx"]
     },
     {
+      "id": "story.settings-session-id-poller-threads",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/settings/__tests__/SchemaFieldPatches.test.tsx"],
+      "components": ["web/src/components/settings/SchemaSection.tsx", "web/src/components/settings/FormFields.tsx"]
+    },
+    {
       "id": "story.modal-about-copy-session-id",
       "kind": "vitest",
       "risk": "low",

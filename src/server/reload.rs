@@ -69,6 +69,7 @@ pub(super) fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Inst
         fresh.last_error = prior.last_error;
     }
     fresh.session_id_poller = prior.session_id_poller;
+    fresh.poller_repair = prior.poller_repair;
     fresh.session_id_poller_retry_after = prior.session_id_poller_retry_after;
     fresh.retroactive_capture_excludes = prior.retroactive_capture_excludes;
     fresh.acp_load_session_capable = prior.acp_load_session_capable;

@@ -68,6 +68,7 @@ pub use flags::{is_valid_session_color, SessionBucket, SESSION_COLORS};
 pub(crate) use lifecycle::NEWER_GENERATION_BUSY_REASON;
 pub use lifecycle::{LifecycleOperation, LifecycleReservation, LifecycleReservationError};
 pub(crate) use omp::persist_omp_session_to_storage;
+pub use polling::PollerStart;
 pub use ready::{EnsureReadyError, EnsureReadyOutcome};
 pub(crate) use resume::ResumeAttemptPolicy;
 pub(crate) use sid_persist::{persist_session_to_storage, SidPersistOutcome, SidWrite};
@@ -674,6 +675,12 @@ pub struct Instance {
     pub last_error: Option<String>,
     #[serde(skip)]
     pub session_id_poller: Option<Arc<Mutex<SessionPoller>>>,
+    /// Retry schedule for replacing a missing session-id poller when the
+    /// process-wide thread budget (or a start failure) blocked the last
+    /// attempt. Runtime-only; carried across reloads like the poller.
+    #[serde(skip)]
+    pub(crate) poller_repair: crate::session::poller::PollerRepairBackoff,
+
     /// Runtime backoff after managed-store ownership or lease contention.
     #[serde(skip)]
     pub(crate) session_id_poller_retry_after: Option<std::time::Instant>,

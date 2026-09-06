@@ -12,6 +12,9 @@
 //   - commit a new snooze duration and it lands as
 //     { session: { snooze_duration_minutes: <number> } }
 //   - flip the sound Enabled toggle and it lands as { sound: { enabled: true } }
+//   - the global-only, advanced session_id_poller_max_threads number sits in
+//     the Session tab's Advanced fold, carries the "not profile-overridable"
+//     note, and commits as { session: { session_id_poller_max_threads: <n> } }
 //
 // Each tab is a SchemaSection fed by `GET /api/settings/schema`, so the mock
 // schema below mirrors the real `#[setting(...)]` shapes (labels, widgets,
@@ -88,6 +91,19 @@ const SCHEMA = [
     profile_overridable: true,
     validation: { rule: "range", min: 1, max: 43200 },
     advanced: false,
+  },
+  {
+    section: "session",
+    field: "session_id_poller_max_threads",
+    category: "Session",
+    label: "Session-id poller threads (restart req.)",
+    description: "Ceiling on concurrent session-id poller threads in one aoe process. 0 keeps the default (50).",
+    widget: { kind: "number", min: 0 },
+    web_write: ALLOW,
+    // global_only + advanced in the real schema.
+    profile_overridable: false,
+    validation: NONE,
+    advanced: true,
   },
   {
     section: "sound",
@@ -244,6 +260,38 @@ describe("schema-driven settings field PATCH payloads", () => {
     await waitFor(() =>
       expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
         session: { snooze_duration_minutes: 12 },
+      }),
+    );
+  });
+
+  it("session poller-thread ceiling is an advanced, global-only number that emits { session: { session_id_poller_max_threads } }", async () => {
+    const LABEL = "Session-id poller threads (restart req.)";
+    const { container } = renderTab("session");
+    await screen.findByText("Snooze Duration (minutes)");
+
+    // Advanced fields live behind the collapsed "Advanced" fold.
+    expect(screen.queryByText(LABEL)).toBeNull();
+    const fold = Array.from(container.querySelectorAll("button[aria-expanded]")).find((b) =>
+      b.textContent?.includes("Advanced"),
+    ) as HTMLButtonElement;
+    expect(fold).toBeTruthy();
+    expect(fold.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(fold);
+    await screen.findByText(LABEL);
+
+    // Global-only: the description says so instead of looking profile-scoped.
+    const labelEl = Array.from(container.querySelectorAll("label")).find((l) => l.textContent === LABEL);
+    expect(labelEl?.parentElement?.textContent).toContain("Applies to all profiles (not profile-overridable).");
+
+    const input = numberInputByLabel(container, LABEL);
+    expect(input.min).toBe("0");
+    expect(input.max).toBe("");
+
+    commit(input, "120");
+
+    await waitFor(() =>
+      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
+        session: { session_id_poller_max_threads: 120 },
       }),
     );
   });

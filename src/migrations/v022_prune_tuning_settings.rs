@@ -17,7 +17,7 @@
 //! config.toml so they don't linger as dead weight. Removals:
 //!
 //! - `[session]`: `new_session_attach_mode`, `conversation_summary_agent`,
-//!   `smart_rename_timing`, `session_id_poller_max_threads`
+//!   `smart_rename_timing`
 //! - `[updates]`: `check_interval_hours`, `notify_in_cli`,
 //!   `web_poll_interval_minutes`
 //! - `[acp]`: `replay_bytes`, `max_concurrent_resumes`,
@@ -53,10 +53,7 @@ pub fn run() -> Result<()> {
 
 /// Keys dropped without a replacement, per section.
 const DROPPED: &[(&str, &[&str])] = &[
-    (
-        "session",
-        &["smart_rename_timing", "session_id_poller_max_threads"],
-    ),
+    ("session", &["smart_rename_timing"]),
     (
         "updates",
         &[
@@ -267,7 +264,12 @@ mode = { specific = "wololo" }
         );
         let session = result["session"].as_table().unwrap();
         assert!(session.get("smart_rename_timing").is_none());
-        assert!(session.get("session_id_poller_max_threads").is_none());
+        assert_eq!(
+            session
+                .get("session_id_poller_max_threads")
+                .and_then(|v| v.as_integer()),
+            Some(42)
+        );
         assert_eq!(
             session.get("default_tool").and_then(|v| v.as_str()),
             Some("claude")
@@ -308,6 +310,45 @@ mode = { specific = "wololo" }
         let sound = result["sound"].as_table().unwrap();
         assert!(sound.get("mode").is_none());
         assert_eq!(sound.get("enabled").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    #[test]
+    fn session_id_poller_max_threads_survives_migration() {
+        // `session_id_poller_max_threads` is a live setting again (the
+        // poller thread budget is configurable); the migration must not
+        // strip it while pruning its dropped neighbours.
+        let result = migrated(
+            r#"
+[session]
+smart_rename_timing = "prompt_start"
+session_id_poller_max_threads = 42
+"#,
+        );
+        let session = result["session"].as_table().unwrap();
+        assert!(session.get("smart_rename_timing").is_none());
+        assert_eq!(
+            session
+                .get("session_id_poller_max_threads")
+                .and_then(|v| v.as_integer()),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn config_with_only_poller_threads_is_untouched() {
+        let (_dir, path) = write(
+            r#"
+[session]
+session_id_poller_max_threads = 4
+"#,
+        );
+        let before = fs::read_to_string(&path).unwrap();
+        migrate_config_file(&path).unwrap();
+        let after = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            before, after,
+            "a live setting must not trigger a rewrite of a clean config"
+        );
     }
 
     #[test]

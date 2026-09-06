@@ -90,6 +90,7 @@ pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
         // visits every instance, so a per-item `list-sessions` fork scales with
         // the store.
         let live = crate::tmux::LiveSessionSnapshot::new();
+        let backoff_before = repair_backoffs(&snapshot);
         let runtime_changed: std::collections::HashSet<String> = snapshot
             .iter_mut()
             .filter_map(|inst| {
@@ -99,12 +100,16 @@ pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
                     .then(|| inst.id.clone())
             })
             .collect();
-        (outcome, snapshot, baseline, runtime_changed)
+        // The walk ran on a clone: a deferral recorded there must reach the
+        // live row, or the next tick re-probes (and re-warns) as if nothing
+        // had been scheduled.
+        let deferred = changed_repair_backoffs(&backoff_before, &snapshot);
+        (outcome, snapshot, baseline, runtime_changed, deferred)
     })
     .await
     {
-        Ok((outcome, mutated, baseline, runtime_changed))
-            if outcome.touched() || !runtime_changed.is_empty() =>
+        Ok((outcome, mutated, baseline, runtime_changed, deferred))
+            if outcome.touched() || !runtime_changed.is_empty() || !deferred.is_empty() =>
         {
             let touched: std::collections::HashSet<&str> = outcome
                 .applied
@@ -117,6 +122,9 @@ pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
                 let Some(dst) = guard.iter_mut().find(|i| i.id == src.id) else {
                     continue;
                 };
+                if let Some(backoff) = deferred.get(&src.id) {
+                    dst.poller_repair = backoff.clone();
+                }
                 let Some(identity_baseline) = baseline.get(&src.id) else {
                     continue;
                 };
@@ -136,6 +144,29 @@ pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
             );
         }
     }
+}
+
+/// Snapshot each row's poller-repair schedule before the repair walk.
+fn repair_backoffs(
+    instances: &[crate::session::Instance],
+) -> std::collections::HashMap<String, crate::session::poller::PollerRepairBackoff> {
+    instances
+        .iter()
+        .map(|inst| (inst.id.clone(), inst.poller_repair.clone()))
+        .collect()
+}
+
+/// Rows whose poller-repair schedule the walk changed (a deferral recorded,
+/// or a reset after a successful start), keyed by id.
+fn changed_repair_backoffs(
+    before: &std::collections::HashMap<String, crate::session::poller::PollerRepairBackoff>,
+    after: &[crate::session::Instance],
+) -> std::collections::HashMap<String, crate::session::poller::PollerRepairBackoff> {
+    after
+        .iter()
+        .filter(|inst| before.get(&inst.id) != Some(&inst.poller_repair))
+        .map(|inst| (inst.id.clone(), inst.poller_repair.clone()))
+        .collect()
 }
 
 #[cfg(test)]

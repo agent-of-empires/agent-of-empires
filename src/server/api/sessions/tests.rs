@@ -2110,7 +2110,10 @@ fn apply_post_restart_sync_propagates_agent_session_id() {
     started.agent_session_id = Some("claude-uuid-restart".to_string());
     started.omp_capture_generation = Some("omp-generation-restart".to_string());
     let mut poller = crate::session::poller::SessionPoller::new("omp-restarted".to_string());
-    assert!(poller.start(before.id.clone(), Box::new(|| None), Box::new(|_| {}), None,));
+    assert_eq!(
+        poller.start(before.id.clone(), Box::new(|| None), Box::new(|_| {}), None,),
+        crate::session::poller::PollerSpawn::Spawned
+    );
     let restarted_poller = std::sync::Arc::new(std::sync::Mutex::new(poller));
     started.session_id_poller = Some(restarted_poller.clone());
     started.last_start_time = Some(std::time::Instant::now());

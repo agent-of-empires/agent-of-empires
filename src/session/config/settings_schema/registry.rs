@@ -130,6 +130,28 @@ mod tests {
         }
     }
 
+    /// The poller-thread ceiling is process-wide tuning: the web shows it
+    /// under the Session tab's Advanced fold with the "not
+    /// profile-overridable" note, as a lower-bounded number (0 = default).
+    #[test]
+    fn session_id_poller_max_threads_is_an_advanced_global_only_number() {
+        let d = descriptor("session", "session_id_poller_max_threads")
+            .expect("session_id_poller_max_threads descriptor");
+        assert!(d.advanced, "sits under the Advanced fold");
+        assert!(
+            !d.profile_overridable,
+            "global-only: one ceiling per process"
+        );
+        assert!(matches!(d.web_write, WebWritePolicy::Allow));
+        assert_eq!(
+            d.widget,
+            WidgetKind::Number {
+                min: Some(0),
+                max: None
+            }
+        );
+    }
+
     #[test]
     fn schema_serializes_with_tagged_widget_policy_validation() {
         // Locks the JSON contract the web `SettingsFieldDescriptor` TS type

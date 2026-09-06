@@ -6,6 +6,29 @@ use sha2::{Digest as _, Sha256};
 
 const MANAGED_CAPTURE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Outcome of [`Instance::maybe_start_poller`].
+///
+/// Only the last two variants are failures a caller should retry with
+/// backoff or warn about. A session can legitimately have nothing to poll
+/// right now — its capture metadata is not resolvable yet, its sandbox
+/// store is not mounted, another process holds the store lease — and
+/// treating those as failed spawns misreports a healthy fleet as over
+/// budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollerStart {
+    /// A poller thread is running for this session (started now, or already).
+    Started,
+    /// Nothing to poll for this session at the moment; not a failure.
+    NotApplicable,
+    /// Another process owns the managed capture store; a retry is scheduled
+    /// on `session_id_poller_retry_after`.
+    Deferred,
+    /// The process-wide poller-thread budget is spent.
+    BudgetExhausted,
+    /// The OS refused to spawn the poller thread.
+    SpawnFailed,
+}
+
 fn try_acquire_managed_capture_lease(
     backend: crate::agents::SessionCaptureBackend,
     store: &Path,
@@ -128,26 +151,60 @@ impl Instance {
         true
     }
 
-    pub fn maybe_start_poller(&mut self) {
-        self.maybe_start_poller_since(None);
+    pub fn maybe_start_poller(&mut self) -> PollerStart {
+        self.maybe_start_poller_since(None)
     }
 
-    pub(super) fn maybe_start_poller_since(&mut self, omp_metadata: Option<OmpCaptureMetadata>) {
+    /// Store a freshly spawned poller, or say why there is none.
+    ///
+    /// The one place a start succeeds, so it is also the one place the
+    /// repair schedule is cleared: a poller started directly (session
+    /// create, restart, resume) must not leave a stale backoff behind for
+    /// the next repair to wait out.
+    fn install_poller(
+        &mut self,
+        poller: SessionPoller,
+        spawn: crate::session::poller::PollerSpawn,
+    ) -> PollerStart {
+        use crate::session::poller::PollerSpawn;
+        match spawn {
+            PollerSpawn::Spawned => {
+                self.session_id_poller = Some(Arc::new(Mutex::new(poller)));
+                self.poller_repair.reset();
+                PollerStart::Started
+            }
+            PollerSpawn::BudgetExhausted => PollerStart::BudgetExhausted,
+            // A poller built on this call cannot have been started already;
+            // if it says so, it is not ours to keep.
+            PollerSpawn::AlreadyStarted | PollerSpawn::SpawnFailed => {
+                tracing::warn!(target: "session.store",
+                    "Failed to start session poller for instance {}, poller will not be stored",
+                    self.id
+                );
+                PollerStart::SpawnFailed
+            }
+        }
+    }
+
+    pub(super) fn maybe_start_poller_since(
+        &mut self,
+        omp_metadata: Option<OmpCaptureMetadata>,
+    ) -> PollerStart {
         if self.session_id_poller_is_running() {
-            return;
+            return PollerStart::Started;
         }
         self.session_id_poller = None;
         let Some((capture, context)) = self.resolved_session_support() else {
-            return;
+            return PollerStart::NotApplicable;
         };
         let backend = capture.backend;
         if !self.supports_session_poller() {
-            return;
+            return PollerStart::NotApplicable;
         }
         let managed_lease =
             if context == crate::agents::SessionCaptureContext::ManagedExclusiveStore {
                 let Some(store) = self.sandbox_capture_store_dir() else {
-                    return;
+                    return PollerStart::NotApplicable;
                 };
                 // Lease contention is the common multi-process loser path. Check it
                 // before loading every profile to prove store exclusivity.
@@ -156,14 +213,14 @@ impl Instance {
                         Some(std::time::Instant::now() + MANAGED_CAPTURE_RETRY_BACKOFF);
                     tracing::warn!(target: "session.capture", session = %self.id, ?backend,
                     "Session capture deferred because another process owns this store");
-                    return;
+                    return PollerStart::Deferred;
                 };
                 if !self.managed_capture_store_is_exclusive(backend) {
                     self.session_id_poller_retry_after =
                         Some(std::time::Instant::now() + MANAGED_CAPTURE_RETRY_BACKOFF);
                     tracing::warn!(target: "session.capture", session = %self.id, ?backend,
                     "Session capture deferred because store ownership is ambiguous");
-                    return;
+                    return PollerStart::Deferred;
                 }
                 Some(lease)
             } else {
@@ -181,7 +238,7 @@ impl Instance {
             .unwrap_or_default();
         let omp_metadata = if backend == crate::agents::SessionCaptureBackend::Omp {
             let Some(options) = self.omp_capture_options() else {
-                return;
+                return PollerStart::NotApplicable;
             };
             omp_metadata.or_else(|| self.omp_capture_metadata(&tmux_session_name, &options, None))
         } else {
@@ -195,11 +252,11 @@ impl Instance {
 
         if backend == crate::agents::SessionCaptureBackend::Omp {
             let Some(metadata) = omp_metadata.as_ref() else {
-                return;
+                return PollerStart::NotApplicable;
             };
             let poll_fn: crate::session::poller::SessionIdPollFn = if self.is_sandboxed() {
                 let Some(sandbox) = self.sandbox_info.as_ref() else {
-                    return;
+                    return PollerStart::NotApplicable;
                 };
                 Box::new(omp_poll_fn_sandboxed(
                     sandbox.container_name.clone(),
@@ -215,15 +272,13 @@ impl Instance {
                 tracing::info!(target: "session.store", "Session ID observed for {}: {}", log_id, new_id);
             });
             let initial = initial_known.map(|sid| metadata.session_observation(sid));
-            if poller.start_observations(instance_id, poll_fn, on_change, initial) {
-                self.session_id_poller = Some(Arc::new(Mutex::new(poller)));
-            }
-            return;
+            let spawn = poller.start_observations(instance_id, poll_fn, on_change, initial);
+            return self.install_poller(poller, spawn);
         }
 
         if backend == crate::agents::SessionCaptureBackend::Pi {
             let Some(source) = self.pi_sidecar_source() else {
-                return;
+                return PollerStart::NotApplicable;
             };
             let inner = crate::session::capture::pi_sidecar_poll_fn(self.id.clone(), source);
             let poll_fn: crate::session::poller::SessionIdPollFn = Box::new(move |_| inner());
@@ -233,10 +288,8 @@ impl Instance {
             });
             let initial =
                 initial_known.map(crate::session::poller::SessionIdObservation::instance_sidecar);
-            if poller.start_observations(instance_id, poll_fn, on_change, initial) {
-                self.session_id_poller = Some(Arc::new(Mutex::new(poller)));
-            }
-            return;
+            let spawn = poller.start_observations(instance_id, poll_fn, on_change, initial);
+            return self.install_poller(poller, spawn);
         }
 
         let capture_floor = self
@@ -254,7 +307,7 @@ impl Instance {
             }
             crate::agents::SessionCaptureBackend::Codex => {
                 let Some(store) = self.sandbox_capture_store_dir() else {
-                    return;
+                    return PollerStart::NotApplicable;
                 };
                 Box::new(codex_poll_fn_sandboxed_store(
                     store,
@@ -266,7 +319,7 @@ impl Instance {
             }
             crate::agents::SessionCaptureBackend::Gemini => {
                 let Some(store) = self.sandbox_capture_store_dir() else {
-                    return;
+                    return PollerStart::NotApplicable;
                 };
                 Box::new(gemini_poll_fn_sandboxed_store(
                     store,
@@ -278,7 +331,7 @@ impl Instance {
             }
             crate::agents::SessionCaptureBackend::Hermes => {
                 let Some(store) = self.sandbox_capture_store_dir() else {
-                    return;
+                    return PollerStart::NotApplicable;
                 };
                 Box::new(hermes_poll_fn_sandboxed_store(
                     store,
@@ -290,7 +343,7 @@ impl Instance {
             }
             crate::agents::SessionCaptureBackend::Kimi => {
                 let Some(store) = self.sandbox_capture_store_dir() else {
-                    return;
+                    return PollerStart::NotApplicable;
                 };
                 Box::new(kimi_poll_fn_sandboxed_store(
                     store,
@@ -302,7 +355,7 @@ impl Instance {
             }
             crate::agents::SessionCaptureBackend::PrimeAgent => {
                 let Some(store) = self.sandbox_capture_store_dir() else {
-                    return;
+                    return PollerStart::NotApplicable;
                 };
                 Box::new(prime_agent_poll_fn_sandboxed_store(
                     store,
@@ -314,7 +367,7 @@ impl Instance {
             }
             crate::agents::SessionCaptureBackend::OpenCode
             | crate::agents::SessionCaptureBackend::Pi
-            | crate::agents::SessionCaptureBackend::Omp => return,
+            | crate::agents::SessionCaptureBackend::Omp => return PollerStart::NotApplicable,
         };
         let poll_fn: Box<dyn Fn() -> Option<String> + Send + 'static> =
             if let Some(lease) = managed_lease {
@@ -330,14 +383,8 @@ impl Instance {
         let on_change: Box<dyn Fn(&str) + Send + 'static> = Box::new(move |new_id| {
             tracing::info!(target: "session.store", "Session ID observed for {}: {}", log_id, new_id);
         });
-        if poller.start(instance_id.clone(), poll_fn, on_change, initial_known) {
-            self.session_id_poller = Some(Arc::new(Mutex::new(poller)));
-        } else {
-            tracing::warn!(target: "session.store",
-                "Failed to start session poller for instance {}, poller will not be stored",
-                instance_id
-            );
-        }
+        let spawn = poller.start(instance_id, poll_fn, on_change, initial_known);
+        self.install_poller(poller, spawn)
     }
 
     pub(crate) fn session_id_poller_is_running(&self) -> bool {
@@ -370,9 +417,50 @@ impl Instance {
         {
             return false;
         }
+        let now = std::time::Instant::now();
+        // A failed attempt schedules the next one (5 s doubling to 60 s), so
+        // an over-budget fleet is not re-probed — and re-warned — for every
+        // session on every 2 s tick.
+        if !self.poller_repair.due(now) {
+            return false;
+        }
         self.session_id_poller = None;
-        self.maybe_start_poller();
-        self.session_id_poller_is_running()
+        match self.maybe_start_poller() {
+            // `install_poller` cleared the schedule.
+            PollerStart::Started => true,
+            // Nothing failed: the session has nothing to poll right now, or
+            // the managed store's own retry deadline governs. Neither is a
+            // reason to back off or to blame the thread budget.
+            PollerStart::NotApplicable | PollerStart::Deferred => {
+                self.poller_repair.reset();
+                false
+            }
+            PollerStart::BudgetExhausted => {
+                self.defer_poller_repair(now, "budget exhausted");
+                false
+            }
+            PollerStart::SpawnFailed => {
+                self.defer_poller_repair(now, "start failed");
+                false
+            }
+        }
+    }
+
+    /// Schedule the next repair attempt and log at the backoff's cadence
+    /// (first miss, each escalation, then every ~10 min at the cap).
+    fn defer_poller_repair(&mut self, now: std::time::Instant, why: &str) {
+        let (active, max) = crate::session::poller::session_id_poller_budget();
+        if let Some(delay) = self.poller_repair.defer(now) {
+            tracing::warn!(
+                target: "session.create",
+                "Session-id poller for {} not restarted ({why}; {active}/{max} threads); \
+                 next attempt in {}s after {} deferral(s). Raise \
+                 [session] session_id_poller_max_threads if the fleet outgrew the budget",
+                self.id,
+                delay.as_secs(),
+                self.poller_repair.deferrals(),
+            );
+        }
     }
 
     pub(super) fn stop_poller(&self) {
@@ -435,7 +523,126 @@ impl Instance {
 
 #[cfg(test)]
 mod tests {
+    use super::PollerStart;
     use crate::session::{Instance, SandboxInfo, Status};
+
+    /// The 2026-09-04 fleet shape: two sessions past the poller budget were
+    /// re-probed by the daemon every 2 s tick, each attempt logging a
+    /// "budget exhausted" + "Failed to start session poller" pair (~2.5
+    /// lines/s). Repair must schedule its retry instead.
+    #[test]
+    fn repair_defers_with_backoff_while_the_poller_budget_is_spent() {
+        let budget = crate::session::poller::test_support::IsolatedBudget::exhausted();
+        let mut inst = Instance::new("repair-backoff", "/tmp/repair-backoff");
+        let live = crate::tmux::LiveSessionSnapshot::from_parts(
+            Some(vec![crate::tmux::Session::generate_name(
+                &inst.id,
+                &inst.title,
+            )]),
+            None,
+        );
+        assert!(
+            inst.has_live_tmux_pane_in(&live),
+            "fixture pane must read live"
+        );
+        assert!(inst.supports_session_poller());
+
+        assert!(!inst.repair_session_id_poller_if_needed(&live));
+        assert!(
+            inst.session_id_poller.is_none(),
+            "no poller stored over budget"
+        );
+        assert_eq!(inst.poller_repair.deferrals(), 1);
+        assert_eq!(
+            inst.poller_repair.current_delay(),
+            Some(std::time::Duration::from_secs(5))
+        );
+
+        // The next tick lands inside the scheduled delay: no probe, no log.
+        assert!(!inst.repair_session_id_poller_if_needed(&live));
+        assert_eq!(
+            inst.poller_repair.deferrals(),
+            1,
+            "tick inside the delay is a no-op"
+        );
+
+        // Once due and still over budget, the delay escalates.
+        inst.poller_repair.expire();
+        assert!(!inst.repair_session_id_poller_if_needed(&live));
+        assert_eq!(inst.poller_repair.deferrals(), 2);
+        assert_eq!(
+            inst.poller_repair.current_delay(),
+            Some(std::time::Duration::from_secs(10))
+        );
+
+        // Budget freed (another session stopped, or the ceiling was raised):
+        // the due attempt starts the poller and clears the schedule.
+        budget.set_active(0);
+        inst.poller_repair.expire();
+        assert!(inst.repair_session_id_poller_if_needed(&live));
+        assert!(inst.session_id_poller_is_running());
+        assert_eq!(inst.poller_repair, Default::default());
+        inst.stop_poller();
+    }
+
+    /// A direct (non-repair) start is a success too: it must clear any
+    /// schedule left by earlier deferrals, or a poller that later dies waits
+    /// out a stale 60 s delay before repair even looks at it.
+    #[test]
+    fn direct_start_clears_a_deferred_repair_schedule() {
+        let _budget = crate::session::poller::test_support::IsolatedBudget::with_ceiling(1);
+        let mut inst = Instance::new("direct-start", "/tmp/direct-start");
+        let now = std::time::Instant::now();
+        inst.poller_repair.defer(now);
+        inst.poller_repair.defer(now);
+        assert!(!inst.poller_repair.due(now), "fixture: a pending schedule");
+
+        assert_eq!(inst.maybe_start_poller(), PollerStart::Started);
+
+        assert!(inst.session_id_poller_is_running());
+        assert_eq!(
+            inst.poller_repair,
+            Default::default(),
+            "a successful start clears the schedule whoever triggered it"
+        );
+        inst.stop_poller();
+    }
+
+    /// A live pane with nothing to poll right now (here: an OMP pane whose
+    /// capture metadata is not resolvable) is not a failed spawn. Repair
+    /// must not schedule a backoff for it, and must not warn that the thread
+    /// budget is too small.
+    #[test]
+    fn repair_does_not_defer_a_session_with_nothing_to_poll() {
+        let mut inst = Instance::new("omp-no-meta", "/tmp/omp-no-meta");
+        inst.tool = "omp".to_string();
+        inst.omp_capture_generation = Some("gen-1".to_string());
+        let live = crate::tmux::LiveSessionSnapshot::from_parts(
+            Some(vec![crate::tmux::Session::generate_name(
+                &inst.id,
+                &inst.title,
+            )]),
+            None,
+        );
+        assert!(inst.has_live_tmux_pane_in(&live));
+        assert!(
+            inst.supports_session_poller(),
+            "OMP is pollable in principle, so repair walks the start path"
+        );
+        assert_eq!(inst.maybe_start_poller(), PollerStart::NotApplicable);
+
+        assert!(!inst.repair_session_id_poller_if_needed(&live));
+        assert!(inst.session_id_poller.is_none());
+        assert_eq!(
+            inst.poller_repair.deferrals(),
+            0,
+            "nothing to poll is not a failed repair"
+        );
+        assert!(
+            inst.poller_repair.due(std::time::Instant::now()),
+            "the next tick may look again"
+        );
+    }
 
     // Restart, stop, standalone attach, and sid_persist all tear down through
     // this helper. Restart was missed when only `stop` flushed.

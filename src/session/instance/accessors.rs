@@ -87,6 +87,7 @@ impl Instance {
             pi_session_path: None,
             last_error: None,
             session_id_poller: None,
+            poller_repair: Default::default(),
             session_id_poller_retry_after: None,
             retroactive_capture_excludes: HashSet::new(),
             pane_dead_observed: false,

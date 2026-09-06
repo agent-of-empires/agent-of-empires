@@ -107,6 +107,7 @@ impl Instance {
         self.last_error_check = previous.last_error_check;
         self.last_start_time = previous.last_start_time;
         self.session_id_poller = previous.session_id_poller.clone();
+        self.poller_repair = previous.poller_repair.clone();
         self.session_id_poller_retry_after = previous.session_id_poller_retry_after;
         self.retroactive_capture_excludes = previous.retroactive_capture_excludes.clone();
         self.acp_load_session_capable = previous.acp_load_session_capable;
@@ -702,7 +703,10 @@ mod tests {
         let mut restarted = before.clone();
         restarted.omp_capture_generation = Some("generation-b".to_string());
         let mut poller = crate::session::poller::SessionPoller::new("omp-restarted".to_string());
-        assert!(poller.start(before.id.clone(), Box::new(|| None), Box::new(|_| {}), None,));
+        assert_eq!(
+            poller.start(before.id.clone(), Box::new(|| None), Box::new(|_| {}), None,),
+            crate::session::poller::PollerSpawn::Spawned
+        );
         let restarted_poller = std::sync::Arc::new(std::sync::Mutex::new(poller));
         restarted.session_id_poller = Some(restarted_poller.clone());
         let mut live = before.clone();
