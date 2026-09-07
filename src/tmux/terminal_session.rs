@@ -755,6 +755,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_terminal_session_is_pane_dead_after_command_exits() {
+        use crate::tmux::test_helpers::{only_pane_id, wait_for_pane_dead};
+
         if !tmux_available() {
             eprintln!("Skipping test: tmux not available");
             return;
@@ -792,7 +794,7 @@ mod tests {
             .expect("tmux new-session");
         assert!(output.status.success());
 
-        std::thread::sleep(std::time::Duration::from_millis(1500));
+        wait_for_pane_dead(&only_pane_id(&session_name));
 
         assert!(
             session.is_pane_dead(),
