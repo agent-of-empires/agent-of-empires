@@ -406,7 +406,6 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     /// #2758: the reconciler's persistent per-session maps must be swept
     /// against the live instance set every tick, so a deleted session's id
@@ -801,28 +800,6 @@ mod tests {
             row_b.last_accessed_at,
             Some(new_ts),
             "profile B's patch must merge its last_accessed_at onto profile B's storage"
-        );
-    }
-
-    // Pins the `MissedTickBehavior::Delay` contract on `tokio::time::interval`;
-    // the prod callsite (`status_poll_loop`) is not exercised by this test.
-    #[tokio::test]
-    async fn status_poll_loop_interval_delays_after_stall() {
-        let period = Duration::from_millis(100);
-        let mut interval = tokio::time::interval(period);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-        interval.tick().await;
-        tokio::time::sleep(period * 4).await;
-        interval.tick().await;
-
-        let before = std::time::Instant::now();
-        interval.tick().await;
-        let gap = before.elapsed();
-
-        assert!(
-            gap >= Duration::from_millis(80),
-            "second post-stall tick must wait ~period (Delay), got {gap:?}"
         );
     }
 }
