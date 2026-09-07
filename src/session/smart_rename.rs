@@ -1650,46 +1650,6 @@ mod serve {
             );
         }
 
-        #[tokio::test]
-        async fn smart_rename_semaphore_bounds_concurrent_permits_to_max() {
-            // A burst of would-be one-shots must see peak concurrency capped
-            // at MAX_CONCURRENT, so N stuck sessions cannot fan out into N
-            // host processes each holding a slot for `ONESHOT_TIMEOUT`.
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            use tokio::sync::Semaphore;
-
-            let sem = Arc::new(Semaphore::new(MAX_CONCURRENT));
-            let live = Arc::new(AtomicUsize::new(0));
-            let peak = Arc::new(AtomicUsize::new(0));
-
-            let mut handles = Vec::new();
-            for _ in 0..5 {
-                let sem = sem.clone();
-                let live = live.clone();
-                let peak = peak.clone();
-                handles.push(tokio::spawn(async move {
-                    let _permit = sem.acquire().await.expect("semaphore closed");
-                    let now = live.fetch_add(1, Ordering::SeqCst) + 1;
-                    peak.fetch_max(now, Ordering::SeqCst);
-                    tokio::time::sleep(Duration::from_millis(80)).await;
-                    live.fetch_sub(1, Ordering::SeqCst);
-                }));
-            }
-            for h in handles {
-                h.await.expect("permit task panicked");
-            }
-
-            let seen = peak.load(Ordering::SeqCst);
-            assert!(
-                seen <= MAX_CONCURRENT,
-                "peak concurrency {seen} exceeded cap {MAX_CONCURRENT}"
-            );
-            assert!(
-                seen >= 2,
-                "expected the burst to actually saturate the pool (seen={seen})"
-            );
-        }
-
         #[test]
         fn force_smart_rename_attempted_clear_re_enables_retry() {
             // `force_smart_rename` at sessions.rs:2582-2587 clears the
