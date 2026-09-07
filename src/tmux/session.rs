@@ -5218,7 +5218,8 @@ mod tests {
             .expect("tmux new-session");
         assert!(output.status.success());
 
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        let pane_id = only_pane_id(&session_name);
+        wait_for_pane_dead(&pane_id);
 
         let session = Session::from_name(&session_name);
         super::refresh_session_cache();
@@ -5231,7 +5232,7 @@ mod tests {
             .expect("respawn_dead_pane should succeed");
         assert!(respawned, "respawn_dead_pane should report it acted");
 
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        wait_for_pane_command(&pane_id, "sleep");
         assert!(session.exists(), "Session should still exist after respawn");
         assert!(
             !session.is_pane_dead(),
