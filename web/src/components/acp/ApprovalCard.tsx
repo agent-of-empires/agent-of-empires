@@ -37,6 +37,7 @@ export function ApprovalCard({ approval, onResolve }: Props) {
   const [held, setHeld] = useState<string | null>(null);
   const pressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const progressTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const holdGeneration = useRef(0);
 
   const raw = approval.tool_call.args_preview;
   const options = approval.options ?? [];
@@ -78,21 +79,42 @@ export function ApprovalCard({ approval, onResolve }: Props) {
     [onResolve],
   );
 
+  const clearHoldTimers = () => {
+    if (pressTimer.current) {
+      clearTimeout(pressTimer.current);
+      pressTimer.current = null;
+    }
+    if (progressTimer.current) {
+      clearInterval(progressTimer.current);
+      progressTimer.current = null;
+    }
+  };
+
   // `held` names the button currently under a hold, so a destructive
   // answer list can put the ring on whichever option is being pressed
   // rather than on a single Allow button.
+  //
+  // At most one hold exists at a time. Two fingers on two options would
+  // otherwise leave the first timer armed with its own captured option,
+  // running the answer the user moved away from, so starting a hold
+  // cancels any hold already running.
+  //
+  // `holdGeneration` covers what `clearTimeout` cannot: a timer that
+  // fired just before the finger lifted, whose callback is already
+  // queued. It finds a newer generation and submits nothing.
   const startLongPress = (key: string, run: () => void) => {
     if (phase !== "pending") return;
+    clearHoldTimers();
+    holdGeneration.current += 1;
+    const generation = holdGeneration.current;
     setHeld(key);
     setProgress(0);
     progressTimer.current = setInterval(() => {
       setProgress((p) => Math.min(100, p + (100 / LONG_PRESS_MS) * 30));
     }, 30);
     pressTimer.current = setTimeout(() => {
-      if (progressTimer.current) {
-        clearInterval(progressTimer.current);
-        progressTimer.current = null;
-      }
+      if (holdGeneration.current !== generation) return;
+      clearHoldTimers();
       if (typeof navigator !== "undefined" && "vibrate" in navigator) {
         try {
           (navigator as Navigator & { vibrate?: (p: number) => void }).vibrate?.(20);
@@ -105,15 +127,11 @@ export function ApprovalCard({ approval, onResolve }: Props) {
     }, LONG_PRESS_MS);
   };
 
+  // Releasing retires the generation as well as the timers, so an
+  // ambiguous multi-touch resolves nothing rather than the wrong thing.
   const cancelLongPress = () => {
-    if (pressTimer.current) {
-      clearTimeout(pressTimer.current);
-      pressTimer.current = null;
-    }
-    if (progressTimer.current) {
-      clearInterval(progressTimer.current);
-      progressTimer.current = null;
-    }
+    holdGeneration.current += 1;
+    clearHoldTimers();
     setHeld(null);
     setProgress(0);
   };

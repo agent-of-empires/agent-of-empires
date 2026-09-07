@@ -451,6 +451,49 @@ describe("ApprovalCard (destructive question)", () => {
     expect(onResolve).toHaveBeenCalledWith("Allow", "logs");
   });
 
+  // Two fingers on two options: the first hold must not survive the
+  // second. An orphaned timer keeps its own captured option, so it would
+  // run the answer the user moved away from.
+  it("does not submit an abandoned option when a second hold starts", () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    render(<ApprovalCard approval={makeDestructiveQuestion()} onResolve={onResolve} />);
+    const wipe = screen.getByRole("button", { name: "Delete everything" });
+    const logs = screen.getByRole("button", { name: "Delete only logs" });
+
+    fireEvent.touchStart(wipe);
+    act(() => {
+      vi.advanceTimersByTime(400);
+    });
+    fireEvent.touchStart(logs);
+    // The abandoned hold's own 800ms would elapse here.
+    act(() => {
+      vi.advanceTimersByTime(400);
+    });
+    expect(onResolve).not.toHaveBeenCalled();
+
+    // The live hold still completes on its own schedule.
+    act(() => {
+      vi.advanceTimersByTime(400);
+    });
+    expect(onResolve).toHaveBeenCalledTimes(1);
+    expect(onResolve).toHaveBeenCalledWith("Allow", "logs");
+  });
+
+  it("does not submit after the hold is released", () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    render(<ApprovalCard approval={makeDestructiveQuestion()} onResolve={onResolve} />);
+    const wipe = screen.getByRole("button", { name: "Delete everything" });
+    fireEvent.touchStart(wipe);
+    act(() => {
+      vi.advanceTimersByTime(700);
+    });
+    fireEvent.touchCancel(wipe);
+    act(() => {
+      vi.advanceTimersByTime(2000);
+    });
+    expect(onResolve).not.toHaveBeenCalled();
+  });
+
   it("keeps Dismiss a single click even when destructive", () => {
     const onResolve = vi.fn().mockResolvedValue(undefined);
     render(<ApprovalCard approval={makeDestructiveQuestion()} onResolve={onResolve} />);
