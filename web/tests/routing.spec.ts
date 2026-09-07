@@ -41,28 +41,27 @@ test.describe("URL routing", () => {
   });
 
   test("'/session/<id>' holds the loading shell while the sessions list is still in flight", async ({ page }) => {
-    // Hold the sessions list open for 1s before responding so the
-    // App.tsx render gate added for #1351 (the `!sessionsLoaded`
-    // branch) executes for long enough to be observable. Without the
-    // gate the dashboard fallback would render immediately and the
-    // dark-shell assertion below would fail. After the response lands
-    // the dashboard fallback takes over because the response carries
-    // no matching session.
-    await page.route("**/api/sessions", async (r) => {
-      if (r.request().method() === "POST") return r.fulfill({ status: 400 });
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-      await r.fulfill({
-        json: { sessions: [], workspace_ordering: [] },
-      });
+    let releaseSessions!: () => void;
+    const sessionsPending = new Promise<void>((resolve) => {
+      releaseSessions = resolve;
+    });
+    let requested = false;
+    await page.route("**/api/sessions", async (route) => {
+      if (route.request().method() === "POST") return route.fulfill({ status: 400 });
+      requested = true;
+      await sessionsPending;
+      await route.fulfill({ json: { sessions: [], workspace_ordering: [] } });
     });
 
-    await page.goto("/session/loading-window");
-    // The minimal pre-auth shell is just a dark <div> with no text or
-    // role-bearing children, so the assertion negates the dashboard
-    // CTA which is what would otherwise render in this window.
-    await expect(page.getByRole("button", { name: NEW_SESSION_PANE_NAME })).not.toBeVisible();
-    // After the stubbed response lands the dashboard fallback takes
-    // over, since the response carries no matching session.
+    try {
+      await page.goto("/session/loading-window");
+      await expect.poll(() => requested).toBe(true);
+      // The shell must have passed the separate /about gate before this negative assertion.
+      await expect(page.locator("header")).toBeVisible();
+      await expect(page.getByRole("button", { name: NEW_SESSION_PANE_NAME })).not.toBeVisible();
+    } finally {
+      releaseSessions();
+    }
     await expect(page.getByRole("button", { name: NEW_SESSION_PANE_NAME })).toBeVisible();
     await expect(page).toHaveURL("/session/loading-window");
   });
