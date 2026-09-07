@@ -4508,7 +4508,7 @@ Final prose line.\n";
             ),
             (
                 "lower approval wins over active statusline",
-                format!("{approval}\n❯\n───────────────────────────────────\n ⠏ 28s · 🖥 host"),
+                format!("⎋ Running tests\n{approval}\n❯\n───────────────────────────────────\n ⠏ 28s · 🖥 host"),
                 Status::Waiting,
             ),
         ];
