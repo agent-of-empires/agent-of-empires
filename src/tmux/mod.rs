@@ -3692,6 +3692,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_export_exec_secrets_not_in_ps_after_exec() {
+        use crate::tmux::test_helpers::{only_pane_id, pane_field, wait_for_pane_command};
+
         if !tmux_available() {
             eprintln!("Skipping test: tmux not available");
             return;
@@ -3701,7 +3703,7 @@ mod tests {
         // command string doesn't end up in the server process's argv.
         let dummy_guard = TmuxTestSession::new("aoe_test_ps_dummy");
         let dummy = dummy_guard.name().to_string();
-        let _ = tmux_command()
+        let dummy_output = tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -3713,8 +3715,9 @@ mod tests {
                 "24",
                 "sleep 120",
             ])
-            .output();
-        std::thread::sleep(std::time::Duration::from_millis(200));
+            .output()
+            .expect("tmux dummy session");
+        assert!(dummy_output.status.success());
 
         let session_guard = TmuxTestSession::new("aoe_test_ps");
         let session_name = session_guard.name().to_string();
@@ -3741,15 +3744,32 @@ mod tests {
             .expect("tmux new-session");
         assert!(output.status.success());
 
-        // Wait for exec to complete
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        let pane_id = only_pane_id(&session_name);
+        wait_for_pane_command(&pane_id, "sleep");
+        let pane_pid = pane_field(&pane_id, "#{pane_pid}")
+            .parse::<u32>()
+            .expect("numeric pane PID");
 
         // Check ps output for the secret value
         let ps_output = Command::new("ps")
             .args(["auxww"])
             .output()
             .expect("ps auxww");
+        assert!(
+            ps_output.status.success(),
+            "ps failed: {}",
+            String::from_utf8_lossy(&ps_output.stderr)
+        );
         let ps_text = String::from_utf8_lossy(&ps_output.stdout);
+        assert!(
+            ps_text.lines().skip(1).any(|line| {
+                line.split_whitespace()
+                    .nth(1)
+                    .and_then(|pid| pid.parse::<u32>().ok())
+                    == Some(pane_pid)
+            }),
+            "the exec process must still be present in the inspected ps snapshot"
+        );
 
         assert!(
             !ps_text.contains(&secret_value),
