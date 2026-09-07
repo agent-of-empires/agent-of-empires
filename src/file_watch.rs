@@ -1442,13 +1442,8 @@ mod tests {
         );
     }
 
-    /// Test 14
-    ///
-    /// Verifies that two distinct paths under one subscription each get
-    /// their own debounce slot. We separate the writes by more than one
-    /// debounce window so the first slot fires before the second write
-    /// arrives; this keeps the test deterministic on macOS FSEvents,
-    /// which sometimes coalesces back-to-back writes into a single batch.
+    /// Observe each path before writing the next so FSEvents cannot coalesce
+    /// both writes into one batch.
     #[tokio::test]
     #[serial(file_watch)]
     async fn debounce_per_subscription_per_path_independent() {
@@ -1460,43 +1455,27 @@ mod tests {
             .subscribe_channel(
                 WatchSpec {
                     dir: dir.path().to_path_buf(),
-                    matcher: FileMatcher::AnyOf(vec![a.clone(), b.clone()]),
+                    matcher: FileMatcher::AnyOf(vec![a, b]),
                     debounce: Some(Duration::from_millis(75)),
                 },
                 32,
             )
             .expect("subscribe");
-        write_file(dir.path(), "a", "x");
-        // Sleep long enough that the debounce slot for "a" has fired AND
-        // FSEvents has flushed its coalescing buffer before we write "b".
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        write_file(dir.path(), "b", "y");
-        let mut seen: std::collections::HashSet<std::ffi::OsString> =
-            std::collections::HashSet::new();
-        let deadline = std::time::Instant::now() + KERNEL_WAIT;
-        while seen.len() < 2 {
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                break;
-            }
-            let remaining = deadline - now;
-            match timeout(remaining, rx.recv()).await {
-                Ok(Some(ev)) => {
-                    if let Some(n) = ev.path.file_name() {
-                        seen.insert(n.to_os_string());
+
+        for (name, contents) in [("a", "x"), ("b", "y")] {
+            write_file(dir.path(), name, contents);
+            let expected = dir.path().join(name);
+            timeout(KERNEL_WAIT, async {
+                loop {
+                    let event = rx.recv().await.expect("watch channel remains open");
+                    if event.path == expected {
+                        break;
                     }
                 }
-                _ => break,
-            }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("expected event for {name}"));
         }
-        assert!(
-            seen.contains(a.file_name().unwrap()),
-            "expected event for a"
-        );
-        assert!(
-            seen.contains(b.file_name().unwrap()),
-            "expected event for b"
-        );
     }
 
     /// Test 15
