@@ -4335,7 +4335,7 @@ Final prose line.\n";
                  ───── ⚙ 1 · Review PR · ⏱ 28.6s ─\n\
                  ❯\n\
                  ───────────────────────────────────\n\
-                  ⠏ 28s · 🖥 linus · 🏃 Prewalk",
+                  ⠏ 28s · 🖥 host · 🏃 Prewalk",
             ),
             (
                 "compaction on claude shape",
@@ -4343,14 +4343,14 @@ Final prose line.\n";
                  ─ 👥 5 agents · Fix unresolved · ⏱ 9h12m ─\n\
                  ❯\n\
                  ───────────────────────────────────\n\
-                  ⠼ 16m · 🖥 linus",
+                  ⠼ 16m · 🖥 host",
             ),
             (
                 "rule shape",
                 "  ⎋ Running tests\n\
                  ── ⚙ 1 · Test · ⏱ 4s ──\n\
                  ❯\n\
-                  ⠦ 5s · 🖥 linus",
+                  ⠦ 5s · 🖥 host",
             ),
             (
                 "pi shape",
@@ -4358,31 +4358,39 @@ Final prose line.\n";
                  ───────────────────────────────────\n\
                  Ask anything, edit files, run tools\n\
                  ───────────────────────────────────\n\
-                  ⠧ 12s · 🖥 linus · gallery",
+                  ⠧ 12s · 🖥 host · gallery",
             ),
             (
                 "borderless shape",
                 "  ⎋ Working…\n\
                  ❯ Ask anything\n\
-                  ⠙ 1m · 🖥 linus",
+                  ⠙ 1m · 🖥 host",
             ),
             (
                 "field shape",
                 "  ⎋ Working…\n\
                  ▐ Ask anything ▌\n\
-                  ⠸ 3s · 🖥 linus",
+                  ⠸ 3s · 🖥 host",
             ),
             (
                 "rail shape",
                 "  ⎋ Working…\n\
                  ▎ Ask anything\n\
-                  ⠴ 45s · 🖥 linus",
+                  ⠴ 45s · 🖥 host",
             ),
             (
                 "band shape",
                 "  ⎋ Working…\n\
                   ⠦ 6s > ⬢ Sonnet > 🗺 Plan\n\
                  ╰─ Ask anything ─╯",
+            ),
+            (
+                "active statusline with quoted selector hint is still running",
+                "  ⎋ Running tests\n\
+                 │ up/down navigate  enter select  esc cancel │\n\
+                 ❯\n\
+                 ───────────────────────────────────\n\
+                  ⠏ 28s · 🖥 host",
             ),
         ];
         for (name, pane) in cases {
@@ -4459,11 +4467,18 @@ Final prose line.\n";
             ),
             (
                 "stale band with parked pi footer",
-                "─ Continue Autonomous · ⏱ 2h4m ─\n❯\n───────────────────────────────────\n π · 🖥 linus",
+                "─ Continue Autonomous · ⏱ 2h4m ─\n❯\n───────────────────────────────────\n π · 🖥 host",
             ),
             (
                 "parked claude shape at prompt",
-                "❯\n───────────────────────────────────\n π · 🖥 linus",
+                "❯\n───────────────────────────────────\n π · 🖥 host",
+            ),
+            (
+                "stale parked spinner with prose mentioning esc to cancel",
+                "Some tool output: press (esc to cancel) to abort\n\
+                 ❯\n\
+                 ───────────────────────────────────\n\
+                  ⠏ 28s · 🖥 host",
             ),
         ];
         for (name, pane) in cases {
@@ -4493,7 +4508,7 @@ Final prose line.\n";
             ),
             (
                 "lower approval wins over active statusline",
-                format!("{approval}\n❯\n───────────────────────────────────\n ⠏ 28s · 🖥 linus"),
+                format!("{approval}\n❯\n───────────────────────────────────\n ⠏ 28s · 🖥 host"),
                 Status::Waiting,
             ),
         ];
