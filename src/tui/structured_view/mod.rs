@@ -888,18 +888,13 @@ async fn handle_terminal_event(
             else {
                 return Ok(false);
             };
-            // The agent asked a question through the option list, so an
-            // allow-shaped decision has no single answer: open the picker
-            // and let the user choose a label. Deny still denies (it maps
-            // to a reject option, or cancels when the agent offered
-            // none). See #3741.
-            if pending.choice
-                && !pending.options.is_empty()
-                && !matches!(decision, ApprovalDecisionWire::Deny)
-            {
-                state.choice = Some(approval_option_picker(&pending));
-                return Ok(false);
-            }
+            let decision = match approval_key_outcome(&pending, decision) {
+                ApprovalKeyOutcome::Resolve(decision) => decision,
+                ApprovalKeyOutcome::OpenPicker => {
+                    state.choice = Some(approval_option_picker(&pending));
+                    return Ok(false);
+                }
+            };
             match state
                 .http
                 .resolve_approval(&state.session_id, &pending.nonce, decision, None)
@@ -1218,6 +1213,37 @@ fn question_picker(
             remaining,
             answers,
         },
+    }
+}
+
+/// What a decision key means for the selected approval.
+enum ApprovalKeyOutcome {
+    Resolve(ApprovalDecisionWire),
+    /// Ask which option the user meant before resolving anything.
+    OpenPicker,
+}
+
+/// Map a decision key onto what it can actually mean for this approval.
+///
+/// An answer list has no permission vocabulary to express, so neither
+/// half of the trio survives: an allow-shaped key opens the picker
+/// instead of guessing an option, and `d` dismisses without answering.
+/// Dismissal must be `Cancelled`, not `Deny`, or the daemon would map it
+/// onto the first reject-kind option and send that as the user's answer.
+/// See #3741.
+fn approval_key_outcome(
+    pending: &reducer::PendingApproval,
+    decision: ApprovalDecisionWire,
+) -> ApprovalKeyOutcome {
+    if !pending.choice || pending.options.is_empty() {
+        return ApprovalKeyOutcome::Resolve(decision);
+    }
+    match decision {
+        ApprovalDecisionWire::Deny => ApprovalKeyOutcome::Resolve(ApprovalDecisionWire::Cancelled),
+        ApprovalDecisionWire::Cancelled => ApprovalKeyOutcome::Resolve(decision),
+        ApprovalDecisionWire::Allow | ApprovalDecisionWire::AllowAlways => {
+            ApprovalKeyOutcome::OpenPicker
+        }
     }
 }
 
@@ -1977,28 +2003,81 @@ mod tests {
         assert_eq!(state.focus, Focus::Approval);
     }
 
-    /// A question option list becomes a picker whose rows submit the
-    /// agent's own `option_id`, not an allow-once guess. See #3741.
-    #[test]
-    fn approval_option_picker_submits_the_agents_option_ids() {
-        use crate::acp::approvals::{ApprovalOption, ApprovalOptionKind};
-        let pending = reducer::PendingApproval {
+    use crate::acp::approvals::{ApprovalOption, ApprovalOptionKind};
+
+    fn pending_approval(choice: bool, options: Vec<ApprovalOption>) -> reducer::PendingApproval {
+        reducer::PendingApproval {
             nonce: "approval-1".into(),
             title: "Pick a plan".into(),
             kind: "other".into(),
             args: "{}".into(),
             destructive: false,
-            options: ["Alpha", "Bravo"]
-                .iter()
-                .enumerate()
-                .map(|(i, name)| ApprovalOption {
-                    option_id: format!("choice-{i}"),
-                    name: (*name).into(),
-                    kind: ApprovalOptionKind::AllowOnce,
-                })
-                .collect(),
-            choice: true,
-        };
+            options,
+            choice,
+        }
+    }
+
+    fn answer_options(kind: ApprovalOptionKind) -> Vec<ApprovalOption> {
+        ["Alpha", "Bravo"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| ApprovalOption {
+                option_id: format!("choice-{i}"),
+                name: (*name).into(),
+                kind,
+            })
+            .collect()
+    }
+
+    /// Dismissing an answer list must cancel, never deny: a deny is
+    /// resolved by kind server-side, so on a reject-kind answer list it
+    /// would send the first option as the user's answer. See #3741.
+    #[test]
+    fn decision_keys_mean_different_things_on_an_answer_list() {
+        let allow_list = pending_approval(true, answer_options(ApprovalOptionKind::AllowOnce));
+        let reject_list = pending_approval(true, answer_options(ApprovalOptionKind::RejectOnce));
+        let plain = pending_approval(false, Vec::new());
+        // Flagged a choice, but with nothing to render: the trio stands.
+        let empty = pending_approval(true, Vec::new());
+
+        for list in [&allow_list, &reject_list] {
+            assert!(matches!(
+                approval_key_outcome(list, ApprovalDecisionWire::Deny),
+                ApprovalKeyOutcome::Resolve(ApprovalDecisionWire::Cancelled)
+            ));
+            for key in [
+                ApprovalDecisionWire::Allow,
+                ApprovalDecisionWire::AllowAlways,
+            ] {
+                assert!(matches!(
+                    approval_key_outcome(list, key),
+                    ApprovalKeyOutcome::OpenPicker
+                ));
+            }
+        }
+
+        for approval in [&plain, &empty] {
+            for key in [
+                ApprovalDecisionWire::Allow,
+                ApprovalDecisionWire::AllowAlways,
+                ApprovalDecisionWire::Deny,
+            ] {
+                assert!(
+                    matches!(
+                        approval_key_outcome(approval, key),
+                        ApprovalKeyOutcome::Resolve(resolved) if resolved == key
+                    ),
+                    "{key:?} must pass through unchanged"
+                );
+            }
+        }
+    }
+
+    /// A question option list becomes a picker whose rows submit the
+    /// agent's own `option_id`, not an allow-once guess. See #3741.
+    #[test]
+    fn approval_option_picker_submits_the_agents_option_ids() {
+        let pending = pending_approval(true, answer_options(ApprovalOptionKind::AllowOnce));
         let picker = approval_option_picker(&pending);
         assert!(picker.title.contains("Pick a plan"));
         assert_eq!(

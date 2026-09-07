@@ -350,6 +350,85 @@ async fn shim_agent_round_trips_a_question_option_list() {
     );
 }
 
+/// #3741: dismissing an answer list must reach the agent as a
+/// cancellation. Resolving it as a deny would be mapped back onto an
+/// option by kind, so a list whose answers are all reject-kind would
+/// send the first one as the user's answer.
+#[tokio::test]
+async fn shim_agent_sees_a_dismissed_question_as_cancelled() {
+    if let Err(reason) = shim_ready() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    let shim = shim_path();
+
+    let config = SpawnConfig {
+        wrapper_substitution: None,
+        agent_key: "claude".into(),
+        tool: "claude".into(),
+        spec: AgentSpec {
+            command: "node".into(),
+            args: vec![shim.to_string_lossy().to_string()],
+            description: "test shim".into(),
+            env_allowlist: None,
+        },
+        cwd: std::env::temp_dir(),
+        additional_dirs: vec![],
+        provider_env: vec![],
+        host_environment: vec![],
+        default_effort: None,
+        default_mode: None,
+        socket_path: None,
+        stored_acp_session_id: None,
+        fork_from: None,
+        seed_history_replay: false,
+        artifact_dir: None,
+        sandbox_info: None,
+        source_profile: None,
+        mcp_servers: Vec::new(),
+    };
+
+    let mut client = AcpClient::spawn(config, AcpSessionId("dismiss".into()))
+        .await
+        .expect("spawn shim agent");
+
+    client
+        .send_prompt("REQUEST_CHOICE please", &[])
+        .await
+        .expect("send_prompt");
+
+    let mut events: Vec<Event> = Vec::new();
+    let drain_deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while std::time::Instant::now() < drain_deadline {
+        match tokio::time::timeout(Duration::from_millis(500), client.next_event()).await {
+            Ok(Some(event)) => {
+                if let Event::ApprovalRequested { approval } = &event {
+                    client
+                        .cancel_permission(approval.nonce.clone())
+                        .await
+                        .expect("cancel_permission");
+                }
+                let stopped = matches!(event, Event::Stopped { .. });
+                events.push(event);
+                if stopped {
+                    break;
+                }
+            }
+            Ok(None) | Err(_) => continue,
+        }
+    }
+
+    let _ = client.shutdown().await;
+
+    assert!(
+        events.iter().any(|e| match e {
+            Event::AgentMessageChunk { text } => text.contains("choice_outcome=cancelled"),
+            _ => false,
+        }),
+        "a dismissal must not answer with an option; got {events:?}"
+    );
+}
+
 /// fs round-trip: shim issues writeTextFile + readTextFile against a
 /// temp dir; aoe handles them via fs_handler with sandbox enforcement;
 /// shim echoes the read content back so we can assert the wire works.

@@ -19,7 +19,7 @@
 
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Check, ChevronDown, MessageCircleQuestion, Shield, X } from "lucide-react";
-import type { Approval, ApprovalDecision } from "../../lib/acpTypes";
+import type { Approval, ApprovalDecision, ApprovalOptionKind } from "../../lib/acpTypes";
 import { useServerDown, OFFLINE_TITLE } from "../../lib/connectionState";
 import { hasArgsBody, humanizePermissionTitle, parseJsonObject, previewFromArgs } from "../../lib/acpArgs";
 
@@ -34,6 +34,7 @@ export function ApprovalCard({ approval, onResolve }: Props) {
   const offline = useServerDown();
   const [phase, setPhase] = useState<"pending" | "submitting" | "rolled-back">("pending");
   const [progress, setProgress] = useState(0);
+  const [held, setHeld] = useState<string | null>(null);
   const pressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const progressTimer = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -41,6 +42,12 @@ export function ApprovalCard({ approval, onResolve }: Props) {
   const options = approval.options ?? [];
   // Without labels there is nothing to render, so fall back to the trio.
   const isChoice = approval.choice === true && options.length > 0;
+  // A destructive tool can still ask its question through an option
+  // list, and single-tapping one of those would run it. Every allowing
+  // option keeps the hold; a reject-kind option is safe to tap, which
+  // matches the trio reserving single-tap for Deny. See #3741.
+  const optionNeedsHold = (kind: ApprovalOptionKind) =>
+    approval.destructive && (kind === "allow_once" || kind === "allow_always");
   // Benign approvals collapse to a one-line preview so the queue stays
   // scannable; destructive ones default expanded so the full command is
   // in view before a hold-to-allow. Either way the toggle stays under
@@ -71,8 +78,12 @@ export function ApprovalCard({ approval, onResolve }: Props) {
     [onResolve],
   );
 
-  const startLongPress = () => {
+  // `held` names the button currently under a hold, so a destructive
+  // answer list can put the ring on whichever option is being pressed
+  // rather than on a single Allow button.
+  const startLongPress = (key: string, run: () => void) => {
     if (phase !== "pending") return;
+    setHeld(key);
     setProgress(0);
     progressTimer.current = setInterval(() => {
       setProgress((p) => Math.min(100, p + (100 / LONG_PRESS_MS) * 30));
@@ -89,7 +100,8 @@ export function ApprovalCard({ approval, onResolve }: Props) {
           // ignore
         }
       }
-      void submit("Allow");
+      setHeld(null);
+      run();
     }, LONG_PRESS_MS);
   };
 
@@ -102,6 +114,7 @@ export function ApprovalCard({ approval, onResolve }: Props) {
       clearInterval(progressTimer.current);
       progressTimer.current = null;
     }
+    setHeld(null);
     setProgress(0);
   };
 
@@ -163,22 +176,44 @@ export function ApprovalCard({ approval, onResolve }: Props) {
 
       {isChoice && (
         <div className="flex flex-col gap-1.5 p-2">
-          {options.map((option) => (
-            <button
-              key={option.option_id}
-              type="button"
-              className={[
-                "w-full rounded-md border border-surface-700 bg-surface-800",
-                "px-3 py-2 text-left text-xs font-medium text-text-primary break-words",
-                "hover:border-brand-600/60 hover:bg-brand-700/10",
-                phase === "submitting" ? "cursor-wait opacity-60" : "",
-              ].join(" ")}
-              disabled={offline || phase === "submitting"}
-              onClick={() => void submit("Allow", option.option_id)}
-            >
-              {option.name}
-            </button>
-          ))}
+          {approval.destructive && <p className="px-1 pb-0.5 text-[11px] text-rose-400">Hold an answer to confirm.</p>}
+          {options.map((option) => {
+            const needsHold = optionNeedsHold(option.kind);
+            const pick = () => void submit("Allow", option.option_id);
+            return (
+              <button
+                key={option.option_id}
+                type="button"
+                className={[
+                  "relative w-full overflow-hidden rounded-md border",
+                  "px-3 py-2 text-left text-xs font-medium text-text-primary break-words",
+                  needsHold
+                    ? "border-rose-900/60 bg-rose-950/30 hover:border-rose-700"
+                    : "border-surface-700 bg-surface-800 hover:border-brand-600/60 hover:bg-brand-700/10",
+                  phase === "submitting" ? "cursor-wait opacity-60" : "",
+                ].join(" ")}
+                disabled={offline || phase === "submitting"}
+                // Mouse-leave and touch-cancel abort the hold, so a slip
+                // never runs a destructive answer.
+                onClick={needsHold ? undefined : pick}
+                onMouseDown={needsHold ? () => startLongPress(option.option_id, pick) : undefined}
+                onMouseUp={needsHold ? cancelLongPress : undefined}
+                onMouseLeave={needsHold ? cancelLongPress : undefined}
+                onTouchStart={needsHold ? () => startLongPress(option.option_id, pick) : undefined}
+                onTouchEnd={needsHold ? cancelLongPress : undefined}
+                onTouchCancel={needsHold ? cancelLongPress : undefined}
+              >
+                <span className="relative z-10">{option.name}</span>
+                {needsHold && (
+                  <span
+                    className="absolute inset-0 origin-left bg-rose-500/40"
+                    style={{ transform: `scaleX(${(held === option.option_id ? progress : 0) / 100})` }}
+                    aria-hidden="true"
+                  />
+                )}
+              </button>
+            );
+          })}
         </div>
       )}
 
@@ -192,10 +227,10 @@ export function ApprovalCard({ approval, onResolve }: Props) {
               phase === "pending" ? "bg-rose-600 hover:bg-rose-500" : "bg-rose-700 opacity-70 cursor-wait",
             ].join(" ")}
             disabled={offline || (phase !== "pending" && phase !== "rolled-back")}
-            onMouseDown={startLongPress}
+            onMouseDown={() => startLongPress("allow", () => void submit("Allow"))}
             onMouseUp={cancelLongPress}
             onMouseLeave={cancelLongPress}
-            onTouchStart={startLongPress}
+            onTouchStart={() => startLongPress("allow", () => void submit("Allow"))}
             onTouchEnd={cancelLongPress}
             onTouchCancel={cancelLongPress}
           >
@@ -203,7 +238,7 @@ export function ApprovalCard({ approval, onResolve }: Props) {
             <span className="relative z-10">{phase === "submitting" ? "Approving…" : "Hold to allow"}</span>
             <span
               className="absolute inset-0 bg-rose-400 origin-left"
-              style={{ transform: `scaleX(${progress / 100})` }}
+              style={{ transform: `scaleX(${(held === "allow" ? progress : 0) / 100})` }}
               aria-hidden="true"
             />
           </button>
@@ -254,7 +289,10 @@ export function ApprovalCard({ approval, onResolve }: Props) {
             .filter(Boolean)
             .join(" ")}
           disabled={offline || phase === "submitting"}
-          onClick={() => void submit("Deny")}
+          // Dismiss answers nothing, so it cancels rather than denying:
+          // a Deny would be mapped onto the first reject-kind option and
+          // sent as the user's answer. See #3741.
+          onClick={() => void submit(isChoice ? "Cancelled" : "Deny")}
         >
           <X className="h-3.5 w-3.5" />
           {isChoice ? "Dismiss" : "Deny"}

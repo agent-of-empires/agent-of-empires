@@ -2840,6 +2840,20 @@ impl<S: BroadcastSink> Supervisor<S> {
         Ok(())
     }
 
+    /// Cancel a pending approval: the user dismissed the card without
+    /// answering it. Distinct from `Deny`, which answers with a reject
+    /// option; a dismissal must never be mapped onto an option, so it
+    /// takes the resolver's cancellation path instead. See #3741.
+    pub async fn cancel_permission(
+        &self,
+        session_id: &str,
+        nonce: Nonce,
+    ) -> Result<(), SupervisorError> {
+        let client = self.client_for_session(session_id).await?;
+        client.cancel_permission(nonce).await?;
+        Ok(())
+    }
+
     /// Resolve a pending `AskUserQuestion` elicitation by nonce, unblocking
     /// the parked `elicitation/create` callback with the user's answer.
     pub async fn resolve_elicitation(

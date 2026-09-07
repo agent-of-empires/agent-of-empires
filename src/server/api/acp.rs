@@ -2708,16 +2708,24 @@ pub async fn resolve_approval(
         Err(rej) => return rej.into_response(),
     };
     let nonce = Nonce(nonce_str.clone());
-    let decision = req.decision;
-    match state
-        .acp_supervisor
-        .resolve_permission(&id, nonce, decision.into(), req.option_id)
-        .await
-    {
-        Ok(()) => {
-            record_approval_decision(&state, decision);
-            StatusCode::NO_CONTENT.into_response()
+    // A dismissal answers nothing, so it must not go through option
+    // matching: `Deny` there would pick the first reject-kind option and
+    // send it as the user's answer. See #3741.
+    let outcome = match req.decision {
+        ApprovalDecisionWire::Cancelled => state.acp_supervisor.cancel_permission(&id, nonce).await,
+        decision => {
+            state
+                .acp_supervisor
+                .resolve_permission(&id, nonce, decision.into(), req.option_id)
+                .await
         }
+    };
+    match outcome {
+        // Telemetry is tallied by the event listener off
+        // `Event::ApprovalResolved`, not here: this endpoint only knows the
+        // decision the client submitted, which for an answered option list
+        // is allow-shaped whatever the option means.
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(SupervisorError::Acp(crate::acp::acp_client::AcpError::UnknownNonce)) => {
             // Intentional override of the canonical Acp 500: echo the nonce
             // so clients (web + native TUI) can confirm the 404 refers to
@@ -2771,21 +2779,6 @@ pub async fn resolve_elicitation(
         }
         Err(e) => supervisor_error_response("resolve failed", &e),
     }
-}
-
-/// Tally a user-resolved approval for the opt-in telemetry snapshot. Only the
-/// three real user decisions are counted; the synthetic daemon-restart
-/// `Cancelled` decision is not a user choice and never reaches this endpoint,
-/// but is matched explicitly so adding a wire variant is a compile error here.
-fn record_approval_decision(state: &AppState, decision: ApprovalDecisionWire) {
-    use std::sync::atomic::Ordering::Relaxed;
-    let counter = match decision {
-        ApprovalDecisionWire::Allow => &state.telemetry_structured.approvals_allow,
-        ApprovalDecisionWire::AllowAlways => &state.telemetry_structured.approvals_allow_always,
-        ApprovalDecisionWire::Deny => &state.telemetry_structured.approvals_deny,
-        ApprovalDecisionWire::Cancelled => return,
-    };
-    counter.fetch_add(1, Relaxed);
 }
 
 /// Build a markdown context primer from the persisted acp event
