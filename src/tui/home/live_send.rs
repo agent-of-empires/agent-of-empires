@@ -4197,10 +4197,14 @@ mod tests {
             return;
         }
         let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_livelock_late");
-        // Spawn against a name that does not exist yet: the entry steal sees
-        // no session and leaves the worker unowned.
+        // A failed resize acknowledges that the worker observed the absent session.
         let worker = LiveSendWorker::spawn(guard.name().to_string(), None);
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        worker.resize(60, 20);
+        wait_until(
+            "resize against absent session",
+            std::time::Duration::from_secs(5),
+            || worker.take_resize_failed(),
+        );
 
         let out = crate::tmux::tmux_command()
             .args([
@@ -4220,7 +4224,7 @@ mod tests {
         crate::tmux::refresh_session_cache();
         let session = crate::tmux::Session::from_name(guard.name());
 
-        // Another surface owns the pane before the worker ever retries.
+        // The new session has a live owner before the next resize.
         assert!(session.steal_size_owner("live-test-thief"));
         assert!(!worker.lock_lost());
 
