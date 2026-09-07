@@ -174,9 +174,8 @@ test.describe("Sidebar multi-session (#956)", () => {
     await page.mouse.down();
     await page.waitForTimeout(220);
     await page.mouse.up();
-    await page.waitForTimeout(16);
 
-    expect(await row.getAttribute("class")).toContain("border-brand-600");
+    await expect(row).toHaveClass(/(?:^|\s)border-brand-600(?:\s|$)/);
     await expect(page).toHaveURL(/\/session\/sess-a$/);
   });
 
