@@ -40,9 +40,15 @@ const frame: LiveFrame = {
 interface Term {
   /** Plain edits, one per character, as a soft keyboard sends them. */
   type: (text: string) => void;
-  /** A composition that hands back `data` when it ends. */
+  /** A retroactive composition: its first update carries the word already
+   *  typed, as SwiftKey's trace on #3746 does, then it ends with `data`. */
   compose: (data: string) => void;
+  /** A composition that starts fresh here, building from its own first
+   *  character rather than adopting what was typed before it. */
+  composeFresh: (first: string, data: string) => void;
   input: (inputType: string) => void;
+  /** A toolbar button, which writes past this component to live.sendData. */
+  toolbar: (data: string) => void;
   sent: () => string[];
 }
 
@@ -50,7 +56,13 @@ interface Term {
 // the pane never receives (a confirmed non-owner, or a full pending queue).
 function renderTerm(accepted = true): Term {
   const inputRef = createRef<HTMLTextAreaElement>();
-  const sendData = vi.fn(() => accepted);
+  // The hook clears the shared word on every write; that is what makes a
+  // toolbar button invalidate the run this component is tracking.
+  const typedWordRef = { current: "" };
+  const sendData = vi.fn((_data: string) => {
+    typedWordRef.current = "";
+    return accepted;
+  });
   render(
     <MobileLiveTerminal
       frame={frame}
@@ -63,6 +75,7 @@ function renderTerm(accepted = true): Term {
       enterReading={vi.fn()}
       returnToLive={vi.fn()}
       sendData={sendData}
+      typedWordRef={typedWordRef}
       uploadPastedImage={vi.fn().mockResolvedValue(null)}
       forwardWheel={vi.fn()}
       forwardButton={vi.fn()}
@@ -83,9 +96,16 @@ function renderTerm(accepted = true): Term {
     },
     compose: (data) => {
       fireEvent.compositionStart(input);
+      fireEvent.compositionUpdate(input, { data: typedWordRef.current });
+      fireEvent.compositionEnd(input, { data });
+    },
+    composeFresh: (first, data) => {
+      fireEvent.compositionStart(input);
+      fireEvent.compositionUpdate(input, { data: first });
       fireEvent.compositionEnd(input, { data });
     },
     input: (inputType) => beforeInput(inputType, null),
+    toolbar: (data) => sendData(data),
     sent: () => sendData.mock.calls.map(([d]: [string]) => d),
   };
 }
@@ -173,6 +193,27 @@ describe("MobileLiveTerminal Android IME word commits", () => {
         t.compose("test");
       },
       sent: ["t", "e", "s", "t", "test"],
+    },
+    {
+      // jerome-benoit on #3751: compositionend.data describes only its own
+      // session, so a composition that starts here is not a replacement.
+      name: "sends a fresh composition that merely shares the typed prefix",
+      run: (t) => {
+        t.type("a");
+        t.composeFresh("n", "android");
+      },
+      sent: ["a", "android"],
+    },
+    {
+      // The toolbar writes past this component straight to live.sendData.
+      name: "forgets the word after a toolbar interrupt",
+      run: (t) => {
+        t.type("test");
+        t.toolbar("\x03");
+        t.type("test");
+        t.compose("test");
+      },
+      sent: ["t", "e", "s", "t", "\x03", "t", "e", "s", "t"],
     },
     {
       name: "sends a composed word that does not continue what was typed",

@@ -422,10 +422,17 @@ export function useLiveTerminal(
     };
   }, [sessionId, wsPath, setState]);
 
+  /** The plain-typed word the pane currently holds, for the mobile IME word
+   *  dedup (#3746). It lives here because `sendData` is the one funnel every
+   *  writer uses (terminal, toolbar), so no writer can leave a stale word
+   *  behind: sending clears it and only the typing path re-arms it. */
+  const typedWordRef = useRef("");
+
   /** True when the pane will receive `data`: sent now, or queued for a flush
    *  that is still expected. False means it was dropped and no caller may
    *  treat it as delivered. */
   const sendData = useCallback((data: string): boolean => {
+    typedWordRef.current = "";
     const ws = wsRef.current;
     const canSend = ownerKnownRef.current && storeRef.current!.snapshot.isOwner;
     if (canSend && ws?.readyState === WebSocket.OPEN) {
@@ -553,6 +560,7 @@ export function useLiveTerminal(
   return {
     state,
     sendData,
+    typedWordRef,
     forwardWheel,
     forwardButton,
     sendResize,

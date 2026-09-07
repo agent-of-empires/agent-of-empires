@@ -128,6 +128,8 @@ export interface MobileLiveTerminalProps {
   returnToLive: (rows: number) => void;
   /** Returns whether the pane will receive the data; see useLiveTerminal. */
   sendData: (data: string) => boolean;
+  /** Shared IME word run; `sendData` clears it, see useLiveTerminal. */
+  typedWordRef: React.RefObject<string>;
   /** Upload a clipboard image pasted into the pane and resolve to the path
    *  the tmux pane can read (host path, or the container mount for sandboxed
    *  sessions), or null on failure. See #2678. */
@@ -499,6 +501,7 @@ export function MobileLiveTerminal({
   enterReading,
   returnToLive,
   sendData: sendDataRaw,
+  typedWordRef,
   uploadPastedImage,
   forwardWheel,
   forwardButton,
@@ -1135,14 +1138,6 @@ export function MobileLiveTerminal({
     },
     [stopMomentum, enqueueTouchWheelDelta, forwardModeRef],
   );
-  // The word being typed as plain `insertText` edits. Android IMEs (SwiftKey,
-  // #3746) spell a word out as plain edits and then, on space, wrap it in a
-  // composition after the fact, so `compositionend` carries the whole word a
-  // second time and "test" reached the pane as "testtest"; whatever the run
-  // already delivered is dropped from that word. Sending clears it below, so it
-  // only ever holds bytes the pane received and the strip can never swallow
-  // bytes it never saw; the paths that continue a word re-arm it.
-  const plainRunRef = useRef("");
   // Typed input interrupts the coast. Without this, keystrokes sent in the
   // coast's 1-2s tail interleave with the wheel storm and the app is busy
   // redrawing scroll frames instead of echoing them (reported as "I start
@@ -1153,7 +1148,6 @@ export function MobileLiveTerminal({
     (data: string) => {
       stopMomentum();
       cancelTouchWheelQueue();
-      plainRunRef.current = "";
       return sendDataRaw(data);
     },
     [sendDataRaw, stopMomentum, cancelTouchWheelQueue],
@@ -1536,6 +1530,9 @@ export function MobileLiveTerminal({
 
   // --- keyboard input -----------------------------------------------------------
   const composingRef = useRef(false);
+  // Whether the composition in flight took over already-typed text: null until
+  // its first update settles it. See handleCompositionUpdate.
+  const retroactiveRef = useRef<boolean | null>(null);
   // Returns whether `data` itself reached the pane, so a caller can tell
   // whether the run may record it. A Ctrl chord sends a control code instead,
   // and a non-owner's keystrokes are dropped outright.
@@ -1560,13 +1557,13 @@ export function MobileLiveTerminal({
   const handleMobileKeyboardProxyInput = useCallback(
     (input: MobileKeyboardProxyInput) => {
       if (composingRef.current || input.isComposing) return;
-      const run = plainRunRef.current;
-      plainRunRef.current = "";
+      const run = typedWordRef.current;
+      typedWordRef.current = "";
       switch (input.inputType) {
         case "insertText": {
           const data = input.data ?? "";
           if (data && !sendKeys(data)) break;
-          plainRunRef.current = plainRunAfter(run, data);
+          typedWordRef.current = plainRunAfter(run, data);
           break;
         }
         case "insertLineBreak":
@@ -1577,7 +1574,7 @@ export function MobileLiveTerminal({
           // One character, so the IME's word loses its last one too;
           // `deleteWordBackward` is a separate input type and not forwarded.
           if (!sendKeys("\x7f")) break;
-          plainRunRef.current = dropLastCodePoint(run);
+          typedWordRef.current = dropLastCodePoint(run);
           break;
         case "insertFromPaste": {
           const text = input.data ?? "";
@@ -1712,23 +1709,39 @@ export function MobileLiveTerminal({
 
   const handleCompositionStart = useCallback(() => {
     composingRef.current = true;
+    retroactiveRef.current = null;
   }, []);
+  // A retroactive composition announces itself on its first update: SwiftKey
+  // adopts the word already typed, so that update carries the whole run
+  // (`compositionupdate "test"` right after `compositionstart ""` in #3746's
+  // trace). A composition genuinely starting here builds from its own first
+  // character instead, so it never matches and its result is sent whole.
+  const handleCompositionUpdate = useCallback(
+    (e: CompositionEvent) => {
+      if (retroactiveRef.current !== null) return;
+      const run = typedWordRef.current;
+      retroactiveRef.current = run !== "" && (e.data ?? "").startsWith(run);
+    },
+    [typedWordRef],
+  );
   const handleCompositionEnd = useCallback(
     (e: CompositionEvent) => {
       composingRef.current = false;
-      const run = plainRunRef.current;
-      plainRunRef.current = "";
+      const retroactive = retroactiveRef.current === true;
+      retroactiveRef.current = null;
+      const run = typedWordRef.current;
+      typedWordRef.current = "";
       const data = e.data ?? "";
-      // The composition may have taken over a word already spelled out as plain
-      // edits; only the part the pane has not seen yet is new.
-      const rest = run && data.startsWith(run) ? data.slice(run.length) : data;
+      // Only a composition that took over the typed word may have its prefix
+      // dropped; anything else is new text and goes to the pane whole.
+      const rest = retroactive && data.startsWith(run) ? data.slice(run.length) : data;
       // The composed word is still the one under the caret, so a second
       // composition over it (a suggestion tap, then the space commit) has to
       // be stripped against everything the pane has of that word.
-      if (!rest || sendKeys(rest)) plainRunRef.current = plainRunAfter(run, rest);
+      if (!rest || sendKeys(rest)) typedWordRef.current = plainRunAfter(run, rest);
       if (e.currentTarget instanceof HTMLTextAreaElement) e.currentTarget.value = "";
     },
-    [sendKeys],
+    [sendKeys, typedWordRef],
   );
 
   // Session selection focuses App's persistent, in-viewport keyboard input
@@ -1745,6 +1758,7 @@ export function MobileLiveTerminal({
     proxy.addEventListener("keydown", handleKeyDown);
     proxy.addEventListener("paste", handlePaste);
     proxy.addEventListener("compositionstart", handleCompositionStart);
+    proxy.addEventListener("compositionupdate", handleCompositionUpdate);
     proxy.addEventListener("compositionend", handleCompositionEnd);
     return () => {
       unregisterProxyInput();
@@ -1752,6 +1766,7 @@ export function MobileLiveTerminal({
       proxy.removeEventListener("keydown", handleKeyDown);
       proxy.removeEventListener("paste", handlePaste);
       proxy.removeEventListener("compositionstart", handleCompositionStart);
+      proxy.removeEventListener("compositionupdate", handleCompositionUpdate);
       proxy.removeEventListener("compositionend", handleCompositionEnd);
     };
   }, [
@@ -1761,6 +1776,7 @@ export function MobileLiveTerminal({
     handleMobileKeyboardProxyInput,
     handlePaste,
     handleCompositionStart,
+    handleCompositionUpdate,
     handleCompositionEnd,
   ]);
 
@@ -2016,6 +2032,7 @@ export function MobileLiveTerminal({
         onKeyDown={(e) => handleKeyDown(e.nativeEvent)}
         onPaste={(e) => handlePaste(e.nativeEvent)}
         onCompositionStart={() => handleCompositionStart()}
+        onCompositionUpdate={(e) => handleCompositionUpdate(e.nativeEvent)}
         onCompositionEnd={(e) => handleCompositionEnd(e.nativeEvent)}
       />
     </div>
