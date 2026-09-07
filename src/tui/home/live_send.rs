@@ -4258,7 +4258,12 @@ mod tests {
         }
         let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_livelock_vacant");
         let worker = LiveSendWorker::spawn(guard.name().to_string(), None);
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        worker.resize(60, 20);
+        wait_until(
+            "resize against absent session",
+            std::time::Duration::from_secs(5),
+            || worker.take_resize_failed(),
+        );
 
         let out = crate::tmux::tmux_command()
             .args([
