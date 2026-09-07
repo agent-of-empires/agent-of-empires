@@ -5021,17 +5021,26 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_protected_env_is_consumed_before_create_returns() {
+    fn test_protected_env_reaches_child_without_exposing_secret_in_ps() {
+        use crate::tmux::test_helpers::pane_field;
+
         if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
             return;
         }
         let guard = TmuxTestSession::new("aoe_test_protected_env");
         let session = Session::from_name(guard.name());
         let temp = tempfile::tempdir().unwrap();
         let output = temp.path().join("value");
-        let command = format!(
-            "printf '%s' \"$AOE_TEST_PROTECTED_VALUE\" > {}; sleep 30",
+        let secret_value = format!("AOE_PROTECTED_{} secret", std::process::id());
+        let script = format!(
+            "printf '%s' \"$AOE_TEST_PROTECTED_VALUE\" > {}; \
+             printf 'protected-ready\\n'; read -r proceed; exec sleep 30",
             crate::session::environment::shell_escape(&output.to_string_lossy())
+        );
+        let command = format!(
+            "exec /bin/sh -c {}",
+            crate::session::environment::shell_escape(&script)
         );
 
         session
@@ -5042,19 +5051,48 @@ mod tests {
                 "default",
                 &[PaneEnvMutation::set(
                     "AOE_TEST_PROTECTED_VALUE".to_string(),
-                    "secret value".to_string(),
+                    secret_value.clone(),
                 )],
             )
             .unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !output.exists() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(std::fs::read_to_string(output).unwrap(), "secret value");
+        // read holds a known shell so this cannot take the non-shell fast path.
+        wait_for_pane_text(&session, "protected-ready");
+        let pane_id = only_pane_id(guard.name());
+        wait_for_pane_command(&pane_id, "sh");
+        assert_eq!(std::fs::read_to_string(output).unwrap(), secret_value);
         assert!(
             !session.is_pane_running_shell(),
-            "live protected-environment wrapper must not look like an exited agent"
+            "a live protected shell must not look like an exited agent"
+        );
+
+        session.send_keys("continue").unwrap();
+        wait_for_pane_command(&pane_id, "sleep");
+        let pane_pid = pane_field(&pane_id, "#{pane_pid}")
+            .parse::<u32>()
+            .expect("numeric pane PID");
+        let ps_output = std::process::Command::new("ps")
+            .args(["auxww"])
+            .output()
+            .expect("ps auxww");
+        assert!(
+            ps_output.status.success(),
+            "ps failed: {}",
+            String::from_utf8_lossy(&ps_output.stderr)
+        );
+        let ps_text = String::from_utf8_lossy(&ps_output.stdout);
+        assert!(
+            ps_text.lines().skip(1).any(|line| {
+                line.split_whitespace()
+                    .nth(1)
+                    .and_then(|pid| pid.parse::<u32>().ok())
+                    == Some(pane_pid)
+            }),
+            "the exec process must be present in the inspected ps snapshot"
+        );
+        assert!(
+            !ps_text.contains(&secret_value),
+            "the protected value must not appear in process arguments"
         );
     }
 
