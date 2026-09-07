@@ -4324,6 +4324,73 @@ Final prose line.\n";
     }
 
     #[test]
+    fn test_detect_omp_status_running_on_active_statusline() {
+        // Composer shapes where the activity band is pushed above the prompt
+        // (claude, rule, pi, borderless, field, rail) or integrated into the
+        // band row park the live braille spinner in the bottom status line.
+        let cases = [
+            (
+                "claude shape with task band and separate statusline",
+                "  ⎋ Capturing live sessions\n\
+                 ───── ⚙ 1 · Review PR · ⏱ 28.6s ─\n\
+                 ❯\n\
+                 ───────────────────────────────────\n\
+                  ⠏ 28s · 🖥 linus · 🏃 Prewalk",
+            ),
+            (
+                "compaction on claude shape",
+                " ⠧ Auto server compaction… (esc to cancel)\n\
+                 ─ 👥 5 agents · Fix unresolved · ⏱ 9h12m ─\n\
+                 ❯\n\
+                 ───────────────────────────────────\n\
+                  ⠼ 16m · 🖥 linus",
+            ),
+            (
+                "rule shape",
+                "  ⎋ Running tests\n\
+                 ── ⚙ 1 · Test · ⏱ 4s ──\n\
+                 ❯\n\
+                  ⠦ 5s · 🖥 linus",
+            ),
+            (
+                "pi shape",
+                "  ⎋ Running tools\n\
+                 ───────────────────────────────────\n\
+                 Ask anything, edit files, run tools\n\
+                 ───────────────────────────────────\n\
+                  ⠧ 12s · 🖥 linus · gallery",
+            ),
+            (
+                "borderless shape",
+                "  ⎋ Working…\n\
+                 ❯ Ask anything\n\
+                  ⠙ 1m · 🖥 linus",
+            ),
+            (
+                "field shape",
+                "  ⎋ Working…\n\
+                 ▐ Ask anything ▌\n\
+                  ⠸ 3s · 🖥 linus",
+            ),
+            (
+                "rail shape",
+                "  ⎋ Working…\n\
+                 ▎ Ask anything\n\
+                  ⠴ 45s · 🖥 linus",
+            ),
+            (
+                "band shape",
+                "  ⎋ Working…\n\
+                  ⠦ 6s > ⬢ Sonnet > 🗺 Plan\n\
+                 ╰─ Ask anything ─╯",
+            ),
+        ];
+        for (name, pane) in cases {
+            assert_eq!(detect_omp_status(pane), Status::Running, "case: {name}");
+        }
+    }
+
+    #[test]
     fn test_detect_omp_status_active_brand_near_misses_idle() {
         let cases = [
             (
@@ -4390,6 +4457,14 @@ Final prose line.\n";
                 "decorated unicode clock-only first segment",
                 "  ⎋ Working…\n❯\n╭── ⏱ 5m ─╮\n╰─",
             ),
+            (
+                "stale band with parked pi footer",
+                "─ Continue Autonomous · ⏱ 2h4m ─\n❯\n───────────────────────────────────\n π · 🖥 linus",
+            ),
+            (
+                "parked claude shape at prompt",
+                "❯\n───────────────────────────────────\n π · 🖥 linus",
+            ),
         ];
         for (name, pane) in cases {
             assert_eq!(detect_omp_status(pane), Status::Idle, "case: {name}");
@@ -4415,6 +4490,11 @@ Final prose line.\n";
                 "lower active band wins",
                 format!("{approval}\n{band}\n╰─"),
                 Status::Running,
+            ),
+            (
+                "lower approval wins over active statusline",
+                format!("{approval}\n❯\n───────────────────────────────────\n ⠏ 28s · 🖥 linus"),
+                Status::Waiting,
             ),
         ];
         for (name, pane, expected) in cases {
