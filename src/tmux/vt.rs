@@ -1,10 +1,11 @@
 //! Shared in-process VT channel.
 //!
-//! A `tmux pipe-pane -IO` stream feeds a pane's raw output into an in-process
+//! A `tmux pipe-pane` stream feeds a pane's raw output into an in-process
 //! [`vt100::Parser`] (a real grid: alt-screen buffer, cursor, mouse/DEC modes),
-//! and the same full-duplex unix socket carries keystroke bytes back to the
-//! pane. tmux still owns the pane (process, persistence, kill-tree); only the
-//! live render/input transport lives here.
+//! and, where tmux can take it safely (`tmux_supports_pipe_pane_input`), the
+//! same full-duplex unix socket carries keystroke bytes back to the pane. tmux
+//! still owns the pane (process, persistence, kill-tree); only the live
+//! render/input transport lives here.
 //!
 //! One [`VtChannel`] per tmux session, shared and refcounted by native live
 //! previews. The channel tears down (disables the pipe, stops the forwarder)
@@ -312,9 +313,9 @@ impl ViewerSignals {
     }
 }
 
-/// `aoe __vt-pipe <socket>`: the bidirectional `pipe-pane -IO` forwarder. tmux
-/// connects the pane's OUTPUT to this process's stdin and the pane's INPUT to
-/// its stdout, so:
+/// `aoe __vt-pipe <socket>`: the `pipe-pane` forwarder. tmux connects the
+/// pane's OUTPUT to this process's stdin and, when armed `-IO`, the pane's
+/// INPUT to its stdout (`-O` only leaves stdout on /dev/null), so:
 ///   - stdin (pane output) -> socket  (a viewer reads it into a vt100 grid)
 ///   - socket -> stdout (pane input)  (a viewer writes keystrokes, no fork)
 ///
@@ -457,14 +458,15 @@ fn lookup_osc52(session: &str) -> Option<Arc<Osc52Channel>> {
 
 /// If `session` has a *live* armed channel, return its current cursor-key mode
 /// (DECCKM): `Some(true)` = application cursor keys (`ESC O A`), `Some(false)` =
-/// normal (`ESC [ A`). `None` means no channel is armed, or its forwarder has
-/// disconnected. Presence of `Some` is the single-writer signal: while live,
-/// ALL pane input must go through [`try_send_input`] (never `send-keys`), so
-/// the two writers don't interleave. Gating on liveness means a dead channel
-/// reports `None` and input falls back to `send-keys` rather than vanishing.
+/// normal (`ESC [ A`). `None` means no channel is armed, it is output-only, or
+/// its forwarder has disconnected. Presence of `Some` is the single-writer
+/// signal: while live, ALL pane input must go through [`try_send_input`]
+/// (never `send-keys`), so the two writers don't interleave. Gating on
+/// liveness means a dead channel reports `None` and input falls back to
+/// `send-keys` rather than vanishing.
 pub(crate) fn input_mode(session: &str) -> Option<bool> {
     lookup(session)
-        .filter(|c| c.is_alive())
+        .filter(|c| c.input && c.is_alive())
         .map(|c| c.app_cursor.load(Ordering::Relaxed))
 }
 
@@ -1016,21 +1018,36 @@ fn strip_trailing_row_terminator(raw: &[u8]) -> &[u8] {
     }
 }
 
-/// `pipe-pane -I` (input injection) landed in tmux 2.8, and a dead-pane write
-/// crash was fixed in 3.4, so we require >= 3.4 before arming a channel. Older
-/// tmux (or a `tmux -V` we can't parse) falls back to the capture path. Cached:
-/// the server version doesn't change under a running aoe.
+/// `pipe-pane -O` landed in tmux 2.8; 3.4 is the floor for arming a channel at
+/// all. Older tmux (or a `tmux -V` we can't parse) falls back to the capture
+/// path. Cached: the server version doesn't change under a running aoe.
 fn tmux_supports_pipe_pane_io(deadline: &crate::tmux::TmuxCommandDeadline) -> bool {
     static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     cached_tmux_support(&SUPPORTED, || {
-        let mut command = crate::tmux::tmux_command();
-        command.arg("-V");
-        let out = deadline.run(&mut command).ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        parse_tmux_pipe_support(&String::from_utf8_lossy(&out.stdout))
+        parse_tmux_pipe_support(&tmux_version(deadline)?)
     })
+}
+
+/// Whether keystrokes may ride the pipe's `-I` side. Through 3.7a, a pane that
+/// exits under `remain-on-exit` frees its pty event but keeps its pipe, so the
+/// next byte the pipe process writes is a NULL `bufferevent_write` that kills
+/// the whole tmux server and every session on it (upstream fix f751d3f, after
+/// 3.7a). Below that, channels arm `-O` only and input stays on `send-keys`.
+fn tmux_supports_pipe_pane_input(deadline: &crate::tmux::TmuxCommandDeadline) -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cached_tmux_support(&SUPPORTED, || {
+        parse_tmux_pipe_input_support(&tmux_version(deadline)?)
+    })
+}
+
+fn tmux_version(deadline: &crate::tmux::TmuxCommandDeadline) -> Option<String> {
+    let mut command = crate::tmux::tmux_command();
+    command.arg("-V");
+    let out = deadline.run(&mut command).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 fn cached_tmux_support(
@@ -1048,6 +1065,14 @@ fn cached_tmux_support(
 }
 
 fn parse_tmux_pipe_support(version: &str) -> Option<bool> {
+    parse_tmux_version(version).map(|v| v >= (3, 4))
+}
+
+fn parse_tmux_pipe_input_support(version: &str) -> Option<bool> {
+    parse_tmux_version(version).map(|v| v >= (3, 8))
+}
+
+fn parse_tmux_version(version: &str) -> Option<(u32, u32)> {
     let digits: String = version
         .trim()
         .trim_start_matches(|c: char| !c.is_ascii_digit())
@@ -1057,7 +1082,7 @@ fn parse_tmux_pipe_support(version: &str) -> Option<bool> {
     let mut parts = digits.split('.');
     let major: u32 = parts.next()?.parse().ok()?;
     let minor: u32 = parts.next()?.parse().ok()?;
-    Some((major, minor) >= (3, 4))
+    Some((major, minor))
 }
 fn cursor_from_screen(screen: &vt100::Screen, rows: u16, cols: u16) -> PaneCursor {
     let (y, x) = screen.cursor_position();
@@ -1490,12 +1515,15 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
     ctx.notify_viewers();
 }
 
-/// One shared pane channel: a vt100 grid fed by a `pipe-pane -IO` byte stream,
+/// One shared pane channel: a vt100 grid fed by a `pipe-pane` byte stream,
 /// plus the writable half of the same socket for keystroke injection. Methods
 /// take `&self` (interior mutability) so many viewers share one `Arc`.
 pub(crate) struct VtChannel {
     /// tmux session name; the registry key.
     name: String,
+    /// Armed `-IO` (keystrokes ride the socket) rather than `-O` only (input
+    /// stays on `send-keys`); see `tmux_supports_pipe_pane_input`.
+    input: bool,
     /// Fencing token for this exact pipe generation.
     owner_id: String,
     /// `name:^.0`, the pane target for tmux commands.
@@ -1756,7 +1784,9 @@ impl VtChannel {
             sh_quote(&exe.to_string_lossy()),
             sh_quote(&sock_path.to_string_lossy())
         );
-        let armed = session.arm_vt_pipe_if_owner_with_deadline(&owner, "-IO", &pipe_cmd, deadline);
+        let input = tmux_supports_pipe_pane_input(deadline);
+        let flags = if input { "-IO" } else { "-O" };
+        let armed = session.arm_vt_pipe_if_owner_with_deadline(&owner, flags, &pipe_cmd, deadline);
         if !armed {
             tracing::warn!(%target, "vt: tmux pipe-pane failed; falling back to capture");
             stop_and_wake_reader(&stop, &sock_path);
@@ -1836,12 +1866,14 @@ impl VtChannel {
             %target,
             cols,
             rows,
+            flags,
             pid = std::process::id(),
-            "vt channel armed (pipe-pane -IO <-> vt100 grid)"
+            "vt channel armed (pipe-pane <-> vt100 grid)"
         );
 
         Some(Self {
             name: name.to_string(),
+            input,
             owner_id: owner,
             target,
             parser,
@@ -2252,6 +2284,9 @@ impl VtChannel {
 
     fn write_input(&self, bytes: &[u8]) -> bool {
         use std::io::Write;
+        if !self.input {
+            return false;
+        }
         let mut guard = self.stream.lock().unwrap();
         match guard.as_mut() {
             Some(stream) => stream.write_all(bytes).is_ok(),
@@ -2588,6 +2623,30 @@ mod tests {
         ];
         for (version, expected) in cases {
             assert_eq!(parse_tmux_pipe_support(version), expected, "{version}");
+        }
+    }
+
+    #[test]
+    fn pipe_input_requires_a_tmux_that_survives_a_dead_pane_write() {
+        // Through 3.7a, tmux keeps the pipe-pane bufferevent after a pane's
+        // process exits under remain-on-exit, so the next byte written to the
+        // dead pane's input is a NULL bufferevent_write that takes the whole
+        // server (every session) down. Output streaming is unaffected.
+        let cases = [
+            ("tmux 3.4", Some(false)),
+            ("tmux 3.5a", Some(false)),
+            ("tmux 3.7a", Some(false)),
+            ("tmux 3.8", Some(true)),
+            ("tmux next-3.8", Some(true)),
+            ("tmux 4.0", Some(true)),
+            ("bad", None),
+        ];
+        for (version, expected) in cases {
+            assert_eq!(
+                parse_tmux_pipe_input_support(version),
+                expected,
+                "{version}"
+            );
         }
     }
 
@@ -3009,9 +3068,18 @@ mod tests {
     /// A hand-built channel (no tmux, no forwarder) for registry / sample
     /// tests. `alive` starts false; flip it via the returned handle.
     fn dummy_channel(name: &str, dir: &std::path::Path) -> (Arc<VtChannel>, Arc<AtomicBool>) {
+        dummy_channel_with_input(name, dir, true)
+    }
+
+    fn dummy_channel_with_input(
+        name: &str,
+        dir: &std::path::Path,
+        input: bool,
+    ) -> (Arc<VtChannel>, Arc<AtomicBool>) {
         let alive = Arc::new(AtomicBool::new(false));
         let ch = Arc::new(VtChannel {
             name: name.to_string(),
+            input,
             owner_id: new_pipe_owner_id(),
             target: format!("{name}:^.0"),
             parser: Arc::new(Mutex::new(vt100::Parser::new(4, 20, SCROLLBACK_LINES))),
@@ -3039,6 +3107,39 @@ mod tests {
             last_owner_hb: Mutex::new(Instant::now()),
         });
         (ch, alive)
+    }
+
+    #[test]
+    fn output_only_channel_never_writes_to_the_pane() {
+        // An output-only channel (tmux without the dead-pane pipe fix) must
+        // steer every keystroke to the send-keys fallback and never touch the
+        // socket, even when a forwarder is connected; a full channel delivers.
+        for (input, delivered) in [(false, false), (true, true)] {
+            let name = format!("aoe_test_vt_input_{input}_{}", std::process::id());
+            let dir = tempfile::tempdir().expect("tempdir");
+            let listener = UnixListener::bind(dir.path().join("s.sock")).expect("bind");
+            let writer = UnixStream::connect(dir.path().join("s.sock")).expect("connect");
+            let (mut pane_side, _) = listener.accept().expect("accept");
+            pane_side
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .expect("read timeout");
+            let (channel, alive) = dummy_channel_with_input(&name, dir.path(), input);
+            *channel.stream.lock().unwrap() = Some(writer);
+            alive.store(true, Ordering::Relaxed);
+            REGISTRY
+                .lock()
+                .unwrap()
+                .insert(name.clone(), Arc::downgrade(&channel));
+
+            assert_eq!(input_mode(&name).is_some(), delivered, "input={input}");
+            assert_eq!(try_send_input(&name, b"x"), delivered, "input={input}");
+            let mut buf = [0u8; 8];
+            let got = pane_side.read(&mut buf).unwrap_or(0);
+            let want: &[u8] = if delivered { b"x" } else { b"" };
+            assert_eq!(&buf[..got], want, "input={input}");
+
+            REGISTRY.lock().unwrap().remove(&name);
+        }
     }
 
     #[test]

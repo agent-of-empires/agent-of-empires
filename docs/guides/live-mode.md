@@ -124,8 +124,10 @@ as a fallback.
 
 The TUI's agent preview and the web dashboard's agent terminal render
 through a persistent VT channel by default: `tmux pipe-pane` streams the
-agent's raw output into an in-process terminal grid, and your keystrokes
-travel back over the same socket. Compared to the polling path
+agent's raw output into an in-process terminal grid, and on tmux 3.8 or
+newer your keystrokes travel back over the same socket (older tmux crashes
+the whole server when that socket writes to a pane whose agent has just
+exited, so there keystrokes stay on `send-keys`). Compared to the polling path
 (`capture-pane` scrapes plus a `send-keys` fork per keystroke), typing
 echo and streaming output land with near-attach latency, agent copies
 (OSC 52) reach your clipboard, and a full-screen agent that brackets its
