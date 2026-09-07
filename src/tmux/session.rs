@@ -3886,6 +3886,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_is_pane_dead_targets_window_zero_with_multiple_windows() {
+        use crate::tmux::test_helpers::pane_field;
+
         if !tmux_available() {
             eprintln!("Skipping test: tmux not available");
             return;
@@ -3917,6 +3919,7 @@ mod tests {
             .output()
             .expect("tmux new-session");
         assert!(output.status.success());
+        let first_pane = only_pane_id(&session_name);
 
         // Force base-index 1 and pane-base-index 1 to simulate users who
         // have both set in their tmux.conf.
@@ -3931,19 +3934,31 @@ mod tests {
             .expect("tmux set-option pane-base-index");
         assert!(output.status.success());
 
-        // Create a second window with a command that exits immediately
+        // Keep the exited pane active so a wrong window target cannot pass.
         let output = crate::tmux::tmux_command()
             .args([
                 "new-window",
+                "-P",
+                "-F",
+                "#{pane_id}",
                 "-t",
                 &session_name,
-                "true", // exits immediately
+                "true",
+                ";",
+                "set-option",
+                "-p",
+                "-t",
+                &session_name,
+                "remain-on-exit",
+                "on",
             ])
             .output()
             .expect("tmux new-window");
         assert!(output.status.success());
-
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        let second_pane = String::from_utf8(output.stdout).unwrap().trim().to_string();
+        wait_for_pane_dead(&second_pane);
+        assert_eq!(pane_field(&first_pane, "#{pane_dead}"), "0");
+        assert_eq!(pane_field(&session_name, "#{pane_id}"), second_pane);
 
         // The agent pane (first window) is still alive, so is_pane_dead should
         // return false even though the second window's pane has exited.
