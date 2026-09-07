@@ -686,18 +686,20 @@ exec /usr/bin/env -i PATH="$TARGET_PATH" SHELL="$FALLBACK_SHELL" "$@"
         #[test]
         #[serial_test::serial]
         fn kills_dead_pane_session() {
+            use crate::tmux::test_helpers::{only_pane_id, wait_for_pane_dead, TmuxTestSession};
+
             if !tmux_available() {
                 eprintln!("Skipping: tmux not available");
                 return;
             }
             let inst = Instance::new("ktid_dead", "/tmp");
             let name = crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title);
+            let _guard = TmuxTestSession::from_name(name.clone());
             // `true` exits immediately; remain-on-exit keeps the session alive
             // with a dead pane (matches the production failure mode: shell
             // exited via Ctrl+D / `exit` / SIGHUP, session still listed).
             spawn_remain_on_exit(&name, "true");
-            // Allow the pane to transition to dead.
-            std::thread::sleep(std::time::Duration::from_millis(300));
+            wait_for_pane_dead(&only_pane_id(&name));
 
             let session = inst.terminal_tmux_session().unwrap();
             assert!(
