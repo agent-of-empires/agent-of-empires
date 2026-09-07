@@ -5162,7 +5162,7 @@ mod tests {
             .expect("tmux new-session");
         assert!(output.status.success());
 
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        wait_for_pane_command(&only_pane_id(&session_name), "sleep");
 
         assert!(
             !is_pane_running_shell(&session_name),
