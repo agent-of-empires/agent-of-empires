@@ -2944,7 +2944,7 @@ mod tests {
         assert!(out.status.success());
         refresh_session_cache();
         let session = Session::from_name(guard.name());
-        std::thread::sleep(Duration::from_millis(300));
+        wait_for_pane_text(&session, "line-");
 
         // tmux dispatches the chained probe/capture/probe in one event-loop
         // turn, so locally every frame is consistent and the suppression
