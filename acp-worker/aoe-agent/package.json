@@ -16,7 +16,7 @@
     "node": ">=22.0.0"
   },
   "dependencies": {
-    "@agentclientprotocol/sdk": "^1.0.0",
+    "@agentclientprotocol/sdk": "^1.4.0",
     "@ai-sdk/anthropic": "^4.0.46",
     "@ai-sdk/google": "^4.0.58",
     "@ai-sdk/openai": "^4.0.52",
