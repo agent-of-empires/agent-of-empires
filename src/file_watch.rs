@@ -1442,38 +1442,40 @@ mod tests {
         );
     }
 
-    /// Observe each path before writing the next so FSEvents cannot coalesce
-    /// both writes into one batch.
-    #[tokio::test]
-    #[serial(file_watch)]
-    async fn debounce_per_subscription_per_path_independent() {
-        let dir = TempDir::new().unwrap();
-        let svc = FileWatchService::new().expect("init");
-        let a = dir.path().join("a");
-        let b = dir.path().join("b");
-        let (mut rx, _h) = svc
-            .subscribe_channel(
-                WatchSpec {
-                    dir: dir.path().to_path_buf(),
-                    matcher: FileMatcher::AnyOf(vec![a, b]),
-                    debounce: Some(Duration::from_millis(75)),
+    // No dispatcher runs between injections, so both paths coexist until fire_due.
+    #[test]
+    fn debounce_per_subscription_per_path_independent() {
+        let svc = FileWatchService::noop();
+        let dir = PathBuf::from("/watched");
+        let paths = [dir.join("a"), dir.join("b")];
+        let receivers = [SubscriptionId(1), SubscriptionId(2)].map(|id| {
+            let (tx, rx) = mpsc::channel(2);
+            svc.inner.lock().unwrap().subscriptions.insert(
+                id,
+                Subscription {
+                    spec: WatchSpec {
+                        dir: dir.clone(),
+                        matcher: FileMatcher::AnyOf(paths.to_vec()),
+                        debounce: Some(Duration::ZERO),
+                    },
+                    sink: DeliverySink(tx),
                 },
-                32,
-            )
-            .expect("subscribe");
+            );
+            rx
+        });
 
-        for (name, contents) in [("a", "x"), ("b", "y")] {
-            write_file(dir.path(), name, contents);
-            timeout(KERNEL_WAIT, async {
-                loop {
-                    let event = rx.recv().await.expect("watch channel remains open");
-                    if event.path.file_name() == Some(std::ffi::OsStr::new(name)) {
-                        break;
-                    }
-                }
-            })
-            .await
-            .unwrap_or_else(|_| panic!("expected event for {name}"));
+        for path in &paths {
+            dispatch_path(&svc, path, FileEventKind::Upserted, EventSource::Local);
+        }
+        fire_due(&svc);
+
+        for mut rx in receivers {
+            let mut received = [
+                rx.try_recv().expect("first path delivered").path,
+                rx.try_recv().expect("second path delivered").path,
+            ];
+            received.sort();
+            assert_eq!(received, paths);
         }
     }
 
