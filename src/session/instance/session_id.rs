@@ -1213,6 +1213,7 @@ mod tests {
         inst.capture_started_at = Some(std::time::SystemTime::now());
         inst.maybe_start_poller_since(None);
         assert!(inst.session_id_poller.is_some());
+        inst.stop_poller();
     }
 
     #[test]

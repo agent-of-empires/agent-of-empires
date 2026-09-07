@@ -2090,6 +2090,7 @@ fn worktree_name_edit_updates_path_and_optionally_branch() {
 }
 
 #[test]
+#[serial_test::serial]
 fn apply_post_restart_sync_propagates_agent_session_id() {
     // Models the rapid double-restart case: in-memory state is stale
     // (agent_session_id = None) because the 2s status poller hasn't

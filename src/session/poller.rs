@@ -703,6 +703,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_poller_detects_change() {
         let call_count = Arc::new(Mutex::new(0u32));
         let call_count_clone = call_count.clone();
@@ -719,22 +720,27 @@ mod tests {
 
         let changed_ids: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let changed_ids_clone = changed_ids.clone();
+        let (changed_tx, changed_rx) = mpsc::channel();
         let on_change: Box<dyn Fn(&str) + Send + 'static> = Box::new(move |id: &str| {
             lock_unpoisoned(&changed_ids_clone).push(id.to_string());
+            if id == "id-2" {
+                let _ = changed_tx.send(());
+            }
         });
 
         let mut poller = SessionPoller::new("test-session".to_string());
-        poller.start(
+        assert!(poller.start(
             "test-change".to_string(),
             poll_fn,
             on_change,
             Some("id-1".to_string()),
-        );
+        ));
 
-        // Wait for the adaptive interval (2s initial) to fire at least once.
-        std::thread::sleep(Duration::from_millis(2500));
+        changed_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the changed observation must be published before retrying it");
         poller.retry_last_observation();
-        std::thread::sleep(Duration::from_millis(100));
+        // Stop follows RetryLast on the same FIFO and joins every callback.
         poller.stop();
 
         let ids = lock_unpoisoned(&changed_ids);
@@ -889,6 +895,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_poller_starts_polling_immediately() {
         let poll_count = Arc::new(Mutex::new(0u32));
         let poll_count_clone = poll_count.clone();
