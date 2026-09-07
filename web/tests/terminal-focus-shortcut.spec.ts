@@ -141,31 +141,29 @@ test.describe("Cmd/Ctrl+` desktop", () => {
 
   test("agent latch fires once ensureSession resolves (slow agent)", async ({ page }) => {
     await mockTerminalApis(page);
-    await page.route("**/api/sessions/*/ensure", async (r) => {
-      await new Promise((res) => setTimeout(res, 1500));
-      await r.fulfill({ json: { ok: true } });
+    let releaseSession!: () => void;
+    const sessionPending = new Promise<void>((resolve) => {
+      releaseSession = resolve;
+    });
+    let requested = false;
+    await page.route("**/api/sessions/*/ensure", async (route) => {
+      requested = true;
+      await sessionPending;
+      await route.fulfill({ json: { ok: true } });
     });
 
-    await page.goto("/");
-    await clickSidebarSession(page, "pinch-test");
-
-    // Wait for paired to be ready (its ensureTerminal isn't delayed); use
-    // it as the focus source so target=agent. Activate its tab first so the
-    // paired shell mounts (tabbed docks #2437).
-    await page.locator('[data-testid^="pane-tab-terminal:"]').first().click();
-    const paired = page.locator('[data-term="paired"]:visible').first();
-    await expect(paired.locator("[data-live-terminal]")).toBeVisible();
-    await paired.locator("textarea").focus();
-    await expect.poll(() => focusedKind(page)).toBe("paired");
-
-    // Agent terminal still mounted as "Starting session..." so its xterm
-    // textarea doesn't exist yet. Press Cmd+` → target=agent → listener
-    // sets the pending latch.
-    await page.keyboard.press("ControlOrMeta+`");
-
-    // ensureSession resolves, ensureState flips to ready, consume effect
-    // fires, focus lands on agent.
-    await expect.poll(() => focusedKind(page), { timeout: 3000 }).toBe("agent");
+    try {
+      // A sidebar click would already arm the agent-focus latch.
+      await page.goto("/session/pinch-test");
+      await expect.poll(() => requested).toBe(true);
+      await focusKind(page, "paired");
+      await expect.poll(() => focusedKind(page)).toBe("paired");
+      await expect(page.locator('[data-term="agent"] textarea')).toHaveCount(0);
+      await page.keyboard.press("ControlOrMeta+`");
+    } finally {
+      releaseSession();
+    }
+    await expect.poll(() => focusedKind(page)).toBe("agent");
   });
 
   test("with diff viewer open, Cmd+` to agent closes the diff", async ({ page }, _testInfo) => {
