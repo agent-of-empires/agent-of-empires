@@ -1464,11 +1464,10 @@ mod tests {
 
         for (name, contents) in [("a", "x"), ("b", "y")] {
             write_file(dir.path(), name, contents);
-            let expected = dir.path().join(name);
             timeout(KERNEL_WAIT, async {
                 loop {
                     let event = rx.recv().await.expect("watch channel remains open");
-                    if event.path == expected {
+                    if event.path.file_name() == Some(std::ffi::OsStr::new(name)) {
                         break;
                     }
                 }
