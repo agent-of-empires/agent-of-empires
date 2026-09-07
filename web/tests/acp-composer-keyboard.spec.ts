@@ -141,11 +141,9 @@ test.describe("Structured-view composer keyboard reservation (#2011)", () => {
 
     // iOS regular Safari: visualViewport shrinks but innerHeight stays full.
     await simulateKeyboardOpen(page, 300);
-    await page.waitForTimeout(400);
-
     // The root reserves ~keyboard height so the flex-1 viewport shrinks and the
     // composer lifts above the keyboard.
-    expect(await rootPaddingBottom(page)).toBeGreaterThanOrEqual(250);
+    await expect.poll(() => rootPaddingBottom(page)).toBeGreaterThanOrEqual(250);
   });
 
   test("does NOT reserve when the layout viewport already shrinks (PWA / Android, innerHeight shrinks)", async ({
