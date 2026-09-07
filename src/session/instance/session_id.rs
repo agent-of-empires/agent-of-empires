@@ -803,7 +803,9 @@ impl Instance {
         let Some(id) = self.prime_published_root_session_id() else {
             return false;
         };
-        if self.agent_session_id.as_deref() == Some(id.as_str()) {
+        if self.retroactive_capture_excludes.contains(&id)
+            || self.agent_session_id.as_deref() == Some(id.as_str())
+        {
             return false;
         }
         self.agent_session_id = Some(id);
@@ -1915,6 +1917,7 @@ process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
             .unwrap();
         let prepared = restarted.prepare_launch_command().unwrap();
         assert!(prepared.command.as_deref().unwrap().contains(parent_id));
+        let excluded_prepared = restarted.prepare_launch_command().unwrap();
         let newer_id = "018f47a6-7b80-7cc3-98a2-37b5f486b2a3";
         std::fs::write(
             sessions.join("newer.jsonl"),
@@ -1937,6 +1940,36 @@ process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
             "/root/.prime/agent/custom-sessions/newer.jsonl",
         )
         .unwrap();
+        for stored in [None, Some(parent_id.to_string())] {
+            let mut excluded = restarted.clone();
+            excluded.agent_session_id = stored.clone();
+            excluded
+                .retroactive_capture_excludes
+                .insert(newer_id.to_string());
+            let mut command = "prime-agent".to_string();
+            excluded.apply_session_flags(&mut command, "test").unwrap();
+            assert_eq!(excluded.agent_session_id, stored);
+            assert!(!command.contains(newer_id), "{command}");
+        }
+        let mut excluded = restarted.clone();
+        excluded
+            .retroactive_capture_excludes
+            .insert(newer_id.to_string());
+        let excluded_launch = excluded
+            .refresh_prepared_prime_launch_after_quiescence(excluded_prepared)
+            .unwrap();
+        assert_eq!(excluded.agent_session_id.as_deref(), Some(parent_id));
+        assert!(excluded_launch
+            .command
+            .as_deref()
+            .unwrap()
+            .contains(parent_id));
+        assert!(!excluded_launch
+            .command
+            .as_deref()
+            .unwrap()
+            .contains(newer_id));
+
         let prepared = restarted
             .refresh_prepared_prime_launch_after_quiescence(prepared)
             .unwrap();
