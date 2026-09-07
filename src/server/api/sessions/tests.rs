@@ -737,41 +737,40 @@ async fn wait_until_left_starting_returns_immediately_if_already_left() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn wait_until_left_starting_resolves_on_broadcast() {
     let mut inst = Instance::new("starting", "/tmp/wait-b");
     inst.id = "wait-resolves".to_string();
     inst.status = Status::Starting;
     let state = crate::server::test_support::build_test_app_state(vec![inst]);
 
-    let updater_state = state.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        {
-            let mut instances = updater_state.instances.write().await;
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == "wait-resolves") {
-                inst.status = Status::Waiting;
-            }
-        }
-        let _ = updater_state
-            .status_tx
-            .send(crate::server::push::StatusChange {
-                instance_id: "wait-resolves".to_string(),
-                instance_title: "starting".to_string(),
-                old: Status::Starting,
-                new: Status::Waiting,
-                at: chrono::Utc::now(),
-            });
-    });
+    let waiter =
+        wait_until_left_starting(&state, "wait-resolves", std::time::Duration::from_secs(5));
+    tokio::pin!(waiter);
+    assert!(futures_util::poll!(waiter.as_mut()).is_pending());
+    {
+        let mut instances = state.instances.write().await;
+        instances
+            .iter_mut()
+            .find(|i| i.id == "wait-resolves")
+            .unwrap()
+            .status = Status::Waiting;
+    }
+    state
+        .status_tx
+        .send(crate::server::push::StatusChange {
+            instance_id: "wait-resolves".to_string(),
+            instance_title: "starting".to_string(),
+            old: Status::Starting,
+            new: Status::Waiting,
+            at: chrono::Utc::now(),
+        })
+        .expect("the waiter must be subscribed before the transition");
 
-    let started = std::time::Instant::now();
-    let result =
-        wait_until_left_starting(&state, "wait-resolves", std::time::Duration::from_secs(5)).await;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+        .await
+        .expect("the broadcast must resolve before the fallback timeout");
     assert_eq!(result.map(|i| i.status), Some(Status::Waiting));
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(2),
-        "must resolve promptly off the broadcast, not sit out the full timeout"
-    );
 }
 
 #[tokio::test]
