@@ -896,30 +896,22 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_poller_starts_polling_immediately() {
-        let poll_count = Arc::new(Mutex::new(0u32));
-        let poll_count_clone = poll_count.clone();
-
-        let poll_fn: Box<dyn Fn() -> Option<String> + Send + 'static> = Box::new(move || {
-            let mut count = lock_unpoisoned(&poll_count_clone);
-            *count += 1;
-            Some("ses_polled".to_string())
-        });
-
-        let on_change: Box<dyn Fn(&str) + Send + 'static> = Box::new(|_| {});
-
+    fn test_poller_publishes_before_waiting_for_commands() {
         let mut poller = SessionPoller::new("test-session".to_string());
-        poller.start("test-immediate".to_string(), poll_fn, on_change, None);
+        // Disconnection prevents either a periodic tick or Stop's final poll.
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        drop(cmd_tx);
+        poller.cmd_rx = Some(cmd_rx);
+        let (observed_tx, observed_rx) = mpsc::channel();
 
-        std::thread::sleep(Duration::from_millis(100));
-
-        let count = *lock_unpoisoned(&poll_count);
-        assert!(
-            count > 0,
-            "poller should have started polling immediately (count={})",
-            count
-        );
-
+        assert!(poller.start(
+            "test-immediate".to_string(),
+            Box::new(|| Some("ses_polled".to_string())),
+            Box::new(move |id| observed_tx.send(id.to_string()).unwrap()),
+            None,
+        ));
         poller.stop();
+
+        assert_eq!(observed_rx.try_recv().unwrap(), "ses_polled");
     }
 }
