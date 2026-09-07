@@ -2519,7 +2519,9 @@ pub(crate) fn build_create_args(
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_helpers::TmuxTestSession;
+    use super::super::test_helpers::{
+        only_pane_id, wait_for_pane_command, wait_for_pane_dead, TmuxTestSession,
+    };
     use super::*;
 
     /// Helper: check if tmux is available for tests that need it
@@ -2529,63 +2531,6 @@ mod tests {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
-    }
-
-    /// The tmux id (`%N`) of `session_name`'s only pane. Call right after
-    /// `new-session`, before any split or extra window, so `-t <session>`
-    /// resolves unambiguously.
-    fn only_pane_id(session_name: &str) -> String {
-        let out = crate::tmux::tmux_command()
-            .args(["display-message", "-t", session_name, "-p", "#{pane_id}"])
-            .output()
-            .expect("tmux display-message");
-        let id = String::from_utf8(out.stdout)
-            .expect("utf8")
-            .trim()
-            .to_string();
-        assert!(!id.is_empty(), "no pane id for session {session_name}");
-        id
-    }
-
-    /// Block until `pane_id` reports `expected` as its current command.
-    ///
-    /// tmux runs a single-string pane command (`"sleep 30"`) through the
-    /// user's shell, so `pane_current_command` reports that shell, which
-    /// `is_shell_command` matches, until it execs into the real command.
-    /// A fixed sleep is a bet on that exec having happened. The window it
-    /// has to cover is the shell's own startup, around 100ms on an idle
-    /// machine and several times that when the suite is competing for
-    /// cores, so the bet loses under load; wait for the exec instead.
-    ///
-    /// Keyed on the pane's own id rather than the `^.0` target so the wait
-    /// never depends on the pane resolution the callers' assertions exist to
-    /// exercise: a targeting regression still fails on the assertion with its
-    /// own message instead of timing out here.
-    fn wait_for_pane_command(pane_id: &str, expected: &str) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let current = crate::tmux::tmux_command()
-                .args([
-                    "display-message",
-                    "-t",
-                    pane_id,
-                    "-p",
-                    "#{pane_current_command}",
-                ])
-                .output()
-                .ok()
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .map(|s| s.trim().to_string())
-                .unwrap_or_default();
-            if current == expected {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "pane {pane_id} still reports {current:?}, expected {expected:?}"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
     }
 
     /// Create a detached session for the composite tests, applying the guards
@@ -3669,8 +3614,7 @@ mod tests {
             .expect("tmux new-session");
         assert!(output.status.success());
 
-        // Wait for the sleep command to finish
-        std::thread::sleep(std::time::Duration::from_millis(1500));
+        wait_for_pane_dead(&only_pane_id(&session_name));
 
         // Session should still exist (remain-on-exit keeps it)
         let exists = crate::tmux::tmux_command()
