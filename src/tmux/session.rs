@@ -2912,15 +2912,13 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn capture_with_cursor_stays_consistent_under_streaming_load() {
+    fn capture_remains_available_under_streaming_load() {
         if !tmux_available() {
             eprintln!("Skipping test: tmux not available");
             return;
         }
         let guard = TmuxTestSession::new("aoe_test_race");
-        // A pane that scrolls as fast as tmux can ingest. The trailing
-        // `set-option pane-base-index 0` chain mirrors `append_pane_base_index_args`
-        // so `^.0` resolves on hosts with `pane-base-index 1` set globally (see #2231).
+        // Match production pane indexing even when tmux.conf uses pane-base-index 1.
         let out = crate::tmux::tmux_command()
             .args([
                 "new-session",
@@ -2946,18 +2944,15 @@ mod tests {
         let session = Session::from_name(guard.name());
         wait_for_pane_text(&session, "line-");
 
-        // tmux dispatches the chained probe/capture/probe in one event-loop
-        // turn, so locally every frame is consistent and the suppression
-        // never fires; the guard exists for loaded/remote tmux servers
-        // where output processing can interleave. Under load the call must
-        // never error, and a reported cursor must always have matching
-        // probes by construction. (The idle-pane Some-cursor case is
-        // covered by capture_pane_with_cursor_returns_content_and_cursor.)
+        // Cursor mapping is covered by the deterministic merge_cursor_probes tests.
         for _ in 0..30 {
             let (content, _cursor) = session
                 .capture_pane_with_cursor(50)
                 .expect("capture should not error under load");
-            assert!(!content.is_empty(), "streaming pane captures content");
+            assert!(
+                content.contains("line-"),
+                "capture must contain producer output"
+            );
         }
     }
 
