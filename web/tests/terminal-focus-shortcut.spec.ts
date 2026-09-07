@@ -112,27 +112,31 @@ test.describe("Cmd/Ctrl+` desktop", () => {
 
   test("paired latch fires once ensureTerminal resolves (slow paired)", async ({ page }) => {
     await mockTerminalApis(page);
-    // Override the host-shell ensure with a 1500ms delay BEFORE goto.
-    // Routes are matched in reverse registration order, so this wins over
-    // the wildcard inside mockTerminalApis.
-    await page.route("**/api/sessions/*/terminal", async (r) => {
-      await new Promise((res) => setTimeout(res, 1500));
-      await r.fulfill({ status: 200, body: "" });
+    let releaseTerminal!: () => void;
+    const terminalPending = new Promise<void>((resolve) => {
+      releaseTerminal = resolve;
+    });
+    let requested = false;
+    await page.route("**/api/sessions/*/terminal*", async (route) => {
+      if (route.request().method() !== "POST") return route.fallback();
+      requested = true;
+      await terminalPending;
+      await route.fulfill({ status: 200, body: "" });
     });
 
-    await page.goto("/");
-    await clickSidebarSession(page, "pinch-test");
-    await expect(page.locator('[data-term="agent"]')).toHaveCount(1);
-
-    // Press Cmd+` immediately while paired is still in its "Starting…"
-    // state. focusSelf in PairedTerminal can't find a textarea, so the
-    // listener calls setPendingTerminalFocus("paired").
-    await focusKind(page, "agent");
-    await page.keyboard.press("ControlOrMeta+`");
-
-    // Within 3s the ensureTerminal mock returns, ready flips true,
-    // the consume-on-ready effect fires, focus lands in paired.
-    await expect.poll(() => focusedKind(page), { timeout: 3000 }).toBe("paired");
+    try {
+      await page.goto("/");
+      await openSession(page);
+      await page.locator('[data-testid^="pane-tab-terminal:"]').first().click();
+      await expect.poll(() => requested).toBe(true);
+      await focusKind(page, "agent");
+      await expect.poll(() => focusedKind(page)).toBe("agent");
+      await expect(page.locator('[data-term="paired"] textarea')).toHaveCount(0);
+      await page.keyboard.press("ControlOrMeta+`");
+    } finally {
+      releaseTerminal();
+    }
+    await expect.poll(() => focusedKind(page)).toBe("paired");
   });
 
   test("agent latch fires once ensureSession resolves (slow agent)", async ({ page }) => {
