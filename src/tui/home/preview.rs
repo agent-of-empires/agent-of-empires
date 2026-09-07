@@ -203,6 +203,11 @@ pub(in crate::tui) struct PreviewCache {
     /// `crate::tui::links` re-anchors each one to the row that shows its text,
     /// and finds plain URLs in the rows themselves.
     pub(in crate::tui) links: Vec<crate::tmux::osc8::PaneLink>,
+    /// Value of the pane's link generation when `links` was collected. The
+    /// rendered grid can be byte-identical across a target change (vt100 strips
+    /// both sequences and the sample dedupes), so `parsed_text` alone is not a
+    /// sufficient trigger to re-collect.
+    pub(in crate::tui) links_generation: u64,
 }
 
 impl PreviewCache {
@@ -220,11 +225,22 @@ impl PreviewCache {
             self.links.clear();
             return;
         }
+        let generation = self
+            .capture_target
+            .as_deref()
+            .map(crate::tmux::pane_links_generation)
+            .unwrap_or(0);
         if self.parsed_text.is_none() {
             self.parsed_text = Some(crate::tui::components::preview::parse_output_text(
                 &self.content,
             ));
             self.links = self.collect_links();
+            self.links_generation = generation;
+        } else if generation != self.links_generation {
+            // The pane repointed a label without changing a single cell. The
+            // text cache is still correct; the targets behind it are not.
+            self.links = self.collect_links();
+            self.links_generation = generation;
         }
     }
 

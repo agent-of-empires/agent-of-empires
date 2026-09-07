@@ -136,14 +136,19 @@ mod tests {
             "ssh with no display cannot reach them"
         );
 
-        // ...unless X11 forwarding puts the display back on their machine.
-        std::env::set_var("DISPLAY", "localhost:10.0");
-        assert!(browser_reachable(), "forwarded display reaches them");
-        std::env::remove_var("DISPLAY");
+        // The rest only holds where the launcher reads these at all, which is
+        // the unix backend. macOS has its own test below.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            // ...unless X11 forwarding puts the display back on their machine.
+            std::env::set_var("DISPLAY", "localhost:10.0");
+            assert!(browser_reachable(), "forwarded display reaches them");
+            std::env::remove_var("DISPLAY");
 
-        // An explicit BROWSER is a deliberate choice; honour it either way.
-        std::env::set_var("BROWSER", "my-forwarder");
-        assert!(browser_reachable(), "an explicit BROWSER always wins");
+            // An explicit BROWSER is a deliberate choice; honor it.
+            std::env::set_var("BROWSER", "my-forwarder");
+            assert!(browser_reachable(), "an explicit BROWSER wins");
+        }
     }
 
     /// On macOS the launcher goes straight to `NSWorkspace` and reads neither

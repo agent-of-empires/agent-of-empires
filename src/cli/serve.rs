@@ -156,7 +156,8 @@ pub struct ServeArgs {
     /// Ignored in a build with no dashboard bundle, under --daemon or --remote,
     /// and whenever no browser the user could see is reachable (see
     /// `tui::open_url`): over SSH without a forwarded display, or on Linux/BSD
-    /// with no display server. `BROWSER` overrides the check.
+    /// with no display server. `BROWSER` overrides the check on platforms whose
+    /// launcher reads it, which excludes macOS.
     #[arg(long)]
     pub open: bool,
 

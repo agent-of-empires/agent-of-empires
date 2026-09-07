@@ -198,6 +198,34 @@ fn hovering_a_link_reveals_its_target_before_the_click() {
 
 #[test]
 #[serial]
+fn a_repointed_label_refreshes_even_when_the_grid_is_identical() {
+    // vt100 strips both sequences, so a pane that reprints the same label
+    // against a new target produces byte-identical content and an identical
+    // cursor. Keying only on the rendered text would keep serving the old
+    // target, and the backend would faithfully re-emit it.
+    let mut env = create_test_env_empty();
+    stage(
+        &mut env,
+        &["see the docs now"],
+        vec![link("the docs", "https://example.com/a")],
+    );
+    env.view.preview_cache.links_generation = 1;
+    assert_eq!(
+        env.view.preview_link_at(PANE.x + 4, PANE.y).as_deref(),
+        Some("https://example.com/a")
+    );
+
+    // The grid is untouched; only the advertised target moved.
+    env.view.preview_cache.links = vec![link("the docs", "https://example.com/b")];
+    assert_eq!(
+        env.view.preview_link_at(PANE.x + 4, PANE.y).as_deref(),
+        Some("https://example.com/b"),
+        "a repointed label must resolve to its new target"
+    );
+}
+
+#[test]
+#[serial]
 fn capture_frames_carry_their_own_targets_through_the_parse() {
     // With the VT transport off the frame text still holds the sequences, so
     // the cache collects them as it strips them for `ansi-to-tui`.

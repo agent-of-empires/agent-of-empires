@@ -732,7 +732,7 @@ struct SeedSink<'a> {
     parser: &'a Mutex<vt100::Parser>,
     app_cursor: &'a AtomicBool,
     grid_gen: &'a AtomicU64,
-    links: &'a Mutex<VecDeque<PaneLink>>,
+    links: &'a LinkTable,
 }
 
 fn seed_parser(
@@ -746,8 +746,7 @@ fn seed_parser(
     let Some(stream) = capture_seed_stream(target, rows, deadline) else {
         return VtRefreshResult::Failed;
     };
-    record_seed_links(sink.links, &stream);
-    swap_seeded_parser(
+    let result = swap_seeded_parser(
         sink.parser,
         sink.app_cursor,
         sink.grid_gen,
@@ -755,7 +754,13 @@ fn seed_parser(
         &stream,
         size,
         chunk_guard,
-    )
+    );
+    // Only a seed that actually landed describes what is on screen. Recording
+    // one that lost its race would leave targets for rows the grid never took.
+    if result == VtRefreshResult::Refreshed {
+        record_seed_links(sink.links, &stream);
+    }
+    result
 }
 /// Capture the pane and weave its modes and cursor into one replayable byte
 /// stream, or `None` when the pane could not be captured. Split from the swap
@@ -1367,26 +1372,33 @@ struct ReaderCtx {
     /// first-chunk special case must not see seed bumps.
     grid_gen: Arc<AtomicU64>,
     /// OSC 8 hyperlinks seen in the stream (see [`VtChannel::links`]).
-    links: Arc<Mutex<VecDeque<PaneLink>>>,
+    links: Arc<LinkTable>,
     signals: Arc<ViewerSignals>,
 }
 
 /// Fold newly scanned links into a channel's table, newest last. A repeat of a
 /// target already held moves to the end rather than duplicating, so a prompt
 /// that reprints the same link does not evict the rest of the table.
-fn record_links(slot: &Mutex<VecDeque<PaneLink>>, found: Vec<PaneLink>) {
+fn record_links(slot: &LinkTable, found: Vec<PaneLink>) {
     if found.is_empty() {
         return;
     }
-    let Ok(mut table) = slot.lock() else {
+    let Ok(mut table) = slot.table.lock() else {
         return;
     };
+    let before: Vec<PaneLink> = table.iter().cloned().collect();
     for link in found {
         table.retain(|held| *held != link);
         table.push_back(link);
         while table.len() > crate::tmux::osc8::MAX_PANE_LINKS {
             table.pop_front();
         }
+    }
+    // Bump only on a real change, and on reordering too: the newest entry wins
+    // ties in `resolve_overlaps`, so a label repointed from A to B changes what
+    // a click resolves without changing the table's length.
+    if before.iter().ne(table.iter()) {
+        slot.generation.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -1398,8 +1410,19 @@ fn record_links(slot: &Mutex<VecDeque<PaneLink>>, found: Vec<PaneLink>) {
 /// which keeps a link that is still on screen recorded no matter how long ago
 /// its sequence left the stream. Recorded even when the swap loses its race:
 /// the pane advertised the link either way.
-fn record_seed_links(slot: &Mutex<VecDeque<PaneLink>>, stream: &[u8]) {
+fn record_seed_links(slot: &LinkTable, stream: &[u8]) {
     record_links(slot, crate::tmux::osc8::extract_links(stream));
+}
+
+/// A channel's link table plus a counter that moves whenever it does.
+///
+/// The counter exists because the grid can be byte-identical across a target
+/// change: vt100 strips both sequences, the sampled content dedupes, and a
+/// consumer keyed on the rendered text alone would keep serving the old target.
+#[derive(Debug, Default)]
+pub(crate) struct LinkTable {
+    table: Mutex<VecDeque<PaneLink>>,
+    generation: AtomicU64,
 }
 
 /// Hyperlinks `session`'s pane has advertised via OSC 8, oldest first. Empty
@@ -1407,8 +1430,20 @@ fn record_seed_links(slot: &Mutex<VecDeque<PaneLink>>, stream: &[u8]) {
 /// frame text instead, so the TUI reads those straight off the content.
 pub(crate) fn pane_links(session: &str) -> Vec<PaneLink> {
     lookup(session)
-        .and_then(|c| c.links.lock().ok().map(|t| t.iter().cloned().collect()))
+        .and_then(|c| {
+            c.links
+                .table
+                .lock()
+                .ok()
+                .map(|t| t.iter().cloned().collect())
+        })
         .unwrap_or_default()
+}
+
+/// How many times `session`'s link table has changed. Cheaper than cloning the
+/// table to find out, so a consumer can watch it every frame.
+pub(crate) fn pane_links_generation(session: &str) -> u64 {
+    lookup(session).map_or(0, |c| c.links.generation.load(Ordering::Acquire))
 }
 
 impl ReaderCtx {
@@ -1475,12 +1510,6 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
                     }
                     ctx.signals.publish_clipboard(text);
                 }
-                // The parser drops OSC 8 the same way, and a vt100 cell has
-                // nowhere to keep a target, so this tap is the only record of
-                // what the pane's hyperlinks point at (#3735). Runs on
-                // pre-seed chunks too: the seed snapshot can carry the link
-                // text onto the grid without the sequence that wrapped it.
-                record_links(&ctx.links, osc8.feed(&buf[..n]));
                 // Claim every read before waiting on the parser. An
                 // authoritative seed that captured this output must then see
                 // the changed sequence and return Busy instead of installing a
@@ -1497,6 +1526,11 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
                     }
                     continue;
                 }
+                // Below the seed gate on purpose, unlike the OSC 52 tap above:
+                // a dropped pre-seed chunk never reaches the grid, and the seed
+                // snapshot carries its links instead, so recording here would
+                // leave targets for text that was never accepted.
+                record_links(&ctx.links, osc8.feed(&buf[..n]));
                 if let Ok(mut p) = ctx.parser.lock() {
                     p.process(&buf[..n]);
                     ctx.app_cursor
@@ -1580,7 +1614,7 @@ pub(crate) struct VtChannel {
     clipboard: Arc<Mutex<Option<String>>>,
     /// OSC 8 hyperlinks the reader thread has seen, oldest first and capped at
     /// `MAX_LINKS`. Read through [`pane_links`].
-    links: Arc<Mutex<VecDeque<PaneLink>>>,
+    links: Arc<LinkTable>,
     /// Number of chunks the reader has parsed. `0` means none yet, so
     /// `chunk_timing` reports `None` and the caller leaves pacing untouched.
     chunk_seq: Arc<AtomicU64>,
@@ -1756,7 +1790,7 @@ impl VtChannel {
         let app_cursor = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(false));
         let clipboard: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        let links: Arc<Mutex<VecDeque<PaneLink>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let links: Arc<LinkTable> = Arc::new(LinkTable::default());
         // Bind the socket inside an owner-only (0700) directory so other users
         // on a shared host cannot connect to the pane channel and capture
         // keystrokes or spoof rendered output (mirrors the worker-dir
@@ -2056,7 +2090,6 @@ impl VtChannel {
         let Some(stream) = capture_seed_stream(&self.target, rows, deadline) else {
             return VtRefreshResult::Failed;
         };
-        record_seed_links(&self.links, &stream);
         let result = swap_seeded_parser(
             &self.parser,
             &self.app_cursor,
@@ -2067,6 +2100,8 @@ impl VtChannel {
             Some((&self.chunk_seq, &self.settled_chunk_seq, expected_chunk_seq)),
         );
         if result == VtRefreshResult::Refreshed {
+            // See `seed_parser`: a rejected reseed describes no accepted frame.
+            record_seed_links(&self.links, &stream);
             self.clear_drift();
         }
         result
@@ -2826,7 +2861,7 @@ mod tests {
                     parser: &parser,
                     app_cursor: &app_cursor,
                     grid_gen: &grid_gen,
-                    links: &Mutex::new(VecDeque::new()),
+                    links: &LinkTable::default(),
                 },
                 (80, 24),
                 &deadline,
@@ -3091,7 +3126,7 @@ mod tests {
             alive: alive.clone(),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
-            links: Arc::new(Mutex::new(VecDeque::new())),
+            links: Arc::new(LinkTable::default()),
             chunk_seq: Arc::new(AtomicU64::new(0)),
             settled_chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
@@ -3351,7 +3386,7 @@ mod tests {
             alive: Arc::new(AtomicBool::new(false)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
-            links: Arc::new(Mutex::new(VecDeque::new())),
+            links: Arc::new(LinkTable::default()),
             chunk_seq: Arc::new(AtomicU64::new(0)),
             settled_chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
@@ -3402,7 +3437,7 @@ mod tests {
             alive: Arc::new(AtomicBool::new(false)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
-            links: Arc::new(Mutex::new(VecDeque::new())),
+            links: Arc::new(LinkTable::default()),
             chunk_seq: chunk_seq.clone(),
             settled_chunk_seq: settled_chunk_seq.clone(),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
@@ -3531,7 +3566,7 @@ mod tests {
             alive: alive.clone(),
             wakeup: wakeup_slot.clone(),
             clipboard: Arc::new(Mutex::new(None)),
-            links: Arc::new(Mutex::new(VecDeque::new())),
+            links: Arc::new(LinkTable::default()),
             chunk_seq: Arc::new(AtomicU64::new(0)),
             settled_chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
@@ -3691,7 +3726,7 @@ mod tests {
             alive: alive.clone(),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: clipboard.clone(),
-            links: Arc::new(Mutex::new(VecDeque::new())),
+            links: Arc::new(LinkTable::default()),
             chunk_seq: Arc::new(AtomicU64::new(0)),
             settled_chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
@@ -3742,7 +3777,7 @@ mod tests {
         let listener = UnixListener::bind(&sock).expect("bind");
         let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
         let stop = Arc::new(AtomicBool::new(false));
-        let links: Arc<Mutex<VecDeque<PaneLink>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let links: Arc<LinkTable> = Arc::new(LinkTable::default());
         let ctx = ReaderCtx {
             parser: parser.clone(),
             stop: stop.clone(),
@@ -3767,7 +3802,7 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(5);
         let recorded = loop {
-            let held: Vec<PaneLink> = links.lock().unwrap().iter().cloned().collect();
+            let held: Vec<PaneLink> = links.table.lock().unwrap().iter().cloned().collect();
             if !held.is_empty() || Instant::now() >= deadline {
                 break held;
             }
@@ -3874,9 +3909,9 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
         }
 
-        let slot = Mutex::new(VecDeque::new());
+        let slot = LinkTable::default();
         record_seed_links(&slot, &stream);
-        let held: Vec<PaneLink> = slot.lock().unwrap().iter().cloned().collect();
+        let held: Vec<PaneLink> = slot.table.lock().unwrap().iter().cloned().collect();
         assert_eq!(
             held,
             vec![
@@ -3898,13 +3933,18 @@ mod tests {
         // `capture-pane -e` replays into a fresh parser without passing through
         // `run_reader`, so a link printed before the channel armed would
         // otherwise stay targetless until the pane reprinted it.
-        let slot = Mutex::new(VecDeque::new());
+        let slot = LinkTable::default();
         record_seed_links(
             &slot,
             b"\x1b[32msee \x1b]8;;https://example.com/repo\x1b\\the repo\x1b]8;;\x1b\\ now\x1b[0m",
         );
         assert_eq!(
-            slot.lock().unwrap().iter().cloned().collect::<Vec<_>>(),
+            slot.table
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
             vec![PaneLink {
                 text: "the repo".to_string(),
                 uri: "https://example.com/repo".to_string(),
@@ -3916,12 +3956,12 @@ mod tests {
             &slot,
             b"\x1b]8;;https://example.com/repo\x1b\\the repo\x1b]8;;\x1b\\",
         );
-        assert_eq!(slot.lock().unwrap().len(), 1);
+        assert_eq!(slot.table.lock().unwrap().len(), 1);
     }
 
     #[test]
     fn record_links_dedupes_and_caps() {
-        let slot = Mutex::new(VecDeque::new());
+        let slot = LinkTable::default();
         let link = |n: usize| PaneLink {
             text: format!("link {n}"),
             uri: format!("https://example.com/{n}"),
@@ -3929,7 +3969,8 @@ mod tests {
         // A reprint moves the link to the newest slot instead of duplicating.
         record_links(&slot, vec![link(0), link(1), link(0)]);
         assert_eq!(
-            slot.lock()
+            slot.table
+                .lock()
                 .unwrap()
                 .iter()
                 .map(|l| l.uri.clone())
@@ -3942,7 +3983,7 @@ mod tests {
                 .map(link)
                 .collect(),
         );
-        let held = slot.lock().unwrap();
+        let held = slot.table.lock().unwrap();
         assert_eq!(held.len(), crate::tmux::osc8::MAX_PANE_LINKS);
         assert_eq!(
             held.back().unwrap().uri,
@@ -4051,7 +4092,7 @@ mod tests {
             alive: Arc::new(AtomicBool::new(false)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
-            links: Arc::new(Mutex::new(VecDeque::new())),
+            links: Arc::new(LinkTable::default()),
             chunk_seq,
             settled_chunk_seq: settled_chunk_seq.clone(),
             last_chunk_ms: last_chunk_ms.clone(),
@@ -4173,7 +4214,7 @@ mod tests {
             alive: Arc::new(AtomicBool::new(false)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: clipboard.clone(),
-            links: Arc::new(Mutex::new(VecDeque::new())),
+            links: Arc::new(LinkTable::default()),
             chunk_seq: chunk_seq.clone(),
             settled_chunk_seq: settled_chunk_seq.clone(),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
@@ -4487,7 +4528,7 @@ mod tests {
             alive: Arc::new(AtomicBool::new(false)),
             wakeup: Arc::new(Mutex::new(Some(wakeup.clone()))),
             clipboard: Arc::new(Mutex::new(None)),
-            links: Arc::new(Mutex::new(VecDeque::new())),
+            links: Arc::new(LinkTable::default()),
             chunk_seq: Arc::new(AtomicU64::new(0)),
             settled_chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),

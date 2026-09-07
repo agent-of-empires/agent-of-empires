@@ -15,6 +15,10 @@ pub(crate) struct LineColumns {
     /// makes an exclusive end offset resolve past both halves of a wide
     /// grapheme.
     column_of: Vec<u16>,
+    /// Whether source text was dropped because it did not fit `width`. A run
+    /// ending at the retained boundary may be a prefix of something longer, so
+    /// anything inferred from the text alone has to refuse it.
+    clipped: bool,
 }
 
 impl LineColumns {
@@ -25,6 +29,12 @@ impl LineColumns {
             .get(byte)
             .copied()
             .unwrap_or_else(|| self.column_of.last().copied().unwrap_or(0))
+    }
+
+    /// Whether the row was cut short of `width`, so its last run may be a
+    /// prefix rather than the whole of what the pane holds.
+    pub(crate) fn is_clipped(&self) -> bool {
+        self.clipped
     }
 
     /// The text painted between `from` and `to_excl` display columns.
@@ -42,28 +52,46 @@ impl LineColumns {
 
 /// Resolve `line` into display columns at `width`.
 pub(crate) fn line_columns(line: &ratatui::text::Line, width: u16) -> LineColumns {
+    use ratatui::buffer::CellWidth;
     use unicode_segmentation::UnicodeSegmentation;
-    use unicode_width::UnicodeWidthStr;
 
     let mut text = String::with_capacity(width as usize);
     let mut column_of = Vec::with_capacity(width as usize);
     let mut col = 0u16;
+    let mut clipped = false;
     for span in &line.spans {
         for grapheme in span.content.graphemes(true) {
-            let cells = UnicodeWidthStr::width(grapheme) as u16;
-            // Mirror what the renderer paints: a grapheme that does not fit the
-            // pane is not drawn, so it must not be matchable either.
+            // Same filtering and the same width rule `Buffer::set_stringn` uses.
+            // `CellWidth` is not `UnicodeWidthStr`: it adds a cell for halfwidth
+            // katakana dakuten/handakuten, and a mapper that disagreed would
+            // shift every underline, OSC 8 span and selection on the row.
+            if grapheme.contains(char::is_control) {
+                continue;
+            }
+            let cells = grapheme.cell_width();
+            if cells == 0 {
+                continue;
+            }
+            // A grapheme the renderer cannot fit is not painted, so it must not
+            // be matchable either.
             if col + cells > width {
-                column_of.push(col);
-                return LineColumns { text, column_of };
+                clipped = true;
+                break;
             }
             column_of.resize(column_of.len() + grapheme.len(), col);
             text.push_str(grapheme);
             col += cells;
         }
+        if clipped {
+            break;
+        }
     }
     column_of.push(col);
-    LineColumns { text, column_of }
+    LineColumns {
+        text,
+        column_of,
+        clipped,
+    }
 }
 
 /// Truncate `text` to `max_width` display cells, appending `…` if

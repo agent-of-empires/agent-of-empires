@@ -68,8 +68,9 @@ to your clipboard instead of opening it, and says so. That covers SSH, where a
 browser launched on the far end would open on a screen you are not sitting at,
 and headless hosts with no browser at all. Your terminal's own link gesture
 still opens it locally, which is usually what you want. Set `BROWSER` to
-override the check: it is honored unconditionally, so a script that forwards
-the URL somewhere useful keeps working.
+override the check, so a script that forwards the URL somewhere useful keeps
+working. That applies on platforms whose browser launcher reads it; macOS opens
+through the system instead and ignores both `BROWSER` and `DISPLAY`.
 
 ## The leader menu
 

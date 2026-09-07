@@ -105,14 +105,21 @@ pub(crate) fn link_spans_for_line(
 
     for (start, end) in bare_url_ranges(&columns.text) {
         let end_column = columns.column_at(end);
-        // `columns.text` is the row as painted, so it is cut at the pane's
-        // right edge. A URL running to that edge may be a prefix of the real
-        // one, and opening `https://example.com/log` for a link that reads
+        // `columns.text` is the row as painted, so it stops where the pane
+        // does. A URL running to that boundary may be a prefix of the real one,
+        // and opening `https://example.com/log` for a link that reads
         // `https://example.com/logout` is a wrong action, not a missing one.
-        // An advertised target cannot hit this: a truncated link text simply
-        // fails to match. Rows wider than the pane show up when scrollback was
+        //
+        // The boundary is not always `width`: a wide grapheme that does not fit
+        // leaves the text one column short, which is how
+        // `https://example.com/日本` at width 25 used to hand back
+        // `https://example.com/` as if it were whole. Refuse anything reaching
+        // the end of a clipped row, and anything reaching the pane edge.
+        //
+        // An advertised target cannot hit this: a truncated label simply fails
+        // to match. Rows wider than the pane show up when scrollback was
         // captured at an older geometry, or mid-resize.
-        if end_column >= width {
+        if end_column >= width || (columns.is_clipped() && end == columns.text.len()) {
             continue;
         }
         candidates.push(Candidate {

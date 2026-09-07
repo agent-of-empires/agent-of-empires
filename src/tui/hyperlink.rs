@@ -280,11 +280,17 @@ mod tests {
     fn a_retargeted_cell_is_re_emitted_on_the_next_frame() {
         use ratatui::buffer::CellDiffOption;
 
+        // Driven through `Buffer::diff` rather than a `Terminal`: constructing
+        // one asks the wrapped `CrosstermBackend` for the host terminal size,
+        // which has no answer on a CI runner with no tty, and the test then
+        // fails before reaching its assertion. The diff is what
+        // `Terminal::flush` hands the backend anyway, so this exercises
+        // retargeting rather than terminal availability.
         let shared: SharedHyperlinks = SharedHyperlinks::default();
         let tap = Tap::default();
-        let mut terminal =
-            ratatui::Terminal::new(HyperlinkBackend::new(tap.clone(), shared.clone()))
-                .expect("terminal");
+        let mut backend = HyperlinkBackend::new(tap.clone(), shared.clone());
+        let area = ratatui::layout::Rect::new(0, 0, 1, 1);
+        let mut previous = ratatui::buffer::Buffer::empty(area);
 
         let mut frame = |uri: &str| {
             {
@@ -292,14 +298,15 @@ mod tests {
                 guard.clear();
                 guard.insert(0, 0, uri);
             }
-            terminal
-                .draw(|f| {
-                    let mut cell = Cell::default();
-                    cell.set_symbol("L");
-                    cell.set_diff_option(CellDiffOption::AlwaysUpdate);
-                    f.buffer_mut()[(0, 0)] = cell;
-                })
+            let mut current = ratatui::buffer::Buffer::empty(area);
+            let mut cell = Cell::default();
+            cell.set_symbol("L");
+            cell.set_diff_option(CellDiffOption::AlwaysUpdate);
+            current[(0, 0)] = cell;
+            backend
+                .draw(previous.diff(&current).into_iter())
                 .expect("draw");
+            previous = current;
             let out =
                 String::from_utf8_lossy(&tap.0.lock().unwrap().clone()).replace('\u{1b}', "^[");
             tap.0.lock().unwrap().clear();
