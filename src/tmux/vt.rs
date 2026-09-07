@@ -456,6 +456,16 @@ fn lookup_osc52(session: &str) -> Option<Arc<Osc52Channel>> {
         .and_then(Weak::upgrade)
 }
 
+/// DECCKM state of `session`'s pane as its *live* grid last saw it, readable
+/// whether or not the channel accepts socket input: `send-keys -H` is as
+/// literal as the socket, so the web terminal re-encodes cursor keys either
+/// way. `None` when no live channel exists.
+pub(crate) fn cursor_mode(session: &str) -> Option<bool> {
+    lookup(session)
+        .filter(|c| c.is_alive())
+        .map(|c| c.app_cursor.load(Ordering::Relaxed))
+}
+
 /// If `session` has a *live* armed channel, return its current cursor-key mode
 /// (DECCKM): `Some(true)` = application cursor keys (`ESC O A`), `Some(false)` =
 /// normal (`ESC [ A`). `None` means no channel is armed, it is output-only, or
@@ -2594,6 +2604,71 @@ impl Drop for Osc52Channel {
     }
 }
 
+/// Test double for a channel that never armed a pipe: no reader thread, no
+/// socket, flags set by the caller. Shared with consumer tests in other modules.
+#[cfg(test)]
+pub(crate) fn dummy_channel_with_input(
+    name: &str,
+    dir: &std::path::Path,
+    input: bool,
+) -> (Arc<VtChannel>, Arc<AtomicBool>) {
+    let alive = Arc::new(AtomicBool::new(false));
+    let ch = Arc::new(VtChannel {
+        name: name.to_string(),
+        input,
+        owner_id: new_pipe_owner_id(),
+        target: format!("{name}:^.0"),
+        parser: Arc::new(Mutex::new(vt100::Parser::new(4, 20, SCROLLBACK_LINES))),
+        stream: Arc::new(Mutex::new(None)),
+        app_cursor: Arc::new(AtomicBool::new(false)),
+        alive: alive.clone(),
+        wakeup: Arc::new(Mutex::new(None)),
+        clipboard: Arc::new(Mutex::new(None)),
+        chunk_seq: Arc::new(AtomicU64::new(0)),
+        settled_chunk_seq: Arc::new(AtomicU64::new(0)),
+        last_chunk_ms: Arc::new(AtomicU64::new(0)),
+        prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
+        grid_gen: Arc::new(AtomicU64::new(0)),
+        signals: Arc::new(ViewerSignals::new()),
+        armed_at: Instant::now(),
+        sample_cache: Mutex::new(None),
+        sock_dir: dir.to_path_buf(),
+        sock_path: dir.join("s.sock"),
+        stop: Arc::new(AtomicBool::new(false)),
+        reader: Mutex::new(None),
+        cols: AtomicU16::new(20),
+        rows: AtomicU16::new(4),
+        last_size_check: Mutex::new(Instant::now()),
+        pending_drift: Mutex::new(None),
+        last_owner_hb: Mutex::new(Instant::now()),
+    });
+    (ch, alive)
+}
+
+/// Publish a live test double for `name` with the given input capability and
+/// DECCKM state, as `acquire` would. The returned `Arc` keeps it registered.
+#[cfg(test)]
+pub(crate) fn register_live_for_test(
+    name: &str,
+    dir: &std::path::Path,
+    input: bool,
+    app_cursor: bool,
+) -> Arc<VtChannel> {
+    let (channel, alive) = dummy_channel_with_input(name, dir, input);
+    channel.app_cursor.store(app_cursor, Ordering::Relaxed);
+    alive.store(true, Ordering::Relaxed);
+    REGISTRY
+        .lock()
+        .unwrap()
+        .insert(name.to_string(), Arc::downgrade(&channel));
+    channel
+}
+
+#[cfg(test)]
+pub(crate) fn unregister_for_test(name: &str) {
+    REGISTRY.lock().unwrap().remove(name);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3071,44 +3146,6 @@ mod tests {
         dummy_channel_with_input(name, dir, true)
     }
 
-    fn dummy_channel_with_input(
-        name: &str,
-        dir: &std::path::Path,
-        input: bool,
-    ) -> (Arc<VtChannel>, Arc<AtomicBool>) {
-        let alive = Arc::new(AtomicBool::new(false));
-        let ch = Arc::new(VtChannel {
-            name: name.to_string(),
-            input,
-            owner_id: new_pipe_owner_id(),
-            target: format!("{name}:^.0"),
-            parser: Arc::new(Mutex::new(vt100::Parser::new(4, 20, SCROLLBACK_LINES))),
-            stream: Arc::new(Mutex::new(None)),
-            app_cursor: Arc::new(AtomicBool::new(false)),
-            alive: alive.clone(),
-            wakeup: Arc::new(Mutex::new(None)),
-            clipboard: Arc::new(Mutex::new(None)),
-            chunk_seq: Arc::new(AtomicU64::new(0)),
-            settled_chunk_seq: Arc::new(AtomicU64::new(0)),
-            last_chunk_ms: Arc::new(AtomicU64::new(0)),
-            prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
-            grid_gen: Arc::new(AtomicU64::new(0)),
-            signals: Arc::new(ViewerSignals::new()),
-            armed_at: Instant::now(),
-            sample_cache: Mutex::new(None),
-            sock_dir: dir.to_path_buf(),
-            sock_path: dir.join("s.sock"),
-            stop: Arc::new(AtomicBool::new(false)),
-            reader: Mutex::new(None),
-            cols: AtomicU16::new(20),
-            rows: AtomicU16::new(4),
-            last_size_check: Mutex::new(Instant::now()),
-            pending_drift: Mutex::new(None),
-            last_owner_hb: Mutex::new(Instant::now()),
-        });
-        (ch, alive)
-    }
-
     #[test]
     fn output_only_channel_never_writes_to_the_pane() {
         // An output-only channel (tmux without the dead-pane pipe fix) must
@@ -3140,6 +3177,24 @@ mod tests {
 
             REGISTRY.lock().unwrap().remove(&name);
         }
+    }
+
+    #[test]
+    fn output_only_channel_still_reports_the_pane_cursor_mode() {
+        // The web terminal re-encodes the browser's normal-mode cursor keys for
+        // a DECCKM app before `send-keys -H` delivers them literally, so the
+        // grid's cursor mode must stay readable while socket input is off.
+        let name = format!("aoe_test_vt_cursor_mode_{}", std::process::id());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let channel = register_live_for_test(&name, dir.path(), false, true);
+
+        assert_eq!(cursor_mode(&name), Some(true));
+        assert_eq!(input_mode(&name), None);
+
+        channel.alive.store(false, Ordering::Relaxed);
+        assert_eq!(cursor_mode(&name), None, "a dead grid's mode is stale");
+
+        unregister_for_test(&name);
     }
 
     #[test]
