@@ -1275,7 +1275,6 @@ mod tests {
     #[serial]
     fn pid_source_for_falls_back_to_control_socket_on_load_err() {
         with_temp_home(|| {
-            use std::os::unix::fs::PermissionsExt;
             let session_id = "sess-load-err";
             let rec = WorkerRecord::new(
                 session_id.into(),
@@ -1292,7 +1291,10 @@ mod tests {
             );
             save(&rec).unwrap();
             let rec_path = record_path(session_id).unwrap();
-            std::fs::set_permissions(&rec_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // Force load() -> Err: a directory keeps path.exists() true while
+            // std::fs::read fails for every user, root included.
+            std::fs::remove_file(&rec_path).unwrap();
+            std::fs::create_dir(&rec_path).unwrap();
             assert!(
                 load(session_id).is_err(),
                 "fixture must force load() to return Err"

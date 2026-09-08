@@ -5441,11 +5441,10 @@ cursor-acp-bridge = "agent acp"
             std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
         }
         let session_id = "sw-err-2102";
-        // Force load() -> Err by writing a real record file and stripping
-        // read permission: path.exists() stays true, but std::fs::read
-        // fails with PermissionDenied. (Corrupt JSON is coerced to
-        // Ok(None) by load itself, so it can't drive the Err arm.)
-        use std::os::unix::fs::PermissionsExt;
+        // Force load() -> Err by replacing the record file with a directory:
+        // path.exists() stays true, but std::fs::read fails for every user,
+        // root included. (Corrupt JSON is coerced to Ok(None) by load itself,
+        // so it can't drive the Err arm.)
         let socket_path = crate::process::worker_registry::socket_path_for(session_id).unwrap();
         let record = crate::process::worker_registry::WorkerRecord::new(
             session_id.into(),
@@ -5462,7 +5461,8 @@ cursor-acp-bridge = "agent acp"
         );
         crate::process::worker_registry::save(&record).unwrap();
         let record_path = crate::process::worker_registry::record_path(session_id).unwrap();
-        std::fs::set_permissions(&record_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::remove_file(&record_path).unwrap();
+        std::fs::create_dir(&record_path).unwrap();
         assert!(
             crate::process::worker_registry::load(session_id).is_err(),
             "fixture must force load() to return Err"

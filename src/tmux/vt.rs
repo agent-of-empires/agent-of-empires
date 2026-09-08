@@ -5181,6 +5181,7 @@ mod tests {
             alive: Arc::new(AtomicBool::new(false)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
+            links: Arc::new(LinkTable::default()),
             chunk_seq: Arc::new(AtomicU64::new(0)),
             settled_chunk_seq: settled.clone(),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
