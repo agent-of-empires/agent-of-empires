@@ -761,15 +761,33 @@ fn shared_credential_path(sandbox_dir: &Path, name: &str) -> Option<PathBuf> {
     (root.file_name()? == SANDBOX_PRIVATE_SUBDIR).then(|| root.join(name))
 }
 
-/// A file's content, or `None` when it is absent or empty (the placeholder a
-/// runtime leaves under a file mount). The store is container-writable, so a
-/// link planted there is not followed; the host file is the user's own.
-fn read_credential_file(dir: &Path, name: &str, follow: SymlinkPolicy) -> Option<String> {
-    follow
-        .read(&dir.join(name))
-        .ok()
-        .flatten()
-        .filter(|content| !content.trim().is_empty())
+/// A file's content, or `None` when it is absent, empty (the placeholder a
+/// runtime leaves under a file mount) or not a plain file. A plain file that
+/// cannot be read is an error, never `None`: the caller would take absence as
+/// leave to write over it. The store is container-writable, so a link planted
+/// there is not followed; the host file is the user's own.
+fn read_credential_file(dir: &Path, name: &str, follow: SymlinkPolicy) -> Result<Option<String>> {
+    let path = dir.join(name);
+    if let Some(content) = follow.read(&path)? {
+        return Ok(Some(content).filter(|content| !content.trim().is_empty()));
+    }
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() => {
+            anyhow::bail!("{} exists but could not be read", path.display())
+        }
+        Ok(_) => Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("inspecting {}", path.display())),
+    }
+}
+
+/// A candidate that cannot be read is skipped; the file it would replace is
+/// still the one every sandbox mounts.
+fn read_credential_candidate(dir: &Path, name: &str, follow: SymlinkPolicy) -> Option<String> {
+    read_credential_file(dir, name, follow).unwrap_or_else(|e| {
+        tracing::warn!(target: "session.profile", "Skipping credential candidate: {}", e);
+        None
+    })
 }
 
 /// Fold the freshest credential into the file every store of this agent
@@ -803,12 +821,16 @@ fn sync_shared_credential(
     std::fs::create_dir_all(root)?;
 
     let mut candidates = Vec::new();
-    candidates.extend(read_credential_file(
+    candidates.extend(read_credential_candidate(
         sandbox_dir,
         name,
         SymlinkPolicy::Never,
     ));
-    candidates.extend(read_credential_file(host_dir, name, SymlinkPolicy::Follow));
+    candidates.extend(read_credential_candidate(
+        host_dir,
+        name,
+        SymlinkPolicy::Follow,
+    ));
     if let Some((service, _)) = mount
         .keychain_credential
         .filter(|(_, filename)| *filename == name)
@@ -824,7 +846,7 @@ fn sync_shared_credential(
     // subprocess); the file is read again under it, right before the write,
     // so another come-up or a container's own refresh in between is seen.
     crate::hooks::with_config_lock_policy(&shared, "lock", SymlinkPolicy::Never, || {
-        let existing = read_credential_file(root, name, SymlinkPolicy::Never);
+        let existing = read_credential_file(root, name, SymlinkPolicy::Never)?;
         let mut winner: Option<&str> = None;
         for candidate in &candidates {
             let current = winner.or(existing.as_deref());
@@ -4312,6 +4334,36 @@ mod tests {
 
     fn credential(expires_at: u64) -> String {
         format!(r#"{{"claudeAiOauth":{{"expiresAt":{expires_at}}}}}"#)
+    }
+
+    #[test]
+    fn an_unreadable_shared_file_is_never_overwritten() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = TempDir::new().unwrap();
+        let host = home.path().join(".claude");
+        let mount = claude_mount_without_keychain();
+        let store = host.join(SANDBOX_PRIVATE_SUBDIR).join("aaaaaaaaaaaaaaaa");
+        let shared = host.join(SANDBOX_PRIVATE_SUBDIR).join(".credentials.json");
+        fs::create_dir_all(&store).unwrap();
+        // A failed sync is logged and the launch goes on; the file must be
+        // left exactly as it was.
+        let prepare =
+            || prepare_sandbox_dir_from(&mount, host.clone(), store.clone(), home.path()).unwrap();
+
+        // Root reads a write-only file regardless, so the case cannot fail there.
+        if !nix::unistd::geteuid().is_root() {
+            fs::write(&shared, credential(5)).unwrap();
+            fs::set_permissions(&shared, fs::Permissions::from_mode(0o200)).unwrap();
+            prepare();
+            fs::set_permissions(&shared, fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(fs::read_to_string(&shared).unwrap(), credential(5));
+            fs::remove_file(&shared).unwrap();
+        }
+
+        // A path that is not a plain file is not seeded over either.
+        fs::create_dir(&shared).unwrap();
+        prepare();
+        assert!(shared.is_dir());
     }
 
     #[test]
