@@ -196,6 +196,26 @@ pub fn summarize(servers: &[ResolvedMcpServer]) -> String {
         .join(", ")
 }
 
+/// The environment a host session of `profile` launches with, as far as it
+/// can be known without spawning: the static `environment` entries that
+/// carry a value. A bare key inherits from AoE's own environment, which the
+/// config-dir lookup already falls back to, so those are skipped here rather
+/// than warned about on every poll. `host_hooks.before_session` output is
+/// only known at spawn, so the spawn path passes its minted environment
+/// instead (#3734).
+pub fn session_env_for_discovery(profile: Option<&str>) -> Vec<(String, String)> {
+    let cfg = crate::session::config::profile_config::resolve_config_or_warn(
+        &crate::session::config::effective_profile(profile.unwrap_or_default()),
+    );
+    let valued: Vec<String> = cfg
+        .environment
+        .iter()
+        .filter(|entry| entry.contains('='))
+        .cloned()
+        .collect();
+    crate::session::environment::resolve_host_environment_pairs(&valued)
+}
+
 /// Resolve the effective MCP server set for a session context, applying the
 /// full precedence stack: agent-native -> global -> per-profile ->
 /// project-local (trust-gated), higher wins per name. This is the single source
@@ -215,16 +235,18 @@ pub fn resolve_effective(
     agent_key: &str,
     profile: Option<&str>,
     cwd: &Path,
+    session_env: &[(String, String)],
 ) -> Vec<ResolvedMcpServer> {
-    let native = load_native_mcp_servers_from_home(agent_key, profile).unwrap_or_else(|e| {
-        warn!(
-            target: "acp.mcp",
-            agent = %agent_key,
-            error = %e,
-            "failed to load native MCP config; contributing none from it"
-        );
-        Vec::new()
-    });
+    let native =
+        load_native_mcp_servers_from_home(agent_key, profile, session_env).unwrap_or_else(|e| {
+            warn!(
+                target: "acp.mcp",
+                agent = %agent_key,
+                error = %e,
+                "failed to load native MCP config; contributing none from it"
+            );
+            Vec::new()
+        });
 
     let global = match crate::session::get_app_dir() {
         Ok(app_dir) => load_global_mcp_servers(&app_dir).unwrap_or_else(|e| {
@@ -328,9 +350,10 @@ pub struct McpSurfaceView {
 /// reconcile updates the snapshot (silent adoption of new servers); conflicts
 /// and removals persist until the user resolves them.
 pub fn resolve_surface(agent: &str, profile: Option<&str>, cwd: &Path) -> McpSurfaceView {
-    let effective = resolve_effective(agent, profile, cwd);
+    let session_env = session_env_for_discovery(profile);
+    let effective = resolve_effective(agent, profile, cwd, &session_env);
 
-    let reconcile = match load_native_mcp_servers_checked_from_home(agent, profile) {
+    let reconcile = match load_native_mcp_servers_checked_from_home(agent, profile, &session_env) {
         Ok(read) => super::mcp_state::reconcile_agent(agent, &read).unwrap_or_else(|e| {
             warn!(target: "acp.mcp", agent = %agent, error = %e, "failed to reconcile MCP drift store");
             Default::default()
@@ -482,8 +505,9 @@ pub fn load_native_mcp_servers(agent_key: &str, home: &Path) -> Result<Vec<Proje
 pub fn load_native_mcp_servers_from_home(
     agent_key: &str,
     profile: Option<&str>,
+    session_env: &[(String, String)],
 ) -> Result<Vec<ProjectMcpServer>> {
-    let read = load_native_mcp_servers_checked_from_home(agent_key, profile)?;
+    let read = load_native_mcp_servers_checked_from_home(agent_key, profile, session_env)?;
     Ok(read
         .servers
         .into_iter()
@@ -496,9 +520,10 @@ pub fn load_native_mcp_servers_from_home(
 pub fn load_native_mcp_servers_checked_from_home(
     agent_key: &str,
     profile: Option<&str>,
+    session_env: &[(String, String)],
 ) -> Result<NativeRead> {
     let home = dirs::home_dir().context("could not resolve home dir for native MCP config")?;
-    let config_dir = native_config_dir_for(agent_key, profile, &home);
+    let config_dir = native_config_dir_for(agent_key, profile, &home, session_env);
     load_native_mcp_servers_checked_in(agent_key, &home, config_dir.as_deref())
 }
 
@@ -517,26 +542,57 @@ pub fn load_native_mcp_servers_checked_from_home(
 /// read, and these definitions carry credentials. `acp::agent_policy` holds the
 /// same line for the same reason.
 ///
-/// Falling back to `CLAUDE_CONFIG_DIR` in AoE's own environment covers the
-/// wrapper case: a shell that exports the variable exports it to the agent's
-/// login shell too. It is a guess, not a fact about the session, so it ranks
-/// below the declared directory.
+/// The result is the directory the session's agent will actually read, so
+/// discovery and the launched agent agree on one `.claude.json` (#3734):
+/// `session.agent_config_dir`, then `CLAUDE_CONFIG_DIR` in the session's own
+/// environment (profile `environment`, with `before_session` output on top
+/// when the caller has it), then AoE's own environment (a shell that
+/// exports the variable exports it to the agent too, a guess rather than a
+/// fact about the session), then the home default.
 fn native_config_dir_for(
     agent_key: &str,
     profile: Option<&str>,
     home: &Path,
+    session_env: &[(String, String)],
 ) -> Option<std::path::PathBuf> {
     let cfg = crate::session::config::profile_config::resolve_config_or_warn(
         &crate::session::config::effective_profile(profile.unwrap_or_default()),
     );
-    cfg.session
-        .agent_config_dir_for(agent_key, home)
-        .or_else(|| match native_config_for(agent_key) {
-            Some(NativeMcpConfig::StandardJson(_)) => std::env::var_os("CLAUDE_CONFIG_DIR")
-                .map(std::path::PathBuf::from)
-                .filter(|dir| !dir.as_os_str().is_empty()),
-            _ => None,
-        })
+    pick_native_config_dir(
+        cfg.session.agent_config_dir_for(agent_key, home),
+        matches!(
+            native_config_for(agent_key),
+            Some(NativeMcpConfig::StandardJson(_))
+        ),
+        session_env,
+        std::env::var_os("CLAUDE_CONFIG_DIR"),
+    )
+}
+
+/// Pure precedence behind `native_config_dir_for`. Later `session_env`
+/// entries win, matching the last-wins merge the spawn applies.
+fn pick_native_config_dir(
+    explicit: Option<std::path::PathBuf>,
+    reads_claude_config_dir: bool,
+    session_env: &[(String, String)],
+    daemon_env: Option<std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    if explicit.is_some() {
+        return explicit;
+    }
+    if !reads_claude_config_dir {
+        return None;
+    }
+    // A relative value would resolve against the daemon's working directory
+    // here and the agent's there; it is not a directory both can agree on.
+    let usable = |dir: std::path::PathBuf| dir.is_absolute().then_some(dir);
+    session_env
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
+        .map(|(_, value)| std::path::PathBuf::from(value))
+        .and_then(usable)
+        .or_else(|| daemon_env.map(std::path::PathBuf::from).and_then(usable))
 }
 
 /// Convert a map of raw server entries, skipping (with a warning) any entry that
@@ -770,6 +826,129 @@ fn read_codex_toml(path: &Path) -> Result<NativeRead> {
 
 #[cfg(test)]
 mod tests {
+    /// The static profile `environment` reaches discovery the way it
+    /// reaches a host launch, so both resolve the same config dir (#3734).
+    #[test]
+    #[serial_test::serial]
+    fn discovery_reads_claude_config_dir_from_the_profile_environment() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp.path());
+        let app_dir = crate::session::get_app_dir().unwrap();
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("config.toml"),
+            "environment = [\"CLAUDE_CONFIG_DIR=/from-profile\"]\n",
+        )
+        .unwrap();
+        let env = super::session_env_for_discovery(None);
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "CLAUDE_CONFIG_DIR" && v == "/from-profile"),
+            "profile environment must reach discovery: {env:?}"
+        );
+    }
+
+    /// #3734: discovery reads the file the agent will read. The session's
+    /// own environment outranks the daemon's, and a later entry (a
+    /// `before_session` value applied on top of the static profile
+    /// environment) outranks an earlier one.
+    #[test]
+    fn native_config_dir_precedence_follows_the_session_environment() {
+        use super::pick_native_config_dir as pick;
+        let p = |s: &str| std::path::PathBuf::from(s);
+        let env = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let daemon = Some(std::ffi::OsString::from("/daemon"));
+        type Case = (
+            &'static str,
+            Option<std::path::PathBuf>,
+            bool,
+            Vec<(String, String)>,
+            Option<std::ffi::OsString>,
+            Option<std::path::PathBuf>,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "explicit agent_config_dir wins",
+                Some(p("/explicit")),
+                true,
+                env(&[("CLAUDE_CONFIG_DIR", "/profile")]),
+                daemon.clone(),
+                Some(p("/explicit")),
+            ),
+            (
+                "profile environment beats the daemon",
+                None,
+                true,
+                env(&[("CLAUDE_CONFIG_DIR", "/profile")]),
+                daemon.clone(),
+                Some(p("/profile")),
+            ),
+            (
+                "a relative session value is ignored like an empty one",
+                None,
+                true,
+                env(&[("CLAUDE_CONFIG_DIR", "relative/dir")]),
+                daemon.clone(),
+                Some(p("/daemon")),
+            ),
+            (
+                "before_session value applied last wins",
+                None,
+                true,
+                env(&[
+                    ("CLAUDE_CONFIG_DIR", "/profile"),
+                    ("CLAUDE_CONFIG_DIR", "/minted"),
+                ]),
+                daemon.clone(),
+                Some(p("/minted")),
+            ),
+            (
+                "daemon environment as fallback",
+                None,
+                true,
+                env(&[("OTHER", "x")]),
+                daemon.clone(),
+                Some(p("/daemon")),
+            ),
+            (
+                "home default when nothing is set",
+                None,
+                true,
+                env(&[]),
+                None,
+                None,
+            ),
+            (
+                "empty session value falls through",
+                None,
+                true,
+                env(&[("CLAUDE_CONFIG_DIR", "")]),
+                daemon.clone(),
+                Some(p("/daemon")),
+            ),
+            (
+                "agents without a config-dir variable ignore the env",
+                None,
+                false,
+                env(&[("CLAUDE_CONFIG_DIR", "/profile")]),
+                daemon,
+                None,
+            ),
+        ];
+        for (label, explicit, reads, session_env, daemon_env, expected) in cases {
+            assert_eq!(
+                pick(explicit, reads, &session_env, daemon_env),
+                expected,
+                "{label}"
+            );
+        }
+    }
+
     use super::*;
 
     fn names(servers: &[ProjectMcpServer]) -> Vec<&str> {

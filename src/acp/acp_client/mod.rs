@@ -103,6 +103,9 @@ pub struct AcpClient {
     pending_responders: PendingResponders,
     /// Hold the subprocess so it gets killed when the client is dropped.
     _child: Option<Arc<Mutex<tokio::process::Child>>>,
+    /// Pid of the detached `aoe __acp-runner` this client launched, so the
+    /// supervisor can identify the exact process its lease owns.
+    runner_pid: Option<u32>,
 }
 
 /// Per-session resources the connection task uses to handle ACP fs/* and
@@ -117,6 +120,18 @@ struct SessionResources {
 }
 
 impl AcpClient {
+    /// Pid of the runner this client spawned, if any. Attached and
+    /// stdio clients have none; their identity comes from the registry.
+    pub fn runner_pid(&self) -> Option<u32> {
+        self.runner_pid
+    }
+
+    #[cfg(test)]
+    pub fn with_runner_pid(mut self, pid: u32) -> Self {
+        self.runner_pid = Some(pid);
+        self
+    }
+
     /// Construct a client that does not actually spawn anything. Useful
     /// for unit tests of structured view state without a real agent.
     pub fn fake_for_test(session_id: AcpSessionId) -> (Self, mpsc::Sender<Event>) {
@@ -127,6 +142,7 @@ impl AcpClient {
             cmd_tx: None,
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
             _child: None,
+            runner_pid: None,
         };
         (client, event_tx)
     }
@@ -147,6 +163,7 @@ impl AcpClient {
             cmd_tx: Some(cmd_tx),
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
             _child: None,
+            runner_pid: None,
         }
     }
 
@@ -184,6 +201,7 @@ impl AcpClient {
             cmd_tx: Some(cmd_tx),
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
             _child: None,
+            runner_pid: None,
         };
         (client, event_tx, saw_delete)
     }
@@ -235,6 +253,7 @@ impl AcpClient {
             cmd_tx: Some(cmd_tx),
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
             _child: None,
+            runner_pid: None,
         };
         (client, event_tx, cmds)
     }
@@ -272,6 +291,7 @@ impl AcpClient {
             cmd_tx: Some(cmd_tx),
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
             _child: None,
+            runner_pid: None,
         };
         (client, event_tx)
     }
@@ -342,7 +362,8 @@ impl AcpClient {
             // before binding the replacement. No-op when there is no live
             // prior runner. See #1689.
             crate::process::worker_registry::terminate_and_wait(&session_id.0).await;
-            spawn_runner_detached(&config, &socket_path, session_id.0.clone(), runner_sandbox)?;
+            let runner_pid =
+                spawn_runner_detached(&config, &socket_path, session_id.0.clone(), runner_sandbox)?;
             return Self::connect_via_socket(
                 socket_path,
                 config.cwd,
@@ -362,7 +383,11 @@ impl AcpClient {
                 default_mode.clone(),
                 mcp_servers,
             )
-            .await;
+            .await
+            .map(|mut client| {
+                client.runner_pid = Some(runner_pid);
+                client
+            });
         }
 
         let child = spawn_subprocess(&config)?;
@@ -491,6 +516,7 @@ impl AcpClient {
             cmd_tx: Some(cmd_tx),
             pending_responders,
             _child: Some(child),
+            runner_pid: None,
         })
     }
 
@@ -644,6 +670,7 @@ impl AcpClient {
             cmd_tx: Some(cmd_tx),
             pending_responders,
             _child: None,
+            runner_pid: None,
         })
     }
 

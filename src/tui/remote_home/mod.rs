@@ -7,7 +7,7 @@ use std::io::Stdout;
 
 use crate::acp::client::discovery::DaemonEndpoint;
 use crate::acp::client::HttpClient;
-use crate::daemon::ContextResumeAvailability;
+use crate::daemon::{ContextResumeAvailability, SessionResponse};
 use crate::plugin::ui_state::UiSnapshot;
 use crate::session::config::{resolve_theme_name, resolve_theme_palette_mode};
 use crate::tui::styles::Theme;
@@ -17,18 +17,6 @@ use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-#[derive(serde::Deserialize)]
-struct RemoteSessionWire {
-    id: String,
-    title: String,
-    project_path: String,
-    #[serde(default)]
-    status: String,
-    #[serde(default)]
-    view: crate::session::View,
-    #[serde(default)]
-    context_resume: Option<ContextResumeAvailability>,
-}
 #[derive(Debug, Clone)]
 pub struct RemoteSession {
     pub id: String,
@@ -183,7 +171,7 @@ async fn run(
     Ok(())
 }
 
-fn sessions_from_snapshot(wire_sessions: Vec<RemoteSessionWire>) -> Vec<RemoteSession> {
+fn sessions_from_snapshot(wire_sessions: Vec<SessionResponse>) -> Vec<RemoteSession> {
     let mut sessions: Vec<_> = wire_sessions
         .into_iter()
         .filter(|session| session.view == crate::session::View::Structured)
@@ -219,12 +207,14 @@ fn apply_session_result(state: &mut RemoteHomeState, result: Result<Vec<RemoteSe
 async fn refresh(state: &mut RemoteHomeState) {
     state.loading = true;
     state.last_error = None;
-    let sessions = state
-        .client
-        .list_sessions::<RemoteSessionWire>()
-        .await
-        .map(sessions_from_snapshot)
-        .map_err(|error| error.to_string());
+    let sessions = match state.endpoint.daemon_client() {
+        Ok(client) => client
+            .list_sessions(None)
+            .await
+            .map(|envelope| sessions_from_snapshot(envelope.sessions))
+            .map_err(|error| error.to_string()),
+        Err(error) => Err(error.to_string()),
+    };
     apply_session_result(state, sessions);
 
     state.plugin_ui = match state.client.plugin_ui_state().await {
@@ -251,15 +241,16 @@ mod tests {
         }
     }
 
-    fn wire(id: &str, view: crate::session::View) -> RemoteSessionWire {
-        RemoteSessionWire {
-            id: id.to_string(),
-            title: id.to_string(),
-            project_path: format!("/tmp/{id}"),
-            status: "Stopped".to_string(),
-            view,
-            context_resume: Some(ContextResumeAvailability::Available),
-        }
+    fn wire(id: &str, view: crate::session::View) -> SessionResponse {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "title": id,
+            "project_path": format!("/tmp/{id}"),
+            "status": "Stopped",
+            "view": view,
+            "context_resume": { "state": "available" },
+        }))
+        .unwrap()
     }
 
     fn state() -> RemoteHomeState {
@@ -273,7 +264,7 @@ mod tests {
 
     #[test]
     fn old_daemon_session_without_new_fields_stays_openable() {
-        let wire: RemoteSessionWire = serde_json::from_value(serde_json::json!({
+        let wire: SessionResponse = serde_json::from_value(serde_json::json!({
             "id": "legacy",
             "title": "Legacy",
             "project_path": "/tmp/legacy",

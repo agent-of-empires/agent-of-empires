@@ -177,6 +177,14 @@ impl Instance {
                 Some(detect_as.as_str()),
             );
             let config = self.build_container_config()?;
+            // Still refreshing its own store copy, which rotates the token
+            // away from every sandbox on the shared file.
+            if container.shared_credential_mounts_match(&config)? == Some(false) {
+                anyhow::bail!(
+                    "running sandbox {} predates the shared credential file; stop it, then relaunch to rebuild it",
+                    self.id
+                );
+            }
             self.identity_publisher_launched = config.identity_publisher_installed
                 && identity_publisher_mount_matches(&container, &config)?
                 && identity_publisher_dependencies_available(&container)
@@ -200,6 +208,7 @@ impl Instance {
             );
         }
 
+        let mut recreate = false;
         if container.exists()? {
             if container.sandbox_store_generation_matches()? == Some(false) {
                 container.remove(false)?;
@@ -214,21 +223,29 @@ impl Instance {
                     Some(detect_as.as_str()),
                 );
                 let config = self.build_container_config()?;
-                container.start()?;
-                self.identity_publisher_launched = config.identity_publisher_installed
-                    && identity_publisher_mount_matches(&container, &config)?
-                    && identity_publisher_dependencies_available(&container)
-                    && self.hook_session_publisher_allowed_by_argv();
-                self.backfill_container_workdir(&container);
-                container_config::ensure_folder_trust_config_for_active_agent(
-                    &self.tool,
-                    Some(detect_as.as_str()),
-                    &self.source_profile,
-                    &self.id,
-                    &self.container_workdir(),
-                    self.is_yolo_mode(),
-                );
-                return Ok(container);
+                // Built before its agent shared a credential file, so it
+                // mounts only the store, whose copy the come-up no longer
+                // refreshes.
+                recreate = container.shared_credential_mounts_match(&config)? == Some(false);
+                if recreate {
+                    container.remove(false)?;
+                } else {
+                    container.start()?;
+                    self.identity_publisher_launched = config.identity_publisher_installed
+                        && identity_publisher_mount_matches(&container, &config)?
+                        && identity_publisher_dependencies_available(&container)
+                        && self.hook_session_publisher_allowed_by_argv();
+                    self.backfill_container_workdir(&container);
+                    container_config::ensure_folder_trust_config_for_active_agent(
+                        &self.tool,
+                        Some(detect_as.as_str()),
+                        &self.source_profile,
+                        &self.id,
+                        &self.container_workdir(),
+                        self.is_yolo_mode(),
+                    );
+                    return Ok(container);
+                }
             }
         }
 
@@ -238,7 +255,10 @@ impl Instance {
 
         // Mint before building the container config so the docker-run env also
         // carries the values (leak-safe via the inherit path in run_create).
-        self.ensure_before_start_env(true)?;
+        // A container just removed for its credential mount was minted above.
+        if !recreate {
+            self.ensure_before_start_env(true)?;
+        }
         let config = self.build_container_config()?;
         // Still the workdir the *previous* container was created with; the pin below
         // is what moves it forward.
@@ -251,6 +271,7 @@ impl Instance {
         );
         container.remove_stranded_named_ignore_volumes(&self.id, &stranded);
         let container_id = container.create(&config)?;
+        container_config::remove_shadowed_credential_copies(&config);
         self.identity_publisher_launched = config.identity_publisher_installed
             && identity_publisher_dependencies_available(&container)
             && self.hook_session_publisher_allowed_by_argv();
