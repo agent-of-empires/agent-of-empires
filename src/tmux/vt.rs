@@ -1099,25 +1099,51 @@ fn seed_parser(
     let Some(stream) = capture_seed_stream(target, rows, deadline) else {
         return VtRefreshResult::Failed;
     };
+    install_seeded_parser(sink, since, &stream, size, guard, fence)
+}
+
+/// Install a captured snapshot behind the fence. Split from the capture above
+/// so the ordering boundary can be driven without forking tmux for a pane.
+fn install_seeded_parser(
+    sink: SeedSink<'_>,
+    since: Option<u64>,
+    stream: &[u8],
+    size: (u16, u16),
+    guard: SeedGuard<'_>,
+    fence: SeedInstallFence<'_>,
+) -> VtRefreshResult {
     let (Some(snapshot), Some(socket), Some(control)) =
         (fence.snapshot, fence.socket, fence.control)
     else {
-        return swap_seeded_parser(sink, since, &stream, size, guard);
+        return swap_seeded_parser(sink, since, stream, size, guard);
     };
     let Ok(_snapshot) = snapshot.lock() else {
         return VtRefreshResult::Failed;
     };
-    let Ok(socket) = socket.lock() else {
-        return VtRefreshResult::Failed;
+    // Take a private descriptor for the queue check and release the mutex
+    // before draining. `drain_forwarder` waits up to 100 ms for the ACK, and
+    // `write_input` needs this same mutex, so holding it across the wait would
+    // stall a keystroke for that long on every attempt. The clone shares the
+    // socket's receive queue, so `FIONREAD` still reports what the reader has
+    // not claimed; the snapshot lock above is what actually fences the swap.
+    let pipe = match socket.lock() {
+        Ok(guard) => match guard.as_ref() {
+            Some(stream) => match stream.try_clone() {
+                Ok(clone) => Some(clone),
+                Err(_) => return VtRefreshResult::Failed,
+            },
+            None => None,
+        },
+        Err(_) => return VtRefreshResult::Failed,
     };
     let guard = SeedGuard {
-        pipe: socket.as_ref(),
+        pipe: pipe.as_ref(),
         ..guard
     };
     swap_drained_seeded_parser(
         sink,
         since,
-        &stream,
+        stream,
         size,
         DrainedSeedGuard { guard, control },
     )
@@ -4675,6 +4701,86 @@ mod tests {
         assert_eq!(&forwarded, b"FORWARDER-MARKER");
         drop(pane_writer);
         forwarder_thread.join().expect("forwarder exits");
+    }
+
+    /// A reseed waits on the forwarder's ACK, and `write_input` needs the
+    /// same socket mutex the seed reads the pipe through. Holding it across
+    /// that wait stalls a keystroke for the whole ACK deadline, once per
+    /// retry. `seed_parser` clones the descriptor and drops the guard before
+    /// draining, so input keeps flowing while a slow forwarder is answering.
+    #[test]
+    fn a_pending_drain_does_not_hold_the_input_socket_mutex() {
+        use std::io::Write;
+        use std::sync::mpsc;
+
+        let (_data_reader, data_forwarder) = UnixStream::pair().expect("data pair");
+        let (parent_control, mut forwarder_control) = UnixStream::pair().expect("control pair");
+        let (probed_tx, probed_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        // Answers only once released, so the seed is parked on the deadline
+        // for as long as the test needs.
+        let forwarder = std::thread::spawn(move || {
+            let (kind, generation) =
+                read_drain_frame(&mut forwarder_control).expect("receive drain probe");
+            assert_eq!(kind, DRAIN_PROBE);
+            probed_tx.send(()).expect("signal the probe arrived");
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            let _ = forwarder_control.write_all(&drain_frame(DRAIN_ACK, generation));
+        });
+
+        let socket = Arc::new(Mutex::new(Some(data_forwarder)));
+        let control = Mutex::new(DrainControl {
+            stream: Some(parent_control),
+            next_generation: 0,
+        });
+        let parser = Mutex::new(vt100::Parser::new(6, 40, 0));
+        let app_cursor = AtomicBool::new(false);
+        let grid_gen = AtomicU64::new(0);
+        let snapshot = Mutex::new(());
+        let seed_socket = Arc::clone(&socket);
+        let seed = std::thread::spawn(move || {
+            install_seeded_parser(
+                SeedSink {
+                    parser: &parser,
+                    app_cursor: &app_cursor,
+                    grid_gen: &grid_gen,
+                    links: &LinkTable::default(),
+                },
+                None,
+                b"INPUT-MUTEX-SEED\r\n",
+                (40, 6),
+                SeedGuard {
+                    chunk: None,
+                    pipe: None,
+                },
+                SeedInstallFence {
+                    snapshot: Some(&snapshot),
+                    socket: Some(&seed_socket),
+                    control: Some(&control),
+                },
+            )
+        });
+
+        probed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("seed sent its drain probe");
+        // The seed is now waiting on the ACK. Input must not be queued behind it.
+        let acquired = socket
+            .try_lock()
+            .map(|mut guard| {
+                guard
+                    .as_mut()
+                    .map(|stream| stream.write_all(b"x").is_ok())
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        release_tx.send(()).ok();
+        let _ = seed.join();
+        forwarder.join().expect("forwarder thread");
+        assert!(
+            acquired,
+            "a keystroke must reach the pane while a reseed waits for its drain ACK"
+        );
     }
 
     #[test]
