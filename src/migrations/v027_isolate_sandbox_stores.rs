@@ -802,7 +802,6 @@ fn run_pass(
     let mut pending = Vec::new();
     let mut blocked_roots = BTreeSet::new();
     let mut orphan_blocked_roots = BTreeSet::new();
-    let mut orphan_ready_ids = BTreeSet::new();
     let mut excluded_by_root = BTreeMap::new();
     let private_roots: BTreeSet<PathBuf> = cohorts
         .values()
@@ -942,8 +941,18 @@ fn run_pass(
             if gated_roots.insert(root.clone()) {
                 copy_gate(root);
             }
+            // Reaped before the move, where a copied store was reaped after
+            // it. A copy left the source in place, so a container that came
+            // up since the probe kept a store to write to; a rename does not,
+            // and nothing later can put it back. Removing without force fails
+            // on a live container, which is what keeps this from moving a
+            // store out from under one.
+            if !reap(&id)? {
+                blocked_roots.insert(root.clone());
+                orphan_blocked_roots.insert(root.clone());
+                continue;
+            }
             relocate_store(&source, &destination_parent.join(orphan))?;
-            orphan_ready_ids.insert((root.clone(), id.into_owned()));
         }
     }
 
@@ -1113,12 +1122,6 @@ fn run_pass(
         }
     }
 
-    for (root, id) in orphan_ready_ids {
-        if !reap(&id)? {
-            blocked_roots.insert(root);
-        }
-    }
-
     // Remove stopped containers only after every store for the row is durable.
     // `force=false` makes a concurrent start fail the transition rather than
     // stopping a container that became live after the probe. A runtime that
@@ -1192,9 +1195,10 @@ fn run_pass(
                     .context("missing cleanup-root exclusions")?;
                 if let Some(kept) = retire_legacy_children(root, replicated)? {
                     progress::notice(format!(
-                        "Kept {}: it holds shared agent state (other sessions' history, caches, logs) \
-                         that is not per-session, so no private store received a copy of it. Nothing \
-                         was deleted; remove it yourself when you no longer want it.",
+                        "Kept {}: it holds shared agent state (other sessions' history, caches, \
+                         logs) that belongs to no one session, so it was not copied into every \
+                         private store. Everything removed from it is in those stores; what is \
+                         left has no other copy. Remove it yourself once you no longer want it.",
                         kept.display()
                     ));
                 }
@@ -1800,6 +1804,11 @@ fn copy_tree_from_fd(
         }
         let stat = fstatat(&dir, name, AtFlags::AT_SYMLINK_NOFOLLOW)?;
         let kind = stat.st_mode & nix::libc::S_IFMT;
+        // A symlink at a shared root usually points into one of the
+        // directories below, so carrying it would publish a dangler.
+        if files_only && kind != nix::libc::S_IFREG {
+            continue;
+        }
         let target = destination.join(name);
         if kind == nix::libc::S_IFLNK {
             let link = readlinkat(&dir, name)?;
@@ -1834,9 +1843,6 @@ fn copy_tree_from_fd(
             continue;
         }
         if kind == nix::libc::S_IFDIR {
-            if files_only {
-                continue;
-            }
             let child = openat(
                 &dir,
                 name,
@@ -1985,11 +1991,11 @@ fn copy_tree_no_links(
                 entry.path().display()
             );
         }
+        if files_only && !metadata.is_file() {
+            continue;
+        }
         let target = destination.join(entry.file_name());
         if metadata.is_dir() {
-            if files_only {
-                continue;
-            }
             match fs::create_dir(&target) {
                 Ok(()) => {}
                 Err(error)
@@ -2036,48 +2042,55 @@ fn sync_tree(path: &Path) -> Result<()> {
 /// Retire a legacy root by removing only what the private stores received.
 ///
 /// Every per-instance child moved into the private layout, and every
-/// top-level file was folded into each of them, so both go. The root's other
-/// directories are what [`publish_store`]'s overlay deliberately did not
-/// replicate: other sessions' conversation history, caches, logs and plugin
-/// trees. This is now the only copy of them, so deleting them to reclaim
-/// space would destroy state that belongs to no single session. Returns the
-/// root when anything was kept, so the caller can say where it is.
+/// top-level regular file was folded into each of them, so both go. What is
+/// left is what [`publish_store`]'s overlay deliberately did not replicate:
+/// other sessions' conversation history, caches, logs and plugin trees. This
+/// root is now the only copy of them, so deleting them to reclaim space would
+/// destroy state that belongs to no single session. Returns the root when
+/// anything was kept, so the caller can say where it is.
 ///
-/// Each entry is renamed aside before it is removed. A crash here leaves rows
-/// still at their pending generation, and a half-deleted store those rows
-/// would copy back over the published one is the failure that protocol
-/// prevents: an entry is either wholly there or wholly gone.
+/// Stores go before files, and everything is renamed aside before it is
+/// removed. This runs before the generation commit, so an interrupted
+/// retirement leaves rows still pending, and a pending row re-copies its
+/// legacy store over the one it already published. Either that store is
+/// wholly gone, and the row keeps what it published, or it is wholly there
+/// and so is every file the overlay folds in beside it. Removing a file
+/// first is what would let a pass re-publish a store without the credentials
+/// the root no longer has.
 fn retire_legacy_children(
     root: &Path,
     replicated: &BTreeSet<std::ffi::OsString>,
 ) -> Result<Option<PathBuf>> {
+    let quarantine = root.join(".v027-retired.v027-quarantine");
+    remove_tree_no_links(&quarantine)?;
     let mut kept = false;
-    let names: Vec<std::ffi::OsString> = fs::read_dir(root)?
-        .map(|entry| Ok(entry?.file_name()))
-        .collect::<Result<_>>()?;
-    for name in names {
-        let leaf = name.to_string_lossy().into_owned();
-        let path = root.join(&name);
-        let quarantine = root.join(format!(".{leaf}.v027-quarantine"));
-        let metadata = fs::symlink_metadata(&path)?;
-        let stale_quarantine = leaf.starts_with('.') && leaf.ends_with(".v027-quarantine");
-        if stale_quarantine {
-            remove_tree_no_links(&path)?;
-            continue;
-        }
-        if metadata.is_dir()
-            && !metadata.file_type().is_symlink()
-            && !replicated.contains(name.as_os_str())
-        {
+    let mut stores = Vec::new();
+    let mut files = Vec::new();
+    for entry in fs::read_dir(root)? {
+        let name = entry?.file_name();
+        let metadata = fs::symlink_metadata(root.join(&name))?;
+        if replicated.contains(name.as_os_str()) {
+            stores.push(name);
+        } else if metadata.is_file() && !metadata.file_type().is_symlink() {
+            files.push(name);
+        } else {
             kept = true;
-            continue;
         }
-        remove_tree_no_links(&quarantine)?;
-        fs::rename(&path, &quarantine)?;
-        fs::File::open(root)?.sync_all()?;
-        remove_tree_no_links(&quarantine)?;
-        fs::File::open(root)?.sync_all()?;
     }
+    fs::create_dir(&quarantine)?;
+    for name in stores {
+        fs::rename(root.join(&name), quarantine.join(&name))?;
+    }
+    // The barrier is the ordering, not the syncs around it: without it the
+    // drive is free to commit a file's removal before a store's.
+    super::store_fs::sync_to_drive(&fs::File::open(root)?)?;
+    super::store_fs::barrier(&fs::File::open(root)?)?;
+    for name in files {
+        fs::rename(root.join(&name), quarantine.join(&name))?;
+    }
+    super::store_fs::sync_to_drive(&fs::File::open(root)?)?;
+    remove_tree_no_links(&quarantine)?;
+    fs::File::open(root)?.sync_all()?;
     if !kept {
         retire_legacy(root)?;
         return Ok(None);
@@ -3604,6 +3617,79 @@ gemini = "{}"
             b"other",
             "what no private store received is the only copy left, so it stays"
         );
+    }
+
+    /// What no private store received is kept, whatever its type; what every
+    /// private store did receive is removed.
+    #[test]
+    fn retiring_a_root_keeps_only_what_no_store_received() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sandbox");
+        fs::create_dir_all(root.join("one")).unwrap();
+        fs::create_dir_all(root.join("sessions")).unwrap();
+        fs::write(root.join("one").join("own"), b"own").unwrap();
+        fs::write(root.join("sessions").join("other"), b"other").unwrap();
+        fs::write(root.join("auth.json"), b"secret").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("sessions", root.join("latest")).unwrap();
+        let replicated: BTreeSet<std::ffi::OsString> = [std::ffi::OsString::from("one")].into();
+
+        let kept = retire_legacy_children(&root, &replicated).unwrap();
+
+        assert_eq!(kept.as_deref(), Some(root.as_path()));
+        assert!(!root.join("one").exists(), "a replicated store is removed");
+        assert!(
+            !root.join("auth.json").exists(),
+            "a top-level file reached every private store, so it is removed"
+        );
+        assert_eq!(
+            fs::read(root.join("sessions").join("other")).unwrap(),
+            b"other"
+        );
+        #[cfg(unix)]
+        assert!(
+            fs::symlink_metadata(root.join("latest")).is_ok(),
+            "a symlink the overlay refused to carry has no other copy"
+        );
+        assert!(!root.join(".v027-retired.v027-quarantine").exists());
+    }
+
+    /// Retirement runs before the generation commit, so a pass killed partway
+    /// through it leaves the row pending and the shared root half emptied.
+    /// Removing the per-instance stores first is what makes that safe: the
+    /// row's source is gone, so the next pass keeps the store it published
+    /// rather than re-copying a root that has lost the credential it needs.
+    #[test]
+    #[serial_test::serial]
+    fn an_interrupted_retirement_keeps_the_published_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        let home = dirs::home_dir().unwrap();
+        fs::create_dir_all(&app).unwrap();
+        let root = home.join(".codex/sandbox");
+        let destination = home.join(".codex/sandbox-v2/codex-one");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        // The store published, its per-instance source already removed, and
+        // the shared root still holding the files that reached it.
+        fs::write(destination.join("auth.json"), b"secret").unwrap();
+        fs::write(destination.join("own"), b"own").unwrap();
+        fs::write(root.join("auth.json"), b"secret").unwrap();
+        fs::write(
+            app.join("sessions.json"),
+            r#"[{"id":"codex-one","tool":"codex","sandbox_info":{"enabled":true}}]"#,
+        )
+        .unwrap();
+
+        run_in(&app, &home, &|_| Ok(false)).unwrap();
+
+        assert_eq!(fs::read(destination.join("auth.json")).unwrap(), b"secret");
+        assert_eq!(fs::read(destination.join("own")).unwrap(), b"own");
+        assert!(!root.exists());
+        let rows: Value =
+            serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
+        assert_eq!(rows[0]["sandbox_store_generation"], 2);
     }
 
     /// The shared root goes when everything in it was replicated, exactly as
