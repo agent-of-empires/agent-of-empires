@@ -7,7 +7,7 @@
 /// the session.
 use super::*;
 use crate::session::Status;
-use crate::tui::daemon_status_poller::DaemonStatusUpdate;
+use crate::tui::session_feed::{DaemonStatusUpdate, SessionFeed, SessionFeedResult, SidebarSource};
 
 fn structured_row(env: &mut TestEnv, status: Status) -> String {
     let mut inst = Instance::new("acp-session", "/tmp/repo");
@@ -122,21 +122,108 @@ fn daemon_status_ignores_an_unknown_session_id() {
     );
 }
 
+fn daemon_row(id: &str, status: &str) -> crate::daemon::SessionResponse {
+    serde_json::from_value(serde_json::json!({
+        "id": id,
+        "status": status,
+        "view": "structured",
+    }))
+    .unwrap()
+}
+
 #[test]
 #[serial]
-fn request_daemon_status_refresh_is_a_no_op_without_structured_rows() {
-    // A terminal-only home view must never talk to the daemon; that would
-    // be one HTTP round trip per second for nothing.
+fn session_feed_snapshot_drives_structured_rows_and_marks_the_daemon_source() {
+    let mut env = create_test_env_empty();
+    let id = structured_row(&mut env, Status::Idle);
+    assert_eq!(env.view.sidebar_source, SidebarSource::Storage);
+    env.view.session_feed =
+        SessionFeed::seeded_for_test(SessionFeedResult::Snapshot(vec![daemon_row(
+            &id, "Running",
+        )]));
+    env.view.pending_session_feed = true;
+
+    assert!(
+        env.view.apply_session_feed(),
+        "an applied row asks for a redraw"
+    );
+
+    assert_eq!(
+        env.view.get_instance(&id).map(|i| i.status),
+        Some(Status::Running)
+    );
+    assert_eq!(env.view.sidebar_source, SidebarSource::Daemon);
+    assert!(
+        !env.view.pending_session_feed,
+        "draining disarms the in-flight flag"
+    );
+}
+
+#[test]
+#[serial]
+fn session_feed_unavailable_falls_back_to_storage_and_keeps_the_last_status() {
+    // No daemon is not an error: the local store serves the sidebar and the
+    // structured row keeps whatever the daemon last said.
+    let mut env = create_test_env_empty();
+    let id = structured_row(&mut env, Status::Running);
+    env.view.sidebar_source = SidebarSource::Daemon;
+    env.view.session_feed =
+        SessionFeed::seeded_for_test(SessionFeedResult::Unavailable("no daemon".to_string()));
+    env.view.pending_session_feed = true;
+
+    assert!(!env.view.apply_session_feed());
+
+    assert_eq!(
+        env.view.get_instance(&id).map(|i| i.status),
+        Some(Status::Running)
+    );
+    assert_eq!(env.view.sidebar_source, SidebarSource::Storage);
+    assert!(!env.view.pending_session_feed);
+}
+
+#[test]
+#[serial]
+fn session_feed_setting_off_never_fetches_and_drops_an_in_flight_result() {
+    let mut env = create_test_env_empty();
+    let id = structured_row(&mut env, Status::Idle);
+    env.view.daemon_sidebar = false;
+
+    env.view.request_session_feed_refresh();
+    assert!(
+        !env.view.pending_session_feed,
+        "off means no request is issued"
+    );
+
+    env.view.session_feed =
+        SessionFeed::seeded_for_test(SessionFeedResult::Snapshot(vec![daemon_row(
+            &id, "Running",
+        )]));
+    env.view.pending_session_feed = true;
+    assert!(!env.view.apply_session_feed());
+    assert_eq!(
+        env.view.get_instance(&id).map(|i| i.status),
+        Some(Status::Idle),
+        "a result that raced the toggle must not drive the row"
+    );
+    assert_eq!(env.view.sidebar_source, SidebarSource::Storage);
+}
+
+#[test]
+#[serial]
+fn request_session_feed_refresh_is_a_no_op_without_structured_rows() {
+    // The daemon owns nothing on a terminal-only sidebar yet, so that view
+    // never talks to it; that would be one HTTP round trip per second for
+    // nothing.
     let mut env = create_test_env_empty();
     let mut inst = Instance::new("tmux-session", "/tmp/repo");
     inst.source_profile = "test".to_string();
     let _ = inst.id.clone();
     env.view.add_instance(inst);
 
-    env.view.request_daemon_status_refresh();
+    env.view.request_session_feed_refresh();
 
     assert!(
-        !env.view.pending_daemon_status_refresh,
+        !env.view.pending_session_feed,
         "no structured rows means no fetch is issued"
     );
 }
@@ -149,31 +236,31 @@ fn request_daemon_status_refresh_is_a_no_op_without_structured_rows() {
 /// the second call had enqueued another request.
 #[test]
 #[serial]
-fn request_daemon_status_refresh_arms_and_disarms_the_in_flight_flag() {
+fn request_session_feed_refresh_arms_and_disarms_the_in_flight_flag() {
     let mut env = create_test_env_empty();
     let _id = structured_row(&mut env, Status::Idle);
 
-    assert!(!env.view.pending_daemon_status_refresh, "starts disarmed");
-    env.view.request_daemon_status_refresh();
-    assert!(env.view.pending_daemon_status_refresh, "first request arms");
+    assert!(!env.view.pending_session_feed, "starts disarmed");
+    env.view.request_session_feed_refresh();
+    assert!(env.view.pending_session_feed, "first request arms");
 
     // While armed, further ticks are dropped at the guard rather than
     // reaching the worker.
-    env.view.pending_daemon_status_refresh = true;
-    env.view.request_daemon_status_refresh();
-    assert!(env.view.pending_daemon_status_refresh);
+    env.view.pending_session_feed = true;
+    env.view.request_session_feed_refresh();
+    assert!(env.view.pending_session_feed);
 
     // Draining the worker disarms, so the next tick can fetch again. The
-    // fetch itself returns empty here (no daemon in the test env), which is
-    // the same path a daemon-less TUI takes.
-    while env.view.pending_daemon_status_refresh {
-        if env.view.apply_daemon_status_updates() {
+    // fetch itself reports the daemon unavailable here (none in the test
+    // env), which is the same path a daemon-less TUI takes.
+    while env.view.pending_session_feed {
+        if env.view.apply_session_feed() {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     assert!(
-        !env.view.pending_daemon_status_refresh,
+        !env.view.pending_session_feed,
         "draining the worker disarms the flag"
     );
 }

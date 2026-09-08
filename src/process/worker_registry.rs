@@ -94,6 +94,12 @@ pub struct WorkerRecord {
     /// back to the default profile, matching pre-persistence behavior.
     #[serde(default)]
     pub source_profile: Option<String>,
+    /// Lifecycle epoch the daemon minted for this runner (see
+    /// `acp::runner_lifecycle`). Together with `pid` it identifies the
+    /// exact process a lease holder may signal or clean up. Records from
+    /// older binaries default to 0, which matches on pid alone.
+    #[serde(default)]
+    pub generation: u64,
     pub started_at: u64,
     pub last_attached_at: Option<u64>,
     pub detached_at: Option<u64>,
@@ -128,10 +134,16 @@ impl WorkerRecord {
             provider_env_keys,
             stored_acp_session_id,
             source_profile,
+            generation: 0,
             started_at: now_secs(),
             last_attached_at: None,
             detached_at: None,
         }
+    }
+
+    pub fn with_generation(mut self, generation: u64) -> Self {
+        self.generation = generation;
+        self
     }
 }
 
@@ -169,36 +181,67 @@ pub fn log_path_for(session_id: &str) -> Result<PathBuf> {
 ///     the "Reconnect" button (the daemon will respawn shortly);
 ///   - signal the reconciler to clear the `attempted` set for this id
 ///     so the next 2s tick actually spawns a fresh worker.
+///
+/// The file holds the generation of the runner being restarted, so the
+/// authority it grants is bound to that runner: a marker for any other
+/// generation is stale and is discarded wherever it is observed.
 pub fn restart_marker_path(session_id: &str) -> Result<PathBuf> {
     crate::process::worker::restart_marker_path(&workers_dir()?, session_id)
 }
 
-/// Best-effort write of an empty restart-pending marker. Called by the
-/// CLI's `aoe acp restart` before deleting the registry entry. The
-/// file's existence is the signal; its contents are irrelevant.
-pub fn mark_restart_pending(session_id: &str) {
+/// Best-effort write of a restart-pending marker for `generation`.
+pub fn mark_restart_pending(session_id: &str, generation: u64) {
     let Ok(path) = restart_marker_path(session_id) else {
         return;
     };
-    let _ = std::fs::write(&path, b"");
+    // Published by rename so a claim can never see a half-written marker.
+    let staged = path.with_extension(format!("restart.tmp-{}", std::process::id()));
+    if std::fs::write(&staged, generation.to_string()).is_err() {
+        return;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600));
+    }
+    if std::fs::rename(&staged, &path).is_err() {
+        let _ = std::fs::remove_file(&staged);
     }
 }
 
-/// Returns `true` if the marker existed (and was deleted). Caller uses
-/// the boolean to pick the publish reason; defense-in-depth removes the
-/// file so a leaked marker doesn't poison the next spawn.
-pub fn take_restart_marker(session_id: &str) -> bool {
-    let Ok(path) = restart_marker_path(session_id) else {
-        return false;
-    };
-    match std::fs::remove_file(&path) {
-        Ok(()) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(_) => false,
+/// Generation named by the marker, without consuming it. `None` when
+/// there is no marker or it names no generation.
+pub fn peek_restart_marker(session_id: &str) -> Option<u64> {
+    let path = restart_marker_path(session_id).ok()?;
+    crate::process::worker::read_restart_marker(&path)
+}
+
+/// Consume the marker atomically: it is renamed aside before it is read,
+/// so a marker written for a newer runner between the read and the delete
+/// is left for its own consumer instead of being erased. `None` when
+/// there was no marker; `Some(None)` for one that names no generation. One
+/// failed rename for the reconciler's per-tick probe of pinned sessions.
+pub fn claim_restart_marker(session_id: &str) -> Option<Option<u64>> {
+    let path = restart_marker_path(session_id).ok()?;
+    let claim = path.with_extension(format!("restart.claim-{}", std::process::id()));
+    std::fs::rename(&path, &claim).ok()?;
+    let generation = crate::process::worker::read_restart_marker(&claim);
+    let _ = std::fs::remove_file(&claim);
+    Some(generation)
+}
+
+/// Consume the marker. Returns `true` only when it named `generation`; a
+/// zero marker matches only a zero (pre-generation) identity, so a runner
+/// started by an older build keeps its restart authority across the
+/// upgrade. The file is removed either way so a stale marker cannot poison
+/// a later stop.
+pub fn take_restart_marker(session_id: &str, generation: u64) -> bool {
+    claim_restart_marker(session_id).flatten() == Some(generation)
+}
+
+pub fn clear_restart_marker(session_id: &str) {
+    if let Ok(path) = restart_marker_path(session_id) {
+        let _ = std::fs::remove_file(&path);
     }
 }
 
@@ -613,6 +656,26 @@ pub async fn terminate_and_wait(session_id: &str) {
     } else {
         delete_if_absent(session_id).ok();
     }
+}
+
+/// Remove the record and sockets only while they still describe the runner
+/// `(pid, generation)`; a record a replacement runner has since written is
+/// left alone. Returns whether the registry is settled for that runner.
+pub fn delete_if_owned_by(session_id: &str, pid: u32, generation: u64) -> bool {
+    let identity = crate::acp::runner_lifecycle::RunnerIdentity { pid, generation };
+    with_registry_lock(session_id, || match load_strict_unlocked(session_id)? {
+        Some(rec) if !identity.matches_record(rec.pid, rec.generation) => {
+            debug!(
+                target: "acp.registry",
+                session = %session_id,
+                current_pid = rec.pid,
+                "leaving registry entry; it belongs to a replacement runner"
+            );
+            Ok(true)
+        }
+        _ => delete_unlocked(session_id).map(|()| true),
+    })
+    .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -1304,6 +1367,106 @@ mod tests {
             let control_socket = crate::process::worker::control_socket_sibling(&raw_socket);
             let _listener = std::os::unix::net::UnixListener::bind(&control_socket).unwrap();
             assert_eq!(pid_source_for(session_id), Some(std::process::id()));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn restart_marker_authority_is_bound_to_a_generation() {
+        with_temp_home(|| {
+            assert!(!take_restart_marker("m", 7), "no marker, nothing to take");
+            mark_restart_pending("m", 7);
+            assert_eq!(peek_restart_marker("m"), Some(7));
+            assert!(
+                !take_restart_marker("m", 8),
+                "a marker for another generation grants nothing"
+            );
+            assert_eq!(peek_restart_marker("m"), None, "but it is still consumed");
+
+            mark_restart_pending("m", 7);
+            assert!(take_restart_marker("m", 7));
+            assert_eq!(peek_restart_marker("m"), None);
+
+            mark_restart_pending("m", 0);
+            assert!(
+                !take_restart_marker("m", 7),
+                "a legacy marker grants nothing to a generation it did not name"
+            );
+            mark_restart_pending("m", 0);
+            assert!(
+                take_restart_marker("m", 0),
+                "a legacy marker restarts a legacy (pre-generation) runner"
+            );
+
+            let path = restart_marker_path("m").unwrap();
+            std::fs::write(&path, b"").unwrap();
+            assert_eq!(
+                peek_restart_marker("m"),
+                None,
+                "an empty legacy marker is unbound"
+            );
+            assert_eq!(
+                claim_restart_marker("m"),
+                Some(None),
+                "a malformed marker is claimed and reported unbound"
+            );
+            assert!(!path.exists(), "a claim leaves nothing behind");
+            assert_eq!(claim_restart_marker("m"), None, "nothing left to claim");
+
+            // A marker written after a claim is a newer runner's authority
+            // and survives it.
+            mark_restart_pending("m", 8);
+            let claimed = claim_restart_marker("m");
+            mark_restart_pending("m", 9);
+            assert_eq!(claimed, Some(Some(8)));
+            assert_eq!(peek_restart_marker("m"), Some(9));
+            let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().contains("restart."))
+                .collect();
+            assert!(
+                leftovers.is_empty(),
+                "publication leaves no staging file: {leftovers:?}"
+            );
+            clear_restart_marker("m");
+            assert!(!path.exists());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn delete_if_owned_by_leaves_a_replacement_record() {
+        with_temp_home(|| {
+            let socket = workers_dir().unwrap().join("g.sock");
+            let rec = WorkerRecord::new(
+                "g".into(),
+                41,
+                socket,
+                "claude-agent-acp".into(),
+                "claude".into(),
+                PathBuf::from("/repo"),
+                None,
+                vec![],
+                vec![],
+                None,
+                None,
+            )
+            .with_generation(3);
+            save(&rec).unwrap();
+            assert!(
+                delete_if_owned_by("g", 40, 3),
+                "other pid: settled without touching"
+            );
+            assert!(load("g").unwrap().is_some());
+            assert!(
+                delete_if_owned_by("g", 41, 4),
+                "other generation: settled, kept"
+            );
+            assert!(load("g").unwrap().is_some());
+            assert!(delete_if_owned_by("g", 41, 3));
+            assert!(load("g").unwrap().is_none());
+            assert!(delete_if_owned_by("g", 41, 3), "missing record is settled");
         });
     }
 }

@@ -73,11 +73,15 @@ export function DeleteSessionDialog({
       ? `Removes the workspace branch "${branchName}"`
       : `Removes branch "${branchName}"`
     : undefined;
+  // The agent store holds that session's saved agent login and history, and
+  // goes with the container it is mounted into. Hedged because a session still
+  // on the pre-v027 shared store has no private store of its own to remove;
+  // the dialog cannot see a session's store generation to say which it is.
   const sandboxDetail = isWorkspaceDelete
     ? sandboxedSessionCount > 0 && sandboxedSessionCount < sessions.length
-      ? `Removes Docker sandbox containers for ${sandboxedSessionCount} sandboxed ${sandboxedSessionLabel} in this workspace`
-      : "Removes Docker sandbox containers for all sessions in this workspace"
-    : "Removes the Docker sandbox container";
+      ? `Removes Docker sandbox containers, and any private agent store, for ${sandboxedSessionCount} sandboxed ${sandboxedSessionLabel} in this workspace`
+      : "Removes Docker sandbox containers, and any private agent store, for all sessions in this workspace"
+    : "Removes the Docker sandbox container and any private agent store it has (including the saved agent login)";
   const scratchDetail = isWorkspaceDelete
     ? "Leaves scratch directories on disk; session records are still removed"
     : "Leaves the scratch directory on disk; session record is still removed";
