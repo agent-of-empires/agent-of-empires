@@ -1837,10 +1837,17 @@ fn record_links(slot: &LinkTable, found: Vec<PaneLink>) {
 /// Replace a channel's table with the links an accepted snapshot advertises.
 ///
 /// A seed covers the whole scrollback the grid keeps, so it is the complete set
-/// of what the pane is currently offering. Merging into the table instead would
-/// leave a target behind for a label the pane has since reprinted as plain
-/// text, and the text matcher would keep that label actionable against an
-/// obsolete URI.
+/// of what the pane is currently offering, including links the reader never saw
+/// (seed bytes are replayed into a fresh parser, not fed through `run_reader`).
+/// Merging into the table instead would leave a target behind for a label the
+/// pane has since reprinted as plain text, and the text matcher would keep that
+/// label actionable against an obsolete URI.
+///
+/// Only an ACCEPTED seed reaches here, under the parser lock beside the grid it
+/// describes, so the table and the frame it speaks for are installed together.
+/// The reader's half is the mirror of that (see `run_reader`), which is what
+/// stops a replacement landing between a target being recorded and the label
+/// that needs it reaching the grid (#3818).
 fn reconcile_links(slot: &LinkTable, found: Vec<PaneLink>) {
     let Ok(mut table) = slot.table.lock() else {
         return;
@@ -1858,19 +1865,6 @@ fn reconcile_links(slot: &LinkTable, found: Vec<PaneLink>) {
         *table = next;
         slot.generation.fetch_add(1, Ordering::Release);
     }
-}
-
-/// Fold a `capture-pane -e` seed's hyperlinks into a channel's table.
-///
-/// The seed bytes are replayed into a fresh parser rather than passing through
-/// `run_reader`, so without this a link already on screen when the channel arms
-/// would lose its target until the pane reprinted it. Reseeds run this too,
-/// which keeps a link that is still on screen recorded no matter how long ago
-/// its sequence left the stream. Recorded even when the swap loses its race:
-/// the pane advertised the link either way.
-#[cfg(test)]
-fn record_seed_links(slot: &LinkTable, stream: &[u8]) {
-    reconcile_links(slot, crate::tmux::osc8::extract_links(stream));
 }
 
 /// A channel's link table plus a counter that moves whenever it does.
@@ -2040,7 +2034,9 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
                 // Below the seed gate on purpose, unlike the OSC 52 tap above:
                 // a dropped pre-seed chunk never reaches the grid, and the seed
                 // snapshot carries its links instead, so recording here would
-                // leave targets for text that was never accepted.
+                // leave targets for text that was never accepted. Inside the
+                // fence with the parse below it, so a seed replacing the table
+                // cannot land between this chunk's targets and its bytes.
                 record_links(&ctx.links, osc8.feed(&buf[..n]));
                 if let Ok(mut p) = ctx.parser.lock() {
                     p.process(&buf[..n]);
@@ -2227,9 +2223,15 @@ impl ResizeState {
         self.declare(target)
     }
 
-    fn end(&mut self) {
+    /// Close a resize's window, and withdraw the declaration it opened when
+    /// `withdrawn` names it: one caller's resize never ran, so its expectation
+    /// goes with it, while a newer declaration for the same geometry stands.
+    fn finish(&mut self, withdrawn: Option<u64>) {
+        if withdrawn == Some(self.token) {
+            self.target = 0;
+        }
         self.epoch += 1;
-        self.in_flight = self.in_flight.saturating_sub(1);
+        self.in_flight -= 1;
     }
 
     /// Whether nothing about the resize state moved since `probe` and nothing
@@ -2289,22 +2291,27 @@ impl VtSample {
 /// expectation the resize declared; dropping it closes the window.
 pub(crate) struct ResizeInFlight<'a> {
     channel: &'a VtChannel,
-    /// The declaration this resize opened, so [`Self::abandon`] withdraws that
-    /// one and not whatever has since replaced it.
+    /// The declaration this resize opened, so a withdrawal names that one and
+    /// not whatever has since replaced it.
     token: u64,
+    withdrawn: bool,
 }
 
 impl ResizeInFlight<'_> {
     /// The resize never ran (this caller turned out not to own the pane size):
-    /// withdraw its expectation, unless a newer one has replaced it.
-    pub(crate) fn abandon(self) {
-        self.channel.abandon_expected_grid(self.token);
+    /// withdraw its expectation, unless a newer one has replaced it. Marks
+    /// rather than acts, so closing the window and withdrawing the declaration
+    /// are the one locked step below.
+    pub(crate) fn abandon(mut self) {
+        self.withdrawn = true;
     }
 }
 
 impl Drop for ResizeInFlight<'_> {
     fn drop(&mut self) {
-        self.channel.resize_state().end();
+        self.channel
+            .resize_state()
+            .finish(self.withdrawn.then_some(self.token));
     }
 }
 
@@ -3031,6 +3038,7 @@ impl VtChannel {
         ResizeInFlight {
             channel: self,
             token,
+            withdrawn: false,
         }
     }
 
@@ -3081,17 +3089,6 @@ impl VtChannel {
             return;
         }
         if state.settled_since(probe) {
-            state.target = 0;
-        }
-    }
-
-    /// Drop an expectation whose resize never happened (the caller turned out
-    /// not to own the pane size). Keyed on the declaration's own identity, so a
-    /// resize another viewer declared in the meantime is left standing even
-    /// when it asked for the very same geometry.
-    fn abandon_expected_grid(&self, token: u64) {
-        let mut state = self.resize_state();
-        if state.token == token {
             state.target = 0;
         }
     }
@@ -5316,6 +5313,11 @@ mod tests {
     /// against a real tmux rather than a hand-built fixture, so a change in how
     /// tmux serializes hyperlinks fails here instead of silently making every
     /// preview link inert.
+    /// What an accepted seed swap does to the table, without the swap.
+    fn record_seed_links(slot: &LinkTable, stream: &[u8]) {
+        reconcile_links(slot, crate::tmux::osc8::extract_links(stream));
+    }
+
     #[test]
     #[serial_test::serial]
     fn real_tmux_capture_carries_hyperlinks_into_the_link_table() {
@@ -5480,6 +5482,264 @@ mod tests {
         let held: Vec<PaneLink> = slot.table.lock().unwrap().iter().cloned().collect();
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].uri, "https://example.com/live");
+    }
+
+    /// The install's half of #3818's ordering: it takes the snapshot fence
+    /// before its drain and still holds it when it replaces the link table.
+    /// The reader cannot show this, and the seed's chunk guard would keep
+    /// catching the erase on its own, so a fence narrowed to the drain alone
+    /// would leave `reconcile_links` racing the reader again with nothing red.
+    ///
+    /// Deterministic without any waiting: the drain cannot complete until the
+    /// forwarder answers, so the forwarder probes the fence knowing the install
+    /// is parked mid-install.
+    #[test]
+    fn an_install_holds_the_snapshot_fence_across_its_drain() {
+        use std::io::Write;
+
+        let (_data_reader, data_forwarder) = UnixStream::pair().expect("data pair");
+        let (parent_control, mut forwarder_control) = UnixStream::pair().expect("control pair");
+        let snapshot = Arc::new(Mutex::new(()));
+        let probed_fence = snapshot.clone();
+        let forwarder = std::thread::spawn(move || {
+            let (kind, generation) =
+                read_drain_frame(&mut forwarder_control).expect("receive drain probe");
+            assert_eq!(kind, DRAIN_PROBE);
+            let fenced = probed_fence.try_lock().is_err();
+            let _ = forwarder_control.write_all(&drain_frame(DRAIN_ACK, generation));
+            fenced
+        });
+
+        let socket = Arc::new(Mutex::new(Some(data_forwarder)));
+        let control = Mutex::new(DrainControl {
+            stream: Some(parent_control),
+            next_generation: 0,
+        });
+        let parser = Mutex::new(vt100::Parser::new(6, 40, 0));
+        let app_cursor = AtomicBool::new(false);
+        let grid_gen = AtomicU64::new(0);
+        let links = LinkTable::default();
+        assert_eq!(
+            install_seeded_parser(
+                SeedSink {
+                    parser: &parser,
+                    app_cursor: &app_cursor,
+                    grid_gen: &grid_gen,
+                    links: &links,
+                },
+                None,
+                b"\x1b]8;;https://example.com/seeded\x1b\\docs\x1b]8;;\x1b\\\r\n",
+                (40, 6),
+                SeedGuard {
+                    chunk: None,
+                    pipe: None,
+                },
+                SeedInstallFence {
+                    snapshot: Some(&snapshot),
+                    socket: Some(&socket),
+                    control: Some(&control),
+                },
+            ),
+            VtRefreshResult::Refreshed,
+        );
+        assert!(
+            forwarder.join().expect("forwarder thread"),
+            "the install must hold the fence from before its drain through the swap"
+        );
+        // The accepted snapshot's targets landed with the grid they describe.
+        assert_eq!(
+            links
+                .table
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![PaneLink {
+                text: "docs".to_string(),
+                uri: "https://example.com/seeded".to_string(),
+            }]
+        );
+    }
+
+    /// #3818: a reseed replaces the link table wholesale from its snapshot, so
+    /// a target the reader recorded after that snapshot was captured must not
+    /// be dropped between being recorded and its label reaching the grid.
+    ///
+    /// Both halves run behind one mutex: `run_reader` holds `snapshot` from
+    /// before `recv` through the parse, and `install_seeded_parser` holds it
+    /// from before its drain through the table replacement. Park a real
+    /// install on its drain ACK to hold that window open, and deliver the
+    /// sequence into it.
+    #[test]
+    fn a_reseed_cannot_erase_a_link_recorded_inside_its_fence() {
+        use std::io::Write;
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("s.sock");
+        let listener = UnixListener::bind(&sock).expect("bind");
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        let app_cursor = Arc::new(AtomicBool::new(false));
+        let grid_gen = Arc::new(AtomicU64::new(0));
+        let links: Arc<LinkTable> = Arc::new(LinkTable::default());
+        let chunk_seq = Arc::new(AtomicU64::new(0));
+        let settled_chunk_seq = Arc::new(AtomicU64::new(0));
+        let snapshot = Arc::new(Mutex::new(()));
+        let stream: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
+        let stop = Arc::new(AtomicBool::new(false));
+        let ctx = ReaderCtx {
+            parser: parser.clone(),
+            stop: stop.clone(),
+            seeded: Arc::new(AtomicBool::new(true)),
+            snapshot: snapshot.clone(),
+            stream: stream.clone(),
+            app_cursor: app_cursor.clone(),
+            lifecycle: Arc::new(AtomicU8::new(VtLifecycle::Starting as u8)),
+            wakeup: Arc::new(Mutex::new(None)),
+            clipboard: Arc::new(Mutex::new(None)),
+            links: links.clone(),
+            chunk_seq: chunk_seq.clone(),
+            settled_chunk_seq: settled_chunk_seq.clone(),
+            last_chunk_ms: Arc::new(AtomicU64::new(0)),
+            prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
+            grid_gen: grid_gen.clone(),
+            signals: Arc::new(ViewerSignals::new()),
+        };
+        let reader = std::thread::spawn(move || run_reader(listener, ctx));
+        let mut conn = UnixStream::connect(&sock).expect("connect");
+
+        // The screen the reseed's snapshot was taken from. Waiting for it also
+        // proves the reader is in its loop with its socket published, which is
+        // what the install reads the pending queue through.
+        conn.write_all(b"see docs now").expect("write pane output");
+        let ready = Instant::now() + Duration::from_secs(5);
+        while settled_chunk_seq.load(Ordering::Acquire) == 0 {
+            assert!(
+                Instant::now() < ready,
+                "reader never applied the first chunk"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        // A forwarder that answers the install's drain as a live one would.
+        let (parent_control, mut forwarder_control) = UnixStream::pair().expect("control pair");
+        let (probed_tx, probed_rx) = mpsc::channel();
+        let forwarder = std::thread::spawn(move || {
+            let (kind, generation) =
+                read_drain_frame(&mut forwarder_control).expect("receive drain probe");
+            assert_eq!(kind, DRAIN_PROBE);
+            probed_tx.send(()).expect("signal the probe arrived");
+            let _ = forwarder_control.write_all(&drain_frame(DRAIN_ACK, generation));
+        });
+        let control = Arc::new(Mutex::new(DrainControl {
+            stream: Some(parent_control),
+            next_generation: 0,
+        }));
+
+        let expected_chunk_seq = chunk_seq.load(Ordering::Acquire);
+        // The snapshot: the same screen, advertising nothing. Accepting it
+        // after the reader has recorded the sequence below is the erase.
+        let seed = assemble_seed_stream(b"see docs now\n", &PaneSeedState::default(), 24);
+
+        // Stand in for the install's own hold on the fence, so the window it
+        // occupies from before its drain through the table replacement is open
+        // for as long as this test needs (its drain deadline is 100 ms).
+        let fence = snapshot.lock().expect("hold the fence");
+        // The pane advertises a new target into that window.
+        conn.write_all(b"\r\n\x1b]8;;https://example.com/new\x1b\\docs\x1b]8;;\x1b\\ added")
+            .expect("write pane output");
+        let install = {
+            let (parser, app_cursor, grid_gen, links) = (
+                parser.clone(),
+                app_cursor.clone(),
+                grid_gen.clone(),
+                links.clone(),
+            );
+            let (chunk_seq, settled_chunk_seq) = (chunk_seq.clone(), settled_chunk_seq.clone());
+            let (snapshot, stream, control) = (snapshot.clone(), stream.clone(), control.clone());
+            std::thread::spawn(move || {
+                install_seeded_parser(
+                    SeedSink {
+                        parser: &parser,
+                        app_cursor: &app_cursor,
+                        grid_gen: &grid_gen,
+                        links: &links,
+                    },
+                    None,
+                    &seed,
+                    (80, 24),
+                    SeedGuard {
+                        chunk: Some((&chunk_seq, &settled_chunk_seq, expected_chunk_seq)),
+                        pipe: None,
+                    },
+                    SeedInstallFence {
+                        snapshot: Some(&snapshot),
+                        socket: Some(&stream),
+                        control: Some(&control),
+                    },
+                )
+            })
+        };
+
+        // Neither side may enter. The install takes the fence before anything
+        // else, so it never reaches its drain; and the reader takes it before
+        // `recv`, so the chunk is not claimed, let alone recorded. This is the
+        // interleaving #3818 describes, and there is no state in which the
+        // target is recorded and its bytes are not yet applied.
+        assert!(
+            probed_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the install must not run its drain inside another holder's fence"
+        );
+        assert_eq!(
+            chunk_seq.load(Ordering::Acquire),
+            expected_chunk_seq,
+            "the fence holds the reader off the chunk, sequence and bytes together"
+        );
+        assert!(links.table.lock().unwrap().is_empty());
+
+        drop(fence);
+        probed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the install proceeds once the fence clears");
+        assert_eq!(
+            install.join().expect("install thread"),
+            VtRefreshResult::Busy,
+            "whichever side wins the released fence, the snapshot is stale: the chunk is either unread on the socket or already past the baseline it captured at"
+        );
+
+        // The reader applies what it was holding: label and target arrive
+        // together, and the stale snapshot took neither.
+        let landed = Instant::now() + Duration::from_secs(5);
+        let recorded = loop {
+            let held: Vec<PaneLink> = links.table.lock().unwrap().iter().cloned().collect();
+            if !held.is_empty() || Instant::now() >= landed {
+                break held;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(
+            recorded,
+            vec![PaneLink {
+                text: "docs".to_string(),
+                uri: "https://example.com/new".to_string(),
+            }],
+            "the newly advertised target must survive the reseed"
+        );
+        assert!(
+            parser
+                .lock()
+                .unwrap()
+                .screen()
+                .contents()
+                .contains("docs added"),
+            "and the label it describes must be on the grid"
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        drop(conn);
+        let _ = reader.join();
+        forwarder.join().expect("forwarder thread");
     }
 
     #[test]
