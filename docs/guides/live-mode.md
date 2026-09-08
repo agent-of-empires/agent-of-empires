@@ -47,6 +47,31 @@ cursor) also receives hover motion. Hold `Shift` while clicking or
 dragging to bypass forwarding and use AoE's own text selection and
 copy instead.
 
+Links in the preview are underlined, and a plain click opens one in your
+browser, ahead of that forwarding. This works whenever the preview is on
+screen, not only in live mode. Both kinds count: a hyperlink the agent
+marked up, whose visible text can hide the address entirely, and a plain URL
+sitting in the output. AoE holds the mouse, so a plain click never reaches your
+terminal emulator; `Shift` behaves as it does elsewhere on the preview, going
+to AoE's own text selection, though emulators that claim shifted clicks for
+themselves (WezTerm, iTerm2) take it before AoE sees it.
+
+Resting the pointer on a link shows where it goes in the status bar. Worth a
+glance before clicking: a link's visible text is chosen by whatever is running
+in the pane, so it need not resemble its address.
+
+AoE also passes the link on to your terminal, so hovering highlights it and
+your terminal's own link gesture works too.
+
+When AoE cannot reach a browser you would actually see, it copies the address
+to your clipboard instead of opening it, and says so. That covers SSH, where a
+browser launched on the far end would open on a screen you are not sitting at,
+and headless hosts with no browser at all. Your terminal's own link gesture
+still opens it locally, which is usually what you want. Set `BROWSER` to
+override the check, so a script that forwards the URL somewhere useful keeps
+working. That applies on platforms whose browser launcher reads it; macOS opens
+through the system instead and ignores both `BROWSER` and `DISPLAY`.
+
 ## The leader menu
 
 Almost every key you press in live mode goes to the agent, so AoE
@@ -133,9 +158,10 @@ repaints in synchronized output (DEC 2026) is shown only between brackets,
 never mid-redraw.
 
 The channel needs tmux 3.4 or newer. A pane that cannot arm one, a pane
-whose grid could not be seeded, an older tmux, a split window, or a
-non-Unix host falls back to the polling path automatically; everything
-still works, with more latency and without the synchronized-output hold.
+whose grid could not be seeded, a grid still catching up with a resize,
+an older tmux, a split window, or a non-Unix host falls back to the
+polling path automatically; everything still works, with more latency
+and without the synchronized-output hold.
 The paired host and container shells always use the polling path.
 
 To rule the VT transport in or out while troubleshooting, toggle "VT

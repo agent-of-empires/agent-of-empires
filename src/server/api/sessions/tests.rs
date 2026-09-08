@@ -2110,7 +2110,10 @@ fn apply_post_restart_sync_propagates_agent_session_id() {
     started.agent_session_id = Some("claude-uuid-restart".to_string());
     started.omp_capture_generation = Some("omp-generation-restart".to_string());
     let mut poller = crate::session::poller::SessionPoller::new("omp-restarted".to_string());
-    assert!(poller.start(before.id.clone(), Box::new(|| None), Box::new(|_| {}), None,));
+    assert_eq!(
+        poller.start(before.id.clone(), Box::new(|| None), Box::new(|_| {}), None,),
+        crate::session::poller::PollerSpawn::Spawned
+    );
     let restarted_poller = std::sync::Arc::new(std::sync::Mutex::new(poller));
     started.session_id_poller = Some(restarted_poller.clone());
     started.last_start_time = Some(std::time::Instant::now());
@@ -2154,6 +2157,54 @@ fn apply_post_restart_sync_propagates_agent_session_id() {
             .expect("running restart poller"),
         &restarted_poller,
     ));
+    restarted_poller
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .stop();
+}
+
+#[test]
+fn apply_post_restart_identity_sync_clears_repair_backoff_when_restart_poller_runs() {
+    let mut before = make_test_instance();
+    before.omp_capture_generation = Some("generation-a".to_string());
+    let now = std::time::Instant::now();
+    before.poller_repair.defer(now);
+    before.poller_repair.defer(now);
+    assert_eq!(before.poller_repair.deferrals(), 2);
+
+    let mut started = before.clone();
+    started.omp_capture_generation = Some("generation-b".to_string());
+    started.poller_repair.reset();
+    let mut poller = crate::session::poller::SessionPoller::new("omp-restarted".to_string());
+    assert_eq!(
+        poller.start(before.id.clone(), Box::new(|| None), Box::new(|_| {}), None,),
+        crate::session::poller::PollerSpawn::Spawned
+    );
+    let restarted_poller = std::sync::Arc::new(std::sync::Mutex::new(poller));
+    started.session_id_poller = Some(restarted_poller.clone());
+
+    let mut live = before.clone();
+    apply_post_restart_identity_sync(&mut live, &before, &started);
+    assert_eq!(
+        live.poller_repair.deferrals(),
+        0,
+        "the merged live row must not keep the pre-restart backoff"
+    );
+
+    let mut peer_relaunched = before.clone();
+    peer_relaunched.omp_capture_generation = Some("peer-generation".to_string());
+    apply_post_restart_identity_sync(&mut peer_relaunched, &before, &started);
+    assert_eq!(peer_relaunched.poller_repair.deferrals(), 0);
+
+    let mut not_started = started.clone();
+    not_started.session_id_poller = None;
+    let mut live = before.clone();
+    apply_post_restart_identity_sync(&mut live, &before, &not_started);
+    assert_eq!(
+        live.poller_repair.deferrals(),
+        2,
+        "a restart without a running poller leaves the schedule alone"
+    );
     restarted_poller
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())

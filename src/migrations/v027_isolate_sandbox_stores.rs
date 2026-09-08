@@ -2215,11 +2215,13 @@ mod tests {
         std::env::remove_var(DEFER_ENV);
         result.unwrap();
 
+        // The runner commits the build's target version, not v27 in
+        // particular: a later migration in the chain must not fail this test.
         assert_eq!(
             fs::read_to_string(app.join(".schema_version"))
                 .unwrap()
                 .trim(),
-            "27"
+            super::super::CURRENT_VERSION.to_string()
         );
         assert!(!super::super::has_pending_migrations());
         assert!(transition_may_be_pending(&app).unwrap());

@@ -916,6 +916,8 @@ mod tests {
                 diffs: Vec::new(),
             },
             destructive: false,
+            options: Vec::new(),
+            choice: false,
             requested_at: chrono::Utc::now(),
             resolved: None,
         };
@@ -1139,6 +1141,8 @@ mod tests {
                 diffs: Vec::new(),
             },
             destructive: false,
+            options: Vec::new(),
+            choice: false,
             requested_at: chrono::Utc::now(),
             resolved: None,
         };

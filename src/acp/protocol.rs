@@ -131,14 +131,24 @@ pub struct DiffCommentsPromptRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ResolveApprovalRequest {
     pub decision: ApprovalDecisionWire,
+    /// The `option_id` the user picked off the agent's own labels, for an
+    /// approval the client rendered as an answer list (`Approval.choice`).
+    /// Omitted by trio-only clients; `decision` then picks by option kind,
+    /// as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub option_id: Option<String>,
 }
 
 /// PascalCase JSON variants (`Allow`, `AllowAlways`, `Deny`,
 /// `Cancelled`) matching the web frontend's approval flow.
-/// `Cancelled` is server-internal (synthesized when the daemon sweeps
-/// orphaned approvals on attach, see #1099); clients never POST it but
-/// it can appear in `Event::ApprovalResolved` payloads broadcast back
-/// over WS, and the wire enum mirrors the internal one for symmetry.
+///
+/// `Cancelled` means "the user dismissed this without answering": it
+/// takes the resolver's cancellation path rather than being mapped onto
+/// an option, so it is the only safe way to dismiss an answer-list card
+/// (`Deny` would answer with the first reject-kind option). The daemon
+/// also synthesizes it when sweeping orphaned approvals on attach (see
+/// #1099), and it appears in `Event::ApprovalResolved` payloads
+/// broadcast back over WS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum ApprovalDecisionWire {

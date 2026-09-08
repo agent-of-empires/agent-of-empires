@@ -148,6 +148,11 @@ pub enum ChoicePurpose {
     /// the browser. Shown when a plugin `open-ui-link` chord resolves to more
     /// than one link (a multi-repo workspace with several open PRs).
     OpenLink,
+    /// Accepting POSTs the approval with the chosen `option_id`, for a
+    /// permission request whose options carry a question rather than an
+    /// allow/deny vocabulary. The option `value` is the `option_id`. See
+    /// #3741.
+    Approval { nonce: String },
     /// Accepting records the answer for the current question and either
     /// advances to the next single-select question or, when `remaining`
     /// is empty, POSTs the accumulated answers.
@@ -930,6 +935,8 @@ mod tests {
             kind: "read".into(),
             args: String::new(),
             destructive: false,
+            options: Vec::new(),
+            choice: false,
         };
         let mut state = test_state(None);
         state.transcript.pending_approvals = vec![pending("approval-b"), pending("approval-c")];

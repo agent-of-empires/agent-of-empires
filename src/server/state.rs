@@ -179,19 +179,13 @@ pub struct AppState {
     /// transitions to `Status::Error` for up to 8 seconds while the agent
     /// is still settling. Periodically GC'd by a background task.
     pub recently_restarted: crate::session::recovery::RecentlyRestarted,
-    /// Bumped once per committed membership change of the session set: a
-    /// removal, after the row is gone from both `sessions.json` and
-    /// `instances`, and a creation, after the row is in both. A reloader
-    /// reads it before its disk read and hands the value back to
-    /// `reload_state_instances_from_disk`, which drops the reload when the
-    /// value moved: the disk snapshot it is carrying predates the mutation,
-    /// so folding it in would resurrect a removed row or drop a created one.
-    /// See invariant 8 on that function.
-    ///
-    /// Membership only. A field edit on an existing row does not bump, because
-    /// the per-id merge already reconciles those; the epoch exists for the
-    /// two cases the merge cannot see, where the id itself is absent from one
-    /// side.
+    /// Bumped after a committed session membership or view transition is on
+    /// disk and mirrored in `instances`. Reloaders capture the epoch before
+    /// reading disk and drop snapshots whose epoch no longer matches under the
+    /// `instances` write lock. This prevents stale snapshots from resurrecting
+    /// rows, dropping rows, or restoring the previous execution backend.
+    /// Other field edits do not bump because their per-id merge may converge on
+    /// the next reload. See invariant 8 on `reload_state_instances_from_disk`.
     pub mutation_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Ids whose startup-recovery cascade is scheduled but not yet complete.
     /// Phase A seeds it; each Phase B worker drains its id on completion. The

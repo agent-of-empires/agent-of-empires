@@ -20,16 +20,13 @@
 //! `AOE_SILENT_ORPHAN_FAST_GRACE_MS` only under `cfg(debug_assertions)`;
 //! release builds would wait the full 60s production default.
 
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use agent_of_empires::acp::acp_client::AcpClient;
 use agent_of_empires::acp::state::{AcpSessionId, Event};
 use serial_test::serial;
-use tokio::net::UnixListener;
-use tokio::process::Command;
 
-use crate::common::{shim_path, shim_ready};
+use crate::common::{shim_ready, spawn_runner_with_shim};
 
 /// RAII helper that snapshots env-var values on construction and
 /// restores them on drop. The watchdog tests are `#[serial]` but the
@@ -75,45 +72,6 @@ impl Drop for EnvGuard {
     }
 }
 
-async fn spawn_shim_socket_bridge_with_preseed(
-    preseed_session_id: &str,
-) -> (PathBuf, tempfile::TempDir) {
-    let shim = shim_path();
-    let temp = tempfile::tempdir().unwrap();
-    let socket_path = temp.path().join("runner.sock");
-
-    let mut cmd = Command::new("node");
-    cmd.arg(&shim);
-    cmd.env("SHIM_PRESEED_SESSION_ID", preseed_session_id);
-    let mut shim_proc = cmd
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn shim");
-    let shim_stdin = shim_proc.stdin.take().expect("shim stdin");
-    let shim_stdout = shim_proc.stdout.take().expect("shim stdout");
-
-    let listener = UnixListener::bind(&socket_path).expect("bind listener");
-
-    tokio::spawn(async move {
-        let _shim_proc = shim_proc;
-        let (stream, _) = match listener.accept().await {
-            Ok(pair) => pair,
-            Err(_) => return,
-        };
-        let (mut sock_read, mut sock_write) = stream.into_split();
-        let mut shim_in = shim_stdin;
-        let mut shim_out = shim_stdout;
-        let to_shim = async move { tokio::io::copy(&mut sock_read, &mut shim_in).await.ok() };
-        let from_shim = async move { tokio::io::copy(&mut shim_out, &mut sock_write).await.ok() };
-        let _ = tokio::join!(to_shim, from_shim);
-    });
-
-    (socket_path, temp)
-}
-
 async fn drain_for_stopped_reason(client: &mut AcpClient, deadline: Instant) -> Option<String> {
     while Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(200), client.next_event()).await {
@@ -146,7 +104,8 @@ async fn silent_orphan_fires_on_cost_then_silence() {
     ]);
 
     let preseed = "silent-orphan-positive";
-    let (socket_path, _tmp) = spawn_shim_socket_bridge_with_preseed(preseed).await;
+    let (socket_path, _tmp) =
+        spawn_runner_with_shim(preseed, &[("SHIM_PRESEED_SESSION_ID", preseed.to_string())]).await;
 
     let client = AcpClient::attach(
         socket_path,
@@ -207,7 +166,8 @@ async fn silent_orphan_suppressed_during_normal_turn() {
     ]);
 
     let preseed = "silent-orphan-negative";
-    let (socket_path, _tmp) = spawn_shim_socket_bridge_with_preseed(preseed).await;
+    let (socket_path, _tmp) =
+        spawn_runner_with_shim(preseed, &[("SHIM_PRESEED_SESSION_ID", preseed.to_string())]).await;
 
     let client = AcpClient::attach(
         socket_path,
@@ -269,7 +229,8 @@ async fn silent_orphan_disabled_by_zero_grace() {
     ]);
 
     let preseed = "silent-orphan-disabled";
-    let (socket_path, _tmp) = spawn_shim_socket_bridge_with_preseed(preseed).await;
+    let (socket_path, _tmp) =
+        spawn_runner_with_shim(preseed, &[("SHIM_PRESEED_SESSION_ID", preseed.to_string())]).await;
 
     let client = AcpClient::attach(
         socket_path,
@@ -327,7 +288,8 @@ async fn silent_orphan_suppressed_during_async_agent_wait() {
     ]);
 
     let preseed = "silent-orphan-async-agent";
-    let (socket_path, _tmp) = spawn_shim_socket_bridge_with_preseed(preseed).await;
+    let (socket_path, _tmp) =
+        spawn_runner_with_shim(preseed, &[("SHIM_PRESEED_SESSION_ID", preseed.to_string())]).await;
 
     let client = AcpClient::attach(
         socket_path,
@@ -386,7 +348,8 @@ async fn silent_orphan_suppressed_during_background_bash() {
     ]);
 
     let preseed = "silent-orphan-background-bash";
-    let (socket_path, _tmp) = spawn_shim_socket_bridge_with_preseed(preseed).await;
+    let (socket_path, _tmp) =
+        spawn_runner_with_shim(preseed, &[("SHIM_PRESEED_SESSION_ID", preseed.to_string())]).await;
 
     let client = AcpClient::attach(
         socket_path,
@@ -439,7 +402,8 @@ async fn silent_orphan_suppressed_during_scheduled_wakeup() {
     ]);
 
     let preseed = "silent-orphan-wakeup";
-    let (socket_path, _tmp) = spawn_shim_socket_bridge_with_preseed(preseed).await;
+    let (socket_path, _tmp) =
+        spawn_runner_with_shim(preseed, &[("SHIM_PRESEED_SESSION_ID", preseed.to_string())]).await;
 
     let client = AcpClient::attach(
         socket_path,

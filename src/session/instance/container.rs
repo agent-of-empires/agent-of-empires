@@ -264,6 +264,15 @@ impl Instance {
         Ok(container)
     }
 
+    fn ensure_container_hook_mount_source(&self) {
+        if let Err(error) = crate::hooks::ensure_instance_dir_path(&self.id) {
+            tracing::warn!(
+                target: "session.profile",
+                "Failed to prepare hook directory before container launch: {error:#}"
+            );
+        }
+    }
+
     /// Backfill [`SandboxInfo::container_workdir`] from a live container for a
     /// session created before that field existed (or one whose value was
     /// cleared). Authoritative: the value is the container's own
@@ -318,6 +327,7 @@ impl Instance {
     }
 
     pub(super) fn build_container_config(&self) -> Result<crate::containers::ContainerConfig> {
+        self.ensure_container_hook_mount_source();
         let detect_as = self.effective_detect_as();
         let sandbox = self
             .sandbox_info
@@ -460,6 +470,22 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hook_mount_source_is_restored_for_agent_without_hooks() {
+        let mut inst = Instance::new("agent without hooks", "/tmp/test");
+        inst.id = format!("restart-hooks-{}", Uuid::new_v4().simple());
+        inst.tool = "bash".to_string();
+
+        let hook_dir = crate::hooks::ensure_instance_dir_path(&inst.id).unwrap();
+        crate::hooks::cleanup_hook_status_dir(&inst.id);
+        assert!(!hook_dir.exists());
+
+        inst.ensure_container_hook_mount_source();
+        assert!(hook_dir.is_dir());
+
+        crate::hooks::cleanup_hook_status_dir(&inst.id);
+    }
 
     /// Regression for issue #2414: a sandboxed worktree session's
     /// `container_workdir()` must stay pinned to what the container was created
