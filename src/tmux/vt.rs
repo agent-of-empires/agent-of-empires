@@ -802,8 +802,8 @@ fn pane_size_cursor(
 /// Split out of the fork so the failure modes are testable: a pane that vanished
 /// mid-probe, or a tmux that could not resolve a format, yields a short or
 /// non-numeric line, and this must report `None` rather than a partial tuple.
-/// A half-read cursor would look like drift to `reconcile_step` and retire a
-/// live grid unnecessarily, which the drift detector exists to avoid.
+/// A half-read cursor would look like drift to `reconcile_step` and reseed the
+/// grid once a second, which is the flicker the drift detector exists to avoid.
 fn parse_size_cursor(raw: &str) -> Option<(u16, u16, u16, u16)> {
     let mut it = raw.split_whitespace();
     let w = it.next()?.parse().ok()?;
@@ -818,13 +818,13 @@ fn parse_size_cursor(raw: &str) -> Option<(u16, u16, u16, u16)> {
 enum GridReconcile {
     /// Grid agrees with the pane; clear any armed drift.
     InSync,
-    /// Geometry changed: retire the live grid for capture fallback.
+    /// Geometry changed: adopt the new size and reseed.
     Resize,
     /// Cursor disagrees for the first time. Remember the generation it was seen
     /// at; a racing probe resolves itself by the next pass.
     ArmDrift,
     /// Cursor still disagrees a full pass later with no output in between, so
-    /// the grid is genuinely diverged from tmux. Retire it for capture fallback.
+    /// the grid is genuinely diverged from tmux. Reseed.
     Reseed,
 }
 
@@ -832,14 +832,14 @@ enum GridReconcile {
 /// grid's own geometry and cursor, the grid generation a drift was first armed
 /// at (`pending`), and the current generation.
 ///
-/// Geometry wins: a resize retires the live grid anyway, so there is no point
-/// ruling on a cursor that the capture fallback will replace.
+/// Geometry wins: a resize reseeds anyway, so there is no point ruling on a
+/// cursor that the reflow is about to move.
 ///
 /// The cursor check is the grid's resync for a pane that is being watched but
 /// never resizes. `pipe-pane` is a one-way byte stream with no
 /// acknowledgement, so any byte the grid misses (or applies twice) is a
-/// permanent divergence, and before this the only live-grid recovery was on a
-/// size change: a pane that never resized stayed wrong indefinitely.
+/// permanent divergence, and before this the only reseed was on a size change:
+/// a pane that never resized stayed wrong indefinitely.
 ///
 /// Confirming across two passes is what keeps it from firing on a race. The
 /// probe is a fork, so a pane that emits output between the grid's last applied
@@ -850,7 +850,7 @@ enum GridReconcile {
 /// none either. A cursor that still disagrees under those conditions cannot be
 /// explained by a race. Streaming output keeps bumping the generation and so
 /// never reaches `Reseed`, which is what stops a busy full-screen agent from
-/// unnecessarily retiring its live grid once a second.
+/// reseeding (and flickering) once a second.
 fn reconcile_step(
     tmux: (u16, u16, u16, u16),
     grid: (u16, u16, u16, u16),
@@ -866,8 +866,8 @@ fn reconcile_step(
     // pane_width` while a wrap is pending, and so does the grid *while
     // streaming*, but the seed's absolute CUP goes through vt100's `set_pos`,
     // which clamps the column to `cols - 1`. A pane parked at a pending wrap
-    // therefore reads as a drift that capture fallback can never clear, so an
-    // unclamped comparison retires the live channel every other pass for as long as the pane is
+    // therefore reads as a drift that reseeding can never clear, so an
+    // unclamped comparison reseeds every other pass for as long as the pane is
     // viewed. The cost is missing a genuine one-column drift at the right
     // edge, which the next chunk of output moves off that column anyway.
     let last_col = tw.saturating_sub(1);
@@ -1862,9 +1862,9 @@ pub(crate) struct LinkTable {
 /// when no channel is armed; the capture fallback carries the sequences in the
 /// frame text instead, so the TUI reads those straight off the content.
 ///
-/// Only a live channel answers. A retired or failed one no longer describes
-/// what is on screen, and with no reseed left to run, `reconcile_links` never
-/// revisits its table: it froze at teardown while the pane kept moving.
+/// Only a live channel answers. A channel whose forwarder died no longer
+/// describes what is on screen, and with no reader left, its table froze at
+/// teardown while the pane kept moving.
 ///
 /// The damage is to labels the frame can no longer speak for. Where the pane
 /// still advertises a target, `Preview::collect_links` offers both and
@@ -1891,7 +1891,7 @@ pub(crate) fn pane_links(session: &str) -> Vec<PaneLink> {
 /// How many times `session`'s link table has changed. Cheaper than cloning the
 /// table to find out, so a consumer can watch it every frame.
 ///
-/// Gated with [`pane_links`], so retirement drops it back to the no-channel
+/// Gated with [`pane_links`], so a dead channel drops it back to the no-channel
 /// zero. That change is itself the signal: a consumer holding a non-zero copy
 /// re-collects once at the transition, and from there the capture path's own
 /// sequences move the frame text whenever a target changes.
@@ -2081,8 +2081,10 @@ pub(crate) struct VtChannel {
     stream: Arc<Mutex<Option<UnixStream>>>,
     /// DECCKM snapshot, refreshed by the reader thread on each grid change.
     app_cursor: Arc<AtomicBool>,
-    /// Shared reader lifecycle. Retirement remains distinct from failure so
-    /// every viewer honors capture-only while legitimate disconnects recover.
+    /// Shared reader lifecycle: `Live` once `accept` publishes the writable
+    /// half, `Failed` when the reader exits (pipe EOF / socket error).
+    /// `acquire` only hands out a `Live` channel, so once it clears, input and
+    /// capture both fall back to the legacy tmux path instead of black-holing.
     lifecycle: Arc<AtomicU8>,
     /// Slot for one in-process poller's wakeup (the TUI capture worker).
     /// The reader thread pokes it on each grid change and on death; last
@@ -2145,7 +2147,7 @@ pub(crate) struct VtChannel {
     rows: AtomicU16,
     last_size_check: Mutex<Instant>,
     /// Grid generation a cursor drift was first seen at, or `None` when the
-    /// grid last agreed with the pane. `reconcile_grid` only retires it when the
+    /// grid last agreed with the pane. `reconcile_grid` only reseeds when the
     /// same drift survives a pass with this generation unchanged, so a probe
     /// that merely raced the byte stream costs nothing (see `reconcile_step`).
     pending_drift: Mutex<Option<u64>>,
@@ -2252,8 +2254,10 @@ impl VtChannel {
         session: &str,
         deadline: &crate::tmux::TmuxCommandDeadline,
     ) -> Option<Arc<VtChannel>> {
-        // Reuse only a live entry. Failure permits recovery, while retirement
-        // suppresses rearming until the viewers holding that generation drop.
+        // Reuse only a live entry. A dead one (its pane was killed and the
+        // tmux session recreated under the same name, e.g. a session restart)
+        // must not be handed out: a viewer that received it would sit on the
+        // capture fallback forever. Arming fresh replaces the registry entry.
         if let Some(ch) = lookup(session) {
             if ch.lifecycle() == VtLifecycle::Live {
                 return Some(ch);
@@ -2591,7 +2595,7 @@ impl VtChannel {
     ///   in between, which means the grid genuinely diverged from tmux:
     ///   `pipe-pane` is an unacknowledged one-way stream, so a missed or doubled
     ///   byte is permanent. `reconcile_step` owns the race-vs-drift call and
-    ///   deliberately does not retire the channel while output is flowing.
+    ///   deliberately does not reseed while output is flowing.
     ///   Cursor-clean cell drift is handled by the capture worker's
     ///   authoritative fallback.
     fn reconcile_grid(&self, deadline: &crate::tmux::TmuxCommandDeadline) {
@@ -2614,7 +2618,7 @@ impl VtChannel {
         // Read the cursor and the generation under ONE parser lock, which is
         // also where `run_reader` bumps the generation: a cursor that already
         // reflects a chunk therefore cannot pair with a generation that does
-        // not, which would read as drift-without-output and retire for nothing.
+        // not, which would read as drift-without-output and reseed for nothing.
         let Ok(p) = self.parser.lock() else {
             return;
         };
@@ -2663,12 +2667,6 @@ impl VtChannel {
         }
     }
 
-    /// Retire the live grid when it needs an authoritative replacement.
-    ///
-    /// Tmux can have output represented by `capture-pane` while it is still in
-    /// its own pipe queue, beyond the forwarder's ordering fence. Replacing the
-    /// parser would replay that output when tmux flushes it, so consumers must
-    /// use the capture-only fallback instead.
     /// Rebuild the grid from `capture-pane` and clear any armed drift after a
     /// successful swap.
     ///
@@ -2686,36 +2684,52 @@ impl VtChannel {
         deadline: &crate::tmux::TmuxCommandDeadline,
     ) -> VtRefreshResult {
         let since = guarded.then(|| self.grid_gen.load(Ordering::Relaxed));
-        let expected_chunk_seq = self.chunk_seq.load(Ordering::Acquire);
-        let result = seed_parser(
-            &self.target,
-            SeedSink {
-                parser: &self.parser,
-                app_cursor: &self.app_cursor,
-                grid_gen: &self.grid_gen,
-                links: &self.links,
-            },
-            since,
-            (cols, rows),
-            deadline,
-            SeedGuard {
-                chunk: Some((&self.chunk_seq, &self.settled_chunk_seq, expected_chunk_seq)),
-                pipe: None,
-            },
-            SeedInstallFence {
-                snapshot: Some(&self.snapshot),
-                socket: Some(&self.stream),
-                control: Some(&self.drain),
-            },
-        );
+        // A resize is the one caller whose Busy is expected rather than
+        // informative: tmux repaints the whole pane, so the fence almost
+        // always finds those bytes in flight on the first attempt. Retry it
+        // on the arm path's cadence until the reader drains them. A guarded
+        // reseed does not retry, because there Busy means the current grid
+        // took output the snapshot lacks and is the better copy.
+        let attempts = if guarded { 1 } else { SEED_INSTALL_ATTEMPTS };
+        let mut result = VtRefreshResult::Failed;
+        for attempt in 0..attempts {
+            if attempt > 0 {
+                std::thread::sleep(SEED_INSTALL_RETRY);
+            }
+            let expected_chunk_seq = self.chunk_seq.load(Ordering::Acquire);
+            result = seed_parser(
+                &self.target,
+                SeedSink {
+                    parser: &self.parser,
+                    app_cursor: &self.app_cursor,
+                    grid_gen: &self.grid_gen,
+                    links: &self.links,
+                },
+                since,
+                (cols, rows),
+                deadline,
+                SeedGuard {
+                    chunk: Some((&self.chunk_seq, &self.settled_chunk_seq, expected_chunk_seq)),
+                    pipe: None,
+                },
+                SeedInstallFence {
+                    snapshot: Some(&self.snapshot),
+                    socket: Some(&self.stream),
+                    control: Some(&self.drain),
+                },
+            );
+            if result != VtRefreshResult::Busy {
+                break;
+            }
+        }
         if result == VtRefreshResult::Refreshed {
             self.clear_drift();
         }
         result
     }
 
-    /// Retire the live grid for authoritative capture fallback even when cursor
-    /// and geometry probes agree, healing cell drift they cannot see.
+    /// Rebuild from an authoritative tmux snapshot even when cursor and
+    /// geometry probes agree, healing cell drift those probes cannot see.
     pub(crate) fn refresh_authoritatively(
         &self,
         deadline: &crate::tmux::TmuxCommandDeadline,
@@ -2884,8 +2898,10 @@ impl VtChannel {
         )
     }
 
-    /// Retire the live grid after the size owner runs `resize-window` so the
-    /// next capture observes tmux's reflow instead of sampling stale pipe data.
+    /// Re-sync the grid to a new pane size right after the size owner ran
+    /// `resize-window`, instead of waiting for the periodic reconcile. Reseeds
+    /// from `capture-pane` because tmux reflows on resize while `pipe-pane`
+    /// carries no reflow redraw (see `seed_parser`).
     pub(crate) fn set_grid_size_with_deadline(
         &self,
         cols: u16,
@@ -4011,7 +4027,7 @@ mod tests {
     }
 
     #[test]
-    fn reader_failure_does_not_look_like_intentional_retirement() {
+    fn reader_exit_marks_the_lifecycle_failed() {
         let lifecycle = AtomicU8::new(VtLifecycle::Live as u8);
         VtLifecycle::fail(&lifecycle);
         assert_eq!(VtLifecycle::load(&lifecycle), VtLifecycle::Failed);
@@ -5735,7 +5751,7 @@ mod tests {
                 GridReconcile::Resize,
             ),
             // First sighting of a cursor mismatch only arms; a probe that raced
-            // the byte stream must not retire the live channel.
+            // the byte stream must not cost a reseed.
             (
                 (80, 24, 5, 3),
                 (80, 24, 4, 3),
@@ -5772,8 +5788,8 @@ mod tests {
             // A pane parked at a pending wrap: tmux reports `cursor_x ==
             // pane_width` (verified against tmux 3.6) while the seeded grid is
             // clamped to `pane_width - 1` by vt100's CUP. Reading that as drift
-            // retires the live channel every other pass forever, since capture fallback reproduces the
-            // same clamped column.
+            // reseeds every other pass forever, since the reseed reproduces
+            // the same clamped column.
             (
                 (10, 5, 10, 0),
                 (10, 5, 9, 0),
@@ -5809,7 +5825,7 @@ mod tests {
     #[test]
     fn parse_size_cursor_rejects_short_or_non_numeric_probes() {
         // A partial parse would hand `reconcile_step` a bogus cursor, which reads
-        // as drift and retires the live grid every pass. Short and unparseable lines
+        // as drift and reseeds the grid every pass. Short and unparseable lines
         // must come back None so the reconcile pass simply skips.
         let cases = [
             ("80 24 5 3", Some((80u16, 24u16, 5u16, 3u16))),
