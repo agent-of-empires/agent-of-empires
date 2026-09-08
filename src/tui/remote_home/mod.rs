@@ -7,8 +7,8 @@ use std::io::Stdout;
 
 use crate::acp::client::discovery::DaemonEndpoint;
 use crate::acp::client::HttpClient;
+use crate::daemon::ContextResumeAvailability;
 use crate::plugin::ui_state::UiSnapshot;
-use crate::server::api::sessions::ContextResumeAvailability;
 use crate::session::config::{resolve_theme_name, resolve_theme_palette_mode};
 use crate::tui::styles::Theme;
 use anyhow::Result;

@@ -23,14 +23,6 @@ pub async fn get_recent_projects() -> Json<RecentProjectsResponse> {
     Json(RecentProjectsResponse { projects })
 }
 
-/// Query params for `GET /api/sessions`. `state` shares its vocabulary with
-/// the CLI's `aoe list --state` via [`crate::session::SessionScope`] so a
-/// future third caller cannot drift.
-#[derive(Deserialize)]
-pub struct ListSessionsQuery {
-    pub state: Option<crate::session::SessionScope>,
-}
-
 pub async fn list_sessions(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<ListSessionsQuery>,
@@ -86,7 +78,7 @@ pub async fn list_sessions(
             let acp_worker_state = worker_states
                 .get(&inst.id)
                 .copied()
-                .unwrap_or(crate::acp::supervisor::AcpWorkerState::Absent);
+                .unwrap_or(crate::daemon::AcpWorkerState::Absent);
             SessionResponse::from_instance_with_plan(
                 inst,
                 claude_fullscreen,
@@ -99,11 +91,9 @@ pub async fn list_sessions(
         })
         .collect();
 
-    // Shared per-request cache of the resolved `SessionConfig` keyed by
-    // (profile, project_path). Both the ACP-capability overlay (serve-only)
-    // and the smart-rename indicator overlay below fetch through this one
-    // cache, halving the disk reads the 3s sidebar poll does when the same
-    // pair appears in more than one row. See #2603.
+    // Share resolved config between the ACP-capability and smart-rename
+    // overlays, halving disk reads when a profile/project pair repeats in the
+    // 3s sidebar poll. See #2603.
     let mut session_cfg_cache: HashMap<(String, String), SessionConfig> = HashMap::new();
 
     // Overlay custom-agent ACP capability (built-ins were resolved in the
@@ -541,10 +531,10 @@ mod workspace_ordering_tests {
             notify_on_idle: None,
             notify_on_error: None,
             view: crate::session::View::Terminal,
-            context_resume: ContextResumeAvailability::Unavailable {
+            acp_worker_state: crate::daemon::AcpWorkerState::Absent,
+            context_resume: Some(ContextResumeAvailability::Unavailable {
                 reason: ContextResumeUnavailableReason::NoTarget,
-            },
-            acp_worker_state: crate::acp::supervisor::AcpWorkerState::Absent,
+            }),
             queued_prompts: Vec::new(),
             acp_capable: false,
             acp_session_id: None,

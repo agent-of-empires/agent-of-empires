@@ -1,17 +1,15 @@
-//! Wire-format types shared between the structured view daemon (`aoe serve`)
-//! and its HTTP / WebSocket clients (web frontend, CLI structured view verbs,
-//! and the TUI structured view).
-//!
-//! Anything sent over the wire lives here so server, client, and TUI
-//! cannot drift on the JSON shape: rename a field in one place and
-//! the build breaks everywhere it's consumed.
+//! ACP-specific request, response, and broadcast wire types shared by the
+//! structured view daemon and its clients. The session-list contract and its
+//! queue and attachment types live in crate::daemon so no-default clients use
+//! the same JSON shape as the server.
 
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use super::approvals::ApprovalDecision;
-use super::state::{DiffComment, Event, PromptAttachmentKind};
+use super::state::{DiffComment, Event};
+use crate::daemon::PromptAttachmentKind;
 
 /// One frame on the per-AppState structured view broadcast channel: the structured view
 /// session id plus the typed structured view Event. Subscribed WebSocket

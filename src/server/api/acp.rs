@@ -22,8 +22,9 @@ use crate::acp::protocol::{
     FilesResponse, PromptAttachmentUpload, PromptRequest, ReplayQuery, ReplayResponse,
     ResolveApprovalRequest, SwitchAgentRequest, SwitchAgentResponse,
 };
-use crate::acp::state::{Event, PromptAttachmentKind, RateLimitInfo};
+use crate::acp::state::{Event, RateLimitInfo};
 use crate::acp::supervisor::SupervisorError;
+use crate::daemon::PromptAttachmentKind;
 use crate::server::session_service::{SendTurnError, SessionCaller};
 use crate::server::AppState;
 

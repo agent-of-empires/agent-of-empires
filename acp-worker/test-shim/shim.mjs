@@ -20,10 +20,10 @@ import { Readable, Writable } from "node:stream";
 // ponytail: one shim process serves exactly one ACP connection, so
 // module-level state is equivalent to the old per-connection instance state.
 const sessions = new Map();
-// Resolver used by the SILENT_ORPHAN test mode: prompt() parks on a Promise
+// Resolver shared by every parking test mode: prompt() waits on a Promise
 // that the session/cancel handler resolves so the test can assert the
 // watchdog without waiting for CANCEL_ESCALATION_GRACE to elapse.
-let silentOrphanResolve = null;
+let parkedPromptResolve = null;
 
 // SHIM_PRESEED_SESSION_ID lets a test attach to the shim via the socket
 // transport with `ConnectMode::Resume` (which skips `session/new`) and still
@@ -197,19 +197,26 @@ async function handlePrompt(params, client) {
     .map((c) => c.text)
     .join("\n");
 
-  // SILENT_ORPHAN reproduces the upstream
-  // `agentclientprotocol/claude-agent-acp#688` failure mode for the
-  // silent-orphan watchdog test in
-  // tests/acp_silent_orphan.rs. Sequence:
+  // COST_THEN_SILENCE reproduces the upstream
+  // `agentclientprotocol/claude-agent-acp#688` failure mode for
+  // tests/integration/acp_silent_orphan.rs: the turn wraps up its
+  // accounting and then never returns the PromptResponse. The daemon
+  // reads the cost marker as authoritative and ends it cleanly as
+  // `prompt_complete` (#2237); SILENCE_NO_COST below is the shape that
+  // actually orphans, so neither name promises the other's outcome.
+  // Sequence:
   //   1. emit one assistant chunk
   //   2. emit a cost-populated usage_update (claude-agent-acp's
   //      "wrap up accounting" marker the daemon uses as a
   //      terminal-candidate signal)
   //   3. park until cancel() resolves the promise
+  // `used` and `size` are mandatory in the ACP usage_update schema, so a
+  // payload without them is rejected before the daemon sees any usage at
+  // all and this scenario silently degrades into SILENCE_NO_COST (#3811).
   // Without the cancel handler we'd hang the test for the full
   // CANCEL_ESCALATION_GRACE; the explicit resolve keeps the test
   // under a second while still exercising the watchdog. See #1240.
-  if (userText.includes("SILENT_ORPHAN")) {
+  if (userText.includes("COST_THEN_SILENCE")) {
     await client.notify("session/update", {
       sessionId: params.sessionId,
       update: {
@@ -221,13 +228,42 @@ async function handlePrompt(params, client) {
       sessionId: params.sessionId,
       update: {
         sessionUpdate: "usage_update",
-        input_tokens: 100,
-        output_tokens: 200,
+        used: 300,
+        size: 200000,
         cost: { amount: 0.01, currency: "USD" },
       },
     });
     await new Promise((resolve) => {
-      silentOrphanResolve = resolve;
+      parkedPromptResolve = resolve;
+    });
+    return { stopReason: "cancelled" };
+  }
+
+  // SILENCE_NO_COST is the genuinely wedged turn: the adapter streams a
+  // chunk and a mid-turn usage_update that carries no cost, then goes
+  // silent without ever wrapping up its accounting. Nothing arms the fast
+  // grace, so the base grace expires and the watchdog cancels the turn and
+  // reports `prompt_orphaned`. Kept apart from COST_THEN_SILENCE so the
+  // cost-bearing recovery of #2237 and the orphan cancel are each covered
+  // by a scenario that can only reach them (#3811).
+  if (userText.includes("SILENCE_NO_COST")) {
+    await client.notify("session/update", {
+      sessionId: params.sessionId,
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "wedged mid-response" },
+      },
+    });
+    await client.notify("session/update", {
+      sessionId: params.sessionId,
+      update: {
+        sessionUpdate: "usage_update",
+        used: 120,
+        size: 200000,
+      },
+    });
+    await new Promise((resolve) => {
+      parkedPromptResolve = resolve;
     });
     return { stopReason: "cancelled" };
   }
@@ -274,7 +310,7 @@ async function handlePrompt(params, client) {
       },
     });
     await new Promise((resolve) => {
-      silentOrphanResolve = resolve;
+      parkedPromptResolve = resolve;
     });
     return { stopReason: "cancelled" };
   }
@@ -283,9 +319,15 @@ async function handlePrompt(params, client) {
   // `Bash` tool fired with `run_in_background: true`. The visible
   // ToolCall completes immediately with the marker
   // "Command running in background with ID: <id>", then the prompt
-  // also receives a cost-populated usage_update (the production
-  // false-positive's trigger). The Rust watchdog must observe the
-  // off-protocol marker and stay suppressed past the fast grace.
+  // parks. The Rust watchdog must observe the off-protocol marker and
+  // stay suppressed past the fast grace.
+  //
+  // Adding WRAP_UP to the prompt appends the cost-populated
+  // usage_update that ends the turn's accounting. A backgrounded command
+  // is fire-and-forget and legitimately outlives its turn, so that frame
+  // drops the off-protocol floor (#1858) and the turn recovers cleanly
+  // rather than staying suppressed. The two shapes reach opposite
+  // outcomes, so each test picks the one it means to assert (#3811).
   if (userText.includes("BACKGROUND_BASH_ORPHAN")) {
     await client.notify("session/update", {
       sessionId: params.sessionId,
@@ -315,20 +357,19 @@ async function handlePrompt(params, client) {
         ],
       },
     });
-    // Force the daemon down the fast-grace path; if off-protocol
-    // suppression is wired correctly, the watchdog should still
-    // stay quiet for the full test window.
-    await client.notify("session/update", {
-      sessionId: params.sessionId,
-      update: {
-        sessionUpdate: "usage_update",
-        input_tokens: 10,
-        output_tokens: 10,
-        cost: { amount: 0.01, currency: "USD" },
-      },
-    });
+    if (userText.includes("WRAP_UP")) {
+      await client.notify("session/update", {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "usage_update",
+          used: 1200,
+          size: 200000,
+          cost: { amount: 0.01, currency: "USD" },
+        },
+      });
+    }
     await new Promise((resolve) => {
-      silentOrphanResolve = resolve;
+      parkedPromptResolve = resolve;
     });
     return { stopReason: "cancelled" };
   }
@@ -397,13 +438,13 @@ async function handlePrompt(params, client) {
       sessionId: params.sessionId,
       update: {
         sessionUpdate: "usage_update",
-        input_tokens: 10,
-        output_tokens: 10,
+        used: 1200,
+        size: 200000,
         cost: { amount: 0.01, currency: "USD" },
       },
     });
     await new Promise((resolve) => {
-      silentOrphanResolve = resolve;
+      parkedPromptResolve = resolve;
     });
     return { stopReason: "cancelled" };
   }
@@ -624,12 +665,12 @@ async function handlePrompt(params, client) {
 }
 
 function handleCancel() {
-  // Unstick the SILENT_ORPHAN park so prompt() returns and the
-  // daemon's prompt_fut resolves. Other prompt branches finish
-  // synchronously so this is a no-op for them.
-  if (silentOrphanResolve) {
-    const resolve = silentOrphanResolve;
-    silentOrphanResolve = null;
+  // Unstick a parked prompt so it returns and the daemon's prompt_fut
+  // resolves. Other prompt branches finish synchronously so this is a
+  // no-op for them.
+  if (parkedPromptResolve) {
+    const resolve = parkedPromptResolve;
+    parkedPromptResolve = null;
     resolve();
   }
 }

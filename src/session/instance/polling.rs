@@ -29,20 +29,55 @@ pub enum PollerStart {
     SpawnFailed,
 }
 
+/// An exclusive claim on one physical capture store, held for as long as the
+/// poller that owns it runs.
+///
+/// `Drop` unlocks explicitly rather than letting the descriptor close do it. A
+/// `flock` belongs to the open file description, not to one descriptor, so a
+/// process forked while the lease was open holds the lock alive through its
+/// inherited copy until `exec` clears it. Releasing by close alone leaves the
+/// store reading as owned by someone else for that window; `unlock` releases
+/// the description itself, and every inherited copy with it.
+#[derive(Debug)]
+struct ManagedCaptureLease(std::fs::File);
+
+impl Drop for ManagedCaptureLease {
+    fn drop(&mut self) {
+        // Spelled through the trait: `File`'s inherent `unlock` is newer than
+        // this crate's MSRV.
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
+/// Why a managed capture store is not available to poll.
+#[derive(Debug, PartialEq, Eq)]
+enum LeaseRefusal {
+    /// Another owner holds this physical store.
+    Contended,
+    /// The claim could not be evaluated at all: the app dir, the store path,
+    /// or the lock file did not resolve. Not evidence of another owner.
+    Unresolved,
+}
+
 fn try_acquire_managed_capture_lease(
     backend: crate::agents::SessionCaptureBackend,
     store: &Path,
-) -> Option<std::fs::File> {
-    let lock_dir = crate::session::get_app_dir().ok()?.join("capture-locks");
-    std::fs::create_dir_all(&lock_dir).ok()?;
-    let store = std::fs::canonicalize(store).ok()?;
+) -> Result<ManagedCaptureLease, LeaseRefusal> {
+    fn unresolved<E>(_: E) -> LeaseRefusal {
+        LeaseRefusal::Unresolved
+    }
+    let lock_dir = crate::session::get_app_dir()
+        .map_err(unresolved)?
+        .join("capture-locks");
+    std::fs::create_dir_all(&lock_dir).map_err(unresolved)?;
+    let store = std::fs::canonicalize(store).map_err(unresolved)?;
     let mut digest = Sha256::new();
     digest.update(format!("{backend:?}\0"));
     digest.update(store.as_os_str().as_encoded_bytes());
     let mut key = String::with_capacity(64);
     for byte in digest.finalize() {
         use std::fmt::Write as _;
-        write!(&mut key, "{byte:02x}").ok()?;
+        write!(&mut key, "{byte:02x}").map_err(unresolved)?;
     }
     let path = lock_dir.join(format!("{key}.lock"));
 
@@ -58,11 +93,13 @@ fn try_acquire_managed_capture_lease(
         .map(|metadata| metadata.file_type().is_symlink())
         .unwrap_or(false)
     {
-        return None;
+        return Err(LeaseRefusal::Unresolved);
     }
-    let lease = options.open(path).ok()?;
-    lease.try_lock_exclusive().ok()?;
-    Some(lease)
+    let lease = options.open(path).map_err(unresolved)?;
+    lease
+        .try_lock_exclusive()
+        .map_err(|_| LeaseRefusal::Contended)?;
+    Ok(ManagedCaptureLease(lease))
 }
 
 impl Instance {
@@ -201,31 +238,43 @@ impl Instance {
         if !self.supports_session_poller() {
             return PollerStart::NotApplicable;
         }
-        let managed_lease =
-            if context == crate::agents::SessionCaptureContext::ManagedExclusiveStore {
-                let Some(store) = self.sandbox_capture_store_dir() else {
-                    return PollerStart::NotApplicable;
-                };
-                // Lease contention is the common multi-process loser path. Check it
-                // before loading every profile to prove store exclusivity.
-                let Some(lease) = try_acquire_managed_capture_lease(backend, &store) else {
+        let managed_lease = if context
+            == crate::agents::SessionCaptureContext::ManagedExclusiveStore
+        {
+            let Some(store) = self.sandbox_capture_store_dir() else {
+                return PollerStart::NotApplicable;
+            };
+            // Lease contention is the common multi-process loser path. Check it
+            // before loading every profile to prove store exclusivity.
+            let lease = match try_acquire_managed_capture_lease(backend, &store) {
+                Ok(lease) => lease,
+                Err(refusal) => {
                     self.session_id_poller_retry_after =
                         Some(std::time::Instant::now() + MANAGED_CAPTURE_RETRY_BACKOFF);
-                    tracing::warn!(target: "session.capture", session = %self.id, ?backend,
-                    "Session capture deferred because another process owns this store");
-                    return PollerStart::Deferred;
-                };
-                if !self.managed_capture_store_is_exclusive(backend) {
-                    self.session_id_poller_retry_after =
-                        Some(std::time::Instant::now() + MANAGED_CAPTURE_RETRY_BACKOFF);
-                    tracing::warn!(target: "session.capture", session = %self.id, ?backend,
-                    "Session capture deferred because store ownership is ambiguous");
+                    match refusal {
+                        LeaseRefusal::Contended => {
+                            tracing::warn!(target: "session.capture", session = %self.id, ?backend,
+                                "Session capture deferred because another process owns this store");
+                        }
+                        LeaseRefusal::Unresolved => {
+                            tracing::warn!(target: "session.capture", session = %self.id, ?backend,
+                                "Session capture deferred because this store's lease could not be resolved");
+                        }
+                    }
                     return PollerStart::Deferred;
                 }
-                Some(lease)
-            } else {
-                None
             };
+            if !self.managed_capture_store_is_exclusive(backend) {
+                self.session_id_poller_retry_after =
+                    Some(std::time::Instant::now() + MANAGED_CAPTURE_RETRY_BACKOFF);
+                tracing::warn!(target: "session.capture", session = %self.id, ?backend,
+                    "Session capture deferred because store ownership is ambiguous");
+                return PollerStart::Deferred;
+            }
+            Some(lease)
+        } else {
+            None
+        };
         self.session_id_poller_retry_after = None;
 
         let tmux_session_name = self
@@ -874,29 +923,33 @@ mod tests {
         let backend = crate::agents::SessionCaptureBackend::Gemini;
         let first =
             super::try_acquire_managed_capture_lease(backend, store.path()).expect("first owner");
-        assert!(
-            super::try_acquire_managed_capture_lease(backend, store.path()).is_none(),
+        assert_eq!(
+            super::try_acquire_managed_capture_lease(backend, store.path()).unwrap_err(),
+            super::LeaseRefusal::Contended,
             "another row using the same store must contend regardless of workspace"
         );
         #[cfg(unix)]
         {
             let alias = app.path().join("store-alias");
             std::os::unix::fs::symlink(store.path(), &alias).unwrap();
-            assert!(
-                super::try_acquire_managed_capture_lease(backend, &alias).is_none(),
+            assert_eq!(
+                super::try_acquire_managed_capture_lease(backend, &alias).unwrap_err(),
+                super::LeaseRefusal::Contended,
                 "a symlink to the same physical store must contend"
             );
         }
-        assert!(
+        assert_eq!(
             super::try_acquire_managed_capture_lease(backend, &app.path().join("missing"))
-                .is_none(),
-            "an unresolved store identity must fail closed"
+                .unwrap_err(),
+            super::LeaseRefusal::Unresolved,
+            "an unresolved store identity fails closed without claiming another owner"
         );
         let distinct = super::try_acquire_managed_capture_lease(backend, other_store.path())
             .expect("a distinct store has a distinct lease");
 
         drop(first);
-        assert!(super::try_acquire_managed_capture_lease(backend, store.path()).is_some());
+        super::try_acquire_managed_capture_lease(backend, store.path())
+            .expect("the released store is claimable again");
         drop(distinct);
     }
 }

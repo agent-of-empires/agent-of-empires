@@ -399,7 +399,7 @@ impl HttpClient {
     pub async fn queue_list(
         &self,
         session_id: &str,
-    ) -> Result<Vec<crate::acp::state::QueuedPromptEntry>, HttpError> {
+    ) -> Result<Vec<crate::daemon::QueuedPromptEntry>, HttpError> {
         let url = format!(
             "{}/api/sessions/{}/queue",
             self.endpoint.base_url, session_id

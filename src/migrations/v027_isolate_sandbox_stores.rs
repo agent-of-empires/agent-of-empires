@@ -14,7 +14,6 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 const JOURNAL: &str = ".v027-sandbox-transition.json";
 pub(crate) const LOCK: &str = ".v027-sandbox-transition.lock";
@@ -32,22 +31,28 @@ fn defer_requested_by(value: Option<&std::ffi::OsStr>) -> bool {
     value.is_some_and(|value| !value.is_empty())
 }
 
-/// Files and bytes copied by the store copy in flight, for the progress line.
-static COPY_FILES: AtomicU64 = AtomicU64::new(0);
-static COPY_BYTES: AtomicU64 = AtomicU64::new(0);
-
-fn begin_copy_progress() {
-    COPY_FILES.store(0, Ordering::Relaxed);
-    COPY_BYTES.store(0, Ordering::Relaxed);
+/// Files and bytes copied by one store move, for the progress line. Per move
+/// rather than process-wide: per-root cohort locks let moves copy at the same
+/// time, each reporting to the reporter installed on its own thread (#3777).
+#[derive(Default)]
+struct CopyProgress {
+    files: u64,
+    bytes: u64,
 }
 
-/// One regular file copied. Reports every 100 files so a large store shows
-/// movement without flooding the reporter.
-fn copied_file(bytes: u64) {
-    let files = COPY_FILES.fetch_add(1, Ordering::Relaxed) + 1;
-    let total = COPY_BYTES.fetch_add(bytes, Ordering::Relaxed) + bytes;
-    if files % 100 == 0 {
-        progress::progress(format!("{files} files, {}", progress::format_bytes(total)));
+impl CopyProgress {
+    /// One regular file copied. Reports every 100 files so a large store shows
+    /// movement without flooding the reporter.
+    fn copied_file(&mut self, bytes: u64) {
+        self.files += 1;
+        self.bytes += bytes;
+        if self.files % 100 == 0 {
+            progress::progress(format!(
+                "{} files, {}",
+                self.files,
+                progress::format_bytes(self.bytes)
+            ));
+        }
     }
 }
 
@@ -1585,15 +1590,22 @@ fn publish_store(
         return Ok(());
     }
     fs::create_dir(&stage)?;
-    begin_copy_progress();
+    let mut copied = CopyProgress::default();
     copy_tree_no_links(
         source,
         &stage,
         exclude_source_children.then_some(excluded_root_children),
         false,
+        &mut copied,
     )?;
     if let Some(overlay) = overlay_shared_root {
-        copy_tree_no_links(overlay, &stage, Some(excluded_root_children), true)?;
+        copy_tree_no_links(
+            overlay,
+            &stage,
+            Some(excluded_root_children),
+            true,
+            &mut copied,
+        )?;
     }
     fs::set_permissions(&stage, fs::symlink_metadata(source)?.permissions())?;
     sync_tree(&stage)?;
@@ -1625,6 +1637,7 @@ fn copy_tree_no_links(
     destination: &Path,
     excluded_children: Option<&BTreeSet<std::ffi::OsString>>,
     overwrite_newer: bool,
+    copied: &mut CopyProgress,
 ) -> Result<()> {
     use nix::fcntl::{open, OFlag};
     use nix::sys::stat::Mode;
@@ -1639,6 +1652,7 @@ fn copy_tree_no_links(
         excluded_children,
         Path::new(""),
         overwrite_newer,
+        copied,
     )
 }
 
@@ -1649,6 +1663,7 @@ fn copy_tree_from_fd(
     excluded_children: Option<&BTreeSet<std::ffi::OsString>>,
     relative: &Path,
     overwrite_newer: bool,
+    copied: &mut CopyProgress,
 ) -> Result<()> {
     use nix::dir::Dir;
     use nix::fcntl::{openat, readlinkat, AtFlags, OFlag};
@@ -1734,7 +1749,14 @@ fn copy_tree_from_fd(
                 }
                 Err(error) => return Err(error.into()),
             };
-            copy_tree_from_fd(child, &target, None, &relative.join(name), overwrite_newer)?;
+            copy_tree_from_fd(
+                child,
+                &target,
+                None,
+                &relative.join(name),
+                overwrite_newer,
+                copied,
+            )?;
             if !existed || source_stat_is_newer(&stat, &target)? {
                 // `st_mode` is u32 on Linux and u16 on Darwin, so the cast is
                 // a no-op on one and a widening on the other.
@@ -1779,7 +1801,7 @@ fn copy_tree_from_fd(
             }
             let mut output = options.open(&target)?;
             let bytes = std::io::copy(&mut input, &mut output)?;
-            copied_file(bytes);
+            copied.copied_file(bytes);
             output.set_permissions(fs::Permissions::from_mode(opened.st_mode as u32))?;
             futimens(
                 &output,
@@ -1824,6 +1846,7 @@ fn copy_tree_no_links(
     destination: &Path,
     excluded_children: Option<&BTreeSet<std::ffi::OsString>>,
     overwrite_newer: bool,
+    copied: &mut CopyProgress,
 ) -> Result<()> {
     for entry in fs::read_dir(source)? {
         let entry = entry?;
@@ -1845,7 +1868,7 @@ fn copy_tree_no_links(
                     if overwrite_newer && error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(error.into()),
             }
-            copy_tree_no_links(&entry.path(), &target, None, overwrite_newer)?;
+            copy_tree_no_links(&entry.path(), &target, None, overwrite_newer, copied)?;
             fs::set_permissions(&target, metadata.permissions())?;
         } else if metadata.is_file() {
             let should_copy = match fs::symlink_metadata(&target) {
@@ -1857,7 +1880,7 @@ fn copy_tree_no_links(
                 Err(error) => return Err(error.into()),
             };
             if should_copy {
-                copied_file(fs::copy(entry.path(), &target)?);
+                copied.copied_file(fs::copy(entry.path(), &target)?);
                 fs::set_permissions(&target, metadata.permissions())?;
                 fs::File::open(&target)?.sync_all()?;
             }
@@ -1949,6 +1972,7 @@ fn sync_parent(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     /// [`super::run_in`] with every container reported reaped, which is what
     /// each case below assumes unless it drives the probe itself. Shadowing
@@ -3868,5 +3892,105 @@ gemini = "{}"
         symlink(&outside, &destination).unwrap();
         assert!(publish_store(&source, &destination, &BTreeSet::new(), None, false).is_err());
         assert_eq!(fs::read(outside.join("secret")).unwrap(), b"secret");
+    }
+
+    /// Move A is parked inside its first progress callback while move B runs
+    /// start to finish, so A's remaining files must be counted from where A
+    /// left off. A shared counter reported B's reset and larger files to A.
+    #[test]
+    #[cfg(unix)]
+    fn concurrent_moves_report_only_their_own_totals() {
+        use std::sync::{mpsc, Arc, Mutex};
+
+        // Distinct file sizes so a leaked byte total is visible, and counts
+        // that make the two moves' 100-file report boundaries interleave.
+        const A_FILES: usize = 200;
+        const A_SIZE: usize = 10;
+        const B_FILES: usize = 150;
+        const B_SIZE: usize = 1000;
+
+        fn seed(root: &Path, files: usize, size: usize) {
+            fs::create_dir_all(root).unwrap();
+            for index in 0..files {
+                fs::write(root.join(format!("f{index}")), vec![b'x'; size]).unwrap();
+            }
+        }
+
+        fn collecting_reporter(seen: &Arc<Mutex<Vec<String>>>) -> progress::Reporter {
+            let seen = Arc::clone(seen);
+            Arc::new(move |event| {
+                if let progress::Event::Progress(message) = event {
+                    seen.lock().unwrap().push(message);
+                }
+            })
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        seed(&temp.path().join("a/source"), A_FILES, A_SIZE);
+        seed(&temp.path().join("b/source"), B_FILES, B_SIZE);
+
+        let (parked_tx, parked_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel::<()>();
+        let a_seen = Arc::new(Mutex::new(Vec::new()));
+
+        let mover_a = {
+            let root = temp.path().to_path_buf();
+            let a_seen = Arc::clone(&a_seen);
+            std::thread::spawn(move || {
+                let collect = collecting_reporter(&a_seen);
+                // Park inside the first report only, so move B's whole copy
+                // lands between A's 100th and 101st file.
+                let gate = Mutex::new(Some((parked_tx, resume_rx)));
+                let reporter: progress::Reporter = Arc::new(move |event| {
+                    collect(event);
+                    if let Some((parked_tx, resume_rx)) = gate.lock().unwrap().take() {
+                        parked_tx.send(()).unwrap();
+                        resume_rx.recv().unwrap();
+                    }
+                });
+                let _guard = progress::install(Some(reporter));
+                publish_store(
+                    &root.join("a/source"),
+                    &root.join("a/private/one"),
+                    &BTreeSet::new(),
+                    None,
+                    false,
+                )
+                .unwrap();
+            })
+        };
+
+        parked_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("move A parked inside its first report");
+        let b_seen = Arc::new(Mutex::new(Vec::new()));
+        {
+            let _guard = progress::install(Some(collecting_reporter(&b_seen)));
+            publish_store(
+                &temp.path().join("b/source"),
+                &temp.path().join("b/private/two"),
+                &BTreeSet::new(),
+                None,
+                false,
+            )
+            .unwrap();
+        }
+        resume_tx.send(()).unwrap();
+        mover_a.join().unwrap();
+
+        assert_eq!(
+            *a_seen.lock().unwrap(),
+            vec![
+                format!("100 files, {}", progress::format_bytes(100 * A_SIZE as u64)),
+                format!("200 files, {}", progress::format_bytes(200 * A_SIZE as u64)),
+            ]
+        );
+        assert_eq!(
+            *b_seen.lock().unwrap(),
+            vec![format!(
+                "100 files, {}",
+                progress::format_bytes(100 * B_SIZE as u64)
+            )]
+        );
     }
 }

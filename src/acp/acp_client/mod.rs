@@ -60,8 +60,9 @@ use crate::acp::approvals::{ApprovalDecision, Nonce};
 use crate::acp::elicitations::{build_response, summarize_answers, ElicitationResolution};
 use crate::acp::event_store::AttachmentBlob;
 use crate::acp::fs_handler::{FsPolicy, SandboxPathMap};
-use crate::acp::state::{AcpSessionId, Event, PromptAttachmentKind};
+use crate::acp::state::{AcpSessionId, Event};
 use crate::acp::terminal_handler::TerminalManager;
+use crate::daemon::PromptAttachmentKind;
 use agent_client_protocol::schema::v1::{
     AudioContent, BlobResourceContents, ContentBlock, EmbeddedResource, EmbeddedResourceResource,
     ImageContent, McpServer, TextContent,
