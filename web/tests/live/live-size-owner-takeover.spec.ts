@@ -25,28 +25,35 @@ async function openLiveView(page: Page, baseUrl: string) {
   await expect.poll(() => page.locator("[data-live-content]").innerText(), { timeout: 15_000 }).toContain(PROMPT);
 }
 
-/** How many rendered rows carry the prompt, and whether the cursor overlay sits
- *  on the first of them (within a pixel of its top).
+/** How many rendered rows carry the prompt, and where the cursor overlay sits
+ *  relative to the first of them, as a phrase rather than a boolean: an
+ *  asserted-equal object reports its mismatched value, so the offset that
+ *  identifies the fault survives into the failure message.
  *
  *  The count is asserted, not navigated around: the agent redraws its prompt in
  *  place on every SIGWINCH, so a second prompt row means the grid put the
  *  cursor somewhere the pane never had it and the redraw landed there (#3824).
  *  Picking the last row instead would have hidden that. */
-async function promptAlignment(page: Page): Promise<{ promptRows: number; aligned: boolean }> {
+async function promptAlignment(page: Page): Promise<{ promptRows: number; cursor: string }> {
   return page.evaluate((prompt) => {
     const content = document.querySelector("[data-live-content]");
     const cursor = document.querySelector("[data-live-cursor]");
-    if (!content || !cursor) return { promptRows: -1, aligned: false };
+    if (!content || !cursor) return { promptRows: -1, cursor: "no live content" };
     const rows = Array.from(content.children).filter((el) => !el.hasAttribute("data-live-cursor"));
     const promptRows = rows.filter((el) => (el.textContent ?? "").includes(prompt));
     const promptRow = promptRows[0];
-    if (!promptRow) return { promptRows: 0, aligned: false };
-    const delta = cursor.getBoundingClientRect().top - promptRow.getBoundingClientRect().top;
-    return { promptRows: promptRows.length, aligned: Math.abs(delta) < 2 };
+    if (!promptRow) return { promptRows: 0, cursor: "no prompt row" };
+    const rect = promptRow.getBoundingClientRect();
+    const delta = cursor.getBoundingClientRect().top - rect.top;
+    const offBy = rect.height > 0 ? Math.round(delta / rect.height) : Number.NaN;
+    return {
+      promptRows: promptRows.length,
+      cursor: Math.abs(delta) < 2 ? "on the prompt row" : `${offBy} rows off (${delta.toFixed(1)}px)`,
+    };
   }, PROMPT);
 }
 
-const ON_PROMPT = { promptRows: 1, aligned: true };
+const ON_PROMPT = { promptRows: 1, cursor: "on the prompt row" };
 
 async function takeOver(page: Page) {
   const banner = page.locator("[data-live-takeover]");

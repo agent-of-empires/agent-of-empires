@@ -890,8 +890,9 @@ fn reconcile_step(
 /// state before and after the `capture-pane` fork and retries while the two
 /// disagree, so a pane that scrolled, moved its cursor, or flipped screens
 /// mid-seed can't stamp a stale position into the fresh grid. `history_size`
-/// and `pane_height` exist for that comparison alone, mirroring the drift
-/// fields `merge_cursor_probes` trusts on the legacy capture path.
+/// exists for that comparison alone, mirroring the drift fields
+/// `merge_cursor_probes` trusts on the legacy capture path; `pane_height` also
+/// anchors [`seeded_cursor_row`].
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct PaneSeedState {
     alt: bool,
@@ -916,7 +917,8 @@ struct PaneSeedState {
     /// pane that scrolled between the probes grew its history, even when the
     /// cursor stayed pinned to the same bottom row.
     history_size: u32,
-    /// `#{pane_height}`: resize detector for the same check; a resize mid-seed
+    /// `#{pane_height}`: resize detector for the same check, and the height
+    /// [`seeded_cursor_row`] counts `cursor_y` back from; a resize mid-seed
     /// invalidates the coordinate space `cursor_y` was reported in.
     pane_height: u16,
     /// `#{pane_width}`: the other resize axis. A width-only resize rewraps the
