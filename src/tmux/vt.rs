@@ -2424,6 +2424,11 @@ impl VtChannel {
     /// stays gated for as long as it takes a reseed to land rather than for a
     /// fixed window that a slow one could outlive.
     ///
+    /// This only ever resolves an expectation a resize declared; it never opens
+    /// one. Ordinary geometry drift is what the reseed below this call is for,
+    /// and gating the grid on it would put the channel into a retry loop over
+    /// something the same reconcile pass is already fixing.
+    ///
     /// `probe_seq` is [`Self::resize_seq`] read BEFORE the probe. Matching
     /// dimensions only retire an expectation when no resize overlapped it: one
     /// viewer's probe can read the pane before another viewer's resize lands
@@ -2431,6 +2436,9 @@ impl VtChannel {
     /// about the resize now in flight. Re-aiming is left unguarded because it
     /// keeps the gate up, which is the safe direction for a stale read.
     fn observe_pane_geometry(&self, pane: (u16, u16), probe_seq: u64) {
+        if self.resync_target.load(Ordering::Relaxed) == 0 {
+            return;
+        }
         if pane
             != (
                 self.cols.load(Ordering::Relaxed),
@@ -4838,9 +4846,15 @@ mod tests {
         ch.observe_pane_geometry(grid, ch.resize_seq());
         assert!(!ch.grid_resync_pending(), "an unmet request is dropped");
 
-        // A pane that disagrees is a real divergence: the expectation is re-aimed
-        // at tmux's own geometry and holds for as long as the reseed takes,
-        // however many attempts that is.
+        // With nothing outstanding, a probe opens no gate of its own: ordinary
+        // drift is the reseed's job, not this one's.
+        ch.observe_pane_geometry((132, 43), ch.resize_seq());
+        assert!(!ch.grid_resync_pending(), "reconcile opens no expectation");
+
+        // A pane that disagrees while one IS outstanding is a real divergence:
+        // it is re-aimed at tmux's own geometry and holds for as long as the
+        // reseed takes, however many attempts that is.
+        drop(ch.begin_resize(1, 1));
         ch.observe_pane_geometry((132, 43), ch.resize_seq());
         assert_eq!(ch.pending_resync_target(), Some((132, 43)));
         for _ in 0..10 {

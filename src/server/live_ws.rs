@@ -325,20 +325,6 @@ fn resize_follow_up(owned: bool, now_ms: u64) -> Option<u64> {
     owned.then(|| now_ms + RESIZE_SETTLE_MS)
 }
 
-/// Whether a parser that has not caught up with the pane must take the grid out
-/// of service, rather than merely withhold its frames.
-///
-/// Inside the settle window the stale frames are already held (their geometry
-/// disagrees with the requested grid), and a reseed refused because a chunk
-/// landed under it usually succeeds on the next retry a few tens of ms later.
-/// Leaving the transport alone for that long spares the client a snapshot
-/// repaint it does not need; past it the fallback is the bounded way to keep
-/// showing the pane, and a viewer with no settle window of its own (it did not
-/// drive this resize) leaves the grid at once.
-fn resync_blocks_grid(resync_pending: bool, now_ms: u64, settle_until_ms: u64) -> bool {
-    resync_pending && now_ms >= settle_until_ms
-}
-
 /// Resize the pane as size owner and rebuild the VT grid to match.
 ///
 /// The channel is told the new geometry BEFORE tmux is asked for it, so there
@@ -376,17 +362,11 @@ fn resize_and_reseed(session: &crate::tmux::Session, who: &str, cols: u16, rows:
     session.resize_window_if_owner(who, cols, rows)
 }
 
-/// The VT grid renders a single-pane window within its scrollback depth, and
-/// only while the parser is known to describe the pane tmux currently has: a
-/// resize whose reseed has not landed leaves it a frame of a geometry that is
-/// gone, so the view falls back to `capture-pane` until the reseed catches up.
+/// The VT grid renders a single-pane window within its scrollback depth; a
+/// split window is composited from `capture-pane`.
 #[cfg(unix)]
-fn grid_transport_eligible(
-    pane_count: Option<u16>,
-    window_lines: usize,
-    resync_pending: bool,
-) -> bool {
-    pane_count == Some(1) && window_lines <= crate::tmux::vt::SCROLLBACK_LINES && !resync_pending
+fn grid_transport_eligible(pane_count: Option<u16>, window_lines: usize) -> bool {
+    pane_count == Some(1) && window_lines <= crate::tmux::vt::SCROLLBACK_LINES
 }
 
 /// Resolve a pending resize expectation while the grid is out of service.
@@ -890,16 +870,7 @@ async fn handle_live_ws(
                 // capture-pane and can take most of the interval.
                 last_grid_resync = Instant::now();
             }
-            #[cfg(unix)]
-            let resync_pending = resync_blocks_grid(
-                live_grid
-                    .as_ref()
-                    .is_some_and(|ch| ch.grid_resync_pending()),
-                live_now_ms(),
-                capture_settings
-                    .resize_settle_until_ms
-                    .load(Ordering::Relaxed),
-            );
+
             let sample_started = std::time::Instant::now();
             let lines = capture_settings.window_lines.load(Ordering::Relaxed);
 
@@ -927,7 +898,7 @@ async fn handle_live_ws(
                     pane_count = (probed.ok().flatten().or(pane_count.0), Instant::now());
                 }
                 outcome = match live_grid {
-                    Some(ch) if grid_transport_eligible(pane_count.0, lines, resync_pending) => {
+                    Some(ch) if grid_transport_eligible(pane_count.0, lines) => {
                         grid_frame = true;
                         match tokio::task::spawn_blocking(move || {
                             let deadline = crate::tmux::TmuxCommandDeadline::new();
@@ -1211,6 +1182,29 @@ async fn handle_live_ws(
                     // that reports itself half-drawn is held whatever the hold
                     // now says: it can have expired, or its bracket closed,
                     // since the payload was assembled.
+                    // The parser has not been rebuilt at the geometry the pane
+                    // was resized to, so its cells are laid out for a size the
+                    // pane no longer has. Withhold rather than switch transport:
+                    // the reseed lands in a frame or two, and flipping the
+                    // client between two serializations of the same screen for
+                    // that long costs it a repaint it does not need.
+                    #[cfg(unix)]
+                    if grid_frame
+                        && capture_vt
+                            .as_ref()
+                            .is_some_and(|ch| ch.grid_resync_pending())
+                    {
+                        stats.settle_held += 1;
+                        wait_for_next(
+                            &capture_settings,
+                            &capture_nudge,
+                            vt_rx.as_mut(),
+                            sample_started,
+                            grid_frame,
+                        )
+                        .await;
+                        continue;
+                    }
                     #[cfg(unix)]
                     if grid_frame
                         && (grid_incomplete
@@ -2207,7 +2201,7 @@ mod tests {
     }
 
     #[test]
-    fn a_resize_whose_reseed_missed_suspends_grid_transport_until_it_lands() {
+    fn a_resize_whose_reseed_missed_withholds_frames_until_it_lands() {
         // The settle window is armed by every resize this connection drives as
         // size owner, and by nothing else.
         assert_eq!(resize_follow_up(true, 100), Some(100 + RESIZE_SETTLE_MS));
@@ -2225,56 +2219,27 @@ mod tests {
         );
 
         // Whether the parser reached the new geometry is the channel's state,
-        // not this connection's: a reseed that came back Busy or Failed has to
-        // hold every viewer of the shared grid off it, not just the one that
-        // drove the resize. The settle window expiring does not resume it.
-        assert!(!grid_transport_eligible(Some(1), 50, true));
+        // not this connection's, and it withholds frames rather than moving the
+        // view to another transport: see `VtChannel::grid_resync_pending`. The
+        // settle window expiring does not republish the old grid either.
         assert!(!resize_settle_holds(
             settle_until + 1,
             settle_until,
             (120, 40),
             (120, 40)
         ));
-        assert!(!grid_transport_eligible(Some(1), 50, true));
-        assert!(grid_transport_eligible(Some(1), 50, false));
-    }
-
-    #[test]
-    fn a_pending_reseed_withholds_frames_before_it_gives_up_the_grid() {
-        // Inside the settle window the stale frames are withheld anyway, so a
-        // reseed that lands on a retry never costs the client a transport flip.
-        assert!(!resync_blocks_grid(true, 100, 400));
-        assert!(grid_transport_eligible(
-            Some(1),
-            50,
-            resync_blocks_grid(true, 100, 400)
-        ));
-        // Past it the bounded snapshot fallback takes over.
-        assert!(resync_blocks_grid(true, 400, 400));
-        assert!(!grid_transport_eligible(
-            Some(1),
-            50,
-            resync_blocks_grid(true, 400, 400)
-        ));
-        // A viewer that did not drive the resize has no window of its own and
-        // leaves the grid at once: its parser is just as stale.
-        assert!(resync_blocks_grid(true, 100, 0));
-        // Nothing outstanding, nothing to gate.
-        assert!(!resync_blocks_grid(false, 100, 0));
-        assert!(!resync_blocks_grid(false, 100, 400));
     }
 
     #[test]
     fn grid_transport_needs_a_single_pane_within_the_grids_scrollback() {
-        assert!(grid_transport_eligible(Some(1), 50, false));
+        assert!(grid_transport_eligible(Some(1), 50));
         // Unprobed or split windows are composited from capture-pane.
-        assert!(!grid_transport_eligible(None, 50, false));
-        assert!(!grid_transport_eligible(Some(2), 50, false));
+        assert!(!grid_transport_eligible(None, 50));
+        assert!(!grid_transport_eligible(Some(2), 50));
         // A window deeper than the grid keeps that history.
         assert!(!grid_transport_eligible(
             Some(1),
-            crate::tmux::vt::SCROLLBACK_LINES + 1,
-            false
+            crate::tmux::vt::SCROLLBACK_LINES + 1
         ));
     }
 
