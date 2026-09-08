@@ -198,29 +198,65 @@ fn hovering_a_link_reveals_its_target_before_the_click() {
 
 #[test]
 #[serial]
-fn a_repointed_label_refreshes_even_when_the_grid_is_identical() {
+fn a_generation_change_re_collects_targets_for_an_unchanged_grid() {
     // vt100 strips both sequences, so a pane that reprints the same label
-    // against a new target produces byte-identical content and an identical
-    // cursor. Keying only on the rendered text would keep serving the old
-    // target, and the backend would faithfully re-emit it.
+    // against a new target leaves the rendered grid byte-identical. Keying only
+    // on the rendered text would keep serving the old target, and the backend
+    // would faithfully re-emit it. Driven through `ensure_parsed` and
+    // `collect_links` rather than by assigning the answer, so the branch under
+    // test is the one that runs in production.
     let mut env = create_test_env_empty();
-    stage(
-        &mut env,
-        &["see the docs now"],
-        vec![link("the docs", "https://example.com/a")],
+    let advertised = "see \x1b]8;;https://example.com/a\x1b\\the docs\x1b]8;;\x1b\\ now\n";
+    env.view.preview_cache.store_capture(
+        advertised.to_string(),
+        "s1".to_string(),
+        "aoe_s1".to_string(),
+        1,
+        (40, 4),
+        None,
     );
-    env.view.preview_cache.links_generation = 1;
+    env.view.preview_cache.ensure_parsed();
+    let painted = env.view.preview_cache.parsed_text.as_ref().unwrap();
+    assert_eq!(painted.lines[0].to_string(), "see the docs now");
+    let total_lines = painted.lines.len();
+    env.view.preview_area = PANE;
+    env.view.preview_text_view = PreviewTextView {
+        pane: PANE,
+        first_line: 0,
+        total_lines,
+    };
     assert_eq!(
         env.view.preview_link_at(PANE.x + 4, PANE.y).as_deref(),
         Some("https://example.com/a")
     );
 
-    // The grid is untouched; only the advertised target moved.
-    env.view.preview_cache.links = vec![link("the docs", "https://example.com/b")];
+    // The pane repoints the label. The visible cells do not move, so
+    // `parsed_text` stays valid; only the advertised target changed, which the
+    // generation is what reports.
+    env.view.preview_cache.content =
+        "see \x1b]8;;https://example.com/b\x1b\\the docs\x1b]8;;\x1b\\ now\n".to_string();
+    env.view.preview_cache.links_generation = 99;
+    env.view.preview_cache.ensure_parsed();
+    assert_eq!(
+        env.view.preview_cache.parsed_text.as_ref().unwrap().lines[0].to_string(),
+        "see the docs now",
+        "the visible cells must be unchanged"
+    );
     assert_eq!(
         env.view.preview_link_at(PANE.x + 4, PANE.y).as_deref(),
         Some("https://example.com/b"),
         "a repointed label must resolve to its new target"
+    );
+
+    // The pane reprints the label as plain text. Nothing is advertised any
+    // more, so the label must stop being actionable.
+    env.view.preview_cache.content = "see the docs now\n".to_string();
+    env.view.preview_cache.links_generation = 100;
+    env.view.preview_cache.ensure_parsed();
+    assert_eq!(
+        env.view.preview_link_at(PANE.x + 4, PANE.y),
+        None,
+        "an obsolete target must not survive the frame that dropped it"
     );
 }
 

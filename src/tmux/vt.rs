@@ -746,21 +746,9 @@ fn seed_parser(
     let Some(stream) = capture_seed_stream(target, rows, deadline) else {
         return VtRefreshResult::Failed;
     };
-    let result = swap_seeded_parser(
-        sink.parser,
-        sink.app_cursor,
-        sink.grid_gen,
-        None,
-        &stream,
-        size,
-        chunk_guard,
-    );
-    // Only a seed that actually landed describes what is on screen. Recording
-    // one that lost its race would leave targets for rows the grid never took.
-    if result == VtRefreshResult::Refreshed {
-        record_seed_links(sink.links, &stream);
-    }
-    result
+    // The table travels with the swap: only a seed that lands describes what is
+    // on screen, and one that loses its race must leave the targets alone.
+    swap_seeded_parser(sink, None, &stream, size, chunk_guard)
 }
 /// Capture the pane and weave its modes and cursor into one replayable byte
 /// stream, or `None` when the pane could not be captured. Split from the swap
@@ -791,14 +779,18 @@ fn capture_seed_stream(
 /// reseeds again on its own cadence. `since` of `None` disables only the
 /// generation guard for callers whose current grid is stale by definition.
 fn swap_seeded_parser(
-    parser: &Mutex<vt100::Parser>,
-    app_cursor: &AtomicBool,
-    grid_gen: &AtomicU64,
+    sink: SeedSink<'_>,
     since: Option<u64>,
     stream: &[u8],
     size: (u16, u16),
     chunk_guard: Option<(&AtomicU64, &AtomicU64, u64)>,
 ) -> VtRefreshResult {
+    let SeedSink {
+        parser,
+        app_cursor,
+        grid_gen,
+        links,
+    } = sink;
     let Ok(mut p) = parser.lock() else {
         return VtRefreshResult::Failed;
     };
@@ -814,6 +806,10 @@ fn swap_seeded_parser(
     *p = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
     p.process(stream);
     app_cursor.store(p.screen().application_cursor(), Ordering::Relaxed);
+    // Under the parser lock, so the grid and the targets that describe it are
+    // installed together: a sampler cannot catch the new frame beside the old
+    // frame's links, or the reverse.
+    reconcile_links(links, crate::tmux::osc8::extract_links(stream));
     grid_gen.fetch_add(1, Ordering::Relaxed);
     VtRefreshResult::Refreshed
 }
@@ -1402,6 +1398,32 @@ fn record_links(slot: &LinkTable, found: Vec<PaneLink>) {
     }
 }
 
+/// Replace a channel's table with the links an accepted snapshot advertises.
+///
+/// A seed covers the whole scrollback the grid keeps, so it is the complete set
+/// of what the pane is currently offering. Merging into the table instead would
+/// leave a target behind for a label the pane has since reprinted as plain
+/// text, and the text matcher would keep that label actionable against an
+/// obsolete URI.
+fn reconcile_links(slot: &LinkTable, found: Vec<PaneLink>) {
+    let Ok(mut table) = slot.table.lock() else {
+        return;
+    };
+    let mut next: VecDeque<PaneLink> = VecDeque::new();
+    for link in found {
+        if !next.contains(&link) {
+            next.push_back(link);
+        }
+    }
+    while next.len() > crate::tmux::osc8::MAX_PANE_LINKS {
+        next.pop_front();
+    }
+    if table.iter().ne(next.iter()) {
+        *table = next;
+        slot.generation.fetch_add(1, Ordering::Release);
+    }
+}
+
 /// Fold a `capture-pane -e` seed's hyperlinks into a channel's table.
 ///
 /// The seed bytes are replayed into a fresh parser rather than passing through
@@ -1410,8 +1432,9 @@ fn record_links(slot: &LinkTable, found: Vec<PaneLink>) {
 /// which keeps a link that is still on screen recorded no matter how long ago
 /// its sequence left the stream. Recorded even when the swap loses its race:
 /// the pane advertised the link either way.
+#[cfg(test)]
 fn record_seed_links(slot: &LinkTable, stream: &[u8]) {
-    record_links(slot, crate::tmux::osc8::extract_links(stream));
+    reconcile_links(slot, crate::tmux::osc8::extract_links(stream));
 }
 
 /// A channel's link table plus a counter that moves whenever it does.
@@ -2091,17 +2114,18 @@ impl VtChannel {
             return VtRefreshResult::Failed;
         };
         let result = swap_seeded_parser(
-            &self.parser,
-            &self.app_cursor,
-            &self.grid_gen,
+            SeedSink {
+                parser: &self.parser,
+                app_cursor: &self.app_cursor,
+                grid_gen: &self.grid_gen,
+                links: &self.links,
+            },
             since,
             &stream,
             (cols, rows),
             Some((&self.chunk_seq, &self.settled_chunk_seq, expected_chunk_seq)),
         );
         if result == VtRefreshResult::Refreshed {
-            // See `seed_parser`: a rejected reseed describes no accepted frame.
-            record_seed_links(&self.links, &stream);
             self.clear_drift();
         }
         result
@@ -2825,9 +2849,12 @@ mod tests {
 
         assert_eq!(
             swap_seeded_parser(
-                &parser,
-                &app_cursor,
-                &grid_gen,
+                SeedSink {
+                    parser: &parser,
+                    app_cursor: &app_cursor,
+                    grid_gen: &grid_gen,
+                    links: &LinkTable::default(),
+                },
                 None,
                 b"STALE-SNAPSHOT",
                 (80, 24),
@@ -2837,9 +2864,12 @@ mod tests {
         );
         assert_eq!(
             swap_seeded_parser(
-                &parser,
-                &app_cursor,
-                &grid_gen,
+                SeedSink {
+                    parser: &parser,
+                    app_cursor: &app_cursor,
+                    grid_gen: &grid_gen,
+                    links: &LinkTable::default(),
+                },
                 None,
                 b"STALE-SNAPSHOT",
                 (80, 24),
@@ -3461,9 +3491,12 @@ mod tests {
         let seed = assemble_seed_stream(b"snapshot-body\n", &PaneSeedState::default(), 24);
         assert_eq!(
             swap_seeded_parser(
-                &parser,
-                &app_cursor,
-                &grid_gen,
+                SeedSink {
+                    parser: &parser,
+                    app_cursor: &app_cursor,
+                    grid_gen: &grid_gen,
+                    links: &LinkTable::default(),
+                },
                 Some(since),
                 &seed,
                 (80, 24),
@@ -3483,9 +3516,12 @@ mod tests {
         let expected_chunk_seq = chunk_seq.load(Ordering::Acquire);
         assert_eq!(
             swap_seeded_parser(
-                &parser,
-                &app_cursor,
-                &grid_gen,
+                SeedSink {
+                    parser: &parser,
+                    app_cursor: &app_cursor,
+                    grid_gen: &grid_gen,
+                    links: &LinkTable::default(),
+                },
                 Some(quiet),
                 &seed,
                 (80, 24),
@@ -3957,6 +3993,77 @@ mod tests {
             b"\x1b]8;;https://example.com/repo\x1b\\the repo\x1b]8;;\x1b\\",
         );
         assert_eq!(slot.table.lock().unwrap().len(), 1);
+    }
+
+    /// An accepted snapshot is the whole of what the pane is offering, so it
+    /// replaces the table. Merging would leave a target behind for a label the
+    /// pane has since reprinted as plain text, and the text matcher would keep
+    /// that label actionable against an obsolete URI.
+    #[test]
+    fn an_accepted_snapshot_replaces_rather_than_merges_links() {
+        let slot = LinkTable::default();
+        record_links(
+            &slot,
+            vec![PaneLink {
+                text: "docs".to_string(),
+                uri: "https://example.com/old".to_string(),
+            }],
+        );
+        let after_record = slot.generation.load(Ordering::Acquire);
+
+        // The accepted frame still shows `docs`, now pointing somewhere else.
+        record_seed_links(
+            &slot,
+            b"see \x1b]8;;https://example.com/new\x1b\\docs\x1b]8;;\x1b\\ now",
+        );
+        let held: Vec<PaneLink> = slot.table.lock().unwrap().iter().cloned().collect();
+        assert_eq!(held.len(), 1, "the obsolete target is gone: {held:?}");
+        assert_eq!(held[0].uri, "https://example.com/new");
+        assert!(slot.generation.load(Ordering::Acquire) > after_record);
+
+        // The pane reprints the same label as plain text: nothing is advertised
+        // any more, so nothing may stay actionable.
+        record_seed_links(&slot, b"see docs now");
+        assert!(
+            slot.table.lock().unwrap().is_empty(),
+            "a snapshot with no sequences must leave no targets"
+        );
+    }
+
+    /// A seed that loses its race describes no accepted frame, so it must not
+    /// touch the targets either.
+    #[test]
+    fn a_rejected_swap_leaves_the_links_alone() {
+        let slot = LinkTable::default();
+        record_links(
+            &slot,
+            vec![PaneLink {
+                text: "docs".to_string(),
+                uri: "https://example.com/live".to_string(),
+            }],
+        );
+        let parser = Mutex::new(vt100::Parser::new(24, 80, 0));
+        let app_cursor = AtomicBool::new(false);
+        let grid_gen = AtomicU64::new(7);
+        assert_eq!(
+            swap_seeded_parser(
+                SeedSink {
+                    parser: &parser,
+                    app_cursor: &app_cursor,
+                    grid_gen: &grid_gen,
+                    links: &slot,
+                },
+                // A generation that no longer matches: the swap stands down.
+                Some(1),
+                b"\x1b]8;;https://example.com/stale\x1b\\docs\x1b]8;;\x1b\\",
+                (80, 24),
+                None,
+            ),
+            VtRefreshResult::Busy
+        );
+        let held: Vec<PaneLink> = slot.table.lock().unwrap().iter().cloned().collect();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].uri, "https://example.com/live");
     }
 
     #[test]
