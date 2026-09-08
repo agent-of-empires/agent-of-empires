@@ -1184,12 +1184,15 @@ mod tests {
         });
 
         let mut poller = SessionPoller::new("test-session".to_string());
-        assert!(poller.start(
-            "test-change".to_string(),
-            poll_fn,
-            on_change,
-            Some("id-1".to_string()),
-        ));
+        assert_eq!(
+            poller.start(
+                "test-change".to_string(),
+                poll_fn,
+                on_change,
+                Some("id-1".to_string()),
+            ),
+            PollerSpawn::Spawned
+        );
 
         changed_rx
             .recv_timeout(Duration::from_secs(10))
@@ -1418,12 +1421,15 @@ mod tests {
         poller.cmd_rx = Some(cmd_rx);
         let (observed_tx, observed_rx) = mpsc::channel();
 
-        assert!(poller.start(
-            "test-immediate".to_string(),
-            Box::new(|| Some("ses_polled".to_string())),
-            Box::new(move |id| observed_tx.send(id.to_string()).unwrap()),
-            None,
-        ));
+        assert_eq!(
+            poller.start(
+                "test-immediate".to_string(),
+                Box::new(|| Some("ses_polled".to_string())),
+                Box::new(move |id| observed_tx.send(id.to_string()).unwrap()),
+                None,
+            ),
+            PollerSpawn::Spawned
+        );
         poller.stop();
 
         assert_eq!(observed_rx.try_recv().unwrap(), "ses_polled");
