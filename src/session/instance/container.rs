@@ -318,6 +318,8 @@ impl Instance {
             .unwrap_or_else(|_| "/workspace".to_string())
     }
 
+    /// Kept out of `build_container_config` so the diagnostic fires once per
+    /// preparation: a launch can build the config more than once.
     fn warn_legacy_agent_config_mounts(&self) {
         let Some(home) = dirs::home_dir() else {
             return;
