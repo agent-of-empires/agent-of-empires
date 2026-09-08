@@ -201,7 +201,12 @@ wrapper points the CLI at another directory, set that host root in
 `session.agent_config_dir`. AoE stages a private per-session child and mounts it
 at the agent's canonical container config path. Remove any
 `sandbox.extra_volumes` entry for that path because it would shadow AoE's
-managed mount.
+managed mount; AoE warns once per container preparation when an extra-volume
+source is that directory or a child of it. Inside the sandbox the wrapper has
+to keep the config-dir variables AoE sets (`CLAUDE_CONFIG_DIR`, for example)
+rather than export its own, which points the agent at the pre-upgrade store
+and its missing folder-trust record, leaving the session on the folder-trust
+dialog. Host-only account selection stays outside the sandbox.
 
 To pre-trust worktrees for host sessions too, see `session.pre_trust_agent_folders`
 in the [configuration guide](configuration.md).
@@ -300,20 +305,6 @@ agent's config and history under `sandbox-v2/<instance-id>` inside the agent's c
 (for example `~/.claude/sandbox-v2/<id>`). The container mounts that copy at
 the agent's usual config path, so credentials, hooks and conversation history
 belong to one session and `aoe` can resume the right conversation.
-
-**Upgrading wrappers with `agent_config_dir`:** older configurations manually
-mounted `<dir>/sandbox` through `sandbox.extra_volumes`. AoE now mounts
-`<dir>/sandbox-v2/<instance-id>` itself and supplies the agent's config-dir
-environment. The store migration does not rewrite wrappers or manual mounts.
-Remove manual agent-config mounts from `extra_volumes` and, inside the sandbox,
-let the wrapper preserve AoE's config-dir variables (for example,
-`CLAUDE_CONFIG_DIR`). Keep host-only account selection outside the sandbox.
-A wrapper that overwrites these variables can read the old store instead of
-the prepared one, without its seeded folder-trust record, even if the old
-mount uses a different container path. AoE warns once per container preparation
-when an extra-volume source is the declared config directory or a child of it;
-this signals a risk, not proof that the wrapper reads that mount. See
-[One CLI, two accounts](configuration.md#one-cli-two-accounts).
 
 Sessions created before this layout shared one agent store per agent (for
 example `~/.claude/sandbox`). Each one moves when you start it: AoE copies the
