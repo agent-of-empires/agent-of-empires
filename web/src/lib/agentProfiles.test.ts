@@ -20,6 +20,7 @@ describe("resolveAgentProfile", () => {
     expect(resolveAgentProfile("kimi").key).toBe("kimi");
     expect(resolveAgentProfile("prime-agent").key).toBe("prime-agent");
     expect(resolveAgentProfile("aoe-agent").key).toBe("aoe-agent");
+    expect(resolveAgentProfile("dsh").key).toBe("dsh");
   });
 
   it("falls back to DEFAULT for unknown / nullish keys", () => {
@@ -123,7 +124,7 @@ describe("resolveAgentLifecycle", () => {
 
   it("resolves active for every other registered key", () => {
     // Table over the remaining mirror keys; all must be plain Active.
-    const cases = ["claude", "claude-code", "codex", "opencode", "vibe", "pi", "omp", "kimi", "aoe-agent"];
+    const cases = ["claude", "claude-code", "codex", "opencode", "vibe", "pi", "omp", "kimi", "aoe-agent", "dsh"];
     for (const key of cases) {
       expect(resolveAgentLifecycle(key).state).toBe("active");
       expect(resolveAgentLifecycle(key).since).toBeUndefined();

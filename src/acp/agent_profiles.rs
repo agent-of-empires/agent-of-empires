@@ -332,6 +332,24 @@ pub const AOE_AGENT: AgentProfile = AgentProfile {
     yolo_mode_id: None,
 };
 
+/// DeepSeek Harness `dsh` via the shipped `dsh --profile acp` server. The
+/// profile is intentionally conservative: until a real dsh ACP capture
+/// confirms `_meta` parent-linkage, plan-mode tools, schedule-wakeup, or
+/// heartbeats, every entry stays off and the adapter renders the generic
+/// tool card. Mirrors the PRIME_AGENT shape — both agents ship a native
+/// ACP server but document only session-info envelopes upstream, so the
+/// safe default is no special-casing.
+pub const DSH: AgentProfile = AgentProfile {
+    key: "dsh",
+    parent_meta_namespaces: &[],
+    clear_aliases: &[],
+    clear_requires_driven_reset: false,
+    supports_exit_plan_mode: false,
+    supports_wakeup_tools: false,
+    emits_heartbeat_keepalives: false,
+    yolo_mode_id: None,
+};
+
 /// Permissive default for unknown registry keys: no claude-specific
 /// gates fire, no clear aliases match, no parent-meta lookup. The
 /// structured view still renders generic tool cards via ACP `ToolKind` and
@@ -362,6 +380,7 @@ pub fn resolve(key: &str) -> &'static AgentProfile {
         "kimi" => &KIMI,
         "prime-agent" => &PRIME_AGENT,
         "aoe-agent" => &AOE_AGENT,
+        "dsh" => &DSH,
         _ => &DEFAULT,
     }
 }
@@ -399,6 +418,7 @@ mod tests {
         assert_eq!(resolve("kimi").key, "kimi");
         assert_eq!(resolve("prime-agent").key, "prime-agent");
         assert_eq!(resolve("aoe-agent").key, "aoe-agent");
+        assert_eq!(resolve("dsh").key, "dsh");
     }
 
     #[test]
@@ -597,7 +617,7 @@ mod tests {
         // conservative empty namespace so a future edit cannot silently
         // start claiming hierarchy (prime-agent's _meta envelope is
         // session-info only today).
-        for profile in [&VIBE, &PI, &OMP, &KIMI, &PRIME_AGENT] {
+        for profile in [&VIBE, &PI, &OMP, &KIMI, &PRIME_AGENT, &DSH] {
             assert!(
                 profile.parent_meta_namespaces.is_empty(),
                 "{}: parent linkage must stay off until observed",
@@ -624,6 +644,7 @@ mod tests {
             &OMP,
             &KIMI,
             &PRIME_AGENT,
+            &DSH,
             &AOE_AGENT,
             &DEFAULT,
         ] {

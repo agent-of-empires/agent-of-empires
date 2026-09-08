@@ -1,5 +1,5 @@
 # aoe-sandbox: Docker image for Agent of Empires sandbox sessions
-# This image provides Claude Code, OpenCode, Mistral Vibe, Hermes, Codex CLI, Gemini CLI, Antigravity CLI, Cursor CLI, Copilot CLI, Pi, OMP, Kiro CLI, Qwen Code, Kimi Code, and Prime Agent in an isolated environment
+# This image provides Claude Code, OpenCode, Mistral Vibe, Hermes, Codex CLI, Gemini CLI, Antigravity CLI, Cursor CLI, Copilot CLI, Pi, OMP, Kiro CLI, Qwen Code, Kimi Code, Prime Agent, and DeepSeek Harness (dsh) in an isolated environment
 
 FROM ubuntu:26.04
 
@@ -96,6 +96,13 @@ RUN curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh \
     && command -v prime-agent \
     && rm /tmp/install-prime-agent.sh
 
+# Install DeepSeek Harness (`dsh`). npm-distributed; the binary is what the
+# dsh ACP registration in `src/acp/agent_registry.rs` calls as `dsh --profile
+# acp`. Session persistence lands in `$DSH_HOME` (default `~/.dsh`); the
+# credential-mount directory below (`/root/.dsh`) is what AoE bind-mounts the
+# host's `~/.dsh` over.
+RUN npm install -g @deepseek-ai/dsh
+
 # Install ACP adapters used by `aoe`'s structured view mode when the session is
 # sandboxed. The structured view runner `docker exec`s these by their bare binary
 # name (see `src/acp/agent_registry.rs`); if they aren't present in
@@ -127,6 +134,7 @@ RUN mkdir -p /root/.claude \
     /root/.qwen \
     /root/.kimi-code \
     /root/.prime/agent \
+    /root/.dsh \
     /root/.ssh
 
 # Allow Claude Code to use --dangerously-skip-permissions as root

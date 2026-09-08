@@ -356,6 +356,27 @@ const AOE_AGENT: AgentProfile = {
   specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
 };
 
+// DeepSeek Harness `dsh` via the shipped `dsh --profile acp` server.
+// Mirrors the Rust DSH profile: until a real dsh capture confirms `_meta`
+// parent linkage, plan-mode tools, schedule-wakeup, or heartbeats, every
+// entry stays off and the Web client renders the generic tool card.
+const DSH: AgentProfile = {
+  key: "dsh",
+  subagentToolNames: [],
+  capabilities: {
+    todos: false,
+    skills: false,
+    wakeup: false,
+    subagents: false,
+    legacyModeFallback: false,
+    heartbeatKeepalives: false,
+  },
+  parentMetaNamespaces: [],
+  mcpPrefixes: ["mcp__"],
+  aliases: {},
+  specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
+};
+
 /** Permissive fallback for unknown agent keys: kind-only dispatch with
  *  no claude-specific specials. Keeps custom or future agents working
  *  through the generic card path rather than crashing. */
@@ -388,6 +409,7 @@ const PROFILES: Record<string, AgentProfile> = {
   kimi: KIMI,
   "prime-agent": PRIME_AGENT,
   "aoe-agent": AOE_AGENT,
+  dsh: DSH,
 };
 
 /** Resolve a profile by the session's `tool` key. Unknown keys (and

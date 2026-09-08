@@ -322,6 +322,33 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         preserve_files: &[],
         clean_files: &[],
     },
+    AgentConfigMount {
+        tool_name: "dsh",
+        // dsh reads its home from `$DSH_HOME` (default `~/.dsh`) — see
+        // https://github.com/deepseek-ai/deepseek-harness `packages/acp/README.md`
+        // and `packages/base/cordis.patch.yml`. The path is mounted both at
+        // the same container-side location so the `dsh --profile acp` binary
+        // finds host credentials, settings.json (where AoE's hook installer
+        // writes `aoe` hook entries via the `hooks-claude-code` schema), and
+        // the persisted sessions dir.
+        host_rel: ".dsh",
+        container_suffix: ".dsh",
+        // Skip AoE's sandbox staging dir (recursion) and dsh's per-instance
+        // session persistence (`sessions/`); the container regenerates both.
+        // logs/ and cache/ are machine-local and would only bloat the bind
+        // mount.
+        skip_entries: &["sandbox", "sessions", "logs", "cache"],
+        seed_files: &[],
+        // The dsh config dir holds user-authored profiles/patches that the
+        // `--profile <name>` and `--patch <file.yml>` argv picks up; copy
+        // these into the container so a host-authored dsh profile reaches
+        // the sandboxed session.
+        copy_dirs: &["profiles", "patches"],
+        keychain_credential: None,
+        home_seed_files: &[],
+        preserve_files: &[],
+        clean_files: &[],
+    },
 ];
 
 /// Sync host agent config into the shared sandbox directory. Copies top-level files
