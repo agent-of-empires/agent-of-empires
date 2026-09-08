@@ -11,11 +11,15 @@
 //! - A store is an orphan only when its id resolves in no profile of either
 //!   build namespace. A registry that cannot be read is never "a profile with
 //!   no sessions"; the pass fails and deletes nothing.
-//! - Liveness is v027's judgement, not a second one: a store whose container is
-//!   running, or whose path is not a plain directory, is preserved, and a
-//!   container runtime that cannot answer reads as live. It is asked of every
-//!   runtime installed, not just the one this build's config names, because
-//!   ownership spans both build namespaces and each can name a different one.
+//! - A store is removed only when *no* container for its id exists, under any
+//!   installed runtime. Not merely "not running": a stopped container can be
+//!   started between the check and the removal, and no lock a reclaim can hold
+//!   is observed by `docker start`. Requiring absence closes that race by
+//!   construction, since a container for an id no session owns cannot be
+//!   created either. A runtime that cannot answer reads as "exists", which is
+//!   v027's fail-closed posture. Every runtime is asked, not just the one this
+//!   build's config names, because ownership spans both build namespaces and
+//!   each can name a different one.
 //! - A store seeded moments ago is preserved. Container preparation seeds the
 //!   store before the session row is inserted (`cli::add` runs `on_create`
 //!   hooks, and so `get_container_for_instance`, before it persists), so a
@@ -36,9 +40,9 @@ use std::path::{Path, PathBuf};
 /// Why a store that resolves in no profile was kept anyway.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Preserved {
-    /// Its container is live. A runtime that cannot answer takes this arm
-    /// too, which is the whole point of v027's probe.
-    Live,
+    /// A container for it still exists, running or stopped, so it may be
+    /// started again. A runtime that cannot answer takes this arm too.
+    Retained,
     /// Not a plain directory, so what it is cannot be established.
     Ambiguous,
     /// Written to moments ago, so it may be a store being seeded for a session
@@ -49,7 +53,7 @@ pub enum Preserved {
 impl Preserved {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Live => "container is running, or the runtime could not be asked",
+            Self::Retained => "a container for it still exists, or a runtime could not be asked",
             Self::Ambiguous => "not a plain directory",
             Self::Recent => "written to too recently to rule out a session being created",
         }
@@ -132,16 +136,15 @@ pub fn reclaim() -> Result<Outcome> {
 /// window is nothing and it closes the only gap the locks cannot.
 const CREATION_GRACE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
-/// Liveness asked of every container runtime installed, not just the one this
-/// build's config names.
+/// Whether any installed runtime still has a container for this id, in any
+/// state.
 ///
 /// `get_container_runtime` resolves through `Config::load`, whose path is the
 /// invoking build's app dir, and each namespace (or profile) can name a
-/// different runtime. Asking only ours would read a store mounted into a
-/// running container of another runtime as quiescent and delete it. Each
-/// runtime is asked through v027's own probe, so the fail-closed answer for a
-/// runtime that cannot be reached is unchanged; a runtime that is not
-/// installed holds no containers and contributes nothing.
+/// different runtime, so asking only ours would miss a container holding the
+/// store. Each runtime is asked through v027's own probe, so the fail-closed
+/// answer for a runtime that cannot be reached is unchanged; a runtime that is
+/// not installed holds no containers and contributes nothing.
 fn every_runtime_probe(announce: bool) -> impl Fn(&str) -> Result<bool> {
     let constructors: Vec<fn() -> crate::containers::ContainerRuntime> = vec![
         crate::containers::ContainerRuntime::docker,
@@ -156,18 +159,18 @@ fn every_runtime_probe(announce: bool) -> impl Fn(&str) -> Result<bool> {
         .map(|new| {
             Box::new(v027::batched_running_probe_with(
                 move || new().batch_container_states(crate::containers::SANDBOX_NAME_PREFIX),
-                move |id| probe_running_with(new(), id),
+                move |id| probe_exists_with(new(), id),
                 announce,
             )) as Box<v027::RunningProbe<'static>>
         })
         .collect();
-    move |id: &str| any_live(&probes, id)
+    move |id: &str| any_retained(&probes, id)
 }
 
-/// Live if any runtime says so. Short-circuits, so a runtime that cannot
-/// answer (and therefore answers "live") keeps the store without the rest
+/// Retained if any runtime says so. Short-circuits, so a runtime that cannot
+/// answer (and therefore answers "retained") keeps the store without the rest
 /// being asked.
-fn any_live(probes: &[Box<v027::RunningProbe<'_>>], id: &str) -> Result<bool> {
+fn any_retained(probes: &[Box<v027::RunningProbe<'_>>], id: &str) -> Result<bool> {
     for probe in probes {
         if probe(id)? {
             return Ok(true);
@@ -177,21 +180,19 @@ fn any_live(probes: &[Box<v027::RunningProbe<'_>>], id: &str) -> Result<bool> {
 }
 
 /// One runtime's answer for one id, in the shape v027's probe expects: whether
-/// it is running, and whether that is the fail-closed substitute for a runtime
-/// that could not be asked. A runtime that is not installed answers a
-/// definitive "not running": it has no containers to hold this store.
-fn probe_running_with(
+/// a container exists, and whether that is the fail-closed substitute for a
+/// runtime that could not be asked. A runtime that is not installed answers a
+/// definitive "no": it has no containers to hold this store.
+fn probe_exists_with(
     runtime: crate::containers::ContainerRuntime,
     id: &str,
 ) -> Result<(bool, bool)> {
     let name = crate::containers::DockerContainer::generate_name(id);
-    match runtime.is_container_running(&name) {
+    match runtime.does_container_exist(&name) {
         Ok(running) => Ok((running, false)),
         Err(crate::containers::error::DockerError::NotInstalled) => Ok((false, false)),
         Err(error) if v027::runtime_cannot_answer(&error) => {
-            tracing::warn!(
-                "sandbox reclaim treating {id} as live: container runtime unavailable ({error})"
-            );
+            tracing::warn!("sandbox reclaim keeping {id}: container runtime unavailable ({error})");
             Ok((true, true))
         }
         Err(error) => Err(error.into()),
@@ -287,11 +288,23 @@ fn registry_paths(app_dir: &Path) -> Result<Vec<PathBuf>> {
             for entry in entries {
                 let path = entry?.path();
                 // Resolved, not `DirEntry::file_type`, which does not follow
-                // symlinks: a symlinked profile directory would be skipped and
-                // its sessions would read as unowned. Reading more registries
-                // is always the safe direction here.
-                if fs::metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
-                    dirs.push(path);
+                // symlinks: a symlinked profile directory would otherwise be
+                // skipped and its sessions would read as unowned. An entry we
+                // cannot stat at all fails the pass rather than being skipped,
+                // for the same reason.
+                match fs::metadata(&path) {
+                    Ok(metadata) if metadata.is_dir() => dirs.push(path),
+                    // A stray file under `profiles/` is not a profile.
+                    Ok(_) => {}
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "{} cannot be inspected; refusing to reclaim stores \
+                                 without reading every profile",
+                                path.display()
+                            )
+                        })
+                    }
                 }
             }
         }
@@ -301,12 +314,23 @@ fn registry_paths(app_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for dir in dirs {
         let path = dir.join("sessions.json");
-        // Presence is decided without following, resolution with: a registry
-        // that is there but cannot be resolved to a regular file (a dangling
-        // symlink, a directory) is one we cannot read, and reading none of it
-        // would call its sessions orphans.
-        if fs::symlink_metadata(&path).is_err() {
-            continue;
+        // Only a genuinely absent registry is a profile with no sessions.
+        // Every other failure means a registry we cannot read, and skipping it
+        // would drop its sessions from the ownership inventory and make its
+        // stores look like orphans. Presence is decided without following the
+        // link, resolution with it, so a dangling symlink fails here rather
+        // than reading as absent.
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "{} cannot be inspected; refusing to reclaim stores without reading it",
+                        path.display()
+                    )
+                })
+            }
         }
         match fs::metadata(&path) {
             Ok(metadata) if metadata.is_file() => paths.push(path),
@@ -363,7 +387,7 @@ fn plan_in(
     also_owned: &[PathBuf],
     home: &Path,
     grace: std::time::Duration,
-    is_running: &v027::RunningProbe<'_>,
+    container_exists: &v027::RunningProbe<'_>,
 ) -> Result<Plan> {
     let owned = owned_ids(app_dir, also_owned)?;
     let roots = store_roots(app_dir, home)?;
@@ -382,7 +406,7 @@ fn plan_in(
                 continue;
             }
             let path = root.join(&child);
-            match classify(&path, &id, grace, is_running)? {
+            match classify(&path, &id, grace, container_exists)? {
                 Some(reason) => plan.preserved.push((path, reason)),
                 None => {
                     let bytes = directory_bytes(&path);
@@ -401,7 +425,7 @@ fn classify(
     path: &Path,
     id: &str,
     grace: std::time::Duration,
-    is_running: &v027::RunningProbe<'_>,
+    container_exists: &v027::RunningProbe<'_>,
 ) -> Result<Option<Preserved>> {
     let metadata =
         fs::symlink_metadata(path).with_context(|| format!("inspecting {}", path.display()))?;
@@ -411,8 +435,8 @@ fn classify(
     if written_within(&metadata, grace) {
         return Ok(Some(Preserved::Recent));
     }
-    if is_running(id)? {
-        return Ok(Some(Preserved::Live));
+    if container_exists(id)? {
+        return Ok(Some(Preserved::Retained));
     }
     Ok(None)
 }
@@ -435,35 +459,34 @@ fn reclaim_in(
     also_owned: &[PathBuf],
     home: &Path,
     grace: std::time::Duration,
-    is_running: &v027::RunningProbe<'_>,
+    container_exists: &v027::RunningProbe<'_>,
 ) -> Result<Outcome> {
-    let plan = plan_in(app_dir, also_owned, home, grace, is_running)?;
+    let plan = plan_in(app_dir, also_owned, home, grace, container_exists)?;
     let mut outcome = Outcome {
         plan,
         ..Outcome::default()
     };
-    // Sizing the plan can take a while on a large store, and a container may
-    // have started since. v027's probe caches its container listing until the
-    // liveness epoch moves, and reclaim is the only thing that can move it
-    // here, so without this the re-check below would replay the planning-time
-    // answer and delete a store that has since been mounted. v027 does the
-    // same before it publishes.
-    v027::refresh_liveness();
-    // Ownership is re-read too: the pass holds the transition lock shared, so
-    // a session created during it can publish its row, and a store that was
+    // Ownership is re-read: the pass holds the transition lock shared, so a
+    // session created during it can publish its row, and a store that was
     // unclaimed at planning time may be claimed by the time we reach it.
     let owned = owned_ids(app_dir, also_owned)?;
     for orphan in &outcome.plan.orphans {
+        // Per candidate, not once for the loop. v027's probe caches its
+        // container listing until the liveness epoch moves, and removing an
+        // earlier candidate can take a while, so a snapshot taken before the
+        // first removal is stale by the last. v027 refreshes for the same
+        // reason before it publishes.
+        v027::refresh_liveness();
         if owned.contains(&orphan.id) {
             outcome
                 .failures
                 .push((orphan.path.clone(), "claimed since the scan".to_string()));
             continue;
         }
-        // Re-classified against the path as it is now, with fresh liveness:
-        // the only thing standing between a swapped or newly live store and
-        // `remove_dir_all`.
-        match classify(&orphan.path, &orphan.id, grace, is_running) {
+        // Re-classified against the path as it is now, with fresh container
+        // evidence: the last thing standing between a swapped store, or one
+        // whose container reappeared, and `remove_dir_all`.
+        match classify(&orphan.path, &orphan.id, grace, container_exists) {
             Ok(None) => {}
             Ok(Some(reason)) => {
                 outcome
@@ -592,11 +615,13 @@ mod tests {
     /// creation grace period is opted out of except where it is the subject.
     const NO_GRACE: std::time::Duration = std::time::Duration::ZERO;
 
-    fn quiescent(_: &str) -> Result<bool> {
+    /// No container anywhere for this id.
+    fn gone(_: &str) -> Result<bool> {
         Ok(false)
     }
 
-    fn live(_: &str) -> Result<bool> {
+    /// A container still exists for it.
+    fn retained(_: &str) -> Result<bool> {
         Ok(true)
     }
 
@@ -610,7 +635,7 @@ mod tests {
         store(&home, "1111111111111111", 10);
         let orphan = store(&home, "2222222222222222", 40);
 
-        let plan = plan_in(&app, &[], &home, NO_GRACE, &quiescent).unwrap();
+        let plan = plan_in(&app, &[], &home, NO_GRACE, &gone).unwrap();
 
         assert_eq!(
             plan.orphans.iter().map(|o| &o.path).collect::<Vec<_>>(),
@@ -635,7 +660,7 @@ mod tests {
         .unwrap();
         store(&home, "2222222222222222", 40);
 
-        let plan = plan_in(&app, &[], &home, NO_GRACE, &quiescent).unwrap();
+        let plan = plan_in(&app, &[], &home, NO_GRACE, &gone).unwrap();
 
         assert!(plan.orphans.is_empty(), "{:?}", plan.orphans);
         assert_eq!(plan.owners, 1);
@@ -653,7 +678,7 @@ mod tests {
 
         for content in [r#"{"not":"an array"}"#, "{", r#"[{"title":"no id"}]"#] {
             fs::write(broken.join("sessions.json"), content).unwrap();
-            let error = plan_in(&app, &[], &home, NO_GRACE, &quiescent).unwrap_err();
+            let error = plan_in(&app, &[], &home, NO_GRACE, &gone).unwrap_err();
             assert!(
                 error.chain().any(|cause| {
                     let text = cause.to_string();
@@ -672,7 +697,7 @@ mod tests {
         fs::create_dir_all(&app).unwrap();
         store(&home, "2222222222222222", 40);
 
-        let error = plan_in(&app, &[], &home, NO_GRACE, &quiescent).unwrap_err();
+        let error = plan_in(&app, &[], &home, NO_GRACE, &gone).unwrap_err();
 
         assert!(error.to_string().contains("refusing"), "{error:#}");
     }
@@ -686,12 +711,12 @@ mod tests {
         app_with_rows(&app, &[]);
         let path = store(&home, "2222222222222222", 40);
 
-        let outcome = reclaim_in(&app, &[], &home, NO_GRACE, &live).unwrap();
+        let outcome = reclaim_in(&app, &[], &home, NO_GRACE, &retained).unwrap();
 
         assert!(outcome.removed.is_empty());
         assert_eq!(
             outcome.plan.preserved,
-            vec![(path.clone(), Preserved::Live)]
+            vec![(path.clone(), Preserved::Retained)]
         );
         assert!(path.exists());
     }
@@ -712,7 +737,7 @@ mod tests {
         let link = root.join("2222222222222222");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        let outcome = reclaim_in(&app, &[], &home, NO_GRACE, &quiescent).unwrap();
+        let outcome = reclaim_in(&app, &[], &home, NO_GRACE, &gone).unwrap();
 
         assert_eq!(
             outcome.plan.preserved,
@@ -731,7 +756,7 @@ mod tests {
         let kept = store(&home, "1111111111111111", 10);
         let orphan = store(&home, "2222222222222222", 40);
 
-        let outcome = reclaim_in(&app, &[], &home, NO_GRACE, &quiescent).unwrap();
+        let outcome = reclaim_in(&app, &[], &home, NO_GRACE, &gone).unwrap();
 
         assert!(!orphan.exists());
         assert!(kept.exists());
@@ -782,7 +807,7 @@ mod tests {
         .unwrap();
         let store = store(&home, "2222222222222222", 40);
 
-        let outcome = reclaim_in(&app, &[sibling], &home, NO_GRACE, &quiescent).unwrap();
+        let outcome = reclaim_in(&app, &[sibling], &home, NO_GRACE, &gone).unwrap();
 
         assert!(outcome.removed.is_empty(), "{:?}", outcome.removed);
         assert!(store.exists(), "the other build's store was reclaimed");
@@ -800,14 +825,8 @@ mod tests {
         app_with_rows(&app, &[]);
         let seeding = store(&home, "2222222222222222", 40);
 
-        let outcome = reclaim_in(
-            &app,
-            &[],
-            &home,
-            std::time::Duration::from_secs(600),
-            &quiescent,
-        )
-        .unwrap();
+        let outcome =
+            reclaim_in(&app, &[], &home, std::time::Duration::from_secs(600), &gone).unwrap();
 
         assert!(seeding.exists(), "a store being seeded was reclaimed");
         assert_eq!(
@@ -851,14 +870,14 @@ mod tests {
         let angry: Box<v027::RunningProbe<'_>> =
             Box::new(|_| Err(anyhow::anyhow!("runtime exploded")));
 
-        assert!(!any_live(&[], "1111111111111111").unwrap());
-        assert!(!any_live(std::slice::from_ref(&quiet), "1111111111111111").unwrap());
-        assert!(any_live(&[quiet, busy, angry], "1111111111111111").unwrap());
+        assert!(!any_retained(&[], "1111111111111111").unwrap());
+        assert!(!any_retained(std::slice::from_ref(&quiet), "1111111111111111").unwrap());
+        assert!(any_retained(&[quiet, busy, angry], "1111111111111111").unwrap());
 
         let angry: Box<v027::RunningProbe<'_>> =
             Box::new(|_| Err(anyhow::anyhow!("runtime exploded")));
         assert!(
-            any_live(&[angry], "1111111111111111").is_err(),
+            any_retained(&[angry], "1111111111111111").is_err(),
             "a real fault must fail the pass, not read as quiescent"
         );
     }
@@ -874,7 +893,7 @@ mod tests {
         let path = store(&home, "2222222222222222", 40);
         let probes: Vec<Box<v027::RunningProbe<'_>>> =
             vec![Box::new(|_| Ok(false)), Box::new(|_| Ok(true))];
-        let any = move |id: &str| any_live(&probes, id);
+        let any = move |id: &str| any_retained(&probes, id);
 
         let outcome = reclaim_in(&app, &[], &home, NO_GRACE, &any).unwrap();
 
@@ -882,7 +901,7 @@ mod tests {
             path.exists(),
             "a store live under another runtime was removed"
         );
-        assert_eq!(outcome.plan.preserved, vec![(path, Preserved::Live)]);
+        assert_eq!(outcome.plan.preserved, vec![(path, Preserved::Retained)]);
     }
 
     /// `remove_stores_for` must not follow a symlink out of the store root.
@@ -914,6 +933,86 @@ mod tests {
         );
     }
 
+    /// A registry that is there but cannot be resolved must abort the pass.
+    /// Skipping it would drop its sessions from the ownership inventory and
+    /// make their stores, which are perfectly readable, look like orphans.
+    ///
+    /// Dangling symlinks rather than permission bits: tests run as root in
+    /// some environments, where a mode of `000` is not an error at all.
+    #[cfg(unix)]
+    #[test]
+    fn an_unresolvable_registry_aborts_before_removing_anything() {
+        type Plant = fn(&Path);
+        let cases: &[(&str, Plant)] = &[
+            ("profile directory", |app: &Path| {
+                std::os::unix::fs::symlink(app.join("nowhere"), app.join("profiles").join("work"))
+                    .unwrap();
+            }),
+            ("registry file", |app: &Path| {
+                let profile = app.join("profiles").join("work");
+                fs::create_dir_all(&profile).unwrap();
+                std::os::unix::fs::symlink(app.join("nowhere"), profile.join("sessions.json"))
+                    .unwrap();
+            }),
+        ];
+
+        for (name, plant) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let app = dir.path().join("app");
+            let home = dir.path().join("home");
+            fs::create_dir_all(app.join("profiles")).unwrap();
+            app_with_rows(&app, &[]);
+            let orphan = store(&home, "2222222222222222", 40);
+            plant(&app);
+
+            let outcome = reclaim_in(&app, &[], &home, NO_GRACE, &gone);
+
+            assert!(
+                outcome.is_err(),
+                "{name}: an unresolvable registry must fail the pass, \
+                 not empty the ownership set"
+            );
+            assert!(
+                orphan.exists(),
+                "{name}: a store was removed despite the failure"
+            );
+        }
+    }
+
+    /// Removing one store takes time, and a container for a later candidate
+    /// can appear while it happens. Evidence has to be re-taken per candidate,
+    /// not once for the loop.
+    #[test]
+    fn a_candidate_whose_container_appears_mid_pass_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("app");
+        let home = dir.path().join("home");
+        fs::create_dir_all(&app).unwrap();
+        app_with_rows(&app, &[]);
+        let first = store(&home, "2222222222222222", 40);
+        let second = store(&home, "3333333333333333", 40);
+
+        // Stands in for a container coming up during the first removal: both
+        // stores are unattached while the plan is made, and the second gains a
+        // container the moment the first is gone.
+        let gate = first.clone();
+        let appears = move |_: &str| Ok(!gate.exists());
+
+        let outcome = reclaim_in(&app, &[], &home, NO_GRACE, &appears).unwrap();
+
+        assert!(!first.exists(), "the first orphan should still be removed");
+        assert!(
+            second.exists(),
+            "a store whose container appeared mid-pass was removed"
+        );
+        assert_eq!(
+            outcome.plan.orphans.len(),
+            2,
+            "both were candidates when the plan was made"
+        );
+        assert_eq!(outcome.removed.len(), 1);
+    }
+
     #[test]
     fn a_directory_that_is_not_an_instance_id_is_never_touched() {
         let dir = tempfile::tempdir().unwrap();
@@ -927,7 +1026,7 @@ mod tests {
             .join(".v027-staging");
         fs::create_dir_all(&staging).unwrap();
 
-        let outcome = reclaim_in(&app, &[], &home, NO_GRACE, &quiescent).unwrap();
+        let outcome = reclaim_in(&app, &[], &home, NO_GRACE, &gone).unwrap();
 
         assert!(staging.exists());
         assert!(outcome.plan.orphans.is_empty());

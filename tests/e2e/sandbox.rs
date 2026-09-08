@@ -109,7 +109,16 @@ fn test_cli_add_sandbox_on_create_hooks_run_in_container() {
 #[parallel]
 fn sandbox_reclaim_reports_before_it_removes() {
     let mut h = TuiTestHarness::new("sandbox_reclaim");
-    h.install_path_command("docker");
+    // A runtime that lists nothing and reports every container absent. The
+    // reclaim keeps any store a container still exists for, so a stub that
+    // merely exits 0 would report every store as attached.
+    let bin = h.install_path_command("docker");
+    std::fs::write(
+        bin.join("docker"),
+        "#!/bin/sh\ncase \"$1\" in\n  ps) exit 0 ;;\nesac\n\
+         echo \"Error: No such container: $3\" >&2\nexit 1\n",
+    )
+    .expect("write docker stub");
     let project = h.project_path();
 
     let add = h.run_cli(&["add", project.to_str().unwrap(), "-t", "Reclaim Owner"]);
