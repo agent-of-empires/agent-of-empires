@@ -1076,12 +1076,21 @@ async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
             reason = "build_stale",
             "stale structured view worker drained; respawning"
         );
-        let generation = crate::process::worker_registry::load(&id)
-            .ok()
-            .flatten()
-            .map(|r| r.generation)
-            .unwrap_or(0);
-        crate::process::worker_registry::mark_restart_pending(&id, generation);
+        let generation = state
+            .acp_supervisor
+            .running_identity(&id)
+            .map(|identity| identity.generation)
+            .or_else(|| {
+                crate::process::worker_registry::load(&id)
+                    .ok()
+                    .flatten()
+                    .map(|r| r.generation)
+            });
+        // With neither an identity nor a record, nothing names the runner;
+        // a marker written by the stop that removed the record stands.
+        if let Some(generation) = generation {
+            crate::process::worker_registry::mark_restart_pending(&id, generation);
+        }
         crate::process::worker_registry::terminate_and_wait(&id).await;
         state.acp_supervisor.clear_respawn_pending(&id);
     }
@@ -3037,6 +3046,40 @@ mod tests {
             crate::process::worker_registry::peek_restart_marker("s-late-marker").is_none(),
             "the marker must be consumed by the tick, not left to poison a later stop"
         );
+    }
+
+    /// `aoe acp restart` of an adopted build-stale runner writes the marker
+    /// for its generation and removes the record; the drain pass must not
+    /// overwrite that marker with a guessed generation.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_drained_stale_respawn_keeps_the_restart_marker_of_its_generation() {
+        let (state, _home, _project) = capacity_test_state("s-drain").await;
+        state
+            .acp_supervisor
+            .test_install_attached(
+                "s-drain",
+                crate::acp::runner_lifecycle::RunnerIdentity {
+                    pid: 4242,
+                    generation: 4,
+                },
+            )
+            .await;
+        for id in ["s-drain", "s-drain-gone"] {
+            state.acp_supervisor.mark_build_respawn_pending(id);
+            crate::process::worker_registry::mark_restart_pending(id, 4);
+        }
+
+        super::respawn_drained_stale_workers(&state).await;
+
+        for id in ["s-drain", "s-drain-gone"] {
+            assert_eq!(
+                crate::process::worker_registry::peek_restart_marker(id),
+                Some(4),
+                "{id}: the restart keeps the generation it stopped"
+            );
+        }
+        assert!(state.acp_supervisor.respawn_pending_ids().is_empty());
     }
 
     /// A worker that failed before establishing a session is re-armed by the

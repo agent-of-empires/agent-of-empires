@@ -790,6 +790,13 @@ impl<S: BroadcastSink> Supervisor<S> {
         lock_recover(&self.respawn_pending).remove(session_id);
     }
 
+    /// The identity of the session's running runner, when one is installed.
+    pub fn running_identity(&self, session_id: &str) -> Option<RunnerIdentity> {
+        lock_recover(&self.lifecycle)
+            .running(session_id)
+            .and_then(|(_, identity)| identity)
+    }
+
     /// Record that a session is parked on a compatibility rejection for
     /// `binary`. Overwrites any prior entry. Cleared by
     /// `clear_incompatible_binary` on a successful (re)spawn. See #2109.
@@ -3574,6 +3581,14 @@ impl<S: BroadcastSink> Supervisor<S> {
 
     /// Install a fake worker under a fresh lease, the way `spawn_inner`
     /// would, with an optional runner identity for teardown assertions.
+    #[cfg(test)]
+    /// Install an attached worker carrying `identity`, for reconciler tests.
+    pub(crate) async fn test_install_attached(&self, session_id: &str, identity: RunnerIdentity) {
+        let (client, _tx) = AcpClient::fake_for_test(AcpSessionId(session_id.into()));
+        self.test_install_handle(session_id, client, WorkerKind::Attached, Some(identity))
+            .await;
+    }
+
     #[cfg(test)]
     async fn test_install_handle(
         &self,
