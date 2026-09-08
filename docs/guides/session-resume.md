@@ -89,7 +89,9 @@ Four relevant fields:
   This loop-breaker prevents startup recovery from retrying that same ID automatically until user action changes the resume state.
 - `pi_session_path`: for Pi sessions, the transcript path the pane published.
   Pi indexes conversations by the directory they started in, so this is what
-  resumes one whose worktree has since moved. Pi writes a transcript lazily,
-  so when this names a file that is not there, an unpinned launch starts fresh
-  and keeps the ID rather than handing `--session` an argument that would fail.
-  Auto-managed; do not edit.
+  resumes one whose worktree has since moved. Pi writes a transcript lazily, so
+  this can name a file that does not exist yet. A launch that would otherwise
+  pass that conversation to `pi --session`, which fails outright on an ID it
+  cannot resolve, starts fresh instead and lets the pane's next conversation
+  take over. Launches that pin with `--session-id` are unaffected, since that
+  flag creates the conversation rather than failing. Auto-managed; do not edit.
