@@ -201,9 +201,10 @@ pub fn ships_sources(binary: &str) -> bool {
 }
 
 /// An in-tree adapter (one that ships sources) whose installed copy no longer
-/// matches this binary's embedded sources. A spawn reinstalls it first; a
-/// resolution outside a spawn refuses it and the install hint names the
-/// reinstall (#3553).
+/// matches this binary's embedded sources. Resolution refuses it and the
+/// install hint names the reinstall; a spawn does not reinstall on its own,
+/// since publishing renames the install dir under any runner already using
+/// it (#3553).
 pub fn installed_copy_is_stale(app_dir: &Path, binary: &str) -> bool {
     lookup(binary).is_some_and(|adapter| {
         !adapter.sources.is_empty()
@@ -388,8 +389,7 @@ pub fn npm_ci_argv(node: &ResolvedNode) -> Option<(PathBuf, Vec<String>)> {
 /// keeps its open file descriptors, but Node resolves a lazy `require()`
 /// against the absolute `__dirname` that the rename just invalidated, so a
 /// running adapter can fail on its next deferred import. Acceptable for an
-/// explicit `doctor --fix`; the spawn-time reinstall of a stale in-tree
-/// adapter runs only while no runner of that adapter is alive.
+/// explicit `doctor --fix`, the only path that publishes over an install.
 fn publish(tmp: &Path, final_dir: &Path) -> std::io::Result<()> {
     if !final_dir.exists() {
         return std::fs::rename(tmp, final_dir);

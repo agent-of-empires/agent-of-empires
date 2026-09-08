@@ -194,20 +194,19 @@ pub fn mark_restart_pending(session_id: &str, generation: u64) {
     let Ok(path) = restart_marker_path(session_id) else {
         return;
     };
-    let _ = std::fs::write(&path, generation.to_string());
+    // Published by rename so a claim can never see a half-written marker.
+    let staged = path.with_extension(format!("restart.tmp-{}", std::process::id()));
+    if std::fs::write(&staged, generation.to_string()).is_err() {
+        return;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600));
     }
-}
-
-/// Whether any registered runner for `agent_binary` is still alive, so an
-/// adapter reinstall does not rename the install dir under it.
-pub fn any_live_runner_for(agent_binary: &str) -> bool {
-    list().unwrap_or_default().iter().any(|record| {
-        record.agent_name == agent_binary && crate::process::worker::is_pid_alive(record.pid)
-    })
+    if std::fs::rename(&staged, &path).is_err() {
+        let _ = std::fs::remove_file(&staged);
+    }
 }
 
 /// Generation named by the marker, without consuming it. `None` when
@@ -664,19 +663,19 @@ pub async fn terminate_and_wait(session_id: &str) {
 /// left alone. Returns whether the registry is settled for that runner.
 pub fn delete_if_owned_by(session_id: &str, pid: u32, generation: u64) -> bool {
     let identity = crate::acp::runner_lifecycle::RunnerIdentity { pid, generation };
-    match load(session_id) {
-        Ok(Some(rec)) if !identity.matches_record(rec.pid, rec.generation) => {
+    with_registry_lock(session_id, || match load_strict_unlocked(session_id)? {
+        Some(rec) if !identity.matches_record(rec.pid, rec.generation) => {
             debug!(
                 target: "acp.registry",
                 session = %session_id,
                 current_pid = rec.pid,
                 "leaving registry entry; it belongs to a replacement runner"
             );
-            true
+            Ok(true)
         }
-        Ok(_) => delete(session_id).is_ok(),
-        Err(_) => false,
-    }
+        _ => delete_unlocked(session_id).map(|()| true),
+    })
+    .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -1421,6 +1420,15 @@ mod tests {
             mark_restart_pending("m", 9);
             assert_eq!(claimed, Some(Some(8)));
             assert_eq!(peek_restart_marker("m"), Some(9));
+            let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().contains("restart."))
+                .collect();
+            assert!(
+                leftovers.is_empty(),
+                "publication leaves no staging file: {leftovers:?}"
+            );
             clear_restart_marker("m");
             assert!(!path.exists());
         });

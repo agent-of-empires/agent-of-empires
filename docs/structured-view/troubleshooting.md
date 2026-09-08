@@ -52,7 +52,9 @@ data dir on demand, like the npm adapters: run
 `aoe acp doctor --fix --adapter aoe-agent`. It needs Node 22.6 or newer (the
 other adapters accept any 22). Until it is installed, sessions that pick it
 fail to start with an install hint and `aoe acp agents` reports it as missing
-rather than present (#3553).
+rather than present (#3553). An aoe upgrade that changes the bundled sources
+makes the installed copy stale; sessions refuse it with the same hint until
+`doctor --fix` reinstalls it.
 
 ### `aoe acp doctor` says claude-code adapter is missing
 

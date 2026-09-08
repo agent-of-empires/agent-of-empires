@@ -3775,7 +3775,9 @@ async fn tear_down_runner_from(
         return Settlement::Proven;
     };
     let pid = identity.pid;
-    if !killed_before && control.is_alive(pid) {
+    if !killed_before {
+        // Sent even when the leader is already gone: descendants in its
+        // group only ever receive the signal, never the liveness probe.
         control.terminate_group(pid);
         wait_for_exit(control, pid, TEARDOWN_TERM_GRACE).await;
     }
@@ -7196,6 +7198,26 @@ cursor-acp-bridge = "agent acp"
             ),
             "a later resume proceeds"
         );
+    }
+
+    /// The group signal is not gated on the leader: a runner that already
+    /// exited can leave descendants that only the signal reaches.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_dead_leader_still_gets_the_group_signal() {
+        let _home = isolate_home();
+        let control = Arc::new(FakeProcessControl::default());
+        let sup = Supervisor::new(VecSink::new()).with_process_control(control.clone());
+        save_record("s-gone", 6060, 1);
+
+        sup.shutdown("s-gone")
+            .await
+            .expect("disk-only runner is stoppable");
+        assert_eq!(control.signals(), vec![(6060, "TERM")]);
+        assert_eq!(sup.worker_state("s-gone").await, AcpWorkerState::Absent);
+        assert!(crate::process::worker_registry::load("s-gone")
+            .unwrap()
+            .is_none());
     }
 
     /// A teardown whose driver was dropped mid-await (a request future
