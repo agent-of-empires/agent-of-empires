@@ -467,14 +467,15 @@ impl Instance {
         Some(self.pi_config_bind_dir()?.join(rest))
     }
 
-    fn pi_resumable_transcript(&self) -> Option<String> {
+    /// The recorded transcript path when it belongs to the conversation this
+    /// row currently owns, paired with whether that file is still there.
+    fn pi_recorded_transcript(&self) -> Option<(&str, bool)> {
         let path = self.pi_session_path.as_deref()?;
         let id = self.agent_session_id.as_deref()?;
         let name = std::path::Path::new(path).file_name()?.to_str()?;
-        let names_this_conversation = name
-            .rsplit_once('_')
+        name.rsplit_once('_')
             .and_then(|(_, tail)| tail.strip_suffix(".jsonl"))
-            .is_some_and(|uuid| uuid == id);
+            .filter(|uuid| *uuid == id)?;
         let exists = if self.is_sandboxed() {
             path.strip_prefix("/root/.pi/")
                 .is_some_and(|relative| self.pi_sandbox_regular_exists(Path::new(relative)))
@@ -482,15 +483,63 @@ impl Instance {
             self.pi_host_view_of(path)
                 .is_some_and(|host_path| host_path.is_file())
         };
-        (names_this_conversation && exists).then(|| path.to_string())
+        Some((path, exists))
+    }
+
+    fn pi_resumable_transcript(&self) -> Option<String> {
+        let (path, exists) = self.pi_recorded_transcript()?;
+        exists.then(|| path.to_string())
+    }
+
+    /// Whether the conversation this row owns is known to have no transcript.
+    ///
+    /// Positive evidence only, and only from what the pane itself published:
+    /// a recorded path for exactly this conversation whose file is gone. Pi
+    /// writes a transcript lazily, so a conversation that was never prompted
+    /// has none, and pi's store layout is never reconstructed to guess.
+    fn pi_recorded_transcript_missing(&self) -> bool {
+        matches!(self.pi_recorded_transcript(), Some((_, false)))
     }
 
     pub(super) fn absorb_published_pi_session(&mut self) {
         if self.resolved_capture_backend() != Some(crate::agents::SessionCaptureBackend::Pi) {
             return;
         }
-        if let Some(path) = self.pi_published_session_path() {
-            self.pi_session_path = Some(path);
+        let Some(path) = self.pi_published_session_path() else {
+            return;
+        };
+        if self.pi_session_path.as_deref() == Some(path.as_str()) {
+            return;
+        }
+        self.pi_session_path = Some(path.clone());
+        // The sidecar this came from lives in the host temp directory, which a
+        // reboot clears. Only the durable copy survives to tell the next launch
+        // which conversation the pane was on and whether it has a transcript.
+        if let Ok(storage) = crate::session::storage::Storage::new(
+            &self.effective_profile(),
+            self.resolve_file_watch(),
+        ) {
+            self.store_pi_session_path(&storage, &path);
+        }
+    }
+
+    /// Record a published transcript path on this row's durable state.
+    pub(super) fn store_pi_session_path(
+        &self,
+        storage: &crate::session::storage::Storage,
+        path: &str,
+    ) {
+        if let Err(error) = storage.update(|instances, _| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == self.id) {
+                inst.pi_session_path = Some(path.to_string());
+            }
+            Ok(())
+        }) {
+            tracing::warn!(
+                target: "session.store",
+                instance = %self.id,
+                "could not persist the Pi transcript path the pane published: {error}",
+            );
         }
     }
 
@@ -806,6 +855,30 @@ impl Instance {
                 tracing::debug!(target: "session.store", "Added resume flags to {} command: {}", context, flags);
                 return Ok(true);
             }
+        }
+        // Pi's `--session <sid>` arm is its hard-failing selector: it exits 1
+        // when the id resolves to nothing, and `remain-on-exit` then leaves a
+        // dead pane that the resume probe reads as a failed resume, so the
+        // next launch discards the conversation. Pi writes a transcript
+        // lazily, so an id AoE holds for a conversation that was never
+        // prompted resolves to nothing. Start fresh instead, keeping the id
+        // for a later launch that can pin it. The `--session-id` arm creates
+        // the conversation rather than failing, which is why it is exempt. An
+        // explicit pin is left to fail: the user named that conversation and
+        // pi's own message in the pane is the answer they asked for.
+        if flag_arm_is_existing
+            && !explicitly_pinned
+            && self.resolved_capture_backend() == Some(crate::agents::SessionCaptureBackend::Pi)
+            && self.pi_recorded_transcript_missing()
+        {
+            tracing::info!(
+                target: "session.store",
+                instance = %self.id,
+                sid = ?session_id,
+                "the conversation this Pi session owns has no transcript; \
+                 starting fresh rather than failing the launch on `--session`",
+            );
+            session_id = None;
         }
         let resume_tool = self
             .resolved_agent()
@@ -1499,6 +1572,57 @@ pi = "~/.pi-personal"
             host_inst.pi_host_view_of("/home/u/.pi/x.jsonl"),
             Some(std::path::PathBuf::from("/home/u/.pi/x.jsonl"))
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pi_launch_drops_the_failing_session_selector_when_the_transcript_is_gone() {
+        // `--session <sid>` exits 1 on an id that resolves to nothing, which
+        // kills the pane and costs the row its conversation on the retry. Pi
+        // writes a transcript lazily, so a conversation that was never
+        // prompted has none. The launch must start fresh and keep the id.
+        let (_hooks, _base, _hooks_tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+
+        // A profile `PATH` assignment means AoE cannot vouch for which `pi`
+        // the pane runs, so the launch takes the `--session` arm rather than
+        // the `--session-id` arm that would create the conversation.
+        let profile = "pi-missing-transcript";
+        let profile_dir = crate::session::get_profile_dir(profile).unwrap();
+        std::fs::write(
+            profile_dir.join("config.toml"),
+            "environment = [\"PATH=/usr/bin\"]\n",
+        )
+        .unwrap();
+
+        let id = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+        let transcript = temp
+            .path()
+            .join(format!("2026-01-01T00-00-00-000Z_{id}.jsonl"));
+
+        let mut inst = Instance::new("pi-gone", "/tmp/pi-gone");
+        inst.tool = "pi".to_string();
+        inst.command = "pi".to_string();
+        inst.source_profile = profile.to_string();
+        inst.agent_session_id = Some(id.to_string());
+        inst.pi_session_path = Some(transcript.to_string_lossy().into_owned());
+
+        let mut cmd = "pi".to_string();
+        let resumed = inst.apply_session_flags(&mut cmd, "test").unwrap();
+        assert_eq!(cmd, "pi", "no selector may be handed to a doomed resume");
+        assert!(!resumed, "nothing was resumed");
+        assert_eq!(
+            inst.agent_session_id.as_deref(),
+            Some(id),
+            "the id stays on the row for a later launch that can pin it"
+        );
+
+        // The same row resumes by path once the transcript is there.
+        std::fs::write(&transcript, "{}\n").unwrap();
+        let mut cmd = "pi".to_string();
+        assert!(inst.apply_session_flags(&mut cmd, "test").unwrap());
+        assert_eq!(cmd, format!("pi --session '{}'", transcript.display()));
     }
 
     #[test]
