@@ -941,12 +941,10 @@ fn run_pass(
             if gated_roots.insert(root.clone()) {
                 copy_gate(root);
             }
-            // Reaped before the move, where a copied store was reaped after
-            // it. A copy left the source in place, so a container that came
-            // up since the probe kept a store to write to; a rename does not,
-            // and nothing later can put it back. Removing without force fails
-            // on a live container, which is what keeps this from moving a
-            // store out from under one.
+            // Reaped before the move, not after: a rename leaves no source
+            // behind for a container that came up since the probe, and
+            // nothing later can put one back. Removing without force fails on
+            // a live container, which is what stops the move.
             if !reap(&id)? {
                 blocked_roots.insert(root.clone());
                 orphan_blocked_roots.insert(root.clone());
@@ -1613,10 +1611,9 @@ fn publish_store(
         // is the credentials, config and state files that home kept at its
         // root. Its directories are the shared home's own accumulation:
         // conversation history belonging to other sessions, caches, logs and
-        // plugin trees. Replicating those per session is what turned a 17 MB
-        // legacy store into a 252 MB private one, and none of it is the
-        // single-instance lock this migration exists to unshare (#3819). What
-        // is not folded in is not deleted either: `retire_legacy_children`
+        // plugin trees, none of them the single-instance lock this migration
+        // exists to unshare, and each replicated once per session (#3819).
+        // What is not folded in is not deleted either: `retire_legacy_children`
         // leaves the shared root holding it.
         copy_tree_no_links(
             overlay,
@@ -1718,11 +1715,15 @@ fn relocate_store(source: &Path, destination: &Path) -> Result<()> {
         .parent()
         .context("private store has no parent")?;
     let publication = Publication::prepare(destination)?;
+    let mut quarantined = false;
     match fs::symlink_metadata(destination) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             bail!("v027 destination is a symlink: {}", destination.display())
         }
-        Ok(_) => fs::rename(destination, &publication.quarantine)?,
+        Ok(_) => {
+            fs::rename(destination, &publication.quarantine)?;
+            quarantined = true;
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
             return Err(error).with_context(|| format!("inspecting {}", destination.display()))
@@ -1733,6 +1734,12 @@ fn relocate_store(source: &Path, destination: &Path) -> Result<()> {
             "v027 copying {} instead of moving it: {error}",
             source.display()
         );
+        // The copy stages before it publishes, so put the destination back
+        // first: falling back with it still quarantined would leave nothing
+        // published for the length of the copy.
+        if quarantined {
+            fs::rename(&publication.quarantine, destination)?;
+        }
         return publish_store(source, destination, &BTreeSet::new(), None, false);
     }
     fs::File::open(parent)?.sync_all()?;
@@ -2047,7 +2054,9 @@ fn sync_tree(path: &Path) -> Result<()> {
 /// other sessions' conversation history, caches, logs and plugin trees. This
 /// root is now the only copy of them, so deleting them to reclaim space would
 /// destroy state that belongs to no single session. Returns the root when
-/// anything was kept, so the caller can say where it is.
+/// this pass both kept something and removed something, which is what the
+/// caller says out loud; a later pass over a root it already stripped has
+/// nothing to report.
 ///
 /// Stores go before files, and everything is renamed aside before it is
 /// removed. This runs before the generation commit, so an interrupted
@@ -2063,20 +2072,33 @@ fn retire_legacy_children(
 ) -> Result<Option<PathBuf>> {
     let quarantine = root.join(".v027-retired.v027-quarantine");
     remove_tree_no_links(&quarantine)?;
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        // A root an earlier pass already emptied and removed. Every later row
+        // under it plans against it and arrives here, so treating its absence
+        // as a failure would fail `aoe migrate`, and every command that runs
+        // migrations, from then on. [`retire_legacy`] is the no-op that also
+        // clears what a killed pass left beside it.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            retire_legacy(root)?;
+            return Ok(None);
+        }
+        Err(error) => return Err(error).with_context(|| format!("reading {}", root.display())),
+    };
     let mut kept = false;
     let mut stores = Vec::new();
     let mut files = Vec::new();
-    for entry in fs::read_dir(root)? {
+    for entry in entries {
         let name = entry?.file_name();
-        let metadata = fs::symlink_metadata(root.join(&name))?;
         if replicated.contains(name.as_os_str()) {
             stores.push(name);
-        } else if metadata.is_file() && !metadata.file_type().is_symlink() {
+        } else if fs::symlink_metadata(root.join(&name))?.is_file() {
             files.push(name);
         } else {
             kept = true;
         }
     }
+    let removed = !stores.is_empty() || !files.is_empty();
     fs::create_dir(&quarantine)?;
     for name in stores {
         fs::rename(root.join(&name), quarantine.join(&name))?;
@@ -2095,7 +2117,7 @@ fn retire_legacy_children(
         retire_legacy(root)?;
         return Ok(None);
     }
-    Ok(Some(root.to_path_buf()))
+    Ok(removed.then(|| root.to_path_buf()))
 }
 
 fn retire_legacy(source: &Path) -> Result<()> {
@@ -3652,6 +3674,47 @@ gemini = "{}"
             "a symlink the overlay refused to carry has no other copy"
         );
         assert!(!root.join(".v027-retired.v027-quarantine").exists());
+    }
+
+    /// Retiring a fully replicated root deletes it, so every later row that
+    /// plans against it meets a root that is not there: a restored session, a
+    /// second profile, a generation reset. That row must publish and commit.
+    /// Failing instead would fail `aoe migrate`, and every command that runs
+    /// migrations, from then on, with nothing able to clear it.
+    #[test]
+    #[serial_test::serial]
+    fn a_retired_root_does_not_fail_the_next_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        let home = dirs::home_dir().unwrap();
+        fs::create_dir_all(&app).unwrap();
+        let root = home.join(".codex/sandbox");
+        fs::create_dir_all(root.join("codex-one")).unwrap();
+        fs::write(root.join("codex-one").join("own"), b"own").unwrap();
+        fs::write(root.join("auth.json"), b"secret").unwrap();
+        fs::write(
+            app.join("sessions.json"),
+            r#"[{"id":"codex-one","tool":"codex","sandbox_info":{"enabled":true}}]"#,
+        )
+        .unwrap();
+
+        run_in(&app, &home, &|_| Ok(false)).unwrap();
+        assert!(!root.exists(), "nothing was left unreplicated, so it goes");
+
+        fs::write(
+            app.join("sessions.json"),
+            r#"[{"id":"codex-one","tool":"codex","sandbox_info":{"enabled":true},"sandbox_store_generation":2},
+                {"id":"codex-two","tool":"codex","sandbox_info":{"enabled":true}}]"#,
+        )
+        .unwrap();
+
+        run_in(&app, &home, &|_| Ok(false)).unwrap();
+
+        let rows: Value =
+            serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
+        assert_eq!(rows[1]["sandbox_store_generation"], 2);
+        assert!(home.join(".codex/sandbox-v2/codex-two").is_dir());
     }
 
     /// Retirement runs before the generation commit, so a pass killed partway
