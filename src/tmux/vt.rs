@@ -2312,9 +2312,10 @@ pub(crate) struct ResizeInFlight<'a> {
 
 impl ResizeInFlight<'_> {
     /// The resize never ran (this caller turned out not to own the pane size):
-    /// withdraw its expectation, unless a newer one has replaced it. Marks
-    /// rather than acts, so closing the window and withdrawing the declaration
-    /// are the one locked step below.
+    /// withdraw its expectation, unless a newer declaration has replaced it or
+    /// another resize is still in flight behind it (see [`ResizeState::finish`]
+    /// for why both). Marks rather than acts, so closing the window and
+    /// withdrawing the declaration are the one locked step below.
     pub(crate) fn abandon(mut self) {
         self.withdrawn = true;
     }
