@@ -1858,8 +1858,17 @@ pub(crate) struct LinkTable {
 /// Hyperlinks `session`'s pane has advertised via OSC 8, oldest first. Empty
 /// when no channel is armed; the capture fallback carries the sequences in the
 /// frame text instead, so the TUI reads those straight off the content.
+///
+/// Only a live channel answers. A retired or failed one no longer describes
+/// what is on screen: its table froze at teardown while the pane kept moving,
+/// and the consumer unions this ahead of the links it reads out of the frame
+/// (`Preview::collect_links`). A label the pane has since repointed would
+/// still resolve through the stale entry, because the dedupe key is
+/// (text, uri) and the two do not collide. Falling silent hands the capture
+/// fallback the same clean slate it gets when no channel ever armed.
 pub(crate) fn pane_links(session: &str) -> Vec<PaneLink> {
     lookup(session)
+        .filter(|c| c.lifecycle() == VtLifecycle::Live)
         .and_then(|c| {
             c.links
                 .table
@@ -1872,8 +1881,15 @@ pub(crate) fn pane_links(session: &str) -> Vec<PaneLink> {
 
 /// How many times `session`'s link table has changed. Cheaper than cloning the
 /// table to find out, so a consumer can watch it every frame.
+///
+/// Gated with [`pane_links`], so retirement drops it back to the no-channel
+/// zero. That change is itself the signal: a consumer holding a non-zero copy
+/// re-collects once at the transition, and from there the capture path's own
+/// sequences move the frame text whenever a target changes.
 pub(crate) fn pane_links_generation(session: &str) -> u64 {
-    lookup(session).map_or(0, |c| c.links.generation.load(Ordering::Acquire))
+    lookup(session)
+        .filter(|c| c.lifecycle() == VtLifecycle::Live)
+        .map_or(0, |c| c.links.generation.load(Ordering::Acquire))
 }
 
 impl ReaderCtx {
@@ -3879,6 +3895,50 @@ mod tests {
             !ARM_LOCKS.lock().unwrap().contains_key(&name),
             "a retired channel must not enter the arm path",
         );
+
+        REGISTRY.lock().unwrap().remove(&name);
+    }
+
+    /// A channel that stops describing the screen must stop answering for it.
+    /// Its table froze at teardown while the pane kept moving, and
+    /// `Preview::collect_links` unions this ahead of the links it reads out of
+    /// the frame, so a stale entry would win the row-text match for a label the
+    /// pane has since repointed. Retired and failed both fall silent; the
+    /// generation drops to the no-channel zero, which is the re-collect signal.
+    #[test]
+    fn only_a_live_channel_answers_for_pane_links() {
+        let name = format!("aoe_test_vt_links_{}", std::process::id());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (channel, lifecycle) = dummy_channel(&name, dir.path());
+        record_links(
+            &channel.links,
+            vec![PaneLink {
+                text: "docs".to_string(),
+                uri: "https://example.com/old".to_string(),
+            }],
+        );
+        REGISTRY
+            .lock()
+            .unwrap()
+            .insert(name.clone(), Arc::downgrade(&channel));
+
+        VtLifecycle::Live.store(&lifecycle);
+        assert_eq!(pane_links(&name).len(), 1, "a live channel still answers");
+        let live_generation = pane_links_generation(&name);
+        assert_ne!(live_generation, 0, "a recorded link moved the generation");
+
+        for gone in [VtLifecycle::Retired, VtLifecycle::Failed] {
+            gone.store(&lifecycle);
+            assert!(
+                pane_links(&name).is_empty(),
+                "{gone:?} must not serve the table it froze at teardown",
+            );
+            assert_eq!(
+                pane_links_generation(&name),
+                0,
+                "{gone:?} must drop to the no-channel zero so consumers re-collect",
+            );
+        }
 
         REGISTRY.lock().unwrap().remove(&name);
     }
