@@ -74,6 +74,7 @@ function props(keyboardOpen: boolean, sendResize = vi.fn()) {
     enterReading: vi.fn(),
     returnToLive: vi.fn(),
     sendData: vi.fn(),
+    typedWordRef: { current: "" },
     uploadPastedImage: vi.fn(),
     forwardWheel: vi.fn(),
     forwardButton: vi.fn(),

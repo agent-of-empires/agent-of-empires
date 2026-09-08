@@ -149,6 +149,27 @@
       "components": ["web/src/hooks/useLiveTerminal.ts", "web/src/components/MobileLiveTerminal.tsx"]
     },
     {
+      "id": "terminal.live-grid-transport",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/live-grid-transport.spec.ts"],
+      "components": ["web/src/components/MobileLiveTerminal.tsx", "web/src/hooks/useLiveTerminal.ts"]
+    },
+    {
+      "id": "terminal.live-row-patches",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/hooks/useLiveTerminal.patch.test.ts"],
+      "components": ["web/src/hooks/useLiveTerminal.ts"]
+    },
+    {
+      "id": "terminal.live-alt-screen-scroll",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/components/__tests__/MobileLiveTerminal.altScreen.test.tsx"],
+      "components": ["web/src/components/MobileLiveTerminal.tsx"]
+    },
+    {
       "id": "terminal.live-line-wrap-units",
       "kind": "vitest",
       "risk": "high",
@@ -201,6 +222,13 @@
         "web/src/hooks/useLiveTerminal.ts",
         "web/src/components/MobileLiveTerminal.tsx"
       ]
+    },
+    {
+      "id": "terminal.mobile-ime-word-commit",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/MobileLiveTerminal.composition.test.tsx"],
+      "components": ["web/src/components/MobileLiveTerminal.tsx"]
     },
     {
       "id": "terminal.mobile-live-scrollback",
@@ -816,7 +844,9 @@
         "web/src/components/session-wizard/steps/Toggle.tsx",
         "web/src/components/session-wizard/steps/ExtraReposPicker.tsx",
         "web/src/components/session-wizard/steps/ProjectStep.tsx",
-        "web/src/components/session-wizard/steps/SessionStep.tsx"
+        "web/src/components/session-wizard/steps/SessionStep.tsx",
+        "web/src/components/session-wizard/steps/projectPicker.ts",
+        "web/src/components/session-wizard/steps/ProjectSearchList.tsx"
       ]
     },
     {
@@ -2896,6 +2926,13 @@
       "components": ["web/src/components/settings/SchemaSection.tsx"]
     },
     {
+      "id": "story.settings-session-id-poller-threads",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/settings/__tests__/SchemaFieldPatches.test.tsx"],
+      "components": ["web/src/components/settings/SchemaSection.tsx", "web/src/components/settings/FormFields.tsx"]
+    },
+    {
       "id": "story.modal-about-copy-session-id",
       "kind": "vitest",
       "risk": "low",
@@ -2914,6 +2951,13 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/acp-stories/approval-allow.spec.ts"],
+      "components": ["web/src/components/acp/ApprovalCard.tsx"]
+    },
+    {
+      "id": "acp.story.approval-question",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-stories/approval-question.spec.ts"],
       "components": ["web/src/components/acp/ApprovalCard.tsx"]
     },
     {
@@ -2949,7 +2993,9 @@
       "components": [
         "web/src/components/session-wizard/steps/ExtraReposPicker.tsx",
         "web/src/components/session-wizard/steps/ProjectStep.tsx",
-        "web/src/components/session-wizard/SessionWizard.tsx"
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/steps/projectPicker.ts",
+        "web/src/components/session-wizard/steps/ProjectSearchList.tsx"
       ]
     },
     {
@@ -3263,7 +3309,11 @@
       "kind": "mocked-playwright",
       "risk": "medium",
       "specs": ["tests/wizard-extra-repos.spec.ts"],
-      "components": ["web/src/components/session-wizard/steps/ExtraReposPicker.tsx"]
+      "components": [
+        "web/src/components/session-wizard/steps/ExtraReposPicker.tsx",
+        "web/src/components/session-wizard/steps/projectPicker.ts",
+        "web/src/components/session-wizard/steps/ProjectSearchList.tsx"
+      ]
     },
     {
       "id": "story.wizard-creating-banner",

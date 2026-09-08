@@ -194,6 +194,7 @@ impl HomeView {
             row_tag_mode: resolved.session.row_tag,
             agent_clipboard_forward: resolved.tmux.clipboard
                 != crate::session::config::TmuxSettingMode::Disabled,
+            hyperlink_cells: crate::tui::hyperlink::SharedHyperlinks::default(),
             vt_live_enabled: resolved.tmux.vt_live,
             profile_default_attach_mode: resolved.session.default_attach_mode,
             project_group_collapsed: user_config
@@ -274,6 +275,8 @@ impl HomeView {
             live_send_last_resize: None,
             live_send_resize_retry_at: None,
             live_send_pending_leader: false,
+            hover_cell: None,
+            status_flash: None,
             live_send_ctrl_c_flash_until: None,
             sidebar_collapsed: user_config
                 .as_ref()
@@ -334,6 +337,9 @@ impl HomeView {
             reconcile_reload_retry_at: None,
             restart_poller: RestartPoller::new(),
             restart_in_flight: std::collections::HashSet::new(),
+            store_move_poller: crate::tui::store_move_poller::StoreMovePoller::new(),
+            store_move_in_flight: None,
+            store_move_bypass: None,
             attach_project_poller: crate::tui::attach_project_poller::AttachProjectPoller::new(),
             attach_project_in_flight: std::collections::HashSet::new(),
             creation_poller: CreationPoller::new(),

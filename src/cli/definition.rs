@@ -49,7 +49,11 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
     Run without arguments to launch the TUI dashboard."
 )]
 pub struct Cli {
-    /// Profile to use (separate workspace with its own sessions)
+    /// Profile to use (separate workspace with its own sessions). Commands that
+    /// consume or create profile state require an existing profile: an unknown
+    /// name is refused, not created (make one with `aoe profile create`).
+    /// Profile-independent commands such as `list --all` and `serve --stop`
+    /// ignore it
     #[arg(short = 'p', long, global = true, env = "AGENT_OF_EMPIRES_PROFILE")]
     pub profile: Option<String>,
 
@@ -233,8 +237,11 @@ pub enum Commands {
     /// Update aoe to the latest release
     Update(UpdateArgs),
 
-    /// Run pending data migrations now, showing progress. Startup runs them
-    /// too; use this after deferring one with AOE_DEFER_SANDBOX_MIGRATION=1.
+    /// Run pending data migrations now, showing progress. A sandboxed session
+    /// moves its own agent store when it starts; use this to move every
+    /// eligible store at once instead. Trashed and archived sessions are
+    /// skipped; each moves when it is started, or restore or unarchive it
+    /// and run this again.
     Migrate,
 
     /// Generate shell completions
