@@ -32,6 +32,10 @@ export function pickWorkerStoppedVariant(args: {
   trashedAt: string | null;
   archivedAt: string | null;
   snoozedUntil: string | null;
+  /** The daemon is still proving the stopped runner dead (#3487); the
+   *  stopping banner explains why Reconnect is refused, so the generic
+   *  stopped banner yields to it. Triage variants keep their own copy. */
+  workerStopping?: boolean;
 }): WorkerStoppedVariant {
   if (!args.workerStopped) return "none";
   if (args.startupError) return "none";
@@ -40,5 +44,11 @@ export function pickWorkerStoppedVariant(args: {
   if (args.trashedAt) return "trashed";
   if (args.archivedAt) return "archived";
   if (args.snoozedUntil) return "snoozed";
-  return "generic";
+  return args.workerStopping ? "none" : "generic";
+}
+
+/** Whether the "worker stopping" banner renders: the daemon holds the
+ *  session in `stopping` and no startup error owns the chrome (#3487). */
+export function showWorkerStoppingBanner(args: { acpWorkerState: string; startupError: string | null }): boolean {
+  return args.acpWorkerState === "stopping" && !args.startupError;
 }

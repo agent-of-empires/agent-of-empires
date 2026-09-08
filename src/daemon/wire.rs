@@ -103,6 +103,9 @@ pub enum AcpWorkerState {
     Resuming,
     /// Worker is online and reachable.
     Running,
+    /// A stop is in progress and the runner is not yet proven dead. The
+    /// session refuses prompts and resumes until it settles.
+    Stopping,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -309,6 +312,17 @@ pub struct SessionResponse {
     /// sidebar `Resuming…` chip and the per-session banner in the
     /// structured view. See #1088.
     pub acp_worker_state: AcpWorkerState,
+    /// The provider rate limit this session is parked on, read from the
+    /// daemon's durable park rather than a browser-side mirror, so the
+    /// sidebar badge clears when a resume lands with no tab open (#3514).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<crate::acp::state::RateLimitInfo>,
+    /// Whether `[acp] rate_limit_auto_resume` is on for this session's
+    /// profile, so the rate-limit banner can say whether the park ends by
+    /// itself. Set by the list handler; omitted by single-session responses,
+    /// whose readers keep the value they last saw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_auto_resume: Option<bool>,
     /// True when this session's agent can run in structured view: a built-in
     /// with an ACP adapter, or a custom agent whose profile config
     /// declares a valid `agent_acp_cmd`. The web terminal view reads

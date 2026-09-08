@@ -470,6 +470,61 @@ impl SessionService {
         }
     }
 
+    /// Record that a prompt is arriving: bump `last_accessed_at` and clear
+    /// any archive, snooze or idle-dormant park, in memory and on disk,
+    /// under the instance lock so it serializes with other lifecycle edits.
+    /// Returns whether the session was idle-dormant, which callers pass to
+    /// `begin_prompt_submission` and `send_turn` so the wake forces a
+    /// resume. Shared by the user prompt handlers and the plugin turn path
+    /// (#3686).
+    pub(crate) async fn touch_and_wake_on_prompt(&self, id: &str) -> bool {
+        let inst_lock = self.instance_lock(id).await;
+        let _guard = inst_lock.lock().await;
+        let (profile, wake, woke_idle_dormant) = {
+            let mut instances = self.instances.write().await;
+            let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+                return false;
+            };
+            let was_idle_dormant = inst.is_idle_dormant();
+            let wake = inst.is_archived() || inst.is_snoozed() || was_idle_dormant;
+            inst.touch_last_accessed();
+            if was_idle_dormant {
+                tracing::info!(
+                    target: "acp.supervisor",
+                    session = %id,
+                    "waking idle-dormant structured view session on prompt; spawning a fresh worker"
+                );
+            }
+            (inst.source_profile.clone(), wake, was_idle_dormant)
+        };
+        if let Ok(storage) = crate::session::Storage::new(&profile, self.file_watch.clone()) {
+            let id_clone = id.to_string();
+            let outcome = tokio::task::spawn_blocking(move || {
+                storage.update(|instances, _groups| {
+                    if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
+                        apply_prompt_persist_to_disk(inst, wake);
+                    }
+                    Ok(())
+                })
+            })
+            .await;
+            match outcome {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!(
+                    target: "server.session_service",
+                    session = %id,
+                    "failed to save after prompt touch and wake: {e}"
+                ),
+                Err(join_err) => tracing::warn!(
+                    target: "server.session_service",
+                    session = %id,
+                    "spawn_blocking join error during prompt touch save: {join_err}"
+                ),
+            }
+        }
+        woke_idle_dormant
+    }
+
     /// Deliver a turn to a structured session: resume a dead/dormant worker
     /// if needed, publish the prompt into the event stream, then forward it
     /// to the agent. Extracted from the `acp_prompt` HTTP handler so a
@@ -1402,7 +1457,7 @@ impl SessionService {
     ///    never overlap; where both are genuinely needed, take this one first.
     ///
     /// One input escapes the hold: `acp_prompt` samples `woke_idle_dormant`
-    /// from `touch_on_prompt_and_wake_if_sunk` before claiming the guard,
+    /// from `touch_and_wake_on_prompt` before claiming the guard,
     /// because that helper takes `instance_lock`. A stale `true` only forces
     /// `send_turn`'s resume trigger, which answers `AlreadyResuming` or
     /// `AlreadyRunning` for a worker that is already there, so it costs a
@@ -1464,7 +1519,7 @@ impl SessionService {
     /// immutable ownership gate: a plugin may act only on a session it
     /// created. Decided before any live state is folded, so a foreign session
     /// answers `not_owner` whatever it is currently doing (#3685).
-    async fn admits_turn(
+    pub(crate) async fn admits_turn(
         &self,
         caller: &SessionCaller,
         id: &str,
@@ -1531,19 +1586,15 @@ impl SessionService {
         Ok((guard, dispatch))
     }
 
-    /// Whether the session's newest lifecycle event is the redelivery-cap
-    /// park (#3688). Off the runtime: `latest_status_event` takes the store's
-    /// lock and scans back to the first lifecycle row.
+    /// Whether the session is parked on the redelivery cap (#3688). Off the
+    /// runtime: `rate_limit_park` takes the store's lock.
     async fn is_rate_limit_exhausted_park(&self, id: &str) -> bool {
         let store = Arc::clone(&self.acp_event_store);
         let id = id.to_string();
         tokio::task::spawn_blocking(move || {
-            matches!(
-                store.latest_status_event(&id),
-                Some(crate::acp::Event::Stopped { reason })
-                    if reason
-                        == crate::server::acp_reconciler::RATE_LIMIT_EXHAUSTED_RETRIES_REASON
-            )
+            store
+                .rate_limit_park(&id)
+                .is_some_and(|park| park.cap_reached)
         })
         .await
         .unwrap_or(false)
@@ -1725,6 +1776,28 @@ fn spec_payload_hash(spec: &StructuredSessionSpec) -> String {
         let _ = write!(out, "{byte:02x}");
     }
     out
+}
+
+/// Disk-side half of [`SessionService::touch_and_wake_on_prompt`], mirroring onto disk
+/// whatever the memory side actually did. A waking prompt keeps touch semantics
+/// and lifts the sink; any other prompt advances recency monotonically and
+/// leaves sink state alone.
+///
+/// What the second tier buys, precisely: `wake` is computed from
+/// `state.instances`, so a daemon whose memory predates a peer's archive would
+/// otherwise clear a sink it has never observed. Tier 2 stops that, and only
+/// that.
+///
+/// Advancing `last_accessed_at` on disk is the signal `merge_user_action_diff`
+/// (`session/instance/merge.rs`) keys on to clear a park, which is right for a
+/// real user gesture (#3465 was about a passive stamp reaching that arm).
+pub(crate) fn apply_prompt_persist_to_disk(disk: &mut crate::session::Instance, wake: bool) {
+    if wake {
+        disk.touch_last_accessed();
+    } else {
+        let now = chrono::Utc::now();
+        disk.last_accessed_at = disk.last_accessed_at.max(Some(now));
+    }
 }
 
 #[cfg(test)]

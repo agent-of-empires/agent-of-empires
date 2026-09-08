@@ -47,6 +47,7 @@ async fn shim_agent_round_trips_prompt() {
         stored_acp_session_id: None,
         fork_from: None,
         seed_history_replay: false,
+        generation: 0,
         artifact_dir: None,
         sandbox_info: None,
         source_profile: None,
@@ -176,6 +177,7 @@ async fn shim_agent_round_trips_approval_allow() {
         stored_acp_session_id: None,
         fork_from: None,
         seed_history_replay: false,
+        generation: 0,
         artifact_dir: None,
         sandbox_info: None,
         source_profile: None,
@@ -262,6 +264,7 @@ async fn shim_agent_round_trips_a_question_option_list() {
     let shim = shim_path();
 
     let config = SpawnConfig {
+        generation: 0,
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
@@ -363,6 +366,7 @@ async fn shim_agent_sees_a_dismissed_question_as_cancelled() {
     let shim = shim_path();
 
     let config = SpawnConfig {
+        generation: 0,
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
@@ -461,6 +465,7 @@ async fn shim_agent_round_trips_fs() {
         stored_acp_session_id: None,
         fork_from: None,
         seed_history_replay: false,
+        generation: 0,
         artifact_dir: None,
         sandbox_info: None,
         source_profile: None,
@@ -540,6 +545,7 @@ async fn shim_agent_round_trips_terminal() {
         stored_acp_session_id: None,
         fork_from: None,
         seed_history_replay: false,
+        generation: 0,
         artifact_dir: None,
         sandbox_info: None,
         source_profile: None,
@@ -631,6 +637,7 @@ async fn shim_agent_set_mode_emits_current_mode_changed() {
         stored_acp_session_id: None,
         fork_from: None,
         seed_history_replay: false,
+        generation: 0,
         artifact_dir: None,
         sandbox_info: None,
         source_profile: None,
@@ -706,6 +713,7 @@ async fn shim_agent_emits_rate_limit_event() {
         stored_acp_session_id: None,
         fork_from: None,
         seed_history_replay: false,
+        generation: 0,
         artifact_dir: None,
         sandbox_info: None,
         source_profile: None,

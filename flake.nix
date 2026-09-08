@@ -36,10 +36,11 @@
             # assets/pi, the extension src/session/instance.rs materializes so
             # pi can publish its own conversation id, and
             # docker/Dockerfile, which the agent_compat test embeds to pin the
-            # sandbox npm floor, and acp-worker/aoe-agent/package.json, which
-            # the acp::node test embeds to pin `engines.node` to
-            # MIN_NODE_MAJOR (the aoe-test and aoe-clippy checks compile test
-            # code, so they need these even though the packages do not).
+            # sandbox npm floor, and acp-worker/aoe-agent (manifest, lock and
+            # sources), which src/acp/adapters.rs embeds to install the
+            # in-tree agent and the acp::node test reads to pin `engines.node`
+            # to the Node floor (the aoe-test and aoe-clippy checks compile
+            # test code, so they need these even though the packages do not).
             # `scripts/check-nix-embedded-assets.py` fails CI if a new embedded
             # asset lands without being added here.
             src = pkgs.lib.fileset.toSource {
@@ -48,6 +49,8 @@
                 (craneLib.fileset.commonCargoSources ./.)
                 ./acp-worker/adapters
                 ./acp-worker/aoe-agent/package.json
+                ./acp-worker/aoe-agent/package-lock.json
+                ./acp-worker/aoe-agent/src
                 ./assets
                 ./docker
               ];
