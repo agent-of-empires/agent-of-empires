@@ -821,18 +821,26 @@ fn sync_shared_credential(
 /// file over. Runs once the container exists: one built before the file was
 /// shared reads that copy instead, and is recreated rather than stripped.
 pub(crate) fn remove_shadowed_credential_copies(config: &ContainerConfig) {
+    let volume_at = |target: &Path| {
+        config
+            .volumes
+            .iter()
+            .find(|volume| Path::new(&volume.container_path) == target)
+    };
     for container_path in &config.shared_credential_mounts {
         let path = Path::new(container_path);
         let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
             continue;
         };
-        let Some(store) = config
-            .volumes
-            .iter()
-            .find(|volume| Path::new(&volume.container_path) == dir)
-        else {
+        let (Some(shared), Some(store)) = (volume_at(path), volume_at(dir)) else {
             continue;
         };
+        // Only a store beside the shared file holds a shadowed copy. A user
+        // extra_volumes entry at the config path replaces the store mount, and
+        // the credential under it is the user's own login.
+        if Path::new(&store.host_path).parent() != Path::new(&shared.host_path).parent() {
+            continue;
+        }
         let copy = Path::new(&store.host_path).join(name);
         match std::fs::remove_file(&copy) {
             Ok(()) => {}
@@ -4385,6 +4393,41 @@ mod tests {
             crate::hooks::cleanup_hook_status_dir(instance_id);
         }
         assert_eq!(fs::read_to_string(&shared).unwrap(), cred);
+    }
+
+    #[test]
+    fn shadowed_credential_copy_is_removed_only_from_a_store() {
+        let home = TempDir::new().unwrap();
+        let host = home.path().join(".claude");
+        let root = host.join(SANDBOX_PRIVATE_SUBDIR);
+        let store = root.join("aaaaaaaaaaaaaaaa");
+        let shared = root.join(".credentials.json");
+        fs::create_dir_all(&store).unwrap();
+        fs::write(&shared, "{}").unwrap();
+        let config_for = |dir: &Path| ContainerConfig {
+            shared_credential_mounts: vec!["/root/.claude/.credentials.json".to_string()],
+            volumes: vec![
+                VolumeMount {
+                    host_path: shared.to_string_lossy().to_string(),
+                    container_path: "/root/.claude/.credentials.json".to_string(),
+                    read_only: false,
+                },
+                VolumeMount {
+                    host_path: dir.to_string_lossy().to_string(),
+                    container_path: "/root/.claude".to_string(),
+                    read_only: false,
+                },
+            ],
+            ..Default::default()
+        };
+        // A user extra_volumes entry at the config path replaces the store
+        // mount; its host copy is the user's own login, not a shadowed one.
+        for (dir, removed) in [(&store, true), (&host, false)] {
+            let copy = dir.join(".credentials.json");
+            fs::write(&copy, "token").unwrap();
+            remove_shadowed_credential_copies(&config_for(dir));
+            assert_eq!(!copy.exists(), removed, "{}", dir.display());
+        }
     }
 
     /// End-to-end test: repo-level sandbox config (environment, volume_ignores,

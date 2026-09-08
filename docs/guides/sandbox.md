@@ -359,7 +359,10 @@ than what the file holds. Logging in on the host and starting or restarting
 one sandboxed session re-authenticates all of them; a login made inside a
 container is never overwritten by a staler host copy. A container created
 before this layout mounts only its store, so it is recreated at its next
-start, as it was for the store move.
+start, as it was for the store move; restart any that is still running to put
+it on the shared file too. Running `/logout` inside a sandbox revokes the token
+for every sandbox but cannot remove the mounted file, so the revoked token
+stays there until the next login.
 
 ### Reclaiming stores
 
@@ -382,7 +385,9 @@ while a store move is in flight.
 
 A session still on the shared legacy store has no private store of its own, so
 deleting it removes its container but leaves that shared store to the
-migration.
+migration. The Claude Code credential file at `sandbox-v2/.credentials.json`
+belongs to no session and is not reclaimed; remove it yourself once the last
+Claude Code sandbox is gone.
 
 ## Worktrees and Sandboxing
 
