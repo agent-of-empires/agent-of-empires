@@ -27,6 +27,7 @@ pub mod poller;
 pub mod projects;
 pub(crate) mod recovery;
 pub mod restart;
+pub mod sandbox_store_reclaim;
 pub mod scope;
 pub mod scratch;
 pub(crate) mod serde_helpers;
@@ -79,8 +80,9 @@ pub(crate) use instance::{
 pub use instance::{
     is_valid_session_color, DetectionState, EnsureReadyError, EnsureReadyOutcome, Instance,
     LaunchSidOutcome, LifecycleOperation, LifecycleReservation, LifecycleReservationError,
-    PluginCreateIdempotency, SandboxInfo, SessionBucket, StartOutcome, Status, TerminalInfo, View,
-    WorkspaceInfo, WorkspaceRepo, WorktreeInfo, SESSION_COLORS, TMUX_SESSION_GONE_ERROR,
+    PluginCreateIdempotency, PollerStart, SandboxInfo, SessionBucket, StartOutcome, Status,
+    TerminalInfo, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo, SESSION_COLORS,
+    TMUX_SESSION_GONE_ERROR,
 };
 #[cfg(test)]
 pub(crate) use move_journal::{
@@ -322,6 +324,35 @@ pub fn debug_namespace_drift() -> Option<(PathBuf, PathBuf)> {
     }
 }
 
+/// The app dir of the *other* build namespace: the release dir from a debug
+/// build, the dev dir from a release build.
+///
+/// Debug and release builds keep separate app dirs but share `$HOME`, and so
+/// share the agent store roots under it. Anything that decides whether a store
+/// is owned has to read both registries or it will call the other build's
+/// sessions orphans. `None` when the paths cannot be resolved.
+pub(crate) fn sibling_namespace_app_dir() -> Option<PathBuf> {
+    let (xdg, other) = if cfg!(debug_assertions) {
+        ("agent-of-empires", ".agent-of-empires")
+    } else {
+        ("agent-of-empires-dev", ".agent-of-empires-dev")
+    };
+    #[cfg(target_os = "linux")]
+    {
+        let _ = other;
+        xdg_config_base().ok().map(|base| base.join(xdg))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_app_dir(xdg, other)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = xdg;
+        dirs::home_dir().map(|home| home.join(other))
+    }
+}
+
 /// Format the user-facing warning shown when `debug_namespace_drift()`
 /// fires. Shared between the CLI stderr print and the TUI startup popup so
 /// both surfaces say exactly the same thing.
@@ -354,6 +385,10 @@ pub fn get_profile_dir(profile: &str) -> Result<PathBuf> {
     };
     let dir = base.join("profiles").join(profile_name);
     if !dir.exists() {
+        // Only a name about to be created runs the strict grammar; an
+        // existing directory still opens, so older malformed profiles stay
+        // listable and deletable.
+        validate_new_profile_name(profile_name)?;
         fs::create_dir_all(&dir)?;
     }
     Ok(dir)
@@ -428,6 +463,51 @@ pub fn list_profiles() -> Result<Vec<String>> {
     list_profile_names_in(&profiles_dir)
 }
 
+/// Picker order: alphabetical, with a profile named `default` last.
+///
+/// Presentation only. [`list_profiles`] stays plainly sorted because
+/// [`config::resolve_default_profile`] takes its first entry when
+/// `config.default_profile` is unset.
+pub fn sort_profiles_for_display(profiles: &mut [String]) {
+    profiles.sort_by(|a, b| {
+        (a == "default")
+            .cmp(&(b == "default"))
+            .then_with(|| a.cmp(b))
+    });
+}
+
+/// [`list_profiles`] in picker order, for surfaces a human chooses from.
+/// Programmatic resolution keeps [`list_profiles`].
+pub fn list_profiles_for_display() -> Result<Vec<String>> {
+    let mut profiles = list_profiles()?;
+    sort_profiles_for_display(&mut profiles);
+    Ok(profiles)
+}
+
+/// Refuse an explicit `-p`/`--profile` naming a profile that does not exist
+/// (#148), so a typo never reaches [`get_profile_dir`] and mints a stray
+/// directory. The daemon create-session endpoint enforces the same check.
+///
+/// Passes without a directory check: an empty `profile` (default resolution
+/// and bootstrap create downstream) and a first run with no profiles yet.
+pub fn require_known_profile(profile: &str) -> Result<()> {
+    if profile.is_empty() {
+        return Ok(());
+    }
+    let known = list_profiles()?;
+    if known.is_empty() || known.iter().any(|p| p == profile) {
+        return Ok(());
+    }
+    // Escaped: arbitrary input headed for stderr and the log.
+    let shown = profile.escape_debug();
+    anyhow::bail!(
+        "Profile '{shown}' does not exist. Create it explicitly with \
+         `aoe profile create {shown}`; a bare -p/--profile will not mint one \
+         (guards against stray profiles from typos or session titles). \
+         Run `aoe profile list` to see existing profiles."
+    );
+}
+
 #[cfg(test)]
 pub(crate) static FAIL_NEXT_LIST_PROFILES: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -475,6 +555,8 @@ fn list_profile_names_in(profiles_dir: &std::path::Path) -> Result<Vec<String>> 
             }
         }
     }
+    // Resolution input: `resolve_default_profile` takes the first entry, so
+    // this stays plain. Picker order lives in `sort_profiles_for_display`.
     profiles.sort();
     Ok(profiles)
 }
@@ -545,6 +627,54 @@ mod profile_listing_tests {
 
         let _ = fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn list_profile_names_keeps_default_in_plain_order() {
+        // Resolution input: "default" sorts like any other name here.
+        let dir = make_temp_profiles_dir();
+        for name in ["default", "alpha", "beta", "zeta"] {
+            fs::create_dir(dir.join(name)).unwrap();
+        }
+
+        let names = list_profile_names_in(&dir).expect("list");
+        assert_eq!(
+            names,
+            vec![
+                "alpha".to_string(),
+                "beta".to_string(),
+                "default".to_string(),
+                "zeta".to_string(),
+            ]
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sort_profiles_for_display_sinks_default_to_last() {
+        let mut names: Vec<String> = ["zeta", "default", "beta", "alpha"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        sort_profiles_for_display(&mut names);
+        assert_eq!(
+            names,
+            vec![
+                "alpha".to_string(),
+                "beta".to_string(),
+                "zeta".to_string(),
+                "default".to_string(),
+            ],
+            "default must sort last; all other profiles stay alphabetical"
+        );
+
+        let mut plain: Vec<String> = ["b", "a"].iter().map(|s| s.to_string()).collect();
+        sort_profiles_for_display(&mut plain);
+        assert_eq!(plain, vec!["a".to_string(), "b".to_string()]);
+        let mut lone = vec!["default".to_string()];
+        sort_profiles_for_display(&mut lone);
+        assert_eq!(lone, vec!["default".to_string()]);
+    }
 }
 
 /// Validate `AOE_INSTANCE_ID` is safe as a single path component and
@@ -600,8 +730,32 @@ fn validate_profile_name(name: &str) -> Result<()> {
     }
 }
 
-pub fn create_profile(name: &str) -> Result<()> {
+/// Grammar for a profile about to be created: `[A-Za-z0-9_-]`, at most 64
+/// characters, on top of the traversal guard in `validate_profile_name`.
+///
+/// It matches the daemon API's `validate_profile_name`, so a profile the CLI
+/// creates is one the web UI can delete, rename or configure. Deletion keeps
+/// the permissive guard so strays minted by older binaries stay removable.
+fn validate_new_profile_name(name: &str) -> Result<()> {
     validate_profile_name(name)?;
+    if name.len() > 64 {
+        anyhow::bail!("Profile name is too long ({} chars; max 64)", name.len());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+    {
+        // Escaped: arbitrary input headed for stderr and the log.
+        anyhow::bail!(
+            "Profile name '{}' has disallowed characters (allowed: A-Z a-z 0-9 _ -)",
+            name.escape_debug()
+        );
+    }
+    Ok(())
+}
+
+pub fn create_profile(name: &str) -> Result<()> {
+    validate_new_profile_name(name)?;
 
     let profiles = list_profiles()?;
     if profiles.contains(&name.to_string()) {
@@ -632,13 +786,12 @@ pub fn delete_profile(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// The source keeps the permissive traversal guard so a stray minted by an
+/// older binary stays renameable; the destination is a new profile and is
+/// held to the create grammar.
 pub fn rename_profile(old_name: &str, new_name: &str) -> Result<()> {
-    if new_name.is_empty() {
-        anyhow::bail!("New profile name cannot be empty");
-    }
-    if new_name.contains('/') || new_name.contains('\\') {
-        anyhow::bail!("Profile name cannot contain path separators");
-    }
+    validate_profile_name(old_name)?;
+    validate_new_profile_name(new_name)?;
 
     let base = get_app_dir()?;
     let old_dir = base.join("profiles").join(old_name);
@@ -1382,6 +1535,34 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn test_implicit_resolution_ignores_picker_order_on_mixed_registry() {
+        // Sinking "default" in the picker must not move the implicit profile:
+        // with `default` + `work` and no configured default, implicit commands
+        // land on `default`, the first entry in plain order.
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        fs::create_dir_all(dir.join("profiles").join("default")).unwrap();
+        fs::create_dir_all(dir.join("profiles").join("work")).unwrap();
+
+        assert_eq!(
+            list_profiles().unwrap(),
+            vec!["default".to_string(), "work".to_string()],
+            "list_profiles is the resolution input and stays plainly sorted"
+        );
+        assert_eq!(config::resolve_default_profile(), "default");
+        assert_eq!(
+            get_profile_dir("").unwrap(),
+            dir.join("profiles").join("default")
+        );
+        assert_eq!(
+            list_profiles_for_display().unwrap(),
+            vec!["work".to_string(), "default".to_string()],
+            "only the picker order sinks default"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn test_get_profile_dir_empty_resolves_without_default_literal() {
         // An empty profile argument resolves through resolve_default_profile,
         // landing on the first existing profile rather than a "default" name.
@@ -1469,6 +1650,208 @@ mod tests {
                 .err()
                 .unwrap_or_else(|| panic!("expected {bad:?} to be rejected"));
         }
+    }
+
+    #[test]
+    fn test_validate_new_profile_name_accepts_typical_names() {
+        for name in [
+            "default",
+            "work",
+            "personal-main",
+            "team_b",
+            "main",
+            "client-a",
+            "1",
+        ] {
+            validate_new_profile_name(name)
+                .unwrap_or_else(|e| panic!("expected {name:?} to pass create gate: {e}"));
+        }
+    }
+
+    #[test]
+    fn test_validate_new_profile_name_rejects_stray_shapes() {
+        // The stray shape (`<profile> <16hex> <title>`, space-joined) plus
+        // other junk must be rejected.
+        for bad in [
+            "work 0123456789abcdef Some Title",
+            "ZZTEST spaced name",
+            "has space",
+            "tab\tname",
+            "emoji\u{1f600}",
+            "all",
+            "..",
+            "a/b",
+            // Dots are outside the charset the daemon API enforces.
+            ".hidden",
+            "a.b",
+        ] {
+            validate_new_profile_name(bad)
+                .err()
+                .unwrap_or_else(|| panic!("expected create gate to reject {bad:?}"));
+        }
+        // 65 chars exceeds the length cap.
+        let too_long = "a".repeat(65);
+        validate_new_profile_name(&too_long).expect_err("65-char name must be rejected");
+    }
+
+    #[test]
+    fn test_validate_new_profile_name_escapes_control_chars_in_error() {
+        // A rejected name is echoed back escaped, never raw.
+        let err = validate_new_profile_name("bad\u{1b}[31mname")
+            .expect_err("control char must be rejected");
+        let text = err.to_string();
+        assert!(
+            !text.contains('\u{1b}'),
+            "raw ESC leaked into the error: {text:?}"
+        );
+        assert!(
+            text.contains("\\u{1b}"),
+            "expected the escaped form in the error: {text:?}"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    #[serial_test::serial]
+    fn test_get_profile_dir_refuses_to_vivify_stray() {
+        // A stray-shaped name must error and must not create a directory.
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        fs::create_dir_all(dir.join("profiles").join("work")).unwrap();
+
+        let stray = "work 0123456789abcdef Some Title";
+        let err = get_profile_dir(stray).expect_err("stray name must be refused");
+        assert!(
+            err.to_string().contains("disallowed characters")
+                || err.to_string().contains("path separators"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !dir.join("profiles").join(stray).exists(),
+            "stray profile dir must NOT have been created"
+        );
+        // A valid name on the same path still vivifies normally.
+        let good = get_profile_dir("personal").expect("valid name must create dir");
+        assert!(good.exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_require_known_profile_rejects_unknown_when_registry_nonempty() {
+        // An explicit -p naming an unknown profile is refused without
+        // creating a directory (#148).
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        fs::create_dir_all(dir.join("profiles").join("work")).unwrap();
+
+        let err =
+            require_known_profile("ghost-profile").expect_err("unknown profile must be refused");
+        assert!(
+            err.to_string().contains("does not exist"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !dir.join("profiles").join("ghost-profile").exists(),
+            "guard must not vivify the unknown profile"
+        );
+
+        // An existing profile and the empty (default) name both pass.
+        require_known_profile("work").expect("existing profile must be allowed");
+        require_known_profile("").expect("empty/default profile must be allowed");
+
+        // The refusal echoes the name escaped, never raw.
+        let err = require_known_profile("nope\u{1b}[31m")
+            .expect_err("unknown profile with control chars must be refused");
+        let text = err.to_string();
+        assert!(
+            !text.contains('\u{1b}') && text.contains("\\u{1b}"),
+            "expected escaped ESC in the error: {text:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_require_known_profile_allows_first_run_empty_registry() {
+        // First run: profiles/ is empty, so the first session must be creatable.
+        let _temp = isolate_app_dir();
+        require_known_profile("main")
+            .expect("first-run profile must be allowed when registry empty");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    #[serial_test::serial]
+    fn test_delete_profile_still_removes_preexisting_stray() {
+        // A spaced stray minted by an older binary stays removable even
+        // though creation rejects that shape.
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        let stray = "work 0123456789abcdef Some Title";
+        fs::create_dir_all(dir.join("profiles").join(stray)).unwrap();
+        fs::create_dir_all(dir.join("profiles").join("work")).unwrap();
+
+        delete_profile(stray).expect("a pre-existing spaced stray must be deletable");
+        assert!(!dir.join("profiles").join(stray).exists());
+        assert!(dir.join("profiles").join("work").exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    #[serial_test::serial]
+    fn test_rename_profile_applies_create_grammar_to_destination() {
+        // A rename destination is a new profile, so it is held to the create
+        // grammar: no spaces, emoji, reserved words, or overlong names.
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        fs::create_dir_all(dir.join("profiles").join("real")).unwrap();
+
+        let too_long = "a".repeat(65);
+        for bad in [
+            "has space",
+            "emoji\u{1f600}",
+            "all",
+            "a.b",
+            too_long.as_str(),
+        ] {
+            let err = rename_profile("real", bad)
+                .err()
+                .unwrap_or_else(|| panic!("expected rename to refuse destination {bad:?}"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("disallowed characters")
+                    || msg.contains("reserved")
+                    || msg.contains("too long"),
+                "unexpected error for {bad:?}: {msg}"
+            );
+            assert!(
+                dir.join("profiles").join("real").exists(),
+                "source must be untouched after refusing {bad:?}"
+            );
+            assert!(!dir.join("profiles").join(bad).exists());
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    #[serial_test::serial]
+    fn test_rename_profile_repairs_preexisting_stray_source() {
+        // The source stays permissive, like deletion: repairing a spaced stray
+        // is what rename is for.
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        let stray = "work 0123456789abcdef Some Title";
+        fs::create_dir_all(dir.join("profiles").join(stray)).unwrap();
+
+        rename_profile(stray, "work").expect("a spaced stray must be renameable");
+        assert!(!dir.join("profiles").join(stray).exists());
+        assert!(dir.join("profiles").join("work").exists());
+
+        // Traversal on the source is still refused, and nothing is moved.
+        fs::create_dir_all(dir.join("bystander")).unwrap();
+        let err = rename_profile("../bystander", "escaped").expect_err("traversal source");
+        assert!(err.to_string().contains("path separators"), "{err}");
+        assert!(dir.join("bystander").exists());
+        assert!(!dir.join("profiles").join("escaped").exists());
     }
 
     #[test]

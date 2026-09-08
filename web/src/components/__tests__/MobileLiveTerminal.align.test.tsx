@@ -47,6 +47,7 @@ function renderTerm(bottomAlign: boolean) {
       enterReading={vi.fn()}
       returnToLive={vi.fn()}
       sendData={vi.fn()}
+      typedWordRef={{ current: "" }}
       forwardWheel={vi.fn()}
       forwardButton={vi.fn()}
       ctrlActiveRef={createRef<boolean>() as React.RefObject<boolean>}

@@ -34,6 +34,24 @@ pub fn is_pid_alive(_pid: u32) -> bool {
     false
 }
 
+/// Like `is_pid_alive`, but `EPERM` counts as dead: a pid this daemon
+/// cannot signal belongs to another user, so it is not a runner of ours
+/// (a reused pid). Teardown proofs use this so a stale record cannot pin
+/// a session on someone else's process. A daemon running as a different
+/// user from its own runners would prove them dead here while the CLI's
+/// `is_pid_alive` still reports them; runners inherit the daemon's user.
+#[cfg(unix)]
+pub fn is_pid_alive_and_ours(pid: u32) -> bool {
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+    kill(Pid::from_raw(pid as i32), None).is_ok()
+}
+
+#[cfg(not(unix))]
+pub fn is_pid_alive_and_ours(_pid: u32) -> bool {
+    false
+}
+
 /// Ask the kernel which process is listening on this Unix domain socket
 /// by connecting and reading the peer's credentials. Returns `Some(pid)`
 /// if the path resolves to a live UDS with a valid peer, `None` otherwise
@@ -283,13 +301,9 @@ pub fn log_path(dir: &Path, id: &str) -> Result<PathBuf> {
     Ok(dir.join(format!("{id}.log")))
 }
 
-/// `<dir>/<id>.control.sock`, the typed control channel that rides
-/// alongside the raw ACP relay `<id>.sock`. Deriving it from the main
-/// socket keeps the runner (which binds it) and the daemon (which dials
-/// it) in agreement without either needing the workers dir: `x.sock`
-/// becomes `x.control.sock`. Session ids are validated (alphanumeric,
-/// `-`, `_`) so they never carry a `.` that would confuse the extension
-/// swap. Phase A of #1054.
+/// `<dir>/<id>.control.sock`, the typed runner control channel. It is derived
+/// from the legacy base path retained in registry records: `x.sock` becomes
+/// `x.control.sock`. Validated session ids cannot confuse the extension swap.
 pub fn control_socket_sibling(main_socket: &Path) -> PathBuf {
     // Guard against self-application: feeding an already-derived control
     // path would silently yield `x.control.control.sock`. All callers pass
@@ -307,6 +321,12 @@ pub fn control_socket_sibling(main_socket: &Path) -> PathBuf {
 pub fn restart_marker_path(dir: &Path, id: &str) -> Result<PathBuf> {
     validate_id(id)?;
     Ok(dir.join(format!("{id}.restart")))
+}
+
+/// Generation named by a restart marker, or `None` when the file is
+/// absent or does not name one.
+pub fn read_restart_marker(path: &Path) -> Option<u64> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 /// What a worker's own registry record looks like from its watchdog's

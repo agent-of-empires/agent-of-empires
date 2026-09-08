@@ -186,10 +186,28 @@ export interface ConfigOptionSwitchFailure {
   at: string;
 }
 
+/** Mirror of `ApprovalOptionKind` in src/acp/approvals.rs. */
+export type ApprovalOptionKind = "allow_once" | "allow_always" | "reject_once" | "reject_always";
+
+/** One option the agent offered on `session/request_permission`. */
+export interface ApprovalOption {
+  option_id: string;
+  name: string;
+  kind: ApprovalOptionKind;
+}
+
 export interface Approval {
   nonce: string;
   tool_call: ToolCall;
   destructive: boolean;
+  /** Options the agent offered, in its own order. Absent on approvals
+   *  replayed from an event log written before #3741. */
+  options?: ApprovalOption[];
+  /** The options are a list of answers, not a permission vocabulary, so
+   *  the card renders the labels and posts back the picked `option_id`.
+   *  Classified server-side by `is_choice_list` in
+   *  src/acp/approvals.rs. */
+  choice?: boolean;
   requested_at: string;
   resolved?: {
     decision: ApprovalDecision;
@@ -1466,6 +1484,11 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       next.monitorWorkSeen = false;
       next.monitorDescription = null;
     }
+    // A stop for any reason but the limit itself ends the park, matching the
+    // daemon's durable park the sidebar badge reads.
+    if (event.Stopped.reason !== "rate_limited" && event.Stopped.reason !== "rate_limit_exhausted_retries") {
+      next.rateLimit = null;
+    }
     if (event.Stopped.reason === "user_stopped") {
       next.workerStopped = true;
       next.workerRestarting = false;
@@ -1582,6 +1605,8 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.workerIdleStopped = false;
     next.agentUnresponsive = false;
     next.agentOrphaned = false;
+    // The worker is back: the park is over on every surface (#3514).
+    next.rateLimit = null;
     return next;
   }
   if ("RateLimitAutoResumed" in event) {

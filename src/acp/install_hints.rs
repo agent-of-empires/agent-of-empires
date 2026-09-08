@@ -7,8 +7,7 @@
 /// Friendly binary token for aoe's own multi-provider agent. Shared by the
 /// registry's spawn registration and [`env_allowlist_for`] so the two cannot
 /// drift onto different spellings (which would silently drop the agent's
-/// provider keys). Distinct from `AgentSpec.command`, whose value for this
-/// agent is the placeholder-templated `${aoe_data_dir}/...` path.
+/// provider keys). Also the registry's `AgentSpec.command` for this agent.
 pub const AOE_AGENT_BINARY: &str = "aoe-agent";
 
 /// Returns the install command for a known ACP binary, or `None` for
@@ -27,6 +26,8 @@ pub fn install_hint_for(binary: &str) -> Option<&'static str> {
         }
         "kimi" => "curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash  (then `kimi acp`)",
         "omp" => "curl -fsSL https://omp.sh/install | sh",
+        // Bundled in the aoe binary; installed into the data dir on demand.
+        AOE_AGENT_BINARY => "aoe acp doctor --fix --adapter aoe-agent",
         // The official installer wraps a checksum-verified `npm install -g`
         // of a release tarball, so the curl script is the supported path;
         // the package is not on the npm registry.
@@ -63,10 +64,7 @@ pub fn npm_package_for(binary: &str) -> Option<&'static str> {
 /// convention alone.
 ///
 /// The key is the friendly binary token used at registration time (e.g.
-/// [`AOE_AGENT_BINARY`]), NOT `AgentSpec.command`. `command` for `aoe-agent`
-/// carries a `${aoe_data_dir}/...` placeholder that is substituted at
-/// spawn time (`supervisor.rs`), so keying on it here would silently
-/// miss that agent.
+/// [`AOE_AGENT_BINARY`]).
 pub fn env_allowlist_for(binary: &str) -> &'static [&'static str] {
     match binary {
         // Existing Claude adapter contract, previously supplied through

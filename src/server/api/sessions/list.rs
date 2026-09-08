@@ -23,14 +23,6 @@ pub async fn get_recent_projects() -> Json<RecentProjectsResponse> {
     Json(RecentProjectsResponse { projects })
 }
 
-/// Query params for `GET /api/sessions`. `state` shares its vocabulary with
-/// the CLI's `aoe list --state` via [`crate::session::SessionScope`] so a
-/// future third caller cannot drift.
-#[derive(Deserialize)]
-pub struct ListSessionsQuery {
-    pub state: Option<crate::session::SessionScope>,
-}
-
 pub async fn list_sessions(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<ListSessionsQuery>,
@@ -86,7 +78,7 @@ pub async fn list_sessions(
             let acp_worker_state = worker_states
                 .get(&inst.id)
                 .copied()
-                .unwrap_or(crate::acp::supervisor::AcpWorkerState::Absent);
+                .unwrap_or(crate::daemon::AcpWorkerState::Absent);
             SessionResponse::from_instance_with_plan(
                 inst,
                 claude_fullscreen,
@@ -99,11 +91,9 @@ pub async fn list_sessions(
         })
         .collect();
 
-    // Shared per-request cache of the resolved `SessionConfig` keyed by
-    // (profile, project_path). Both the ACP-capability overlay (serve-only)
-    // and the smart-rename indicator overlay below fetch through this one
-    // cache, halving the disk reads the 3s sidebar poll does when the same
-    // pair appears in more than one row. See #2603.
+    // Share resolved config between the ACP-capability and smart-rename
+    // overlays, halving disk reads when a profile/project pair repeats in the
+    // 3s sidebar poll. See #2603.
     let mut session_cfg_cache: HashMap<(String, String), SessionConfig> = HashMap::new();
 
     // Overlay custom-agent ACP capability (built-ins were resolved in the
@@ -175,6 +165,24 @@ pub async fn list_sessions(
         }
     }
 
+    // Inputs for the rate-limit park overlay below, snapshotted here so the
+    // blocking batch can run once the registry read lock is released. A live
+    // worker is never parked, so only workerless sessions pay for the probe.
+    let park_probes: Vec<(usize, String, String, bool)> = sessions
+        .iter()
+        .zip(scoped_instances.iter().copied())
+        .enumerate()
+        .filter(|(_, (_, inst))| inst.is_structured() && !inst.is_archived() && !inst.is_trashed())
+        .map(|(i, (resp, inst))| {
+            (
+                i,
+                inst.id.clone(),
+                inst.source_profile.clone(),
+                resp.acp_worker_state != crate::daemon::AcpWorkerState::Running,
+            )
+        })
+        .collect();
+
     // Overlay the smart-rename indicator. `Running` comes from the live
     // in-flight set; `Pending` from the shared eligibility predicate, so the
     // indicator cannot drift from the runtime gate. Config is projected from
@@ -226,6 +234,44 @@ pub async fn list_sessions(
             if eligible {
                 resp.smart_rename = SmartRenameState::Pending;
             }
+        }
+    }
+
+    // The park probe touches config files and SQLite; run it with the
+    // session registry unlocked so writers are not held behind it.
+    drop(scoped_instances);
+    drop(instances);
+    if !park_probes.is_empty() {
+        let store = Arc::clone(&state.acp_event_store);
+        let overlays = tokio::task::spawn_blocking(move || {
+            use std::collections::HashMap;
+            let mut auto_resume_cache: HashMap<String, bool> = HashMap::new();
+            park_probes
+                .into_iter()
+                .map(|(i, id, profile, workerless)| {
+                    let auto_resume =
+                        *auto_resume_cache.entry(profile.clone()).or_insert_with(|| {
+                            crate::session::config::profile_config::resolve_config_or_warn(&profile)
+                                .acp
+                                .rate_limit_auto_resume
+                        });
+                    let park = workerless
+                        .then(|| {
+                            store.rate_limit_park(&id).map(|park| {
+                                park.info
+                                    .unwrap_or_else(crate::acp::state::RateLimitInfo::undated)
+                            })
+                        })
+                        .flatten();
+                    (i, auto_resume, park)
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
+        for (i, auto_resume, park) in overlays {
+            sessions[i].rate_limit_auto_resume = Some(auto_resume);
+            sessions[i].rate_limit = park;
         }
     }
 
@@ -541,10 +587,12 @@ mod workspace_ordering_tests {
             notify_on_idle: None,
             notify_on_error: None,
             view: crate::session::View::Terminal,
-            context_resume: ContextResumeAvailability::Unavailable {
+            acp_worker_state: crate::daemon::AcpWorkerState::Absent,
+            context_resume: Some(ContextResumeAvailability::Unavailable {
                 reason: ContextResumeUnavailableReason::NoTarget,
-            },
-            acp_worker_state: crate::acp::supervisor::AcpWorkerState::Absent,
+            }),
+            rate_limit: None,
+            rate_limit_auto_resume: None,
             queued_prompts: Vec::new(),
             acp_capable: false,
             acp_session_id: None,

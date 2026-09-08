@@ -57,6 +57,7 @@ function renderTerm(f: LiveFrame, forwardWheel = vi.fn(), forwardButton = vi.fn(
       enterReading={vi.fn()}
       returnToLive={vi.fn()}
       sendData={sendData}
+      typedWordRef={{ current: "" }}
       forwardWheel={forwardWheel}
       forwardButton={forwardButton}
       ctrlActiveRef={createRef<boolean>() as React.RefObject<boolean>}
@@ -279,6 +280,7 @@ describe("MobileLiveTerminal wheel forwarding", () => {
         enterReading={enterReading}
         returnToLive={vi.fn()}
         sendData={vi.fn()}
+        typedWordRef={{ current: "" }}
         forwardWheel={vi.fn()}
         forwardButton={vi.fn()}
         ctrlActiveRef={createRef<boolean>() as React.RefObject<boolean>}

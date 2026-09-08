@@ -11,7 +11,11 @@
 //     does NOT resolve until LONG_PRESS_MS elapses,
 //   - args_preview rendering: parsed JSON → <dl> with `_aoe_*` keys
 //     hidden; non-object → raw <pre>,
-//   - offline + rolled-back states disable the action surface.
+//   - offline + rolled-back states disable the action surface,
+//   - a destructive answer list keeps the hold on every allowing option,
+//   - choice branch (#3741): an agent that puts a question in the
+//     option list gets its own labels rendered, and picking one posts
+//     back that option_id instead of an allow-once guess.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
@@ -215,21 +219,21 @@ describe("ApprovalCard (benign)", () => {
     render(<ApprovalCard approval={makeApproval()} onResolve={onResolve} />);
     fireEvent.click(screen.getByText("Allow"));
     expect(onResolve).toHaveBeenCalledTimes(1);
-    expect(onResolve).toHaveBeenCalledWith<ApprovalDecision[]>("Allow");
+    expect(onResolve).toHaveBeenCalledWith<[ApprovalDecision, string | undefined]>("Allow", undefined);
   });
 
   it("routes Always to onResolve('AllowAlways')", () => {
     const onResolve = vi.fn().mockResolvedValue(undefined);
     render(<ApprovalCard approval={makeApproval()} onResolve={onResolve} />);
     fireEvent.click(screen.getByText("Always"));
-    expect(onResolve).toHaveBeenCalledWith("AllowAlways");
+    expect(onResolve).toHaveBeenCalledWith("AllowAlways", undefined);
   });
 
   it("routes Deny to onResolve('Deny')", () => {
     const onResolve = vi.fn().mockResolvedValue(undefined);
     render(<ApprovalCard approval={makeApproval()} onResolve={onResolve} />);
     fireEvent.click(screen.getByText("Deny"));
-    expect(onResolve).toHaveBeenCalledWith("Deny");
+    expect(onResolve).toHaveBeenCalledWith("Deny", undefined);
   });
 
   it("shows the rolled-back message when onResolve rejects", async () => {
@@ -286,14 +290,215 @@ describe("ApprovalCard (destructive)", () => {
       vi.advanceTimersByTime(800);
     });
     expect(onResolve).toHaveBeenCalledTimes(1);
-    expect(onResolve).toHaveBeenCalledWith("Allow");
+    expect(onResolve).toHaveBeenCalledWith("Allow", undefined);
   });
 
   it("routes Deny without requiring a hold even in destructive mode", () => {
     const onResolve = vi.fn().mockResolvedValue(undefined);
     render(<ApprovalCard approval={makeApproval({ destructive: true })} onResolve={onResolve} />);
     fireEvent.click(screen.getByText("Deny"));
-    expect(onResolve).toHaveBeenCalledWith("Deny");
+    expect(onResolve).toHaveBeenCalledWith("Deny", undefined);
+  });
+});
+
+describe("ApprovalCard (question option list)", () => {
+  function makeQuestion(over: Partial<Approval> = {}): Approval {
+    return makeApproval({
+      tool_call: {
+        id: "pi-ui-7",
+        name: "Pi select",
+        kind: "other",
+        args_preview: JSON.stringify({ message: "Which plan?" }),
+        started_at: "2026-05-21T00:00:00Z",
+      },
+      choice: true,
+      options: ["Option Alpha", "Option Bravo", "Option Charlie", "Option Delta"].map((name, i) => ({
+        option_id: `choice-${i}`,
+        name,
+        kind: "allow_once" as const,
+      })),
+      ...over,
+    });
+  }
+
+  it("renders the agent's option labels instead of the Allow/Always trio", () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    render(<ApprovalCard approval={makeQuestion()} onResolve={onResolve} />);
+    expect(screen.getByRole("alertdialog", { name: /Question: Pi select/i })).toBeTruthy();
+    expect(screen.getByText("Question")).toBeTruthy();
+    for (const label of ["Option Alpha", "Option Bravo", "Option Charlie", "Option Delta"]) {
+      expect(screen.getByText(label)).toBeTruthy();
+    }
+    expect(screen.queryByText("Allow")).toBeNull();
+    expect(screen.queryByText("Always")).toBeNull();
+  });
+
+  it("posts back the picked option_id, not the first option", () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    render(<ApprovalCard approval={makeQuestion()} onResolve={onResolve} />);
+    fireEvent.click(screen.getByText("Option Charlie"));
+    expect(onResolve).toHaveBeenCalledTimes(1);
+    expect(onResolve).toHaveBeenCalledWith("Allow", "choice-2");
+  });
+
+  // A Deny with no option would be mapped onto the first reject-kind
+  // option server-side and sent as the user's answer, so dismissing has
+  // to cancel instead.
+  it("offers Dismiss, which cancels rather than denying", () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    render(<ApprovalCard approval={makeQuestion()} onResolve={onResolve} />);
+    fireEvent.click(screen.getByText("Dismiss"));
+    expect(onResolve).toHaveBeenCalledWith("Cancelled", undefined);
+  });
+
+  it("dismisses a reject-kind answer list without picking one of its options", () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    const rejectList = makeQuestion({
+      options: ["Stop here", "Stop and revert"].map((name, i) => ({
+        option_id: `no-${i}`,
+        name,
+        kind: "reject_once" as const,
+      })),
+    });
+    render(<ApprovalCard approval={rejectList} onResolve={onResolve} />);
+    fireEvent.click(screen.getByText("Dismiss"));
+    expect(onResolve).toHaveBeenCalledWith("Cancelled", undefined);
+    expect(onResolve).not.toHaveBeenCalledWith("Allow", "no-0");
+    expect(onResolve).not.toHaveBeenCalledWith("Deny", undefined);
+  });
+
+  it("still answers with an explicitly picked reject-kind option", () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    const rejectList = makeQuestion({
+      options: ["Stop here", "Stop and revert"].map((name, i) => ({
+        option_id: `no-${i}`,
+        name,
+        kind: "reject_once" as const,
+      })),
+    });
+    render(<ApprovalCard approval={rejectList} onResolve={onResolve} />);
+    fireEvent.click(screen.getByText("Stop and revert"));
+    expect(onResolve).toHaveBeenCalledWith("Allow", "no-1");
+  });
+
+  it("shows the question body without needing an expand click", () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    render(<ApprovalCard approval={makeQuestion()} onResolve={onResolve} />);
+    expect(screen.getByText("Which plan?")).toBeTruthy();
+  });
+
+  it("falls back to the trio when the server flagged a choice but sent no options", () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    render(<ApprovalCard approval={makeQuestion({ options: [] })} onResolve={onResolve} />);
+    expect(screen.getByText("Allow")).toBeTruthy();
+    expect(screen.getByText("Deny")).toBeTruthy();
+  });
+});
+
+describe("ApprovalCard (destructive question)", () => {
+  function makeDestructiveQuestion(): Approval {
+    return makeApproval({
+      destructive: true,
+      choice: true,
+      tool_call: {
+        id: "tc-9",
+        name: "Bash",
+        kind: "execute",
+        args_preview: JSON.stringify({ command: "rm -rf ./build" }),
+        started_at: "2026-05-21T00:00:00Z",
+      },
+      options: [
+        { option_id: "wipe", name: "Delete everything", kind: "allow_once" },
+        { option_id: "logs", name: "Delete only logs", kind: "allow_once" },
+      ],
+    });
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  // The card is the only gate before a destructive action, so an option
+  // list must not turn the 800ms hold into a single tap.
+  it("does not resolve on a quick click of a destructive option", () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    render(<ApprovalCard approval={makeDestructiveQuestion()} onResolve={onResolve} />);
+    const option = screen.getByRole("button", { name: "Delete only logs" });
+    fireEvent.click(option);
+    fireEvent.mouseDown(option);
+    act(() => {
+      vi.advanceTimersByTime(400);
+    });
+    fireEvent.mouseUp(option);
+    act(() => {
+      vi.advanceTimersByTime(1000);
+    });
+    expect(onResolve).not.toHaveBeenCalled();
+  });
+
+  it("answers with the held option after a sustained hold", () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    render(<ApprovalCard approval={makeDestructiveQuestion()} onResolve={onResolve} />);
+    fireEvent.mouseDown(screen.getByRole("button", { name: "Delete only logs" }));
+    act(() => {
+      vi.advanceTimersByTime(800);
+    });
+    expect(onResolve).toHaveBeenCalledTimes(1);
+    expect(onResolve).toHaveBeenCalledWith("Allow", "logs");
+  });
+
+  // Two fingers on two options: the first hold must not survive the
+  // second. An orphaned timer keeps its own captured option, so it would
+  // run the answer the user moved away from.
+  it("does not submit an abandoned option when a second hold starts", () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    render(<ApprovalCard approval={makeDestructiveQuestion()} onResolve={onResolve} />);
+    const wipe = screen.getByRole("button", { name: "Delete everything" });
+    const logs = screen.getByRole("button", { name: "Delete only logs" });
+
+    fireEvent.touchStart(wipe);
+    act(() => {
+      vi.advanceTimersByTime(400);
+    });
+    fireEvent.touchStart(logs);
+    // The abandoned hold's own 800ms would elapse here.
+    act(() => {
+      vi.advanceTimersByTime(400);
+    });
+    expect(onResolve).not.toHaveBeenCalled();
+
+    // The live hold still completes on its own schedule.
+    act(() => {
+      vi.advanceTimersByTime(400);
+    });
+    expect(onResolve).toHaveBeenCalledTimes(1);
+    expect(onResolve).toHaveBeenCalledWith("Allow", "logs");
+  });
+
+  it("does not submit after the hold is released", () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    render(<ApprovalCard approval={makeDestructiveQuestion()} onResolve={onResolve} />);
+    const wipe = screen.getByRole("button", { name: "Delete everything" });
+    fireEvent.touchStart(wipe);
+    act(() => {
+      vi.advanceTimersByTime(700);
+    });
+    fireEvent.touchCancel(wipe);
+    act(() => {
+      vi.advanceTimersByTime(2000);
+    });
+    expect(onResolve).not.toHaveBeenCalled();
+  });
+
+  it("keeps Dismiss a single click even when destructive", () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    render(<ApprovalCard approval={makeDestructiveQuestion()} onResolve={onResolve} />);
+    fireEvent.click(screen.getByText("Dismiss"));
+    expect(onResolve).toHaveBeenCalledWith("Cancelled", undefined);
   });
 });
 

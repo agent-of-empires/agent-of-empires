@@ -192,13 +192,10 @@ impl TerminalManager {
             .ok_or_else(|| TerminalError::UnknownTerminal(terminal_id.into()))
     }
 
-    /// Implements ACP `terminal/release` by dropping the captured output.
-    pub async fn release(&self, terminal_id: &str) -> Result<(), TerminalError> {
-        let mut inner = self.inner.lock().await;
-        if inner.outputs.remove(terminal_id).is_none() {
-            return Err(TerminalError::UnknownTerminal(terminal_id.into()));
-        }
-        Ok(())
+    /// Drop captured output. Release is a cleanup operation, so absent ids are
+    /// already in the requested postcondition and succeed idempotently.
+    pub async fn release(&self, terminal_id: &str) {
+        self.inner.lock().await.outputs.remove(terminal_id);
     }
 }
 
@@ -220,16 +217,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn release_removes_terminal() {
+    async fn release_is_idempotent_cleanup() {
         let mgr = TerminalManager::new();
-        let cwd = std::env::temp_dir();
         let id = mgr
-            .create_and_run("s-1", "true", vec![], cwd, None)
+            .create_and_run("s-1", "true", vec![], std::env::temp_dir(), None)
             .await
             .unwrap();
-        mgr.release(&id).await.unwrap();
-        let result = mgr.output(&id).await;
-        assert!(matches!(result, Err(TerminalError::UnknownTerminal(_))));
+        mgr.release(&id).await;
+        mgr.release(&id).await;
+        mgr.release("never-existed").await;
+        assert!(matches!(
+            mgr.output(&id).await,
+            Err(TerminalError::UnknownTerminal(_))
+        ));
     }
 
     // Regression: pipe-buffer deadlock when stderr exceeds the

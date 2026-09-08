@@ -67,6 +67,8 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe project list`↴](#aoe-project-list)
 * [`aoe project add`↴](#aoe-project-add)
 * [`aoe project remove`↴](#aoe-project-remove)
+* [`aoe sandbox`↴](#aoe-sandbox)
+* [`aoe sandbox reclaim`↴](#aoe-sandbox-reclaim)
 * [`aoe worktree`↴](#aoe-worktree)
 * [`aoe worktree list`↴](#aoe-worktree-list)
 * [`aoe worktree info`↴](#aoe-worktree-info)
@@ -149,6 +151,7 @@ Run without arguments to launch the TUI dashboard.
 * `plugin` — Manage plugins (list, info, enable, disable, install, update, uninstall)
 * `profile` — Manage profiles (separate workspaces)
 * `project` — Manage the project registry used by multi-repo session pickers
+* `sandbox` — Inspect and reclaim per-session sandbox agent stores
 * `worktree` — Manage git worktrees for parallel development
 * `tmux` — tmux integration utilities
 * `sounds` — Manage sound effects for agent state transitions
@@ -168,7 +171,7 @@ Run without arguments to launch the TUI dashboard.
 
 ###### **Options:**
 
-* `-p`, `--profile <PROFILE>` — Profile to use (separate workspace with its own sessions)
+* `-p`, `--profile <PROFILE>` — Profile to use (separate workspace with its own sessions). Commands that consume or create profile state require an existing profile: an unknown name is refused, not created (make one with `aoe profile create`). Profile-independent commands such as `list --all` and `serve --stop` ignore it
 * `--daemon-url <DAEMON_URL>` — Attach to a remote agent daemon instead of using the local session list. Equivalent to setting `AOE_DAEMON_URL`; pair with `AOE_DAEMON_TOKEN` for the bearer token. Only meaningful at the no-subcommand `aoe` invocation (the TUI dashboard); ignored otherwise
 
 
@@ -979,7 +982,7 @@ Create a new profile
 
 ###### **Arguments:**
 
-* `<NAME>` — Profile name
+* `<NAME>` — Profile name: letters, digits, `_` and `-` only, at most 64 characters; `all` is reserved
 
 
 
@@ -1004,7 +1007,7 @@ Rename a profile
 ###### **Arguments:**
 
 * `<OLD_NAME>` — Current profile name
-* `<NEW_NAME>` — New profile name
+* `<NEW_NAME>` — New profile name (same rules as `aoe profile create`)
 
 
 
@@ -1103,6 +1106,30 @@ Remove a project from the registry
 
   Possible values: `global`, `profile`
 
+
+
+
+## `aoe sandbox`
+
+Inspect and reclaim per-session sandbox agent stores
+
+**Usage:** `aoe sandbox <COMMAND>`
+
+###### **Subcommands:**
+
+* `reclaim` — Report per-session agent stores whose session no longer exists in any profile, and how much disk they hold. Reports only unless `--delete` is given: each store holds a copy of that agent's credentials
+
+
+
+## `aoe sandbox reclaim`
+
+Report per-session agent stores whose session no longer exists in any profile, and how much disk they hold. Reports only unless `--delete` is given: each store holds a copy of that agent's credentials
+
+**Usage:** `aoe sandbox reclaim [OPTIONS]`
+
+###### **Options:**
+
+* `--delete` — Remove the reported stores instead of only naming them
 
 
 
@@ -1558,7 +1585,7 @@ Start the aoe daemon: REST/WebSocket API, plus the web dashboard in builds that 
 
    `--status` is read-only and incompatible with every flag that would change daemon state (`--stop`, `--daemon`, `--remote`) or the bind config of a fresh daemon (`--no-auth`, `--auth`, `--behind-proxy`, `--read-only`, `--passphrase`, `--port`, `--tunnel-name`, `--no-tailscale`, `--tunnel-url`, `--open`, `--allowed-host`, `--allowed-origin`). Clap reports the misuse instead of silently ignoring the extras.
 * `--passphrase <PASSPHRASE>` — Require a passphrase for login (second-factor auth). Can also be set via AOE_SERVE_PASSPHRASE environment variable
-* `--open` — Open the dashboard URL in the default browser once the server is ready. Ignored in a build with no dashboard bundle, and under --daemon, --remote, SSH (SSH_CONNECTION/SSH_TTY), or when no display server is reachable on Linux/BSD
+* `--open` — Open the dashboard URL in the default browser once the server is ready. Ignored in a build with no dashboard bundle, under --daemon or --remote, and whenever no browser the user could see is reachable (see `tui::open_url`): over SSH without a forwarded display, or on Linux/BSD with no display server. `BROWSER` overrides the check on platforms whose launcher reads it, which excludes macOS
 * `--restart` — Restart a running `aoe serve` daemon, replaying the host, port, mode, and auth it was launched with (read from `serve.launch`). The passphrase is recalled from `serve.passphrase` or `AOE_SERVE_PASSPHRASE` before the old daemon is stopped, so a passphrase-protected daemon is never left down. Incompatible with the flags that would change the daemon's bind config: that config comes from the persisted launch state
 
 
@@ -1593,7 +1620,7 @@ Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 * `history` — Print the persisted transcript for an agent session
 * `status` — Print live status for an agent session: highest/lowest seq, and whether the on-disk retention window has truncated history
 * `prompt` — Send a prompt to an agent session's agent
-* `approve` — Resolve a pending approval (default: allow). Use --always for a session-scoped allow-list entry, --deny to refuse the request
+* `approve` — Resolve a pending approval (default: allow). Use --always for a session-scoped allow-list entry, --deny to refuse the request, and --option to answer a request that lists choices
 * `cancel` — Cancel the in-flight prompt for an agent session
 * `tail` — Stream the agent broadcast for a session to stdout as JSON lines (one frame per line). Press Ctrl-C to stop
 * `attach` — Open the TUI structured view directly for a known session id. Combine with `AOE_DAEMON_URL` (+ `AOE_DAEMON_TOKEN`) to attach across machines without going through the home session list
@@ -1611,9 +1638,9 @@ Verify the structured view can start: Node runtime, configured agents, provider 
 
 * `--json` — Emit machine-readable JSON instead of a human report
 * `--fix` — Attempt safe remediations: download the bundled Node runtime if none is present, then install the pinned npm ACP adapter into the data dir with that Node's own npm (no global install, no sudo). Installs claude-agent-acp by default; each adapter is a separate several-hundred-MB tree, so pick others with --adapter
-* `--adapter <ADAPTER>` — Adapter to install with --fix (repeatable). Defaults to claude-agent-acp. One of: claude-agent-acp, codex-acp, pi-acp
+* `--adapter <ADAPTER>` — Adapter to install with --fix (repeatable). Defaults to claude-agent-acp
 
-  Possible values: `claude-agent-acp`, `codex-acp`, `pi-acp`
+  Possible values: `claude-agent-acp`, `codex-acp`, `pi-acp`, `aoe-agent`
 
 * `--all-adapters` — Install every pinned adapter with --fix instead of just the default one
 
@@ -1733,7 +1760,7 @@ Send a prompt to an agent session's agent
 
 ## `aoe acp approve`
 
-Resolve a pending approval (default: allow). Use --always for a session-scoped allow-list entry, --deny to refuse the request
+Resolve a pending approval (default: allow). Use --always for a session-scoped allow-list entry, --deny to refuse the request, and --option to answer a request that lists choices
 
 **Usage:** `aoe acp approve [OPTIONS] <SESSION> <NONCE>`
 
@@ -1746,6 +1773,7 @@ Resolve a pending approval (default: allow). Use --always for a session-scoped a
 
 * `--always` — Allow this kind of operation for the rest of the session
 * `--deny` — Refuse the request
+* `--option <ID>` — Answer with this option id, from the request's option list. An id the request never offered cancels it instead
 
 
 
