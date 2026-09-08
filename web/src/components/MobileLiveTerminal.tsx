@@ -1589,7 +1589,7 @@ export function MobileLiveTerminal({
           break;
       }
     },
-    [sendKeys, sendData],
+    [sendKeys, sendData, typedWordRef],
   );
   const handleBeforeInput = useCallback(
     (ev: InputEvent) => {
@@ -1735,10 +1735,13 @@ export function MobileLiveTerminal({
       // Only a composition that took over the typed word may have its prefix
       // dropped; anything else is new text and goes to the pane whole.
       const rest = retroactive && data.startsWith(run) ? data.slice(run.length) : data;
-      // The composed word is still the one under the caret, so a second
+      // The typed word is still the one under the caret, so a second
       // composition over it (a suggestion tap, then the space commit) has to
-      // be stripped against everything the pane has of that word.
-      if (!rest || sendKeys(rest)) typedWordRef.current = plainRunAfter(run, rest);
+      // be stripped against everything the pane has of that word. A
+      // composition that stood on its own leaves no typed word behind: its
+      // result must not become a run for the next composition to strip.
+      if (!rest) typedWordRef.current = run;
+      else if (sendKeys(rest) && retroactive) typedWordRef.current = plainRunAfter(run, rest);
       if (e.currentTarget instanceof HTMLTextAreaElement) e.currentTarget.value = "";
     },
     [sendKeys, typedWordRef],

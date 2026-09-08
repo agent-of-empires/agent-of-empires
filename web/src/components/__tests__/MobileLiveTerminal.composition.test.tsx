@@ -43,9 +43,9 @@ interface Term {
   /** A retroactive composition: its first update carries the word already
    *  typed, as SwiftKey's trace on #3746 does, then it ends with `data`. */
   compose: (data: string) => void;
-  /** A composition that starts fresh here, building from its own first
-   *  character rather than adopting what was typed before it. */
-  composeFresh: (first: string, data: string) => void;
+  /** A composition whose first update carries `first`, which is what decides
+   *  whether it read as taking over the typed word or standing on its own. */
+  composeUpdating: (first: string, data: string) => void;
   input: (inputType: string) => void;
   /** A toolbar button, which writes past this component to live.sendData. */
   toolbar: (data: string) => void;
@@ -99,7 +99,7 @@ function renderTerm(accepted = true): Term {
       fireEvent.compositionUpdate(input, { data: typedWordRef.current });
       fireEvent.compositionEnd(input, { data });
     },
-    composeFresh: (first, data) => {
+    composeUpdating: (first, data) => {
       fireEvent.compositionStart(input);
       fireEvent.compositionUpdate(input, { data: first });
       fireEvent.compositionEnd(input, { data });
@@ -200,9 +200,20 @@ describe("MobileLiveTerminal Android IME word commits", () => {
       name: "sends a fresh composition that merely shares the typed prefix",
       run: (t) => {
         t.type("a");
-        t.composeFresh("n", "android");
+        t.composeUpdating("n", "android");
       },
       sent: ["a", "android"],
+    },
+    {
+      // A suggestion tap corrects the word in the same breath as adopting it,
+      // so the first update carries more than the run. Pins the classifier to
+      // a prefix test: an equality test would send the whole word again.
+      name: "strips an adopting composition that corrects as it takes over",
+      run: (t) => {
+        t.type("tes");
+        t.composeUpdating("test", "test");
+      },
+      sent: ["t", "e", "s", "t"],
     },
     {
       // The toolbar writes past this component straight to live.sendData.
@@ -227,6 +238,17 @@ describe("MobileLiveTerminal Android IME word commits", () => {
       name: "sends a composition that follows no plain typing",
       run: (t) => t.compose("日本"),
       sent: ["日本"],
+    },
+    {
+      // A composition that stood on its own is not a typed word under the
+      // caret, so the next one must reach the pane whole even when it repeats
+      // it. Samsung's trace on #3746 composes every word this way.
+      name: "sends a character composed twice in a row",
+      run: (t) => {
+        t.composeUpdating("a", "a");
+        t.composeUpdating("a", "a");
+      },
+      sent: ["a", "a"],
     },
     {
       name: "keeps repeated characters typed without a composition",
