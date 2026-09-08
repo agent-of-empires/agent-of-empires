@@ -2770,17 +2770,32 @@ mod tests {
         assert!(status.success());
         refresh_session_cache();
 
+        /// Releases the pane on the way out, so an unwind inside the scope
+        /// below cannot leave the waiter forking against a killed session
+        /// until its budget expires.
+        struct ReleaseOnDrop<'a>(&'a std::path::Path);
+        impl Drop for ReleaseOnDrop<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::write(self.0, b"");
+            }
+        }
+
         let (returned_tx, returned_rx) = std::sync::mpsc::channel();
         let session = Session::from_name(&name);
-        // Observations are collected, not asserted, inside the scope: the
-        // release below then always runs, so no failure path leaves the waiter
-        // forking against a killed session and the scope's join stays prompt.
+        // Observations are collected, not asserted, inside the scope, and the
+        // release runs on every path out of it, so no failure leaves the
+        // waiter forking against a killed session and the join stays prompt.
         let (settled, last, premature, early, released) = std::thread::scope(|scope| {
             scope.spawn(|| {
+                // Only a failure deadline, and it has to dominate the
+                // sample-bounded window below: a budget the window can reach
+                // on a slow host would expire mid-window and read as the
+                // early return this test exists to catch.
                 Session::from_name(&name)
-                    .wait_until_ready(std::time::Duration::from_secs(15), Some("ask anything"));
+                    .wait_until_ready(std::time::Duration::from_secs(60), Some("ask anything"));
                 let _ = returned_tx.send(());
             });
+            let _release_on_unwind = ReleaseOnDrop(&release);
             // Negative claim, so it needs a window: hold the settled markerless
             // screen across several of the waiter's 200ms polls, which is the
             // state an early return would key on. Bounded by sample count, not
@@ -2823,6 +2838,7 @@ mod tests {
         );
         released.expect("did not return promptly once the marker appeared");
     }
+
     #[test]
     fn chrome_rows_accounts_for_status_bar_and_ignores_splits() {
         // #2766: the reporter's tmux yields a pane one row shorter than the
