@@ -131,6 +131,13 @@ fn sandbox_reclaim_reports_before_it_removes() {
     for store in [&owned, &orphan] {
         std::fs::create_dir_all(store).expect("create store");
         std::fs::write(store.join(".credentials.json"), vec![b'x'; 4096]).expect("write store");
+        // Past the creation grace period, which exists to protect a store
+        // being seeded for a session whose row is not inserted yet.
+        let aged = std::time::SystemTime::now() - std::time::Duration::from_secs(24 * 60 * 60);
+        std::fs::File::open(store)
+            .expect("open store")
+            .set_times(std::fs::FileTimes::new().set_modified(aged))
+            .expect("age store");
     }
 
     let report = h.run_cli(&["sandbox", "reclaim"]);
@@ -146,6 +153,12 @@ fn sandbox_reclaim_reports_before_it_removes() {
     );
     assert!(orphan.exists(), "a bare report must delete nothing");
 
+    // A store written to just now is held back, so a session being created
+    // concurrently cannot have its seeded credentials swept.
+    let fresh = root.join("3333333333333333");
+    std::fs::create_dir_all(&fresh).expect("create fresh store");
+    std::fs::write(fresh.join(".credentials.json"), b"seeding").expect("write fresh store");
+
     let deleted = h.run_cli(&["sandbox", "reclaim", "--delete"]);
     assert!(
         deleted.status.success(),
@@ -154,4 +167,5 @@ fn sandbox_reclaim_reports_before_it_removes() {
     );
     assert!(!orphan.exists(), "the orphaned store was not removed");
     assert!(owned.exists(), "a claimed store must survive the pass");
+    assert!(fresh.exists(), "a store being seeded right now was swept");
 }

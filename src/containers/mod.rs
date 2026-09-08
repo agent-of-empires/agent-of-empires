@@ -28,6 +28,10 @@ pub fn runtime_binary() -> &'static str {
     }
 }
 
+/// Name prefix every aoe sandbox container carries. Also the filter a batch
+/// listing passes to the runtime, so the two cannot drift.
+pub const SANDBOX_NAME_PREFIX: &str = "aoe-sandbox-";
+
 pub fn get_container_runtime() -> ContainerRuntime {
     if let Ok(cfg) = Config::load() {
         match cfg.sandbox.container_runtime {
@@ -44,7 +48,7 @@ pub fn get_container_runtime() -> ContainerRuntime {
 /// Returns a map of container name -> is_running.
 pub fn batch_container_health() -> HashMap<String, bool> {
     let start = std::time::Instant::now();
-    let map = get_container_runtime().batch_running_states("aoe-sandbox-");
+    let map = get_container_runtime().batch_running_states(SANDBOX_NAME_PREFIX);
     tracing::debug!(
         target: "containers.runtime",
         count = map.len(),
@@ -59,7 +63,7 @@ pub fn batch_container_health() -> HashMap<String, bool> {
 /// name means.
 pub fn batch_container_states() -> HashMap<String, ContainerState> {
     let start = std::time::Instant::now();
-    let map = get_container_runtime().batch_container_states("aoe-sandbox-");
+    let map = get_container_runtime().batch_container_states(SANDBOX_NAME_PREFIX);
     tracing::debug!(
         target: "containers.runtime",
         count = map.len(),
@@ -74,7 +78,7 @@ pub fn batch_container_states() -> HashMap<String, ContainerState> {
 /// usable sample for is absent rather than zeroed.
 pub fn batch_container_stats() -> stats::StatsMap {
     let start = std::time::Instant::now();
-    let map = get_container_runtime().batch_stats("aoe-sandbox-");
+    let map = get_container_runtime().batch_stats(SANDBOX_NAME_PREFIX);
     tracing::debug!(
         target: "containers.runtime",
         count = map.len(),
@@ -157,7 +161,7 @@ impl DockerContainer {
     }
 
     pub fn generate_name(session_id: &str) -> String {
-        format!("aoe-sandbox-{}", truncate_id(session_id, 8))
+        format!("{SANDBOX_NAME_PREFIX}{}", truncate_id(session_id, 8))
     }
 
     pub fn from_session_id(session_id: &str) -> Self {

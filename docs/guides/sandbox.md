@@ -354,9 +354,14 @@ aoe sandbox reclaim --delete   # remove it
 ```
 
 The report is the default because a store holds a copy of the agent's
-credentials. A store whose container is still running is kept, as is one when
-the container runtime cannot be asked, and the pass refuses to run while a
-store move is in flight.
+credentials. A store is kept when its container is still running under any
+installed runtime, when a runtime cannot be asked, or when it was written to in
+the last fifteen minutes, since a store is seeded before the session that owns
+it is recorded. The pass refuses to run while a store move is in flight.
+
+A session still on the shared legacy store has no private store of its own, so
+deleting it removes its container but leaves that shared store to the
+migration.
 
 ## Worktrees and Sandboxing
 

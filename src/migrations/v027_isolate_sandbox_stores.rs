@@ -94,7 +94,7 @@ thread_local! {
 /// so its next answer asks the runtime again. Publishing calls this because
 /// the copy before it ran without the transition lock, and a container may
 /// have come up meanwhile.
-fn refresh_liveness() {
+pub(crate) fn refresh_liveness() {
     LIVENESS_EPOCH.with(|epoch| epoch.set(epoch.get() + 1));
 }
 
@@ -106,7 +106,7 @@ fn refresh_liveness() {
 /// it; a transitional or unrecognised state is inspected rather than read as
 /// stopped, so a new runtime state can only cost a subprocess, never a copy
 /// out from under a live agent.
-fn batched_running_probe_with(
+pub(crate) fn batched_running_probe_with(
     batch: impl Fn() -> std::collections::HashMap<String, crate::containers::ContainerState>,
     inspect: impl Fn(&str) -> Result<(bool, bool)>,
     announce: bool,
@@ -182,7 +182,7 @@ type ReapProbe<'a> = dyn Fn(&str) -> Result<bool> + 'a;
 /// later `aoe` invocation too. Callers substitute their own fail-closed answer
 /// and leave the row pending. A local I/O fault is a real failure and still
 /// propagates.
-fn runtime_cannot_answer(error: &crate::containers::error::DockerError) -> bool {
+pub(crate) fn runtime_cannot_answer(error: &crate::containers::error::DockerError) -> bool {
     use crate::containers::error::DockerError;
     matches!(
         error,
