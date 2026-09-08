@@ -201,7 +201,12 @@ wrapper points the CLI at another directory, set that host root in
 `session.agent_config_dir`. AoE stages a private per-session child and mounts it
 at the agent's canonical container config path. Remove any
 `sandbox.extra_volumes` entry for that path because it would shadow AoE's
-managed mount.
+managed mount; AoE warns once per container preparation when an extra-volume
+source is that directory or a child of it. Inside the sandbox the wrapper has
+to keep the config-dir variables AoE sets (`CLAUDE_CONFIG_DIR`, for example)
+rather than export its own, which points the agent at the pre-upgrade store
+and its missing folder-trust record, leaving the session on the folder-trust
+dialog. Host-only account selection stays outside the sandbox.
 
 To pre-trust worktrees for host sessions too, see `session.pre_trust_agent_folders`
 in the [configuration guide](configuration.md).

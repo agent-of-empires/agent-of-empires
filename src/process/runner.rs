@@ -1,51 +1,24 @@
 //! `aoe __acp-runner`: the per-worker shim that owns the agent
 //! subprocess and outlives `aoe serve`.
 //!
-//! Invoked by `Supervisor::spawn` as a detached child via `setsid` so its
-//! process group is independent of the daemon's. The runner:
+//! The detached runner writes its registry record, spawns a stdio-only ACP
+//! agent, and exposes the framed v3 protocol on `<session_id>.control.sock`.
+//! It owns the ACP handshake, forwards both RPC directions, buffers outbound
+//! control frames while detached, and accepts the next daemon connection
+//! without restarting an established agent session.
 //!
-//! 1. Writes a registry entry at
-//!    `<app_dir>/acp-workers/<session_id>.json` with its PID, socket
-//!    path, and agent metadata.
-//! 2. Spawns the configured ACP agent as a child over stdio.
-//! 3. Binds a Unix listener at `<app_dir>/acp-workers/<session_id>.sock`
-//!    and accepts connections in a loop, proxying bytes between the
-//!    currently-connected aoe daemon and the agent's stdio.
-//! 4. Buffers agent → daemon traffic (line-oriented ndjson) in a ring
-//!    buffer while no daemon is attached, so the next reattach replays
-//!    the gap.
-//! 5. On agent exit or SIGTERM/SIGINT: deletes the registry file and
-//!    socket, then exits.
+//! On agent exit, signal, abandonment, or an incomplete handshake disconnect,
+//! the runner terminates the agent process tree and removes only registry files
+//! that still belong to its PID. Per-runner logs remain under `acp-workers`
+//! so `aoe acp logs --session <id> --follow` can tail them independently.
 //!
-//! The daemon disconnects the unix socket on `detach_all` without
-//! signalling the runner; the runner just sees a closed connection and
-//! goes back to accepting.
-//!
-//! Logging: the runner appends to
-//! `<app_dir>/acp-workers/<session_id>.log` so `aoe acp logs
-//! --session <id> --follow` can tail it independently of the shared
-//! `debug.log` that all aoe processes append to.
-//!
-//! ## Why a shim and not "let the agent bind the socket"
-//!
-//! Issue #1037's Proposal A suggested patching ACP agents to listen on
-//! a unix socket directly, with the daemon connecting in. That works
-//! for cooperating agents (`aoe-agent` already honors `AOE_ACP_SOCKET`)
-//! but the third-party agents we proxy (`claude-agent-acp`, etc.)
-//! only speak stdio today. This shim bridges stdio-only agents into
-//! the socket-mode lifecycle without requiring upstream changes.
-//!
-//! Treat the shim as a deprecation path, not a permanent layer:
-//! agents that gain native socket-mode transport in the future can
-//! bypass `aoe __acp-runner` entirely and have the daemon connect
-//! to them directly. The wire protocol is just newline-delimited
-//! JSON-RPC (ACP), no shim-specific framing, so collapsing this
-//! process is purely an agent-side change.
+//! This shim lets third-party agents that only speak ACP over stdio participate
+//! in the detached worker lifecycle without requiring agent-side socket support.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -107,9 +80,8 @@ const ATTACHED: u64 = 0;
 /// accept loop on connect/disconnect, read by the watchdog.
 type DetachedSince = AtomicU64;
 
-/// Why the runner is tearing down. Drives whether teardown deletes the
-/// registry entry: a superseded runner must NOT delete, since the files
-/// now belong to the fresh runner that replaced it.
+/// Why the abandonment watchdog asked the runner to tear down. Registry
+/// cleanup still checks PID ownership atomically for every reason.
 #[derive(Debug, Clone, Copy)]
 enum WatchdogShutdown {
     /// Our registry record vanished (HOME deleted, or daemon `delete`d it).
@@ -119,11 +91,6 @@ enum WatchdogShutdown {
     /// Detached past [`DETACHED_RETENTION`] with no daemon reattaching.
     DetachedRetentionExpired,
 }
-
-/// Cap on agent → daemon notification lines stored while detached.
-/// Each entry is at most one ndjson line (a few KB). Past this, oldest
-/// entries are dropped; the daemon-side event_store still has them.
-const NOTIFICATION_BUFFER_LINES: usize = 256;
 
 /// An agent that exits within this window of being spawned is treated as a
 /// broken spawn and logged at warn (not info), so a crash loop is visible in
@@ -171,9 +138,8 @@ pub struct AcpRunnerArgs {
     /// auth-shape the session uses without re-reading the daemon.
     #[arg(long, value_delimiter = ',', default_value = "")]
     pub provider_env_keys: Vec<String>,
-    /// Cached ACP session id, written by the daemon and read on
-    /// reattach. The runner doesn't itself use this field; it surfaces
-    /// in the registry for the daemon's restart path.
+    /// ACP session id supplied when the runner starts. The runner durably
+    /// replaces this registry field before exposing a newly established id.
     #[arg(long)]
     pub stored_acp_session_id: Option<String>,
     /// Profile the session was created under. Persisted on the
@@ -229,12 +195,13 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         "structured view runner starting"
     );
 
-    // Bind the sibling control socket BEFORE the main relay socket, and
-    // both before spawning the agent. The daemon waits for the main
-    // socket to appear, then dials the control socket; binding control
-    // first guarantees it is connectable by the time the main socket is,
-    // so no capability handshake or record field is needed to advertise
-    // it. Phase A of #1054.
+    // Bind the control socket before spawning the agent, so the daemon's
+    // post-spawn connect cannot race the listener. This is the only live socket;
+    // the legacy `<id>.sock` path is retained only as a derivation base,
+    // and the daemon's readiness probe and liveness check both key on the
+    // control socket instead. `--socket` stays the derivation base for the
+    // sibling path (and the registry record's `socket_path`), so runner and
+    // daemon agree without a new field.
     let control_socket = crate::process::worker::control_socket_sibling(&args.socket);
     if let Some(parent) = args.socket.parent() {
         std::fs::create_dir_all(parent)
@@ -249,20 +216,6 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&control_socket, std::fs::Permissions::from_mode(0o600));
-    }
-
-    // Bind the main relay socket. The runner binds before it spawns the
-    // agent so the daemon's post-spawn connect doesn't race the listener
-    // creation.
-    if args.socket.exists() {
-        let _ = std::fs::remove_file(&args.socket);
-    }
-    let listener = UnixListener::bind(&args.socket)
-        .with_context(|| format!("bind {}", args.socket.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&args.socket, std::fs::Permissions::from_mode(0o600));
     }
 
     // Persist the registry record BEFORE spawning the agent. The record is
@@ -289,7 +242,7 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         },
     );
     if let Err(e) = worker_registry::save(&record).context("writing registry record") {
-        let _ = std::fs::remove_file(&args.socket);
+        let _ = std::fs::remove_file(&control_socket);
         return Err(e);
     }
 
@@ -331,67 +284,24 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         });
     }
 
-    let shared = Arc::new(RunnerShared::new());
+    let shared = Arc::new(RunnerShared::new(Some((args.session_id.clone(), our_pid))));
 
-    // Last time (epoch millis) the agent wrote to stdout; drives the
-    // stdout-silence keepalive (#2455).
-    // Fan-out task: reads agent stdout and either forwards to the
-    // currently-attached daemon or buffers in the ring. Single owner of
-    // the read half of the agent's stdout pipe.
+    // Wrap agent stdin in a tokio Mutex so the control loop and the stdout
+    // fanout can each write to it. Wrapping (not splitting) keeps stdin
+    // alive across reconnects; closing it would cause aoe-agent to
+    // `process.exit(0)`. The fanout also answers agent calls on the daemon's
+    // behalf during capacity refusal and disconnect cleanup.
+    let agent_stdin = Arc::new(Mutex::new(agent_stdin));
+
+    // Fan-out task: reads agent stdout, classifies each line, and appends
+    // the daemon-facing frame to the control queue. Single owner of the read
+    // half of the agent's stdout pipe.
     let agent_stdout_task = tokio::spawn(fanout_agent_stdout(
         agent_stdout,
         Arc::clone(&shared),
+        Arc::clone(&agent_stdin),
         args.session_id.clone(),
     ));
-
-    // Wrap agent stdin in a tokio Mutex so both accept loops can hand it
-    // to one connection at a time. Wrapping (not splitting) keeps stdin
-    // alive across reconnects; closing it would cause aoe-agent to
-    // `process.exit(0)`. The control loop needs it too now that the runner
-    // owns the handshake and issues `session/prompt` itself (#2976).
-    let agent_stdin = Arc::new(Mutex::new(agent_stdin));
-
-    // Control-channel accept loop. Serves the sibling `<id>.control.sock`,
-    // over which the runner drives the ACP handshake it owns and the turn
-    // request/response (#2976 Phase B), and reports native turn-complete
-    // signals (#1054 Phase A). Independent of the main byte-relay accept
-    // loop; a daemon attaches to both. Detached like the stderr drainer:
-    // the process teardown drops it.
-    let control_shared = Arc::clone(&shared);
-    let control_session = args.session_id.clone();
-    let control_stdin = Arc::clone(&agent_stdin);
-    let mut control_accept_task = tokio::spawn(async move {
-        loop {
-            match control_listener.accept().await {
-                Ok((stream, _addr)) => {
-                    info!(
-                        target: "acp.runner",
-                        session = %control_session,
-                        "daemon connected (control channel)"
-                    );
-                    if handle_control_connection(
-                        stream,
-                        Arc::clone(&control_shared),
-                        Arc::clone(&control_stdin),
-                        control_session.clone(),
-                    )
-                    .await
-                    {
-                        return;
-                    }
-                    info!(
-                        target: "acp.runner",
-                        session = %control_session,
-                        "daemon disconnected (control channel)"
-                    );
-                }
-                Err(e) => {
-                    warn!(target: "acp.runner", "control accept error: {e}");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            }
-        }
-    });
 
     // Signal handling: SIGTERM/SIGINT → kill agent, cleanup, exit.
     let shutdown_signal = wait_for_shutdown();
@@ -427,34 +337,44 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
     let accept_session_id = session_id.clone();
     let accept_shared = Arc::clone(&shared);
     let accept_detached = Arc::clone(&detached_since);
+    let accept_stdin = Arc::clone(&agent_stdin);
+    // The control-channel accept loop owns attach and detach bookkeeping:
+    // `mark_attached` / `mark_detached` on the registry record, and the
+    // `detached_since` clock the abandonment watchdog reads. Missing that
+    // move would leave the runner permanently "detached" and have the 48h
+    // retention watchdog eventually reap a session a daemon is actively
+    // using.
     let accept_loop = async move {
         loop {
-            match listener.accept().await {
+            match control_listener.accept().await {
                 Ok((stream, _addr)) => {
                     info!(
                         target: "acp.runner",
                         session = %accept_session_id,
-                        "daemon connected"
+                        "daemon connected (control channel)"
                     );
-                    worker_registry::mark_attached(&accept_session_id);
+                    worker_registry::mark_attached(&accept_session_id, our_pid);
                     accept_detached.store(ATTACHED, Ordering::Relaxed);
-                    handle_connection(
+                    if handle_control_connection(
                         stream,
                         Arc::clone(&accept_shared),
-                        Arc::clone(&agent_stdin),
+                        Arc::clone(&accept_stdin),
                         accept_session_id.clone(),
                     )
-                    .await;
+                    .await
+                    {
+                        return true;
+                    }
                     info!(
                         target: "acp.runner",
                         session = %accept_session_id,
-                        "daemon disconnected; runner stays alive"
+                        "daemon disconnected (control channel); runner stays alive"
                     );
-                    worker_registry::mark_detached(&accept_session_id);
+                    worker_registry::mark_detached(&accept_session_id, our_pid);
                     accept_detached.store(now_secs(), Ordering::Relaxed);
                 }
                 Err(e) => {
-                    warn!(target: "acp.runner", "accept error: {e}");
+                    warn!(target: "acp.runner", "control accept error: {e}");
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
@@ -505,6 +425,15 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
             let _ = agent_child.start_kill();
             let _ = agent_child.wait().await;
         }
+        _ = shared.fatal_triggered() => {
+            warn!(
+                target: "acp.runner",
+                session = %session_id,
+                "fatal runner state detected; terminating agent"
+            );
+            let _ = agent_child.start_kill();
+            let _ = agent_child.wait().await;
+        }
         reason = &mut watchdog_rx => {
             if let Ok(reason) = reason {
                 // A superseded runner must not delete the registry/socket:
@@ -518,21 +447,12 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
                 self_terminate_agent_tree(reason, &session_id, our_pid, &mut agent_child).await;
             }
         }
-        _ = accept_loop => {
-            warn!(target: "acp.runner", session = %session_id, "accept loop exited unexpectedly");
-        }
-        result = &mut control_accept_task => {
-            match result {
-                Ok(()) => {
-                    // The daemon owns path cleanup after cancelling an
-                    // incomplete handshake and may already have spawned a
-                    // replacement. Never unlink that replacement here.
-                    preserve_registry = true;
-                }
-                Err(error) => {
-                    warn!(target: "acp.runner", session = %session_id, "control accept task failed: {error}");
-                }
-            }
+        terminate_runner = accept_loop => {
+            debug_assert!(terminate_runner);
+            // The daemon owns path cleanup after cancelling an incomplete
+            // handshake and may already have spawned a replacement. Never
+            // unlink that replacement here.
+            preserve_registry = true;
             let _ = agent_child.start_kill();
             let _ = agent_child.wait().await;
         }
@@ -540,9 +460,8 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
 
     watchdog_handle.abort();
     agent_stdout_task.abort();
-    control_accept_task.abort();
     if !preserve_registry {
-        worker_registry::delete(&session_id).ok();
+        worker_registry::delete_if_owned(&session_id, our_pid).ok();
     }
     Ok(())
 }
@@ -641,15 +560,9 @@ async fn self_terminate_agent_tree(
         "runner abandoned; terminating agent tree"
     );
 
-    // A superseded runner must NOT delete the registry/socket: those files
-    // now belong to the fresh runner that replaced us, and deleting them
-    // would make the new runner's own watchdog see "missing" and cascade.
-    // Every other reason means we still own them (or they're already gone),
-    // so cleanup is safe and clears a stale socket that would confuse
-    // attach.
-    if !matches!(reason, WatchdogShutdown::Superseded) {
-        worker_registry::delete(session_id).ok();
-    }
+    // Teardown can race a replacement after the watchdog's last registry
+    // observation. Delete only while the record still names this runner.
+    worker_registry::delete_if_owned(session_id, own_pid).ok();
 
     // Polite SIGTERM to the agent (node) so a cooperative adapter can
     // flush; the group SIGKILL below is the guarantee.
@@ -674,83 +587,59 @@ async fn self_terminate_agent_tree(
     }
 }
 
-/// State the accept loop and the agent-stdout fanout share. The active
-/// connection is the daemon's write-half of the socket; only one daemon
-/// is attached at a time.
+/// State the control accept loop and the agent-stdout fanout share. One
+/// daemon is attached at a time; the runner outlives all of them.
 struct RunnerShared {
-    /// The currently-attached daemon's send-side of the unix socket. The
-    /// fanout task writes agent → daemon notifications here when set.
-    active_outbound: Mutex<Option<tokio::net::unix::OwnedWriteHalf>>,
-    /// Ring of agent → daemon ndjson lines that arrived while no daemon
-    /// was attached. Drained into the next attached daemon's outbound.
-    pending: Mutex<VecDeque<Vec<u8>>>,
-    /// JSON-RPC request ids the agent issued to the daemon that have
-    /// not yet seen a response. Populated from agent → daemon traffic
-    /// (`method` + numeric `id`) and cleared on response (`id` only).
-    /// On daemon disconnect the runner synthesizes a response for every
-    /// outstanding request so the agent doesn't park forever on one the
-    /// new daemon can't answer (the responder oneshot died with the old
-    /// daemon's `pending_responders` map): a `cancelled` outcome for
-    /// `session/request_permission`, a JSON-RPC error for other methods.
-    /// See #1099.
-    outstanding_requests: Mutex<HashMap<i64, String>>,
-    /// JSON-RPC ids of daemon-issued `session/prompt` requests awaiting a
-    /// response. Populated from daemon to agent traffic; drained when the
-    /// matching response is seen on the agent to daemon path, which fires
-    /// a `PromptCompleted` control event. Lives on `RunnerShared` (not a
-    /// connection) so a prompt issued by one daemon still reports
-    /// completion to whichever daemon is attached when the agent
-    /// responds. Phase A of #1054.
+    /// JSON-RPC ids of daemon-issued prompts awaiting a response.
     prompt_requests: Mutex<HashSet<i64>>,
-    /// Control-channel outbound and the single completion buffered across
-    /// a no-daemon gap, under one lock so emit and attach are mutually
-    /// exclusive (no drain-then-set TOCTOU).
+    /// The ordered runner-to-daemon queue and active attachment identity.
     control: Mutex<ControlChannel>,
-    /// Mirror of `active_outbound.is_some()`, read lock-free by
-    /// `emit_control` to decide whether a completion is owned by a live
-    /// main-relay daemon (drop it) or occurred during a genuine no-daemon
-    /// gap (buffer it for the next control attach). Set/cleared alongside
-    /// `active_outbound`.
-    main_attached: std::sync::atomic::AtomicBool,
-    /// Advances when the active daemon's relay write half fails. The
-    /// connection reader watches this so a daemon that keeps only its write
-    /// half open cannot pin the sequential accept loop.
-    relay_failures: watch::Sender<u64>,
-    /// Runner-owned ACP handshake cache (#2976 Phase B). Populated the
-    /// first time a v2 daemon drives `initialize` / `session/new|load|fork`
-    /// through the control channel; replayed verbatim on every later
-    /// attach so the agent is handshaken exactly once.
+    /// Wakes the writer when frames arrive or queue space is released.
+    control_wake: tokio::sync::Notify,
+    /// Wakes producers waiting for the byte-bounded queue to make space.
+    control_space: tokio::sync::Notify,
+    /// Monotonic identity for daemon attachments. Connection-bound frames and
+    /// correlations are purged by this id on disconnect.
+    next_attachment_id: AtomicU64,
+    /// Runner-owned ACP handshake state, cached independently of any attach.
     handshake: Mutex<RunnerHandshake>,
-    /// Monotonic JSON-RPC id allocator for the requests the runner issues
-    /// to the agent on its own (`initialize`, `session/*`, `session/prompt`)
-    /// now that it owns the client side of the protocol. On the v2 path the
-    /// daemon still issues `set_mode` / `set_config_option` / `delete_session`
-    /// over the relay to the same agent via the crate connection, but the
-    /// crate allocates UUID-string request ids (`RequestId::Str`), so they
-    /// can never match the runner's integer ids (`parse_response_id` reads
-    /// `as_i64`, which is `None` for a string) and the two id spaces cannot
-    /// overlap. The high [`RUNNER_REQUEST_ID_BASE`] seed is defense in depth
-    /// in case the crate ever switches to integer ids.
+    /// Serializes handshake round trips without blocking stdout fanout.
+    handshake_gate: Mutex<()>,
+    /// Sole JSON-RPC id allocator for requests sent to the agent.
     next_req_id: AtomicI64,
-    /// Responders for runner-issued request/response round-trips awaited
-    /// inline (`initialize`, `session/*`). The stdout fanout routes a
-    /// matching response into the oneshot and swallows it instead of
-    /// forwarding it to the daemon. Prompt responses are NOT here; they use
-    /// the async `prompt_requests` path that fires `PromptCompleted`.
+    /// Inline handshake request responders.
     pending_client_responses: Mutex<HashMap<i64, tokio::sync::oneshot::Sender<serde_json::Value>>>,
-    /// Ids of daemon-issued relay `session/new` requests, keyed by the raw
-    /// JSON rendering of the id (the daemon's crate connection uses string
-    /// UUID ids, which the i64-based trackers above never match). A v2
-    /// daemon only sends `session/new` over the relay for a driven
-    /// conversation reset (#2979: a clear command on an adapter with no
-    /// native reset); the stdout fanout uses the tracked id to refresh the
-    /// cached handshake session from the response, so `ControlBody::Cancel`
-    /// and later cache replays address the fresh conversation instead of
-    /// the pre-reset one. The response itself still flows to the daemon.
-    relay_session_news: Mutex<HashSet<String>>,
+    /// Agent-to-daemon calls awaiting an answer from their originating attach.
+    pending_server_calls: Mutex<HashMap<u64, PendingServerCall>>,
+    /// Monotonic allocator for reverse-lane call ids.
+    next_call_id: AtomicU64,
+    /// Agent-bound requests issued for a specific daemon attachment.
+    pending_agent_calls: Mutex<HashMap<i64, PendingAgentCall>>,
+    /// Sent resets remain authoritative until their response is committed.
+    pending_resets: AtomicUsize,
+    reset_finished: tokio::sync::Notify,
+    /// Registry ownership used to commit session identity before success.
+    registry_owner: Option<(String, u32)>,
+    /// A durability failure makes further runner state unsafe to expose.
+    fatal: AtomicBool,
+    fatal_wake: tokio::sync::Notify,
 }
 
-/// Runner-owned ACP handshake state (#2976 Phase B).
+/// A reverse-lane call awaiting a daemon answer.
+struct PendingServerCall {
+    agent_id: serde_json::Value,
+    method: String,
+    attachment_id: u64,
+}
+
+/// A forward-lane call awaiting the agent answer for one attachment.
+struct PendingAgentCall {
+    call_id: u64,
+    attachment_id: u64,
+    method: String,
+}
+
+/// Runner-owned ACP handshake state.
 #[derive(Default)]
 struct RunnerHandshake {
     /// Cached raw `initialize` result once the runner has run it.
@@ -760,24 +649,95 @@ struct RunnerHandshake {
     session: Option<(String, serde_json::Value)>,
 }
 
-/// Control-channel state for the sibling `<id>.control.sock`. A single
-/// mutex covers both fields so `emit_control` (check outbound, else
-/// buffer) and `install_control_outbound` (drain buffer, set outbound)
-/// cannot interleave and strand a completion.
+/// Whether a queued frame may survive the daemon attachment that produced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryScope {
+    Persistent,
+    Attachment(u64),
+}
+
+/// Metadata needed for shedding and connection-scoped cleanup. The encoded
+/// bytes are the sole payload copy retained by the queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueuedKind {
+    Notify,
+    PromptStarted,
+    PromptCompleted,
+    Handshake,
+    ServerCall,
+    AgentReply,
+}
+
+struct QueuedControl {
+    id: u64,
+    scope: DeliveryScope,
+    kind: QueuedKind,
+    wire: Arc<[u8]>,
+}
+
 #[derive(Default)]
 struct ControlChannel {
-    /// Write half to the attached daemon, or None when detached.
-    outbound: Option<tokio::net::unix::OwnedWriteHalf>,
-    /// The one completion produced during a no-daemon gap, awaiting the
-    /// next control attach. ACP is serial per session, so at most one turn
-    /// is ever legitimately pending; a newer completion supersedes.
-    pending: Option<ControlBody>,
-    /// True while a v2 daemon (#2976 Phase B) holds the control channel.
-    /// The v2 channel is persistent: it carries the handshake and every
-    /// turn, so `emit_control` must retain the outbound after a
-    /// `PromptCompleted` write instead of the Phase A one-shot teardown
-    /// (which delivers a single adopted-turn completion and closes).
-    persistent: bool,
+    queue: VecDeque<QueuedControl>,
+    queued_bytes: usize,
+    active_attachment: Option<u64>,
+    next_entry_id: u64,
+    in_flight: Option<u64>,
+    /// Last flushed prompt completion, replayed until a newer prompt starts.
+    last_prompt_completion: Option<Arc<[u8]>>,
+}
+
+/// Bound both queue dimensions. One maximum-sized ACP frame must fit, while a
+/// detached runner must never retain an unbounded number of large JSON values.
+const MAX_CONTROL_QUEUE: usize = 4096;
+const MAX_CONTROL_QUEUE_BYTES: usize = 128 * 1024 * 1024;
+
+impl ControlChannel {
+    fn remove_at(&mut self, index: usize) -> QueuedControl {
+        let frame = self.queue.remove(index).expect("queue index exists");
+        self.queued_bytes = self.queued_bytes.saturating_sub(frame.wire.len());
+        frame
+    }
+
+    fn make_room(&mut self, incoming_bytes: usize) -> bool {
+        while self.queue.len() >= MAX_CONTROL_QUEUE
+            || self.queued_bytes.saturating_add(incoming_bytes) > MAX_CONTROL_QUEUE_BYTES
+        {
+            let Some(index) = self.queue.iter().position(|frame| {
+                frame.kind == QueuedKind::Notify && self.in_flight != Some(frame.id)
+            }) else {
+                return false;
+            };
+            self.remove_at(index);
+        }
+        true
+    }
+
+    fn push(&mut self, scope: DeliveryScope, kind: QueuedKind, wire: Arc<[u8]>) {
+        let id = self.next_entry_id;
+        self.next_entry_id = self.next_entry_id.wrapping_add(1);
+        self.queued_bytes += wire.len();
+        self.queue.push_back(QueuedControl {
+            id,
+            scope,
+            kind,
+            wire,
+        });
+    }
+
+    fn purge_attachment(&mut self, attachment_id: u64) {
+        let mut index = 0;
+        while index < self.queue.len() {
+            if self.queue[index].scope == DeliveryScope::Attachment(attachment_id) {
+                self.remove_at(index);
+            } else {
+                index += 1;
+            }
+        }
+        if self.active_attachment == Some(attachment_id) {
+            self.active_attachment = None;
+        }
+        self.in_flight = None;
+    }
 }
 
 /// JSON-RPC peek for outstanding-request tracking. Pulls only the
@@ -794,33 +754,49 @@ struct JsonRpcPeek {
 
 /// Method that gets a semantic `cancelled` outcome on disconnect. Every
 /// other outstanding method is answered with a generic JSON-RPC error
-/// (see `cancel_outstanding_requests`), so no request parks; only this
+/// (see `disconnect_control`), so no request parks; only this
 /// one needs a typed result because its `cancelled` outcome is a normal,
 /// non-error control-flow signal the agent expects.
 const PERMISSION_METHOD: &str = "session/request_permission";
 
+fn disconnected_server_call_outcome(
+    method: &str,
+) -> Result<serde_json::Value, control_protocol::JsonRpcError> {
+    if method == PERMISSION_METHOD {
+        Ok(serde_json::json!({ "outcome": { "outcome": "cancelled" } }))
+    } else {
+        Err(control_protocol::JsonRpcError::new(
+            control_protocol::DAEMON_GONE,
+            "daemon disconnected; request cancelled",
+        ))
+    }
+}
+
 /// The daemon-issued request whose response marks a turn complete. The
 /// runner tracks its id (seen on the daemon to agent path) and surfaces
 /// a native `PromptCompleted` when the matching response comes back on
-/// the agent to daemon path. Phase A of #1054.
+/// the agent to daemon path.
 const PROMPT_METHOD: &str = "session/prompt";
 
-/// Seed for the runner's own agent-bound JSON-RPC ids (#2976 Phase B). The
-/// crate `ConnectionTo` on the daemon side allocates UUID-string ids for
-/// the `set_mode` / `set_config_option` / `delete_session` requests it
-/// still sends over the relay on the v2 path, so those never collide with
-/// the runner's integer ids by construction. This high seed is only defense
-/// in depth against a future crate change to integer ids.
+/// Seed for the runner's own agent-bound JSON-RPC ids. Since #2977 retired
+/// the relay, the runner allocates EVERY id on the agent's stdin (handshake,
+/// turn, and the forward-lane methods the daemon requests), so this is the
+/// only id space there and collisions are impossible by construction. The
+/// high seed is a leftover guard from when the daemon also put ids on that
+/// wire; harmless to keep, and it makes runner-issued ids obvious in a log.
 const RUNNER_REQUEST_ID_BASE: i64 = 1 << 48;
 
-/// Deadline for a single control-channel frame write. `emit_control`
-/// holds the `control` mutex across the write and runs on the sole
-/// stdout-relay task, so an unbounded write to a stalled control peer (a
-/// slow reader or a full socket buffer) would freeze the mutex and the
-/// whole session's relay. Capping it bounds that blast radius; a timeout
-/// is treated as a write failure so the existing drop/buffer cleanup
-/// runs. Phase A of #1054.
+/// Deadline for a single control-channel frame write. Since #2977 the write
+/// happens on a dedicated writer task rather than under the queue lock, so a
+/// stalled peer no longer freezes the session; the cap is what stops that
+/// writer parking forever on a peer that accepted the connection and then
+/// stopped reading. A timeout is treated as a write failure, so the frame is
+/// requeued for the next attach.
 const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Maximum time a peer may hold the sole accept slot without proving it
+/// speaks the current control protocol.
+const CONTROL_ATTACH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Write a control frame with a bounded deadline. Returns `true` on a
 /// successful write, `false` on a write error or timeout; callers treat
@@ -839,176 +815,354 @@ async fn write_control_frame(
     )
 }
 
-/// Soft cap on `outstanding_requests`. Hit only if the daemon stops
-/// answering non-permission requests (which a healthy ACP daemon
-/// always does); a misbehaving daemon shouldn't be able to grow the
-/// map without bound across reconnects. When the cap trips we shed the
-/// non-permission entries first (permission cancellations are the
-/// semantically important ones to preserve for the disconnect sweep)
-/// and log once at warn so the leak is visible.
+/// Cap on reverse calls outstanding at once. Hit only if the daemon stops
+/// answering (a healthy one always does), so it exists to stop a wedged or
+/// misbehaving daemon growing `pending_server_calls` without bound across
+/// reconnects.
+///
+/// At the cap the runner REFUSES the new request with an error rather than
+/// evicting an existing entry. Evicting would drop the bookkeeping for a
+/// request the agent is already parked on, so nothing would ever answer it;
+/// refusing lets the agent's RPC layer resolve the id and move on.
 const MAX_OUTSTANDING_REQUESTS: usize = 1024;
 
-/// Cap on tracked daemon-issued relay `session/new` ids (driven
-/// conversation resets, #2979). Resets are user-paced and one-shot, so
-/// anything beyond a handful means responses stopped arriving; refuse
-/// new entries rather than growing without bound.
-const MAX_RELAY_SESSION_NEWS: usize = 8;
-
 impl RunnerShared {
-    fn new() -> Self {
+    fn new(registry_owner: Option<(String, u32)>) -> Self {
         Self {
-            active_outbound: Mutex::new(None),
-            pending: Mutex::new(VecDeque::with_capacity(NOTIFICATION_BUFFER_LINES)),
-            outstanding_requests: Mutex::new(HashMap::new()),
             prompt_requests: Mutex::new(HashSet::new()),
             control: Mutex::new(ControlChannel::default()),
-            main_attached: std::sync::atomic::AtomicBool::new(false),
-            relay_failures: watch::channel(0).0,
+            control_wake: tokio::sync::Notify::new(),
+            control_space: tokio::sync::Notify::new(),
+            next_attachment_id: AtomicU64::new(1),
             handshake: Mutex::new(RunnerHandshake::default()),
+            handshake_gate: Mutex::new(()),
             next_req_id: AtomicI64::new(RUNNER_REQUEST_ID_BASE),
             pending_client_responses: Mutex::new(HashMap::new()),
-            relay_session_news: Mutex::new(HashSet::new()),
+            pending_server_calls: Mutex::new(HashMap::new()),
+            next_call_id: AtomicU64::new(1),
+            pending_agent_calls: Mutex::new(HashMap::new()),
+            pending_resets: AtomicUsize::new(0),
+            reset_finished: tokio::sync::Notify::new(),
+            registry_owner,
+            fatal: AtomicBool::new(false),
+            fatal_wake: tokio::sync::Notify::new(),
         }
     }
 
-    /// Forward a line to the daemon if attached; else buffer. Returns
-    /// whether forwarding happened (false → buffered/consumed).
-    async fn deliver_line(&self, line: &[u8]) -> bool {
-        // #2976 Phase B: a response to a request the RUNNER issued
-        // (`initialize` / `session/*` during the runner-owned handshake) is
-        // consumed here and never forwarded to the daemon, which drives
-        // those over the control channel and would drop the stray response.
-        // Agent server->client requests (id + method) and notifications
-        // (no id) are not runner responses and fall through to the relay.
+    fn persist_acp_session_id(
+        &self,
+        acp_session_id: &str,
+    ) -> std::result::Result<(), control_protocol::JsonRpcError> {
+        let Some((session_id, owner_pid)) = self.registry_owner.as_ref() else {
+            return Ok(());
+        };
+        if let Err(error) =
+            worker_registry::update_stored_acp_session_id(session_id, *owner_pid, acp_session_id)
+        {
+            warn!(
+                target: "acp.runner",
+                session = %session_id,
+                %error,
+                "failed to persist ACP session identity; terminating runner"
+            );
+            self.fatal.store(true, Ordering::Release);
+            self.fatal_wake.notify_one();
+            return Err(control_protocol::JsonRpcError::new(
+                control_protocol::INTERNAL_ERROR,
+                format!("failed to persist ACP session identity: {error}"),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn fatal_triggered(&self) {
+        loop {
+            let notified = self.fatal_wake.notified();
+            if self.fatal.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+    /// Classify one agent stdout line and enqueue whatever the daemon needs.
+    async fn deliver_line(&self, line: &[u8], agent_stdin: &Mutex<tokio::process::ChildStdin>) {
         if let Some(id) = parse_response_id(line) {
             let responder = self.pending_client_responses.lock().await.remove(&id);
             if let Some(tx) = responder {
                 if let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) {
                     let _ = tx.send(value);
                 }
-                return false;
+                return;
             }
         }
 
-        // Peek-parse outgoing agent → daemon traffic to track outstanding
-        // requests. A line with both a numeric `id` and a `method` is a
-        // request the agent is making to the daemon; record it so we can
-        // synthesize a cancellation response if the daemon disconnects
-        // before answering. Notifications (no id) and responses (id but
-        // no method) are not requests; ignore them here.
-        if let Some((id, method)) = parse_request(line) {
-            let mut map = self.outstanding_requests.lock().await;
-            if map.len() >= MAX_OUTSTANDING_REQUESTS {
-                let before = map.len();
-                map.retain(|_, m| m.as_str() == PERMISSION_METHOD);
-                warn!(
-                    target: "acp.runner",
-                    before,
-                    after = map.len(),
-                    "outstanding_requests soft cap reached; evicted non-permission ids"
-                );
-            }
-            map.insert(id, method);
-        }
-
-        // Phase A #1054: if this is the agent's response to a tracked
-        // `session/prompt`, surface a native turn-complete over the
-        // control channel. Gated on actually tracking a prompt so a busy
-        // session does not JSON-parse every agent line twice (this on top
-        // of `note_daemon_response`). Independent of the byte-relay
-        // outbound below, since the control channel is a separate socket.
-        let prompt_completed = if !self.prompt_requests.lock().await.is_empty() {
+        if !self.prompt_requests.lock().await.is_empty() {
             if let Some((id, outcome)) = parse_response(line) {
                 if self.prompt_requests.lock().await.remove(&id) {
-                    Some(ControlBody::PromptCompleted {
-                        prompt_req_id: id,
-                        outcome,
-                    })
-                } else {
-                    None
+                    self.enqueue(
+                        DeliveryScope::Persistent,
+                        QueuedKind::PromptCompleted,
+                        ControlBody::PromptCompleted {
+                            prompt_req_id: id,
+                            outcome,
+                        },
+                    )
+                    .await;
+                    return;
                 }
-            } else {
-                None
             }
-        } else {
-            None
+        }
+
+        if let Some(id) = parse_response_id(line) {
+            let pending = self.pending_agent_calls.lock().await.remove(&id);
+            if let Some(pending) = pending {
+                let frame = match parse_agent_call_outcome(line) {
+                    Ok(result) => match self
+                        .refresh_session_from_reset(&pending.method, &result)
+                        .await
+                    {
+                        Ok(()) => ControlBody::AgentResult {
+                            call_id: pending.call_id,
+                            result,
+                        },
+                        Err(error) => ControlBody::AgentError {
+                            call_id: pending.call_id,
+                            error,
+                        },
+                    },
+                    Err(error) => ControlBody::AgentError {
+                        call_id: pending.call_id,
+                        error,
+                    },
+                };
+                if pending.method == "session/new" {
+                    self.finish_reset();
+                }
+                self.enqueue(
+                    DeliveryScope::Attachment(pending.attachment_id),
+                    QueuedKind::AgentReply,
+                    frame,
+                )
+                .await;
+                return;
+            }
+        }
+
+        if let Some((agent_id, method)) = parse_request_value_id(line) {
+            self.forward_server_call(agent_id, method, line, agent_stdin)
+                .await;
+            return;
+        }
+
+        if let Some((method, params)) = parse_notification(line) {
+            self.enqueue(
+                DeliveryScope::Persistent,
+                QueuedKind::Notify,
+                ControlBody::Notify { method, params },
+            )
+            .await;
+        }
+    }
+
+    /// Forward an agent-issued request only to the daemon attachment that was
+    /// active when it arrived. Capacity refusal is answered at the agent.
+    async fn forward_server_call(
+        &self,
+        agent_id: serde_json::Value,
+        method: String,
+        line: &[u8],
+        agent_stdin: &Mutex<tokio::process::ChildStdin>,
+    ) {
+        let params = serde_json::from_slice::<serde_json::Value>(line)
+            .ok()
+            .and_then(|mut v| v.get_mut("params").map(std::mem::take))
+            .unwrap_or(serde_json::Value::Null);
+        let call_id = self.next_call_id.fetch_add(1, Ordering::Relaxed);
+        let body = ControlBody::ServerCall {
+            call_id,
+            method: method.clone(),
+            params,
+        };
+        let wire: Arc<[u8]> = match control_protocol::encode_frame(&body) {
+            Ok(frame) => frame.into(),
+            Err(error) => {
+                warn!(target: "acp.runner", %error, "reverse call exceeds control frame limit");
+                self.answer_agent(
+                    agent_stdin,
+                    &agent_id,
+                    Err(control_protocol::JsonRpcError::new(
+                        control_protocol::DAEMON_GONE,
+                        "runner reverse call exceeds transport capacity",
+                    )),
+                )
+                .await;
+                return;
+            }
         };
 
-        // #2979: refresh the cached handshake session when this line answers
-        // a daemon-driven relay `session/new` (conversation reset). Gated on
-        // a non-empty tracking set so idle traffic isn't re-parsed; the
-        // response is forwarded to the daemon below either way.
-        self.refresh_session_cache_from_relay(line).await;
+        let mut channel = self.control.lock().await;
+        let Some(attachment_id) = channel.active_attachment else {
+            drop(channel);
+            self.answer_agent(
+                agent_stdin,
+                &agent_id,
+                disconnected_server_call_outcome(&method),
+            )
+            .await;
+            return;
+        };
+        let mut pending = self.pending_server_calls.lock().await;
+        if pending.len() >= MAX_OUTSTANDING_REQUESTS || !channel.make_room(wire.len()) {
+            warn!(
+                target: "acp.runner",
+                method = %method,
+                outstanding = pending.len(),
+                "reverse-call capacity reached; refusing the request"
+            );
+            drop(pending);
+            drop(channel);
+            self.answer_agent(
+                agent_stdin,
+                &agent_id,
+                Err(control_protocol::JsonRpcError::new(
+                    control_protocol::DAEMON_GONE,
+                    "runner reverse-call capacity exceeded",
+                )),
+            )
+            .await;
+            return;
+        }
 
-        let mut guard = self.active_outbound.lock().await;
-        if let Some(out) = guard.as_mut() {
-            if out.write_all(line).await.is_ok() && out.flush().await.is_ok() {
-                drop(guard);
-                if let Some(body) = prompt_completed {
-                    self.emit_control(body).await;
-                }
-                return true;
-            }
-            // Write failure: daemon side closed. Drop the writer and
-            // buffer this line for the next attach. Advance the failure
-            // signal while holding `active_outbound` so the reader cannot
-            // observe a half-updated attachment state.
-            *guard = None;
-            self.main_attached
-                .store(false, std::sync::atomic::Ordering::Relaxed);
-            self.relay_failures
-                .send_modify(|generation| *generation = generation.wrapping_add(1));
-        }
-        // Buffer while STILL holding `active_outbound`. Dropping it before
-        // locking `pending` opens a TOCTOU window: a reattaching
-        // `install_outbound` (which locks `active_outbound` then `pending`
-        // in the same order) could drain `pending` and install its writer in
-        // the gap, stranding this line until the next reattach. Holding the
-        // lock makes the "no live writer, so buffer" step atomic. Lock order
-        // is `active_outbound` then `pending` everywhere, so no deadlock.
-        let mut pending = self.pending.lock().await;
-        while pending.len() >= NOTIFICATION_BUFFER_LINES {
-            pending.pop_front();
-        }
-        pending.push_back(line.to_vec());
+        pending.insert(
+            call_id,
+            PendingServerCall {
+                agent_id,
+                method,
+                attachment_id,
+            },
+        );
+        channel.push(
+            DeliveryScope::Attachment(attachment_id),
+            QueuedKind::ServerCall,
+            wire,
+        );
         drop(pending);
-        // Keep replacement attach behind the completion decision so it cannot
-        // set `main_attached` and make `emit_control` discard this completion.
-        if let Some(body) = prompt_completed {
-            self.emit_control(body).await;
-        }
-        drop(guard);
-        false
+        drop(channel);
+        self.control_wake.notify_one();
     }
 
-    /// Peek-parse a daemon → agent line: if it's a response (id without
-    /// method) clear the matching outstanding request.
-    async fn note_daemon_response(&self, line: &[u8]) {
-        if let Some(id) = parse_response_id(line) {
-            self.outstanding_requests.lock().await.remove(&id);
-        }
-    }
-
-    /// On daemon disconnect, unblock every outstanding agent → daemon
-    /// request so the agent's stdio loop never parks on a responder that
-    /// died with the previous daemon. `session/request_permission` gets a
-    /// semantic `cancelled` outcome (the agent retries on the next prompt);
-    /// every other method gets a method-agnostic JSON-RPC error, which the
-    /// agent's RPC layer resolves by id without needing the method's typed
-    /// result shape, so no per-method synthesis (and its state-corruption
-    /// risk) is required.
-    async fn cancel_outstanding_requests(
+    async fn answer_agent(
         &self,
+        agent_stdin: &Mutex<tokio::process::ChildStdin>,
+        agent_id: &serde_json::Value,
+        outcome: Result<serde_json::Value, control_protocol::JsonRpcError>,
+    ) -> bool {
+        let response = match outcome {
+            Ok(result) => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": agent_id,
+                "result": result,
+            }),
+            Err(error) => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": agent_id,
+                "error": error,
+            }),
+        };
+        self.write_agent_line(agent_stdin, &response).await
+    }
+
+    async fn resolve_server_call(
+        &self,
+        agent_stdin: &Mutex<tokio::process::ChildStdin>,
+        attachment_id: u64,
+        call_id: u64,
+        outcome: Result<serde_json::Value, control_protocol::JsonRpcError>,
+        session_id: &str,
+    ) {
+        let pending = {
+            let mut pending = self.pending_server_calls.lock().await;
+            match pending.get(&call_id) {
+                Some(call) if call.attachment_id == attachment_id => pending.remove(&call_id),
+                _ => None,
+            }
+        };
+        let Some(pending) = pending else {
+            debug!(
+                target: "acp.runner",
+                session = %session_id,
+                call_id,
+                "ignoring answer for an unknown or detached reverse call"
+            );
+            return;
+        };
+        if !self
+            .answer_agent(agent_stdin, &pending.agent_id, outcome)
+            .await
+        {
+            warn!(
+                target: "acp.runner",
+                session = %session_id,
+                call_id,
+                method = %pending.method,
+                "agent stdin write failed answering a reverse call"
+            );
+        }
+    }
+
+    /// Purge every correlation and queued frame owned by one dead attachment.
+    async fn disconnect_control(
+        &self,
+        attachment_id: u64,
         agent_stdin: &Mutex<tokio::process::ChildStdin>,
         session_id: &str,
     ) {
-        let drained: Vec<(i64, String)> = {
-            let mut map = self.outstanding_requests.lock().await;
-            let drained: Vec<(i64, String)> = map.iter().map(|(id, m)| (*id, m.clone())).collect();
-            map.clear();
+        let drained = {
+            let mut channel = self.control.lock().await;
+            let mut pending = self.pending_server_calls.lock().await;
+            let ids: Vec<u64> = pending
+                .iter()
+                .filter_map(|(id, call)| (call.attachment_id == attachment_id).then_some(*id))
+                .collect();
+            let drained: Vec<_> = ids
+                .into_iter()
+                .filter_map(|id| pending.remove(&id).map(|call| (id, call)))
+                .collect();
+            self.pending_agent_calls.lock().await.retain(|_, call| {
+                call.attachment_id != attachment_id || call.method == "session/new"
+            });
+            channel.purge_attachment(attachment_id);
             drained
         };
+        self.control_space.notify_waiters();
+        if !drained.is_empty() {
+            info!(
+                target: "acp.runner",
+                session = %session_id,
+                count = drained.len(),
+                "synthesising responses for reverse calls on control disconnect"
+            );
+        }
+        for (_, pending) in drained {
+            if !self
+                .answer_agent(
+                    agent_stdin,
+                    &pending.agent_id,
+                    disconnected_server_call_outcome(&pending.method),
+                )
+                .await
+            {
+                warn!(target: "acp.runner", session = %session_id, "agent stdin write failed during disconnect cleanup");
+                break;
+            }
+        }
+    }
 
+    async fn abort_agent_calls(&self, session_id: &str) {
+        let drained: Vec<PendingAgentCall> = {
+            let mut map = self.pending_agent_calls.lock().await;
+            map.drain().map(|(_, pending)| pending).collect()
+        };
         if drained.is_empty() {
             return;
         }
@@ -1016,195 +1170,75 @@ impl RunnerShared {
             target: "acp.runner",
             session = %session_id,
             count = drained.len(),
-            "synthesising responses for outstanding requests on daemon disconnect"
+            "failing in-flight forward calls; agent is gone"
         );
-        // Drop these now-answered requests from the pending replay ring so a
-        // reattaching daemon is not handed a request the agent already saw
-        // resolved (which it would answer a second time). Notifications and
-        // any requests made after this sweep stay buffered and replay
-        // normally. A `deliver_line` racing between its outstanding-insert
-        // and its pending-push could still slip one request past this purge,
-        // but that is harmless: the agent's transport already resolved the
-        // id, so the duplicate response the new daemon sends is ignored.
-        let cancelled_ids: HashSet<i64> = drained.iter().map(|(id, _)| *id).collect();
-        {
-            let mut pending = self.pending.lock().await;
-            pending.retain(|line| match parse_request(line) {
-                Some((id, _)) => !cancelled_ids.contains(&id),
-                None => true,
-            });
+        for pending in drained {
+            if pending.method == "session/new" {
+                self.finish_reset();
+            }
+            self.enqueue(
+                DeliveryScope::Attachment(pending.attachment_id),
+                QueuedKind::AgentReply,
+                ControlBody::AgentError {
+                    call_id: pending.call_id,
+                    error: control_protocol::JsonRpcError::new(
+                        control_protocol::DAEMON_GONE,
+                        "agent exited before answering",
+                    ),
+                },
+            )
+            .await;
         }
-        let mut stdin = agent_stdin.lock().await;
-        for (id, method) in drained {
-            let response = if method == PERMISSION_METHOD {
-                // ACP `RequestPermissionResponse` with the `cancelled`
-                // outcome. The agent SDK unblocks its parked stdio loop on
-                // receipt and either retries on the next user prompt or
-                // surfaces a cancelled-tool-call event upstream.
-                serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": { "outcome": { "outcome": "cancelled" } }
-                })
-            } else {
-                // Method-agnostic JSON-RPC error. The agent's transport
-                // rejects the pending request by id; no typed result shape
-                // is guessed, so this is safe for fs/*, terminal/*, and any
-                // future method. Code -32001 is a server-defined error
-                // signalling the daemon went away.
-                serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "error": {
-                        "code": -32001,
-                        "message": "daemon disconnected; request cancelled"
+    }
+
+    /// Encode once and admit by exact wire bytes. Notifications may be shed;
+    /// correlation and completion frames apply backpressure instead.
+    async fn enqueue(&self, scope: DeliveryScope, kind: QueuedKind, body: ControlBody) -> bool {
+        let wire: Arc<[u8]> = match control_protocol::encode_frame(&body) {
+            Ok(frame) => frame.into(),
+            Err(error) => {
+                warn!(target: "acp.runner", %error, "dropping unrepresentable control frame");
+                return false;
+            }
+        };
+        loop {
+            let space = self.control_space.notified();
+            {
+                let mut channel = self.control.lock().await;
+                if let DeliveryScope::Attachment(attachment_id) = scope {
+                    if channel.active_attachment != Some(attachment_id) {
+                        return false;
                     }
-                })
-            };
-            let mut bytes = match serde_json::to_vec(&response) {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!(
-                        target: "acp.runner",
-                        session = %session_id,
-                        "failed to serialise cancellation for id {id}: {e}"
-                    );
-                    continue;
                 }
-            };
-            bytes.push(b'\n');
-            if stdin.write_all(&bytes).await.is_err() || stdin.flush().await.is_err() {
-                warn!(
-                    target: "acp.runner",
-                    session = %session_id,
-                    "agent stdin write failed during cancellation synthesis"
-                );
-                break;
-            }
-        }
-    }
-
-    /// Install the daemon's outbound write half. First drains the
-    /// pending ring into it so the reattaching daemon sees the gap's
-    /// notifications.
-    async fn install_outbound(
-        &self,
-        mut out: tokio::net::unix::OwnedWriteHalf,
-    ) -> Result<Option<tokio::net::unix::OwnedWriteHalf>, ()> {
-        // Hold `active_outbound` across the whole drain + install so a
-        // concurrent `deliver_line` (which locks `active_outbound` first,
-        // sees None, then buffers into `pending`) cannot slip a line into
-        // `pending` after we have drained it but before the writer is
-        // installed. Lock order is `active_outbound` then `pending`
-        // everywhere, so this cannot deadlock.
-        let mut guard = self.active_outbound.lock().await;
-        let prev = guard.take();
-        let mut pending = self.pending.lock().await;
-        while let Some(line) = pending.pop_front() {
-            if out.write_all(&line).await.is_err() || out.flush().await.is_err() {
-                // Drain failed mid-way, so push the remaining lines back
-                // and surface the write half as unusable. `active_outbound`
-                // stays None (via the earlier take), matching the old
-                // behavior of leaving no live writer on a failed attach.
-                pending.push_front(line);
-                self.main_attached
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
-                self.relay_failures
-                    .send_modify(|generation| *generation = generation.wrapping_add(1));
-                return Err(());
-            }
-        }
-        drop(pending);
-        *guard = Some(out);
-        self.main_attached
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        Ok(prev)
-    }
-
-    async fn clear_outbound(&self, preserve_completion: bool) {
-        *self.active_outbound.lock().await = None;
-        self.main_attached
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        // A main-relay disconnect starts a no-daemon gap. Drop any
-        // completion left un-drained from a prior gap so only the current
-        // gap's completion is ever replayed to the next resuming daemon.
-        if !preserve_completion {
-            self.control.lock().await.pending = None;
-        }
-    }
-
-    /// Peek a daemon to agent line: if it is a `session/prompt` request,
-    /// record its id so the matching response (agent to daemon) reports a
-    /// native turn-complete. Phase A of #1054.
-    async fn note_prompt_request(&self, line: &[u8]) {
-        if let Some((id, method)) = parse_request(line) {
-            if method == PROMPT_METHOD {
-                self.prompt_requests.lock().await.insert(id);
-            }
-        }
-    }
-
-    /// Deliver a control frame to the attached daemon, else buffer it for
-    /// the next control attach. Phase A delivers exactly one completion
-    /// per control attach (the adopted turn), so a successful live write
-    /// tears the outbound down: no later frame is written to a socket the
-    /// daemon has stopped reading. A completion is only buffered during a
-    /// genuine no-daemon gap; while a main-relay daemon is attached it
-    /// already owns that turn's completion via its own prompt future, so
-    /// buffering it would replay a stale completion onto a future adopted
-    /// turn. One lock over both fields keeps this mutually exclusive with
-    /// `install_control_outbound`.
-    async fn emit_control(&self, body: ControlBody) {
-        let mut ch = self.control.lock().await;
-        if let Some(out) = ch.outbound.as_mut() {
-            let ok = write_control_frame(out, &body).await;
-            // v2 (#2976): the control channel is persistent, so keep the
-            // outbound after a successful write to carry later turns. Phase
-            // A tears it down: it delivers one adopted-turn completion per
-            // attach and must never write to a socket the daemon stopped
-            // reading.
-            if ok {
-                if !ch.persistent {
-                    ch.outbound = None;
+                if channel.make_room(wire.len()) {
+                    channel.push(scope, kind, Arc::clone(&wire));
+                    drop(channel);
+                    self.control_wake.notify_one();
+                    return true;
                 }
-                return;
+                if kind == QueuedKind::Notify {
+                    return false;
+                }
             }
-            ch.outbound = None;
-            // Dead or stalled control socket. A control daemon had dialed
-            // in (this is the resume/adopted-turn path), so this completion
-            // is real and was not received: buffer it unconditionally for
-            // the next control attach to replay. Do NOT fall through to the
-            // main_attached gate, which would drop it (the write timing out
-            // is exactly when the fast path matters most). See PR #2975.
-            ch.pending = Some(body);
-            return;
+            space.await;
         }
-        // No control daemon was ever attached on this channel. Only buffer
-        // during a genuine no-daemon gap; while a main-relay daemon is
-        // attached it owns this turn's completion via its own prompt
-        // future, so buffering would replay a stale completion onto a
-        // future adopted turn.
-        if self
-            .main_attached
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            return;
-        }
-        ch.pending = Some(body);
     }
 
-    async fn clear_control_outbound(&self) {
-        let mut ch = self.control.lock().await;
-        ch.outbound = None;
-        ch.persistent = false;
+    async fn begin_attachment(&self) -> u64 {
+        let attachment_id = self.next_attachment_id.fetch_add(1, Ordering::Relaxed);
+        self.control.lock().await.active_attachment = Some(attachment_id);
+        self.control_wake.notify_one();
+        attachment_id
+    }
+    async fn cached_prompt_completion(&self) -> Option<Arc<[u8]>> {
+        self.control.lock().await.last_prompt_completion.clone()
     }
 
-    /// Install the v2 (#2976) control write half: greet with `Hello`, then
-    /// under the control lock mark the channel persistent, drain any
-    /// completion buffered across a no-daemon gap, and retain the outbound
-    /// so the handshake and every turn's `PromptCompleted` can be written
-    /// to it. Returns false if the initial `Hello` write failed.
-    async fn install_v2_control(
+    async fn clear_prompt_completion(&self) {
+        self.control.lock().await.last_prompt_completion = None;
+    }
+
+    async fn install_control(
         &self,
         out: &mut Option<tokio::net::unix::OwnedWriteHalf>,
         session_id: &str,
@@ -1213,25 +1247,48 @@ impl RunnerShared {
             control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
             session_id: session_id.to_string(),
         };
-        let mut w = out.take().expect("write half present");
-        if !write_control_frame(&mut w, &hello).await {
-            return false;
-        }
-        let pending = {
-            let mut ch = self.control.lock().await;
-            ch.persistent = true;
-            ch.pending.take()
-        };
-        if let Some(body) = pending {
-            if !write_control_frame(&mut w, &body).await {
-                self.control.lock().await.pending = Some(body);
-                return false;
-            }
-        }
-        self.control.lock().await.outbound = Some(w);
-        true
+        write_control_frame(out.as_mut().expect("write half present"), &hello).await
     }
 
+    async fn next_outbound(&self, attachment_id: u64) -> Option<(u64, Arc<[u8]>)> {
+        let mut channel = self.control.lock().await;
+        if channel.active_attachment != Some(attachment_id) || channel.in_flight.is_some() {
+            return None;
+        }
+        let (id, wire) = {
+            let frame = channel.queue.front()?;
+            (frame.id, Arc::clone(&frame.wire))
+        };
+        channel.in_flight = Some(id);
+        Some((id, wire))
+    }
+
+    async fn commit_outbound(&self, attachment_id: u64, entry_id: u64) {
+        let mut channel = self.control.lock().await;
+        if channel.active_attachment == Some(attachment_id)
+            && channel.in_flight == Some(entry_id)
+            && channel.queue.front().map(|frame| frame.id) == Some(entry_id)
+        {
+            if let Some(wire) = channel.queue.front().and_then(|frame| {
+                (frame.kind == QueuedKind::PromptCompleted).then(|| Arc::clone(&frame.wire))
+            }) {
+                channel.last_prompt_completion = Some(wire);
+            }
+            channel.remove_at(0);
+        }
+        if channel.in_flight == Some(entry_id) {
+            channel.in_flight = None;
+        }
+        drop(channel);
+        self.control_space.notify_waiters();
+    }
+
+    async fn release_outbound(&self, entry_id: u64) {
+        let mut channel = self.control.lock().await;
+        if channel.in_flight == Some(entry_id) {
+            channel.in_flight = None;
+        }
+    }
     /// Serialize a JSON value as one ndjson line to the agent's stdin.
     /// Returns false if serialization or the write failed.
     async fn write_agent_line(
@@ -1276,14 +1333,27 @@ impl RunnerShared {
 
     /// Issue a runner-owned `session/prompt` to the agent. The response is
     /// detected asynchronously by the stdout fanout (via `prompt_requests`),
-    /// which fires `PromptCompleted`. Returns the assigned request id, or
-    /// None if the write failed.
+    /// which fires `PromptCompleted`. Enqueue the attachment's `PromptStarted`
+    /// before the agent can answer. Returns the assigned request id, or None
+    /// if the attachment is gone or the write failed.
     async fn agent_prompt(
         &self,
         agent_stdin: &Mutex<tokio::process::ChildStdin>,
+        attachment_id: u64,
         params: serde_json::Value,
     ) -> Option<i64> {
         let id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
+        if !self
+            .enqueue(
+                DeliveryScope::Attachment(attachment_id),
+                QueuedKind::PromptStarted,
+                ControlBody::PromptStarted { prompt_req_id: id },
+            )
+            .await
+        {
+            return None;
+        }
+        self.clear_prompt_completion().await;
         self.prompt_requests.lock().await.insert(id);
         let req = serde_json::json!({
             "jsonrpc": "2.0",
@@ -1323,6 +1393,7 @@ impl RunnerShared {
         agent_stdin: &Mutex<tokio::process::ChildStdin>,
         request: serde_json::Value,
     ) -> Result<serde_json::Value, serde_json::Value> {
+        let _gate = self.handshake_gate.lock().await;
         if let Some(cached) = self.handshake.lock().await.initialized.clone() {
             return Ok(cached);
         }
@@ -1346,6 +1417,7 @@ impl RunnerShared {
         method: &str,
         request: serde_json::Value,
     ) -> Result<(String, serde_json::Value), serde_json::Value> {
+        let _gate = self.handshake_gate.lock().await;
         if let Some(cached) = self.handshake.lock().await.session.clone() {
             return Ok(cached);
         }
@@ -1355,9 +1427,41 @@ impl RunnerShared {
             .ok_or_else(|| transport_error(&format!("agent closed before answering {method}")))?;
         let result = handshake_result(&response)?;
         let acp_session_id = established_session_id(method, &request, &result)?;
+        self.persist_acp_session_id(&acp_session_id)
+            .map_err(|error| serde_json::to_value(error).expect("JSON-RPC error serializes"))?;
         let cached = (acp_session_id, result);
         self.handshake.lock().await.session = Some(cached.clone());
         Ok(cached)
+    }
+
+    fn finish_reset(&self) {
+        self.pending_resets.fetch_sub(1, Ordering::AcqRel);
+        self.reset_finished.notify_waiters();
+    }
+
+    /// Resolve a reattach against the agent state, not a stale registry snapshot.
+    /// The accept loop cannot admit another daemon until all requests from the
+    /// preceding attachment have been registered, so its sent resets are visible
+    /// here. Keep their count live through persistence and cache replacement.
+    async fn resume_session(&self) -> Result<(String, serde_json::Value), serde_json::Value> {
+        loop {
+            let finished = self.reset_finished.notified();
+            if self.pending_resets.load(Ordering::Acquire) == 0 {
+                if self.fatal.load(Ordering::Acquire) {
+                    return Err(transport_error(
+                        "runner session state could not be committed",
+                    ));
+                }
+                return self
+                    .handshake
+                    .lock()
+                    .await
+                    .session
+                    .clone()
+                    .ok_or_else(|| transport_error("runner has no established session to resume"));
+            }
+            finished.await;
+        }
     }
 
     /// The ACP session id the runner established, if any.
@@ -1369,82 +1473,91 @@ impl RunnerShared {
             .as_ref()
             .map(|(id, _)| id.clone())
     }
-
-    /// If a daemon re-sends a handshake request over the relay after the
-    /// runner already owns the session, answer it from cache instead of
-    /// forwarding a duplicate `initialize` / `session/*` to the
-    /// already-initialized agent. This guards the downgrade case where a v1
-    /// daemon (which drives the handshake over the relay) reattaches to a
-    /// runner a v2 daemon already handshook. Returns the synthesized
-    /// response line to send back to the daemon, or None to forward the
-    /// line to the agent unchanged.
-    async fn intercept_handshake(&self, line: &[u8]) -> Option<Vec<u8>> {
-        let (id, method) = parse_request(line)?;
-        let result = {
-            let hs = self.handshake.lock().await;
-            match method.as_str() {
-                "initialize" => hs.initialized.clone()?,
-                "session/new" | "session/load" | "session/fork" => {
-                    hs.session.as_ref().map(|(_, r)| r.clone())?
+    /// Issue a forward-lane request at the agent on one daemon attachment's
+    /// behalf. Responses from a detached caller are discarded, never replayed
+    /// into a later daemon whose correlation table cannot contain the call.
+    async fn issue_agent_call(
+        &self,
+        agent_stdin: &Mutex<tokio::process::ChildStdin>,
+        attachment_id: u64,
+        call_id: u64,
+        method: &str,
+        params: serde_json::Value,
+    ) {
+        let req_id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
+        if method == "session/new" {
+            self.pending_resets.fetch_add(1, Ordering::AcqRel);
+        }
+        self.pending_agent_calls.lock().await.insert(
+            req_id,
+            PendingAgentCall {
+                call_id,
+                attachment_id,
+                method: method.to_string(),
+            },
+        );
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": method,
+            "params": params,
+        });
+        if !self.write_agent_line(agent_stdin, &request).await {
+            if let Some(pending) = self.pending_agent_calls.lock().await.remove(&req_id) {
+                if pending.method == "session/new" {
+                    self.finish_reset();
                 }
-                _ => return None,
+            } else {
+                return; // The agent already answered while the write was finishing.
             }
-        };
-        let resp = serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result });
-        let mut bytes = serde_json::to_vec(&resp).ok()?;
-        bytes.push(b'\n');
-        Some(bytes)
+            self.enqueue(
+                DeliveryScope::Attachment(attachment_id),
+                QueuedKind::AgentReply,
+                ControlBody::AgentError {
+                    call_id,
+                    error: control_protocol::JsonRpcError::new(
+                        control_protocol::DAEMON_GONE,
+                        format!("agent stdin write failed for {method}"),
+                    ),
+                },
+            )
+            .await;
+        }
     }
 
-    /// Track a daemon-issued relay `session/new` for a driven conversation
-    /// reset (#2979), so its response can refresh the handshake cache.
-    /// The daemon's crate connection uses string UUID request ids, which
-    /// `intercept_handshake` / `parse_request` (i64-only) never match, so
-    /// the request passes through to the agent untouched; this only
-    /// records the id for the fanout to correlate. Bounded: at most a
-    /// handful of resets can ever be in flight, so a small cap guards
-    /// against ids whose responses never arrive.
-    async fn note_relay_session_new(&self, line: &[u8]) {
-        let Some((id_key, method)) = parse_request_any_id(line) else {
-            return;
-        };
+    /// Refresh the cached handshake session when a forward-lane response
+    /// carries a fresh `sessionId`, such as a conversation-reset `session/new`.
+    /// Only a successful response reaches here, so a failed reset leaves the
+    /// previous session cached and live.
+    async fn refresh_session_from_reset(
+        &self,
+        method: &str,
+        result: &serde_json::Value,
+    ) -> std::result::Result<(), control_protocol::JsonRpcError> {
         if method != "session/new" {
-            return;
+            return Ok(());
         }
-        let mut set = self.relay_session_news.lock().await;
-        if set.len() < MAX_RELAY_SESSION_NEWS {
-            set.insert(id_key);
-        }
-    }
-
-    /// If `line` answers a tracked relay `session/new`, refresh the cached
-    /// handshake session with the fresh `(sessionId, result)` so
-    /// `ControlBody::Cancel` and later cache replays address the post-reset
-    /// conversation. The response is NOT swallowed; the daemon still owns
-    /// it. An error response just clears the tracking (the reset failed and
-    /// the old session stays live).
-    async fn refresh_session_cache_from_relay(&self, line: &[u8]) {
-        if self.relay_session_news.lock().await.is_empty() {
-            return;
-        }
-        let Some((id_key, result)) = parse_response_any_id(line) else {
-            return;
+        let Some(sid) = result.get("sessionId").and_then(|value| value.as_str()) else {
+            return Ok(());
         };
-        if !self.relay_session_news.lock().await.remove(&id_key) {
-            return;
+        if self
+            .handshake
+            .lock()
+            .await
+            .session
+            .as_ref()
+            .is_some_and(|(current, _)| current == sid)
+        {
+            return Ok(());
         }
-        let Some(result) = result else {
-            return;
-        };
-        let Some(sid) = result.get("sessionId").and_then(|v| v.as_str()) else {
-            return;
-        };
+        self.persist_acp_session_id(sid)?;
         info!(
             target: "acp.runner",
             new_acp_session_id = %sid,
-            "daemon-driven session/new observed on the relay; refreshing handshake cache"
+            "daemon-driven session/new observed; refreshing handshake cache"
         );
-        self.handshake.lock().await.session = Some((sid.to_string(), result));
+        self.handshake.lock().await.session = Some((sid.to_string(), result.clone()));
+        Ok(())
     }
 }
 
@@ -1511,44 +1624,64 @@ fn transport_error(message: &str) -> serde_json::Value {
     serde_json::json!({ "code": -32603, "message": message })
 }
 
-/// Extract `(id, method)` from a JSON-RPC request line. Returns None
-/// for malformed lines, notifications (no id), responses (no method),
-/// and lines whose id is non-numeric (we only track i64 ids; ACP
-/// agents in practice always use numbers, and a fast peek doesn't
-/// have to model the entire JSON-RPC spec).
-fn parse_request(line: &[u8]) -> Option<(i64, String)> {
+/// Extract `(id, method)` from a JSON-RPC request line, yielding the id as
+/// the JSON value it actually is. The reverse lane has to echo the agent's
+/// own id back verbatim in the response envelope, and adapters differ: a
+/// numeric id must not come back as `"7"`, nor a string id as `7`. Returns
+/// None for notifications (no id), responses (no method), and malformed
+/// lines.
+fn parse_request_value_id(line: &[u8]) -> Option<(serde_json::Value, String)> {
     let peek: JsonRpcPeek = serde_json::from_slice(line).ok()?;
-    let id = peek.id?.as_i64()?;
+    let id = peek.id?;
     let method = peek.method?;
     Some((id, method))
 }
 
-/// Like [`parse_request`], but keys the id by its raw JSON rendering so
-/// string ids are covered too: the daemon's crate connection allocates
-/// UUID-string request ids, which the i64 trackers deliberately never
-/// match. Used to correlate a daemon-driven relay `session/new` (#2979)
-/// with its response.
-fn parse_request_any_id(line: &[u8]) -> Option<(String, String)> {
-    let peek: JsonRpcPeek = serde_json::from_slice(line).ok()?;
-    let id = peek.id?;
-    let method = peek.method?;
-    Some((id.to_string(), method))
-}
-
-/// Response counterpart of [`parse_request_any_id`]: `(id key, result)`,
-/// where `result` is `None` for an error envelope. Returns None for
-/// requests (a `method` is present), notifications (no id), and
-/// malformed lines.
-fn parse_response_any_id(line: &[u8]) -> Option<(String, Option<serde_json::Value>)> {
-    let peek: JsonRpcResponsePeek = serde_json::from_slice(line).ok()?;
-    if peek.method.is_some() {
+/// Parse an agent notification: a line with a `method` and no `id`. Yields
+/// the method and its params so the runner can forward it opaquely.
+fn parse_notification(line: &[u8]) -> Option<(String, serde_json::Value)> {
+    let mut value: serde_json::Value = serde_json::from_slice(line).ok()?;
+    if value.get("id").is_some_and(|id| !id.is_null()) {
         return None;
     }
-    let id = peek.id?;
-    if peek.error.is_some() {
-        return Some((id.to_string(), None));
+    let method = value.get("method")?.as_str()?.to_string();
+    let params = value
+        .get_mut("params")
+        .map(std::mem::take)
+        .unwrap_or(serde_json::Value::Null);
+    Some((method, params))
+}
+
+/// Split an agent response line into the forward-lane outcome: `Ok(result)`
+/// for a success envelope, `Err(error)` for an error envelope. A response
+/// carrying neither is treated as a null result, matching how the crate's
+/// transport handles an empty-body ack (`session/set_mode` answers `{}`).
+fn parse_agent_call_outcome(
+    line: &[u8],
+) -> Result<serde_json::Value, control_protocol::JsonRpcError> {
+    let mut value: serde_json::Value = match serde_json::from_slice(line) {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(control_protocol::JsonRpcError::new(
+                control_protocol::DAEMON_GONE,
+                format!("agent response was not JSON: {e}"),
+            ))
+        }
+    };
+    if let Some(error) = value.get_mut("error").map(std::mem::take) {
+        if !error.is_null() {
+            return Err(serde_json::from_value(error.clone()).unwrap_or_else(|_| {
+                control_protocol::JsonRpcError::new(
+                    control_protocol::DAEMON_GONE,
+                    format!("agent error envelope was malformed: {error}"),
+                )
+            }));
+        }
     }
-    Some((id.to_string(), peek.result))
+    Ok(value
+        .get_mut("result")
+        .map(std::mem::take)
+        .unwrap_or(serde_json::Value::Null))
 }
 
 /// Extract the response id from a JSON-RPC response line, i.e. a line
@@ -1568,7 +1701,7 @@ fn parse_response_id(line: &[u8]) -> Option<i64> {
 /// line *count*, not bytes. 64 MiB sits far above any legitimate ACP
 /// frame (large tool outputs, file contents, diffs) while still bounding
 /// memory.
-const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+const MAX_FRAME_BYTES: usize = control_protocol::MAX_AGENT_FRAME_BYTES;
 
 /// Read one newline-terminated NDJSON frame into `buf`, bounded to
 /// `MAX_FRAME_BYTES`. Returns `Ok(0)` at EOF, `Ok(n)` for an `n`-byte
@@ -1622,7 +1755,7 @@ struct JsonRpcResponsePeek {
 #[derive(Deserialize)]
 struct JsonRpcErrorPeek {
     #[serde(default)]
-    code: i64,
+    code: i32,
     #[serde(default)]
     message: String,
     #[serde(default)]
@@ -1664,20 +1797,21 @@ fn parse_response(line: &[u8]) -> Option<(i64, PromptOutcome)> {
 async fn fanout_agent_stdout(
     stdout: tokio::process::ChildStdout,
     shared: Arc<RunnerShared>,
+    agent_stdin: Arc<Mutex<tokio::process::ChildStdin>>,
     session_id: String,
 ) {
     let mut reader = BufReader::with_capacity(STDOUT_READ_BUF, stdout);
     let mut line = Vec::with_capacity(4096);
     loop {
         // read_frame_bounded preserves the trailing newline, which ndjson
-        // consumers (the daemon's ACP transport) need, and caps frame size.
+        // consumers need, and caps frame size.
         match read_frame_bounded(&mut reader, &mut line).await {
             Ok(0) => {
                 debug!(target: "acp.runner", session = %session_id, "agent stdout EOF");
                 break;
             }
             Ok(_) => {
-                shared.deliver_line(&line).await;
+                shared.deliver_line(&line, &agent_stdin).await;
             }
             Err(e) => {
                 warn!(target: "acp.runner", session = %session_id, "stdout read error: {e}");
@@ -1685,103 +1819,63 @@ async fn fanout_agent_stdout(
             }
         }
     }
+    // The agent is gone. Fail every forward call the daemon is awaiting, so
+    // it surfaces an error rather than parking on a response that will never
+    // come.
+    shared.abort_agent_calls(&session_id).await;
 }
 
-/// Handle one daemon connection: install its write half, then pump
-/// inbound lines (daemon → agent stdin) until the socket closes. Reads
-/// line-by-line so the runner can peek-parse responses and clear the
-/// outstanding-requests map; without that, the cancellation-on-detach
-/// sweep wouldn't know which ids the daemon has already answered.
-async fn handle_connection(
-    stream: UnixStream,
+/// Drain the outbound queue to one daemon attachment. Queue ownership remains
+/// with the runner until a full socket write and flush succeeds. A disconnect
+/// before that point leaves the exact front entry available to the next attach.
+async fn run_control_writer(
+    mut out: tokio::net::unix::OwnedWriteHalf,
     shared: Arc<RunnerShared>,
-    agent_stdin: Arc<Mutex<tokio::process::ChildStdin>>,
     session_id: String,
+    attachment_id: u64,
+    mut shutdown: watch::Receiver<bool>,
 ) {
-    let (read_half, write_half) = stream.into_split();
-    let mut relay_failures = shared.relay_failures.subscribe();
-    let relay_generation = *relay_failures.borrow_and_update();
-    let prev = match shared.install_outbound(write_half).await {
-        Ok(prev) => prev,
-        Err(()) => {
-            shared
-                .cancel_outstanding_requests(&agent_stdin, &session_id)
-                .await;
-            shared.clear_outbound(true).await;
+    loop {
+        if *shutdown.borrow() {
             return;
         }
-    };
-    if prev.is_some() {
-        debug!(
-            target: "acp.runner",
-            session = %session_id,
-            "evicting prior daemon outbound (concurrent attach)"
-        );
-    }
-
-    let mut reader = BufReader::with_capacity(STDOUT_READ_BUF, read_half);
-    let mut line = Vec::with_capacity(4096);
-    let mut relay_failed = false;
-    loop {
-        let read = tokio::select! {
-            biased;
-            changed = relay_failures.changed() => {
-                if changed.is_ok() {
-                    relay_failed = true;
+        while let Some((entry_id, wire)) = shared.next_outbound(attachment_id).await {
+            let written = tokio::select! {
+                biased;
+                _ = shutdown.changed() => {
+                    shared.release_outbound(entry_id).await;
+                    return;
                 }
-                break;
+                result = tokio::time::timeout(
+                    CONTROL_WRITE_TIMEOUT,
+                    control_protocol::write_encoded_frame(&mut out, &wire),
+                ) => matches!(result, Ok(Ok(()))),
+            };
+            if !written {
+                warn!(
+                    target: "acp.runner",
+                    session = %session_id,
+                    "control write failed or timed out; retaining frame for the next attach"
+                );
+                shared.release_outbound(entry_id).await;
+                return;
             }
-            read = read_frame_bounded(&mut reader, &mut line) => read,
-        };
-        match read {
-            Ok(0) => break, // EOF: daemon closed the connection.
-            Ok(_) => {
-                // #2976: once the runner owns the session, answer a relay
-                // handshake re-send from cache rather than double-initialize
-                // the agent (v1-daemon downgrade reattach).
-                if let Some(synth) = shared.intercept_handshake(&line).await {
-                    shared.deliver_line(&synth).await;
-                    continue;
-                }
-                shared.note_daemon_response(&line).await;
-                shared.note_prompt_request(&line).await;
-                // #2979: a daemon-driven conversation reset issues
-                // `session/new` over the relay (string id, so the i64
-                // trackers above ignore it); record it so the fanout can
-                // refresh the cached handshake session from the response.
-                shared.note_relay_session_new(&line).await;
-                let mut stdin = agent_stdin.lock().await;
-                if stdin.write_all(&line).await.is_err() || stdin.flush().await.is_err() {
-                    warn!(
-                        target: "acp.runner",
-                        session = %session_id,
-                        "agent stdin write failed; agent likely exited"
-                    );
-                    break;
-                }
-            }
-            Err(e) => {
-                warn!(target: "acp.runner", session = %session_id, "daemon read error: {e}");
-                break;
-            }
+            shared.commit_outbound(attachment_id, entry_id).await;
+        }
+        tokio::select! {
+            _ = shared.control_wake.notified() => {}
+            _ = shutdown.changed() => return,
         }
     }
-    // Daemon disconnected. Synthesize responses for any outstanding
-    // agent → daemon requests so the agent's stdio loop unblocks instead
-    // of waiting forever on a responder that died with the previous
-    // daemon (permission requests get a `cancelled` outcome, everything
-    // else a JSON-RPC error).
-    shared
-        .cancel_outstanding_requests(&agent_stdin, &session_id)
-        .await;
-    relay_failed |= *relay_failures.borrow() != relay_generation;
-    shared.clear_outbound(relay_failed).await;
 }
 
-enum ControlRead {
-    Frame(ControlBody),
-    Closed,
-    Failed(String),
+enum HandshakeCommand {
+    Initialize(serde_json::Value),
+    ResumeSession,
+    EstablishSession {
+        method: String,
+        request: serde_json::Value,
+    },
 }
 
 async fn await_handshake_or_control_loss<T>(
@@ -1799,21 +1893,10 @@ async fn await_handshake_or_control_loss<T>(
     }
 }
 
-/// Handle one control-channel connection (#2976 Phase B). Greets with
-/// `Hello`, installs the persistent write half (draining any completion
-/// buffered across a no-daemon gap), then drives the runner-owned protocol:
-///
-/// - `Initialize` / `EstablishSession` run (or replay from cache) the ACP
-///   handshake against the agent and answer with `Initialized` /
-///   `SessionReady` (or `HandshakeFailed`).
-/// - `Prompt` / `Cancel` issue a runner-owned `session/prompt` /
-///   `session/cancel`; the turn's `PromptCompleted` is fired
-///   asynchronously by the stdout fanout, so this loop does not block on it.
-///
-/// A v1 daemon never dials the control channel (it sees `Hello`'s v2
-/// version and falls back to the relay + resume-idle watchdog), so this
-/// loop only ever serves a v2 daemon; the read simply ends at EOF when the
-/// daemon detaches.
+/// Handle one v3 control-channel attachment. Reads directly from the socket,
+/// which applies transport backpressure instead of treating a valid burst as a
+/// protocol failure. The writer is supervised in every socket-read wait, so a
+/// stalled peer releases the serial accept slot when its write deadline fires.
 async fn handle_control_connection(
     stream: UnixStream,
     shared: Arc<RunnerShared>,
@@ -1822,104 +1905,249 @@ async fn handle_control_connection(
 ) -> bool {
     let (mut read_half, write_half) = stream.into_split();
     let mut write_half = Some(write_half);
-    if !shared
-        .install_v2_control(&mut write_half, &session_id)
-        .await
-    {
-        shared.clear_control_outbound().await;
+    if !shared.install_control(&mut write_half, &session_id).await {
         return false;
     }
 
-    let (frame_tx, mut frame_rx) = mpsc::channel(8);
-    let (control_closed_tx, mut control_closed_rx) = watch::channel(false);
-    let reader_session = session_id.clone();
-    let frame_reader = tokio::spawn(async move {
-        loop {
-            match control_protocol::read_frame(&mut read_half).await {
-                Ok(Some(frame)) => match frame_tx.try_send(ControlRead::Frame(frame)) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Closed(_)) => return,
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        warn!(target: "acp.runner", session = %reader_session, "control command queue exceeded capacity");
-                        let _ = control_closed_tx.send(true);
+    let attach = tokio::time::timeout(
+        CONTROL_ATTACH_TIMEOUT,
+        control_protocol::read_frame(&mut read_half),
+    )
+    .await;
+    match attach {
+        Ok(Ok(Some(ControlBody::Attach {
+            control_protocol_version,
+        }))) if control_protocol_version == control_protocol::CONTROL_PROTOCOL_VERSION => {}
+        Ok(Ok(Some(ControlBody::Attach {
+            control_protocol_version,
+        }))) => {
+            warn!(
+                target: "acp.runner",
+                session = %session_id,
+                daemon_version = control_protocol_version,
+                runner_version = control_protocol::CONTROL_PROTOCOL_VERSION,
+                "daemon attached with a mismatched control version; refusing the connection"
+            );
+            return false;
+        }
+        Ok(Ok(Some(frame))) => {
+            warn!(target: "acp.runner", session = %session_id, ?frame, "first daemon frame was not Attach");
+            return false;
+        }
+        Ok(Ok(None)) => return false,
+        Ok(Err(error)) => {
+            warn!(target: "acp.runner", session = %session_id, "failed to read Attach: {error}");
+            return false;
+        }
+        Err(_) => {
+            warn!(target: "acp.runner", session = %session_id, "timed out waiting for Attach");
+            return false;
+        }
+    }
+
+    if let Some(wire) = shared.cached_prompt_completion().await {
+        let replayed = matches!(
+            tokio::time::timeout(
+                CONTROL_WRITE_TIMEOUT,
+                control_protocol::write_encoded_frame(
+                    write_half.as_mut().expect("write half present"),
+                    &wire,
+                ),
+            )
+            .await,
+            Ok(Ok(()))
+        );
+        if !replayed {
+            return false;
+        }
+    }
+
+    let attachment_id = shared.begin_attachment().await;
+    let (writer_shutdown_tx, writer_shutdown_rx) = watch::channel(false);
+    let mut writer = tokio::spawn(run_control_writer(
+        write_half
+            .take()
+            .expect("write half present after greeting"),
+        Arc::clone(&shared),
+        session_id.clone(),
+        attachment_id,
+        writer_shutdown_rx,
+    ));
+    let mut writer_finished = false;
+
+    let (control_closed_tx, control_closed_rx) = watch::channel(false);
+    let handshake_complete = Arc::new(std::sync::atomic::AtomicBool::new(
+        shared.acp_session_id().await.is_some(),
+    ));
+    let (handshake_tx, mut handshake_rx) = mpsc::channel(8);
+    let handshake_shared = Arc::clone(&shared);
+    let handshake_stdin = Arc::clone(&agent_stdin);
+    let handshake_done = Arc::clone(&handshake_complete);
+    let handshake_session = session_id.clone();
+    let handshake_worker = tokio::spawn(async move {
+        let mut control_closed = control_closed_rx;
+        while let Some(command) = handshake_rx.recv().await {
+            let frame = match command {
+                HandshakeCommand::Initialize(request) => {
+                    let Some(result) = await_handshake_or_control_loss(
+                        &mut control_closed,
+                        handshake_shared.run_or_replay_initialize(&handshake_stdin, request),
+                    )
+                    .await
+                    else {
                         return;
+                    };
+                    match result {
+                        Ok(result) => ControlBody::Initialized { result },
+                        Err(error) => {
+                            warn!(target: "acp.runner", session = %handshake_session, "initialize failed: {error}");
+                            ControlBody::HandshakeFailed { error }
+                        }
                     }
-                },
-                Ok(None) => {
-                    let _ = frame_tx.try_send(ControlRead::Closed);
-                    let _ = control_closed_tx.send(true);
-                    return;
                 }
-                Err(error) => {
-                    let _ = frame_tx.try_send(ControlRead::Failed(error.to_string()));
-                    let _ = control_closed_tx.send(true);
-                    return;
+                HandshakeCommand::ResumeSession => {
+                    let Some(result) = await_handshake_or_control_loss(
+                        &mut control_closed,
+                        handshake_shared.resume_session(),
+                    )
+                    .await
+                    else {
+                        return;
+                    };
+                    match result {
+                        Ok((acp_session_id, result)) => ControlBody::SessionReady {
+                            acp_session_id,
+                            result,
+                        },
+                        Err(error) => ControlBody::HandshakeFailed { error },
+                    }
                 }
-            }
+                HandshakeCommand::EstablishSession { method, request } => {
+                    let Some(result) = await_handshake_or_control_loss(
+                        &mut control_closed,
+                        handshake_shared.run_or_replay_session(&handshake_stdin, &method, request),
+                    )
+                    .await
+                    else {
+                        return;
+                    };
+                    match result {
+                        Ok((acp_session_id, result)) => {
+                            handshake_done.store(true, Ordering::Release);
+                            ControlBody::SessionReady {
+                                acp_session_id,
+                                result,
+                            }
+                        }
+                        Err(error) => {
+                            warn!(target: "acp.runner", session = %handshake_session, "{method} failed: {error}");
+                            ControlBody::HandshakeFailed { error }
+                        }
+                    }
+                }
+            };
+            handshake_shared
+                .enqueue(
+                    DeliveryScope::Attachment(attachment_id),
+                    QueuedKind::Handshake,
+                    frame,
+                )
+                .await;
         }
     });
 
-    let mut handshake_complete = shared.acp_session_id().await.is_some();
     let terminate_runner = 'connection: loop {
-        let body = match frame_rx.recv().await {
-            Some(ControlRead::Frame(frame)) => frame,
-            Some(ControlRead::Closed) | None => break 'connection !handshake_complete,
-            Some(ControlRead::Failed(error)) => {
-                warn!(target: "acp.runner", session = %session_id, "control read error: {error}");
-                break 'connection !handshake_complete;
+        let body = tokio::select! {
+            result = &mut writer => {
+                writer_finished = true;
+                if let Err(error) = result {
+                    warn!(target: "acp.runner", session = %session_id, "control writer task failed: {error}");
+                }
+                break 'connection false;
+            }
+            result = control_protocol::read_frame(&mut read_half) => match result {
+                Ok(Some(frame)) => frame,
+                Ok(None) => break 'connection !handshake_complete.load(Ordering::Acquire),
+                Err(error) => {
+                    warn!(target: "acp.runner", session = %session_id, "control read error: {error}");
+                    break 'connection !handshake_complete.load(Ordering::Acquire);
+                }
             }
         };
         match body {
-            ControlBody::Attach { .. } => {}
             ControlBody::Initialize { request } => {
-                let Some(result) = await_handshake_or_control_loss(
-                    &mut control_closed_rx,
-                    shared.run_or_replay_initialize(&agent_stdin, request),
-                )
-                .await
-                else {
-                    break 'connection true;
-                };
-                let frame = match result {
-                    Ok(result) => ControlBody::Initialized { result },
-                    Err(error) => {
-                        warn!(target: "acp.runner", session = %session_id, "initialize failed: {error}");
-                        ControlBody::HandshakeFailed { error }
+                let send = handshake_tx.send(HandshakeCommand::Initialize(request));
+                tokio::pin!(send);
+                let sent = tokio::select! {
+                    result = &mut writer => {
+                        writer_finished = true;
+                        if let Err(error) = result {
+                            warn!(target: "acp.runner", session = %session_id, "control writer task failed: {error}");
+                        }
+                        false
                     }
+                    result = &mut send => result.is_ok(),
                 };
-                shared.emit_control(frame).await;
+                if !sent {
+                    break 'connection false;
+                }
+            }
+            ControlBody::ResumeSession => {
+                let send = handshake_tx.send(HandshakeCommand::ResumeSession);
+                tokio::pin!(send);
+                let sent = tokio::select! {
+                    result = &mut writer => {
+                        writer_finished = true;
+                        if let Err(error) = result {
+                            warn!(target: "acp.runner", session = %session_id, "control writer task failed: {error}");
+                        }
+                        false
+                    }
+                    result = &mut send => result.is_ok(),
+                };
+                if !sent {
+                    break 'connection false;
+                }
             }
             ControlBody::EstablishSession { method, request } => {
-                let Some(result) = await_handshake_or_control_loss(
-                    &mut control_closed_rx,
-                    shared.run_or_replay_session(&agent_stdin, &method, request),
-                )
-                .await
-                else {
-                    break 'connection true;
-                };
-                let frame = match result {
-                    Ok((acp_session_id, result)) => {
-                        handshake_complete = true;
-                        ControlBody::SessionReady {
-                            acp_session_id,
-                            result,
+                let send =
+                    handshake_tx.send(HandshakeCommand::EstablishSession { method, request });
+                tokio::pin!(send);
+                let sent = tokio::select! {
+                    result = &mut writer => {
+                        writer_finished = true;
+                        if let Err(error) = result {
+                            warn!(target: "acp.runner", session = %session_id, "control writer task failed: {error}");
                         }
+                        false
                     }
-                    Err(error) => {
-                        warn!(target: "acp.runner", session = %session_id, "{method} failed: {error}");
-                        ControlBody::HandshakeFailed { error }
-                    }
+                    result = &mut send => result.is_ok(),
                 };
-                shared.emit_control(frame).await;
+                if !sent {
+                    break 'connection false;
+                }
             }
             ControlBody::Prompt { request } => {
-                if shared.agent_prompt(&agent_stdin, request).await.is_none() {
-                    warn!(
-                        target: "acp.runner",
-                        session = %session_id,
-                        "prompt write to agent failed; likely exited"
-                    );
+                let prompt = shared.agent_prompt(&agent_stdin, attachment_id, request);
+                tokio::pin!(prompt);
+                let prompt_id = tokio::select! {
+                    result = &mut writer => {
+                        writer_finished = true;
+                        if let Err(error) = result {
+                            warn!(target: "acp.runner", session = %session_id, "control writer task failed: {error}");
+                        }
+                        // Release admission backpressure without cancelling an
+                        // in-progress NDJSON write to the agent. Full correlation
+                        // cleanup below may itself need the agent stdin lock.
+                        shared.control.lock().await.purge_attachment(attachment_id);
+                        shared.control_space.notify_waiters();
+                        let _ = prompt.await;
+                        break 'connection false;
+                    }
+                    result = &mut prompt => result,
+                };
+                if prompt_id.is_none() {
+                    warn!(target: "acp.runner", session = %session_id, "prompt write to agent failed");
                 }
             }
             ControlBody::Cancel => {
@@ -1927,15 +2155,53 @@ async fn handle_control_connection(
                     shared.agent_cancel(&agent_stdin, &acp_session_id).await;
                 }
             }
-            // Runner -> daemon frames should never arrive here; ignore.
+            ControlBody::ServerResult { call_id, result } => {
+                shared
+                    .resolve_server_call(
+                        &agent_stdin,
+                        attachment_id,
+                        call_id,
+                        Ok(result),
+                        &session_id,
+                    )
+                    .await;
+            }
+            ControlBody::ServerError { call_id, error } => {
+                shared
+                    .resolve_server_call(
+                        &agent_stdin,
+                        attachment_id,
+                        call_id,
+                        Err(error),
+                        &session_id,
+                    )
+                    .await;
+            }
+            ControlBody::AgentCall {
+                call_id,
+                method,
+                params,
+            } => {
+                shared
+                    .issue_agent_call(&agent_stdin, attachment_id, call_id, &method, params)
+                    .await;
+            }
             _ => {}
         }
     };
-    frame_reader.abort();
-    shared.clear_control_outbound().await;
+
+    let _ = control_closed_tx.send(true);
+    if !writer_finished {
+        let _ = writer_shutdown_tx.send(true);
+        let _ = writer.await;
+    }
+    shared
+        .disconnect_control(attachment_id, &agent_stdin, &session_id)
+        .await;
+    drop(handshake_tx);
+    let _ = handshake_worker.await;
     terminate_runner
 }
-
 fn spawn_agent(
     args: &AcpRunnerArgs,
 ) -> Result<(
@@ -2145,72 +2411,100 @@ fn open_log_file(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn parse_request_extracts_id_and_method() {
-        let line =
-            br#"{"jsonrpc":"2.0","id":42,"method":"session/request_permission","params":{}}"#;
-        let parsed = parse_request(line);
-        assert_eq!(parsed, Some((42, "session/request_permission".into())));
+    /// A `RunnerShared` plus a real agent stdin to write into.
+    ///
+    /// `cat` is the stand-in agent: the runner only ever writes to stdin
+    /// here, and piping it back out on stdout gives the test a way to read
+    /// exactly what was written without a fake ACP agent. The child is
+    /// returned so the caller keeps it alive and can drain it.
+    async fn shared_with_stdin() -> (
+        Arc<RunnerShared>,
+        Mutex<tokio::process::ChildStdin>,
+        tokio::process::Child,
+    ) {
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cat");
+        let stdin = child.stdin.take().expect("stdin piped");
+        (Arc::new(RunnerShared::new(None)), Mutex::new(stdin), child)
+    }
+
+    /// Everything currently queued for the daemon, oldest first.
+    async fn queued(shared: &RunnerShared) -> Vec<ControlBody> {
+        let channel = shared.control.lock().await;
+        channel
+            .queue
+            .iter()
+            .map(|entry| {
+                serde_json::from_slice(&entry.wire[4..])
+                    .expect("queued control frame is valid JSON")
+            })
+            .collect()
+    }
+
+    /// Read back whatever the runner wrote to the agent's stdin.
+    ///
+    /// Reads until the echo goes quiet rather than until EOF: the caller
+    /// still holds the stdin half (some tests write again afterwards), so
+    /// `cat` never sees EOF and `read_to_end` would block forever. The writes
+    /// under test are flushed before this is called, so one quiet window is
+    /// enough to have seen all of them.
+    async fn read_agent_stdin(child: &mut tokio::process::Child) -> String {
+        use tokio::io::AsyncReadExt;
+        let out = child.stdout.as_mut().expect("stdout piped");
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        while let Ok(Ok(n)) =
+            tokio::time::timeout(Duration::from_millis(150), out.read(&mut chunk)).await
+        {
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        String::from_utf8(buf).expect("utf8")
     }
 
     #[test]
-    fn parse_request_returns_none_for_notifications() {
-        let line = br#"{"jsonrpc":"2.0","method":"session/update","params":{}}"#;
-        assert_eq!(parse_request(line), None);
-    }
-
-    #[test]
-    fn parse_request_returns_none_for_responses() {
-        let line = br#"{"jsonrpc":"2.0","id":7,"result":{}}"#;
-        assert_eq!(parse_request(line), None);
-    }
-
-    #[test]
-    fn parse_request_skips_non_numeric_ids() {
-        // String ids exist in the JSON-RPC spec but ACP agents emit
-        // numeric ids in practice. The peek skips strings rather than
-        // misclassifying them.
-        let line = br#"{"jsonrpc":"2.0","id":"abc","method":"foo","params":{}}"#;
-        assert_eq!(parse_request(line), None);
-    }
-
-    #[test]
-    fn parse_request_any_id_covers_string_and_numeric_ids() {
-        // The daemon's crate connection uses UUID-string ids, which the
-        // i64 peek above skips; the any-id variant keys them by their raw
-        // JSON rendering so a relay session/new (#2979) can be tracked.
-        let line = br#"{"jsonrpc":"2.0","id":"abc","method":"session/new","params":{}}"#;
-        assert_eq!(
-            parse_request_any_id(line),
-            Some(("\"abc\"".into(), "session/new".into()))
-        );
-        let line = br#"{"jsonrpc":"2.0","id":9,"method":"session/new","params":{}}"#;
-        assert_eq!(
-            parse_request_any_id(line),
-            Some(("9".into(), "session/new".into()))
-        );
-        assert_eq!(
-            parse_request_any_id(br#"{"jsonrpc":"2.0","method":"session/update","params":{}}"#),
-            None
-        );
-    }
-
-    #[test]
-    fn parse_response_any_id_returns_result_and_flags_errors() {
-        let ok = br#"{"jsonrpc":"2.0","id":"abc","result":{"sessionId":"sid-2"}}"#;
-        let (id, result) = parse_response_any_id(ok).expect("response parses");
-        assert_eq!(id, "\"abc\"");
-        assert_eq!(
-            result.and_then(|r| r.get("sessionId").cloned()),
-            Some(serde_json::json!("sid-2"))
-        );
-        let err = br#"{"jsonrpc":"2.0","id":"abc","error":{"code":-32603,"message":"x"}}"#;
-        assert_eq!(parse_response_any_id(err), Some(("\"abc\"".into(), None)));
-        // Requests and notifications are not responses.
-        assert_eq!(
-            parse_response_any_id(br#"{"jsonrpc":"2.0","id":1,"method":"m","params":{}}"#),
-            None
-        );
+    fn parse_request_value_id_covers_id_shapes_and_non_requests() {
+        let j = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+        /// `(line, expected (id, method))`.
+        type Case = (&'static [u8], Option<(serde_json::Value, String)>);
+        let cases: Vec<Case> = vec![
+            // Numeric id: the common shape.
+            (
+                br#"{"jsonrpc":"2.0","id":7,"method":"fs/read_text_file","params":{}}"#,
+                Some((j("7"), "fs/read_text_file".into())),
+            ),
+            // A string id must survive as a string. The relay-era parser
+            // keyed ids by their JSON rendering, which was fine as a map key
+            // but would have echoed `"abc"` back to the agent as the literal
+            // 5-character string including quotes.
+            (
+                br#"{"jsonrpc":"2.0","id":"abc","method":"terminal/create","params":{}}"#,
+                Some((j(r#""abc""#), "terminal/create".into())),
+            ),
+            // Notification: no id.
+            (
+                br#"{"jsonrpc":"2.0","method":"session/update","params":{}}"#,
+                None,
+            ),
+            // Response: no method.
+            (br#"{"jsonrpc":"2.0","id":7,"result":{}}"#, None),
+            // Malformed.
+            (b"not json", None),
+        ];
+        for (line, expected) in cases {
+            assert_eq!(
+                parse_request_value_id(line),
+                expected,
+                "{}",
+                String::from_utf8_lossy(line)
+            );
+        }
     }
 
     #[test]
@@ -2295,57 +2589,33 @@ mod tests {
         }
     }
 
-    /// #2979: a daemon-driven relay `session/new` (conversation reset)
-    /// must refresh the runner's cached handshake session so
+    /// #2979, re-homed onto the forward lane: a conversation-reset
+    /// `session/new` must refresh the cached handshake session so
     /// `ControlBody::Cancel` and later cache replays address the fresh
-    /// conversation, not the pre-reset one. An error response leaves the
-    /// cache untouched (the reset failed; the old session stays live).
+    /// conversation, not the pre-reset one. A response with no `sessionId`
+    /// leaves the cache alone (the reset failed; the old session stays live).
     #[tokio::test]
-    async fn relay_session_new_response_refreshes_handshake_cache() {
-        let shared = RunnerShared::new();
+    async fn reset_refresh_only_follows_a_response_carrying_a_session_id() {
+        let shared = RunnerShared::new(None);
         shared.handshake.lock().await.session =
             Some(("sid-1".into(), serde_json::json!({ "sessionId": "sid-1" })));
 
         shared
-            .note_relay_session_new(
-                br#"{"jsonrpc":"2.0","id":"uuid-1","method":"session/new","params":{"cwd":"/p"}}"#,
-            )
-            .await;
-        shared
-            .refresh_session_cache_from_relay(
-                br#"{"jsonrpc":"2.0","id":"uuid-1","result":{"sessionId":"sid-2"}}"#,
-            )
-            .await;
+            .refresh_session_from_reset("session/new", &serde_json::json!({"sessionId": "sid-2"}))
+            .await
+            .unwrap();
         assert_eq!(
             shared.acp_session_id().await.as_deref(),
             Some("sid-2"),
-            "the cache must follow the daemon-driven reset"
+            "the cache follows the reset"
         );
 
-        // Error response: tracked id is consumed but the cache keeps the
-        // last-established session.
+        // An ack with no session id (set_mode, steering, a failed reset) must
+        // not disturb the established session.
         shared
-            .note_relay_session_new(
-                br#"{"jsonrpc":"2.0","id":"uuid-2","method":"session/new","params":{"cwd":"/p"}}"#,
-            )
-            .await;
-        shared
-            .refresh_session_cache_from_relay(
-                br#"{"jsonrpc":"2.0","id":"uuid-2","error":{"code":-32603,"message":"boom"}}"#,
-            )
-            .await;
-        assert_eq!(shared.acp_session_id().await.as_deref(), Some("sid-2"));
-        assert!(
-            shared.relay_session_news.lock().await.is_empty(),
-            "tracked ids are one-shot"
-        );
-
-        // An untracked response never rewrites the cache.
-        shared
-            .refresh_session_cache_from_relay(
-                br#"{"jsonrpc":"2.0","id":"uuid-3","result":{"sessionId":"sid-9"}}"#,
-            )
-            .await;
+            .refresh_session_from_reset("session/set_mode", &serde_json::json!({}))
+            .await
+            .unwrap();
         assert_eq!(shared.acp_session_id().await.as_deref(), Some("sid-2"));
     }
 
@@ -2369,7 +2639,7 @@ mod tests {
 
     #[test]
     fn parse_helpers_tolerate_malformed_json() {
-        assert_eq!(parse_request(b"not json"), None);
+        assert_eq!(parse_request_value_id(b"not json"), None);
         assert_eq!(parse_response_id(b"not json"), None);
         assert_eq!(parse_response(b"not json"), None);
     }
@@ -2418,361 +2688,540 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parse_request_detects_prompt() {
-        let line = br#"{"jsonrpc":"2.0","id":11,"method":"session/prompt","params":{}}"#;
-        assert_eq!(parse_request(line), Some((11, PROMPT_METHOD.into())));
-    }
-
-    /// The core Phase A invariant: a tracked `session/prompt` request id,
-    /// seen on the daemon to agent path, produces a `PromptCompleted`
-    /// control event when the matching response arrives on the agent to
-    /// daemon path. With no control daemon attached (and no main daemon
-    /// attached, i.e. a genuine gap) the event is buffered in
-    /// `control.pending`, which is exactly the mid-restart case the change
-    /// exists to cover.
+    /// The core turn-complete invariant, now end to end through the runner's
+    /// own prompt path: `agent_prompt` allocates and tracks the id, and the
+    /// matching agent response queues a `PromptCompleted`.
     #[tokio::test]
-    async fn prompt_response_emits_completed_control_event() {
-        let shared = RunnerShared::new();
-        let prompt = br#"{"jsonrpc":"2.0","id":5,"method":"session/prompt","params":{}}
-"#;
-        shared.note_prompt_request(prompt).await;
-        assert!(shared.prompt_requests.lock().await.contains(&5));
+    async fn prompt_response_queues_completed_control_event() {
+        let (shared, stdin, _child) = shared_with_stdin().await;
+        let attachment_id = shared.begin_attachment().await;
+        let id = shared
+            .agent_prompt(&stdin, attachment_id, serde_json::json!({"sessionId": "s"}))
+            .await
+            .expect("prompt written");
+        assert!(shared.prompt_requests.lock().await.contains(&id));
 
-        let resp = br#"{"jsonrpc":"2.0","id":5,"result":{"stopReason":"end_turn"}}
-"#;
-        shared.deliver_line(resp).await;
+        let resp = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"stopReason\":\"end_turn\"}}}}\n"
+        );
+        shared.deliver_line(resp.as_bytes(), &stdin).await;
 
-        // The prompt id is drained and a completion event is buffered.
         assert!(shared.prompt_requests.lock().await.is_empty());
         assert_eq!(
-            shared.control.lock().await.pending,
-            Some(ControlBody::PromptCompleted {
-                prompt_req_id: 5,
-                outcome: PromptOutcome::Completed {
-                    stop_reason: Some("end_turn".into()),
+            queued(&shared).await,
+            vec![
+                ControlBody::PromptStarted { prompt_req_id: id },
+                ControlBody::PromptCompleted {
+                    prompt_req_id: id,
+                    outcome: PromptOutcome::Completed {
+                        stop_reason: Some("end_turn".into()),
+                    },
                 },
-            })
+            ]
         );
     }
 
-    /// The gate: a completion produced while a main-relay daemon is
-    /// attached is owned by that daemon's own prompt future, so it must
-    /// NOT be buffered (buffering would replay it onto a future adopted
-    /// turn, prematurely stopping it). See PR #2975 review.
+    /// The ordering guarantee: notifications and
+    /// the turn's completion share one FIFO queue in agent-stdout order, so
+    /// a `Stopped` can never reach the daemon ahead of the chunks that
+    /// preceded it.
     #[tokio::test]
-    async fn completion_not_buffered_while_main_daemon_attached() {
-        let shared = RunnerShared::new();
-        shared
-            .main_attached
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let prompt = br#"{"jsonrpc":"2.0","id":8,"method":"session/prompt","params":{}}
-"#;
-        shared.note_prompt_request(prompt).await;
-        let resp = br#"{"jsonrpc":"2.0","id":8,"result":{"stopReason":"end_turn"}}
-"#;
-        shared.deliver_line(resp).await;
-        assert!(
-            shared.control.lock().await.pending.is_none(),
-            "a live main-relay daemon owns the completion; nothing should buffer"
+    async fn notifications_stay_ahead_of_the_completion_that_followed_them() {
+        let (shared, stdin, _child) = shared_with_stdin().await;
+        let attachment_id = shared.begin_attachment().await;
+        let id = shared
+            .agent_prompt(&stdin, attachment_id, serde_json::json!({"sessionId": "s"}))
+            .await
+            .expect("prompt written");
+
+        for text in ["first", "second"] {
+            let line = format!(
+                "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"text\":\"{text}\"}}}}\n"
+            );
+            shared.deliver_line(line.as_bytes(), &stdin).await;
+        }
+        let resp = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"stopReason\":\"end_turn\"}}}}\n"
         );
+        shared.deliver_line(resp.as_bytes(), &stdin).await;
+
+        let q = queued(&shared).await;
+        assert!(matches!(q.as_slice(), [
+            ControlBody::PromptStarted { prompt_req_id: started_id },
+            ControlBody::Notify { .. },
+            ControlBody::Notify { .. },
+            ControlBody::PromptCompleted { prompt_req_id: completed_id, .. },
+        ] if *started_id == id && *completed_id == id));
     }
 
     #[tokio::test]
-    async fn prompt_completion_survives_main_relay_write_failure() {
-        use std::sync::atomic::Ordering;
-
-        let shared = RunnerShared::new();
-        let (peer, ours) = tokio::net::UnixStream::pair().unwrap();
-        drop(peer);
-        let (_read, write) = ours.into_split();
-        *shared.active_outbound.lock().await = Some(write);
-        shared.main_attached.store(true, Ordering::Relaxed);
-
-        shared
-            .note_prompt_request(
-                br#"{"jsonrpc":"2.0","id":9,"method":"session/prompt","params":{}}"#,
-            )
-            .await;
-        let response = br#"{"jsonrpc":"2.0","id":9,"result":{"stopReason":"end_turn"}}
-"#;
-        assert!(!shared.deliver_line(response).await);
-
-        assert!(!shared.main_attached.load(Ordering::Relaxed));
-        assert_eq!(
-            shared.control.lock().await.pending,
-            Some(ControlBody::PromptCompleted {
-                prompt_req_id: 9,
-                outcome: PromptOutcome::Completed {
-                    stop_reason: Some("end_turn".into()),
-                },
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn replacement_attach_cannot_overtake_failed_prompt_completion() {
-        use std::sync::atomic::Ordering;
-        use tokio::io::AsyncReadExt;
-
-        let shared = Arc::new(RunnerShared::new());
-        let (closed_daemon, failed_runner) = UnixStream::pair().expect("failed relay pair");
-        drop(closed_daemon);
-        let (_failed_read, failed_write) = failed_runner.into_split();
-        *shared.active_outbound.lock().await = Some(failed_write);
-        shared.main_attached.store(true, Ordering::Relaxed);
-        shared
-            .note_prompt_request(
-                br#"{"jsonrpc":"2.0","id":10,"method":"session/prompt","params":{}}"#,
-            )
-            .await;
-
-        let control = shared.control.lock().await;
-        let mut failures = shared.relay_failures.subscribe();
-        let response = br#"{"jsonrpc":"2.0","id":10,"result":{"stopReason":"end_turn"}}
-"#;
-        let delivery = {
-            let shared = Arc::clone(&shared);
-            tokio::spawn(async move { shared.deliver_line(response).await })
-        };
-        failures.changed().await.expect("relay failure signal");
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if shared
-                    .pending
-                    .lock()
-                    .await
-                    .back()
-                    .is_some_and(|line| line == response)
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
+    async fn prompt_start_precedes_agent_write_and_is_not_replayed() {
+        let (shared, stdin, mut child) = shared_with_stdin().await;
+        let attachment_id = shared.begin_attachment().await;
+        let stdin_guard = stdin.lock().await;
+        let prompt =
+            shared.agent_prompt(&stdin, attachment_id, serde_json::json!({"sessionId": "s"}));
+        tokio::pin!(prompt);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(prompt.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
         })
-        .await
-        .expect("failed response buffered");
-
-        let (replacement_daemon, replacement_runner) =
-            UnixStream::pair().expect("replacement relay pair");
-        let (mut replacement_read, _replacement_write) = replacement_daemon.into_split();
-        let (_runner_read, replacement_write) = replacement_runner.into_split();
-        let (replacement_started_tx, replacement_started_rx) = tokio::sync::oneshot::channel();
-        let replacement = {
-            let shared = Arc::clone(&shared);
-            tokio::spawn(async move {
-                replacement_started_tx
-                    .send(())
-                    .expect("replacement start receiver");
-                shared.install_outbound(replacement_write).await
-            })
+        .await;
+        let frames = queued(&shared).await;
+        let [ControlBody::PromptStarted { prompt_req_id }] = frames.as_slice() else {
+            panic!(
+                "prompt correlation must be queued while the agent write is blocked: {frames:?}"
+            );
         };
-        replacement_started_rx
-            .await
-            .expect("replacement install task starts");
-        assert!(
-            !replacement.is_finished(),
-            "replacement attach must wait for completion preservation"
-        );
-        assert!(!shared.main_attached.load(Ordering::Relaxed));
+        drop(stdin_guard);
+        assert_eq!(prompt.await, Some(*prompt_req_id));
+        let written = read_agent_stdin(&mut child).await;
+        let request: serde_json::Value = serde_json::from_str(written.trim()).unwrap();
+        assert_eq!(request["id"], *prompt_req_id);
+        assert_eq!(request["method"], PROMPT_METHOD);
 
-        drop(control);
-        assert!(!delivery.await.expect("failed response delivery task"));
-        assert!(replacement
+        shared.disconnect_control(attachment_id, &stdin, "s").await;
+        let _new_attachment = shared.begin_attachment().await;
+        let response = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{prompt_req_id},\"result\":{{\"stopReason\":\"end_turn\"}}}}\n"
+        );
+        shared.deliver_line(response.as_bytes(), &stdin).await;
+        assert_eq!(
+            queued(&shared).await,
+            vec![ControlBody::PromptCompleted {
+                prompt_req_id: *prompt_req_id,
+                outcome: PromptOutcome::Completed {
+                    stop_reason: Some("end_turn".into()),
+                },
+            }],
+            "only the durable completion may reach the replacement attachment"
+        );
+        assert!(shared
+            .agent_prompt(&stdin, attachment_id, serde_json::json!({}))
             .await
-            .expect("replacement install task")
-            .expect("replacement relay installs")
             .is_none());
-        let mut replayed = vec![0; response.len()];
-        replacement_read
-            .read_exact(&mut replayed)
-            .await
-            .expect("read buffered response");
-        assert_eq!(replayed, response);
-        assert!(shared.main_attached.load(Ordering::Relaxed));
-        assert_eq!(
-            shared.control.lock().await.pending,
-            Some(ControlBody::PromptCompleted {
-                prompt_req_id: 10,
-                outcome: PromptOutcome::Completed {
-                    stop_reason: Some("end_turn".into()),
-                },
-            })
-        );
+        assert!(read_agent_stdin(&mut child).await.is_empty());
     }
 
+    /// An agent-issued request becomes a `ServerCall` with a stable id, and
+    /// the agent's own id is retained so the eventual answer can echo it.
     #[tokio::test]
-    async fn relay_failure_preempts_ready_stale_daemon_frame() {
-        use tokio::io::AsyncReadExt;
+    async fn agent_request_becomes_a_server_call() {
+        let (shared, stdin, _child) = shared_with_stdin().await;
+        let _attachment_id = shared.begin_attachment().await;
+        let req = br#"{"jsonrpc":"2.0","id":"req-1","method":"fs/read_text_file","params":{"path":"/tmp/x"}}
+"#;
+        shared.deliver_line(req, &stdin).await;
 
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg("cat")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("spawn agent stdin fixture");
-        let agent_stdin = Arc::new(Mutex::new(child.stdin.take().expect("agent stdin")));
-        let mut agent_stdout = child.stdout.take().expect("agent stdout");
-        let shared = Arc::new(RunnerShared::new());
-        let (daemon, runner) = UnixStream::pair().expect("relay socket pair");
-        let handler = tokio::spawn(handle_connection(
-            runner,
-            Arc::clone(&shared),
-            Arc::clone(&agent_stdin),
-            "fixture-session".into(),
-        ));
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !shared.main_attached.load(Ordering::Relaxed) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("relay handler installs outbound within timeout");
-
-        // Mirror relay write failure state, then make the failure notification
-        // and a stale inbound frame ready without yielding to the handler.
-        drop(shared.active_outbound.lock().await.take());
-        shared.main_attached.store(false, Ordering::Relaxed);
-        shared
-            .relay_failures
-            .send_modify(|generation| *generation = generation.wrapping_add(1));
-        let stale = b"stale daemon frame\n";
-        assert_eq!(
-            daemon.try_write(stale).expect("queue stale frame"),
-            stale.len()
-        );
-
-        handler.await.expect("connection handler");
-        drop(daemon);
-        let agent_stdin =
-            Arc::try_unwrap(agent_stdin).unwrap_or_else(|_| panic!("handler retained agent stdin"));
-        drop(agent_stdin.into_inner());
-        let mut forwarded = Vec::new();
-        agent_stdout
-            .read_to_end(&mut forwarded)
-            .await
-            .expect("read agent fixture output");
-        child.wait().await.expect("agent fixture exits");
-        assert!(
-            forwarded.is_empty(),
-            "relay failure must prevent stale daemon input from reaching agent stdin"
-        );
-    }
-
-    /// Regression for PR #2975: when a live control write fails (dead or
-    /// stalled socket), the completion must be buffered for the next attach
-    /// rather than dropped through the `main_attached` gate. A control
-    /// daemon had dialed in, so the completion is real and unreceived.
-    #[tokio::test]
-    async fn emit_control_buffers_on_write_failure_even_when_main_attached() {
-        use std::sync::atomic::Ordering;
-
-        let shared = RunnerShared::new();
-        // A control outbound whose peer is gone: writes to it fail. For an
-        // AF_UNIX stream, a write after the peer closes returns an error
-        // rather than buffering, so this is deterministic.
-        let (peer, ours) = tokio::net::UnixStream::pair().unwrap();
-        drop(peer);
-        let (_r, w) = ours.into_split();
-        shared.control.lock().await.outbound = Some(w);
-        // Main relay attached: the pre-fix code would drop here.
-        shared.main_attached.store(true, Ordering::Relaxed);
-
-        let body = ControlBody::PromptCompleted {
-            prompt_req_id: 9,
-            outcome: PromptOutcome::Completed {
-                stop_reason: Some("end_turn".into()),
-            },
+        let q = queued(&shared).await;
+        let ControlBody::ServerCall {
+            call_id,
+            method,
+            params,
+        } = &q[0]
+        else {
+            panic!("expected a ServerCall, got {q:?}");
         };
-        shared.emit_control(body.clone()).await;
-
-        let ch = shared.control.lock().await;
-        assert!(ch.outbound.is_none(), "a failed write clears the outbound");
-        assert_eq!(
-            ch.pending,
-            Some(body),
-            "completion buffered despite main_attached, not dropped through the gate"
-        );
+        assert_eq!(method, "fs/read_text_file");
+        assert_eq!(params, &serde_json::json!({"path": "/tmp/x"}));
+        let pending = shared.pending_server_calls.lock().await;
+        let entry = pending.get(call_id).expect("call is tracked");
+        assert_eq!(entry.agent_id, serde_json::json!("req-1"));
+        assert_eq!(entry.method, "fs/read_text_file");
     }
 
-    /// A response id the runner never tracked as a prompt (e.g. a reply to
-    /// an fs/terminal request) must not produce a completion event.
+    /// A reverse call still outstanding when the daemon drops must be
+    /// answered toward the agent, never replayed: `session/request_permission`
+    /// gets the semantic `cancelled` outcome and everything else a JSON-RPC
+    /// error, so the agent's stdio loop cannot park on a daemon that is gone.
+    /// This is the #1099 safety net, re-homed onto the control channel.
     #[tokio::test]
-    async fn untracked_response_emits_nothing() {
-        let shared = RunnerShared::new();
-        let resp = br#"{"jsonrpc":"2.0","id":77,"result":{}}
-"#;
-        shared.deliver_line(resp).await;
-        assert!(shared.control.lock().await.pending.is_none());
+    async fn control_disconnect_cancels_reverse_calls_rather_than_replaying() {
+        for (method, expect_cancelled) in [
+            (PERMISSION_METHOD, true),
+            ("fs/write_text_file", false),
+            ("terminal/create", false),
+        ] {
+            let (shared, stdin, mut child) = shared_with_stdin().await;
+            let attachment_id = shared.begin_attachment().await;
+            let req = format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"{method}\",\"params\":{{}}}}\n"
+            );
+            shared.deliver_line(req.as_bytes(), &stdin).await;
+            assert_eq!(shared.pending_server_calls.lock().await.len(), 1);
+
+            shared
+                .disconnect_control(attachment_id, &stdin, "s-1")
+                .await;
+
+            assert!(
+                shared.pending_server_calls.lock().await.is_empty(),
+                "{method}: the sweep drains the map"
+            );
+            assert!(
+                !queued(&shared)
+                    .await
+                    .iter()
+                    .any(|frame| matches!(frame, ControlBody::ServerCall { .. })),
+                "{method}: the queued call must not survive to be replayed"
+            );
+            let assert_response = |sent: &serde_json::Value, id: i64| {
+                assert_eq!(sent["id"], serde_json::json!(id), "{method}: id is echoed");
+                if expect_cancelled {
+                    assert_eq!(
+                        sent["result"],
+                        serde_json::json!({"outcome": {"outcome": "cancelled"}}),
+                        "permission gets the semantic cancelled outcome"
+                    );
+                } else {
+                    assert_eq!(
+                        sent["error"]["code"],
+                        serde_json::json!(control_protocol::DAEMON_GONE),
+                        "{method}: gets a method-agnostic error"
+                    );
+                }
+            };
+            let written = read_agent_stdin(&mut child).await;
+            let sent: serde_json::Value =
+                serde_json::from_str(written.trim()).expect("a response line was written");
+            assert_response(&sent, 42);
+
+            // A request emitted after disconnect is cancelled at insertion,
+            // never queued for the next daemon. The terminal/create row proves
+            // a side-effecting call cannot execute twice through replay.
+            let late = format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":43,\"method\":\"{method}\",\"params\":{{}}}}\n"
+            );
+            shared.deliver_line(late.as_bytes(), &stdin).await;
+            assert!(shared.pending_server_calls.lock().await.is_empty());
+            assert!(!queued(&shared)
+                .await
+                .iter()
+                .any(|frame| matches!(frame, ControlBody::ServerCall { .. })));
+            let written = read_agent_stdin(&mut child).await;
+            let sent: serde_json::Value =
+                serde_json::from_str(written.trim()).expect("a detached response line was written");
+            assert_response(&sent, 43);
+        }
     }
 
-    /// `deliver_line` populates the outstanding-requests map on the
-    /// agent → daemon request path; `note_daemon_response` removes it
-    /// on the daemon → agent reply path. The map is the source of
-    /// truth for `cancel_outstanding_requests`, so this covers the
-    /// bookkeeping invariant directly.
+    /// Past the cap the runner refuses the request outright instead of
+    /// evicting its bookkeeping. Evicting would leave the agent parked
+    /// forever on an id nothing will ever answer.
     #[tokio::test]
-    async fn outstanding_requests_tracked_and_cleared() {
-        let shared = RunnerShared::new();
-        let req = br#"{"jsonrpc":"2.0","id":1,"method":"session/request_permission","params":{}}
-"#;
-        // No active outbound: line just gets buffered, but the peek
-        // path still runs.
-        shared.deliver_line(req).await;
-        assert_eq!(
-            shared.outstanding_requests.lock().await.get(&1),
-            Some(&"session/request_permission".to_string())
-        );
-
-        let resp = br#"{"jsonrpc":"2.0","id":1,"result":{"outcome":{"outcome":"selected","optionId":"allow"}}}
-"#;
-        shared.note_daemon_response(resp).await;
-        assert!(shared.outstanding_requests.lock().await.is_empty());
-    }
-
-    /// Soft-cap protection against an unanswered-non-permission flood.
-    /// Permission ids must survive the eviction; everything else is
-    /// fair game so the permission-cancellation path stays accurate.
-    #[tokio::test]
-    async fn outstanding_requests_evicts_non_permission_at_soft_cap() {
-        let shared = RunnerShared::new();
-        // One permission request that must survive.
-        let perm =
-            br#"{"jsonrpc":"2.0","id":9999,"method":"session/request_permission","params":{}}
-"#;
-        shared.deliver_line(perm).await;
-        // Pre-fill the map up to the cap with non-permission requests.
-        for id in 0..(MAX_OUTSTANDING_REQUESTS as i64 - 1) {
+    async fn reverse_call_cap_refuses_rather_than_parking_the_agent() {
+        let (shared, stdin, mut child) = shared_with_stdin().await;
+        let _attachment_id = shared.begin_attachment().await;
+        for id in 0..MAX_OUTSTANDING_REQUESTS {
             let line = format!(
                 "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"fs/read_text_file\",\"params\":{{}}}}\n"
             );
-            shared.deliver_line(line.as_bytes()).await;
+            shared.deliver_line(line.as_bytes(), &stdin).await;
         }
         assert_eq!(
-            shared.outstanding_requests.lock().await.len(),
+            shared.pending_server_calls.lock().await.len(),
             MAX_OUTSTANDING_REQUESTS
         );
-        // One more push trips the eviction; only the permission entry
-        // and the just-inserted line remain.
-        let extra = br#"{"jsonrpc":"2.0","id":424242,"method":"fs/read_text_file","params":{}}
+
+        let extra = br#"{"jsonrpc":"2.0","id":999999,"method":"fs/read_text_file","params":{}}
 "#;
-        shared.deliver_line(extra).await;
-        let map = shared.outstanding_requests.lock().await;
+        shared.deliver_line(extra, &stdin).await;
         assert_eq!(
-            map.get(&9999),
-            Some(&"session/request_permission".to_string()),
-            "permission id must survive eviction"
+            shared.pending_server_calls.lock().await.len(),
+            MAX_OUTSTANDING_REQUESTS,
+            "the refused call is not tracked"
         );
+        let written = read_agent_stdin(&mut child).await;
+        let last: serde_json::Value = serde_json::from_str(
+            written
+                .trim()
+                .lines()
+                .next_back()
+                .expect("a refusal was written"),
+        )
+        .expect("refusal is JSON");
+        assert_eq!(last["id"], serde_json::json!(999999));
         assert_eq!(
-            map.get(&424242),
-            Some(&"fs/read_text_file".to_string()),
-            "the request that tripped the cap is inserted after the sweep"
+            last["error"]["code"],
+            serde_json::json!(control_protocol::DAEMON_GONE)
         );
+    }
+
+    /// Queue admission accounts exact encoded bytes, sheds only notifications,
+    /// and refuses to evict frames that complete outstanding work.
+    #[test]
+    fn queue_budget_sheds_notifications_and_preserves_correlations() {
+        let wire = |len| Arc::<[u8]>::from(vec![0; len]);
+        let mut channel = ControlChannel::default();
+        channel.push(DeliveryScope::Persistent, QueuedKind::AgentReply, wire(16));
+        channel.push(DeliveryScope::Persistent, QueuedKind::Notify, wire(8));
+        channel.push(DeliveryScope::Persistent, QueuedKind::Notify, wire(8));
+        channel.push(
+            DeliveryScope::Persistent,
+            QueuedKind::PromptCompleted,
+            wire(16),
+        );
+
+        assert!(channel.make_room(MAX_CONTROL_QUEUE_BYTES - 32));
+        assert_eq!(channel.queued_bytes, 32);
+        assert_eq!(channel.queue.len(), 2);
+        assert!(channel
+            .queue
+            .iter()
+            .all(|frame| frame.kind != QueuedKind::Notify));
         assert!(
-            map.len() <= MAX_OUTSTANDING_REQUESTS,
-            "map stays within the cap after eviction"
+            !channel.make_room(MAX_CONTROL_QUEUE_BYTES - 31),
+            "correlation frames must apply backpressure rather than be evicted"
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_frame_remains_queued_until_write_commit() {
+        let shared = RunnerShared::new(None);
+        shared
+            .enqueue(
+                DeliveryScope::Persistent,
+                QueuedKind::PromptCompleted,
+                ControlBody::PromptCompleted {
+                    prompt_req_id: 7,
+                    outcome: PromptOutcome::Aborted,
+                },
+            )
+            .await;
+        let first_attachment = shared.begin_attachment().await;
+        let (entry_id, first_wire) = shared
+            .next_outbound(first_attachment)
+            .await
+            .expect("leased frame");
+
+        shared.release_outbound(entry_id).await;
+        let second_attachment = shared.begin_attachment().await;
+        let (retried_id, retried_wire) = shared
+            .next_outbound(second_attachment)
+            .await
+            .expect("frame survives cancelled writer");
+        assert_eq!(retried_id, entry_id);
+        assert_eq!(retried_wire, first_wire);
+
+        shared.commit_outbound(second_attachment, retried_id).await;
+        let channel = shared.control.lock().await;
+        assert!(channel.queue.is_empty());
+        assert_eq!(channel.queued_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn disconnect_purges_scoped_frames_and_late_forward_responses() {
+        let (shared, stdin, mut child) = shared_with_stdin().await;
+        let old_attachment = shared.begin_attachment().await;
+        assert!(
+            shared
+                .enqueue(
+                    DeliveryScope::Attachment(old_attachment),
+                    QueuedKind::Handshake,
+                    ControlBody::Initialized {
+                        result: serde_json::json!({}),
+                    },
+                )
+                .await
+        );
+        shared
+            .issue_agent_call(
+                &stdin,
+                old_attachment,
+                9,
+                "session/set_mode",
+                serde_json::json!({}),
+            )
+            .await;
+        let written = read_agent_stdin(&mut child).await;
+        let request: serde_json::Value = serde_json::from_str(written.trim()).unwrap();
+        let request_id = request["id"].as_i64().unwrap();
+
+        shared.disconnect_control(old_attachment, &stdin, "s").await;
+        let _new_attachment = shared.begin_attachment().await;
+        assert!(
+            !shared
+                .enqueue(
+                    DeliveryScope::Attachment(old_attachment),
+                    QueuedKind::Handshake,
+                    ControlBody::Initialized {
+                        result: serde_json::json!({"stale": true}),
+                    },
+                )
+                .await
+        );
+        let response = format!("{{\"jsonrpc\":\"2.0\",\"id\":{request_id},\"result\":{{}}}}\n");
+        shared.deliver_line(response.as_bytes(), &stdin).await;
+
+        assert!(shared.pending_agent_calls.lock().await.is_empty());
+        assert!(queued(&shared).await.is_empty());
+    }
+
+    /// A conversation reset changes durable runner state even if its daemon
+    /// disconnects before the agent answers. The old daemon's correlation is
+    /// not replayed, but a later attach must inherit the new session id.
+    #[tokio::test]
+    async fn detached_reset_response_refreshes_session_without_replaying_result() {
+        let (shared, stdin, mut child) = shared_with_stdin().await;
+        let old_attachment = shared.begin_attachment().await;
+        shared.handshake.lock().await.session = Some((
+            "old-session".into(),
+            serde_json::json!({"sessionId": "old-session"}),
+        ));
+        shared
+            .issue_agent_call(
+                &stdin,
+                old_attachment,
+                77,
+                "session/new",
+                serde_json::json!({"cwd": "/tmp"}),
+            )
+            .await;
+        let written = read_agent_stdin(&mut child).await;
+        let sent: serde_json::Value =
+            serde_json::from_str(written.trim()).expect("request written");
+        assert_eq!(sent["method"], "session/new");
+        let req_id = sent["id"].as_i64().expect("runner allocated a numeric id");
+
+        shared
+            .disconnect_control(old_attachment, &stdin, "session")
+            .await;
+        let _new_attachment = shared.begin_attachment().await;
+        let resp = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{req_id},\"result\":{{\"sessionId\":\"new-session\"}}}}\n"
+        );
+        shared.deliver_line(resp.as_bytes(), &stdin).await;
+
+        assert!(
+            queued(&shared).await.is_empty(),
+            "the detached daemon's AgentResult must not reach its replacement"
+        );
+        assert_eq!(
+            shared.acp_session_id().await.as_deref(),
+            Some("new-session"),
+            "the runner cache must follow the completed reset across reattach"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn watchdog_teardown_preserves_replacement_registry_owner() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let session_id = "watchdog-replacement";
+        let socket = worker_registry::socket_path_for(session_id).unwrap();
+        let control_socket = crate::process::worker::control_socket_sibling(&socket);
+        let _listener = std::os::unix::net::UnixListener::bind(&control_socket).unwrap();
+        worker_registry::save(&WorkerRecord::new(
+            session_id.into(),
+            222,
+            socket,
+            "agent".into(),
+            "agent".into(),
+            PathBuf::from("/repo"),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        ))
+        .unwrap();
+        let mut child = Command::new("sleep").arg("60").spawn().unwrap();
+
+        self_terminate_agent_tree(WatchdogShutdown::RecordMissing, session_id, 111, &mut child)
+            .await;
+
+        assert_eq!(worker_registry::load(session_id).unwrap().unwrap().pid, 222);
+        assert!(control_socket.exists());
+    }
+
+    /// An agent error envelope on the forward lane surfaces as `AgentError`
+    /// with the agent's own code preserved, not collapsed into a generic one.
+    #[tokio::test]
+    async fn forward_call_error_envelope_is_preserved() {
+        let (shared, stdin, mut child) = shared_with_stdin().await;
+        let attachment_id = shared.begin_attachment().await;
+        shared
+            .issue_agent_call(
+                &stdin,
+                attachment_id,
+                5,
+                "session/set_mode",
+                serde_json::json!({}),
+            )
+            .await;
+        let written = read_agent_stdin(&mut child).await;
+        let sent: serde_json::Value = serde_json::from_str(written.trim()).unwrap();
+        let req_id = sent["id"].as_i64().unwrap();
+
+        let resp = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{req_id},\"error\":{{\"code\":-32000,\"message\":\"nope\"}}}}\n"
+        );
+        shared.deliver_line(resp.as_bytes(), &stdin).await;
+
+        let q = queued(&shared).await;
+        match &q[0] {
+            ControlBody::AgentError { call_id, error } => {
+                assert_eq!(*call_id, 5);
+                assert_eq!(error.code, -32000);
+                assert_eq!(error.message, "nope");
+            }
+            other => panic!("expected AgentError, got {other:?}"),
+        }
+    }
+
+    /// A response id the runner never tracked (a stray or duplicate reply)
+    /// must not produce a completion or any other frame.
+    #[tokio::test]
+    async fn untracked_response_queues_nothing() {
+        let (shared, stdin, _child) = shared_with_stdin().await;
+        let resp = br#"{"jsonrpc":"2.0","id":77,"result":{}}
+"#;
+        shared.deliver_line(resp, &stdin).await;
+        assert!(queued(&shared).await.is_empty());
+    }
+
+    /// Answering the same `call_id` twice must not write a second response to
+    /// the agent: it already got its one answer, and a duplicate could
+    /// resolve an unrelated later request in a lax adapter.
+    #[tokio::test]
+    async fn duplicate_answer_for_a_resolved_call_is_dropped() {
+        let (shared, stdin, mut child) = shared_with_stdin().await;
+        let attachment_id = shared.begin_attachment().await;
+        let req = br#"{"jsonrpc":"2.0","id":3,"method":"fs/read_text_file","params":{}}
+"#;
+        shared.deliver_line(req, &stdin).await;
+        let call_id = *shared
+            .pending_server_calls
+            .lock()
+            .await
+            .keys()
+            .next()
+            .expect("tracked");
+
+        shared
+            .resolve_server_call(
+                &stdin,
+                attachment_id,
+                call_id,
+                Ok(serde_json::json!({"content": "x"})),
+                "s",
+            )
+            .await;
+        shared
+            .resolve_server_call(
+                &stdin,
+                attachment_id,
+                call_id,
+                Ok(serde_json::json!({"content": "y"})),
+                "s",
+            )
+            .await;
+        let written = read_agent_stdin(&mut child).await;
+        assert_eq!(
+            written.trim().lines().count(),
+            1,
+            "exactly one response reached the agent: {written}"
         );
     }
 }

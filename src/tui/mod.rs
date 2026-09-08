@@ -12,6 +12,8 @@ mod deletion_poller;
 pub mod dialogs;
 pub mod diff;
 pub(crate) mod home;
+pub mod hyperlink;
+pub(crate) mod links;
 pub(crate) mod markdown;
 mod metrics_poller;
 pub(crate) mod open_url;
@@ -229,6 +231,11 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
         return remote_home::run_standalone(endpoint).await;
     }
 
+    // Opening the local session store creates the profile directory, so an
+    // unknown name is refused first (#148); the remote client above never
+    // touches local profiles.
+    crate::session::require_known_profile(profile)?;
+
     // Run pending migrations with a spinner that names the migration, its
     // current step and the elapsed time, and keeps the notices a migration
     // emits (what is being moved, how to defer it) on screen. Unconditional
@@ -337,8 +344,6 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
         .unwrap_or_default();
     let enable_mouse = mouse_capture_requested(&startup_session_config) && !mosh_active;
     let _terminal_guard = TerminalGuard::enter(enable_mouse, mosh_active)?;
-    let backend = CrosstermBackend::new(io::stdout());
-    let mut terminal = Terminal::new(backend)?;
 
     // Combine the caller-supplied startup warning (e.g. debug-log file
     // failures) with any config-parse failures we detect at startup.
@@ -386,6 +391,10 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
     if let Some(warning) = combined_warning {
         app.show_startup_warning(&warning);
     }
+    // Built after `App` so it can share the map the renderer fills: the
+    // backend re-emits OSC 8 around whatever cells the frame marked as links.
+    let backend = crate::tui::hyperlink::HyperlinkBackend::new(io::stdout(), app.hyperlink_cells());
+    let mut terminal = Terminal::new(backend)?;
     let result = app.run(&mut terminal).await;
 
     crate::session::clear_tui_heartbeat();
