@@ -376,19 +376,163 @@ fn generate_cli_docs() {
     println!("Generated CLI documentation at {}", output_path.display());
 }
 
-fn collect_subcommand_paths(cmd: &clap::Command, prefix: &str, out: &mut BTreeSet<String>) {
-    for sub in cmd.get_subcommands() {
-        if sub.get_name() == "help" {
+/// The clap command tree, flattened into the three questions the skill check
+/// asks of a command path it read out of a skill file.
+#[derive(Default)]
+struct CliTree {
+    /// Canonical `aoe <path>` subcommand paths.
+    commands: BTreeSet<String>,
+    /// Paths that take a subcommand of their own, so a word after one of them
+    /// is a subcommand name. After any other path it is a positional argument.
+    parents: BTreeSet<String>,
+    /// Paths reachable through a `#[command(alias = ...)]`. Accepted as input
+    /// but kept out of the advisory: `aoe ls` in a skill file is not a
+    /// documentation gap for `aoe list`, and aliases are absent from
+    /// `docs/cli/reference.md` on purpose.
+    aliases: BTreeSet<String>,
+}
+
+impl CliTree {
+    fn from_command(cmd: &clap::Command) -> Self {
+        let mut tree = Self::default();
+        tree.walk(cmd, "");
+        tree
+    }
+
+    fn walk(&mut self, cmd: &clap::Command, prefix: &str) {
+        for sub in cmd.get_subcommands() {
+            if sub.get_name() == "help" {
+                continue;
+            }
+            let join = |name: &str| {
+                if prefix.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{prefix} {name}")
+                }
+            };
+            let path = join(sub.get_name());
+            if sub.has_subcommands() {
+                self.parents.insert(path.clone());
+            }
+            for alias in sub.get_all_aliases() {
+                let alias_path = join(alias);
+                if sub.has_subcommands() {
+                    self.parents.insert(alias_path.clone());
+                }
+                self.aliases.insert(alias_path);
+            }
+            self.commands.insert(path.clone());
+            self.walk(sub, &path);
+        }
+    }
+
+    fn is_known(&self, path: &str) -> bool {
+        self.commands.contains(path) || self.aliases.contains(path)
+    }
+}
+
+/// The spans of a markdown file where `aoe` is a command rather than the
+/// ordinary English word it also is in these files: fenced code blocks, and
+/// inline backtick spans in prose.
+///
+/// Spans are line-local, which is also what keeps the frontmatter's
+/// `name: aoe` from reading as an invocation of whatever the next line
+/// starts with. A line whose backticks do not pair is skipped: its spans
+/// cannot be told from its prose.
+fn code_spans(content: &str) -> Vec<&str> {
+    let mut spans = Vec::new();
+    let mut in_fence = false;
+    for line in content.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
             continue;
         }
-        let path = if prefix.is_empty() {
-            sub.get_name().to_string()
-        } else {
-            format!("{} {}", prefix, sub.get_name())
-        };
-        out.insert(path.clone());
-        collect_subcommand_paths(sub, &path, out);
+        if in_fence {
+            spans.push(line);
+            continue;
+        }
+        let parts: Vec<&str> = line.split('`').collect();
+        if parts.len().is_multiple_of(2) {
+            continue;
+        }
+        spans.extend(parts.iter().skip(1).step_by(2));
     }
+    spans
+}
+
+/// Every `aoe <words>` invocation in `content`'s code spans, as the words that
+/// were read rather than the prefix of them that happened to resolve.
+fn read_invocations(content: &str) -> Vec<Vec<String>> {
+    let re = regex::Regex::new(r"\baoe[ \t]+([a-z][a-z0-9 \t-]*)").unwrap();
+    let mut invocations = Vec::new();
+    for span in code_spans(content) {
+        for cap in re.captures_iter(span) {
+            let words: Vec<String> = cap[1]
+                .split_whitespace()
+                .take_while(|w| w.chars().all(|c| c.is_ascii_lowercase() || c == '-'))
+                .map(str::to_string)
+                .collect();
+            if !words.is_empty() {
+                invocations.push(words);
+            }
+        }
+    }
+    invocations
+}
+
+/// Resolve one invocation against the CLI tree.
+///
+/// `Ok(Some(path))` is a canonical command to credit in the advisory,
+/// `Ok(None)` an alias or a bare prefix with nothing to credit, and `Err` the
+/// command text to report as nonexistent. Before #3479 the caller only ever
+/// recorded paths the tree had already accepted, so the "does not exist" arm
+/// it then checked was unsatisfiable.
+fn resolve_invocation(words: &[String], cli: &CliTree) -> Result<Option<String>, String> {
+    let mut resolved: Option<(String, usize)> = None;
+    let mut path = String::new();
+    for (index, word) in words.iter().enumerate() {
+        if path.is_empty() {
+            path = word.clone();
+        } else {
+            path = format!("{path} {word}");
+        }
+        if cli.is_known(&path) {
+            resolved = Some((path.clone(), index + 1));
+        }
+    }
+
+    let Some((resolved, consumed)) = resolved else {
+        return Err(words[0].clone());
+    };
+    // A word after a leaf command is a positional argument (`aoe group create
+    // mygroup`); after a command that takes subcommands it is a subcommand
+    // name, and an unknown one is the bug this check exists for.
+    if cli.parents.contains(&resolved) {
+        if let Some(next) = words.get(consumed) {
+            return Err(format!("{resolved} {next}"));
+        }
+    }
+    Ok(cli.commands.contains(&resolved).then_some(resolved))
+}
+
+/// Check every `aoe ...` invocation in one skill file, returning the canonical
+/// commands to credit in the advisory and the nonexistent ones to report.
+fn check_invocations(content: &str, cli: &CliTree) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut referenced = BTreeSet::new();
+    let mut unknown = BTreeSet::new();
+    for words in read_invocations(content) {
+        match resolve_invocation(&words, cli) {
+            Ok(Some(path)) => {
+                referenced.insert(path);
+            }
+            Ok(None) => {}
+            Err(bad) => {
+                unknown.insert(bad);
+            }
+        }
+    }
+    (referenced, unknown)
 }
 
 /// How the skill's published version is sourced, which determines whether a
@@ -408,9 +552,7 @@ fn check_skill() {
     ];
 
     // Build the clap command tree once; shared across every skill file.
-    let cli_cmd = agent_of_empires::cli::Cli::command();
-    let mut cli_commands: BTreeSet<String> = BTreeSet::new();
-    collect_subcommand_paths(&cli_cmd, "", &mut cli_commands);
+    let cli = CliTree::from_command(&agent_of_empires::cli::Cli::command());
 
     let mut has_error = false;
     let mut referenced: BTreeSet<String> = BTreeSet::new();
@@ -425,20 +567,14 @@ fn check_skill() {
 
         let content = fs::read_to_string(skill_path).expect("Failed to read SKILL.md");
 
-        if check_skill_file(
-            path_str,
-            &content,
-            version_rule,
-            &cli_commands,
-            &mut referenced,
-        ) {
+        if check_skill_file(path_str, &content, version_rule, &cli, &mut referenced) {
             has_error = true;
         }
     }
 
     // Advisory: CLI commands not referenced in any skill file.
     let mut missing_from_skill = Vec::new();
-    for cli_cmd in &cli_commands {
+    for cli_cmd in &cli.commands {
         let mentioned = referenced.iter().any(|s| {
             s == cli_cmd
                 || cli_cmd.starts_with(&format!("{} ", s))
@@ -470,7 +606,7 @@ fn check_skill_file(
     path_str: &str,
     content: &str,
     version_rule: &VersionRule,
-    cli_commands: &BTreeSet<String>,
+    cli: &CliTree,
     referenced: &mut BTreeSet<String>,
 ) -> bool {
     let mut has_error = false;
@@ -502,64 +638,125 @@ fn check_skill_file(
         _ => {}
     }
 
-    // Extract `aoe <words>` patterns and match longest valid subcommand path
-    let re = regex::Regex::new(r"aoe\s+([a-z][a-z0-9 -]*)").unwrap();
-    let mut skill_commands: BTreeSet<String> = BTreeSet::new();
-    for cap in re.captures_iter(content) {
-        let raw = cap[1].trim();
-        let words: Vec<&str> = raw
-            .split_whitespace()
-            .take_while(|w| {
-                !w.starts_with('-')
-                    && !w.starts_with('<')
-                    && !w.starts_with('"')
-                    && !w.starts_with('$')
-                    && !w.starts_with('/')
-                    && !w.starts_with('.')
-                    && w.chars().all(|c| c.is_ascii_lowercase() || c == '-')
-            })
-            .collect();
-
-        // Find the longest prefix that is a known CLI command
-        let mut best = String::new();
-        let mut path = String::new();
-        for word in &words {
-            if path.is_empty() {
-                path = word.to_string();
-            } else {
-                path = format!("{} {}", path, word);
-            }
-            if cli_commands.contains(&path) {
-                best = path.clone();
-            }
-        }
-        // If no exact match, use the first word if it's a known top-level command
-        if best.is_empty() && !words.is_empty() && cli_commands.contains(words[0]) {
-            best = words[0].to_string();
-        }
-        if !best.is_empty() {
-            skill_commands.insert(best);
-        }
+    let (found, unknown) = check_invocations(content, cli);
+    for bad in unknown {
+        eprintln!("ERROR: {path_str} references command 'aoe {bad}' which does not exist in CLI");
+        has_error = true;
     }
 
-    // Check for skill references to commands that don't exist
-    for skill_cmd in &skill_commands {
-        if !cli_commands.contains(skill_cmd) {
-            let is_prefix = cli_commands
-                .iter()
-                .any(|c| c.starts_with(&format!("{} ", skill_cmd)));
-            if !is_prefix {
-                eprintln!(
-                    "ERROR: {} references command 'aoe {}' which does not exist in CLI",
-                    path_str, skill_cmd
-                );
-                has_error = true;
-            }
-        }
-    }
-
-    referenced.extend(skill_commands);
+    referenced.extend(found);
     has_error
+}
+
+#[cfg(test)]
+mod skill_check_tests {
+    use super::{check_invocations, code_spans, CliTree};
+    use std::collections::BTreeSet;
+
+    fn set(paths: &[&str]) -> BTreeSet<String> {
+        paths.iter().map(|p| p.to_string()).collect()
+    }
+
+    fn tree() -> CliTree {
+        CliTree {
+            commands: set(&[
+                "list",
+                "session",
+                "session capture",
+                "group",
+                "group create",
+            ]),
+            parents: set(&["session", "group"]),
+            aliases: set(&["ls", "group ls"]),
+        }
+    }
+
+    #[test]
+    fn code_spans_are_fences_and_paired_inline_spans() {
+        let cases: &[(&str, &[&str])] = &[
+            ("```sh\naoe list\n```", &["aoe list"]),
+            ("Run `aoe list` now.", &["aoe list"]),
+            (
+                "Two `aoe list` and `aoe group` spans.",
+                &["aoe list", "aoe group"],
+            ),
+            // Prose is not code: `aoe` is an ordinary word in these files.
+            ("Use aoe list to see sessions.", &[]),
+            // One backtick cannot delimit a span, so the line is skipped.
+            ("A stray ` and aoe list after it.", &[]),
+            // Line-local, so frontmatter cannot join two keys into a command.
+            ("name: aoe\ndescription: something", &[]),
+            // A `#` comment inside a fence is still code.
+            (
+                "```sh\n# aoe list is the listing\n```",
+                &["# aoe list is the listing"],
+            ),
+            // Neither tilde fences nor indented blocks are code context here.
+            ("~~~\naoe list\n~~~", &[]),
+            ("    aoe list", &[]),
+        ];
+        for (content, expected) in cases {
+            assert_eq!(&code_spans(content), expected, "spans of {content:?}");
+        }
+    }
+
+    #[test]
+    fn invocations_resolve_credit_and_reject() {
+        // (content, credited commands, commands reported as nonexistent)
+        let cases: &[(&str, &[&str], &[&str])] = &[
+            ("`aoe list`", &["list"], &[]),
+            ("`aoe session capture`", &["session capture"], &[]),
+            // #3479: none of these three could be reported before, and the
+            // middle one also suppressed every `aoe session *` advisory entry.
+            ("`aoe totallybogus`", &[], &["totallybogus"]),
+            ("`aoe session bogusverb`", &[], &["session bogusverb"]),
+            ("`aoe session pin`", &[], &["session pin"]),
+            // A word after a leaf is a positional argument, not a subcommand.
+            ("`aoe group create mygroup`", &["group create"], &[]),
+            ("`aoe session capture my-id`", &["session capture"], &[]),
+            // An alias is accepted as input but credits no canonical command.
+            ("`aoe ls`", &[], &[]),
+            ("`aoe group ls`", &[], &[]),
+            // Flags and placeholders end the command path.
+            ("`aoe list --json`", &["list"], &[]),
+            ("`aoe session capture <id>`", &["session capture"], &[]),
+            // A bare prefix is a real reference with nothing extra to check.
+            ("`aoe session`", &["session"], &[]),
+            // Repeats report once.
+            (
+                "`aoe totallybogus` and `aoe totallybogus`",
+                &[],
+                &["totallybogus"],
+            ),
+            // Prose is not scanned, so neither half of this is read.
+            ("Use aoe totallybogus freely.", &[], &[]),
+        ];
+        let cli = tree();
+        for (content, credited, unknown) in cases {
+            let (referenced, reported) = check_invocations(content, &cli);
+            assert_eq!(referenced, set(credited), "credited for {content:?}");
+            assert_eq!(reported, set(unknown), "reported for {content:?}");
+        }
+    }
+
+    #[test]
+    fn aliases_are_read_from_the_clap_tree() {
+        use clap::CommandFactory;
+        let cli = CliTree::from_command(&agent_of_empires::cli::Cli::command());
+        // `collect_subcommand_paths` recorded `get_name()` only, so every
+        // `#[command(alias = ...)]` read as a nonexistent command (#3479).
+        assert!(!cli.aliases.is_empty(), "the CLI declares command aliases");
+        assert!(
+            cli.aliases
+                .iter()
+                .all(|alias| !cli.commands.contains(alias)),
+            "an alias must not also be advertised as a canonical command"
+        );
+        assert!(
+            cli.parents.iter().all(|parent| cli.is_known(parent)),
+            "every parent path must resolve"
+        );
+    }
 }
 
 #[cfg(all(test, unix))]
