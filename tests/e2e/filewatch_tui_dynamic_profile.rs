@@ -32,10 +32,11 @@ fn dynamic_profile_add_and_remove_keeps_subscriptions_in_sync() {
     h.spawn_tui();
     h.wait_for(" aoe ");
 
+    // All-profiles mode opens the picker on its first row, and the picker
+    // sinks `default` last, so that row is the new profile.
     h.send_keys("P");
     h.wait_for("Profiles");
     h.assert_screen_contains(new_profile);
-    h.send_keys("Down");
     h.send_keys("Enter");
     h.wait_for_absent("Profiles", Duration::from_secs(5));
 

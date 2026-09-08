@@ -79,7 +79,7 @@ enum IdempotentMatch {
 /// disk. Deliberately explicit: the disk write no longer re-runs the caller's
 /// closure, so a field that is not listed here is simply not persisted.
 struct MirroredFields {
-    queued_prompts: Vec<crate::acp::state::QueuedPromptEntry>,
+    queued_prompts: Vec<crate::daemon::QueuedPromptEntry>,
     queued_prompt_next_seq: u64,
     idle_dormant_since: Option<chrono::DateTime<chrono::Utc>>,
     /// Mirrored as `disk = max(disk, memory)`, not copied, because the field is
@@ -121,9 +121,9 @@ pub(crate) enum EditQueuedOutcome {
 /// no clear aliases combines the whole queue. Pure, so the boundary logic is
 /// unit-tested without a live worker.
 fn queue_drain_batch<'a>(
-    queue: &'a [crate::acp::state::QueuedPromptEntry],
+    queue: &'a [crate::daemon::QueuedPromptEntry],
     profile: &crate::acp::agent_profiles::AgentProfile,
-) -> (&'a [crate::acp::state::QueuedPromptEntry], String) {
+) -> (&'a [crate::daemon::QueuedPromptEntry], String) {
     if queue.is_empty() {
         return (&[], String::new());
     }
@@ -751,7 +751,7 @@ impl SessionService {
         self: &Arc<Self>,
         id: &str,
         text: String,
-        attachments: Vec<crate::acp::state::PromptAttachmentRef>,
+        attachments: Vec<crate::daemon::PromptAttachmentRef>,
     ) {
         let profile = {
             let mut instances = self.instances.write().await;
@@ -954,10 +954,10 @@ impl SessionService {
         id: &str,
         prompt_id: String,
         text: String,
-        attachments: Vec<crate::acp::state::PromptAttachmentRef>,
+        attachments: Vec<crate::daemon::PromptAttachmentRef>,
         origin_device: Option<String>,
         created_at: String,
-    ) -> Option<crate::acp::state::QueuedPromptEntry> {
+    ) -> Option<crate::daemon::QueuedPromptEntry> {
         self.mutate_instance_persisted(id, move |inst| {
             inst.last_accessed_at = inst.last_accessed_at.max(Some(chrono::Utc::now()));
             if let Some(existing) = inst.queued_prompts.iter_mut().find(|q| q.id == prompt_id) {
@@ -967,7 +967,7 @@ impl SessionService {
             }
             let seq = inst.queued_prompt_next_seq;
             inst.queued_prompt_next_seq = seq.saturating_add(1);
-            let entry = crate::acp::state::QueuedPromptEntry {
+            let entry = crate::daemon::QueuedPromptEntry {
                 id: prompt_id.clone(),
                 seq,
                 text: text.clone(),
@@ -1084,7 +1084,7 @@ impl SessionService {
     pub(crate) async fn queued_prompts_snapshot(
         &self,
         id: &str,
-    ) -> Vec<crate::acp::state::QueuedPromptEntry> {
+    ) -> Vec<crate::daemon::QueuedPromptEntry> {
         let instances = self.instances.read().await;
         instances
             .iter()
@@ -2049,9 +2049,9 @@ mod tests {
                 "sess-husk",
                 "husk".into(),
                 String::new(),
-                vec![crate::acp::state::PromptAttachmentRef {
+                vec![crate::daemon::PromptAttachmentRef {
                     id: "att-1".into(),
-                    kind: crate::acp::state::PromptAttachmentKind::Image,
+                    kind: crate::daemon::PromptAttachmentKind::Image,
                     mime_type: "image/png".into(),
                     name: Some("shot.png".into()),
                     size: 9,
@@ -2158,9 +2158,9 @@ mod tests {
                     id,
                     "husk".into(),
                     String::new(),
-                    vec![crate::acp::state::PromptAttachmentRef {
+                    vec![crate::daemon::PromptAttachmentRef {
                         id: "att-1".into(),
-                        kind: crate::acp::state::PromptAttachmentKind::Image,
+                        kind: crate::daemon::PromptAttachmentKind::Image,
                         mime_type: "image/png".into(),
                         name: Some("shot.png".into()),
                         size: 9,
@@ -2203,10 +2203,12 @@ mod tests {
     /// uses: it makes `wait_for_worker` park exactly as it does mid-respawn,
     /// with no process, sandbox, or agent involved.
     #[tokio::test]
+    #[serial_test::serial]
     async fn the_queue_drain_frees_instance_lock_while_it_waits_for_a_resuming_worker() {
         use crate::acp::supervisor::{ResumeKind, ResumeReservationOutcome};
         use std::time::Duration;
 
+        let _home = crate::session::test_support::isolate_app_dir();
         let mut inst = Instance::new("queue-3621", "/tmp/aoe-3621-drain");
         inst.id = "sess-3621".to_string();
         inst.view = crate::session::View::Structured;
@@ -2758,7 +2760,7 @@ mod tests {
 
     #[test]
     fn queue_drain_batch_splits_on_clear_boundary() {
-        use crate::acp::state::QueuedPromptEntry;
+        use crate::daemon::QueuedPromptEntry;
         let entry = |id: &str, seq: u64, text: &str| QueuedPromptEntry {
             id: id.into(),
             seq,

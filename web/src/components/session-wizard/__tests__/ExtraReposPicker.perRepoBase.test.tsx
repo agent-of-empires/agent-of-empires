@@ -14,6 +14,8 @@ const fetchBranches = vi.fn();
 
 vi.mock("../../../lib/api", () => ({
   fetchProjects: vi.fn().mockResolvedValue([]),
+  fetchSessions: vi.fn().mockResolvedValue({ sessions: [], workspace_ordering: [] }),
+  fetchRecentProjects: vi.fn().mockResolvedValue({ projects: [] }),
   fetchBranches: (...args: unknown[]) => fetchBranches(...args),
 }));
 

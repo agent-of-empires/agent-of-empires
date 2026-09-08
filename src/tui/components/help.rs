@@ -96,6 +96,10 @@ fn shortcuts(strict: bool, live_on_enter: bool) -> Vec<(&'static str, Vec<(Strin
         "Drag".to_string(),
         "Select + copy preview (live mode)".to_string(),
     ));
+    other.push((
+        "Click link".to_string(),
+        "Open underlined preview link or URL".to_string(),
+    ));
     other.push(("Ctrl+K".to_string(), "Command palette".to_string()));
     // Tips has no global hotkey (it's palette / badge driven), so it isn't in
     // the registry-derived rows above; surface it here so `?` still documents it.

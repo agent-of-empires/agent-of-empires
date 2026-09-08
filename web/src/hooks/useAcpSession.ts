@@ -1668,7 +1668,9 @@ export function useAcpSession(
   }, [sessionId, fetchReplay, clearRetryTimers]);
 
   const resolveApproval = useCallback(
-    async (nonce: string, decision: ApprovalDecision) => {
+    // `optionId` answers with the agent's own option instead of letting
+    // the daemon pick by option kind.
+    async (nonce: string, decision: ApprovalDecision, optionId?: string) => {
       if (!sessionId) return;
       try {
         const res = await fetch(
@@ -1676,7 +1678,7 @@ export function useAcpSession(
           {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ decision }),
+            body: JSON.stringify(optionId === undefined ? { decision } : { decision, option_id: optionId }),
           },
         );
         const detail = res.ok ? "" : await safeText(res);

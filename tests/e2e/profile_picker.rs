@@ -107,10 +107,7 @@ fn test_profile_picker_delete_flow() {
     h.wait_for("Profiles");
     h.assert_screen_contains("deleteme");
 
-    // Navigate to "deleteme" (after "default" alphabetically)
-    h.send_keys("j");
-    std::thread::sleep(Duration::from_millis(50));
-
+    // "deleteme" is the first row: the picker sinks "default" last.
     // Press 'd' to delete
     h.send_keys("d");
     h.wait_for("Delete Profile");
@@ -139,10 +136,7 @@ fn test_profile_picker_delete_cancel() {
     h.send_keys("P");
     h.wait_for("Profiles");
 
-    // Navigate to "keepme"
-    h.send_keys("j");
-    std::thread::sleep(Duration::from_millis(50));
-
+    // "keepme" is the first row: the picker sinks "default" last.
     h.send_keys("d");
     h.wait_for("Delete Profile");
 
@@ -167,9 +161,7 @@ fn test_profile_picker_switch_profile() {
     h.send_keys("P");
     h.wait_for("Profiles");
 
-    // Navigate to "other" and select
-    h.send_keys("j");
-    std::thread::sleep(Duration::from_millis(50));
+    // "other" is the first row: the picker sinks "default" last.
     h.send_keys("Enter");
 
     // Picker should close

@@ -123,6 +123,11 @@ const GRID_CEILING_MS: u64 = 250;
 /// disagrees with the requested grid are withheld for this long, so the client
 /// sees one clean repaint instead of a clear, a half-draw, and a settle.
 const RESIZE_SETTLE_MS: u64 = 300;
+/// Gap between retries of a VT reseed a resize could not land. Each retry forks
+/// `capture-pane` and only runs while one is outstanding; several fit inside
+/// the settle window below, so an ordinary `Busy` (a chunk landed under the
+/// capture) is absorbed without the client ever leaving the grid.
+const GRID_RESYNC_RETRY: Duration = Duration::from_millis(120);
 /// A freshly armed channel seeded from `capture-pane`, which cannot tell
 /// whether the app was mid-repaint. Its first publish waits for output to
 /// arrive and go quiet for this long (a torn seed is completed by the rest of
@@ -275,6 +280,33 @@ struct LiveSettings {
     resize_settle_until_ms: AtomicU64,
 }
 
+impl LiveSettings {
+    fn new() -> Self {
+        Self {
+            window_lines: AtomicUsize::new(DEFAULT_WINDOW_LINES),
+            fast: AtomicBool::new(true),
+            screen_rows: AtomicU64::new(0),
+            screen_cols: AtomicU64::new(0),
+            is_owner: AtomicBool::new(false),
+            deflate: AtomicBool::new(false),
+            patch: AtomicBool::new(false),
+            force_full: AtomicBool::new(false),
+            resize_settle_until_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// Withhold frames still at the old geometry after a resize this connection
+    /// drove as size owner, so the client sees one clean repaint. Whether the
+    /// VT parser caught up is tracked on the shared channel, not here: every
+    /// viewer of it has to stay off the grid until it does.
+    fn record_owner_resize(&self, owned: bool) {
+        if let Some(settle_until_ms) = resize_follow_up(owned, live_now_ms()) {
+            self.resize_settle_until_ms
+                .store(settle_until_ms, Ordering::Relaxed);
+        }
+    }
+}
+
 static LIVE_CLOCK: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
 
 fn live_now_ms() -> u64 {
@@ -285,6 +317,90 @@ fn live_now_ms() -> u64 {
 /// the window is open and the pane has not yet reached the requested grid.
 fn resize_settle_holds(now_ms: u64, until_ms: u64, want: (u16, u16), have: (u16, u16)) -> bool {
     now_ms < until_ms && want != have
+}
+
+/// When old-geometry frames stop being withheld after a resize this connection
+/// drove, or `None` when it did not own the resize and nothing moved.
+fn resize_follow_up(owned: bool, now_ms: u64) -> Option<u64> {
+    owned.then(|| now_ms + RESIZE_SETTLE_MS)
+}
+
+/// Resize the pane as size owner and rebuild the VT grid to match.
+///
+/// The channel is told the new geometry BEFORE tmux is asked for it, so there
+/// is no window where the pane has resized and viewers are still free to
+/// publish the parser's old layout; an expectation whose resize turns out not
+/// to be ours is withdrawn. The resize stays marked in flight for as long as
+/// the guard lives, so another viewer probing the pane's size across it cannot
+/// mistake a not-yet-applied resize for one tmux refused. `Busy` (a chunk
+/// landed under the capture, common while an agent streams) and `Failed` leave
+/// the expectation standing, which is what keeps grid transport suspended until
+/// a retry lands.
+#[cfg(unix)]
+fn resize_and_reseed(
+    session: &crate::tmux::Session,
+    who: &str,
+    ch: Option<&crate::tmux::vt::VtChannel>,
+    cols: u16,
+    rows: u16,
+) -> bool {
+    let in_flight = ch.map(|ch| ch.begin_resize(cols, rows));
+    let owned = session.resize_window_if_owner(who, cols, rows);
+    match (owned, ch, in_flight) {
+        (true, Some(ch), _guard) => {
+            let deadline = crate::tmux::TmuxCommandDeadline::new();
+            ch.set_grid_size_with_deadline(cols, rows, &deadline);
+        }
+        (false, _, Some(guard)) => guard.abandon(),
+        _ => {}
+    }
+    owned
+}
+
+#[cfg(not(unix))]
+fn resize_and_reseed(session: &crate::tmux::Session, who: &str, cols: u16, rows: u16) -> bool {
+    session.resize_window_if_owner(who, cols, rows)
+}
+
+/// The VT grid renders a single-pane window within its scrollback depth; a
+/// split window is composited from `capture-pane`.
+#[cfg(unix)]
+fn grid_transport_eligible(pane_count: Option<u16>, window_lines: usize) -> bool {
+    pane_count == Some(1) && window_lines <= crate::tmux::vt::SCROLLBACK_LINES
+}
+
+/// Resolve a pending resize expectation while the grid is out of service.
+///
+/// Reconciling first is what ends it either way: tmux is asked for the pane's
+/// real size, which drops an expectation the pane never took and re-aims a real
+/// divergence at the geometry it does have. Every viewer does that much, since
+/// the snapshot fallback samples nothing and would otherwise leave the channel
+/// unread. The reseed after it is the size owner's fast path, and takes the
+/// cross-process lock into account: the local flag lags a steal by up to a
+/// heartbeat, and rebuilding the shared parser on a stale one would aim it at a
+/// geometry the new owner has already moved the pane away from.
+#[cfg(unix)]
+fn retry_pending_resync(
+    name: &str,
+    who: &str,
+    is_owner: bool,
+    ch: Option<&crate::tmux::vt::VtChannel>,
+    deadline: &crate::tmux::TmuxCommandDeadline,
+) {
+    let Some(ch) = ch else {
+        return;
+    };
+    if ch.pending_resync_target().is_none() {
+        return;
+    }
+    ch.reconcile_with_deadline(deadline);
+    let Some((cols, rows)) = ch.pending_resync_target() else {
+        return;
+    };
+    if !is_owner || !crate::tmux::Session::from_name(name).refresh_size_owner(who) {
+        return;
+    }
+    ch.set_grid_size_with_deadline(cols, rows, deadline);
 }
 
 /// Rewrite bare cursor-key sequences for an app in DECCKM (application
@@ -626,17 +742,7 @@ async fn handle_live_ws(
         }
     }
 
-    let settings = Arc::new(LiveSettings {
-        window_lines: AtomicUsize::new(DEFAULT_WINDOW_LINES),
-        fast: AtomicBool::new(true),
-        screen_rows: AtomicU64::new(0),
-        screen_cols: AtomicU64::new(0),
-        is_owner: AtomicBool::new(false),
-        deflate: AtomicBool::new(false),
-        patch: AtomicBool::new(false),
-        force_full: AtomicBool::new(false),
-        resize_settle_until_ms: AtomicU64::new(0),
-    });
+    let settings = Arc::new(LiveSettings::new());
     // Identifies this connection in the cross-process size-owner lock (shared
     // with the web PTY attach and the native TUI via tmux user options).
     let owner_id = format!(
@@ -731,10 +837,40 @@ async fn handle_live_ws(
         let mut deflater: Option<FrameDeflater> = None;
         let mut dead_probes: u32 = 0;
         let mut last_reassert = std::time::Instant::now() - REASSERT_MIN_INTERVAL;
+        #[cfg(unix)]
+        let mut last_grid_resync = Instant::now() - GRID_RESYNC_RETRY;
         let mut reassert_guard = ReassertGuard::new(STUCK_REASSERT_RETRY);
         let mut last_heartbeat = std::time::Instant::now() - SIZE_OWNER_HEARTBEAT;
         let mut last_reclaim = std::time::Instant::now() - SIZE_OWNER_HEARTBEAT;
         loop {
+            // The grid serves single-pane windows within its scrollback depth;
+            // a split window is composited from capture-pane.
+            #[cfg(unix)]
+            let live_grid = capture_vt.as_ref().filter(|ch| ch.is_alive()).cloned();
+            // A resize whose reseed did not land left the parser at the old
+            // geometry. Resolve it on a throttle, before this cycle's frame is
+            // timed; until it lands the frames come from capture-pane, which
+            // reads the resized pane itself.
+            #[cfg(unix)]
+            if last_grid_resync.elapsed() >= GRID_RESYNC_RETRY
+                && live_grid
+                    .as_ref()
+                    .is_some_and(|ch| ch.grid_resync_pending())
+            {
+                let name = capture_tmux.clone();
+                let who = capture_owner.clone();
+                let is_owner = capture_settings.is_owner.load(Ordering::Relaxed);
+                let ch = live_grid.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let deadline = crate::tmux::TmuxCommandDeadline::new();
+                    retry_pending_resync(&name, &who, is_owner, ch.as_deref(), &deadline);
+                })
+                .await;
+                // Throttle from the end of the attempt: a reseed forks
+                // capture-pane and can take most of the interval.
+                last_grid_resync = Instant::now();
+            }
+
             let sample_started = std::time::Instant::now();
             let lines = capture_settings.window_lines.load(Ordering::Relaxed);
 
@@ -744,11 +880,13 @@ async fn handle_live_ws(
             let outcome: CaptureOutcome;
             #[cfg(unix)]
             let mut grid_frame = false;
+            // Set from the sample itself, not from a later hold check: only the
+            // sampler knows whether the payload it assembled is a half-drawn
+            // synchronized-output frame.
+            #[cfg(unix)]
+            let mut grid_incomplete = false;
             #[cfg(unix)]
             {
-                // The grid serves single-pane windows within its scrollback
-                // depth; a split window is composited from capture-pane.
-                let live_grid = capture_vt.as_ref().filter(|ch| ch.is_alive()).cloned();
                 if live_grid.is_some() && pane_count.1.elapsed() >= PANE_COUNT_PROBE_INTERVAL {
                     let name = capture_tmux.clone();
                     // Advance the probe clock even on failure, or a tmux that
@@ -760,10 +898,7 @@ async fn handle_live_ws(
                     pane_count = (probed.ok().flatten().or(pane_count.0), Instant::now());
                 }
                 outcome = match live_grid {
-                    Some(ch)
-                        if pane_count.0 == Some(1)
-                            && lines <= crate::tmux::vt::SCROLLBACK_LINES =>
-                    {
+                    Some(ch) if grid_transport_eligible(pane_count.0, lines) => {
                         grid_frame = true;
                         match tokio::task::spawn_blocking(move || {
                             let deadline = crate::tmux::TmuxCommandDeadline::new();
@@ -771,7 +906,10 @@ async fn handle_live_ws(
                         })
                         .await
                         {
-                            Ok((content, cursor)) => CaptureOutcome::Frame(content, cursor),
+                            Ok(sample) => {
+                                grid_incomplete = sample.incomplete;
+                                CaptureOutcome::Frame(sample.content, sample.cursor)
+                            }
                             Err(_) => break,
                         }
                     }
@@ -864,16 +1002,30 @@ async fn handle_live_ws(
                             last_reclaim = std::time::Instant::now();
                             let name = capture_tmux.clone();
                             let who = capture_owner.clone();
+                            #[cfg(unix)]
+                            let reclaim_vt = capture_vt.clone();
                             let claimed = tokio::task::spawn_blocking(move || {
                                 let session = crate::tmux::Session::from_name(&name);
-                                if session.claim_size_owner(&who, SIZE_OWNER_TTL) {
-                                    session.resize_window_if_owner(&who, cols, rows)
-                                } else {
-                                    false
+                                if !session.claim_size_owner(&who, SIZE_OWNER_TTL) {
+                                    return false;
                                 }
+                                #[cfg(unix)]
+                                let owned = resize_and_reseed(
+                                    &session,
+                                    &who,
+                                    reclaim_vt.as_deref(),
+                                    cols,
+                                    rows,
+                                );
+                                #[cfg(not(unix))]
+                                let owned = resize_and_reseed(&session, &who, cols, rows);
+                                owned
                             })
                             .await
                             .unwrap_or(false);
+                            // This resize moves the pane like any other the
+                            // owner drives, so it owes the same settle window.
+                            capture_settings.record_owner_resize(claimed);
                             if claimed {
                                 capture_settings.is_owner.store(true, Ordering::Relaxed);
                                 last_heartbeat = std::time::Instant::now();
@@ -939,26 +1091,23 @@ async fn handle_live_ws(
                                 #[cfg(unix)]
                                 let reassert_vt = capture_vt.clone();
                                 let still_owner = tokio::task::spawn_blocking(move || {
-                                    let owned = crate::tmux::Session::from_name(&name)
-                                        .resize_window_if_owner(&who, want_cols, want_rows);
+                                    let session = crate::tmux::Session::from_name(&name);
                                     #[cfg(unix)]
-                                    if owned {
-                                        if let Some(ch) = reassert_vt.as_ref() {
-                                            let deadline = crate::tmux::TmuxCommandDeadline::new();
-                                            ch.set_grid_size_with_deadline(
-                                                want_cols, want_rows, &deadline,
-                                            );
-                                        }
-                                    }
+                                    let owned = resize_and_reseed(
+                                        &session,
+                                        &who,
+                                        reassert_vt.as_deref(),
+                                        want_cols,
+                                        want_rows,
+                                    );
+                                    #[cfg(not(unix))]
+                                    let owned =
+                                        resize_and_reseed(&session, &who, want_cols, want_rows);
                                     owned
                                 })
                                 .await
                                 .unwrap_or(false);
-                                if still_owner {
-                                    capture_settings
-                                        .resize_settle_until_ms
-                                        .store(live_now_ms() + RESIZE_SETTLE_MS, Ordering::Relaxed);
-                                }
+                                capture_settings.record_owner_resize(still_owner);
                                 if !still_owner {
                                     capture_settings.is_owner.store(false, Ordering::Relaxed);
                                     let _ = capture_tx
@@ -1029,9 +1178,38 @@ async fn handle_live_ws(
                     // Mid-bracket grid (the app is inside a synchronized-output
                     // repaint, or a reseed just copied tmux's half-drawn cells):
                     // wait for the close, which wakes the loop. The hold expires
-                    // on its own if the app never closes the bracket.
+                    // on its own if the app never closes the bracket. A sample
+                    // that reports itself half-drawn is held whatever the hold
+                    // now says: it can have expired, or its bracket closed,
+                    // since the payload was assembled.
+                    // The parser has not been rebuilt at the geometry the pane
+                    // was resized to, so its cells are laid out for a size the
+                    // pane no longer has. Withhold rather than switch transport:
+                    // the reseed lands in a frame or two, and flipping the
+                    // client between two serializations of the same screen for
+                    // that long costs it a repaint it does not need.
                     #[cfg(unix)]
-                    if grid_frame && capture_vt.as_ref().is_some_and(|ch| ch.sync_hold_active()) {
+                    if grid_frame
+                        && capture_vt
+                            .as_ref()
+                            .is_some_and(|ch| ch.grid_resync_pending())
+                    {
+                        stats.settle_held += 1;
+                        wait_for_next(
+                            &capture_settings,
+                            &capture_nudge,
+                            vt_rx.as_mut(),
+                            sample_started,
+                            grid_frame,
+                        )
+                        .await;
+                        continue;
+                    }
+                    #[cfg(unix)]
+                    if grid_frame
+                        && (grid_incomplete
+                            || capture_vt.as_ref().is_some_and(|ch| ch.sync_hold_active()))
+                    {
                         stats.sync_held += 1;
                         wait_for_next(
                             &capture_settings,
@@ -1072,6 +1250,14 @@ async fn handle_live_ws(
                     #[cfg(unix)]
                     if announced_grid != Some(grid_frame) {
                         announced_grid = Some(grid_frame);
+                        // The two transports serialize the same screen from
+                        // different sources, and carry their own scrollback
+                        // depth with it. Patching across the switch would apply
+                        // rows (and a history shift) computed against the other
+                        // one's frame, which lands the cursor rows away from the
+                        // line it belongs on. Drop the baseline so the first
+                        // frame after a switch is a whole one.
+                        last_sent = None;
                         if capture_tx
                             .send(Message::Text(transport_json(grid_frame).into()))
                             .await
@@ -1276,25 +1462,24 @@ async fn handle_live_ws(
                                 let resize_vt = vt.clone();
                                 let owned = tokio::task::spawn_blocking(move || {
                                     let session = crate::tmux::Session::from_name(&name);
-                                    let owned = session.claim_size_owner(&who, SIZE_OWNER_TTL)
-                                        && session.resize_window_if_owner(&who, cols, rows);
-                                    #[cfg(unix)]
-                                    if owned {
-                                        if let Some(ch) = resize_vt.as_ref() {
-                                            let deadline = crate::tmux::TmuxCommandDeadline::new();
-                                            ch.set_grid_size_with_deadline(cols, rows, &deadline);
-                                        }
+                                    if !session.claim_size_owner(&who, SIZE_OWNER_TTL) {
+                                        return false;
                                     }
+                                    #[cfg(unix)]
+                                    let owned = resize_and_reseed(
+                                        &session,
+                                        &who,
+                                        resize_vt.as_deref(),
+                                        cols,
+                                        rows,
+                                    );
+                                    #[cfg(not(unix))]
+                                    let owned = resize_and_reseed(&session, &who, cols, rows);
                                     owned
                                 })
                                 .await
                                 .unwrap_or(false);
-                                if owned {
-                                    settings.resize_settle_until_ms.store(
-                                        live_now_ms() + RESIZE_SETTLE_MS,
-                                        Ordering::Relaxed,
-                                    );
-                                }
+                                settings.record_owner_resize(owned);
                                 settings.is_owner.store(owned, Ordering::Relaxed);
                                 let _ = out_tx
                                     .send(Message::Text(size_owner_json(owned).into()))
@@ -1346,32 +1531,29 @@ async fn handle_live_ws(
                                 let rows = settings.screen_rows.load(Ordering::Relaxed) as u16;
                                 #[cfg(unix)]
                                 let claim_vt = vt.clone();
-                                let owned = tokio::task::spawn_blocking(move || {
+                                let (owned, resized) = tokio::task::spawn_blocking(move || {
                                     let session = crate::tmux::Session::from_name(&name);
                                     if !session.steal_size_owner(&who) {
-                                        return false;
+                                        return (false, false);
                                     }
                                     if cols == 0 || rows == 0 {
-                                        return true;
+                                        return (true, false);
                                     }
-                                    let owned = session.resize_window_if_owner(&who, cols, rows);
                                     #[cfg(unix)]
-                                    if owned {
-                                        if let Some(ch) = claim_vt.as_ref() {
-                                            let deadline = crate::tmux::TmuxCommandDeadline::new();
-                                            ch.set_grid_size_with_deadline(cols, rows, &deadline);
-                                        }
-                                    }
-                                    owned
+                                    let owned = resize_and_reseed(
+                                        &session,
+                                        &who,
+                                        claim_vt.as_deref(),
+                                        cols,
+                                        rows,
+                                    );
+                                    #[cfg(not(unix))]
+                                    let owned = resize_and_reseed(&session, &who, cols, rows);
+                                    (owned, owned)
                                 })
                                 .await
-                                .unwrap_or(false);
-                                if owned && cols > 0 && rows > 0 {
-                                    settings.resize_settle_until_ms.store(
-                                        live_now_ms() + RESIZE_SETTLE_MS,
-                                        Ordering::Relaxed,
-                                    );
-                                }
+                                .unwrap_or((false, false));
+                                settings.record_owner_resize(resized);
                                 settings.is_owner.store(owned, Ordering::Relaxed);
                                 let _ = out_tx
                                     .send(Message::Text(size_owner_json(owned).into()))
@@ -2016,6 +2198,49 @@ mod tests {
         assert!(resize_settle_holds(100, 400, (80, 24), (120, 40)));
         assert!(!resize_settle_holds(100, 400, (80, 24), (80, 24)));
         assert!(!resize_settle_holds(500, 400, (80, 24), (120, 40)));
+    }
+
+    #[test]
+    fn a_resize_whose_reseed_missed_withholds_frames_until_it_lands() {
+        // The settle window is armed by every resize this connection drives as
+        // size owner, and by nothing else.
+        assert_eq!(resize_follow_up(true, 100), Some(100 + RESIZE_SETTLE_MS));
+        assert_eq!(resize_follow_up(false, 100), None);
+
+        let settings = LiveSettings::new();
+        settings.record_owner_resize(true);
+        let settle_until = settings.resize_settle_until_ms.load(Ordering::Relaxed);
+        assert!(settle_until > 0);
+        settings.record_owner_resize(false);
+        assert_eq!(
+            settings.resize_settle_until_ms.load(Ordering::Relaxed),
+            settle_until,
+            "a resize this connection did not own arms nothing"
+        );
+
+        // Whether the parser reached the new geometry is the channel's state,
+        // not this connection's, and it withholds frames rather than moving the
+        // view to another transport: see `VtChannel::grid_resync_pending`. The
+        // settle window expiring does not republish the old grid either.
+        assert!(!resize_settle_holds(
+            settle_until + 1,
+            settle_until,
+            (120, 40),
+            (120, 40)
+        ));
+    }
+
+    #[test]
+    fn grid_transport_needs_a_single_pane_within_the_grids_scrollback() {
+        assert!(grid_transport_eligible(Some(1), 50));
+        // Unprobed or split windows are composited from capture-pane.
+        assert!(!grid_transport_eligible(None, 50));
+        assert!(!grid_transport_eligible(Some(2), 50));
+        // A window deeper than the grid keeps that history.
+        assert!(!grid_transport_eligible(
+            Some(1),
+            crate::tmux::vt::SCROLLBACK_LINES + 1
+        ));
     }
 
     #[test]

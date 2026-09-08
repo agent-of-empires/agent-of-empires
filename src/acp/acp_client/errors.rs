@@ -110,9 +110,7 @@ impl AcpError {
     }
 }
 
-/// Build a crate `Error` carrying `message`, for the v2 control path where
-/// the daemon's handshake round-trip fails at the control channel rather
-/// than at a crate `send_request`.
+/// Build a crate error for a control v3 handshake failure.
 pub(super) fn acp_internal_error(message: String) -> agent_client_protocol::Error {
     let mut err = agent_client_protocol::Error::internal_error();
     err.message = message;

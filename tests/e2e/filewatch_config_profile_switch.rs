@@ -26,10 +26,11 @@ fn peer_edit_after_switch_propagates_via_watcher() {
     h.wait_for(" aoe ");
 
     // Switch into B FIRST. switch_profile reads B's (empty) config; the
-    // cold-reload path observes confirm_before_quit = false.
+    // cold-reload path observes confirm_before_quit = false. The picker
+    // sinks `default` last, so B is one row above the active row.
     h.send_keys("P");
     h.wait_for("Profiles");
-    h.send_keys("Down");
+    h.send_keys("Up");
     h.send_keys("Enter");
     h.wait_for_absent("Profiles", Duration::from_secs(5));
     h.assert_screen_contains("[scratch_b]");

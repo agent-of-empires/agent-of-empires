@@ -658,6 +658,7 @@ async fn list_sessions_shares_config_resolution_across_overlays() {
 #[tokio::test]
 #[serial_test::serial]
 async fn list_sessions_state_filter() {
+    let _guard = crate::session::test_support::isolate_app_dir();
     let mut live = Instance::new("live", "/tmp/scope-live");
     live.id = "scope-live".to_string();
     let mut trashed = Instance::new("trashed", "/tmp/scope-trashed");
@@ -673,9 +674,15 @@ async fn list_sessions_state_filter() {
         archived.clone(),
     ]);
 
-    let ids = |envelope: &SessionsEnvelope| -> Vec<String> {
-        envelope.sessions.iter().map(|s| s.id.clone()).collect()
-    };
+    async fn ids(response: Json<SessionsEnvelope>) -> Vec<String> {
+        let response = response.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let envelope: crate::daemon::SessionsEnvelope = serde_json::from_slice(&body).unwrap();
+        envelope.sessions.into_iter().map(|s| s.id).collect()
+    }
 
     let all = list_sessions(
         axum::extract::State(state.clone()),
@@ -683,9 +690,8 @@ async fn list_sessions_state_filter() {
     )
     .await;
     assert_eq!(
-        ids(&all).len(),
-        3,
-        "no param stays unfiltered (back-compat)"
+        ids(all).await,
+        ["scope-live", "scope-trashed", "scope-archived"]
     );
 
     let live_only = list_sessions(
@@ -695,7 +701,7 @@ async fn list_sessions_state_filter() {
         }),
     )
     .await;
-    assert_eq!(ids(&live_only), vec!["scope-live".to_string()]);
+    assert_eq!(ids(live_only).await, ["scope-live"]);
 
     let trashed_only = list_sessions(
         axum::extract::State(state.clone()),
@@ -704,7 +710,7 @@ async fn list_sessions_state_filter() {
         }),
     )
     .await;
-    assert_eq!(ids(&trashed_only), vec!["scope-trashed".to_string()]);
+    assert_eq!(ids(trashed_only).await, ["scope-trashed"]);
 
     let explicit_all = list_sessions(
         axum::extract::State(state),
@@ -713,7 +719,10 @@ async fn list_sessions_state_filter() {
         }),
     )
     .await;
-    assert_eq!(ids(&explicit_all).len(), 3);
+    assert_eq!(
+        ids(explicit_all).await,
+        ["scope-live", "scope-trashed", "scope-archived"]
+    );
 }
 
 #[tokio::test]
@@ -2110,7 +2119,10 @@ fn apply_post_restart_sync_propagates_agent_session_id() {
     started.agent_session_id = Some("claude-uuid-restart".to_string());
     started.omp_capture_generation = Some("omp-generation-restart".to_string());
     let mut poller = crate::session::poller::SessionPoller::new("omp-restarted".to_string());
-    assert!(poller.start(before.id.clone(), Box::new(|| None), Box::new(|_| {}), None,));
+    assert_eq!(
+        poller.start(before.id.clone(), Box::new(|| None), Box::new(|_| {}), None,),
+        crate::session::poller::PollerSpawn::Spawned
+    );
     let restarted_poller = std::sync::Arc::new(std::sync::Mutex::new(poller));
     started.session_id_poller = Some(restarted_poller.clone());
     started.last_start_time = Some(std::time::Instant::now());
@@ -2154,6 +2166,54 @@ fn apply_post_restart_sync_propagates_agent_session_id() {
             .expect("running restart poller"),
         &restarted_poller,
     ));
+    restarted_poller
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .stop();
+}
+
+#[test]
+fn apply_post_restart_identity_sync_clears_repair_backoff_when_restart_poller_runs() {
+    let mut before = make_test_instance();
+    before.omp_capture_generation = Some("generation-a".to_string());
+    let now = std::time::Instant::now();
+    before.poller_repair.defer(now);
+    before.poller_repair.defer(now);
+    assert_eq!(before.poller_repair.deferrals(), 2);
+
+    let mut started = before.clone();
+    started.omp_capture_generation = Some("generation-b".to_string());
+    started.poller_repair.reset();
+    let mut poller = crate::session::poller::SessionPoller::new("omp-restarted".to_string());
+    assert_eq!(
+        poller.start(before.id.clone(), Box::new(|| None), Box::new(|_| {}), None,),
+        crate::session::poller::PollerSpawn::Spawned
+    );
+    let restarted_poller = std::sync::Arc::new(std::sync::Mutex::new(poller));
+    started.session_id_poller = Some(restarted_poller.clone());
+
+    let mut live = before.clone();
+    apply_post_restart_identity_sync(&mut live, &before, &started);
+    assert_eq!(
+        live.poller_repair.deferrals(),
+        0,
+        "the merged live row must not keep the pre-restart backoff"
+    );
+
+    let mut peer_relaunched = before.clone();
+    peer_relaunched.omp_capture_generation = Some("peer-generation".to_string());
+    apply_post_restart_identity_sync(&mut peer_relaunched, &before, &started);
+    assert_eq!(peer_relaunched.poller_repair.deferrals(), 0);
+
+    let mut not_started = started.clone();
+    not_started.session_id_poller = None;
+    let mut live = before.clone();
+    apply_post_restart_identity_sync(&mut live, &before, &not_started);
+    assert_eq!(
+        live.poller_repair.deferrals(),
+        2,
+        "a restart without a running poller leaves the schedule alone"
+    );
     restarted_poller
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())

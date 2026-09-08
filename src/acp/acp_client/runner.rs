@@ -20,10 +20,9 @@ pub(super) fn runner_socket_deadline() -> std::time::Duration {
     if let Ok(raw) = std::env::var("AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS") {
         if let Ok(ms) = raw.parse::<u64>() {
             // Clamp to a floor of 100ms so a typo like
-            // `AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS=0` does not make
-            // wait_for_socket fail immediately and surface as a
-            // mysterious "runner socket did not appear" without ever
-            // polling.
+            // `AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS=0` does not make the
+            // control dial fail before it has retried even once, surfacing
+            // as a mysterious "does not speak control protocol".
             return std::time::Duration::from_millis(ms.max(100));
         }
     }
@@ -309,35 +308,4 @@ pub(super) fn spawn_runner_detached(
     // wait on drop, so the runner stays alive. setsid + nohup-equivalent
     // make this an actual detach.
     Ok(())
-}
-
-/// Poll the socket file's existence with `connect()` until a deadline.
-/// Used by `connect_via_socket` to wait for the runner to finish binding
-/// before the daemon dials in.
-pub(super) async fn wait_for_socket(
-    path: &std::path::Path,
-    deadline: std::time::Duration,
-) -> Result<tokio::net::UnixStream, AcpError> {
-    let started = std::time::Instant::now();
-    let mut delay_ms = 20_u64;
-    loop {
-        if path.exists() {
-            match tokio::net::UnixStream::connect(path).await {
-                Ok(s) => return Ok(s),
-                Err(e) if matches!(e.kind(), std::io::ErrorKind::ConnectionRefused) => {
-                    // Listener not yet ready; back off and retry.
-                }
-                Err(e) => return Err(AcpError::Spawn(format!("connect {}: {e}", path.display()))),
-            }
-        }
-        if started.elapsed() >= deadline {
-            return Err(AcpError::Spawn(format!(
-                "runner socket {} did not appear within {}s",
-                path.display(),
-                deadline.as_secs()
-            )));
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-        delay_ms = (delay_ms * 2).min(200);
-    }
 }
