@@ -103,7 +103,7 @@ impl HomeView {
         if !self.daemon_sidebar {
             self.set_sidebar_source(
                 crate::tui::session_feed::SidebarSource::Storage,
-                "session.daemon_sidebar is off",
+                Some("session.daemon_sidebar is off"),
             );
         }
         self.agent_clipboard_forward =

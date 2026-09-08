@@ -6,22 +6,17 @@
 //! or an unavailable report, and the home view projects the daemon-owned
 //! fields onto its rows (see `HomeView::apply_session_feed`).
 //!
-//! Which fields the daemon owns is narrow on purpose while the TUI is still
-//! the writer of durable session state: today it is the runtime status of
-//! structured (ACP) rows. Those have no tmux pane for the local poller to
-//! observe, and the daemon never persists their status to `sessions.json`
-//! (see the durability contract on `apply_acp_overlay_inplace`), so a TUI
-//! reading disk would show them frozen at whatever creation or an explicit
-//! start/stop wrote. Terminal rows stay with the local tmux poller: the
-//! daemon does not own tmux yet, and taking its copy would put a second
-//! producer on every row with a multi-second lag behind the local probe.
+//! The daemon-owned set is narrow while the TUI still writes durable session
+//! state: today it is the runtime status of structured (ACP) rows, which have
+//! no tmux pane and whose status the daemon never persists (see
+//! `apply_acp_overlay_inplace`). Terminal rows stay with the local tmux
+//! poller, which the daemon does not own yet.
 //!
 //! No daemon reachable, or `session.daemon_sidebar` off, means the local
 //! session store serves the sidebar alone and daemon-owned state keeps its
 //! last value. That is not an error: a structured session cannot be running
-//! without a daemon (the event store is opened by `aoe serve`, and
-//! `require_daemon` refuses to auto-spawn), so there is no live status to
-//! miss.
+//! without a daemon (`require_daemon` refuses to auto-spawn), so there is no
+//! live status to miss.
 
 use std::sync::mpsc::TryRecvError;
 

@@ -584,7 +584,19 @@ impl HttpClient {
         &self,
         session_id: &str,
     ) -> Result<crate::acp::session_paths::SessionViewInfo, HttpError> {
-        let envelope = self.endpoint.daemon_client()?.list_sessions(None).await?;
+        let envelope = self
+            .endpoint
+            .daemon_client()?
+            .list_sessions(None)
+            .await
+            .map_err(|error| match error {
+                crate::daemon::DaemonClientError::Status { status, .. }
+                    if status == StatusCode::UNAUTHORIZED =>
+                {
+                    HttpError::Unauthorized
+                }
+                error => HttpError::Daemon(error),
+            })?;
         envelope
             .sessions
             .into_iter()

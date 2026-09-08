@@ -251,8 +251,8 @@ fn request_session_feed_refresh_arms_and_disarms_the_in_flight_flag() {
     assert!(env.view.pending_session_feed);
 
     // Draining the worker disarms, so the next tick can fetch again. The
-    // fetch itself returns empty here (no daemon in the test env), which is
-    // the same path a daemon-less TUI takes.
+    // fetch itself reports the daemon unavailable here (none in the test
+    // env), which is the same path a daemon-less TUI takes.
     while env.view.pending_session_feed {
         if env.view.apply_session_feed() {
             break;

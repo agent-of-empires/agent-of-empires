@@ -210,11 +210,12 @@ impl HomeView {
 
     /// Record where daemon-owned sidebar state comes from, logging the
     /// transition so a sidebar stuck on stale structured status is
-    /// diagnosable from the log alone.
+    /// diagnosable from the log alone. `reason` says why the daemon is not
+    /// the source and is ignored for `Daemon`.
     pub(super) fn set_sidebar_source(
         &mut self,
         source: crate::tui::session_feed::SidebarSource,
-        reason: &str,
+        reason: Option<&str>,
     ) {
         use crate::tui::session_feed::SidebarSource;
 
@@ -229,7 +230,7 @@ impl HomeView {
             ),
             SidebarSource::Storage => tracing::info!(
                 target: "tui.home",
-                reason,
+                reason = reason.unwrap_or(""),
                 "sidebar: local store only; daemon-owned state keeps its last value",
             ),
         }
@@ -285,7 +286,7 @@ impl HomeView {
                 }
                 match result {
                     SessionFeedResult::Snapshot(rows) => {
-                        self.set_sidebar_source(SidebarSource::Daemon, "");
+                        self.set_sidebar_source(SidebarSource::Daemon, None);
                         let updates = session_feed::structured_updates(&rows);
                         let applied = !updates.is_empty();
                         for update in updates {
@@ -294,7 +295,7 @@ impl HomeView {
                         applied
                     }
                     SessionFeedResult::Unavailable(reason) => {
-                        self.set_sidebar_source(SidebarSource::Storage, &reason);
+                        self.set_sidebar_source(SidebarSource::Storage, Some(&reason));
                         false
                     }
                 }

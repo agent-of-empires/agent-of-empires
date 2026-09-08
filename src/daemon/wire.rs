@@ -491,6 +491,7 @@ pub struct CleanupDefaults {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionsEnvelope {
     pub sessions: Vec<SessionResponse>,
+    #[serde(default)]
     pub workspace_ordering: Vec<String>,
 }
 
@@ -521,5 +522,13 @@ mod tests {
         assert_eq!(row.context_resume, None);
 
         assert!(serde_json::from_str::<SessionResponse>(r#"{"title":"no id"}"#).is_err());
+    }
+
+    #[test]
+    fn sessions_envelope_decodes_without_workspace_ordering() {
+        let envelope: SessionsEnvelope =
+            serde_json::from_str(r#"{"sessions":[{"id":"a"}]}"#).unwrap();
+        assert_eq!(envelope.sessions.len(), 1);
+        assert!(envelope.workspace_ordering.is_empty());
     }
 }
