@@ -17,6 +17,7 @@ use super::{
 };
 use crate::cli::truncate_id;
 use crate::process;
+use crate::session::environment::shell_escape_script_word;
 use crate::session::Status;
 use crate::util::now_ms;
 
@@ -667,7 +668,7 @@ impl Session {
             bail!("Session does not exist: {}", self.name);
         }
 
-        if std::env::var("TMUX").is_ok() {
+        if crate::tmux::utils::inside_tmux() {
             let status = crate::tmux::tmux_command()
                 .args(["switch-client", "-t", &self.name])
                 .status()?;
@@ -1818,15 +1819,19 @@ impl Session {
         quoted
     }
 
+    /// Returns the applied window row count (`rows` plus status-bar chrome)
+    /// on success, so callers can later compare the observed window size
+    /// against what was actually set; `None` when the guard declined or tmux
+    /// errored.
     fn resize_window_if_format_with_deadline(
         &self,
         condition: &str,
         cols: u16,
         rows: u16,
         deadline: &crate::tmux::TmuxCommandDeadline,
-    ) -> bool {
+    ) -> Option<u16> {
         if cols == 0 || rows == 0 {
-            return false;
+            return None;
         }
         let pane_target = format!("{}:^.0", self.name);
         let window_rows = self
@@ -1836,18 +1841,28 @@ impl Session {
         // if-shell -F evaluates the owner/attachment guard and inserts this
         // branch in the same tmux command queue. No other client can replace
         // the guarded state between the check and resize-window.
-        let target = Self::tmux_command_string_literal(&self.name);
+        //
+        // Target the FIRST window (`:^`) explicitly: a bare session target
+        // resolves to the session's current window, so on a session where the
+        // user created more windows the resize would land on the wrong one
+        // while the chrome probe above and the preview capture both use the
+        // first. The observed-size reconcile also reads the first window, so
+        // resizing any other would loop forever chasing a mismatch.
+        let target = Self::tmux_command_string_literal(&format!("{}:^", self.name));
         let resize = format!(
             "resize-window -t {target} -x {cols} -y {window_rows} ; display-message -p aoe-resize-applied"
         );
         let mut command = crate::tmux::tmux_command();
         command.args(["if-shell", "-t", &self.name, "-F", condition, &resize]);
-        deadline.run(&mut command).is_ok_and(|output| {
-            output.status.success()
-                && String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .any(|line| line.trim() == "aoe-resize-applied")
-        })
+        deadline
+            .run(&mut command)
+            .is_ok_and(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .any(|line| line.trim() == "aoe-resize-applied")
+            })
+            .then_some(window_rows)
     }
 
     fn release_owner_at_with_deadline(
@@ -2003,7 +2018,10 @@ impl Session {
                 owner_id,
                 &heartbeat.to_string(),
             );
-            if self.resize_window_if_format_with_deadline(&condition, cols, rows, deadline) {
+            if self
+                .resize_window_if_format_with_deadline(&condition, cols, rows, deadline)
+                .is_some()
+            {
                 return true;
             }
 
@@ -2039,12 +2057,13 @@ impl Session {
     /// Resize a detached pane only if the inactive owner state observed here
     /// is unchanged when tmux executes resize-window. This fences a live owner
     /// or terminal attach that arrives after the preliminary worker checks.
+    /// Returns the applied window row count on success, `None` when declined.
     pub(crate) fn resize_window_if_detached_without_active_owner_after_exists_with_deadline(
         &self,
         cols: u16,
         rows: u16,
         deadline: &crate::tmux::TmuxCommandDeadline,
-    ) -> bool {
+    ) -> Option<u16> {
         let owner_condition = match self.owner_at_result_with_deadline(
             SIZE_OWNER_OPT,
             SIZE_OWNER_HB_OPT,
@@ -2056,7 +2075,7 @@ impl Session {
             Ok(Some((_, heartbeat)))
                 if now_ms().saturating_sub(heartbeat) <= SIZE_OWNER_TTL.as_millis() as u64 =>
             {
-                return false;
+                return None;
             }
             Ok(Some((owner, heartbeat))) => {
                 let owner = Self::tmux_format_literal(&owner);
@@ -2064,7 +2083,7 @@ impl Session {
                     "#{{&&:#{{==:#{{{SIZE_OWNER_OPT}}},{owner}}},#{{==:#{{{SIZE_OWNER_HB_OPT}}},{heartbeat}}}}}"
                 )
             }
-            Err(_) => return false,
+            Err(_) => return None,
         };
         let condition = format!("#{{&&:#{{==:#{{session_attached}},0}},{owner_condition}}}");
         self.resize_window_if_format_with_deadline(&condition, cols, rows, deadline)
@@ -2350,7 +2369,7 @@ impl EphemeralEnvFile {
             }
             match mutation {
                 PaneEnvMutation::Set { key, value } => {
-                    writeln!(file, "export {}={}", key, script_shell_escape(value))?;
+                    writeln!(file, "export {}={}", key, shell_escape_script_word(value))?;
                 }
                 PaneEnvMutation::Unset { key } => writeln!(file, "unset {}", key)?,
             }
@@ -2378,18 +2397,18 @@ impl EphemeralEnvFile {
                 file,
                 "exec {}<{} || exit 1",
                 crate::session::environment::CONTAINER_EXEC_ENV_FD,
-                script_shell_escape(&container_env_path.to_string_lossy())
+                shell_escape_script_word(&container_env_path.to_string_lossy())
             )?;
             writeln!(
                 file,
                 "rm -f -- {}",
-                script_shell_escape(&container_env_path.to_string_lossy())
+                shell_escape_script_word(&container_env_path.to_string_lossy())
             )?;
         }
         writeln!(
             file,
             "rm -f -- {}",
-            script_shell_escape(&path.to_string_lossy())
+            shell_escape_script_word(&path.to_string_lossy())
         )?;
         writeln!(file, "{launch}")?;
         file.flush()?;
@@ -2435,13 +2454,6 @@ impl Drop for EphemeralEnvFile {
             let _ = std::fs::remove_file(path);
         }
     }
-}
-
-/// Quote one POSIX script word without changing its bytes. Unlike the
-/// single-line command formatter, literal CR and LF bytes are valid inside
-/// single quotes here and must survive environment transport.
-fn script_shell_escape(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// Whether `text` should get a trailing space appended before being typed
@@ -3156,20 +3168,48 @@ mod tests {
         assert!(session.size_owner().is_none());
 
         let deadline = crate::tmux::TmuxCommandDeadline::new();
-        assert!(
-            session.resize_window_if_detached_without_active_owner_after_exists_with_deadline(
+        assert!(session
+            .resize_window_if_detached_without_active_owner_after_exists_with_deadline(
                 91, 31, &deadline,
             )
-        );
+            .is_some());
         assert_eq!(pane_size(), (91, 31));
         assert!(session.claim_size_owner("active", Duration::from_secs(10)));
         let deadline = crate::tmux::TmuxCommandDeadline::new();
-        assert!(!session
+        assert!(session
             .resize_window_if_detached_without_active_owner_after_exists_with_deadline(
                 92, 32, &deadline,
-            ));
+            )
+            .is_none());
         assert_eq!(pane_size(), (91, 31));
         session.release_size_owner("active");
+
+        // The resize must land on the FIRST window even when the session's
+        // current window is a later one: preview capture, the chrome probe,
+        // and the observed-size reconcile all read `:^`, so a bare-session
+        // target (which tmux resolves to the current window) would resize the
+        // wrong window and the reconcile would loop chasing a mismatch.
+        let out = crate::tmux::tmux_command()
+            .args(["new-window", "-t", guard.name(), "sleep 30"])
+            .output()
+            .expect("tmux new-window");
+        assert!(out.status.success());
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        assert!(session
+            .resize_window_if_detached_without_active_owner_after_exists_with_deadline(
+                93, 33, &deadline,
+            )
+            .is_some());
+        assert_eq!(
+            pane_size(),
+            (93, 33),
+            "the first window must be the resize target"
+        );
+        let out = crate::tmux::tmux_command()
+            .args(["kill-window", "-t", &format!("{}:$", guard.name())])
+            .output()
+            .expect("tmux kill-window");
+        assert!(out.status.success());
 
         // A partial owner write is unknown to passive readers, but a later
         // claimant must repair it rather than leaving the lock wedged forever.
@@ -4908,8 +4948,8 @@ mod tests {
         .unwrap();
         let command = format!(
             "printf '%s' \"$MULTILINE_SECRET\" > {}; printf '%s' \"${{AOE_TEST_STALE+x}}\" > {}",
-            script_shell_escape(&output.to_string_lossy()),
-            script_shell_escape(&stale_output.to_string_lossy())
+            shell_escape_script_word(&output.to_string_lossy()),
+            shell_escape_script_word(&stale_output.to_string_lossy())
         );
         let wrapper = file.wrap_command(Some(&command)).unwrap();
         let status = std::process::Command::new("sh")
@@ -4949,9 +4989,9 @@ mod tests {
         let command = format!(
             "printf '%s\\n%s' \"$PATH\" \"${{DOCKER_HOST-unset}}\" > {}; \
              cat {} > {}",
-            script_shell_escape(&host_output.to_string_lossy()),
+            shell_escape_script_word(&host_output.to_string_lossy()),
             crate::session::environment::CONTAINER_EXEC_ENV_PATH,
-            script_shell_escape(&payload_output.to_string_lossy()),
+            shell_escape_script_word(&payload_output.to_string_lossy()),
         );
         let wrapper = file.wrap_command(Some(&command)).unwrap();
         let script = std::fs::read_to_string(&script_path).unwrap();

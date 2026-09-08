@@ -2,7 +2,7 @@ name: PR Template Check
 
 on:
   # Use pull_request_target to have write access for PRs from forks
-  # This is safe because we only read the PR body from the event payload
+  # This is safe because we only read PR metadata from the event payload
   # and don't checkout or execute any code from the fork
   pull_request_target:
     types: [opened, edited]
@@ -16,8 +16,7 @@ jobs:
     # triggered the event; on an `edited` event fired by a maintainer or
     # another bot the actor is the editor, so a github.actor guard would let
     # the check run against Dependabot's templateless body. Matches the
-    # close-stale job and the nix-npm-hash escape hatch, which both key on
-    # pull_request.user.login.
+    # close-stale job, which keys on the same field.
     if: github.event_name == 'pull_request_target' && github.event.pull_request.user.login != 'dependabot[bot]'
     runs-on: ubuntu-latest
     permissions:
@@ -43,27 +42,30 @@ jobs:
               body.includes('## Test Coverage Analysis') &&
               body.includes('## AI Usage');
 
-            // Escape hatch for trusted internal automation: the
-            // nix-npm-hash bot (`.github/workflows/nix-npm-hash.yml`)
-            // emits a body with only `## Checklist` plus a
-            // `<!-- nix-npm-hash: -->` marker. Gate this on actor
-            // login = github-actions[bot] so a human PR cannot opt
-            // out of template enforcement by dropping the marker
-            // into its body.
-            const actor = context.payload.pull_request.user?.login;
+            // Escape hatches for trusted internal automation, whose body
+            // is not the contributor template: the nix-npm-hash bot
+            // (`.github/workflows/nix-npm-hash.yml`) and the weekly
+            // release-staging PR (`.github/workflows/open-release-pr.yml`).
+            //
+            // Both open their PR with `secrets.RELEASE_TOKEN`, so the
+            // author is the token owner, not github-actions[bot]. Key on
+            // the head branch, as `tag-release-pr.yml` does: creating a
+            // branch in the base repo needs push access, so a fork cannot
+            // opt out of enforcement by pasting a marker into its body.
+            const head = context.payload.pull_request.head;
+            const isInternalRepo =
+              head?.repo?.full_name === `${context.repo.owner}/${context.repo.repo}`;
+            const headRef = head?.ref || '';
+
             const isNixNpmHashBotPr =
-              actor === 'github-actions[bot]' &&
+              isInternalRepo &&
+              headRef === 'chore/nix-npm-hash-update' &&
               body.includes('<!-- nix-npm-hash:') &&
               body.includes('## Checklist');
 
-            // Escape hatch for the weekly release-staging PR
-            // (`.github/workflows/open-release-pr.yml`), whose body is a
-            // version bump plus changelog, not the contributor template.
-            // It carries a `<!-- release-version: -->` marker; gate on
-            // actor login = github-actions[bot] so a human PR cannot opt
-            // out by pasting the marker into its body.
             const isReleaseStagingBotPr =
-              actor === 'github-actions[bot]' &&
+              isInternalRepo &&
+              headRef.startsWith('release-staging/v') &&
               body.includes('<!-- release-version:');
 
             const hasChecklist =
@@ -182,12 +184,20 @@ jobs:
                 continue;
               }
 
-              // Skip the weekly release-staging PR; its body is exempt
-              // from the template check above, so it should never be
-              // closed for missing it.
-              if (pr.user?.login === 'github-actions[bot]' &&
-                  (pr.body || '').includes('<!-- release-version:')) {
+              // Skip the automation PRs the check above exempts. This
+              // listing returns issue payloads, which carry no head
+              // branch, so key on the label the opening workflow applies;
+              // only a maintainer can set one.
+              const prBody = pr.body || '';
+              const prLabels = (pr.labels || []).map(l => l.name);
+              if (prLabels.includes('release-staging') &&
+                  prBody.includes('<!-- release-version:')) {
                 console.log(`Skipping release-staging PR #${pr.number}`);
+                continue;
+              }
+              if (prLabels.includes('automated') &&
+                  prBody.includes('<!-- nix-npm-hash:')) {
+                console.log(`Skipping nix-npm-hash PR #${pr.number}`);
                 continue;
               }
 

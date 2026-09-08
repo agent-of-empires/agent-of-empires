@@ -47,13 +47,11 @@ pub fn plugin_commands() -> Vec<PluginCommand> {
 /// so no extra cost is added to the fast parse path.
 pub fn augmented_command() -> Command {
     let cmd = graft_onto(Cli::command(), plugin_commands());
-    #[cfg(feature = "serve")]
-    let cmd = hide_disabled_serve(cmd, web_disabled());
-    cmd
+
+    hide_disabled_serve(cmd, web_disabled())
 }
 
 /// True when the builtin `aoe.web` plugin is present and disabled.
-#[cfg(feature = "serve")]
 pub fn web_disabled() -> bool {
     crate::plugin::registry()
         .get("aoe.web")
@@ -63,7 +61,6 @@ pub fn web_disabled() -> bool {
 /// Hide `serve` from `--help` when the dashboard plugin is off. It stays
 /// parseable, since the lifecycle verbs must keep working; a fresh start is
 /// rejected as unrecognized in `main` (see `serve_start_blocked`).
-#[cfg(feature = "serve")]
 fn hide_disabled_serve(cmd: Command, web_disabled: bool) -> Command {
     if web_disabled {
         cmd.mut_subcommand("serve", |c| c.hide(true))
@@ -76,7 +73,6 @@ fn hide_disabled_serve(cmd: Command, web_disabled: bool) -> Command {
 /// subcommand: the command is `serve`, it is not a daemon lifecycle verb
 /// (`--stop` / `--status` / `--restart`, which must always reach a running
 /// daemon), and the `aoe.web` plugin is disabled.
-#[cfg(feature = "serve")]
 pub fn serve_start_blocked(cli: &Cli, web_disabled: bool) -> bool {
     let Some(super::definition::Commands::Serve(args)) = &cli.command else {
         return false;
@@ -182,7 +178,6 @@ mod tests {
         assert!(dispatch_plugin_command(&matches).is_err());
     }
 
-    #[cfg(feature = "serve")]
     fn parse(args: &[&str]) -> Cli {
         use clap::FromArgMatches;
         Cli::from_arg_matches(
@@ -193,7 +188,6 @@ mod tests {
         .expect("into Cli")
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn serve_start_blocked_only_when_web_off_and_not_lifecycle() {
         let start = parse(&["aoe", "serve"]);
@@ -207,11 +201,10 @@ mod tests {
                 "{verb} must bypass the gate"
             );
         }
-        // A non-serve command is never blocked.
+        // A command other than `serve` is never blocked.
         assert!(!serve_start_blocked(&parse(&["aoe", "agents"]), true));
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn hide_disabled_serve_hides_only_when_disabled() {
         let shown = hide_disabled_serve(Cli::command(), false);

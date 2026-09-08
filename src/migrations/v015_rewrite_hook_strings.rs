@@ -306,7 +306,7 @@ mod tests {
                     assert!(!event_defs.is_empty(), "unknown Claude event: {event_name}");
                     let mut canonical_set: Vec<String> = Vec::new();
                     for event_def in event_defs {
-                        if event_def.session_id_capture {
+                        if event_def.identity_field.is_some() {
                             canonical_set
                                 .push(canonical_session_id_command(HookInstallTarget::Host));
                         }

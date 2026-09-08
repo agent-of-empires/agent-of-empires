@@ -437,7 +437,8 @@ impl PluginManagerDialog {
     /// settings-search jump into the Plugins tab lands on the right plugin's
     /// detail pane. Returns whether a row matched.
     pub fn select_plugin_owning_ident(&mut self, ident: &str) -> bool {
-        let Some(rest) = ident.strip_prefix(crate::session::settings_schema::PLUGIN_SECTION_PREFIX)
+        let Some(rest) =
+            ident.strip_prefix(crate::session::config::settings_schema::PLUGIN_SECTION_PREFIX)
         else {
             return false;
         };

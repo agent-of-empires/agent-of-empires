@@ -29,11 +29,11 @@ pub enum AcpCommands {
         #[arg(long)]
         fix: bool,
         /// Adapter to install with --fix (repeatable). Defaults to
-        /// claude-agent-acp. One of: claude-agent-acp, codex-acp, pi-acp.
+        /// claude-agent-acp.
         #[arg(
             long,
             requires = "fix",
-            value_parser = ["claude-agent-acp", "codex-acp", "pi-acp"]
+            value_parser = clap::builder::PossibleValuesParser::new(bundled_adapter_names())
         )]
         adapter: Vec<String>,
         /// Install every pinned adapter with --fix instead of just the
@@ -115,18 +115,23 @@ pub enum AcpCommands {
         text: String,
     },
     /// Resolve a pending approval (default: allow). Use --always for a
-    /// session-scoped allow-list entry, --deny to refuse the request.
+    /// session-scoped allow-list entry, --deny to refuse the request, and
+    /// --option to answer a request that lists choices.
     Approve {
         /// Acp session id.
         session: String,
         /// Approval nonce, as printed in the pending-approval banner.
         nonce: String,
         /// Allow this kind of operation for the rest of the session.
-        #[arg(long, conflicts_with = "deny")]
+        #[arg(long, conflicts_with_all = ["deny", "option"])]
         always: bool,
         /// Refuse the request.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "option")]
         deny: bool,
+        /// Answer with this option id, from the request's option list. An
+        /// id the request never offered cancels it instead.
+        #[arg(long, value_name = "ID")]
+        option: Option<String>,
     },
     /// Cancel the in-flight prompt for an agent session.
     Cancel {
@@ -198,7 +203,8 @@ pub async fn run(command: AcpCommands) -> Result<()> {
             nonce,
             always,
             deny,
-        } => approve(&session, &nonce, always, deny).await,
+            option,
+        } => approve(&session, &nonce, always, deny, option).await,
         AcpCommands::Cancel { session } => cancel(&session).await,
         AcpCommands::Tail { session, since } => tail(&session, since).await,
         AcpCommands::Attach { session } => attach(&session).await,
@@ -250,7 +256,6 @@ struct AgentVersionIssue {
     install_command: String,
 }
 
-#[cfg(feature = "serve")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DoctorFixAction {
     PrintHint { reason: String },
@@ -261,7 +266,6 @@ enum DoctorFixAction {
 /// npm-distributed adapters are installed by `adapters::install`, not
 /// here). Missing or stale gated adapters get a manual install hint; a
 /// current or ungated adapter is left alone.
-#[cfg(feature = "serve")]
 fn doctor_fix_action(
     gate: Option<crate::acp::agent_compat::VersionGate>,
     probe: &crate::acp::version_probe::ProbeStatus,
@@ -308,7 +312,6 @@ fn doctor_fix_action(
 /// the bundled install above. A bundled adapter that IS on `PATH` still
 /// gets checked, because that copy shadows the pinned one (PATH-first
 /// resolution) and a stale one would break the session anyway.
-#[cfg(feature = "serve")]
 fn skip_gate_check(binary: &str, on_path: bool) -> bool {
     !on_path && crate::acp::adapters::is_bundled(binary)
 }
@@ -324,7 +327,6 @@ fn skip_gate_check(binary: &str, on_path: bool) -> bool {
 /// or failed probe keeps the PATH copy at spawn, so it stays flagged
 /// here. Absence with nothing installed stays the presence check's
 /// report; probing cannot sharpen it.
-#[cfg(feature = "serve")]
 fn doctor_version_issue(
     gate: &crate::acp::agent_compat::VersionGate,
     probe: &crate::acp::version_probe::ProbeStatus,
@@ -371,10 +373,16 @@ fn doctor_version_issue(
 /// in the app data dir, not merely bundleable. Shared by the `--fix`
 /// reporter and the plain listing so the #1017 fallback semantics have
 /// one definition.
-#[cfg(feature = "serve")]
 fn bundled_copy_installed(binary: &str) -> bool {
-    crate::session::get_app_dir()
-        .is_ok_and(|app_dir| crate::acp::adapters::bundled_adapter_bin(&app_dir, binary).is_some())
+    crate::session::get_app_dir().is_ok_and(|app_dir| bundled_copy_usable(&app_dir, binary))
+}
+
+/// What spawn resolution would accept: a bundled copy that is present, not
+/// stale, and runnable by the Node that would launch it.
+fn bundled_copy_usable(app_dir: &std::path::Path, binary: &str) -> bool {
+    crate::acp::adapters::bundled_adapter_bin(app_dir, binary).is_some()
+        && !crate::acp::adapters::installed_copy_is_stale(app_dir, binary)
+        && crate::acp::adapters::runtime_too_old_for(app_dir, binary).is_none()
 }
 
 /// Resolve whether `gate`'s adapter would miss its version floor at
@@ -382,7 +390,6 @@ fn bundled_copy_installed(binary: &str) -> bool {
 /// and credit the pinned bundle only when its own copy provably meets
 /// the floor. Skips the probe subprocess entirely when nothing usable
 /// is installed; the presence branch already reports that.
-#[cfg(feature = "serve")]
 async fn run_doctor_version_issue(
     gate: &crate::acp::agent_compat::VersionGate,
 ) -> Option<AgentVersionIssue> {
@@ -429,7 +436,6 @@ async fn run_doctor_version_issue(
 
 /// Strict stdout semver of the installed pinned copy, probed at its
 /// resolved data-dir path (`which::which` cannot see it there).
-#[cfg(feature = "serve")]
 async fn bundled_copy_strict_version(binary: &str) -> Option<semver::Version> {
     let app_dir = crate::session::get_app_dir().ok()?;
     let path = crate::acp::adapters::bundled_adapter_bin(&app_dir, binary)?;
@@ -446,13 +452,11 @@ async fn bundled_copy_strict_version(binary: &str) -> Option<semver::Version> {
 /// an older pin in the data dir; crediting it would reproduce #3267
 /// behind a green doctor, since spawn prefers it whenever the PATH copy
 /// looks stale and validate() then rejects the handshake.
-#[cfg(feature = "serve")]
 async fn bundled_copy_meets_floor(gate: &crate::acp::agent_compat::VersionGate) -> bool {
     let found = bundled_copy_strict_version(gate.binary).await;
     semver::Version::parse(gate.min_version).is_ok_and(|min| found.is_some_and(|v| v >= min))
 }
 
-#[cfg(feature = "serve")]
 async fn run_doctor_fix_action(binary: &str) {
     let gate = crate::acp::agent_compat::version_gate_for(
         crate::acp::agent_compat::ExpectedAgent::from_command(binary),
@@ -523,7 +527,17 @@ async fn doctor(json: bool, fix: bool, adapter: Vec<String>, all_adapters: bool)
                 "Cannot resolve the app data dir ({e}); skipping the Node and adapter install."
             ),
             Ok(app_dir) => {
-                let node = match node::resolve("", &app_dir) {
+                // A source adapter needs a Node that runs its TypeScript; a
+                // PATH copy below that floor is passed over for the bundled
+                // runtime, downloaded below if absent, so the install the
+                // hint names cannot refuse the Node this same command found.
+                let needs_sources =
+                    adapters_to_install(&adapter, all_adapters).is_ok_and(|wanted| {
+                        wanted
+                            .iter()
+                            .any(|b| crate::acp::adapters::ships_sources(b))
+                    });
+                let node = match node::resolve_for("", &app_dir, needs_sources) {
                     Ok(node) => {
                         println!("Node available: {} ({})", node.path.display(), node.version);
                         Some(node)
@@ -579,7 +593,6 @@ async fn doctor(json: bool, fix: bool, adapter: Vec<String>, all_adapters: bool)
         // any bundled adapter whose PATH copy shadows the pinned one. A
         // stale global would otherwise win at spawn with `--fix` reporting
         // success. See #1017.
-        #[cfg(feature = "serve")]
         for gate in crate::acp::agent_compat::version_gates() {
             if skip_gate_check(gate.binary, find_in_path(gate.binary).is_some()) {
                 continue;
@@ -590,12 +603,10 @@ async fn doctor(json: bool, fix: bool, adapter: Vec<String>, all_adapters: bool)
     let registry = AgentRegistry::with_defaults();
 
     let node_status = check_node();
-    #[cfg(feature = "serve")]
     let mut gate_issues: Vec<(&'static str, Option<AgentVersionIssue>)> = Vec::new();
     let mut agent_entries: Vec<AgentDoctorEntry> = Vec::new();
     for (name, spec) in registry.list() {
         let command_present = command_present(&spec.command);
-        #[cfg(feature = "serve")]
         let version_issue = if command_present {
             let expected = crate::acp::agent_compat::ExpectedAgent::from_command(&spec.command);
             match crate::acp::agent_compat::version_gate_for(expected) {
@@ -756,15 +767,28 @@ fn find_in_path(binary: &str) -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
+/// The `--adapter` values, kept equal to the bundled table so a newly
+/// bundled adapter is installable by name without a second list.
+fn bundled_adapter_names() -> Vec<&'static str> {
+    crate::acp::adapters::BUNDLED_ADAPTERS
+        .iter()
+        .map(|a| a.binary)
+        .collect()
+}
+
 pub(crate) fn command_present(command: &str) -> bool {
-    // Placeholders like `${aoe_data_dir}/acp-worker/...` resolve at
-    // runtime against the app data dir, so the literal string contains
-    // both `${` and `/`. Check the placeholder branch FIRST — otherwise
-    // the `/`-branch tries to stat a literal path containing `${...}`
-    // and reports "missing" for every placeholder-based agent (notably
-    // `aoe-agent`).
+    // A `${aoe_data_dir}` placeholder resolves the way the spawn resolves it,
+    // then the path is checked like any other (#3553).
+    if command.contains("${aoe_data_dir}") {
+        return crate::session::get_app_dir()
+            .map(|dir| {
+                std::path::Path::new(&command.replace("${aoe_data_dir}", &dir.to_string_lossy()))
+                    .exists()
+            })
+            .unwrap_or(false);
+    }
     if command.contains("${") {
-        true
+        false
     } else if command.contains('/') || command.contains('\\') {
         std::path::Path::new(command).exists()
     } else {
@@ -772,8 +796,7 @@ pub(crate) fn command_present(command: &str) -> bool {
         find_in_path(command).is_some()
             || crate::session::get_app_dir()
                 .ok()
-                .and_then(|app_dir| crate::acp::adapters::bundled_adapter_bin(&app_dir, command))
-                .is_some()
+                .is_some_and(|app_dir| bundled_copy_usable(&app_dir, command))
     }
 }
 
@@ -985,7 +1008,7 @@ fn restart(session: &str) -> Result<()> {
     // instead of `user_stopped` — the UI then renders a transient
     // "Restarting…" banner instead of the persistent "Stopped +
     // Reconnect" affordance.
-    worker_registry::mark_restart_pending(session);
+    worker_registry::mark_restart_pending(session, record.generation);
     worker_registry::delete(session).ok();
     // Group-SIGTERM so the agent's node/SDK grandchildren die with the
     // runner rather than orphaning under PID 1 before respawn (#1689).
@@ -1093,7 +1116,13 @@ async fn prompt(session: &str, text: &str) -> Result<()> {
     Ok(())
 }
 
-async fn approve(session: &str, nonce: &str, always: bool, deny: bool) -> Result<()> {
+async fn approve(
+    session: &str,
+    nonce: &str,
+    always: bool,
+    deny: bool,
+    option: Option<String>,
+) -> Result<()> {
     let decision = match (always, deny) {
         (_, true) => ApprovalDecisionWire::Deny,
         (true, false) => ApprovalDecisionWire::AllowAlways,
@@ -1101,11 +1130,15 @@ async fn approve(session: &str, nonce: &str, always: bool, deny: bool) -> Result
     };
     let endpoint = require_daemon().await?;
     let client = HttpClient::new(endpoint)?;
+    let label = match &option {
+        Some(id) => format!("{decision:?} (option {id})"),
+        None => format!("{decision:?}"),
+    };
     client
-        .resolve_approval(session, nonce, decision)
+        .resolve_approval(session, nonce, decision, option)
         .await
         .map_err(map_http)?;
-    println!("approval {nonce} -> {decision:?}");
+    println!("approval {nonce} -> {label}");
     Ok(())
 }
 
@@ -1288,7 +1321,6 @@ mod tests {
         assert_eq!(value["lifecycle"]["since"], "2026-06-18", "{value}");
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn doctor_fix_hints_missing_and_stale_gated_agents() {
         let claude = crate::acp::agent_compat::version_gate_for(
@@ -1311,7 +1343,6 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn doctor_fix_skips_current_and_ungated_agents() {
         let claude = crate::acp::agent_compat::version_gate_for(
@@ -1369,7 +1400,6 @@ mod tests {
         assert!(!skip_gate_check("opencode", true));
     }
 
-    #[cfg(feature = "serve")]
     #[test]
     fn doctor_fix_hints_non_npm_stale_agents() {
         let opencode = crate::acp::agent_compat::version_gate_for(
@@ -1389,7 +1419,6 @@ mod tests {
     }
 
     /// Gate fixture for the doctor version-issue tests.
-    #[cfg(feature = "serve")]
     fn claude_gate() -> crate::acp::agent_compat::VersionGate {
         crate::acp::agent_compat::version_gate_for(
             crate::acp::agent_compat::ExpectedAgent::ClaudeAgentAcp,
@@ -1401,7 +1430,6 @@ mod tests {
     /// gate, not mere binary presence. The exact repro from the issue:
     /// global adapter at 0.37.0 against the 0.55.0 floor, on PATH,
     /// nothing bundled, sessions dying at initialize.
-    #[cfg(feature = "serve")]
     #[test]
     fn doctor_flags_stale_gated_adapter_with_remediation() {
         let gate = claude_gate();
@@ -1427,7 +1455,6 @@ mod tests {
     /// stale, and absence stays the presence check's report instead of a
     /// second complaint. Bundle-only installs never reach this function:
     /// the runner judges them from the pinned copy itself.
-    #[cfg(feature = "serve")]
     #[test]
     fn doctor_version_issue_verdicts() {
         use crate::acp::version_probe::ProbeStatus;

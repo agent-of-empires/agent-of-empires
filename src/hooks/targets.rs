@@ -139,7 +139,9 @@ pub(super) fn collect_env_lists_from_session() -> Vec<Vec<String>> {
     match crate::session::list_profiles() {
         Ok(profiles) => {
             for p in profiles {
-                out.push(crate::session::profile_config::resolve_config_or_warn(&p).environment);
+                out.push(
+                    crate::session::config::profile_config::resolve_config_or_warn(&p).environment,
+                );
             }
         }
         Err(e) => {

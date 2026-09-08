@@ -62,10 +62,10 @@ export class LineParseCache {
   private live = new Map<string, CachedLine>();
   private prev = new Map<string, CachedLine>();
 
-  lines(content: string): AnsiSegment[][] {
+  lines(content: string | readonly string[]): AnsiSegment[][] {
     this.prev = this.live;
     this.live = new Map();
-    const raw = content.split("\n");
+    const raw = typeof content === "string" ? content.split("\n") : content;
     const lines: AnsiSegment[][] = [];
     let entry: AnsiStyle = {};
     for (const r of raw) {
@@ -82,8 +82,9 @@ export class LineParseCache {
       entry = hit.exit;
     }
     // Mirror ansiToLines: capture-pane terminates every line, including
-    // the last, with `\n`; drop the phantom empty line that creates.
-    if (lines.length > 1 && lines[lines.length - 1]!.length === 0) {
+    // the last, with `\n`; drop the phantom empty line that creates. A row
+    // array from the hook has already had it removed.
+    if (typeof content === "string" && lines.length > 1 && lines[lines.length - 1]!.length === 0) {
       lines.pop();
     }
     return lines;

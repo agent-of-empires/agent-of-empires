@@ -13,7 +13,7 @@
 //!
 //! Also drops the orphaned `auto_update` boolean that lingered in older
 //! configs (it was never wired to anything; see the legacy-fields test in
-//! `src/session/config.rs`).
+//! `src/session/config/mod.rs`).
 
 use anyhow::{Context, Result};
 use std::fs;

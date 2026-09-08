@@ -14,8 +14,8 @@
 ## Commands
 
 ```sh
-cargo build                         # TUI only
-cargo build --features serve        # web dashboard, requires Node and npm
+cargo build                         # TUI + daemon, no Node needed
+cargo build --features web          # web dashboard, requires Node and npm
 cargo build --profile dev-release   # optimized local build without LTO
 cargo test
 cargo fmt
@@ -28,6 +28,14 @@ prefix, with `aoe serve` on port 8081. Release and `dev-release` builds use the
 installed app's namespace and port 8080. `AOE_TMUX_SOCKET` overrides the socket.
 
 For web commands and tests, read `web/AGENTS.md`.
+
+Stay on one feature set per worktree. Each distinct combination of features is a
+separate build hash, so cargo keeps a full extra copy of the crate in `target/`
+for every one you run: plain `cargo test` and `cargo test --features web` cost
+roughly twice the disk of either alone. Pick the narrowest set that covers your
+change rather than running several to be thorough. `--all-targets` links all
+twenty-odd test binaries separately; keep it for a pre-push check, not routine
+iteration.
 
 ## Code rules
 
@@ -67,9 +75,9 @@ duplicating cases across test functions.
 
 ### E2E tests
 
-Run `cargo test --features e2e-tests --test e2e`; add `serve` for dashboard or
-structured-view coverage. New e2e tests use `#[parallel]`. Reserve `#[serial]`
-for tests that mutate process-global state. The harness already isolates HOME,
+Run `cargo test --features e2e-tests --test e2e`; add `web` for dashboard
+coverage. New e2e tests use `#[parallel]`. Reserve `#[serial]` for tests
+that mutate process-global state. The harness already isolates HOME,
 tmux sockets, and session names. Tests auto-skip unavailable external tools.
 
 Use `RECORD_E2E=1` to record local review artifacts. See `tests/e2e/harness.rs`
@@ -82,7 +90,7 @@ for the harness API.
 - Follow `.github/pull_request_template.md`; include what changed, why, tests,
   and screenshots or recordings for UI changes.
 - Before review, run `cargo fmt`, `cargo clippy`, and `cargo test`, adding
-  `--features serve` when relevant.
+  `--features web` when relevant.
 - For `web/` changes also run its format, lint, type, and applicable test checks
   from `web/AGENTS.md`, including the coverage matrix requirement.
 

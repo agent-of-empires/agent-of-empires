@@ -196,7 +196,6 @@ impl HomeView {
     /// Request the daemon's view of every structured row's status
     /// (non-blocking). Skipped entirely when no structured session is
     /// loaded, so a terminal-only home view never talks to the daemon.
-    #[cfg(feature = "serve")]
     pub fn request_daemon_status_refresh(&mut self) {
         if self.pending_daemon_status_refresh {
             return;
@@ -235,7 +234,6 @@ impl HomeView {
     /// legible). The tmux producer has the same property via its own
     /// `is_archived()` short-circuit, so this is consistent rather than new,
     /// but unarchiving is the only way back.
-    #[cfg(feature = "serve")]
     fn daemon_status_applies_to(&self, inst: &Instance) -> bool {
         !self.recovery_in_flight.contains(&inst.id)
             && !self.restart_in_flight.contains(&inst.id)
@@ -245,7 +243,6 @@ impl HomeView {
 
     /// Apply any pending daemon-sourced statuses. Returns true if the
     /// caller should redraw.
-    #[cfg(feature = "serve")]
     pub fn apply_daemon_status_updates(&mut self) -> bool {
         use std::sync::mpsc::TryRecvError;
 
@@ -288,7 +285,6 @@ impl HomeView {
     /// trusted from the wire: the daemon's `view` and the local row's could
     /// disagree for a session mid-conversion, and the tmux poller owns
     /// terminal rows. Dropping the mismatch keeps one producer per row.
-    #[cfg(feature = "serve")]
     pub(in crate::tui) fn apply_daemon_status_update(
         &mut self,
         update: crate::tui::daemon_status_poller::DaemonStatusUpdate,
@@ -431,7 +427,7 @@ impl HomeView {
                 // and silently disables restamping on real transitions.
                 // Locked by
                 // [`apply_status_update_propagates_live_status_baseline_from_poller`]
-                // in `src/tui/home/tests.rs`. See #2690.
+                // in `src/tui/home/tests/status_rows_menu.rs`. See #2690.
                 if let Some(baseline) = new_live_status_baseline {
                     inst.live_status_baseline = Some(baseline);
                 }

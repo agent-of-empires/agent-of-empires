@@ -106,41 +106,31 @@ pub async fn set_enabled_live(plugin_id: &str, enabled: bool) -> Result<LiveTogg
     if super::registry().get(plugin_id).is_none() {
         bail!("unknown plugin {plugin_id:?}; see `aoe plugin list`");
     }
-    // The daemon client lives in the serve-gated `acp` module; a TUI-only
-    // build ships no daemon, so it always writes locally.
-    #[cfg(feature = "serve")]
-    {
-        let endpoint = match crate::acp::client::discovery::discover_local() {
-            Ok(endpoint) => endpoint,
-            Err(_) => {
-                set_enabled(plugin_id, enabled)?;
-                return Ok(LiveToggle::Local);
-            }
-        };
-        let daemon_result = async {
-            let client = crate::acp::client::HttpClient::new(endpoint)?;
-            client.set_plugin_enabled(plugin_id, enabled).await
+    let endpoint = match crate::acp::client::discovery::discover_local() {
+        Ok(endpoint) => endpoint,
+        Err(_) => {
+            set_enabled(plugin_id, enabled)?;
+            return Ok(LiveToggle::Local);
         }
-        .await;
-        match daemon_result {
-            Ok(()) => {
-                // The daemon wrote config to disk; refresh this process's
-                // registry from it rather than writing again.
-                super::reload_registry();
-                Ok(LiveToggle::Daemon)
-            }
-            Err(e) => {
-                set_enabled(plugin_id, enabled)?;
-                Ok(LiveToggle::LocalDaemonStale {
-                    reason: format!("{e}"),
-                })
-            }
-        }
+    };
+    let daemon_result = async {
+        let client = crate::acp::client::HttpClient::new(endpoint)?;
+        client.set_plugin_enabled(plugin_id, enabled).await
     }
-    #[cfg(not(feature = "serve"))]
-    {
-        set_enabled(plugin_id, enabled)?;
-        Ok(LiveToggle::Local)
+    .await;
+    match daemon_result {
+        Ok(()) => {
+            // The daemon wrote config to disk; refresh this process's
+            // registry from it rather than writing again.
+            super::reload_registry();
+            Ok(LiveToggle::Daemon)
+        }
+        Err(e) => {
+            set_enabled(plugin_id, enabled)?;
+            Ok(LiveToggle::LocalDaemonStale {
+                reason: format!("{e}"),
+            })
+        }
     }
 }
 
@@ -1071,51 +1061,43 @@ pub fn approve_installed(id: &str, expected_manifest_hash: &str) -> Result<()> {
 /// order) supersedes older batches, and a global lock serializes the actual
 /// requests, so the newest save's values always land last.
 pub fn nudge_daemon_enabled(changes: Vec<(String, bool)>) {
-    // No daemon client in a TUI-only build (see `set_enabled_live`).
-    #[cfg(not(feature = "serve"))]
-    {
-        let _ = changes;
-    }
-    #[cfg(feature = "serve")]
-    {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static GENERATION: AtomicU64 = AtomicU64::new(0);
-        static IN_FLIGHT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static GENERATION: AtomicU64 = AtomicU64::new(0);
+    static IN_FLIGHT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-        if changes.is_empty() {
+    if changes.is_empty() {
+        return;
+    }
+    let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    tokio::spawn(async move {
+        let _serialize = IN_FLIGHT.lock().await;
+        // A newer save superseded this batch while it waited its turn;
+        // its values are already stale against disk, so drop it.
+        if GENERATION.load(Ordering::SeqCst) != generation {
             return;
         }
-        let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
-        tokio::spawn(async move {
-            let _serialize = IN_FLIGHT.lock().await;
-            // A newer save superseded this batch while it waited its turn;
-            // its values are already stale against disk, so drop it.
+        let Ok(endpoint) = crate::acp::client::discovery::discover_local() else {
+            return;
+        };
+        let client = match crate::acp::client::HttpClient::new(endpoint) {
+            Ok(client) => client,
+            Err(e) => {
+                tracing::warn!("plugin toggle: daemon client build failed: {e}");
+                return;
+            }
+        };
+        for (id, enabled) in changes {
             if GENERATION.load(Ordering::SeqCst) != generation {
                 return;
             }
-            let Ok(endpoint) = crate::acp::client::discovery::discover_local() else {
-                return;
-            };
-            let client = match crate::acp::client::HttpClient::new(endpoint) {
-                Ok(client) => client,
-                Err(e) => {
-                    tracing::warn!("plugin toggle: daemon client build failed: {e}");
-                    return;
-                }
-            };
-            for (id, enabled) in changes {
-                if GENERATION.load(Ordering::SeqCst) != generation {
-                    return;
-                }
-                if let Err(e) = client.set_plugin_enabled(&id, enabled).await {
-                    tracing::warn!(
-                        "plugin toggle: daemon did not reconcile {id} (enabled={enabled}): {e}; \
+            if let Err(e) = client.set_plugin_enabled(&id, enabled).await {
+                tracing::warn!(
+                    "plugin toggle: daemon did not reconcile {id} (enabled={enabled}): {e}; \
                          restart the daemon or toggle from the dashboard"
-                    );
-                }
+                );
             }
-        });
-    }
+        }
+    });
 }
 
 /// Record that the user declined an available update by its fingerprint, so the
@@ -1752,8 +1734,7 @@ mod tests {
     fn reject_incompatible_host_blocks_out_of_range_and_allows_in_range() {
         // The host is this crate's CARGO_PKG_VERSION (a 1.x release); a range
         // bracketing 1.x installs, a future-major-only range is refused with an
-        // id-prefixed message. Keep the literals semver-free so this compiles in
-        // a TUI-only build, where the host crate's semver dep is serve-gated.
+        // id-prefixed message.
         let in_range = manifest_with_aoe_version(Some(">=1.0.0, <2.0.0"));
         assert!(reject_incompatible_host(&in_range).is_ok());
 

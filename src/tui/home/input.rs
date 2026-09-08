@@ -7,12 +7,12 @@ use tui_input::Input;
 
 use super::bindings::{self, ActionId};
 use super::{live_send, DragKind, HomeView, PreviewSelection, TerminalMode, ViewMode};
+use crate::session::config::repo_config;
 use crate::session::config::{
     load_config, update_app_state, update_config, GroupByMode, SortOrder,
 };
-use crate::session::{list_profiles, repo_config, resolve_config_or_warn, Item, Status};
+use crate::session::{list_profiles_for_display, Item, Status};
 use crate::tui::app::Action;
-#[cfg(feature = "serve")]
 use crate::tui::dialogs::ServeAction;
 use crate::tui::dialogs::{
     builtin_commands, CommandPaletteDialog, ConfirmDialog, ContextMenuAction, ContextMenuDialog,
@@ -43,10 +43,9 @@ pub(super) enum SidebarSection {
 }
 
 /// Persist the user's picks from the first-run intro wizard. Theme name goes
-/// to `config.theme.name`; attach mode goes to `default_attach_mode`, which
-/// covers both Enter/double-click activation and the post-create attach.
-/// Failures are logged and swallowed: the intro should never block startup
-/// on a config write hiccup.
+/// to `config.theme.name`; attach mode goes to `default_attach_mode` for
+/// existing session activation. Failures are logged and swallowed: the intro
+/// should never block startup on a config write hiccup.
 fn apply_intro_outcome(outcome: &IntroOutcome) {
     if outcome.final_theme.is_none()
         && outcome.final_attach_mode.is_none()
@@ -399,7 +398,7 @@ fn resolve_hook_install_agent(
                 .get(tool_name)
                 .and_then(|detect_as| crate::agents::get_agent(detect_as))
         })
-        .filter(|agent| agent.hook_config.is_some())
+        .filter(|agent| agent.hook_config.is_some() || agent.sidecar_hooks.is_some())
 }
 
 pub(super) fn parse_hotkey(s: &str) -> Option<(KeyCode, KeyModifiers)> {
@@ -465,14 +464,7 @@ pub(super) fn build_tool_hotkey_cache(
 /// cell symbols then mirrors the old frame-buffer extraction cell for
 /// cell. Unwritten cells read as a single space, which the caller trims.
 fn slice_line_columns(line: &ratatui::text::Line, from: u16, to_excl: u16, width: u16) -> String {
-    let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, width, 1));
-    buf.set_line(0, 0, line, width);
-    let hi = to_excl.min(width);
-    let mut out = String::new();
-    for col in from..hi {
-        out.push_str(buf[(col, 0)].symbol());
-    }
-    out
+    crate::tui::components::text::line_columns(line, width).slice(from, to_excl.min(width))
 }
 
 impl HomeView {
@@ -717,8 +709,9 @@ impl HomeView {
         }
         // Seed the selection in content coords so it survives a scroll
         // and can span more than one page. `contains` also requires the
-        // pane to hold real scrollback, so a drag over an empty / not-yet
-        // -captured pane is a no-op rather than a phantom selection.
+        // cell to sit on a painted content row, so a drag over an empty
+        // pane or the blank area below short content is a no-op rather
+        // than a phantom selection.
         let view = self.preview_text_view;
         if view.contains(col, row) {
             let cell = view.screen_to_content(col, row);
@@ -1039,7 +1032,6 @@ impl HomeView {
         // (see `wrapped_transcript`), so (row, column) slicing below maps
         // one-to-one onto the on-screen cells. Terminal previews keep
         // reading the tmux capture cache.
-        #[cfg(feature = "serve")]
         let structured_lines = self
             .structured_preview
             .as_ref()
@@ -1049,13 +1041,10 @@ impl HomeView {
                     .is_some_and(|id| id == v.session_id())
             })
             .map(|v| v.selection_text(width));
-        #[cfg(feature = "serve")]
         let lines = match structured_lines.as_ref() {
             Some(text) => text,
             None => self.active_preview_cache().parsed_text.as_ref()?,
         };
-        #[cfg(not(feature = "serve"))]
-        let lines = self.active_preview_cache().parsed_text.as_ref()?;
         // Resolve `from_bottom` distances to absolute indices against the
         // SAME `total_lines` the renderer used this frame, so the copied
         // range matches the painted highlight cell for cell.
@@ -1190,12 +1179,10 @@ impl HomeView {
                 None
             }
             "pull_sandbox_image" => self.pending_image_pull.take().map(Action::SpawnImagePull),
-            #[cfg(feature = "serve")]
             "switch_view" => self
                 .pending_switch_view_session
                 .take()
                 .map(Action::SwitchSessionView),
-            #[cfg(feature = "serve")]
             "start_daemon_structured" => self
                 .pending_daemon_start_session
                 .take()
@@ -1667,15 +1654,19 @@ impl HomeView {
                         self.pending_hooks_install_data = None;
                     }
                     DialogResult::Submit(_) => {
-                        self.hooks_install_dialog = None;
-                        if let Err(e) = crate::session::config::update_app_state(|state| {
+                        match crate::session::config::update_app_state(|state| {
                             state.has_acknowledged_agent_hooks = true;
                         }) {
-                            tracing::warn!(target: "tui.input", "Failed to save config: {e}");
-                        }
-                        if let Some(data) = self.pending_hooks_install_data.take() {
-                            self.pending_dialog_click_action =
-                                self.maybe_confirm_volume_ignores_globs(data);
+                            Ok(()) => {
+                                self.hooks_install_dialog = None;
+                                if let Some(data) = self.pending_hooks_install_data.take() {
+                                    self.pending_dialog_click_action =
+                                        self.maybe_confirm_volume_ignores_globs(data);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(target: "tui.input", "Failed to save config: {e}")
+                            }
                         }
                     }
                 }
@@ -1864,7 +1855,6 @@ impl HomeView {
         }
 
         // Handle serve view (full-screen takeover)
-        #[cfg(feature = "serve")]
         if let Some(ref mut serve) = self.serve_view {
             match serve.handle_key(key) {
                 ServeAction::Continue => return None,
@@ -2093,16 +2083,16 @@ impl HomeView {
                     self.pending_hooks_install_data = None;
                 }
                 DialogResult::Submit(_) => {
-                    self.hooks_install_dialog = None;
-                    // Persist the acknowledgment
-                    if let Err(e) = crate::session::config::update_app_state(|state| {
+                    match crate::session::config::update_app_state(|state| {
                         state.has_acknowledged_agent_hooks = true;
                     }) {
-                        tracing::warn!(target: "tui.input", "Failed to save config: {e}");
-                    }
-                    // Resume session creation
-                    if let Some(data) = self.pending_hooks_install_data.take() {
-                        return self.maybe_confirm_volume_ignores_globs(data);
+                        Ok(()) => {
+                            self.hooks_install_dialog = None;
+                            if let Some(data) = self.pending_hooks_install_data.take() {
+                                return self.maybe_confirm_volume_ignores_globs(data);
+                            }
+                        }
+                        Err(e) => tracing::warn!(target: "tui.input", "Failed to save config: {e}"),
                     }
                 }
             }
@@ -2200,7 +2190,10 @@ impl HomeView {
                         data.tool.clone()
                     };
 
-                    let resolved_config = resolve_config_or_warn(&data.profile);
+                    let resolved_config = crate::session::resolve_config_with_repo_or_warn(
+                        &data.profile,
+                        std::path::Path::new(&data.path),
+                    );
                     if let Some(hook_agent) =
                         resolve_hook_install_agent(&tool_name, &resolved_config.session)
                     {
@@ -2211,11 +2204,15 @@ impl HomeView {
                             .map(|c| c.app_state.has_acknowledged_agent_hooks)
                             .unwrap_or(false);
 
-                        if hooks_enabled && !acknowledged {
-                            self.hooks_install_dialog = Some(HooksInstallDialog::new_for_profile(
-                                hook_agent.name,
-                                Some(&data.profile),
-                            ));
+                        if crate::agents::hook_install_required(hook_agent, hooks_enabled)
+                            && !acknowledged
+                        {
+                            self.hooks_install_dialog =
+                                Some(HooksInstallDialog::new_for_profile_resolved(
+                                    &tool_name,
+                                    hook_agent.name,
+                                    Some(&data.profile),
+                                ));
                             self.pending_hooks_install_data = Some(data);
                             return None;
                         }
@@ -2981,7 +2978,8 @@ impl HomeView {
             let current_profile = self
                 .profile_for_cursor(self.cursor)
                 .unwrap_or_else(|| self.config_profile());
-            let profiles = list_profiles().unwrap_or_else(|_| vec![current_profile.clone()]);
+            let profiles =
+                list_profiles_for_display().unwrap_or_else(|_| vec![current_profile.clone()]);
             let mut dialog = NewSessionDialog::new(
                 self.available_tools.clone(),
                 existing_groups,
@@ -3023,17 +3021,7 @@ impl HomeView {
             return false;
         };
         if inst.is_structured() {
-            #[cfg(feature = "serve")]
-            {
-                crate::session::fork::structured_fork_capable(
-                    &inst.tool,
-                    inst.agent_name.as_deref(),
-                )
-            }
-            #[cfg(not(feature = "serve"))]
-            {
-                false
-            }
+            crate::session::fork::structured_fork_capable(&inst.tool, inst.agent_name.as_deref())
         } else {
             crate::session::fork::terminal_agent_can_fork(&inst.tool)
         }
@@ -3045,42 +3033,33 @@ impl HomeView {
     /// always go back to a terminal; a terminal session can go structured
     /// only when its tool is ACP-capable and the `offer_structured_in_new_session`
     /// opt-in is on (the structured view is still maturing, so switching into it
-    /// is gated the same way the new-session toggle is). Serve builds only (the swap runs
-    /// through the daemon and the result needs a structured view to open).
+    /// is gated the same way the new-session toggle is).
     /// Archived / trashed / mid-lifecycle rows are excluded: their agent is
     /// deliberately stopped, and the swap would boot a worker or tmux pane
     /// behind the parked state.
     pub(super) fn session_switch_view_target(&self, id: &str) -> Option<bool> {
-        #[cfg(feature = "serve")]
+        let inst = self.get_instance(id)?;
+        if inst.is_archived()
+            || inst.is_trashed()
+            || matches!(inst.status, Status::Creating | Status::Deleting)
         {
-            let inst = self.get_instance(id)?;
-            if inst.is_archived()
-                || inst.is_trashed()
-                || matches!(inst.status, Status::Creating | Status::Deleting)
-            {
-                return None;
-            }
-            if inst.is_structured() {
-                return Some(true);
-            }
-            let config = crate::session::repo_config::resolve_config_with_repo_or_warn(
-                &inst.source_profile,
-                std::path::Path::new(&inst.project_path),
-            );
-            // Switching a terminal session INTO the structured view is gated on
-            // the same opt-in as the new-session toggle: the structured view is
-            // still maturing, so don't offer to switch into it unless the user
-            // turned it on. The reverse direction (already-structured -> terminal)
-            // stays available above regardless, so a session can always get out.
-            (config.acp.offer_structured_in_new_session
-                && crate::session::builder::structured::tool_acp_capable(&inst.tool, &config))
-            .then_some(false)
+            return None;
         }
-        #[cfg(not(feature = "serve"))]
-        {
-            let _ = id;
-            None
+        if inst.is_structured() {
+            return Some(true);
         }
+        let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+            &inst.source_profile,
+            std::path::Path::new(&inst.project_path),
+        );
+        // Switching a terminal session INTO the structured view is gated on
+        // the same opt-in as the new-session toggle: the structured view is
+        // still maturing, so don't offer to switch into it unless the user
+        // turned it on. The reverse direction (already-structured -> terminal)
+        // stays available above regardless, so a session can always get out.
+        (config.acp.offer_structured_in_new_session
+            && crate::session::builder::structured::tool_acp_capable(&inst.tool, &config))
+        .then_some(false)
     }
 
     /// Confirm before flipping the selected session's view. Enabling
@@ -3144,7 +3123,6 @@ impl HomeView {
     /// found no daemon running. Neutral tone: nothing is destroyed; the
     /// user is just about to run a background process they may not have
     /// expected. Remote setups keep their manual commands.
-    #[cfg(feature = "serve")]
     pub(in crate::tui) fn prompt_start_daemon_for_structured(&mut self, session_id: &str) {
         self.pending_daemon_start_session = Some(session_id.to_string());
         self.confirm_dialog = Some(
@@ -3165,7 +3143,6 @@ impl HomeView {
     /// archive or trash (those render their own placeholder pages, so a
     /// mounted view would be invisible while still streaming). Drives
     /// preview-on-select and the active-view liveness check.
-    #[cfg(feature = "serve")]
     pub(in crate::tui) fn selected_structured_session(&self) -> Option<String> {
         let id = self.selected_session.clone()?;
         let inst = self.get_instance(&id)?;
@@ -3180,7 +3157,6 @@ impl HomeView {
     /// Used by the embedded structured view open path: both modes route
     /// keystrokes away from the home view and paint the preview pane,
     /// so they cannot coexist.
-    #[cfg(feature = "serve")]
     pub(in crate::tui) fn exit_live_send_if_active(&mut self) {
         if let Some(state) = self.live_send.clone() {
             self.exit_live_send_and_restore_sizing(&state);
@@ -3209,9 +3185,7 @@ impl HomeView {
         // Pull the few parent fields we need into owned locals so the
         // immutable borrow of `self` is dropped before the mutable `self.`
         // calls below (dialog construction, info_dialog assignment). A
-        // structured view parent forks through ACP. The captured ACP session
-        // id is read into a local only under `serve`, since only that fork
-        // branch consumes it.
+        // structured view parent forks through ACP.
         let Some(parent) = self
             .selected_session
             .as_ref()
@@ -3225,9 +3199,7 @@ impl HomeView {
         let group_path = parent.group_path.clone();
         let title = parent.title.clone();
         let parent_is_structured = parent.is_structured();
-        #[cfg(feature = "serve")]
         let parent_agent_name = parent.agent_name.clone();
-        #[cfg(feature = "serve")]
         let parent_acp_session_id = parent.acp_session_id.clone();
 
         let seed = if parent_is_structured {
@@ -3235,52 +3207,32 @@ impl HomeView {
             // not the terminal resume-with-fork-flag path. The captured ACP
             // session id is the parent to fork from; without one there is no
             // conversation to fork yet.
-            #[cfg(feature = "serve")]
-            {
-                // Gate on the same predicate the REST create-guard and the web
-                // `acp_can_fork` projection use: a resume-only ACP agent (e.g.
-                // `aoe-agent`) has no fork strategy, so `session/fork` would be
-                // refused at the handshake and silently downgrade to
-                // `session/new`, handing the user an empty session they think is
-                // a fork. Refuse up front with the same info dialog terminal
-                // denial uses.
-                if !crate::session::fork::structured_fork_capable(
-                    &tool,
-                    parent_agent_name.as_deref(),
-                ) {
-                    self.info_dialog = Some(InfoDialog::new(
+            // Gate on the same predicate the REST create-guard and the web
+            // `acp_can_fork` projection use: a resume-only ACP agent (e.g.
+            // `aoe-agent`) has no fork strategy, so `session/fork` would be
+            // refused at the handshake and silently downgrade to
+            // `session/new`, handing the user an empty session they think is
+            // a fork. Refuse up front with the same info dialog terminal
+            // denial uses.
+            if !crate::session::fork::structured_fork_capable(&tool, parent_agent_name.as_deref()) {
+                self.info_dialog = Some(InfoDialog::new(
                         "Fork not supported",
                         &format!(
                             "The '{}' agent cannot fork a structured view session. Fork is available for agents that support the ACP fork capability, such as Claude.",
                             tool
                         ),
                     ));
-                    return;
-                }
-                let Some(acp_id) = parent_acp_session_id.filter(|s| !s.is_empty()) else {
-                    self.info_dialog = Some(InfoDialog::new(
+                return;
+            }
+            let Some(acp_id) = parent_acp_session_id.filter(|s| !s.is_empty()) else {
+                self.info_dialog = Some(InfoDialog::new(
                         "Nothing to fork yet",
                         "This session has no captured conversation to fork from. Send it at least one message first.",
                     ));
-                    return;
-                };
-                crate::session::ForkSeed::Structured {
-                    parent_acp_session_id: acp_id,
-                }
-            }
-            #[cfg(not(feature = "serve"))]
-            {
-                self.info_dialog = Some(InfoDialog::new(
-                    "Fork not available in this build",
-                    "This `aoe` binary was built without the web dashboard \
-                     (a `--no-default-features` source build), so structured \
-                     view session forking is not included.\n\n\
-                     To fork this session:\n\
-                       \u{2022} Install a release build from GitHub Releases, or\n\
-                       \u{2022} Build from source with default features:\n\
-                         cargo build --release",
-                ));
                 return;
+            };
+            crate::session::ForkSeed::Structured {
+                parent_acp_session_id: acp_id,
             }
         } else {
             let child_id = crate::session::capture::generate_session_uuid();
@@ -3315,7 +3267,8 @@ impl HomeView {
         let current_profile = self
             .profile_for_cursor(self.cursor)
             .unwrap_or_else(|| self.config_profile());
-        let profiles = list_profiles().unwrap_or_else(|_| vec![current_profile.clone()]);
+        let profiles =
+            list_profiles_for_display().unwrap_or_else(|_| vec![current_profile.clone()]);
         let mut dialog = NewSessionDialog::new(
             self.available_tools.clone(),
             existing_groups,
@@ -3593,7 +3546,7 @@ impl HomeView {
     /// "Auto-name now": run the agent one-shot title generator for the
     /// selected still-default-named session, on demand and even when
     /// auto-rename-on-start is disabled (#3039). Terminal sessions rename via a
-    /// detached child; structured sessions go through the daemon (serve builds).
+    /// detached child; structured sessions go through the daemon.
     /// Best-effort: a 202-style "started", not a synchronous rename.
     fn auto_name_selected(&mut self) -> Option<Action> {
         let Some(id) = self.selected_session.clone() else {
@@ -3631,18 +3584,7 @@ impl HomeView {
         }
 
         if structured {
-            #[cfg(feature = "serve")]
-            {
-                return Some(Action::SmartRenameNow(id));
-            }
-            #[cfg(not(feature = "serve"))]
-            {
-                self.info_dialog = Some(InfoDialog::new(
-                    "Unavailable",
-                    "Auto-naming a structured-view session needs a serve-enabled build.",
-                ));
-                return None;
-            }
+            return Some(Action::SmartRenameNow(id));
         }
 
         // Preflight the gates the detached child re-applies, so this action stops
@@ -3651,7 +3593,7 @@ impl HomeView {
         // fork avoidance. `setting_on = true` because the manual action runs even
         // when auto-rename-on-start is off (#3039), matching the `--force` the
         // child receives and the web endpoint's preflight.
-        let resolved = crate::session::repo_config::resolve_config_with_repo_or_warn(
+        let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
             &profile,
             std::path::Path::new(&project_path),
         );
@@ -3709,38 +3651,20 @@ impl HomeView {
     }
 
     fn open_serve(&mut self) {
-        #[cfg(feature = "serve")]
-        {
-            let web_disabled = crate::plugin::registry()
-                .get("aoe.web")
-                .is_some_and(|p| !p.enabled);
-            if web_disabled {
-                self.info_dialog = Some(InfoDialog::new(
-                    "Web dashboard disabled",
-                    "The aoe.web plugin is disabled, so the web dashboard cannot \
+        let web_disabled = crate::plugin::registry()
+            .get("aoe.web")
+            .is_some_and(|p| !p.enabled);
+        if web_disabled {
+            self.info_dialog = Some(InfoDialog::new(
+                "Web dashboard disabled",
+                "The aoe.web plugin is disabled, so the web dashboard cannot \
                      be served.\n\n\
                      Re-enable it in Settings > Plugins (or run \
                      `aoe plugin enable aoe.web`), then press R again.",
-                ));
-                return;
-            }
-            self.serve_view = Some(crate::tui::dialogs::ServeView::new());
-        }
-        #[cfg(not(feature = "serve"))]
-        {
-            self.info_dialog = Some(InfoDialog::new(
-                "Serve unavailable",
-                "This `aoe` binary was built without the web dashboard \
-                 (a `--no-default-features` source build), so local network \
-                 serving and Cloudflare Tunnel integration are not included.\n\n\
-                 To serve to your phone (LAN / Tailscale / tunnel):\n\
-                   \u{2022} Install a release build from GitHub Releases, or\n\
-                   \u{2022} Build from source with default features:\n\
-                     cargo build --release\n\n\
-                 Once you have a `serve`-enabled binary, press R again to \
-                 open the serve dialog.",
             ));
+            return;
         }
+        self.serve_view = Some(crate::tui::dialogs::ServeView::new());
     }
 
     pub(super) fn open_settings(&mut self) {
@@ -3823,8 +3747,7 @@ impl HomeView {
     }
 
     fn open_command_palette(&mut self) {
-        let serve_enabled = cfg!(feature = "serve");
-        let mut entries: Vec<PaletteCommand> = builtin_commands(serve_enabled, self.strict_hotkeys);
+        let mut entries: Vec<PaletteCommand> = builtin_commands(self.strict_hotkeys);
 
         // Quit lives in the registry but is excluded from `builtin_commands`
         // (no palette metadata) so it can sit in the Settings group at the end;
@@ -4184,20 +4107,11 @@ impl HomeView {
                 return None;
             }
             if inst.is_structured() {
-                #[cfg(feature = "serve")]
-                {
-                    // The embedded structured view takes over the preview
-                    // pane; leave live-send first so the two don't fight
-                    // over it (mirrors `exit_live_send_before_attach`).
-                    self.exit_live_send_if_active();
-                    return Some(Action::OpenStructuredView(id));
-                }
-                #[cfg(not(feature = "serve"))]
-                {
-                    return Some(Action::SetTransientStatus(
-                        "Acp session: rebuild with default features to attach".to_string(),
-                    ));
-                }
+                // The embedded structured view takes over the preview
+                // pane; leave live-send first so the two don't fight
+                // over it (mirrors `exit_live_send_before_attach`).
+                self.exit_live_send_if_active();
+                return Some(Action::OpenStructuredView(id));
             }
         }
         match self.view_mode {
@@ -4367,6 +4281,13 @@ impl HomeView {
                 }
             }
         }
+        if self.flat_items.is_empty() {
+            self.cursor = 0;
+            self.selected_session = None;
+            self.selected_group = None;
+            self.selected_group_profile = None;
+            return;
+        }
         self.cursor = self.cursor.min(self.flat_items.len().saturating_sub(1));
         self.update_selected();
     }
@@ -4478,7 +4399,7 @@ impl HomeView {
     /// * **Mouse tracking on**: forward the wheel as a mouse event, encoding
     ///   following the app (SGR 1006 when `mouse_sgr` is set, else legacy
     ///   X10). The previewed pane is sized to the preview rect in both modes
-    ///   (`preview_pane_synced` / the live-send sync resize), so the mapped
+    ///   (`passive_pane_synced` / the live-send sync resize), so the mapped
     ///   coordinates land inside it.
     /// * **Mouse tracking off**: send `PageUp`/`PageDown`, not arrow keys. A
     ///   full-screen app reads arrows as cursor / input-history navigation,
@@ -4946,8 +4867,7 @@ impl HomeView {
                 // View switching mirrors the web sidebar's per-session
                 // switch action: offered when a structured session can go
                 // back to a terminal, or a terminal session's tool is
-                // ACP-capable. Serve builds only; the swap runs through
-                // the daemon.
+                // ACP-capable. The swap runs through the daemon.
                 let switch_view = match &self.flat_items[idx] {
                     super::Item::Session { id, .. } => self.session_switch_view_target(id),
                     super::Item::Group { .. } => None,
@@ -5121,7 +5041,8 @@ impl HomeView {
         let existing_groups: Vec<String> =
             self.all_groups().iter().map(|g| g.path.clone()).collect();
         let current_profile = self.config_profile();
-        let profiles = list_profiles().unwrap_or_else(|_| vec![current_profile.clone()]);
+        let profiles =
+            list_profiles_for_display().unwrap_or_else(|_| vec![current_profile.clone()]);
         self.new_dialog = Some(NewSessionDialog::new(
             self.available_tools.clone(),
             existing_groups,
@@ -5331,7 +5252,8 @@ impl HomeView {
                 .as_ref()
                 .map(|w| (w.branch.clone(), w.main_repo_path.clone()));
 
-            let profiles = list_profiles().unwrap_or_else(|_| vec![current_profile.clone()]);
+            let profiles =
+                list_profiles_for_display().unwrap_or_else(|_| vec![current_profile.clone()]);
             let existing_groups: Vec<String> =
                 self.all_groups().iter().map(|g| g.path.clone()).collect();
             let mut dialog = RenameDialog::new(
@@ -5363,7 +5285,8 @@ impl HomeView {
                 .selected_group_profile
                 .clone()
                 .unwrap_or_else(|| self.config_profile());
-            let profiles = list_profiles().unwrap_or_else(|_| vec![current_profile.clone()]);
+            let profiles =
+                list_profiles_for_display().unwrap_or_else(|_| vec![current_profile.clone()]);
             // Duplicate-name validation is per-profile (rename_selected_group
             // checks only the target profile's tree), so the dialog's existing
             // names must be scoped to this group's profile too. Spanning all
@@ -5763,6 +5686,74 @@ impl HomeView {
         self.preview_double_click_action_at(std::time::Instant::now(), kind, modifiers, col, row)
     }
 
+    /// Forget the press that would have paired with the next one into a
+    /// double-click. Called once a press has been spent on something else, so
+    /// clicking a link twice (the browser opened behind the terminal, so the
+    /// user tries again) does not also activate the session.
+    pub fn forget_preview_click(&mut self) {
+        self.last_preview_click = None;
+    }
+
+    /// Record the link under `(col, row)` for the status bar. Returns whether
+    /// it changed, so the caller only repaints when the answer moved.
+    pub fn update_hovered_link(&mut self, col: u16, row: u16) -> bool {
+        let cell = Some((col, row));
+        if cell == self.hover_cell {
+            return false;
+        }
+        // Report whether the resolved LINK moved, not the pointer: tracking a
+        // pointer across one link must not repaint on every motion event.
+        let before = self.hovered_link();
+        self.hover_cell = cell;
+        before != self.hovered_link()
+    }
+
+    /// The link the pointer is resting on, if any.
+    pub(in crate::tui) fn hovered_link(&self) -> Option<String> {
+        let (col, row) = self.hover_cell?;
+        self.preview_link_at(col, row)
+    }
+
+    /// The link under `(col, row)`, if one is painted there this frame. The
+    /// preview's transport strips OSC 8 before the text reaches ratatui, so a
+    /// target is recovered by matching the pane's advertised link text against
+    /// the row, or by finding a plain URL in the row itself (`crate::tui::links`).
+    pub fn preview_link_at(&self, col: u16, row: u16) -> Option<String> {
+        if self.has_non_live_send_overlay() {
+            return None;
+        }
+        // A mounted structured transcript owns the pane and supplies its own
+        // rows, but `active_preview_cache` still returns the tmux capture and
+        // `preview_text_view` was set from the transcript's geometry. Resolving
+        // one against the other opens a URL from a different session's output,
+        // and the painter returns before it can underline anything, so nothing
+        // would warn the user. Same line-source branch
+        // `extract_preview_selection_text` already makes.
+        let structured_owns_pane = self
+            .structured_preview
+            .as_ref()
+            .zip(self.selected_session.as_deref())
+            .is_some_and(|(view, id)| view.session_id() == id);
+        if structured_owns_pane {
+            return None;
+        }
+        let view = self.preview_text_view;
+        if !view.contains(col, row) {
+            return None;
+        }
+        let cache = self.active_preview_cache();
+        let line = cache
+            .parsed_text
+            .as_ref()?
+            .lines
+            .get(view.abs_line_at_row(row))?;
+        let offset = col - view.pane.x;
+        crate::tui::links::link_spans_for_line(line, view.pane.width, &cache.links)
+            .into_iter()
+            .find(|span| (span.start..span.end).contains(&offset))
+            .map(|span| span.uri)
+    }
+
     /// Same as `preview_double_click_action`, but the caller supplies `now` so
     /// unit tests can drive double-click detection deterministically.
     pub(super) fn preview_double_click_action_at(
@@ -6106,7 +6097,8 @@ impl HomeView {
         let current_tool = inst.tool.clone();
         let current_command = inst.command.clone();
         let current_extra_args = inst.extra_args.clone();
-        let profiles = list_profiles().unwrap_or_else(|_| vec![current_profile.clone()]);
+        let profiles =
+            list_profiles_for_display().unwrap_or_else(|_| vec![current_profile.clone()]);
         let tools: Vec<String> = self.available_tools.available_list().to_vec();
         self.restart_dialog = Some(RestartDialog::new(
             &current_title,
@@ -6295,9 +6287,7 @@ impl HomeView {
                 return;
             }
         }
-        if let Some(reason) = self.live_send_drift_reason(&state) {
-            self.exit_live_send_and_restore_sizing(&state);
-            self.info_dialog = Some(InfoDialog::new("Live send ended", reason));
+        if self.end_live_send_on_drift(&state) {
             return;
         }
         // Ctrl+C reaching this point is forwarded to the agent rather than
@@ -6357,7 +6347,7 @@ impl HomeView {
     /// re-asserting `window-size latest` would stomp it (the exact flap
     /// the size-owner lock exists to kill).
     fn teardown_live_send(&mut self) {
-        self.live_send = None;
+        let live_session_id = self.live_send.take().map(|state| state.session_id);
         self.live_send_worker = None;
         // Leave the capture worker running: the same pane is still
         // previewed after exit, just at the idle cadence. The render
@@ -6376,7 +6366,10 @@ impl HomeView {
         // Live mode just owned the pane's size; the non-live preview must
         // re-assert its geometry on the next render now that the header is
         // visible again (and so the agent reflows back to the previewed size).
-        self.preview_pane_synced = None;
+        if let Some(id) = &live_session_id {
+            self.clear_preview_pane_sync(id);
+        }
+        self.reseat_cursor_after_rebuild();
         // Preview selections also work outside live mode now, but a
         // live-mode highlight pins to the live-resized pane coords,
         // and exiting reflows the preview back to its normal size.
@@ -6433,6 +6426,15 @@ impl HomeView {
         None
     }
 
+    pub(super) fn end_live_send_on_drift(&mut self, state: &live_send::LiveSendState) -> bool {
+        let Some(reason) = self.live_send_drift_reason(state) else {
+            return false;
+        };
+        self.exit_live_send_and_restore_sizing(state);
+        self.info_dialog = Some(InfoDialog::new("Live send ended", reason));
+        true
+    }
+
     /// Poll the live-send worker's lock-loss flag (set off-thread when
     /// another surface takes the size-owner lock) and exit live mode when
     /// it trips, mirroring the web live view's demote-on-heartbeat. Called
@@ -6460,9 +6462,7 @@ impl HomeView {
         // A dead or renamed session also fails the worker's ownership
         // refresh; prefer the accurate drift message over blaming a
         // takeover that never happened.
-        if let Some(reason) = self.live_send_drift_reason(&state) {
-            self.exit_live_send_and_restore_sizing(&state);
-            self.info_dialog = Some(InfoDialog::new("Live send ended", reason));
+        if self.end_live_send_on_drift(&state) {
             return true;
         }
         // Name the thief where the owner id makes it unambiguous. The web
@@ -6805,7 +6805,7 @@ impl HomeView {
         let config =
             repo_config::resolve_config_with_repo(&data.profile, std::path::Path::new(&data.path))
                 .ok()?;
-        let expansions = crate::session::container_config::preview_glob_volume_ignores(
+        let expansions = crate::session::config::container_config::preview_glob_volume_ignores(
             &data.path,
             None,
             &config.sandbox.volume_ignores,
@@ -7202,7 +7202,7 @@ mod tests {
             height: 999,
         });
         assert_eq!(mouse_pane_rect(&cursor, pane), pane);
-        // And the origin is honoured: a cell above/left of the rect is outside.
+        // And the origin is honored: a cell above/left of the rect is outside.
         assert_eq!(mouse_target_rect(&cursor, pane, 1, 3), None);
         assert!(mouse_target_rect(&cursor, pane, 2, 3).is_some());
     }

@@ -178,6 +178,19 @@ everything and filtering client-side.
 | --- | --- | --- |
 | `state` | (unfiltered) | `live` excludes trashed and archived sessions. `trashed` returns only trashed sessions. `all` (or omitting the param) is the historical unfiltered behavior. An unrecognized value is rejected with `400` rather than ignored, so a typo surfaces instead of silently returning every session. |
 
+Each session row includes `context_resume`, the request-invariant availability
+of preserving that agent's context across a later lifecycle transition. It is
+an object tagged by `state`, with a `reason` on every state but `available`.
+
+| `state` | `reason` values | Meaning |
+| --- | --- | --- |
+| `available` | (none) | A resume target exists and the launch path will use it. |
+| `indeterminate` | `runtime_check_required`, `agent_handshake_required` | The answer needs a runtime probe this endpoint does not perform. Treat it as "ask again at launch", not as a no. |
+| `unavailable` | `agent_unsupported`, `sandbox_unsupported`, `command_unsupported`, `forced_fresh`, `invalid_target`, `fork_pending`, `previous_failure`, `no_target` | Context will not be preserved. |
+
+A daemon older than this field omits it entirely. Treat an absent
+`context_resume` as unreported rather than as `unavailable`.
+
 **Example**
 
 ```bash

@@ -1,15 +1,14 @@
-//! Web dashboard for remote agent session access
-//!
-//! Provides an embedded axum web server that serves a responsive dashboard
-//! for monitoring and interacting with agent sessions from any browser.
+//! The daemon: an axum server exposing the REST/WS API that the dashboard,
+//! the TUI structured view, and ACP clients all speak. The embedded dashboard
+//! bundle it can also serve is optional; the `web` feature gates it, and
+//! `assets` holds the serving code.
 
 pub(crate) mod access;
 pub(crate) mod acp_events;
-#[cfg(feature = "serve")]
 pub mod acp_reconciler;
-#[cfg(feature = "serve")]
 pub mod acp_ws;
 pub mod api;
+#[cfg(feature = "web")]
 pub(crate) mod assets;
 pub(crate) mod attach_project;
 pub mod auth;
@@ -37,7 +36,7 @@ pub(crate) mod status_poll;
 pub(crate) mod structured_repair;
 #[cfg(test)]
 mod test_helpers;
-#[cfg(all(feature = "serve", any(test, feature = "test-support")))]
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod test_support;
 pub(crate) mod token;
@@ -47,11 +46,17 @@ pub mod tunnel;
 /// kept under `crate::server::` so existing supervisor/WS call sites keep
 /// resolving without churn. The canonical definition lives in protocol.rs
 /// so the daemon and any client share a single source of truth.
-#[cfg(feature = "serve")]
 pub use crate::acp::protocol::AcpBroadcastFrame;
 pub(crate) use access::{is_untrusted_ip_literal, is_wildcard_bind, norm_host};
 pub(crate) use acp_events::{apply_status_intent, derive_acp_status};
+#[cfg(feature = "web")]
 pub use assets::web_build_id;
+
+/// No dashboard is embedded, so there is no bundle identity to report.
+#[cfg(not(feature = "web"))]
+pub fn web_build_id() -> Option<&'static str> {
+    None
+}
 pub(crate) use disk_watch::{
     add_profile_disk_watch, remove_profile_disk_watch, rename_profile_disk_watch,
 };

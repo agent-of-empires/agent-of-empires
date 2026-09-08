@@ -324,7 +324,6 @@ pub(super) async fn access_policy(
 /// the handlers keep their `cityhall_block*` calls as defense in depth. Reads
 /// (GET/HEAD) pass the gate; the few sensitive ones keep their per-handler
 /// guard. See #7.
-#[cfg(feature = "serve")]
 pub(super) const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
     // Session creation (server-derived) + lifecycle / metadata on the structured
     // sessions this mode owns; each handler re-checks the target is structured.
@@ -463,7 +462,6 @@ pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
 /// for: it covers every module prefix and method uniformly (an unmatched or
 /// unlisted mutating route fails closed), so a handler can no longer silently
 /// reopen a hole by omission. See #7.
-#[cfg(feature = "serve")]
 pub(super) async fn cityhall_gate(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     request: axum::extract::Request,

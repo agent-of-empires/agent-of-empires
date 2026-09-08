@@ -79,7 +79,15 @@ pub(super) fn build_resume_flags(
     let Some(agent) = get_agent(tool) else {
         return String::new();
     };
-    match &agent.resume_strategy {
+    let Some(support) = agent.session_support.as_ref() else {
+        tracing::info!(target: "session.store",
+            tool = %tool,
+            sid = %session_id,
+            "session resume is disabled for this agent; stored ID left unused"
+        );
+        return String::new();
+    };
+    match &support.resume {
         ResumeStrategy::Flag(flag) => format!("{} {}", flag, session_id),
         ResumeStrategy::FlagPair {
             existing,
@@ -93,16 +101,6 @@ pub(super) fn build_resume_flags(
             format!("{} {}", flag, session_id)
         }
         ResumeStrategy::Subcommand(sub) => format!("{} {}", sub, session_id),
-        // A stored id survives the strategy being turned off, so say why the
-        // launch is dropping it rather than starting fresh with no trace.
-        ResumeStrategy::Unsupported => {
-            tracing::info!(target: "session.store",
-                tool = %tool,
-                sid = %session_id,
-                "session resume is disabled for this agent; stored ID left unused"
-            );
-            String::new()
-        }
     }
 }
 
@@ -133,8 +131,8 @@ pub(super) fn build_fork_flags(tool: &str, parent_id: &str, child_id: &str) -> S
         ForkStrategy::Flag(fork_flag) => {
             // Resume the parent session (using the agent's own resume flag),
             // then add the fork flag; the agent mints the new id.
-            match agent.resume_strategy {
-                ResumeStrategy::Flag(resume_flag) => {
+            match agent.session_support.as_ref().map(|support| support.resume) {
+                Some(ResumeStrategy::Flag(resume_flag)) => {
                     format!("{resume_flag} {parent_id} {fork_flag}")
                 }
                 _ => String::new(),
@@ -144,20 +142,73 @@ pub(super) fn build_fork_flags(tool: &str, parent_id: &str, child_id: &str) -> S
     }
 }
 
-/// Splice `part` into `cmd`: insert it right after the binary (before other
-/// flags) when it is a subcommand, else append it. Shared by the resume and
-/// fork launch-flag builders.
-pub(super) fn splice_subcommand_or_append(cmd: &mut String, part: &str, is_subcommand: bool) {
-    if is_subcommand {
-        if let Some(space_pos) = cmd.find(' ') {
-            let binary = &cmd[..space_pos];
-            let flags = &cmd[space_pos..];
-            *cmd = format!("{} {}{}", binary, part, flags);
-        } else {
-            *cmd = format!("{} {}", cmd, part);
+pub(super) struct ParsedLaunchCommand {
+    pub(super) words: Vec<String>,
+    pub(super) executable_end: usize,
+}
+
+pub(super) fn parse_launch_command(command: &str) -> Option<ParsedLaunchCommand> {
+    let words = shell_words::split(command).ok()?;
+    words.first()?;
+
+    let mut started = false;
+    let mut quote = None;
+    let mut escaped = false;
+    for (offset, ch) in command.char_indices() {
+        let separator = matches!(ch, ' ' | '\t' | '\n' | '\r');
+        if !started {
+            if separator {
+                continue;
+            }
+            started = true;
         }
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some('\'') => {
+                if ch == '\'' {
+                    quote = None;
+                }
+            }
+            Some('"') => match ch {
+                '"' => quote = None,
+                '\\' => escaped = true,
+                _ => {}
+            },
+            _ => match ch {
+                '\'' | '"' => quote = Some(ch),
+                '\\' => escaped = true,
+                _ if separator => {
+                    return Some(ParsedLaunchCommand {
+                        words,
+                        executable_end: offset,
+                    });
+                }
+                _ => {}
+            },
+        }
+    }
+    Some(ParsedLaunchCommand {
+        words,
+        executable_end: command.len(),
+    })
+}
+
+/// Insert a subcommand at the parsed executable boundary, or append flags.
+pub(super) fn splice_subcommand_or_append(
+    cmd: &mut String,
+    part: &str,
+    subcommand_at: Option<usize>,
+) {
+    cmd.reserve(part.len() + 1);
+    if let Some(offset) = subcommand_at {
+        cmd.insert_str(offset, part);
+        cmd.insert(offset, ' ');
     } else {
-        *cmd = format!("{} {}", cmd, part);
+        cmd.push(' ');
+        cmd.push_str(part);
     }
 }
 
@@ -166,6 +217,7 @@ pub(super) fn append_resume_flags(
     session_id: Option<&str>,
     is_existing_session: bool,
     cmd: &mut String,
+    executable_end: usize,
     context: &str,
 ) -> bool {
     use crate::agents::{get_agent, ResumeStrategy};
@@ -175,11 +227,15 @@ pub(super) fn append_resume_flags(
         if resume_part.is_empty() {
             return false;
         }
-        let is_subcommand = matches!(
-            get_agent(tool).map(|a| &a.resume_strategy),
-            Some(ResumeStrategy::Subcommand(_))
-        );
-        splice_subcommand_or_append(cmd, &resume_part, is_subcommand);
+        let subcommand_at = matches!(
+            get_agent(tool).and_then(|agent| agent.session_support.as_ref()),
+            Some(crate::agents::SessionSupport {
+                resume: ResumeStrategy::Subcommand(_),
+                ..
+            })
+        )
+        .then_some(executable_end);
+        splice_subcommand_or_append(cmd, &resume_part, subcommand_at);
         tracing::debug!(target: "session.store", "Added resume flags to {} command: {}", context, resume_part);
         return true;
     }
@@ -400,6 +456,7 @@ impl Instance {
             // Pi publishes its conversation from inside the container through
             // the same extension, reaching the instance dir and the extension
             // file by bind-mount (see `container_config`).
+            self.pi_extension_launched = false;
             let pi_extension = self.pi_extension_launch();
             if let Some((ref flag, _)) = pi_extension {
                 // Empty for a container: the extension is discovered there
@@ -407,7 +464,7 @@ impl Instance {
                 tool_cmd.push_str(flag);
                 self.pi_extension_launched = true;
             }
-            let is_existing = self.apply_session_flags(&mut tool_cmd, "sandboxed");
+            let is_existing = self.apply_session_flags(&mut tool_cmd, "sandboxed")?;
             apply_agent_launch_env(&mut tool_cmd, agent);
 
             let sandbox = self
@@ -505,6 +562,15 @@ impl Instance {
         &mut self,
         agent: Option<&'static crate::agents::AgentDef>,
     ) -> Result<(Option<String>, bool, Option<OmpCapturePlan>)> {
+        let pi_extension = self.pi_extension_launch();
+        self.build_host_command_with_pi_extension(agent, pi_extension)
+    }
+
+    fn build_host_command_with_pi_extension(
+        &mut self,
+        agent: Option<&'static crate::agents::AgentDef>,
+        pi_extension: Option<(String, String)>,
+    ) -> Result<(Option<String>, bool, Option<OmpCapturePlan>)> {
         // Resolve after `on_launch`. The snapshot is checked inside the
         // profile environment assignment scope executed by the login shell;
         // startup-file routing drift therefore disables capture.
@@ -514,9 +580,9 @@ impl Instance {
 
         let profile = self.effective_profile();
         let mut env_prefix = status_hook_env_prefix(&profile, &self.id, agent);
-        // Pi publishes its own conversation through an AoE extension; the flag
-        // rides the built-in command only, an override being unvouched.
-        let pi_extension = self.pi_extension_launch();
+        // A verified direct Pi command publishes through the same extension
+        // whether it came from the built-in command or an exact alias.
+        self.pi_extension_launched = false;
         if let Some((_, ref env)) = pi_extension {
             env_prefix.push_str(env);
             self.pi_extension_launched = true;
@@ -545,7 +611,7 @@ impl Instance {
                             apply_yolo_mode(&mut cmd, yolo, false);
                         }
                     }
-                    let is_existing = self.apply_session_flags(&mut cmd, "host agent");
+                    let is_existing = self.apply_session_flags(&mut cmd, "host agent")?;
                     apply_agent_launch_env(&mut cmd, agent);
                     let raw_command = format!("{}{}", env_prefix, cmd);
                     let command = if let Some(plan) = omp_capture_plan.as_ref() {
@@ -564,6 +630,9 @@ impl Instance {
             }
         } else {
             let mut cmd = self.command.clone();
+            if let Some((ref flag, _)) = pi_extension {
+                cmd.push_str(flag);
+            }
             if !self.extra_args.is_empty() {
                 cmd = format!("{} {}", cmd, self.extra_args);
             }
@@ -572,7 +641,7 @@ impl Instance {
                     apply_yolo_mode(&mut cmd, yolo, false);
                 }
             }
-            let is_existing = self.apply_session_flags(&mut cmd, "host custom");
+            let is_existing = self.apply_session_flags(&mut cmd, "host custom")?;
             apply_agent_launch_env(&mut cmd, agent);
             let raw_command = format!("{}{}", env_prefix, cmd);
             let command = if let Some(plan) = omp_capture_plan.as_ref() {
@@ -624,7 +693,7 @@ mod tests {
         assert!(
             cmd.contains(&format!(
                 "AOE_PI_SESSION_ID_FILE={}/{}/session_id",
-                crate::session::container_config::PI_SIDECAR_DIR_IN_CONTAINER,
+                crate::session::config::container_config::PI_SIDECAR_DIR_IN_CONTAINER,
                 inst.id
             )),
             "the pane cannot publish without this: {cmd}"
@@ -667,11 +736,75 @@ mod tests {
             env.trim(),
             format!(
                 "AOE_PI_SESSION_ID_FILE={}/{}/session_id",
-                crate::session::container_config::PI_SIDECAR_DIR_IN_CONTAINER,
+                crate::session::config::container_config::PI_SIDECAR_DIR_IN_CONTAINER,
                 inst.id
             )
         );
     }
+    #[test]
+    #[serial_test::serial]
+    fn verified_direct_pi_alias_emits_the_extension_it_marks_as_launched() {
+        let home = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+        let mut inst = Instance::new("pi alias", "/tmp/pi-alias-launch");
+        inst.tool = "company-pi".to_string();
+        inst.detect_as = "pi".to_string();
+        inst.command = "pi".to_string();
+        let agent = inst.resolved_agent();
+
+        let (command, _, _) = inst
+            .build_host_command_with_pi_extension(
+                agent,
+                Some((
+                    " -e '/tmp/pi-aoe-session-id.js'".to_string(),
+                    "AOE_PI_SESSION_ID_FILE='/tmp/pi-session-id' ".to_string(),
+                )),
+            )
+            .unwrap();
+        let command = command.unwrap();
+
+        assert!(command.contains(" -e "), "missing Pi extension: {command}");
+        assert!(command.contains("AOE_PI_SESSION_ID_FILE="));
+        assert!(inst.pi_extension_launched);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pi_alias_with_non_pi_command_does_not_get_extension() {
+        let home = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+        let mut inst = Instance::new("pi alias wrapper", "/tmp/pi-alias-wrapper");
+        inst.tool = "company-pi".to_string();
+        inst.detect_as = "pi".to_string();
+        inst.command = "echo not-pi".to_string();
+        let agent = inst.resolved_agent();
+
+        assert!(inst.pi_extension_launch().is_none());
+        let (command, _, _) = inst.build_host_command(agent).unwrap();
+        let command = command.unwrap();
+
+        assert!(!command.contains("pi-aoe-session-id.js"));
+        assert!(!command.contains("AOE_PI_SESSION_ID_FILE="));
+        assert!(!inst.pi_extension_launched);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pi_option_terminator_disables_extension_injection() {
+        let home = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+        let mut inst = Instance::new("pi terminator", "/tmp/pi-terminator");
+        inst.tool = "pi".to_string();
+        inst.extra_args = "--".to_string();
+        let agent = inst.resolved_agent();
+
+        let (command, _, _) = inst.build_host_command(agent).unwrap();
+        let command = command.unwrap();
+
+        assert!(!command.contains(" -e "), "extension follows --: {command}");
+        assert!(!inst.pi_extension_launched);
+    }
+
     use super::*;
 
     use crate::session::test_support::EnvGuard;
@@ -904,6 +1037,19 @@ mod tests {
     }
 
     #[test]
+    fn test_build_resume_flags_for_resume_only_agents() {
+        let session_id = "session-789";
+        assert_eq!(
+            build_resume_flags("vibe", session_id, true),
+            "--resume session-789"
+        );
+        assert_eq!(
+            build_resume_flags("copilot", session_id, true),
+            "--session-id session-789"
+        );
+    }
+
+    #[test]
     fn test_build_resume_flags_rejects_invalid_id() {
         let flags = build_resume_flags("claude", "$(rm -rf /)", true);
         assert_eq!(flags, "");
@@ -950,8 +1096,90 @@ mod tests {
             from: "parent-1234".to_string(),
         };
         let mut cmd = "codex --some-flag".to_string();
-        inst.apply_session_flags(&mut cmd, "test");
+        inst.apply_session_flags(&mut cmd, "test").unwrap();
         assert_eq!(cmd, "codex fork parent-1234 --some-flag");
+    }
+
+    #[test]
+    fn resume_command_uses_validated_executable_anchor() {
+        let cases = [
+            (
+                "tab separator",
+                "codex",
+                "",
+                "codex\t--model o3",
+                "codex resume SID\t--model o3",
+            ),
+            (
+                "leading whitespace",
+                "codex",
+                "",
+                " \tcodex\t--model o3",
+                " \tcodex resume SID\t--model o3",
+            ),
+            (
+                "multiple spaces",
+                "codex",
+                "",
+                "codex   --model o3",
+                "codex resume SID   --model o3",
+            ),
+            (
+                "direct alias",
+                "codex-personal",
+                "codex",
+                " \tcodex\t--model o3",
+                " \tcodex resume SID\t--model o3",
+            ),
+        ];
+        for (name, tool, detect_as, command, expected) in cases {
+            let mut inst = Instance::new(name, "/tmp/x");
+            inst.tool = tool.to_string();
+            inst.detect_as = detect_as.to_string();
+            inst.command = command.to_string();
+            inst.agent_session_id = Some("SID".to_string());
+            inst.resume_intent = ResumeIntent::Use("SID".to_string());
+            let mut cmd = command.to_string();
+
+            assert!(
+                inst.apply_session_flags(&mut cmd, "test").unwrap(),
+                "{name}"
+            );
+            assert_eq!(cmd, expected, "{name}");
+            assert_eq!(
+                shell_words::split(&cmd).unwrap(),
+                ["codex", "resume", "SID", "--model", "o3"],
+                "{name}"
+            );
+        }
+
+        // A bare renamed wrapper is the program the pane runs, so the
+        // subcommand still lands in the position that reaches the agent it
+        // execs. Refusing it took resume from every renamed wrapper (#3638).
+        let mut wrapper = Instance::new("wrapper", "/tmp/x");
+        wrapper.tool = "codex-personal".to_string();
+        wrapper.detect_as = "codex".to_string();
+        wrapper.command = "codex-personal".to_string();
+        wrapper.agent_session_id = Some("SID".to_string());
+        wrapper.resume_intent = ResumeIntent::Use("SID".to_string());
+        let mut cmd = wrapper.command.clone();
+
+        assert!(wrapper.apply_session_flags(&mut cmd, "test").unwrap());
+        assert_eq!(cmd, "codex-personal resume SID");
+
+        // A launcher still hides the binary, so the token would reach `ssh`.
+        let mut launcher = Instance::new("launcher", "/tmp/x");
+        launcher.tool = "codex-personal".to_string();
+        launcher.detect_as = "codex".to_string();
+        launcher.command = "ssh -t host codex".to_string();
+        launcher.agent_session_id = Some("SID".to_string());
+        launcher.resume_intent = ResumeIntent::Use("SID".to_string());
+        let mut launcher_cmd = launcher.command.clone();
+
+        assert!(!launcher
+            .apply_session_flags(&mut launcher_cmd, "test")
+            .unwrap());
+        assert_eq!(launcher_cmd, "ssh -t host codex");
     }
 
     #[test]
@@ -963,7 +1191,7 @@ mod tests {
             from: "parent-9999".to_string(),
         };
         let mut cmd = "opencode".to_string();
-        inst.apply_session_flags(&mut cmd, "test");
+        inst.apply_session_flags(&mut cmd, "test").unwrap();
         assert_eq!(cmd, "opencode --session parent-9999 --fork");
     }
 

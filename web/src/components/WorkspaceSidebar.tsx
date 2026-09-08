@@ -101,7 +101,7 @@ import { requestSwitchAgent } from "../lib/switchAgentTrigger";
 import { useClampedMenuPosition } from "../lib/menuPosition";
 import { useHasDraftForSessions } from "../lib/acpDrafts";
 import { useQueuedCountForSessions } from "../hooks/useAcpQueueCount";
-import { useRateLimitedForSessions } from "../hooks/useAcpRateLimit";
+import { summarizeRateLimits } from "../lib/rateLimitSummary";
 import {
   triageMenuShape,
   triageStateOf,
@@ -1125,9 +1125,10 @@ export const SessionRow = memo(function SessionRow({
   const queuedCount = useQueuedCountForSessions(sessionIds);
   // Rate-limit park visibility parity with the structured view notice (#1715).
   // The server maps rate-limited stops to Idle, so the status glyph can't
-  // distinguish a parked session from a normal idle one; surface it here
-  // from the same acp-state mirror the queued badge reads.
-  const rateLimited = useRateLimitedForSessions(sessionIds);
+  // distinguish a parked session from a normal idle one; the daemon reports
+  // the park on the session payload, so a resume with no tab open clears
+  // the badge on the next poll (#3514).
+  const rateLimited = useMemo(() => summarizeRateLimits(workspace.sessions), [workspace.sessions]);
   const rateLimitResetLabel = useMemo(() => {
     if (!rateLimited?.resetsAt) return null;
     const reset = new Date(rateLimited.resetsAt);
@@ -1670,6 +1671,16 @@ export const SessionRow = memo(function SessionRow({
                     >
                       <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-amber-400/80" />
                       Resuming
+                    </span>
+                  )}
+                  {firstSession?.view === "structured" && firstSession.acp_worker_state === "stopping" && (
+                    <span
+                      title="Structured view worker is stopping; it will not resume until the process has exited"
+                      aria-label="Stopping"
+                      className="inline-flex shrink-0 items-center gap-0.5 rounded border border-amber-700/40 bg-amber-950/30 px-1 py-0 text-[10px] font-medium text-amber-300"
+                    >
+                      <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-amber-400/80" />
+                      Stopping
                     </span>
                   )}
                   {firstSession?.smart_rename === "pending" && (
@@ -2445,7 +2456,7 @@ export function AddProjectModal({
 /** Bounds for `validate_snooze_duration` on the server. Mirrored
  *  client-side so the modal can pre-validate and disable the submit
  *  button rather than round-trip a 400. See
- *  `src/session/config.rs::SNOOZE_MAX_MINUTES`. */
+ *  `src/session/config/mod.rs::SNOOZE_MAX_MINUTES`. */
 const SNOOZE_MIN_MINUTES = 1;
 const SNOOZE_MAX_MINUTES = 30 * 24 * 60;
 

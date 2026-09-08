@@ -1,14 +1,11 @@
 //! E2E coverage for the serve dialog state machine.
 //!
 //! Targeted regression tests for the `R`-key ModePicker + Confirm flow
-//! introduced with the Tailscale Funnel transport picker. Compiled only
-//! with the default `serve` feature since the serve dialog doesn't exist
-//! under `--no-default-features`; run via:
+//! introduced with the Tailscale Funnel transport picker. Run via:
 //!
 //! ```sh
 //! cargo test --features e2e-tests --test e2e -- tui_serve_dialog
 //! ```
-#![cfg(feature = "serve")]
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};

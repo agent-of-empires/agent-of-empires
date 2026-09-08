@@ -71,13 +71,31 @@ pub fn apply_status_bar(
     set_session_option(
         session_name,
         "status-left",
-        &format!(
-            " #[fg={accent},bold]#S#[fg={fg},nobold] \u{2502} #[fg={hint}]{prefix} d#[fg={hint}] to detach ",
-        ),
+        &status_left_format(prefix, &accent, &fg, &hint),
     )?;
-    set_session_option(session_name, "status-left-length", "50")?;
+    // Sized past the longest name aoe generates rather than to this one: `#S`
+    // expands when tmux paints, so a session renamed after this write (smart
+    // rename is on by default) outgrows an exact fit and the hint is cut
+    // again. tmux only trims at this cap and never pads, so over-sizing is
+    // free. See #3445.
+    set_session_option(session_name, "status-left-length", "200")?;
 
     Ok(())
+}
+
+/// `status-left`: the session name and the key that takes the client back to
+/// aoe. tmux picks the key per client when it paints: a client that arrived
+/// by `switch-client` (the TUI running inside tmux) has a `client_last_session`
+/// and returns to it with `prefix L`; one that arrived by `attach-session` has
+/// none and leaves with `prefix d`. A destroyed last session clears the
+/// variable, so the hint falls back to detach.
+fn status_left_format(prefix: &str, accent: &str, fg: &str, hint: &str) -> String {
+    format!(
+        " #[fg={accent},bold]#S#[fg={fg},nobold] \u{2502} #[fg={hint}]{prefix} \
+         #{{?client_last_session,{switch} back to aoe,{detach} to detach}} ",
+        switch = crate::tmux::utils::SWITCH_BACK_KEY,
+        detach = crate::tmux::utils::DETACH_KEY,
+    )
 }
 
 /// Remove a session-scoped option override so the global value applies.
@@ -96,9 +114,12 @@ fn set_session_option_unset(session_name: &str, option: &str) -> Result<()> {
 }
 
 fn set_session_option(session_name: &str, option: &str, value: &str) -> Result<()> {
-    let output = crate::tmux::tmux_command()
-        .args(["set-option", "-t", session_name, option, value])
-        .output()?;
+    // Deadline-bounded like every other tmux call aoe makes: `rekey_session`
+    // reaches this from a rename the TUI and the HTTP handler both wait on, so
+    // a wedged server must not hold the rename open.
+    let mut command = crate::tmux::tmux_command();
+    command.args(["set-option", "-t", session_name, option, value]);
+    let output = crate::tmux::run_tmux_command_with_timeout(&mut command)?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -107,6 +128,18 @@ fn set_session_option(session_name: &str, option: &str, value: &str) -> Result<(
     }
 
     Ok(())
+}
+
+/// Refresh the title the status bar and `aoe tmux-status` read for a session.
+///
+/// A rename moves the session name but leaves `@aoe_title` holding the
+/// pre-rename title, and nothing re-applies the status bar to a session that
+/// is already live. Written outside the `StatusBar` setting gate on purpose:
+/// `@aoe_*` are aoe's own user options rather than tmux built-ins, so they
+/// never override a user's config, and `aoe tmux-status` serves them to users
+/// painting their own bar.
+pub(crate) fn refresh_session_title(session_name: &str, title: &str) {
+    let _ = set_session_option(session_name, "@aoe_title", title);
 }
 
 /// Apply mouse support option to a tmux session.
@@ -285,6 +318,15 @@ mod tests {
     #[test]
     fn test_color_to_tmux_non_rgb_fallback() {
         assert_eq!(color_to_tmux(Color::Red), "default");
+    }
+
+    #[test]
+    fn status_left_hint_follows_the_clients_attach_path() {
+        assert_eq!(
+            status_left_format("Ctrl+b", "#111111", "#222222", "#333333"),
+            " #[fg=#111111,bold]#S#[fg=#222222,nobold] \u{2502} #[fg=#333333]Ctrl+b \
+             #{?client_last_session,L back to aoe,d to detach} "
+        );
     }
 
     #[test]

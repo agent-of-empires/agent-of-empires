@@ -1817,23 +1817,25 @@ enter to select · esc to cancel";
     #[test]
     fn test_claude_background_work_outlives_the_turn() {
         // A finished turn whose background work is still going: the REPL is
-        // parked and the box is free, but shells, MCP tasks or agents the
-        // agent started are still running. Captured from a live footer.
+        // parked and the box is free, but MCP tasks or agents the agent
+        // started are still running. Captured from a live footer.
         let parked = "✻ Cooked for 1m 58s\n❯ \n";
         let footer =
             |tail: &str| format!("{parked}  ⏵⏵ auto mode on (shift+tab to cycle) · PR #3600{tail}");
 
-        // The footer's shells segment is live: present while they run, gone
-        // when the last one exits, so its absence is the parked case.
+        // #3738: the footer's shell count is of live children of the pane's
+        // shell, which a user can attach to for the session's lifetime, so it
+        // is not read as the agent working. A turn that is genuinely running
+        // still is, from its own chrome, which is what the deletion must not
+        // have taken with it.
         let with_shells = footer(" · 5 shells · ← for agents");
-        assert!(claude_rule_matches("background_shell", &with_shells));
-        assert_eq!(detect_claude(&with_shells, "", None), Status::Running);
+        assert_eq!(detect_claude(&with_shells, "", None), Status::Idle);
+        assert_eq!(claude_rule(&with_shells), "completed_turn");
+        let live = format!("✻ Brewing… (17s · esc to interrupt)\n{with_shells}");
+        assert_eq!(detect_claude(&live, "", None), Status::Running);
 
-        let without = footer(" · ← for agents");
-        assert!(!claude_rule_matches("background_shell", &without));
-        assert_eq!(detect_claude(&without, "", None), Status::Idle);
-
-        // MCP tasks outliving the turn that started them.
+        // MCP tasks outliving the turn that started them. The agent dispatched
+        // these and will report back on them, so they still read as work.
         let mcp = format!("{parked}✻ Ran 3 tools · 2 MCP tasks still running\n");
         assert!(claude_rule_matches("background_mcp_task", &mcp));
         assert_eq!(detect_claude(&mcp, "", None), Status::Running);
@@ -4322,6 +4324,81 @@ Final prose line.\n";
     }
 
     #[test]
+    fn test_detect_omp_status_running_on_active_statusline() {
+        // Composer shapes where the activity band is pushed above the prompt
+        // (claude, rule, pi, borderless, field, rail) or integrated into the
+        // band row park the live braille spinner in the bottom status line.
+        let cases = [
+            (
+                "claude shape with task band and separate statusline",
+                "  ⎋ Capturing live sessions\n\
+                 ───── ⚙ 1 · Review PR · ⏱ 28.6s ─\n\
+                 ❯\n\
+                 ───────────────────────────────────\n\
+                  ⠏ 28s · 🖥 host · 🏃 Prewalk",
+            ),
+            (
+                "compaction on claude shape",
+                " ⠧ Auto server compaction… (esc to cancel)\n\
+                 ─ 👥 5 agents · Fix unresolved · ⏱ 9h12m ─\n\
+                 ❯\n\
+                 ───────────────────────────────────\n\
+                  ⠼ 16m · 🖥 host",
+            ),
+            (
+                "rule shape",
+                "  ⎋ Running tests\n\
+                 ── ⚙ 1 · Test · ⏱ 4s ──\n\
+                 ❯\n\
+                  ⠦ 5s · 🖥 host",
+            ),
+            (
+                "pi shape",
+                "  ⎋ Running tools\n\
+                 ───────────────────────────────────\n\
+                 Ask anything, edit files, run tools\n\
+                 ───────────────────────────────────\n\
+                  ⠧ 12s · 🖥 host · gallery",
+            ),
+            (
+                "borderless shape",
+                "  ⎋ Working…\n\
+                 ❯ Ask anything\n\
+                  ⠙ 1m · 🖥 host",
+            ),
+            (
+                "field shape",
+                "  ⎋ Working…\n\
+                 ▐ Ask anything ▌\n\
+                  ⠸ 3s · 🖥 host",
+            ),
+            (
+                "rail shape",
+                "  ⎋ Working…\n\
+                 ▎ Ask anything\n\
+                  ⠴ 45s · 🖥 host",
+            ),
+            (
+                "band shape",
+                "  ⎋ Working…\n\
+                  ⠦ 6s > ⬢ Sonnet > 🗺 Plan\n\
+                 ╰─ Ask anything ─╯",
+            ),
+            (
+                "active statusline with quoted selector hint is still running",
+                "  ⎋ Running tests\n\
+                 │ up/down navigate  enter select  esc cancel │\n\
+                 ❯\n\
+                 ───────────────────────────────────\n\
+                  ⠏ 28s · 🖥 host",
+            ),
+        ];
+        for (name, pane) in cases {
+            assert_eq!(detect_omp_status(pane), Status::Running, "case: {name}");
+        }
+    }
+
+    #[test]
     fn test_detect_omp_status_active_brand_near_misses_idle() {
         let cases = [
             (
@@ -4388,6 +4465,21 @@ Final prose line.\n";
                 "decorated unicode clock-only first segment",
                 "  ⎋ Working…\n❯\n╭── ⏱ 5m ─╮\n╰─",
             ),
+            (
+                "stale band with parked pi footer",
+                "─ Continue Autonomous · ⏱ 2h4m ─\n❯\n───────────────────────────────────\n π · 🖥 host",
+            ),
+            (
+                "parked claude shape at prompt",
+                "❯\n───────────────────────────────────\n π · 🖥 host",
+            ),
+            (
+                "stale parked spinner with prose mentioning esc to cancel",
+                "Some tool output: press (esc to cancel) to abort\n\
+                 ❯\n\
+                 ───────────────────────────────────\n\
+                  ⠏ 28s · 🖥 host",
+            ),
         ];
         for (name, pane) in cases {
             assert_eq!(detect_omp_status(pane), Status::Idle, "case: {name}");
@@ -4413,6 +4505,11 @@ Final prose line.\n";
                 "lower active band wins",
                 format!("{approval}\n{band}\n╰─"),
                 Status::Running,
+            ),
+            (
+                "lower approval wins over active statusline",
+                format!("⎋ Running tests\n{approval}\n❯\n───────────────────────────────────\n ⠏ 28s · 🖥 host"),
+                Status::Waiting,
             ),
         ];
         for (name, pane, expected) in cases {

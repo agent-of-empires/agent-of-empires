@@ -77,11 +77,11 @@ export function historyWindowStart(rows: readonly ActivityRow[], visibleRows: nu
   return snapBackToSubagentParent(rows, start);
 }
 
-/** Index of the latest `/clear` divider, or -1 when cleared turns are
- *  shown (folding off) or there is no clear. Rows before it are hidden
- *  behind the ClearedTurnsBanner, not by the history window. */
-function lastClearedIndex(rows: readonly ActivityRow[], showClearedTurns: boolean): number {
-  if (showClearedTurns) return -1;
+/** Index of the latest `/clear` divider, or -1 when there is none. The fold
+ *  pins to the LAST clear so repeated /clears collapse cumulatively. The
+ *  message tree, the runtime key, and the ClearedTurnsBanner all measure the
+ *  fold from here, so they cannot disagree. See #1101. */
+export function lastClearIndex(rows: readonly ActivityRow[]): number {
   for (let i = rows.length - 1; i >= 0; i -= 1) {
     if (rows[i]!.kind === "session_cleared") return i;
   }
@@ -104,7 +104,13 @@ export function historyWindow(
   showClearedTurns: boolean,
 ): HistoryWindow {
   const start = historyWindowStart(rows, visibleRows);
-  const clearIndex = lastClearedIndex(rows, showClearedTurns);
-  const canLoadEarlier = clearIndex < 0 ? start > 0 : start > clearIndex;
-  return { start, canLoadEarlier };
+  return { start, canLoadEarlier: canLoadEarlierFrom(rows, start, showClearedTurns) };
+}
+
+/** Whether "Load earlier" would reveal anything from `start`. Pre-`/clear`
+ *  rows are reached via the ClearedTurnsBanner, not by "Load earlier", so
+ *  they must not make that control look live. */
+export function canLoadEarlierFrom(rows: readonly ActivityRow[], start: number, showClearedTurns: boolean): boolean {
+  const clearIndex = showClearedTurns ? -1 : lastClearIndex(rows);
+  return clearIndex < 0 ? start > 0 : start > clearIndex;
 }

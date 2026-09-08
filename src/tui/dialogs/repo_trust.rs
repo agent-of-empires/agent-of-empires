@@ -11,8 +11,9 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 use super::DialogResult;
-use crate::session::project_mcp::ProjectMcpServer;
-use crate::session::{repo_config, HooksConfig};
+use crate::session::config::repo_config;
+use crate::session::mcp::project_mcp::ProjectMcpServer;
+use crate::session::HooksConfig;
 use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::styles::Theme;
 
@@ -318,7 +319,7 @@ impl RepoTrustDialog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::project_mcp::load_project_mcp_servers;
+    use crate::session::mcp::project_mcp::load_project_mcp_servers;
     use crossterm::event::KeyModifiers;
 
     fn key(code: KeyCode) -> KeyEvent {

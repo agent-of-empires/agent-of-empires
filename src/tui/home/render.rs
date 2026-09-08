@@ -299,6 +299,51 @@ fn passive_resize_step(
     }
 }
 
+/// What the fleet reconcile should do for one session wanting `(cols, rows)`.
+/// The fleet has its own debounce (the armed fleet geometry in
+/// `reconcile_passive_fleet`), so per session this only dedups: an
+/// already-synced, declined, or already-queued geometry is not re-sent,
+/// anything else is handed to the worker.
+#[derive(Debug, PartialEq, Eq)]
+enum FleetPassiveStep {
+    Skip,
+    Queue,
+}
+
+fn fleet_passive_step(
+    want: (u16, u16),
+    synced: Option<(u16, u16)>,
+    declined: Option<(u16, u16)>,
+    queued: Option<(u16, u16)>,
+) -> FleetPassiveStep {
+    if synced == Some(want) || declined == Some(want) || queued == Some(want) {
+        FleetPassiveStep::Skip
+    } else {
+        FleetPassiveStep::Queue
+    }
+}
+
+/// How long a declined passive resize stays parked before the fleet retries
+/// it. Declines come from a live attach or an active size owner; nothing
+/// announces when those go away, so a bounded retry turns "parked until the
+/// next geometry change" into "recovers within half a minute", at one
+/// guarded worker attempt per declined session per interval.
+pub(super) const PASSIVE_DECLINE_RETRY: Duration = Duration::from_secs(30);
+
+/// Whether a pane observation contradicts an applied passive resize: taken
+/// after adoption (the shared list-panes snapshot can lag our own resize,
+/// and acting on an older one would re-SIGWINCH a pane that is already
+/// correct) and showing a window size other than the one we applied. True
+/// means another client resized the window and the synced entry must be
+/// dropped so the reconcile re-asserts the pane.
+fn passive_synced_contradicted(
+    synced: &super::PassiveSynced,
+    observed: (u16, u16),
+    observed_at: Instant,
+) -> bool {
+    observed_at > synced.adopted_at && observed != (synced.cols, synced.window_rows)
+}
+
 /// Clamp the user's preview scroll offset to what the freshly captured pane
 /// can actually render. Prevents the offset from drifting into "phantom"
 /// territory (M3 from the multi-AI review) when tmux history is shorter than
@@ -804,6 +849,15 @@ impl HomeView {
         self.footer_buttons.clear();
         self.collapse_button_area = Rect::default();
         self.expand_strip_area = Rect::default();
+        // Hyperlink cells are per-frame: a takeover view or a preview that
+        // paints no link must leave none behind for the backend to re-emit.
+        // Recover from poison rather than skip, matching the backend: if the
+        // renderer stopped clearing while the backend kept emitting, the last
+        // recorded set would be re-wrapped over unrelated cells indefinitely.
+        self.hyperlink_cells
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
 
         // Settings view takes over the whole screen
         if let Some(ref mut settings) = self.settings_view {
@@ -844,7 +898,6 @@ impl HomeView {
         }
 
         // Serve view takes over the whole screen
-        #[cfg(feature = "serve")]
         if let Some(ref serve) = self.serve_view {
             self.divider_col = None;
             self.main_area_width = 0;
@@ -1315,7 +1368,7 @@ impl HomeView {
             .enumerate()
         {
             let abs_idx = i + scroll.scroll_offset;
-            let is_selected = abs_idx == self.cursor;
+            let is_selected = self.is_sidebar_item_selected(item, abs_idx);
             let is_hovered = !is_selected && Some(abs_idx) == hover_idx;
             let is_match =
                 !self.search_matches.is_empty() && self.search_matches.contains(&abs_idx);
@@ -1390,7 +1443,7 @@ impl HomeView {
                 .enumerate()
             {
                 let abs_idx = list_len + sscroll.scroll_offset + i;
-                let is_selected = abs_idx == self.cursor;
+                let is_selected = self.is_sidebar_item_selected(item, abs_idx);
                 let is_hovered = !is_selected && Some(abs_idx) == hover_idx;
                 let is_match =
                     !self.search_matches.is_empty() && self.search_matches.contains(&abs_idx);
@@ -1479,10 +1532,7 @@ impl HomeView {
     }
 
     fn has_overlay_above_search(&self) -> bool {
-        #[cfg(feature = "serve")]
         let serve_open = self.serve_view.is_some();
-        #[cfg(not(feature = "serve"))]
-        let serve_open = false;
 
         self.show_help
             || self.new_dialog.is_some()
@@ -1975,11 +2025,24 @@ impl HomeView {
         }
     }
 
+    pub(super) fn is_sidebar_item_selected(&self, item: &Item, index: usize) -> bool {
+        // A reload can hide the live row while the cursor falls onto a peer.
+        match (&self.live_send, &self.selected_session, item) {
+            (Some(_), Some(selected), Item::Session { id, .. }) => id == selected,
+            (Some(_), Some(_), _) => false,
+            _ => index == self.cursor,
+        }
+    }
+
     /// tmux session name backing the pane the preview currently shows, as a
     /// function of the selected session and view mode (and, for Terminal,
-    /// the host/container sub-mode). `None` when nothing is selected. Drives
+    /// the host/container sub-mode). Live-send pins the pane captured at entry,
+    /// independent of storage-driven selection changes. Drives
     /// `sync_preview_capture_worker`.
     pub(super) fn displayed_pane_tmux_name(&self) -> Option<String> {
+        if let Some(state) = &self.live_send {
+            return Some(state.tmux_name.clone());
+        }
         let id = self.selected_session.as_ref()?;
         let inst = self.get_instance(id)?;
         let name = match &self.view_mode {
@@ -2251,6 +2314,209 @@ impl HomeView {
         preview_frozen(self.preview_scroll_offset, self.preview_selection.is_some())
     }
 
+    /// Adopt passive-resize completions into the per-session bookkeeping.
+    /// Applied geometry becomes the synced dedup (and clears the live-send
+    /// dedup when the resize raced live entry, see
+    /// `passive_resize_invalidates_live_geometry`); declined geometry is
+    /// parked so the fleet reconcile stops retrying it until the wanted
+    /// geometry changes.
+    fn adopt_passive_resize_completions(&mut self) {
+        for done in crate::tmux::take_passive_resize_dones() {
+            self.passive_pane_queued.remove(&done.session_id);
+            let Some(window_rows) = done.applied_window_rows else {
+                self.passive_pane_declined.insert(
+                    done.session_id,
+                    ((done.cols, done.rows), std::time::Instant::now()),
+                );
+                continue;
+            };
+            let invalidates_live = passive_resize_invalidates_live_geometry(
+                self.live_send.as_ref().map(|live| &live.target),
+                self.selected_session.as_deref(),
+                &done.session_id,
+            );
+            self.passive_pane_declined.remove(&done.session_id);
+            self.passive_pane_synced.insert(
+                done.session_id.clone(),
+                super::PassiveSynced {
+                    cols: done.cols,
+                    rows: done.rows,
+                    window_rows,
+                    adopted_at: std::time::Instant::now(),
+                },
+            );
+            if self.preview_pane_pending.as_ref() == Some(&(done.session_id, done.cols, done.rows))
+            {
+                self.preview_pane_pending = None;
+            }
+            if invalidates_live {
+                self.live_send_last_resize = None;
+                self.live_send_resize_retry_at = None;
+            }
+        }
+    }
+
+    /// Drop synced entries contradicted by a newer pane snapshot: an
+    /// external `tmux attach` or the web live view resized the window after
+    /// we set it, and treating the entry as in-sync would leave the preview
+    /// clipped with no self-recovery. The reconcile then re-asserts the pane
+    /// like any other diff.
+    fn invalidate_externally_resized_panes(&mut self) {
+        let stale: Vec<String> = self
+            .passive_pane_synced
+            .iter()
+            .filter(|(id, synced)| {
+                let Some(inst) = self.get_instance(id) else {
+                    return false;
+                };
+                let name = crate::tmux::Session::resolve_name_for_display(id, &inst.title);
+                match crate::tmux::observed_window_size_from_cache(&name) {
+                    Some((observed, at)) => passive_synced_contradicted(synced, observed, at),
+                    None => false,
+                }
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in stale {
+            self.passive_pane_synced.remove(&id);
+        }
+    }
+
+    /// Keep every open session's detached agent pane pre-sized to the preview
+    /// output rect it would be shown at, so selecting a row or entering live
+    /// view lands on an already-correct pane instead of waiting out a resize
+    /// round-trip. `exclude` is the session whose per-frame sync in
+    /// `refresh_preview_cache_if_needed` owns its geometry this frame; the
+    /// live-send session is skipped because its worker owns the pane.
+    ///
+    /// The per-session target is fully predictable: `PreviewLayout::compute`
+    /// over the shared preview rect and that instance's own header height,
+    /// the same split the renderer will use when the row is selected. Work
+    /// runs on the passive-resize worker under its atomic detached/no-owner
+    /// guard. Two debounces bound the SIGWINCH cost: resizes fire only when
+    /// the same fleet geometry is wanted on two consecutive refreshes (the
+    /// fleet analogue of `passive_resize_step`'s one-frame-toast rule), and a
+    /// geometry the worker declined is not retried until the wanted fleet
+    /// geometry changes or [`PASSIVE_DECLINE_RETRY`] elapses.
+    ///
+    /// Single-TUI only: with more than one aoe TUI alive, each would treat
+    /// the other's fleet resizes as external (the observed-size invalidation
+    /// below) and re-assert its own geometry, oscillating every open pane at
+    /// snapshot cadence. The presence count already surfaced as the
+    /// "N watching" indicator gates both the fleet pass and the invalidation;
+    /// the selected-session sync stays on, matching the pre-fleet behavior
+    /// those TUIs had.
+    pub(super) fn reconcile_passive_fleet(
+        &mut self,
+        inner: Rect,
+        compact: bool,
+        exclude: Option<&str>,
+    ) {
+        self.adopt_passive_resize_completions();
+        if self.active_tui_count > 1 {
+            return;
+        }
+        self.invalidate_externally_resized_panes();
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+        // The excluded (selected) and live sessions are skipped at the firing
+        // loop below, NOT while building `wants`: the armed epoch key must be
+        // pure geometry, or moving the selection would re-arm the fleet and
+        // retry every declined session on each cursor stop.
+        let mut wants: Vec<(String, u16, u16)> = Vec::new();
+        for (id, inst) in &self.instances {
+            if inst.is_archived() || inst.is_trashed() || inst.is_structured() {
+                continue;
+            }
+            if !matches!(
+                inst.status,
+                Status::Running | Status::Waiting | Status::Idle
+            ) {
+                continue;
+            }
+            let output = preview::PreviewLayout::compute(
+                inner,
+                compact,
+                self.show_preview_info,
+                preview::agent_info_height(inst),
+            )
+            .output;
+            if output.width == 0 || output.height == 0 {
+                continue;
+            }
+            wants.push((id.clone(), output.width, output.height));
+        }
+        // Order-independent epoch key: `self.instances` is rebuilt from the
+        // `storages` HashMap on reload, so an order-only shuffle of an
+        // identical fleet must not read as a new geometry (which would clear
+        // the declines early). Sorting also makes the firing order below
+        // deterministic.
+        wants.sort_unstable();
+        if self.passive_fleet_armed.as_ref() != Some(&wants) {
+            // First sighting of this fleet geometry: arm it, let declined
+            // sessions retry once under the new epoch, and nudge the event
+            // loop so the confirming refresh isn't left to an idle heartbeat.
+            // Queued entries are dropped too: re-queueing work that is truly
+            // in flight is suppressed by the worker's tickets, while an entry
+            // orphaned by a lost completion (worker panic) would otherwise
+            // block its session at that geometry indefinitely.
+            self.passive_fleet_armed = Some(wants);
+            self.passive_pane_declined.clear();
+            self.passive_pane_queued.clear();
+            // Prune synced entries for sessions that no longer exist so the
+            // map cannot grow without bound as sessions come and go.
+            let instances = &self.instances;
+            self.passive_pane_synced
+                .retain(|id, _| instances.contains_key(id));
+            self.preview_wake.notify_one();
+            return;
+        }
+        let live_session = self.live_send.as_ref().map(|live| live.session_id.clone());
+        let selected = self.selected_session.clone();
+        for (id, cols, rows) in wants {
+            if Some(id.as_str()) == exclude || Some(id.as_str()) == live_session.as_deref() {
+                continue;
+            }
+            let want = (cols, rows);
+            let synced = self.passive_pane_synced.get(&id).map(|s| (s.cols, s.rows));
+            // An expired decline reads as absent so the session is retried
+            // once its blocking attach or size owner may have gone away.
+            let declined = self
+                .passive_pane_declined
+                .get(&id)
+                .filter(|(_, at)| at.elapsed() < PASSIVE_DECLINE_RETRY)
+                .map(|(geometry, _)| *geometry);
+            match fleet_passive_step(
+                want,
+                synced,
+                declined,
+                self.passive_pane_queued.get(&id).copied(),
+            ) {
+                FleetPassiveStep::Skip => {}
+                FleetPassiveStep::Queue => {
+                    let Some(inst) = self.get_instance(&id) else {
+                        continue;
+                    };
+                    crate::tmux::queue_passive_resize(crate::tmux::PassiveResizeIntent {
+                        session_id: id.clone(),
+                        session_name: crate::tmux::Session::resolve_name_for_display(
+                            &id,
+                            &inst.title,
+                        ),
+                        cols,
+                        rows,
+                        // The viewed session (selected here in Terminal/Tool
+                        // view; the Structured selection goes through
+                        // `refresh_preview_cache_if_needed`) jumps the queue.
+                        priority: selected.as_deref() == Some(id.as_str()),
+                    });
+                    self.passive_pane_queued.insert(id, want);
+                }
+            }
+        }
+    }
+
     pub(super) fn refresh_preview_cache_if_needed(&mut self, width: u16, height: u16) {
         // Forward an agent's OSC 52 copy to the host clipboard (#2420). The
         // VT reader extracts it from the raw pane stream (the vt100 grid
@@ -2277,27 +2543,10 @@ impl HomeView {
         // the cache; tui.render preview_apply_us measures that paint-side work,
         // not tmux capture latency.
         let in_live = self.live_send.is_some();
-        // Adopt passive completions before live sizing. A passive resize can
-        // have passed its detached/no-owner checks just before live-send took
-        // ownership, then land after the live worker's first resize. Clear the
-        // live dedup for that active agent so the call below reasserts current
-        // geometry in this same frame.
-        for done in crate::tmux::take_passive_resize_dones() {
-            let invalidates_live = passive_resize_invalidates_live_geometry(
-                self.live_send.as_ref().map(|live| &live.target),
-                self.selected_session.as_deref(),
-                &done.session_id,
-            );
-            self.preview_pane_synced = Some((done.session_id.clone(), done.cols, done.rows));
-            if self.preview_pane_pending.as_ref() == Some(&(done.session_id, done.cols, done.rows))
-            {
-                self.preview_pane_pending = None;
-            }
-            if invalidates_live {
-                self.live_send_last_resize = None;
-                self.live_send_resize_retry_at = None;
-            }
-        }
+        // Passive completions were adopted by `reconcile_passive_fleet`
+        // earlier this frame (it runs before every preview refresh), so the
+        // live-dedup invalidation for a passive resize that raced live entry
+        // is already in place for the live sizing below.
         // While in live-send mode, keep the agent's tmux pane sized to the
         // preview's visible output area so it renders directly into view.
         self.resize_live_pane_if_target(live_send::LiveSendTarget::Agent, width, height);
@@ -2314,13 +2563,18 @@ impl HomeView {
         if !in_live && width > 0 && height > 0 {
             if let Some(id) = self.selected_session.clone() {
                 let want = (id, width, height);
+                let synced = self
+                    .passive_pane_synced
+                    .get(&want.0)
+                    .map(|s| (want.0.clone(), s.cols, s.rows));
                 match passive_resize_step(
                     &want,
-                    self.preview_pane_synced.as_ref(),
+                    synced.as_ref(),
                     self.preview_pane_pending.as_ref(),
                 ) {
                     PassiveResizeStep::InSync => {
                         crate::tmux::cancel_pending_passive_resize(&want.0);
+                        self.passive_pane_queued.remove(&want.0);
                         self.preview_pane_pending = None;
                     }
                     PassiveResizeStep::Arm => {
@@ -2351,7 +2605,11 @@ impl HomeView {
                                 ),
                                 cols: want.1,
                                 rows: want.2,
+                                // The user is viewing this session; its
+                                // resize goes ahead of queued fleet work.
+                                priority: true,
                             });
+                            self.passive_pane_queued.insert(want.0, (want.1, want.2));
                         }
                     }
                 }
@@ -2619,10 +2877,7 @@ impl HomeView {
             // transcript scrolls inside the embedded view); the generic
             // indicator below reads the tmux capture cache and home's
             // wheel offset, both of which are stale or empty for it.
-            #[cfg(feature = "serve")]
             let structured_mounted = self.structured_preview.is_some();
-            #[cfg(not(feature = "serve"))]
-            let structured_mounted = false;
             let scroll_indicator = if !self.show_preview_info && !structured_mounted {
                 let inner_height = area.height.saturating_sub(2);
                 let visible_height = inner_height as usize;
@@ -2672,11 +2927,13 @@ impl HomeView {
         // live to capture. Short-circuit every view mode to a calm "Archived"
         // placeholder instead of forking captures that come back empty and
         // surface as "No output available".
-        let selected_archived = self
-            .selected_session
-            .as_ref()
-            .and_then(|id| self.get_instance(id))
-            .is_some_and(|inst| inst.is_archived());
+        let live_send_active = self.live_send.is_some();
+        let selected_archived = !live_send_active
+            && self
+                .selected_session
+                .as_ref()
+                .and_then(|id| self.get_instance(id))
+                .is_some_and(|inst| inst.is_archived());
 
         // A session whose pane is simply gone (killed, exited, server reboot)
         // with no diagnostic detail carries the generic gone-error. Present
@@ -2690,13 +2947,15 @@ impl HomeView {
         // must not hide that pane's output there.
         // A trashed session's pane was also killed (on trash). Same calm
         // placeholder treatment as archived, with a restore hint.
-        let selected_trashed = self
-            .selected_session
-            .as_ref()
-            .and_then(|id| self.get_instance(id))
-            .is_some_and(|inst| inst.is_trashed());
+        let selected_trashed = !live_send_active
+            && self
+                .selected_session
+                .as_ref()
+                .and_then(|id| self.get_instance(id))
+                .is_some_and(|inst| inst.is_trashed());
 
-        let selected_stopped = !selected_archived
+        let selected_stopped = !live_send_active
+            && !selected_archived
             && !selected_trashed
             && matches!(self.view_mode, ViewMode::Structured)
             && self
@@ -2713,7 +2972,8 @@ impl HomeView {
         // pane forever, so short-circuit to an explanatory placeholder
         // instead. Only in the Structured (agent output) view; Terminal
         // and Tool views show their own, independently-live panes.
-        let selected_structured = !selected_archived
+        let selected_structured = !live_send_active
+            && !selected_archived
             && !selected_trashed
             && matches!(self.view_mode, ViewMode::Structured)
             && self
@@ -2734,6 +2994,23 @@ impl HomeView {
                 self.displayed_pane_tmux_name()
             };
         self.sync_preview_capture_worker(desired);
+
+        // Pre-size every other open session's detached pane to the preview
+        // rect it would be shown at (and adopt worker completions), in every
+        // view mode and selection state. The selected session is excluded
+        // exactly when the Structured branch below runs its own per-frame
+        // sync in `refresh_preview_cache_if_needed`.
+        let selected_owns_sync = matches!(self.view_mode, ViewMode::Structured)
+            && !selected_archived
+            && !selected_trashed
+            && !selected_stopped
+            && !selected_structured;
+        let fleet_exclude = if selected_owns_sync {
+            self.selected_session.clone()
+        } else {
+            None
+        };
+        self.reconcile_passive_fleet(inner, compact, fleet_exclude.as_deref());
 
         if selected_archived {
             self.render_archived_preview(frame, inner, theme);
@@ -2758,65 +3035,62 @@ impl HomeView {
             // content: info header on top (same `i` toggle and layout as
             // the terminal previews), the streaming transcript below, and
             // the drag-select machinery pointed at the painted rows.
-            #[cfg(feature = "serve")]
-            {
-                let selected_id = self.selected_session.clone();
-                let mounted_matches = self
-                    .structured_preview
-                    .as_ref()
-                    .zip(selected_id.as_deref())
-                    .is_some_and(|(v, id)| v.session_id() == id);
-                if mounted_matches {
-                    // Take/put-back so the view's `&mut` render can't
-                    // fight the instance lookup's shared borrow of self.
-                    let mut view = self.structured_preview.take();
-                    let inst = selected_id.as_deref().and_then(|id| self.get_instance(id));
-                    let layout = preview::PreviewLayout::compute(
-                        inner,
-                        compact,
-                        self.show_preview_info,
-                        inst.map(preview::agent_info_height).unwrap_or(0),
+            let selected_id = self.selected_session.clone();
+            let mounted_matches = self
+                .structured_preview
+                .as_ref()
+                .zip(selected_id.as_deref())
+                .is_some_and(|(v, id)| v.session_id() == id);
+            if mounted_matches {
+                // Take/put-back so the view's `&mut` render can't
+                // fight the instance lookup's shared borrow of self.
+                let mut view = self.structured_preview.take();
+                let inst = selected_id.as_deref().and_then(|id| self.get_instance(id));
+                let layout = preview::PreviewLayout::compute(
+                    inner,
+                    compact,
+                    self.show_preview_info,
+                    inst.map(preview::agent_info_height).unwrap_or(0),
+                );
+                if let (Some(info_area), Some(inst)) = (layout.info, inst) {
+                    preview::Preview::render_info(
+                        frame,
+                        info_area,
+                        inst,
+                        theme,
+                        self.idle_decay_window,
                     );
-                    if let (Some(info_area), Some(inst)) = (layout.info, inst) {
-                        preview::Preview::render_info(
-                            frame,
-                            info_area,
-                            inst,
-                            theme,
-                            self.idle_decay_window,
-                        );
-                    }
-                    // No ` Output ` banner row: the transcript block has
-                    // its own titled border, so the banner slot stays a
-                    // blank separator under the header.
-                    let geometry = view
-                        .as_mut()
-                        .and_then(|v| v.render(frame, layout.output, theme));
-                    self.structured_preview = view;
-                    self.preview_pane_area = layout.output;
-                    if let Some(g) = geometry {
-                        self.preview_visible_rows = g.text_area.height as usize;
-                        self.preview_text_view = crate::tui::home::PreviewTextView {
-                            pane: g.text_area,
-                            first_line: g.first_line,
-                            total_lines: g.total_lines,
-                        };
-                    }
-                    self.paint_preview_selection(frame, theme);
-                    return;
                 }
-                if self.structured_preview_pending {
-                    // A mount is underway (or about to start): render a
-                    // quiet beat instead of the wordy "press Enter" page,
-                    // which otherwise flashes on every selection.
-                    let para = Paragraph::new(Line::from(Span::styled(
-                        "…",
-                        Style::default().fg(theme.dimmed),
-                    )))
-                    .alignment(Alignment::Center);
-                    frame.render_widget(para, inner);
-                    return;
+                // No ` Output ` banner row: the transcript block has
+                // its own titled border, so the banner slot stays a
+                // blank separator under the header.
+                let geometry = view
+                    .as_mut()
+                    .and_then(|v| v.render(frame, layout.output, theme));
+                self.structured_preview = view;
+                self.preview_pane_area = layout.output;
+                if let Some(g) = geometry {
+                    self.preview_visible_rows = g.text_area.height as usize;
+                    self.preview_text_view = crate::tui::home::PreviewTextView {
+                        pane: g.text_area,
+                        first_line: g.first_line,
+                        total_lines: g.total_lines,
+                    };
                 }
+                self.paint_preview_selection(frame, theme);
+                return;
+            }
+            if self.structured_preview_pending {
+                // A mount is underway (or about to start): render a
+                // quiet beat instead of the wordy "press Enter" page,
+                // which otherwise flashes on every selection.
+                let para = Paragraph::new(Line::from(Span::styled(
+                    "…",
+                    Style::default().fg(theme.dimmed),
+                )))
+                .alignment(Alignment::Center);
+                frame.render_widget(para, inner);
+                return;
             }
             self.render_structured_preview(frame, inner, theme);
             self.paint_preview_selection(frame, theme);
@@ -2826,11 +3100,12 @@ impl HomeView {
         match self.view_mode {
             ViewMode::Structured => {
                 // Check if selected session is being created (show hook progress)
-                let is_creating = self
-                    .selected_session
-                    .as_ref()
-                    .and_then(|id| self.get_instance(id))
-                    .is_some_and(|inst| inst.status == Status::Creating);
+                let is_creating = !live_send_active
+                    && self
+                        .selected_session
+                        .as_ref()
+                        .and_then(|id| self.get_instance(id))
+                        .is_some_and(|inst| inst.status == Status::Creating);
 
                 if is_creating {
                     self.render_creating_preview(frame, inner, theme);
@@ -3111,12 +3386,74 @@ impl HomeView {
             frame.set_cursor_position(pos);
         }
 
+        // Hyperlink underlines go under the selection highlight: a link inside
+        // a drag should still read as selected.
+        self.paint_preview_links(frame.buffer_mut());
+
         // Selection highlight goes last so it sits on top of whatever
         // the active ViewMode painted into the inner area. The handlers
         // only populate `preview_selection` while a drag is live or a
         // finalized highlight is showing, so this branch is a no-op
         // otherwise.
         self.paint_preview_selection(frame, theme);
+    }
+
+    /// Underline the hyperlink spans on the visible preview rows.
+    ///
+    /// Without this a link whose visible text is not itself a URL is
+    /// indistinguishable from surrounding output: the host terminal never sees
+    /// the OSC 8 (the grid drops it) and has no URL to match on either, so
+    /// nothing marks the text as clickable. The underline is the affordance for
+    /// `preview_link_at`, which opens the target on a plain click.
+    pub(super) fn paint_preview_links(&self, buf: &mut Buffer) {
+        // Same guard as `preview_link_at`: an overlay swallows the click, so
+        // underlining behind it would advertise an affordance that does
+        // nothing, and the dialog paints over these cells after this runs,
+        // leaving the backend to wrap the dialog's own text in OSC 8.
+        if self.has_non_live_send_overlay() {
+            return;
+        }
+        let view = self.preview_text_view;
+        let pane = view.pane;
+        if pane.width == 0 || pane.height == 0 {
+            return;
+        }
+        let cache = self.active_preview_cache();
+        let Some(text) = cache.parsed_text.as_ref() else {
+            return;
+        };
+        let buf_area = buf.area;
+        let mut cells = Some(
+            self.hyperlink_cells
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        for row_offset in 0..pane.height {
+            let Some(line) = text.lines.get(view.first_line + row_offset as usize) else {
+                break;
+            };
+            for span in crate::tui::links::link_spans_for_line(line, pane.width, &cache.links) {
+                for col in span.start..span.end {
+                    let pos = (pane.x + col, pane.y + row_offset);
+                    if !buf_area.contains(Position::from(pos)) {
+                        continue;
+                    }
+                    buf[pos].modifier |= Modifier::UNDERLINED;
+                    // The URI lives outside the `Buffer`, so ratatui's diff
+                    // cannot see a target change on otherwise identical cells:
+                    // the same label repointed from A to B would leave the
+                    // terminal holding A while the hit-test resolves B. Hand
+                    // linked cells to the backend on every frame instead.
+                    buf[pos].set_diff_option(ratatui::buffer::CellDiffOption::AlwaysUpdate);
+                    // Hand the target to the backend as well, so the host
+                    // terminal gets a real hyperlink and not just an
+                    // underline it cannot act on.
+                    if let Some(cells) = cells.as_mut() {
+                        cells.insert(pos.0, pos.1, &span.uri);
+                    }
+                }
+            }
+        }
     }
 
     /// Where to paint the live-send cursor this frame, or `None` to paint no
@@ -3542,6 +3879,59 @@ impl HomeView {
         // a stale rect can't make a footer click open tips when the badge is
         // hidden (live-send, nothing unseen, or no room).
         self.tips_badge_rect = None;
+        // A flash is one-shot feedback on something the user just did, so it
+        // takes the row for its few seconds; a hovered link's target takes it
+        // for as long as the pointer rests there. The flash wins the overlap,
+        // because it reports the click the user just made on that same link.
+        // In live-send the LIVE chip stays either way: which pane keystrokes
+        // land on must never be hidden, not even briefly.
+        // A hovered target is only shown while an overlay is not covering the
+        // preview: the click is inert there, so advertising one would be a lie.
+        // Resolved per frame, so it cannot outlive the row it described.
+        // Suppressed while the leader is armed: the which-key menu below is a
+        // discoverability affordance a resting pointer must not hide.
+        let hovered = (!self.live_send_pending_leader)
+            .then(|| self.hovered_link())
+            .flatten()
+            .map(|uri| format!("\u{1f517} {uri}"));
+        let transient = self.status_flash_text().map(str::to_string).or(hovered);
+        if let Some(text) = transient {
+            let mut spans = Vec::new();
+            let mut budget = area.width as usize;
+            // In live-send the chip and the way out both stay. A flash lasts
+            // three seconds, but a hovered target lasts as long as the pointer
+            // rests there, and leaving the user with no visible exit chord for
+            // that long is not a trade worth making.
+            let exit = self.live_send.as_ref().map(|state| {
+                let chord = if state.exit_chords.is_empty() {
+                    "?".to_string()
+                } else {
+                    live_send::display_chord_list(&state.exit_chords)
+                };
+                format!(" {chord} to exit ")
+            });
+            if self.live_send.is_some() {
+                let chip = " \u{25CF} LIVE ";
+                budget = budget.saturating_sub(unicode_width::UnicodeWidthStr::width(chip));
+                spans.push(Span::styled(
+                    chip,
+                    Style::default()
+                        .fg(theme.background)
+                        .bg(theme.running)
+                        .bold(),
+                ));
+            }
+            if let Some(exit) = exit.as_deref() {
+                budget = budget.saturating_sub(unicode_width::UnicodeWidthStr::width(exit));
+            }
+            let text = truncate_to_width(&format!(" {text} "), budget);
+            spans.push(Span::styled(text, Style::default().fg(theme.accent).bold()));
+            if let Some(exit) = exit {
+                spans.push(Span::styled(exit, Style::default().fg(theme.dimmed)));
+            }
+            frame.render_widget(Paragraph::new(Line::from(spans)), area);
+            return;
+        }
         // Live-send banner takes over the status bar so the user has an
         // always-visible reminder that keystrokes are being relayed to
         // the pane (and how to get out). Distinct color + bold so it
@@ -3745,23 +4135,27 @@ impl HomeView {
         // The TUI does not own the daemon, so we probe the PID file each
         // render. Mode comes from a PID-keyed cache so we don't read the
         // serve.mode file from disk on every frame.
-        #[cfg(feature = "serve")]
-        {
-            let mode_label = crate::cli::serve::cached_serve_mode_label();
-            if crate::cli::serve::daemon_pid().is_some() {
-                let label = match mode_label {
-                    Some(m) => format!(" \u{25CF} Serving ({}) ", m),
-                    None => " \u{25CF} Serving ".to_string(),
-                };
-                groups.push((
-                    0,
-                    None,
-                    vec![Span::styled(
-                        label,
-                        Style::default().fg(theme.running).bold(),
-                    )],
-                ));
-            }
+        let mode_label = crate::cli::serve::cached_serve_mode_label();
+        if crate::cli::serve::daemon_pid().is_some() {
+            // A build without the dashboard bundle answers the API only, so
+            // the badge must not read as "the dashboard is up".
+            let what = if cfg!(feature = "web") {
+                "Serving"
+            } else {
+                "Serving API"
+            };
+            let label = match mode_label {
+                Some(m) => format!(" \u{25CF} {} ({}) ", what, m),
+                None => format!(" \u{25CF} {} ", what),
+            };
+            groups.push((
+                0,
+                None,
+                vec![Span::styled(
+                    label,
+                    Style::default().fg(theme.running).bold(),
+                )],
+            ));
         }
 
         // Other-TUI indicator: shown only when more than one `aoe` TUI is
@@ -4142,7 +4536,7 @@ mod tests {
     // by `preview::PreviewLayout`; its tests live alongside it in
     // `components/preview.rs`. The render-side regression is covered end to end
     // by `preview_visible_rows_equal_output_area_with_info_shown` in
-    // `home/tests.rs`, which renders a real frame and asserts
+    // `home/tests/keys_and_nav.rs`, which renders a real frame and asserts
     // `preview_visible_rows == preview_pane_area.height`.
 
     /// A preview worker gets the full shared tmux deadline plus grace before
@@ -4247,6 +4641,57 @@ mod tests {
         assert_eq!(
             passive_resize_step(&want, None, Some(&pending)),
             PassiveResizeStep::Arm,
+        );
+    }
+
+    #[test]
+    fn fleet_passive_step_dedups_per_session() {
+        let want = (120, 40);
+        let other = (100, 30);
+        let cases = [
+            // Fresh session: hand it to the worker.
+            (None, None, None, FleetPassiveStep::Queue),
+            // Pane already matches: leave it alone.
+            (Some(want), None, None, FleetPassiveStep::Skip),
+            // The worker declined this exact geometry (attached, owned, or
+            // missing): no retry until the fleet epoch changes.
+            (None, Some(want), None, FleetPassiveStep::Skip),
+            // Already handed to the worker: wait for its completion.
+            (None, None, Some(want), FleetPassiveStep::Skip),
+            // A decline for a different geometry does not block the new want.
+            (None, Some(other), None, FleetPassiveStep::Queue),
+            // A queued different geometry is superseded (the queue keeps only
+            // the latest intent per session).
+            (Some(other), None, Some(other), FleetPassiveStep::Queue),
+        ];
+        for (synced, declined, queued, expect) in cases {
+            assert_eq!(
+                fleet_passive_step(want, synced, declined, queued),
+                expect,
+                "synced={synced:?} declined={declined:?} queued={queued:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn passive_synced_contradiction_requires_a_fresher_mismatch() {
+        let adopted_at = Instant::now();
+        let synced = crate::tui::home::PassiveSynced {
+            cols: 141,
+            rows: 43,
+            window_rows: 44,
+            adopted_at,
+        };
+        let newer = adopted_at + Duration::from_millis(1);
+        let older = adopted_at - Duration::from_millis(1);
+        assert!(passive_synced_contradicted(&synced, (200, 50), newer));
+        assert!(
+            !passive_synced_contradicted(&synced, (141, 44), newer),
+            "an observation matching the applied window size is not a contradiction"
+        );
+        assert!(
+            !passive_synced_contradicted(&synced, (200, 50), older),
+            "a snapshot that may predate our own resize must not invalidate"
         );
     }
 

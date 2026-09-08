@@ -8,7 +8,7 @@ the common case, adding a setting is a single edit.
 ## The one-edit case
 
 Add the field to the relevant `#[derive(SettingsSection)]` struct (in
-`src/session/config.rs`, `src/sound/config.rs`, or `src/status_hooks.rs`) with a
+`src/session/config/mod.rs`, `src/sound/config.rs`, or `src/status_hooks.rs`) with a
 doc comment and a `#[setting(...)]` annotation:
 
 ```rust
@@ -33,13 +33,15 @@ crate) turns the annotated field into a `FieldDescriptor` in
   extend.
 - **`config.toml`** round-trips via `serde`.
 
-Run `cargo test` and `cargo build --features serve`; the field is live on all
+Run `cargo test` and `cargo build --features web`; the field is live on all
 surfaces.
 
 ## Choosing the section and widget
 
 The section is the struct's `#[setting_section(name = "...", category = "...")]`.
-`name` is the `[section]` table in `config.toml`; `category` is the TUI tab.
+`name` is the `[section]` table in `config.toml`; `category` is the TUI tab. An
+optional `repo_default = "allow" | "deny"` sets the repo-config policy every
+field in the section inherits.
 
 Pick a `widget` for the field's type:
 
@@ -60,14 +62,19 @@ Pick a `widget` for the field's type:
 `select`), `min` / `max` / `step`, `multiline` / `mono`, plus:
 
 - `validate`: server-authoritative value check (`range:MIN[:MAX]`, `nonempty`,
-  `memory_limit`, `volume_list`, `env_list`, `port_mapping_list`). Add a new
-  `ValidationKind` variant (`src/session/settings_schema/`) and a `validate=`
+  `memory_limit`, `volume_list`, `env_list`, `port_mapping_list`,
+  `capability_list`, `security_opt_list`, `network`). Add a new
+  `ValidationKind` variant (`src/session/config/settings_schema/`) and a `validate=`
   keyword (`aoe-settings-derive`) if none fits; that is what drives both the
   client UX validator and the server gate from one rule.
 - `web`: `elevation:<reason>` (passphrase step-up required to save from the
   web) or `local_only:<reason>` (host-execution surface the server rejects and
   the dashboard never renders, e.g. a binary path or command argv). Omit for a
   plain allow.
+- `repo`: `allow` or `deny`; whether a repo's `.agent-of-empires/config.toml`
+  may override the field. If absent, the field inherits the `repo_default` its
+  `#[setting_section(...)]` declares (`allow` unless stated; `session` declares
+  `deny`). Global-only fields are never repo-settable.
 - `category`: override the section's default TUI tab.
 - `advanced`: group the field under an "Advanced" fold on both surfaces.
 - `global_only`: shown but not profile-overridable (the dashboard adds an
@@ -144,7 +151,7 @@ fallback.
 ## Tests
 
 - The schema, server policy, and validators have unit tests under
-  `src/session/settings_schema/`.
+  `src/session/config/settings_schema/`.
 - A custom widget should have a TUI round-trip test
   (`src/tui/settings/fields.rs`) and a web contract test
   (`web/src/components/settings/__tests__/customWidgets.test.tsx`).

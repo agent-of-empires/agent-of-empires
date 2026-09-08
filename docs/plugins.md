@@ -37,13 +37,14 @@ survives every config save.
 
 | Plugin | What it does | Disabled behavior |
 |---|---|---|
-| `aoe.web` | The web dashboard management marker. Present whenever the dashboard is compiled in (`--features serve`), so every released binary ships it, enabled by default. | When disabled, `aoe serve` is an unrecognized subcommand (hidden from `aoe --help`); re-enable with `aoe plugin enable aoe.web`. `--stop` / `--status` / `--restart` still reach a running daemon. |
+| `aoe.web` | The web dashboard management marker. Present whenever the dashboard is compiled in (`--features web`), so every released binary ships it, enabled by default. | When disabled, `aoe serve` is an unrecognized subcommand (hidden from `aoe --help`); re-enable with `aoe plugin enable aoe.web`. `--stop` / `--status` / `--restart` still reach a running daemon. |
 
 `aoe.web` is the only bundled plugin today, and it rides along with the web
-dashboard. So a release binary (or any `cargo build --features serve`) shows it
-in `aoe plugin list`, while a TUI-only build (`cargo build`, no `serve`) has an
+dashboard. So a release binary (or any `cargo build --features web`) shows it
+in `aoe plugin list`, while a build without the dashboard (`cargo build`) has an
 empty registry and `aoe plugin list` reports no plugins. That is expected, not a
-bug.
+bug. The daemon itself is always compiled in, so `aoe serve` still runs there;
+it just serves the API with no dashboard behind it.
 
 The bundled set is deliberately minimal while the system is proven out. More
 first-party plugins land as each piece is verified.

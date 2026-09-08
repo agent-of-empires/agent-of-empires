@@ -37,9 +37,7 @@ pub enum ForkDenied {
 /// Process-wide default ACP registry, used only to answer "does this built-in
 /// tool have an ACP adapter?" for capability checks that have no
 /// profile-resolved config handy. Cached so the check doesn't rebuild the
-/// registry per call. Structured fork is a serve-only concept (the `acp`
-/// module is serve-gated), so this and `structured_fork_capable` are too.
-#[cfg(feature = "serve")]
+/// registry per call.
 fn builtin_acp_registry() -> &'static crate::acp::AgentRegistry {
     static REG: std::sync::OnceLock<crate::acp::AgentRegistry> = std::sync::OnceLock::new();
     REG.get_or_init(crate::acp::AgentRegistry::with_defaults)
@@ -63,7 +61,6 @@ fn builtin_acp_registry() -> &'static crate::acp::AgentRegistry {
 /// `aoe-agent` is ACP-capable but reads false because it is registry-only: it
 /// has no `AGENTS` entry, so `get_agent` returns `None`, the same path custom
 /// agents take.
-#[cfg(feature = "serve")]
 pub fn structured_fork_capable(tool: &str, agent_name: Option<&str>) -> bool {
     let resolved = agent_name.filter(|s| !s.is_empty()).unwrap_or(tool);
     builtin_acp_registry().get(resolved).is_some()

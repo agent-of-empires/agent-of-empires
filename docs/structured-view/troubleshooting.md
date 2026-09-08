@@ -47,10 +47,14 @@ non-standard location, set `AOE_ACP_NODE=/path/to/node` or configure
 
 ### `aoe acp doctor` says aoe-agent is missing
 
-`aoe-agent` is not packaged with the aoe binary yet (#3553). The default
-structured-view agent is `claude-code`; leave `acp.default_agent` on an adapter
-that `aoe acp doctor` reports as installed, or build `acp-worker/aoe-agent`
-yourself and point the registry command at it.
+`aoe-agent` ships inside the `aoe` binary as sources and is installed into the
+data dir on demand, like the npm adapters: run
+`aoe acp doctor --fix --adapter aoe-agent`. It needs Node 22.6 or newer (the
+other adapters accept any 22). Until it is installed, sessions that pick it
+fail to start with an install hint and `aoe acp agents` reports it as missing
+rather than present (#3553). An aoe upgrade that changes the bundled sources
+makes the installed copy stale; sessions refuse it with the same hint until
+`doctor --fix` reinstalls it.
 
 ### `aoe acp doctor` says claude-code adapter is missing
 
@@ -182,12 +186,25 @@ rate_limit_auto_resume = true
 ```
 
 The setting is editable in the structured view settings (TUI and web
-dashboard) and can be overridden per profile. Resume fires once the reported
+dashboard) and can be overridden per profile. The park survives a resume
+that fails to start: the sidebar badge and the banner stay until the worker
+is back or the session is stopped for another reason. Resume fires once the reported
 reset time plus a fixed 15-second cushion passes, and the reset time survives
 an `aoe serve` restart. With no reported reset time, resume retries an hour
-after the park; if the limit has not cleared the session re-parks and the next
-retry is another hour out. The manual "Continue in another agent" and reconnect paths
-stay available regardless of the setting.
+after the park, and each further attempt waits twice as long as the last: 1h,
+2h, 4h, 8h, 16h. A quota that is exhausted for days is then retried on a
+schedule that matches it, instead of once an hour forever.
+
+Auto-resume re-sends the interrupted prompt each time, so it stops after five
+re-sends that all come back rate-limited. Those five span 31 hours, so a limit
+that clears overnight is still picked up. The banner then reads "Auto-resume
+stopped: the same prompt was re-sent too many times without getting through",
+and the session stays put rather than burning the same turn indefinitely. The park itself resets the count, so recovering from it starts a
+fresh five whether you use "Resume now" or send a new prompt. A completed turn
+and an agent switch reset it too, and "Resume now" retries never count against
+it. A prompt sent before auto-resume gives up does not reset anything: it
+continues on whatever is left of the five. The manual "Continue in another
+agent" and reconnect paths stay available regardless of the setting.
 
 ### Switching agents manually
 

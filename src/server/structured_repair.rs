@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use super::state::AppState;
 
-#[cfg(feature = "serve")]
 pub(super) struct StructuredRowRepair {
     session_id: String,
     source_profile: String,
@@ -15,11 +14,9 @@ pub(super) struct StructuredRowRepair {
     acp_session_id: String,
 }
 
-#[cfg(feature = "serve")]
 pub(super) type LiveStructuredWorkerRecord =
     (crate::process::worker_registry::WorkerRecord, String);
 
-#[cfg(feature = "serve")]
 pub(super) fn live_structured_worker_records() -> Vec<LiveStructuredWorkerRecord> {
     use crate::process::worker_registry::{self, is_record_live};
 
@@ -50,7 +47,6 @@ pub(super) fn live_structured_worker_records() -> Vec<LiveStructuredWorkerRecord
 
 /// Runs before the ACP overlay so freshly repaired rows pass the
 /// `is_structured()` gate and keep their live worker status.
-#[cfg(feature = "serve")]
 pub(super) fn repair_structured_rows_from_live_workers(
     merged: &mut [Instance],
     records: Vec<LiveStructuredWorkerRecord>,
@@ -87,6 +83,7 @@ pub(super) fn repair_structured_rows_from_live_workers(
             inst.agent_model = record.model.clone();
         }
         inst.acp_session_id = Some(acp_session_id.clone());
+        inst.acp_load_session_capable = None;
         tracing::warn!(
             target: "server.file_watch",
             session = %inst.id,
@@ -104,10 +101,10 @@ pub(super) fn repair_structured_rows_from_live_workers(
     repairs
 }
 
-#[cfg(feature = "serve")]
 pub(super) fn persist_structured_row_repairs(
     state: &Arc<AppState>,
     repairs: Vec<StructuredRowRepair>,
+    repair_guards: Vec<tokio::sync::OwnedMutexGuard<()>>,
 ) {
     if repairs.is_empty() {
         return;
@@ -119,6 +116,9 @@ pub(super) fn persist_structured_row_repairs(
         "server.reload.persist_repairs",
         crate::task_util::PanicPolicy::Log,
         async move {
+            // Keep view transitions behind the repair until its durable write
+            // (or rollback) finishes; otherwise a queued repair can undo disable.
+            let _repair_guards = repair_guards;
             let mut by_profile: std::collections::HashMap<String, Vec<StructuredRowRepair>> =
                 std::collections::HashMap::new();
             for repair in repairs {
@@ -181,7 +181,6 @@ pub(super) fn persist_structured_row_repairs(
     );
 }
 
-#[cfg(feature = "serve")]
 pub(super) async fn rollback_structured_row_repairs(state: &Arc<AppState>, failed_ids: &[String]) {
     let mut instances = state.instances.write().await;
     for inst in instances.iter_mut() {
@@ -196,7 +195,6 @@ pub(super) async fn rollback_structured_row_repairs(state: &Arc<AppState>, faile
 mod tests {
     use super::*;
 
-    #[cfg(feature = "serve")]
     #[test]
     #[serial_test::serial]
     fn repair_structured_rows_from_live_workers_restores_structured_session_rows() {
@@ -210,7 +208,7 @@ mod tests {
         let socket_path = crate::process::worker_registry::workers_dir()
             .expect("workers dir")
             .join("repair-live.sock");
-        std::fs::write(&socket_path, b"").expect("socket sentinel");
+        crate::process::worker_registry::touch_live_socket(&socket_path);
         let live_record = crate::process::worker_registry::WorkerRecord::new(
             "repair-live".to_string(),
             std::process::id(),
@@ -229,7 +227,7 @@ mod tests {
         let existing_socket_path = crate::process::worker_registry::workers_dir()
             .expect("workers dir")
             .join("repair-existing.sock");
-        std::fs::write(&existing_socket_path, b"").expect("socket sentinel");
+        crate::process::worker_registry::touch_live_socket(&existing_socket_path);
         let existing_record = crate::process::worker_registry::WorkerRecord::new(
             "repair-existing".to_string(),
             std::process::id(),
@@ -249,7 +247,7 @@ mod tests {
         let stale_socket_path = crate::process::worker_registry::workers_dir()
             .expect("workers dir")
             .join("repair-no-id.sock");
-        std::fs::write(&stale_socket_path, b"").expect("socket sentinel");
+        crate::process::worker_registry::touch_live_socket(&stale_socket_path);
         let no_id_record = crate::process::worker_registry::WorkerRecord::new(
             "repair-no-id".to_string(),
             std::process::id(),
@@ -268,7 +266,7 @@ mod tests {
         let empty_socket_path = crate::process::worker_registry::workers_dir()
             .expect("workers dir")
             .join("repair-empty-id.sock");
-        std::fs::write(&empty_socket_path, b"").expect("socket sentinel");
+        crate::process::worker_registry::touch_live_socket(&empty_socket_path);
         let empty_id_record = crate::process::worker_registry::WorkerRecord::new(
             "repair-empty-id".to_string(),
             std::process::id(),
@@ -292,6 +290,7 @@ mod tests {
             Instance::new("repair-empty-id", "/tmp/repo"),
         ];
         rows[0].id = "repair-live".to_string();
+        rows[0].acp_load_session_capable = Some(true);
         rows[1].id = "repair-existing".to_string();
         rows[1].agent_name = Some("custom-agent".to_string());
         rows[1].agent_model = Some("custom-model".to_string());
@@ -308,6 +307,7 @@ mod tests {
         assert_eq!(rows[0].agent_name.as_deref(), Some("codex"));
         assert_eq!(rows[0].agent_model.as_deref(), Some("gpt-5"));
         assert_eq!(rows[0].acp_session_id.as_deref(), Some("acp-session-1"));
+        assert_eq!(rows[0].acp_load_session_capable, None);
         assert_eq!(rows[1].view, crate::session::View::Structured);
         assert_eq!(rows[1].agent_name.as_deref(), Some("custom-agent"));
         assert_eq!(rows[1].agent_model.as_deref(), Some("custom-model"));

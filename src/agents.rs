@@ -54,6 +54,7 @@ pub enum YoloMode {
 }
 
 /// How an agent resumes an existing session from the CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResumeStrategy {
     /// Append a flag (e.g. `--session <id>`). For agents where new and existing
     /// sessions use the same flag.
@@ -69,8 +70,46 @@ pub enum ResumeStrategy {
     /// The subcommand + id are inserted right after the binary name so that
     /// other flags land after it.
     Subcommand(&'static str),
-    /// AoE must not emit resume arguments for this agent.
+}
+
+/// Backend that proves which native conversation belongs to one AoE instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionCaptureBackend {
+    Claude,
+    OpenCode,
+    Codex,
+    Gemini,
+    HookSidecar,
+    Pi,
+    Hermes,
+    Kimi,
+    Omp,
+    PrimeAgent,
+}
+
+/// Authority available in one launch environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionCaptureContext {
+    /// AoE must not discover a native identity in this environment.
     Unsupported,
+    PaneScoped,
+    Preassigned,
+    ManagedExclusiveStore,
+}
+
+/// Capture routing and environment support paired with resume argv.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionCaptureSpec {
+    pub backend: SessionCaptureBackend,
+    pub host: SessionCaptureContext,
+    pub sandbox: SessionCaptureContext,
+}
+
+/// Complete native-session contract. Absence means fail-closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionSupport {
+    pub resume: ResumeStrategy,
+    pub capture: Option<SessionCaptureSpec>,
 }
 
 /// How an agent forks an existing session from the CLI: resume the parent's
@@ -160,6 +199,13 @@ impl std::fmt::Display for AgentLifecycle {
     }
 }
 
+/// Hook payload field that names the pane's native conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum HookIdentityField {
+    SessionId,
+    ConversationIdOrSessionId,
+}
+
 /// A single hook event that AoE registers in an agent's settings file.
 #[derive(Debug)]
 pub struct HookEvent {
@@ -169,10 +215,8 @@ pub struct HookEvent {
     pub matcher: Option<&'static str>,
     /// AoE status to write when this event fires.
     pub status: Option<HookStatus>,
-    /// When `true`, install an additional hook command that extracts
-    /// `session_id` from the agent's stdin JSON payload and writes it to
-    /// `/tmp/aoe-hooks-<euid>/<AOE_INSTANCE_ID>/session_id`.
-    pub session_id_capture: bool,
+    /// Native identity field to extract into the per-instance sidecar.
+    pub identity_field: Option<HookIdentityField>,
     /// Tool names whose invocation blocks on the user for the tool's entire
     /// execution (e.g. Claude's `AskUserQuestion` selection UI). When
     /// non-empty on a status event, the generated hook command inspects the
@@ -188,7 +232,7 @@ pub struct ResolvedHookEvent {
     pub name: String,
     pub matcher: Option<String>,
     pub status: Option<HookStatus>,
-    pub session_id_capture: bool,
+    pub identity_field: Option<HookIdentityField>,
     pub waiting_tools: Vec<String>,
 }
 
@@ -198,6 +242,7 @@ pub struct ResolvedHookEvent {
 pub struct SidecarHookEvent {
     pub name: &'static str,
     pub status: HookStatus,
+    pub identity_field: Option<HookIdentityField>,
 }
 
 /// On-disk format an agent uses for its status-detection hooks. Each variant
@@ -375,8 +420,8 @@ pub struct AgentDef {
     /// `hook_config` path cannot emit (settl/hermes/kiro). Mutually exclusive
     /// with `hook_config`.
     pub sidecar_hooks: Option<SidecarHooks>,
-    /// How this agent resumes a prior session.
-    pub resume_strategy: ResumeStrategy,
+    /// Complete invocation and capture contract, or none when unsupported.
+    pub session_support: Option<SessionSupport>,
     /// How this agent forks a prior session into a new, independent one.
     pub fork_strategy: ForkStrategy,
     /// If true, this agent can only run on the host (no sandbox/worktree support).
@@ -440,12 +485,10 @@ pub struct PermissionResponse {
     pub deny: &'static [KeyToken],
 }
 
-/// Claude Code hook events. `SessionStart` and `UserPromptSubmit` carry
-/// `session_id_capture: true` so the per-instance sidecar
-/// (`/tmp/aoe-hooks-<euid>/<id>/session_id`) is updated whenever Claude rotates
-/// its session UUID (`/clear`, `/new`, `--fork-session`, resume, compact).
-/// `claude_poll_fn` reads this sidecar before falling back to its disk
-/// scan.
+/// Claude Code `SessionStart` and `UserPromptSubmit` hooks publish the
+/// top-level `session_id` into the instance-keyed sidecar whenever Claude
+/// rotates conversations (`/clear`, `/new`, fork, resume, compact).
+/// This pane-scoped sidecar is the sole automatic identity source.
 ///
 /// `idle` has two sources, not just `Stop`. `Stop` does not fire on every
 /// turn-end path: a turn killed by an API error fires `StopFailure` instead,
@@ -490,147 +533,116 @@ const CLAUDE_HOOK_EVENTS: &[HookEvent] = &[
         name: "SessionStart",
         matcher: None,
         status: None,
-        session_id_capture: true,
+        identity_field: Some(HookIdentityField::SessionId),
         waiting_tools: &[],
     },
     HookEvent {
         name: "PreToolUse",
         matcher: None,
         status: Some(HookStatus::Running),
-        session_id_capture: false,
+        identity_field: None,
         waiting_tools: &["AskUserQuestion"],
     },
     HookEvent {
         name: "PostToolUse",
         matcher: Some("AskUserQuestion"),
         status: Some(HookStatus::Running),
-        session_id_capture: false,
+        identity_field: None,
         waiting_tools: &[],
     },
     HookEvent {
         name: "UserPromptSubmit",
         matcher: None,
         status: Some(HookStatus::Running),
-        session_id_capture: true,
+        identity_field: Some(HookIdentityField::SessionId),
         waiting_tools: &[],
     },
     HookEvent {
         name: "Stop",
         matcher: None,
         status: Some(HookStatus::Idle),
-        session_id_capture: false,
+        identity_field: None,
         waiting_tools: &[],
     },
     HookEvent {
         name: "StopFailure",
         matcher: None,
         status: Some(HookStatus::Idle),
-        session_id_capture: false,
+        identity_field: None,
         waiting_tools: &[],
     },
     HookEvent {
         name: "Notification",
         matcher: Some("permission_prompt|elicitation_dialog|agent_needs_input"),
         status: Some(HookStatus::Waiting),
-        session_id_capture: false,
+        identity_field: None,
         waiting_tools: &[],
     },
     HookEvent {
         name: "Notification",
         matcher: Some("idle_prompt|agent_completed"),
         status: Some(HookStatus::Idle),
-        session_id_capture: false,
+        identity_field: None,
         waiting_tools: &[],
     },
     HookEvent {
         name: "ElicitationResult",
         matcher: None,
         status: Some(HookStatus::Running),
-        session_id_capture: false,
+        identity_field: None,
         waiting_tools: &[],
     },
 ];
-
-/// Cursor CLI hook events. No `session_id_capture`: Cursor's session id is
-/// not consumed by AoE pollers, and Cursor's hook payload uses a different
-/// schema, so installing the capture command would do useless work on every
-/// `UserPromptSubmit`.
-const CURSOR_HOOK_EVENTS: &[HookEvent] = &[
-    HookEvent {
-        name: "PreToolUse",
-        matcher: None,
-        status: Some(HookStatus::Running),
-        session_id_capture: false,
-        waiting_tools: &[],
+/// Cursor's native beforeSubmitPrompt hook publishes the stable conversation_id.
+/// generation_id is turn-scoped and must never be used as resume identity.
+const CURSOR_HOOK_EVENTS: &[SidecarHookEvent] = &[
+    SidecarHookEvent {
+        name: "beforeSubmitPrompt",
+        status: HookStatus::Running,
+        identity_field: Some(HookIdentityField::ConversationIdOrSessionId),
     },
-    HookEvent {
-        name: "UserPromptSubmit",
-        matcher: None,
-        status: Some(HookStatus::Running),
-        session_id_capture: false,
-        waiting_tools: &[],
-    },
-    HookEvent {
-        name: "Stop",
-        matcher: None,
-        status: Some(HookStatus::Idle),
-        session_id_capture: false,
-        waiting_tools: &[],
-    },
-    HookEvent {
-        name: "Notification",
-        matcher: Some("permission_prompt|elicitation_dialog"),
-        status: Some(HookStatus::Waiting),
-        session_id_capture: false,
-        waiting_tools: &[],
-    },
-    HookEvent {
-        name: "ElicitationResult",
-        matcher: None,
-        status: Some(HookStatus::Running),
-        session_id_capture: false,
-        waiting_tools: &[],
+    SidecarHookEvent {
+        name: "stop",
+        status: HookStatus::Idle,
+        identity_field: None,
     },
 ];
-
-/// Qwen Code uses the same Claude-style event schema and `permission_prompt`/
-/// `elicitation_dialog` notification types, but does not emit `ElicitationResult`.
-/// `PostToolUse` is used instead to clear the waiting state after the user
-/// approves a permission prompt and the tool runs to completion.
+/// Qwen Code uses the Claude-style event schema. PostToolUse clears waiting
+/// after a permission prompt is approved and the tool completes.
 const QWEN_HOOK_EVENTS: &[HookEvent] = &[
     HookEvent {
         name: "PreToolUse",
         matcher: None,
         status: Some(HookStatus::Running),
-        session_id_capture: false,
+        identity_field: None,
         waiting_tools: &[],
     },
     HookEvent {
         name: "UserPromptSubmit",
         matcher: None,
         status: Some(HookStatus::Running),
-        session_id_capture: false,
+        identity_field: None,
         waiting_tools: &[],
     },
     HookEvent {
         name: "PostToolUse",
         matcher: None,
         status: Some(HookStatus::Running),
-        session_id_capture: false,
+        identity_field: None,
         waiting_tools: &[],
     },
     HookEvent {
         name: "Stop",
         matcher: None,
         status: Some(HookStatus::Idle),
-        session_id_capture: false,
+        identity_field: None,
         waiting_tools: &[],
     },
     HookEvent {
         name: "Notification",
         matcher: Some("permission_prompt|elicitation_dialog"),
         status: Some(HookStatus::Waiting),
-        session_id_capture: false,
+        identity_field: None,
         waiting_tools: &[],
     },
 ];
@@ -641,42 +653,42 @@ const CODEX_HOOK_EVENTS: &[HookEvent] = &[
         name: "SessionStart",
         matcher: None,
         status: Some(HookStatus::Idle),
-        session_id_capture: false,
+        identity_field: None,
         waiting_tools: &[],
     },
     HookEvent {
         name: "UserPromptSubmit",
         matcher: None,
         status: Some(HookStatus::Running),
-        session_id_capture: false,
+        identity_field: None,
         waiting_tools: &[],
     },
     HookEvent {
         name: "PreToolUse",
         matcher: None,
         status: Some(HookStatus::Running),
-        session_id_capture: false,
+        identity_field: None,
         waiting_tools: &[],
     },
     HookEvent {
         name: "PermissionRequest",
         matcher: None,
         status: Some(HookStatus::Waiting),
-        session_id_capture: false,
+        identity_field: None,
         waiting_tools: &[],
     },
     HookEvent {
         name: "PostToolUse",
         matcher: None,
         status: Some(HookStatus::Running),
-        session_id_capture: false,
+        identity_field: None,
         waiting_tools: &[],
     },
     HookEvent {
         name: "Stop",
         matcher: None,
         status: Some(HookStatus::Idle),
-        session_id_capture: false,
+        identity_field: None,
         waiting_tools: &[],
     },
 ];
@@ -685,14 +697,17 @@ pub(crate) const SETTL_SIDECAR_EVENTS: &[SidecarHookEvent] = &[
     SidecarHookEvent {
         name: "TurnStarted",
         status: HookStatus::Running,
+        identity_field: None,
     },
     SidecarHookEvent {
         name: "WaitingForHuman",
         status: HookStatus::Waiting,
+        identity_field: None,
     },
     SidecarHookEvent {
         name: "GameWon",
         status: HookStatus::Idle,
+        identity_field: None,
     },
 ];
 
@@ -700,26 +715,32 @@ pub(crate) const HERMES_SIDECAR_EVENTS: &[SidecarHookEvent] = &[
     SidecarHookEvent {
         name: "pre_llm_call",
         status: HookStatus::Running,
+        identity_field: None,
     },
     SidecarHookEvent {
         name: "pre_tool_call",
         status: HookStatus::Running,
+        identity_field: None,
     },
     SidecarHookEvent {
         name: "post_llm_call",
         status: HookStatus::Idle,
+        identity_field: None,
     },
     SidecarHookEvent {
         name: "pre_approval_request",
         status: HookStatus::Waiting,
+        identity_field: None,
     },
     SidecarHookEvent {
         name: "post_approval_response",
         status: HookStatus::Running,
+        identity_field: None,
     },
     SidecarHookEvent {
         name: "on_session_end",
         status: HookStatus::Idle,
+        identity_field: None,
     },
 ];
 
@@ -727,14 +748,17 @@ pub(crate) const KIRO_SIDECAR_EVENTS: &[SidecarHookEvent] = &[
     SidecarHookEvent {
         name: "preToolUse",
         status: HookStatus::Running,
+        identity_field: None,
     },
     SidecarHookEvent {
         name: "userPromptSubmit",
         status: HookStatus::Running,
+        identity_field: None,
     },
     SidecarHookEvent {
         name: "stop",
         status: HookStatus::Idle,
+        identity_field: None,
     },
 ];
 
@@ -747,28 +771,57 @@ pub(crate) const KIMI_SIDECAR_EVENTS: &[SidecarHookEvent] = &[
     SidecarHookEvent {
         name: "UserPromptSubmit",
         status: HookStatus::Running,
+        identity_field: None,
     },
     SidecarHookEvent {
         name: "PreToolUse",
         status: HookStatus::Running,
+        identity_field: None,
     },
     SidecarHookEvent {
         name: "PermissionRequest",
         status: HookStatus::Waiting,
+        identity_field: None,
     },
     SidecarHookEvent {
         name: "PermissionResult",
         status: HookStatus::Running,
+        identity_field: None,
     },
     SidecarHookEvent {
         name: "Stop",
         status: HookStatus::Idle,
+        identity_field: None,
     },
     SidecarHookEvent {
         name: "StopFailure",
         status: HookStatus::Idle,
+        identity_field: None,
     },
 ];
+
+const fn session_support(
+    resume: ResumeStrategy,
+    backend: SessionCaptureBackend,
+    host: SessionCaptureContext,
+    sandbox: SessionCaptureContext,
+) -> Option<SessionSupport> {
+    Some(SessionSupport {
+        resume,
+        capture: Some(SessionCaptureSpec {
+            backend,
+            host,
+            sandbox,
+        }),
+    })
+}
+
+const fn resume_only(resume: ResumeStrategy) -> Option<SessionSupport> {
+    Some(SessionSupport {
+        resume,
+        capture: None,
+    })
+}
 
 pub const AGENTS: &[AgentDef] = &[
     AgentDef {
@@ -790,10 +843,15 @@ pub const AGENTS: &[AgentDef] = &[
             format: HookFormat::JsonSettings,
         }),
         sidecar_hooks: None,
-        resume_strategy: ResumeStrategy::FlagPair {
+        session_support: session_support(
+            ResumeStrategy::FlagPair {
             existing: "--resume",
             new_session: "--session-id",
-        },
+            },
+            SessionCaptureBackend::Claude,
+            SessionCaptureContext::PaneScoped,
+            SessionCaptureContext::PaneScoped,
+        ),
         fork_strategy: ForkStrategy::ClaudeFork,
         host_only: false,
         // Claude Code has paste-burst suppression like Codex. Its input handler
@@ -827,7 +885,12 @@ pub const AGENTS: &[AgentDef] = &[
         container_env: &[],
         hook_config: None,
         sidecar_hooks: None,
-        resume_strategy: ResumeStrategy::Flag("--session"),
+        session_support: session_support(
+            ResumeStrategy::Flag("--session"),
+            SessionCaptureBackend::OpenCode,
+            SessionCaptureContext::Preassigned,
+            SessionCaptureContext::Unsupported,
+        ),
         fork_strategy: ForkStrategy::Flag("--fork"),
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -866,7 +929,7 @@ pub const AGENTS: &[AgentDef] = &[
         container_env: &[],
         hook_config: None,
         sidecar_hooks: None,
-        resume_strategy: ResumeStrategy::Flag("--resume"),
+        session_support: resume_only(ResumeStrategy::Flag("--resume")),
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -898,7 +961,12 @@ pub const AGENTS: &[AgentDef] = &[
             format: HookFormat::CodexJson,
         }),
         sidecar_hooks: None,
-        resume_strategy: ResumeStrategy::Subcommand("resume"),
+        session_support: session_support(
+            ResumeStrategy::Subcommand("resume"),
+            SessionCaptureBackend::Codex,
+            SessionCaptureContext::Unsupported,
+            SessionCaptureContext::ManagedExclusiveStore,
+        ),
         fork_strategy: ForkStrategy::CodexFork,
         host_only: false,
         // Codex has paste-burst detection with a 120ms Enter-suppression window;
@@ -934,35 +1002,40 @@ pub const AGENTS: &[AgentDef] = &[
                     name: "BeforeTool",
                     matcher: None,
                     status: Some(HookStatus::Running),
-                    session_id_capture: false,
+                    identity_field: None,
                     waiting_tools: &[],
                 },
                 HookEvent {
                     name: "BeforeAgent",
                     matcher: None,
                     status: Some(HookStatus::Running),
-                    session_id_capture: false,
+                    identity_field: None,
                     waiting_tools: &[],
                 },
                 HookEvent {
                     name: "AfterAgent",
                     matcher: None,
                     status: Some(HookStatus::Idle),
-                    session_id_capture: false,
+                    identity_field: None,
                     waiting_tools: &[],
                 },
                 HookEvent {
                     name: "Notification",
                     matcher: Some("ToolPermission"),
                     status: Some(HookStatus::Waiting),
-                    session_id_capture: false,
+                    identity_field: None,
                     waiting_tools: &[],
                 },
             ],
             format: HookFormat::JsonSettings,
         }),
         sidecar_hooks: None,
-        resume_strategy: ResumeStrategy::Flag("--resume"),
+        session_support: session_support(
+            ResumeStrategy::Flag("--resume"),
+            SessionCaptureBackend::Gemini,
+            SessionCaptureContext::Unsupported,
+            SessionCaptureContext::ManagedExclusiveStore,
+        ),
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -987,14 +1060,23 @@ pub const AGENTS: &[AgentDef] = &[
         set_default_command: false,
         detect_status: status_detection::detect_cursor_status,
         container_env: &[("CURSOR_CONFIG_DIR", "/root/.cursor")],
-        hook_config: Some(AgentHookConfig {
-            settings_rel_path: ".cursor/settings.json",
-            config_dir_env_var: Some("CURSOR_CONFIG_DIR"),
+        hook_config: None,
+        sidecar_hooks: Some(SidecarHooks {
+            host_config_subpath: ".cursor/hooks.json",
+            sandbox_config_subpath: ".cursor/sandbox/hooks.json",
+            install: crate::hooks::install_cursor_hooks_with_events,
+            uninstall: crate::hooks::uninstall_cursor_hooks,
+            post_install_host: None,
+            selected_agent_hooks: None,
+            format: SidecarFormat::KiroJson,
             events: CURSOR_HOOK_EVENTS,
-            format: HookFormat::JsonSettings,
         }),
-        sidecar_hooks: None,
-        resume_strategy: ResumeStrategy::Unsupported,
+        session_support: session_support(
+            ResumeStrategy::Flag("--resume"),
+            SessionCaptureBackend::HookSidecar,
+            SessionCaptureContext::PaneScoped,
+            SessionCaptureContext::PaneScoped,
+        ),
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -1017,13 +1099,9 @@ pub const AGENTS: &[AgentDef] = &[
         container_env: &[("COPILOT_CONFIG_DIR", "/root/.copilot")],
         hook_config: None,
         sidecar_hooks: None,
-        // Copilot records its live session id (a UUID) in the `sessions` table
-        // of `~/.copilot/session-store.db`; the poller captures it and resumes
-        // with `copilot --session-id <id>`. `--session-id` takes a required
-        // value, so the space-separated form `build_resume_flags` emits parses
-        // unambiguously; `--resume[=<id>]` takes an optional value and would
-        // read a space-separated id as a positional prompt instead.
-        resume_strategy: ResumeStrategy::Flag("--session-id"),
+        // Copilot exposes native resume argv but no verified pane-to-row
+        // ownership source for automatic capture.
+        session_support: resume_only(ResumeStrategy::Flag("--session-id")),
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -1051,10 +1129,15 @@ pub const AGENTS: &[AgentDef] = &[
         // id; `--session` (every pi version) only resumes one already on
         // file, and is what an unpinnable binary falls back to. See
         // `pi_supports_session_id_flag`.
-        resume_strategy: ResumeStrategy::FlagPair {
+        session_support: session_support(
+            ResumeStrategy::FlagPair {
             existing: "--session",
             new_session: "--session-id",
-        },
+            },
+            SessionCaptureBackend::Pi,
+            SessionCaptureContext::PaneScoped,
+            SessionCaptureContext::PaneScoped,
+        ),
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -1077,7 +1160,7 @@ pub const AGENTS: &[AgentDef] = &[
         container_env: &[],
         hook_config: None,
         sidecar_hooks: None,
-        resume_strategy: ResumeStrategy::Unsupported,
+        session_support: None,
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -1112,7 +1195,7 @@ pub const AGENTS: &[AgentDef] = &[
             format: SidecarFormat::SettlToml,
             events: SETTL_SIDECAR_EVENTS,
         }),
-        resume_strategy: ResumeStrategy::Unsupported,
+        session_support: None,
         fork_strategy: ForkStrategy::Unsupported,
         host_only: true,
         send_keys_enter_delay_ms: 0,
@@ -1153,7 +1236,12 @@ pub const AGENTS: &[AgentDef] = &[
             format: SidecarFormat::HermesYaml,
             events: HERMES_SIDECAR_EVENTS,
         }),
-        resume_strategy: ResumeStrategy::Flag("--resume"),
+        session_support: session_support(
+            ResumeStrategy::Flag("--resume"),
+            SessionCaptureBackend::Hermes,
+            SessionCaptureContext::Unsupported,
+            SessionCaptureContext::ManagedExclusiveStore,
+        ),
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -1202,7 +1290,8 @@ pub const AGENTS: &[AgentDef] = &[
             format: SidecarFormat::KiroJson,
             events: KIRO_SIDECAR_EVENTS,
         }),
-        resume_strategy: ResumeStrategy::Unsupported,
+        // Kiro's native identity payload shape is not verified.
+        session_support: None,
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -1230,7 +1319,8 @@ pub const AGENTS: &[AgentDef] = &[
             format: HookFormat::JsonSettings,
         }),
         sidecar_hooks: None,
-        resume_strategy: ResumeStrategy::Unsupported,
+        // Qwen's native identity payload shape is not verified.
+        session_support: None,
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -1253,7 +1343,7 @@ pub const AGENTS: &[AgentDef] = &[
         container_env: &[],
         hook_config: None,
         sidecar_hooks: None,
-        resume_strategy: ResumeStrategy::Unsupported,
+        session_support: None,
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -1290,11 +1380,15 @@ pub const AGENTS: &[AgentDef] = &[
             format: SidecarFormat::KimiToml,
             events: KIMI_SIDECAR_EVENTS,
         }),
-        // `kimi --session <id>` resumes a prior conversation. On the host the id
-        // is captured from `~/.kimi-code/session_index.jsonl` (see
-        // `capture_kimi_session_id`); sandboxed sessions have no capture yet and
-        // start fresh on restart, mirroring Copilot.
-        resume_strategy: ResumeStrategy::Flag("--session"),
+        // Kimi resume is enabled only in a sandbox whose exact mounted store,
+        // container cwd, launch floor, and ownership lease are all controlled.
+        // Host store capture is unsupported.
+        session_support: session_support(
+            ResumeStrategy::Flag("--session"),
+            SessionCaptureBackend::Kimi,
+            SessionCaptureContext::Unsupported,
+            SessionCaptureContext::ManagedExclusiveStore,
+        ),
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -1317,7 +1411,12 @@ pub const AGENTS: &[AgentDef] = &[
         container_env: &[("PI_CODING_AGENT_DIR", "/root/.omp/agent")],
         hook_config: None,
         sidecar_hooks: None,
-        resume_strategy: ResumeStrategy::Flag("--resume"),
+        session_support: session_support(
+            ResumeStrategy::Flag("--resume"),
+            SessionCaptureBackend::Omp,
+            SessionCaptureContext::PaneScoped,
+            SessionCaptureContext::PaneScoped,
+        ),
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -1352,7 +1451,12 @@ pub const AGENTS: &[AgentDef] = &[
         // stays on the stub below.
         hook_config: None,
         sidecar_hooks: None,
-        resume_strategy: ResumeStrategy::Flag("--resume"),
+        session_support: session_support(
+            ResumeStrategy::Flag("--resume"),
+            SessionCaptureBackend::PrimeAgent,
+            SessionCaptureContext::Unsupported,
+            SessionCaptureContext::ManagedExclusiveStore,
+        ),
         // Upstream `--fork <path|id>` requires the parent id as its value,
         // but build_fork_flags' Flag arm appends the fork flag bare after
         // `<resume> <parent_id>`, which prime-agent's parser silently drops
@@ -1554,8 +1658,7 @@ pub fn get_agent(name: &str) -> Option<&'static AgentDef> {
 /// Registry lifecycle state for an ACP-registry key. Falls back to Active
 /// for registry entries with no `AGENTS` counterpart (bundled or alias-only
 /// keys). Shared by the doctor, `/api/acp/agents`, and `aoe acp agents`
-/// surfaces; every consumer is serve-gated, so the helper is too.
-#[cfg(feature = "serve")]
+/// surfaces.
 pub(crate) fn registry_lifecycle(name: &str) -> AgentLifecycle {
     get_agent(name)
         .map(|def| def.lifecycle)
@@ -1658,11 +1761,27 @@ fn append_configured_status_events(
                 name: name.clone(),
                 matcher: None,
                 status: Some(*status),
-                session_id_capture: false,
+                identity_field: None,
                 waiting_tools: Vec::new(),
             });
         }
     }
+}
+
+pub(crate) fn hook_install_required(agent: &AgentDef, status_hooks_enabled: bool) -> bool {
+    (status_hooks_enabled && (agent.hook_config.is_some() || agent.sidecar_hooks.is_some()))
+        || agent.hook_config.as_ref().is_some_and(|hooks| {
+            hooks
+                .events
+                .iter()
+                .any(|event| event.identity_field.is_some())
+        })
+        || agent.sidecar_hooks.as_ref().is_some_and(|hooks| {
+            hooks
+                .events
+                .iter()
+                .any(|event| event.identity_field.is_some())
+        })
 }
 
 pub fn resolved_hook_events(
@@ -1682,7 +1801,7 @@ pub fn resolved_hook_events(
             status: overrides
                 .and_then(|map| map.get(event.name).copied())
                 .or(event.status),
-            session_id_capture: event.session_id_capture,
+            identity_field: event.identity_field,
             waiting_tools: event.waiting_tools.iter().map(|t| t.to_string()).collect(),
         })
         .collect();
@@ -1709,7 +1828,7 @@ pub fn resolved_sidecar_hook_events(
                     .and_then(|map| map.get(event.name).copied())
                     .unwrap_or(event.status),
             ),
-            session_id_capture: false,
+            identity_field: event.identity_field,
             waiting_tools: Vec::new(),
         })
         .collect();
@@ -2215,8 +2334,8 @@ mod tests {
             Some(YoloMode::CliFlag("--auto-approve"))
         ));
         assert!(matches!(
-            &omp.resume_strategy,
-            ResumeStrategy::Flag("--resume")
+            omp.session_support.as_ref().map(|support| support.resume),
+            Some(ResumeStrategy::Flag("--resume"))
         ));
         assert_eq!(omp.oneshot_flag, Some("-p"));
         assert_eq!(omp.oneshot_model_flag(), Some("--model"));
@@ -2305,7 +2424,7 @@ mod tests {
             .expect("custom event should be appended");
         assert_eq!(custom.status, Some(HookStatus::Running));
         assert!(custom.matcher.is_none());
-        assert!(!custom.session_id_capture);
+        assert!(custom.identity_field.is_none());
     }
 
     #[test]
@@ -2331,12 +2450,12 @@ mod tests {
             DetectionMethod::Which("copilot")
         ));
         assert!(matches!(&copilot.yolo, Some(YoloMode::CliFlag("--yolo"))));
-        // Copilot resumes a prior conversation with `copilot --session-id <id>`,
-        // where the id is captured from `~/.copilot/session-store.db`.
+        let support = copilot.session_support.as_ref().unwrap();
         assert!(matches!(
-            &copilot.resume_strategy,
+            support.resume,
             ResumeStrategy::Flag("--session-id")
         ));
+        assert!(support.capture.is_none());
         // One-shot title generation runs `copilot -p <prompt> -s
         // --allow-all-tools --no-ask-user`.
         assert_eq!(copilot.oneshot_flag, Some("-p"));
@@ -2503,7 +2622,10 @@ mod tests {
         for agent in AGENTS {
             if agent.launch_subcommand.is_some() {
                 assert!(
-                    !matches!(agent.resume_strategy, ResumeStrategy::Subcommand(_)),
+                    !matches!(
+                        agent.session_support.as_ref().map(|support| support.resume),
+                        Some(ResumeStrategy::Subcommand(_))
+                    ),
                     "agent '{}' combines launch_subcommand with ResumeStrategy::Subcommand; \
                      resume token would be inserted before the subcommand",
                     agent.name
@@ -2627,6 +2749,152 @@ mod tests {
     }
 
     #[test]
+    fn session_capture_context_matrix_is_explicit() {
+        use SessionCaptureBackend as Backend;
+        use SessionCaptureContext as Context;
+
+        let expected = [
+            (
+                "claude",
+                Some((Backend::Claude, Context::PaneScoped, Context::PaneScoped)),
+            ),
+            (
+                "opencode",
+                Some((
+                    Backend::OpenCode,
+                    Context::Preassigned,
+                    Context::Unsupported,
+                )),
+            ),
+            ("vibe", None),
+            (
+                "codex",
+                Some((
+                    Backend::Codex,
+                    Context::Unsupported,
+                    Context::ManagedExclusiveStore,
+                )),
+            ),
+            (
+                "gemini",
+                Some((
+                    Backend::Gemini,
+                    Context::Unsupported,
+                    Context::ManagedExclusiveStore,
+                )),
+            ),
+            (
+                "cursor",
+                Some((
+                    Backend::HookSidecar,
+                    Context::PaneScoped,
+                    Context::PaneScoped,
+                )),
+            ),
+            ("droid", None),
+            (
+                "pi",
+                Some((Backend::Pi, Context::PaneScoped, Context::PaneScoped)),
+            ),
+            ("copilot", None),
+            ("settl", None),
+            (
+                "hermes",
+                Some((
+                    Backend::Hermes,
+                    Context::Unsupported,
+                    Context::ManagedExclusiveStore,
+                )),
+            ),
+            ("qwen", None),
+            ("kiro", None),
+            ("antigravity", None),
+            (
+                "kimi",
+                Some((
+                    Backend::Kimi,
+                    Context::Unsupported,
+                    Context::ManagedExclusiveStore,
+                )),
+            ),
+            (
+                "omp",
+                Some((Backend::Omp, Context::PaneScoped, Context::PaneScoped)),
+            ),
+            (
+                "prime-agent",
+                Some((
+                    Backend::PrimeAgent,
+                    Context::Unsupported,
+                    Context::ManagedExclusiveStore,
+                )),
+            ),
+        ];
+        assert_eq!(expected.len(), AGENTS.len());
+        for (name, expected) in expected {
+            let actual = get_agent(name)
+                .unwrap()
+                .session_support
+                .as_ref()
+                .and_then(|support| support.capture.as_ref())
+                .map(|capture| (capture.backend, capture.host, capture.sandbox));
+            assert_eq!(actual, expected, "capture contract for {name}");
+        }
+    }
+
+    #[test]
+    fn cursor_stop_hook_returns_status_to_idle() {
+        let events = get_agent("cursor")
+            .unwrap()
+            .sidecar_hooks
+            .as_ref()
+            .unwrap()
+            .events;
+        let stop = events.iter().find(|event| event.name == "stop").unwrap();
+        assert_eq!(stop.status, HookStatus::Idle);
+        assert_eq!(stop.identity_field, None);
+    }
+
+    #[test]
+    fn pane_hook_capture_agents_declare_their_native_identity_field() {
+        for agent in AGENTS {
+            let expected = match agent.name {
+                "claude" => Some(HookIdentityField::SessionId),
+                "cursor" => Some(HookIdentityField::ConversationIdOrSessionId),
+                _ => None,
+            };
+            let fields = agent
+                .hook_config
+                .iter()
+                .flat_map(|config| {
+                    config
+                        .events
+                        .iter()
+                        .filter_map(|event| event.identity_field)
+                })
+                .chain(agent.sidecar_hooks.iter().flat_map(|config| {
+                    config
+                        .events
+                        .iter()
+                        .filter_map(|event| event.identity_field)
+                }))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                !fields.is_empty(),
+                expected.is_some(),
+                "identity source for {}",
+                agent.name
+            );
+            if let Some(expected) = expected {
+                assert!(
+                    fields.iter().all(|field| *field == expected),
+                    "identity field drift for {}: {fields:?}",
+                    agent.name
+                );
+            }
+        }
+    }
+    #[test]
     fn test_all_agents_have_install_hint() {
         for agent in AGENTS {
             assert!(
@@ -2696,7 +2964,6 @@ mod tests {
             ("claude", HookFormat::JsonSettings),
             ("codex", HookFormat::CodexJson),
             ("gemini", HookFormat::JsonSettings),
-            ("cursor", HookFormat::JsonSettings),
             ("qwen", HookFormat::JsonSettings),
         ];
         for (name, fmt) in expected {
@@ -2725,6 +2992,7 @@ mod tests {
         // sidecar path. The dispatch in `crate::hooks::has_aoe_marker` is
         // keyed off this field.
         let expected: &[(&str, SidecarFormat)] = &[
+            ("cursor", SidecarFormat::KiroJson),
             ("settl", SidecarFormat::SettlToml),
             ("hermes", SidecarFormat::HermesYaml),
             ("kiro", SidecarFormat::KiroJson),
@@ -2814,8 +3082,8 @@ mod tests {
         // No built-in approval gate upstream, so like pi it is AlwaysYolo.
         assert!(matches!(&prime.yolo, Some(YoloMode::AlwaysYolo)));
         assert!(matches!(
-            &prime.resume_strategy,
-            ResumeStrategy::Flag("--resume")
+            prime.session_support.as_ref().map(|support| support.resume),
+            Some(ResumeStrategy::Flag("--resume"))
         ));
         // Fork stays Unsupported: upstream `--fork` needs the parent id as
         // its value, which build_fork_flags does not emit (see AGENTS entry).

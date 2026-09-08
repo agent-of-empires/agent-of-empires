@@ -182,6 +182,70 @@ pub(super) fn override_if_distinct(stored: Option<&str>, fresh: String) -> Optio
 }
 
 impl Instance {
+    /// Consume an explicit OMP resume pin only after the matching launch
+    /// reports the already-durable sid. All three facts are checked under the
+    /// storage flock so a concurrent re-pin or relaunch cannot be consumed.
+    pub(crate) fn persist_omp_pin_confirmation(
+        profile: &str,
+        instance_id: &str,
+        session_id: &str,
+        generation: &str,
+        file_watch: &std::sync::Arc<crate::file_watch::FileWatchService>,
+    ) -> SidWrite {
+        if !is_valid_session_id(session_id) {
+            return SidWrite::Failed;
+        }
+        let storage = match crate::session::storage::Storage::new(profile, file_watch.clone()) {
+            Ok(storage) => storage,
+            Err(error) => {
+                tracing::warn!(target: "session.store",
+                    instance = %instance_id,
+                    "Failed to open storage for OMP pin confirmation: {error}"
+                );
+                return SidWrite::Failed;
+            }
+        };
+        let outcome = storage.update(|instances, _groups| {
+            let Some(instance) = instances
+                .iter_mut()
+                .find(|instance| instance.id == instance_id)
+            else {
+                return Ok(SidWrite::Failed);
+            };
+            let intent_matches = matches!(
+                &instance.resume_intent,
+                ResumeIntent::Use(pinned) if pinned == session_id
+            );
+            if instance.agent_session_id.as_deref() != Some(session_id)
+                || !intent_matches
+                || instance.omp_capture_generation.as_deref() != Some(generation)
+            {
+                tracing::warn!(target: "session.store",
+                    instance = %instance_id,
+                    sid = %session_id,
+                    generation = %generation,
+                    disk_sid = ?instance.agent_session_id,
+                    disk_intent = ?instance.resume_intent,
+                    disk_generation = ?instance.omp_capture_generation,
+                    "OMP pin confirmation CAS mismatch"
+                );
+                return Ok(SidWrite::Skipped);
+            }
+            instance.resume_intent = ResumeIntent::Default;
+            Ok(SidWrite::Applied)
+        });
+        match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                tracing::warn!(target: "session.store",
+                    instance = %instance_id,
+                    "Failed to persist OMP pin confirmation: {error}"
+                );
+                SidWrite::Failed
+            }
+        }
+    }
+
     pub(super) fn persist_session_id(
         &mut self,
         profile: &str,
@@ -224,19 +288,27 @@ impl Instance {
         expected_prior_intent: ResumeIntent,
     ) -> SidPersistOutcome {
         let new_sid = self.agent_session_id.clone();
-        // Cleared, Fork, and Use are all one-shot launch directives: after the
-        // launch they ran with completes, the session resumes its own id
-        // normally, so the intent must auto-promote to Default. A fork left as
-        // Fork on disk would re-fork the parent on the next restart
-        // (double-fork). A Use pin left durable would let the drain never
-        // adopt a post-launch capture (e.g. the resume-probe fallback minting
-        // a fresh sid, or a later `/clear`), so a launched pin hands control
-        // back to normal capture; a pin on a session that never launches keeps
-        // Use and stays authoritative (see #2708).
+        // Cleared and Fork are one-shot launch directives. Use stays durable
+        // only when no pane-scoped capture backend can observe a later `/new`;
+        // capture-backed agents hand ownership back to their poller.
         let promote_one_shot = matches!(
             expected_prior_intent,
-            ResumeIntent::Cleared | ResumeIntent::Fork { .. } | ResumeIntent::Use(_)
-        );
+            ResumeIntent::Cleared | ResumeIntent::Fork { .. }
+        ) || matches!(expected_prior_intent, ResumeIntent::Use(_))
+            && self.launch_has_session_publisher();
+        // OMP seeds its poller with the in-memory sid. Keeping the pin there
+        // would suppress the first equal observation, which is the launch's
+        // confirmation. Leave the durable sid intact but make this launch's
+        // generation report it back through the guarded sync path.
+        let await_omp_pin_confirmation = matches!(
+            (&expected_prior_intent, new_sid.as_deref()),
+            (ResumeIntent::Use(pinned), Some(sid)) if pinned == sid
+        ) && self.resolved_capture_backend()
+            == Some(crate::agents::SessionCaptureBackend::Omp)
+            && self
+                .omp_capture_generation
+                .as_deref()
+                .is_some_and(|generation| !generation.starts_with("tombstone-"));
 
         let instance_id = self.id.clone();
         let new_sid_for_closure = new_sid.clone();
@@ -366,6 +438,9 @@ impl Instance {
                         }
                     }
                 }
+                if await_omp_pin_confirmation {
+                    self.agent_session_id = None;
+                }
                 SidPersistOutcome::Published
             }
             Ok(SidWrite::Skipped) => match storage.load() {
@@ -374,6 +449,13 @@ impl Instance {
                         self.agent_session_id = disk.agent_session_id;
                         self.resume_intent = disk.resume_intent;
                         self.resume_probe_failed_sid = disk.resume_probe_failed_sid;
+                        let disk_still_awaits_confirmation = matches!(
+                            (&self.resume_intent, self.agent_session_id.as_deref()),
+                            (ResumeIntent::Use(pinned), Some(sid)) if pinned == sid
+                        );
+                        if await_omp_pin_confirmation && disk_still_awaits_confirmation {
+                            self.agent_session_id = None;
+                        }
                         SidPersistOutcome::Published
                     }
                     None => {
@@ -726,7 +808,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn use_intent_promotes_to_default_after_launch() {
+    fn use_intent_remains_sticky_after_launch() {
         let temp = tempdir().unwrap();
         std::env::set_var("HOME", temp.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -737,7 +819,7 @@ mod tests {
         let pinned = "019342ab-1234-7def-8901-abcdef012345";
 
         let mut inst = Instance::new("Pinned", "/tmp/x");
-        inst.tool = "claude".into();
+        inst.tool = "copilot".into();
         inst.source_profile = profile.into();
         inst.agent_session_id = Some(pinned.into());
         inst.resume_intent = ResumeIntent::Use(pinned.into());
@@ -763,15 +845,101 @@ mod tests {
         let disk = reloaded.iter().find(|i| i.id == inst.id).unwrap();
         assert_eq!(
             disk.resume_intent,
-            ResumeIntent::Default,
-            "Use must auto-promote to Default after the launch consumes the pin so the drain adopts subsequent post-launch captures (#2708)",
+            ResumeIntent::Use(pinned.to_string()),
+            "an explicit pin must remain authoritative across later launches",
         );
         assert_eq!(
             inst.resume_intent,
-            ResumeIntent::Default,
-            "In-memory resume_intent must also promote so the drain PIN guard stops firing on the same tick",
+            ResumeIntent::Use(pinned.to_string()),
+            "the in-memory pin must remain aligned with durable state",
         );
         assert_eq!(disk.agent_session_id.as_deref(), Some(pinned));
+    }
+
+    #[test]
+    #[serial]
+    fn omp_pinned_launch_leaves_equal_sid_for_guarded_poller_confirmation() {
+        let temp = tempdir().unwrap();
+        std::env::set_var("HOME", temp.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+
+        let profile = "use-omp-confirm";
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        let pinned = "019342ab-1234-7def-8901-abcdef012345";
+        let mut inst = Instance::new("Pinned OMP", "/tmp/x");
+        inst.tool = "omp".into();
+        inst.source_profile = profile.into();
+        inst.agent_session_id = Some(pinned.into());
+        inst.resume_intent = ResumeIntent::Use(pinned.into());
+        inst.omp_capture_generation = Some("launch-current".into());
+        let on_disk = inst.clone();
+        storage
+            .update(|instances, groups| {
+                *instances = vec![on_disk.clone()];
+                *groups =
+                    crate::session::GroupTree::new_with_groups(std::slice::from_ref(&on_disk), &[])
+                        .get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+
+        let expected_sid = inst.agent_session_id.clone();
+        let expected_intent = inst.resume_intent.clone();
+        let outcome = inst.persist_session_id(profile, expected_sid.as_deref(), expected_intent);
+
+        assert_eq!(outcome, SidPersistOutcome::Published);
+        assert_eq!(inst.agent_session_id, None);
+        assert_eq!(inst.resume_intent, ResumeIntent::Use(pinned.into()));
+        let disk = storage.load().unwrap();
+        assert_eq!(disk[0].agent_session_id.as_deref(), Some(pinned));
+        assert_eq!(disk[0].resume_intent, ResumeIntent::Use(pinned.into()));
+    }
+
+    #[test]
+    #[serial]
+    fn capture_backed_use_promotes_so_a_later_conversation_can_be_adopted() {
+        let temp = tempdir().unwrap();
+        std::env::set_var("HOME", temp.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let profile = "use-capture-promote";
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        let pinned = "019342ab-1234-7def-8901-abcdef012345";
+        let mut inst = Instance::new("Pinned Claude", "/tmp/x");
+        inst.tool = "claude".into();
+        inst.source_profile = profile.into();
+        inst.agent_session_id = Some(pinned.into());
+        inst.resume_intent = ResumeIntent::Use(pinned.into());
+        let on_disk = inst.clone();
+        storage
+            .update(|instances, groups| {
+                *instances = vec![on_disk.clone()];
+                *groups =
+                    crate::session::GroupTree::new_with_groups(std::slice::from_ref(&on_disk), &[])
+                        .get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+
+        let expected_sid = inst.agent_session_id.clone();
+        let _ =
+            inst.persist_session_id(profile, expected_sid.as_deref(), inst.resume_intent.clone());
+        assert_eq!(
+            inst.resume_intent,
+            ResumeIntent::Use(pinned.into()),
+            "configured capture support is not enough without a launch publisher"
+        );
+
+        inst.identity_publisher_launched = true;
+        let _ =
+            inst.persist_session_id(profile, expected_sid.as_deref(), inst.resume_intent.clone());
+
+        assert_eq!(inst.resume_intent, ResumeIntent::Default);
+        assert_eq!(
+            storage.load().unwrap()[0].resume_intent,
+            ResumeIntent::Default
+        );
     }
 
     #[test]
@@ -1124,6 +1292,7 @@ mod tests {
             let storage = Storage::new_unwatched(profile).unwrap();
             let mut live = pinned.clone();
             live.agent_session_id = Some(SID_X.to_string());
+            live.identity_publisher_launched = true;
             let outcome = live.persist_session_id_with_storage(
                 &storage,
                 None,
@@ -1135,7 +1304,7 @@ mod tests {
             assert_eq!(
                 live.resume_intent,
                 ResumeIntent::Default,
-                "consumed pin must promote to Default"
+                "capture-backed pins must hand ownership back after launch"
             );
             let disk = load(profile);
             assert_eq!(

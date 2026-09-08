@@ -300,11 +300,10 @@ export function resolveAoeBinary(): string {
   const fromEnv = process.env.AOE_E2E_BINARY;
   if (fromEnv && existsSync(fromEnv)) return fromEnv;
   const repoRoot = resolve(__dirname, "..", "..", "..");
-  // Prefer release if both exist (CI builds release by default), fall
-  // back to debug for local `cargo build` flows.
-  const release = join(repoRoot, "target", "release", "aoe");
-  if (existsSync(release)) return release;
-  return join(repoRoot, "target", "debug", "aoe");
+  // Live tests require debug-only timing overrides. CI also supplies a debug binary.
+  const debug = join(repoRoot, "target", "debug", "aoe");
+  if (existsSync(debug)) return debug;
+  return join(repoRoot, "target", "release", "aoe");
 }
 
 /**
@@ -313,7 +312,7 @@ export function resolveAoeBinary(): string {
  * `cfg!(debug_assertions)`; we can't query it from JS, so we derive it
  * from the build directory in the path. CI passes the binary via
  * `AOE_E2E_BINARY` so this works in CI; locally it falls through to the
- * release/debug heuristic in `resolveAoeBinary`.
+ * debug/release fallback in `resolveAoeBinary`.
  */
 export function tmuxPrefixFor(binaryPath: string): "aoe_" | "aoe_dev_" {
   return binaryPath.includes("/target/debug/") ? "aoe_dev_" : "aoe_";
@@ -527,7 +526,8 @@ function writeFakeAcpShim(
         : name === "codex-acp" || name === "codex"
           ? [...scriptLines, "export FAKE_ACP_IMPERSONATE=codex"]
           : scriptLines;
-    const script = `#!/bin/bash\n${perName.join("\n")}\nexec node ${JSON.stringify(fakeAgentJs)} "$@"\n`;
+    // The isolated home cannot initialize user-scoped Node version-manager shims.
+    const script = `#!/bin/bash\n${perName.join("\n")}\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(fakeAgentJs)} "$@"\n`;
     const path = join(binDir, name);
     writeFileSync(path, script);
     chmodSync(path, 0o755);
@@ -600,6 +600,10 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
   for (const dir of [xdg, xdgData, tmp, tmuxTmp, shimBin]) {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
+  const appDir = appDirFor(home, xdg, aoeBinary);
+  mkdirSync(appDir, { recursive: true, mode: 0o700 });
+  // General live tests exercise launches, not the one-time TUI approval flow.
+  writeFileSync(join(appDir, "config.toml"), "[app_state]\nhas_acknowledged_agent_hooks = true\n");
   const fakeAcpDebugLog = join(home, "fake-acp.log");
   if (opts.acp) {
     writeFakeAcpShim(shimBin, opts.fakeAcpScript, fakeAcpDebugLog, opts.extraEnv);

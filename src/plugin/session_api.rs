@@ -557,23 +557,35 @@ async fn sessions_turn_send(
 
     let result = async {
         deps.policy.admit_turn(&plugin_id)?;
+        let caller = SessionCaller::Plugin {
+            plugin_id: plugin_id.clone(),
+        };
         // Same per-session submission authority the HTTP surfaces and the
         // queue drain take, and the same disposition decided under it, so a
         // plugin turn cannot land between the drain's idle check and its send
-        // (#3621, #3649). An unknown session is refused here rather than by
-        // `send_turn`, so a plugin probing distinct nonexistent ids cannot
-        // grow the lock registry within its turn quota.
-        let Some((_submission, dispatch)) = deps
-            .session_service
-            .begin_prompt_submission(&req.session_id, false)
+        // (#3621, #3649). Existence and ownership are settled here rather
+        // than by `send_turn`: a plugin probing distinct nonexistent ids
+        // cannot grow the lock registry within its turn quota (#3651), and a
+        // foreign session is refused before its disposition is computed, so
+        // it cannot answer `agent_busy` for a session the caller may not see
+        // (#3685).
+        // Ownership is checked before the wake so a foreign session is never
+        // touched. The wake clears an idle-dormant (or manually stopped)
+        // park the same way a user prompt does: a turn is intent to continue,
+        // so the host resumes rather than refusing (#3686).
+        deps.session_service
+            .admits_turn(&caller, &req.session_id)
             .await
-        else {
-            return Err(DispatchError::with_kind(
-                codes::INVALID_PARAMS,
-                "session_not_found",
-                "session not found",
-            ));
-        };
+            .map_err(|e| map_send_error(e.into()))?;
+        let woke_idle_dormant = deps
+            .session_service
+            .touch_and_wake_on_prompt(&req.session_id)
+            .await;
+        let (_submission, dispatch) = deps
+            .session_service
+            .begin_prompt_submission(&caller, &req.session_id, woke_idle_dormant)
+            .await
+            .map_err(|e| map_send_error(e.into()))?;
         // A cold worker is not a refusal on this path: `send_turn` resumes it
         // and waits, which is how a scheduler wakes a session it created. The
         // turn gates are, because a second prompt at a busy non-steerable
@@ -588,15 +600,16 @@ async fn sessions_turn_send(
                 ));
             }
         }
+        // Unlike the user path, the pending initial turn is left alone: for
+        // a plugin session it may be the `sessions.create { initial_turn }`
+        // the worker has not delivered yet.
         deps.session_service
             .send_turn(
-                &SessionCaller::Plugin {
-                    plugin_id: plugin_id.clone(),
-                },
+                &caller,
                 &req.session_id,
                 &req.text,
                 &[],
-                false,
+                woke_idle_dormant,
                 None,
             )
             .await
@@ -666,18 +679,30 @@ mod tests {
     }
 
     fn test_deps(prior: Vec<Instance>) -> (Arc<SessionRpcDeps>, tempfile::TempDir) {
+        let (deps, _state, dir) = test_deps_with_state(prior);
+        (deps, dir)
+    }
+
+    /// [`test_deps`] keeping the app state, for a test that has to publish
+    /// events through the real sink to move a session's control fold.
+    fn test_deps_with_state(
+        prior: Vec<Instance>,
+    ) -> (
+        Arc<SessionRpcDeps>,
+        Arc<crate::server::AppState>,
+        tempfile::TempDir,
+    ) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let session_service = crate::server::test_support::build_test_app_state(prior)
-            .session_service
-            .clone();
+        let state = crate::server::test_support::build_test_app_state(prior);
         let policy =
             Arc::new(AutomationPolicy::open(&dir.path().join("plugin_events.db")).expect("policy"));
         (
             Arc::new(SessionRpcDeps {
-                session_service,
+                session_service: state.session_service.clone(),
                 policy,
                 profile: "test".to_string(),
             }),
+            state,
             dir,
         )
     }
@@ -936,6 +961,158 @@ mod tests {
             Vec::<&'static str>::new(),
             "nothing may reach the agent behind the running turn"
         );
+    }
+
+    /// #3685: ownership is immutable and decided before any live state is
+    /// folded, so a session another plugin owns answers `not_owner` whatever
+    /// it is doing. Settling the disposition first leaked coarse live state
+    /// for a foreign session, and answered a retryable `agent_busy` for a
+    /// permanently unauthorized call.
+    #[tokio::test]
+    async fn turn_send_refuses_a_foreign_session_in_every_control_state() {
+        use crate::acp::state::Event;
+        use crate::acp::supervisor::BroadcastSink;
+
+        let mut foreign = Instance::new("other-owned", "/tmp/aoe-3685-plugin");
+        foreign.id = "sess-3685".to_string();
+        foreign.view = crate::session::View::Structured;
+        foreign.agent_name = Some("claude".to_string());
+        foreign.created_by_plugin = Some("other-plugin".to_string());
+        let (deps, state, _dir) = test_deps_with_state(vec![foreign]);
+        // A live worker: without one every dispatch parks on `WorkerDown`,
+        // which this path forwards rather than refusing, so the leak the test
+        // is about would never be reachable.
+        deps.session_service
+            .acp_supervisor
+            .test_insert_worker("sess-3685")
+            .await;
+        let sink = crate::acp::supervisor::ChannelSink {
+            tx: state.acp_events_tx.clone(),
+            event_store: Arc::clone(&state.acp_event_store),
+            control_cache: Arc::clone(&state.acp_control_cache),
+        };
+        let ctx = ctx_with(&["session.prompt"]);
+
+        let mut seq = 0;
+        let mut record = |event: Event| {
+            seq += 1;
+            assert!(
+                sink.publish_persisted("sess-3685", seq, &event),
+                "publish must reach the event store"
+            );
+        };
+        let prompt = || Event::UserPromptSent {
+            text: "the owner's turn".into(),
+            attachments: Vec::new(),
+            prompt_id: None,
+        };
+        // Each state named by the disposition it would have leaked.
+        for (label, events, expected) in [
+            ("idle", vec![], crate::acp::dispatch::PromptDispatch::Sent),
+            (
+                "busy",
+                vec![prompt()],
+                crate::acp::dispatch::PromptDispatch::Queued {
+                    reason: crate::acp::dispatch::QueueReason::TurnActive,
+                },
+            ),
+            (
+                "cancelling",
+                vec![Event::CancelRequested {
+                    escalates_at: chrono::Utc::now(),
+                }],
+                crate::acp::dispatch::PromptDispatch::Queued {
+                    reason: crate::acp::dispatch::QueueReason::Cancelling,
+                },
+            ),
+            (
+                "compacting",
+                vec![
+                    Event::Stopped {
+                        reason: "cancelled".into(),
+                    },
+                    prompt(),
+                    Event::ConversationCompactionStarted,
+                ],
+                crate::acp::dispatch::PromptDispatch::Queued {
+                    reason: crate::acp::dispatch::QueueReason::Compacting,
+                },
+            ),
+        ] {
+            for event in events {
+                record(event);
+            }
+            assert_eq!(
+                crate::acp::dispatch::decide(
+                    &deps.session_service.fold_control_state("sess-3685").await,
+                    crate::acp::dispatch::WorkerLiveness {
+                        running: true,
+                        idle_dormant: false,
+                        rate_limit_exhausted: false,
+                    },
+                ),
+                expected,
+                "{label}: the session is not in the state this row exercises"
+            );
+            let err = dispatch(
+                &deps,
+                &ctx,
+                "sessions.turn.send",
+                &serde_json::json!({ "session_id": "sess-3685", "text": "hi" }),
+            )
+            .await
+            .expect_err("a foreign session must be refused");
+            assert_eq!(kind(&err), "not_owner", "{label}");
+            assert_eq!(err.code, codes::FORBIDDEN, "{label}");
+        }
+    }
+
+    /// #3686: a parked plugin session is woken by a turn, not refused as
+    /// missing. The resume itself fails here (no real agent), which is a
+    /// worker error, never `session_not_found`.
+    #[tokio::test]
+    async fn turn_send_wakes_a_parked_session() {
+        type Park = (&'static str, fn(&mut Instance));
+        let parks: Vec<Park> = vec![
+            ("idle-dormant", |i| i.mark_idle_dormant()),
+            ("archived", |i| i.archived_at = Some(chrono::Utc::now())),
+            ("snoozed", |i| {
+                i.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::hours(1))
+            }),
+            ("stopped by the user, nothing to clear", |_| {}),
+        ];
+        for (label, park) in parks {
+            let mut parked = Instance::new("parked-owned", "/tmp/aoe-3686-plugin");
+            parked.id = "sess-3686".to_string();
+            parked.view = crate::session::View::Structured;
+            parked.agent_name = Some("aoe-no-such-agent-3686".to_string());
+            parked.created_by_plugin = Some("cron".to_string());
+            park(&mut parked);
+            let (deps, state, _dir) = test_deps_with_state(vec![parked]);
+            let ctx = ctx_with(&["session.prompt"]);
+
+            let result = dispatch(
+                &deps,
+                &ctx,
+                "sessions.turn.send",
+                &serde_json::json!({ "session_id": "sess-3686", "text": "wake up" }),
+            )
+            .await;
+            if let Err(err) = &result {
+                assert_ne!(
+                    kind(err),
+                    "session_not_found",
+                    "{label}: a parked session is resumed, not reported missing: {err:?}"
+                );
+            }
+            let instances = state.instances.read().await;
+            let inst = instances.iter().find(|i| i.id == "sess-3686").unwrap();
+            assert!(
+                !inst.is_idle_dormant() && !inst.is_archived() && !inst.is_snoozed(),
+                "{label}: the turn clears the park"
+            );
+            assert!(inst.last_accessed_at.is_some(), "{label}");
+        }
     }
 
     /// `prompt_submission` auto-vivifies a per-session lock-registry entry

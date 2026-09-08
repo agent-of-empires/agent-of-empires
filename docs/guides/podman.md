@@ -15,14 +15,9 @@ Set the runtime in `~/.config/agent-of-empires/config.toml` (Linux) or `~/.agent
 container_runtime = "podman"
 ```
 
-Scope it to a single profile to keep Docker as the global default:
-
-```toml
-[profiles.podman]
-sandbox.container_runtime = "podman"
-```
-
-Use it with `aoe add --profile podman .`, or pick the runtime per-session in the TUI under **Sandbox > Container Runtime**.
+The runtime is global-only: every container call resolves it from the global
+config, so a profile or repo override is ignored. Set it once here, or in the
+TUI under **Sandbox > Container Runtime** in the Global scope.
 
 ## Podman-specific gotchas
 

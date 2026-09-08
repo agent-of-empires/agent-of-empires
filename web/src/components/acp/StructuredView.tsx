@@ -34,7 +34,8 @@ import { AskUserQuestionCard } from "./AskUserQuestionCard";
 import { AcpFileRefContext } from "./AcpFileRefContext";
 import type { FileRef, FileRefSession } from "../../lib/fileRef";
 import { anchorIsStale, autoLoadDecision, isPinnedToBottom, scrollRestoreDelta } from "../../lib/historyScroll";
-import { loadScrollState, saveScrollState } from "../../lib/acpScrollState";
+import { lastClearIndex } from "../../lib/acpHistoryWindow";
+import { loadScrollState, restoredScrollTop, saveScrollState } from "../../lib/acpScrollState";
 import { repinOnResize } from "../../lib/repinOnResize";
 import { ToolDensityToggle, ToolDisplayModeProvider, useToolDensityPref } from "./ToolDisplayMode";
 import { AcpRuntime, SUBAGENT_TASK_NAME, TODO_GROUP_NAME, TOOL_GROUP_NAME, type AcpContext } from "./AcpRuntime";
@@ -46,7 +47,7 @@ import { SwitchAgentModal } from "./SwitchAgentModal";
 import { Markdown } from "./Markdown";
 import { isQueuedPromptLong, queuedStripLayout } from "./queuedPromptsLayout";
 import { StartupErrorScreen } from "./StartupErrorScreen";
-import { pickWorkerStoppedVariant } from "./workerStoppedBanner";
+import { pickWorkerStoppedVariant, showWorkerStoppingBanner } from "./workerStoppedBanner";
 import { BackgroundAgentsContext } from "./backgroundAgentsContext";
 import { AsyncSubagentCard, SubagentCard, ToolCard, ToolGroupCard, TodoGroupCard } from "./ToolCards";
 import { DiffCommentsUserCard } from "../diff/comments/DiffCommentsUserCard";
@@ -92,7 +93,11 @@ interface Props {
   /** Structured view worker lifecycle pulled from `SessionResponse.acp_worker_state`
    *  (REST-poll-driven, ~3s cadence). Drives the `WorkerResumingBanner`
    *  while the reconciler is mid-spawn/attach. See #1088. */
-  acpWorkerState: "absent" | "resuming" | "running";
+  acpWorkerState: "absent" | "resuming" | "running" | "stopping";
+  /** Whether `[acp] rate_limit_auto_resume` is on for this session's
+   *  profile, from `SessionResponse.rate_limit_auto_resume`. The rate-limit
+   *  notice says whether the park ends by itself (#3514). */
+  rateLimitAutoResume?: boolean;
   /** Session's `tool` registry key (claude / codex / opencode / gemini
    *  / etc.). Resolves the active AgentProfile that drives card
    *  dispatch and claude-specific capability gates. */
@@ -161,6 +166,7 @@ export function StructuredView(props: Props) {
   const {
     sessionId,
     acpWorkerState,
+    rateLimitAutoResume,
     tool,
     acpAgent,
     clearAliases,
@@ -199,6 +205,7 @@ export function StructuredView(props: Props) {
                 <AcpChrome
                   sessionId={sessionId}
                   acpWorkerState={acpWorkerState}
+                  rateLimitAutoResume={rateLimitAutoResume}
                   acpAgent={acpAgent}
                   showClearedTurns={showClearedTurns}
                   onToggleClearedTurns={() => setShowClearedTurns((v) => !v)}
@@ -285,6 +292,7 @@ export function StructuredViewRoot({ children }: { children: React.ReactNode }) 
 function AcpChrome({
   sessionId,
   acpWorkerState,
+  rateLimitAutoResume,
   acpAgent,
   showClearedTurns,
   onToggleClearedTurns,
@@ -328,7 +336,8 @@ function AcpChrome({
   isSandboxed,
 }: AcpContext & {
   sessionId: string;
-  acpWorkerState: "absent" | "resuming" | "running";
+  acpWorkerState: "absent" | "resuming" | "running" | "stopping";
+  rateLimitAutoResume?: boolean;
   acpAgent: string | null;
   showClearedTurns: boolean;
   onToggleClearedTurns: () => void;
@@ -340,22 +349,11 @@ function AcpChrome({
   onRestore?: () => Promise<boolean> | void;
   isSandboxed?: boolean;
 }) {
-  // Count how many activity rows precede the latest `session_cleared`
-  // divider so the banner can say "12 earlier turns hidden". The
-  // reducer always appends the divider as the last row at clear time,
-  // so the count is `lastClearIndex` (rows before it are the cleared
-  // history). See #1101.
-  const clearedSummary = (() => {
-    let lastClearIndex = -1;
-    for (let i = state.activity.length - 1; i >= 0; i -= 1) {
-      if (state.activity[i]!.kind === "session_cleared") {
-        lastClearIndex = i;
-        break;
-      }
-    }
-    if (lastClearIndex < 0) return null;
-    return { hiddenCount: lastClearIndex };
-  })();
+  // Rows preceding the latest `/clear` divider are the hidden history, so the
+  // divider's index is the count the banner reports ("12 earlier turns
+  // hidden"). See #1101.
+  const clearIndex = lastClearIndex(state.activity);
+  const clearedSummary = clearIndex < 0 ? null : { hiddenCount: clearIndex };
   // Composer prefill keyed for re-fires; set by the
   // ContextPrimerBanner on click. Local rather than on AcpState
   // because it's a one-shot UI action, not part of the event log.
@@ -383,12 +381,11 @@ function AcpChrome({
     respawn: resumeRateLimitedSession,
   } = useRespawnSession(sessionId, state.rateLimit ? (state.rateLimit.resets_at ?? "unknown") : null);
 
-  // Re-pin the chat viewport to the bottom when the composer (or any
-  // sibling below it: queued strip, primer banner) grows. assistant-ui's
-  // `autoScroll` only re-pins on message updates, not on viewport
-  // height shrinks; without this, typing multi-line prompts slides the
-  // visible bottom of the chat up by the height the composer just
-  // grew. See #1104.
+  // Re-pin the chat viewport when its content or the chrome below it grows.
+  // These observers own the stick-to-bottom contract; the primitive's separate
+  // auto-scroll state is disabled below so it cannot override a reader who has
+  // scrolled up. Without the viewport resize observer, typing multi-line prompts
+  // slides the visible bottom up by the composer's growth. See #1104.
   //
   // We sample "is the viewport pinned to the bottom?" on every scroll
   // event into a ref. By the time the ResizeObserver fires the layout
@@ -501,10 +498,8 @@ function AcpChrome({
     const below = belowViewportRef.current;
     const content = messagesContentRef.current;
     if (!vp || !below) return;
-    // Treat "within 16px of the bottom" as pinned. assistant-ui's
-    // own stick-to-bottom uses a similar slop; sub-pixel rounding
-    // and momentary content reflows otherwise drop us out of the
-    // pinned state for one frame.
+    // Treat "within 16px of the bottom" as pinned. Sub-pixel rounding and
+    // momentary content reflows otherwise drop the pinned state for one frame.
     // Stick-to-bottom intent (`wasAtBottomRef`) must change ONLY on a real user
     // scroll gesture. On a coarse-pointer device the browser also fires "scroll"
     // for programmatic scrolls and, critically, for the interim scroll it emits
@@ -595,14 +590,13 @@ function AcpChrome({
       if (stick) lastAtBottomAtRef.current = performance.now();
       setAtBottom(stick);
       const applyStart = () => {
-        if (stick) {
-          vp.scrollTop = vp.scrollHeight;
-        } else if (saved) {
-          vp.scrollTop = Math.max(0, Math.min(saved.top, vp.scrollHeight - vp.clientHeight));
-        }
+        const top = restoredScrollTop(saved, wasAtBottomRef.current, vp.scrollHeight, vp.clientHeight);
+        if (top != null) vp.scrollTop = top;
       };
-      // After the cached transcript lays out; a second pass for the stick case
-      // catches content (markdown, tool cards, images) that renders a beat later.
+      // Pin the rendered transcript before paint. Later passes catch markdown,
+      // tool cards, and images that lay out afterward, but applyStart rechecks
+      // current stick intent so an intervening user scroll wins.
+      applyStart();
       requestAnimationFrame(() => requestAnimationFrame(applyStart));
       if (stick) window.setTimeout(applyStart, 150);
     }
@@ -634,9 +628,9 @@ function AcpChrome({
     //   - Otherwise it grew at the BOTTOM (a streaming turn, a new message):
     //     keep the view pinned to the bottom if the user was already there, so
     //     the latest output follows without them chasing it. If they scrolled
-    //     up, leave their position alone. This is our own stick-to-bottom;
-    //     assistant-ui's `autoScroll` is a belt-and-suspenders backstop that
-    //     was under-sticking during fast streams, which is why this exists.
+    //     up, leave their position alone. This observer is the authoritative
+    //     bottom-following path; the viewport primitive's competing auto-scroll
+    //     intent is disabled below.
     const contentRo = new ResizeObserver(() => {
       const anchor = pendingScrollAnchorRef.current;
       if (anchor != null) {
@@ -676,9 +670,8 @@ function AcpChrome({
   const chromeTransitionInitRef = useRef(true);
   useEffect(() => {
     // Skip the initial mount: only actual open/close transitions should pin.
-    // The first paint's scroll-to-bottom is handled by autoScroll + the content
-    // observer, and pinning here on mount would fight a user scrolling up right
-    // after the view appears.
+    // The first paint is handled by the content observer and scroll-state
+    // restore; pinning here would fight a user scrolling up immediately.
     if (chromeTransitionInitRef.current) {
       chromeTransitionInitRef.current = false;
       return;
@@ -728,11 +721,13 @@ function AcpChrome({
         onPrefill={recoveryHandoffPrefill}
       >
         {({ onSwitchAgent }) =>
-          status !== "open" || state.lagged || state.rateLimit || reconnecting ? (
+          status !== "open" || state.lagged || state.rateLimit || state.rateLimitRetriesExhausted || reconnecting ? (
             <SystemNotices
               status={status}
               lagged={state.lagged}
               rateLimit={state.rateLimit}
+              rateLimitAutoResume={rateLimitAutoResume}
+              rateLimitRetriesExhausted={state.rateLimitRetriesExhausted}
               hasEverOpened={hasEverOpened}
               reconnecting={reconnecting}
               retryCount={retryCount}
@@ -756,6 +751,7 @@ function AcpChrome({
           trashedAt,
           archivedAt,
           snoozedUntil,
+          workerStopping: acpWorkerState === "stopping",
         });
         if (variant === "trashed") {
           return <TrashedWorkerStoppedBanner sessionId={sessionId} onRestore={onRestore} />;
@@ -779,6 +775,7 @@ function AcpChrome({
         !state.workerStopped &&
         !state.workerRestarting &&
         (state.lastSeq === 0 ? <SpawningBanner /> : <WorkerResumingBanner />)}
+      {showWorkerStoppingBanner({ acpWorkerState, startupError: state.startupError }) && <WorkerStoppingBanner />}
       {state.nextWakeupAt &&
         !state.turnActive &&
         !state.startupError &&
@@ -799,10 +796,10 @@ function AcpChrome({
             the bottom of the scroll area, just above the composer. */}
         <div className="relative flex min-h-0 flex-1 flex-col">
           <ThreadPrimitive.Viewport
-            autoScroll
+            autoScroll={false}
             ref={viewportRef}
             data-testid="acp-viewport"
-            className="flex-1 overflow-x-hidden overflow-y-auto"
+            className="flex-1 overflow-x-hidden overflow-y-auto [overflow-anchor:none]"
           >
             <div ref={messagesContentRef} className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl px-4 py-6">
               <ThreadPrimitive.Empty>
@@ -880,8 +877,7 @@ function AcpChrome({
             </div>
           </ThreadPrimitive.Viewport>
           {/* Phone-only quick "jump to bottom" while scrolled up in a long
-              transcript. Desktop relies on the mouse wheel + autoScroll re-pin,
-              so it is gated to coarse pointers to avoid crowding that layout. */}
+              transcript. Coarse-pointer gating avoids crowding desktop. */}
           {isCoarse && !atBottom && (
             <button
               type="button"
@@ -1711,10 +1707,15 @@ function PendingApproval({
   onResolve,
 }: {
   approval: Approval;
-  onResolve: (nonce: string, decision: ApprovalDecision) => Promise<void>;
+  onResolve: (nonce: string, decision: ApprovalDecision, optionId?: string) => Promise<void>;
 }) {
   // ApprovalCard owns its own chrome (matches the tool-card style).
-  return <ApprovalCard approval={approval} onResolve={(decision) => onResolve(approval.nonce, decision)} />;
+  return (
+    <ApprovalCard
+      approval={approval}
+      onResolve={(decision, optionId) => onResolve(approval.nonce, decision, optionId)}
+    />
+  );
 }
 
 /* ── System notices ──────────────────────────────────────────────── */
@@ -1768,6 +1769,8 @@ export function SystemNotices({
   status,
   lagged,
   rateLimit,
+  rateLimitAutoResume,
+  rateLimitRetriesExhausted,
   hasEverOpened,
   reconnecting,
   retryCount,
@@ -1782,6 +1785,10 @@ export function SystemNotices({
   status: AcpContext["status"];
   lagged: boolean;
   rateLimit: AcpState["rateLimit"];
+  /** Whether auto-resume is armed for the session's profile; omitted when
+   *  the caller does not know, in which case nothing is claimed. */
+  rateLimitAutoResume?: boolean;
+  rateLimitRetriesExhausted: boolean;
   hasEverOpened: boolean;
   reconnecting: boolean;
   retryCount: number;
@@ -1798,7 +1805,7 @@ export function SystemNotices({
   // `maxRetries` and we're sitting on a dead WS. Surface the manual
   // affordance instead of a status line so the user has a clear path
   // back to live. See #1130.
-  const retriesExhausted = status !== "open" && hasEverOpened && !reconnecting && retryCount >= maxRetries;
+  const reconnectRetriesExhausted = status !== "open" && hasEverOpened && !reconnecting && retryCount >= maxRetries;
   if (reconnecting && status !== "open") {
     // Auto-retry banner: "Reconnecting (3/7) in 4s". Replaces the bare
     // "Reconnecting…" copy with concrete progress so the user knows
@@ -1820,7 +1827,7 @@ export function SystemNotices({
         ? "Structured view reconnecting… showing cached transcript; new messages disabled."
         : "Starting structured view worker… this can take a few seconds for new sessions.",
     });
-  } else if (status === "closed" && !retriesExhausted) {
+  } else if (status === "closed" && !reconnectRetriesExhausted) {
     messages.push({
       kind: "warn",
       text: hasEverOpened
@@ -1846,9 +1853,25 @@ export function SystemNotices({
           ? `Rate-limited (${rateLimit.kind}); resets at ${reset.toLocaleTimeString()}.`
           : `Rate-limited (${rateLimit.kind}); ${rateLimitWording(rateLimit.status)}`,
     });
+    // Say whether the park ends by itself: the same banner with the setting
+    // off used to read as "AoE is broken" rather than "as configured" (#3514).
+    if (rateLimitAutoResume === true && !rateLimitRetriesExhausted) {
+      messages.push({ kind: "muted", text: "Auto-resume is armed; the session resumes when the window clears." });
+    } else if (rateLimitAutoResume === false) {
+      messages.push({
+        kind: "muted",
+        text: "Auto-resume is off for this profile; use Resume now, or enable acp.rate_limit_auto_resume.",
+      });
+    }
+  }
+  if (rateLimitRetriesExhausted) {
+    messages.push({
+      kind: "warn",
+      text: "Auto-resume stopped: the same prompt was re-sent too many times without getting through. Resume manually or send a new prompt.",
+    });
   }
   const resumePending = rateLimitResumeState === "retrying" || rateLimitResumeState === "ok";
-  if (messages.length === 0 && !retriesExhausted) return null;
+  if (messages.length === 0 && !reconnectRetriesExhausted) return null;
   return (
     <div className="border-b border-surface-800 px-4 py-2 space-y-1">
       {messages.map((m, i) => (
@@ -1889,7 +1912,7 @@ export function SystemNotices({
       {rateLimit && rateLimitResumeState === "failed" && rateLimitResumeError && (
         <div className="pt-1 text-xs text-brand-400">Resume failed: {rateLimitResumeError}</div>
       )}
-      {retriesExhausted && (
+      {reconnectRetriesExhausted && (
         <div className="flex items-center justify-between gap-3 text-xs text-brand-400">
           <span>Connection lost. Auto-retry stopped.</span>
           <button
@@ -1982,6 +2005,18 @@ function WorkerResumingBanner() {
         Resuming structured view worker… cached transcript still available. Queued prompts will send once the agent is
         back online.
       </span>
+    </div>
+  );
+}
+
+/** Shown while `SessionResponse.acp_worker_state === "stopping"`: the
+ *  daemon has signalled the worker but has not proven it gone. Prompts are
+ *  held and resumes refused until it settles. See #3487. */
+export function WorkerStoppingBanner() {
+  return (
+    <div className="flex items-center gap-2 border-b border-status-warning/30 bg-status-warning/10 px-4 py-2 text-xs text-status-warning">
+      <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-status-warning" aria-hidden />
+      <span>Stopping structured view worker… waiting for the agent process to exit before anything can resume.</span>
     </div>
   );
 }

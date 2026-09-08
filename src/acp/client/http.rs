@@ -399,7 +399,7 @@ impl HttpClient {
     pub async fn queue_list(
         &self,
         session_id: &str,
-    ) -> Result<Vec<crate::acp::state::QueuedPromptEntry>, HttpError> {
+    ) -> Result<Vec<crate::daemon::QueuedPromptEntry>, HttpError> {
         let url = format!(
             "{}/api/sessions/{}/queue",
             self.endpoint.base_url, session_id
@@ -528,18 +528,23 @@ impl HttpClient {
         Ok(res.json::<SwitchAgentResponse>().await?)
     }
 
-    /// `POST /api/sessions/{id}/acp/approvals/{nonce}`.
+    /// `POST /api/sessions/{id}/acp/approvals/{nonce}`. `option_id` names
+    /// an option the TUI answered through the option picker.
     pub async fn resolve_approval(
         &self,
         session_id: &str,
         nonce: &str,
         decision: ApprovalDecisionWire,
+        option_id: Option<String>,
     ) -> Result<(), HttpError> {
         let url = format!(
             "{}/api/sessions/{}/acp/approvals/{}",
             self.endpoint.base_url, session_id, nonce
         );
-        let body = ResolveApprovalRequest { decision };
+        let body = ResolveApprovalRequest {
+            decision,
+            option_id,
+        };
         let res = self.auth(self.http.post(&url)).json(&body).send().await?;
         let status = res.status();
         if status.is_success() {
@@ -576,11 +581,7 @@ impl HttpClient {
         Err(classify_resolve_error(status, &text, nonce, session_id))
     }
 
-    /// `GET /api/sessions`. Returns the daemon's session list as
-    /// whatever shape the caller deserialises into. Used by the
-    /// remote-structured view picker so the bespoke `reqwest::Client` it used
-    /// to keep can be retired in favour of the shared auth/header
-    /// plumbing.
+    /// Returns session rows from `GET /api/sessions` using shared authentication.
     pub async fn list_sessions<T: serde::de::DeserializeOwned>(&self) -> Result<Vec<T>, HttpError> {
         let url = format!("{}/api/sessions", self.endpoint.base_url);
         let res = self.auth(self.http.get(&url)).send().await?;
@@ -612,8 +613,7 @@ impl HttpClient {
     /// the daemon already resolves the active profile's value for the web
     /// dashboard. See #3253.
     pub async fn compaction_reminder(&self) -> Result<Option<u8>, HttpError> {
-        /// The two `/api/about` fields the view needs. `ServerAbout` lives
-        /// behind the `serve` feature, so a TUI-only build cannot name it.
+        /// The two `/api/about` fields the view needs.
         #[derive(serde::Deserialize)]
         struct ReminderAbout {
             acp_compaction_reminder: bool,

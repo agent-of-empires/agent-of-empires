@@ -16,7 +16,7 @@ impl HomeView {
     /// Tick dialog animations/timers and drain hook progress.
     /// Returns true when a redraw is needed.
     pub fn tick_dialog(&mut self) -> bool {
-        use crate::session::repo_config::HookProgress;
+        use crate::session::config::repo_config::HookProgress;
 
         let mut changed = false;
 
@@ -35,7 +35,6 @@ impl HomeView {
         }
 
         // Poll serve dialog for subprocess startup events.
-        #[cfg(feature = "serve")]
         if let Some(view) = &mut self.serve_view {
             if view.tick() {
                 changed = true;
@@ -94,10 +93,7 @@ impl HomeView {
     /// (the wheel-scroll on the dashboard preview won't work while it's
     /// off).
     pub fn wants_text_selection(&self) -> bool {
-        #[cfg(feature = "serve")]
         let serve_open = self.serve_view.is_some();
-        #[cfg(not(feature = "serve"))]
-        let serve_open = false;
 
         serve_open
             || self.info_dialog.is_some()
@@ -122,10 +118,7 @@ impl HomeView {
     /// gate off the fast path it's supposed to enable — that's why the
     /// fast path needs this method instead.
     pub(in crate::tui) fn has_non_live_send_overlay(&self) -> bool {
-        #[cfg(feature = "serve")]
         let serve_open = self.serve_view.is_some();
-        #[cfg(not(feature = "serve"))]
-        let serve_open = false;
 
         self.show_help
             || self.search_active
@@ -187,11 +180,41 @@ impl HomeView {
             .is_some_and(|deadline| std::time::Instant::now() < deadline)
     }
 
+    /// Show `text` in the status bar for a few seconds. For feedback on an
+    /// action the user just took, where an acknowledgement would be noise.
+    /// Matches the Ctrl+C hint's window so the two read as the same kind of
+    /// thing.
+    pub(in crate::tui) fn flash_status(&mut self, text: impl Into<String>) {
+        self.status_flash = Some((
+            text.into(),
+            std::time::Instant::now() + std::time::Duration::from_secs(3),
+        ));
+    }
+
+    /// The flash text while it is still within its window.
+    pub(in crate::tui) fn status_flash_text(&self) -> Option<&str> {
+        self.status_flash
+            .as_ref()
+            .filter(|(_, deadline)| std::time::Instant::now() < *deadline)
+            .map(|(text, _)| text.as_str())
+    }
+
+    /// Drop a flash whose window has closed, reporting whether anything
+    /// changed so the caller can schedule the one repaint that clears it.
+    pub(in crate::tui) fn expire_status_flash(&mut self) -> bool {
+        if self
+            .status_flash
+            .as_ref()
+            .is_some_and(|(_, deadline)| std::time::Instant::now() >= *deadline)
+        {
+            self.status_flash = None;
+            return true;
+        }
+        false
+    }
+
     pub fn has_dialog(&self) -> bool {
-        #[cfg(feature = "serve")]
         let serve_open = self.serve_view.is_some();
-        #[cfg(not(feature = "serve"))]
-        let serve_open = false;
 
         self.live_send.is_some()
             || self.show_help

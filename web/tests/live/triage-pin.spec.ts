@@ -5,7 +5,7 @@
 //     `pinned_at` survives a hard reload through the persistence layer.
 //   - Unpin via the same menu round-trips back to `pinned_at == null`.
 //
-// The PATCH handler lives in `src/server/api/sessions.rs::update_session_pin`;
+// The PATCH handler lives in `src/server/api/sessions/lifecycle.rs::update_session_pin`;
 // the render path is in `web/src/components/WorkspaceSidebar.tsx` (the Pin
 // glyph plus the `Pin/Unpin` menu entry). Live coverage catches wire-format
 // drift on either side that mocked specs miss.

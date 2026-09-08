@@ -247,9 +247,8 @@ struct InstanceMetrics {
 
 /// Map an instance to its `(agent bucket, model bucket)` telemetry labels, both
 /// already coerced to the [`sanitize`] allowlist. Shared by [`aggregate_instances`]
-/// (point-in-time) and the serve windowed aggregator ([`aggregate`]) so both
-/// bucket sessions identically. The model bucket only exists in `serve` builds;
-/// elsewhere it is treated as absent (`unset`).
+/// (point-in-time) and the windowed aggregator ([`aggregate`]) so both bucket
+/// sessions identically.
 pub(crate) fn instance_buckets(inst: &Instance) -> (String, String) {
     // Prefer the canonical detection name; fall back to the raw tool string.
     // Either way it is coerced to an allowlisted bucket.
@@ -258,10 +257,7 @@ pub(crate) fn instance_buckets(inst: &Instance) -> (String, String) {
     } else {
         inst.detect_as.as_str()
     };
-    #[cfg(feature = "serve")]
     let model = inst.agent_model.as_deref();
-    #[cfg(not(feature = "serve"))]
-    let model: Option<&str> = None;
     (
         sanitize::agent_bucket(agent_src),
         sanitize::model_bucket(model).to_string(),
@@ -303,12 +299,7 @@ fn aggregate_instances(instances: &[Instance]) -> InstanceMetrics {
             crate::session::Status::Error => error += 1,
             _ => {}
         }
-        // Acp fields only exist in `serve` builds; treat them as absent
-        // otherwise so the aggregation stays surface-agnostic.
-        #[cfg(feature = "serve")]
         let is_structured = inst.is_structured();
-        #[cfg(not(feature = "serve"))]
-        let is_structured = false;
         if is_structured {
             acp += 1;
         }
@@ -400,8 +391,8 @@ pub fn build_usage_snapshot(
     if !opted_in_with(&config) {
         return None;
     }
-    // auth_mode / serve_mode are serve-only deployment metadata. Normalize here
-    // rather than trusting every caller to pass None, so a future non-serve call
+    // auth_mode / serve_mode are daemon-only deployment metadata. Normalize
+    // here rather than trusting every caller to pass None, so a future call
     // site can never leak them onto a TUI / CLI payload.
     debug_assert!(
         matches!(surface, Surface::Serve) || (auth_mode.is_none() && serve_mode.is_none()),

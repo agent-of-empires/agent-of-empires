@@ -57,6 +57,7 @@ function renderTerm(uploadPastedImage = vi.fn().mockResolvedValue(null)) {
       enterReading={vi.fn()}
       returnToLive={vi.fn()}
       sendData={sendData}
+      typedWordRef={{ current: "" }}
       uploadPastedImage={uploadPastedImage}
       forwardWheel={vi.fn()}
       forwardButton={vi.fn()}

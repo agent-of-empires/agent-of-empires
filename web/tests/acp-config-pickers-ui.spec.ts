@@ -31,6 +31,19 @@ function modelOption(current: string) {
   };
 }
 
+function longModelOption(current: string, count: number) {
+  return {
+    id: "model",
+    name: "Model",
+    category: "model",
+    current_value: current,
+    options: Array.from({ length: count }, (_, i) => ({
+      value: `model-${i}`,
+      name: `Model ${i}`,
+    })),
+  };
+}
+
 function effortOption(current: string) {
   return {
     id: "effort",
@@ -117,6 +130,43 @@ test("user picks reasoning effort and the segment becomes active", async ({ page
     timeout: 10_000,
   });
   await expect(page.getByTestId("config-option-effort-value-default")).toHaveAttribute("aria-checked", "false");
+});
+
+test("model menu stays on-screen and scrollable on a short viewport", async ({ page }) => {
+  // A long option list plus a short viewport is exactly the geometry the
+  // fixed max-height missed: the menu opens upward from the composer
+  // footer, so its true ceiling is the trigger's distance from the top of
+  // the viewport, not a flat guess (review on #3747).
+  await page.setViewportSize({ width: 800, height: 320 });
+  const mock = await mockAcpSession(page, {
+    title: "ui-pickers-short-viewport",
+    initialEvents: [configOptionsUpdated([longModelOption("model-0", 40)])],
+  });
+  await openStructuredSession(page, mock);
+
+  const modelChip = page.getByTestId("config-option-model");
+  await expect(modelChip).toBeVisible({ timeout: 15_000 });
+  await modelChip.click();
+
+  const menu = page.locator('[id^="config-option-menu-model"]');
+  await expect(menu).toBeVisible();
+
+  const viewportSize = page.viewportSize();
+  expect(viewportSize).not.toBeNull();
+  const menuBox = await menu.boundingBox();
+  expect(menuBox).not.toBeNull();
+  expect(menuBox!.y).toBeGreaterThanOrEqual(0);
+  expect(menuBox!.y + menuBox!.height).toBeLessThanOrEqual(viewportSize!.height);
+
+  // The capped menu must actually scroll, not just fit on-screen by
+  // silently truncating the option list: the scrollable list's content
+  // height must exceed what's visible.
+  const scrollContainer = menu.locator(".overflow-y-auto");
+  const { scrollHeight, clientHeight } = await scrollContainer.evaluate((el) => ({
+    scrollHeight: el.scrollHeight,
+    clientHeight: el.clientHeight,
+  }));
+  expect(scrollHeight).toBeGreaterThan(clientHeight);
 });
 
 test("rejected switch renders a dismissable non-blocking notice", async ({ page }) => {

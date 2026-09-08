@@ -25,6 +25,7 @@ mod rows;
 mod selection;
 mod send;
 mod status;
+mod store_move;
 #[cfg(test)]
 mod tests;
 mod user_action;
@@ -49,7 +50,6 @@ use crate::tmux::AvailableTools;
 
 use super::creation_poller::{CreatedWorktreeInfo, CreationPoller, CreationRequest};
 use super::deletion_poller::DeletionPoller;
-#[cfg(feature = "serve")]
 use super::dialogs::ServeView;
 use super::dialogs::{
     AttachProjectDialog, ChangelogDialog, CommandPaletteDialog, ConfirmDialog, ContextMenuDialog,
@@ -132,6 +132,19 @@ pub(super) struct CreatingHookProgress {
     pub(super) current_hook: Option<String>,
 }
 
+/// One applied passive resize: the preview geometry the dedup keys on, the
+/// window geometry tmux actually applied (preview rows plus status-bar
+/// chrome), and when render adopted it. Only a pane snapshot taken after
+/// adoption can invalidate the entry, because the shared snapshot can lag
+/// our own resize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PassiveSynced {
+    pub(super) cols: u16,
+    pub(super) rows: u16,
+    pub(super) window_rows: u16,
+    pub(super) adopted_at: std::time::Instant,
+}
+
 /// Result delivered by a startup-recovery worker back to the TUI tick.
 struct RecoveryUpdate {
     instance_id: String,
@@ -188,6 +201,10 @@ pub struct HomeView {
     /// is about tmux server options, which cannot influence this in-process
     /// path.
     pub(super) agent_clipboard_forward: bool,
+    /// Cells carrying an OSC 8 target in the frame being painted, shared with
+    /// the terminal backend so it can re-emit the sequences. Cleared at the top
+    /// of every render.
+    pub(super) hyperlink_cells: crate::tui::hyperlink::SharedHyperlinks,
     /// Whether live previews may use the VT transport (`[tmux] vt_live`).
     /// Cached at construction + config refresh and pushed into the capture
     /// worker (`set_vt_enabled`), so a settings toggle applies in place.
@@ -208,7 +225,7 @@ pub struct HomeView {
     /// key)`: the key disambiguates same-named owners on different hosts
     /// (GitHub "acme" vs GitLab "acme"), the owner alone is the header's
     /// display text. Mirrors the server's `AppState.remote_owner_cache`
-    /// (`src/server/api/sessions.rs`), but process-local to this TUI
+    /// (`src/server/api/sessions/list.rs`), but process-local to this TUI
     /// instance. `RefCell` gives interior mutability so `org_group_key` can
     /// stay `&self`, matching every other `*_group_name` call site.
     /// Cleared on every `reload_storage_only` so a `git remote
@@ -273,7 +290,6 @@ pub struct HomeView {
     pub(super) plugin_manager_dialog: Option<crate::tui::dialogs::PluginManagerDialog>,
     pub(super) skills_manager_dialog: Option<crate::tui::dialogs::SkillsManagerDialog>,
     pub(super) command_palette: Option<CommandPaletteDialog>,
-    #[cfg(feature = "serve")]
     pub(super) serve_view: Option<ServeView>,
     pub(super) update_confirm_dialog: Option<UpdateConfirmDialog>,
     /// One-time opt-in popup for users who finished the walkthrough before
@@ -368,6 +384,15 @@ pub struct HomeView {
     /// shows the which-key menu. Always false outside live mode; cleared on
     /// live-send exit. See `handle_live_send_key`.
     pub(super) live_send_pending_leader: bool,
+    /// Target of the link under the pointer, shown in the status bar while it
+    /// rests there. A plain click opens without confirmation and the pane
+    /// controls both the visible text and the target, so this is the chance to
+    /// see where a link goes BEFORE committing to it.
+    pub(super) hover_cell: Option<(u16, u16)>,
+    /// A short-lived status-bar message and its expiry, for one-shot feedback
+    /// that needs no acknowledgement (opening a link). Distinct from
+    /// `App::update_status`, which is a persistent notice the user dismisses.
+    pub(super) status_flash: Option<(String, std::time::Instant)>,
     /// Deadline until which the live-send footer flashes a "Ctrl+C sent to
     /// agent" reminder. Set on every Ctrl+C forwarded through live mode
     /// (#2894) so the user learns the keystroke reached the agent rather
@@ -382,13 +407,38 @@ pub struct HomeView {
     /// (`leader b`). Persisted to `app_state.home_sidebar_collapsed` so the
     /// choice survives restarts.
     pub(super) sidebar_collapsed: bool,
-    /// `(session_id, cols, rows)` of the last NON-live preview resize we sent
-    /// to the selected agent's pane, so the 250ms preview poll doesn't
-    /// SIGWINCH-storm it every tick. Invalidated (set to None) on attach and on
-    /// live-send enter/exit, where the window's real size changes out from
-    /// under us and the next render must re-assert the preview geometry. See
-    /// `refresh_preview_cache_if_needed`.
-    pub(super) preview_pane_synced: Option<(String, u16, u16)>,
+    /// Per-session record of the last NON-live passive resize the worker
+    /// applied, so neither the selected-session sync nor the fleet reconcile
+    /// SIGWINCH-storms a pane that already matches. A session's entry is
+    /// dropped on attach and on live-send enter/exit, where its window's real
+    /// size changes out from under us, and when a newer pane snapshot shows a
+    /// window size other than the one we applied (an external `tmux attach`
+    /// or the web live view resized it behind our back). See
+    /// `refresh_preview_cache_if_needed` and `reconcile_passive_fleet`.
+    pub(super) passive_pane_synced: std::collections::HashMap<String, PassiveSynced>,
+    /// Per-session `(cols, rows)` the worker declined to apply (session
+    /// missing, client attached, or size owner active), with when. The fleet
+    /// reconcile skips a session while it still wants its declined geometry,
+    /// so background sessions get one attempt per geometry change instead of
+    /// a per-frame retry loop; the selected session ignores this and keeps
+    /// its historical retry-until-applied behavior. Cleared whenever the
+    /// fleet's wanted geometry changes, and an entry older than
+    /// `PASSIVE_DECLINE_RETRY` reads as absent so a session recovers once its
+    /// blocking attach or size owner goes away.
+    pub(super) passive_pane_declined:
+        std::collections::HashMap<String, ((u16, u16), std::time::Instant)>,
+    /// Per-session `(cols, rows)` handed to the passive-resize worker whose
+    /// completion has not been adopted yet. Gates duplicate queueing; the
+    /// selected-session sync also uses it to cancel a stale queued intent
+    /// when its geometry lands back in sync before the worker picks it up.
+    pub(super) passive_pane_queued: std::collections::HashMap<String, (u16, u16)>,
+    /// The fleet geometry `reconcile_passive_fleet` saw last refresh: one
+    /// `(session_id, cols, rows)` per eligible session, selection-independent
+    /// so cursor movement cannot re-arm the fleet. Resizes fire only once the
+    /// same fleet geometry is wanted on two consecutive refreshes, extending
+    /// the one-frame-toast debounce (`passive_resize_step`) to the whole
+    /// fleet.
+    pub(super) passive_fleet_armed: Option<Vec<(String, u16, u16)>>,
     /// `(session_id, cols, rows)` the NON-live preview sync wants but has only
     /// seen for one refresh so far. The sync fires a resize only once the same
     /// geometry is wanted on two consecutive refreshes: the `EnterLiveSend` /
@@ -426,7 +476,6 @@ pub struct HomeView {
     pub(super) pending_switch_view_session: Option<String>,
     /// Session whose structured-view open is waiting on the "start a
     /// local daemon?" confirm (see `prompt_start_daemon_for_structured`).
-    #[cfg(feature = "serve")]
     pub(super) pending_daemon_start_session: Option<String>,
     /// The structured-view session mounted in the preview pane, if any:
     /// a streaming transcript that `render_preview` paints as the
@@ -435,7 +484,6 @@ pub struct HomeView {
     /// preview renderer, info header, and drag-select all compose with
     /// it; the `App` loop drives its async sides (connect, WS pump,
     /// active-mode key routing).
-    #[cfg(feature = "serve")]
     pub(in crate::tui) structured_preview:
         Option<crate::tui::structured_view::embedded::EmbeddedView>,
     /// True while the App's preview-on-select reconcile has picked a
@@ -443,7 +491,6 @@ pub struct HomeView {
     /// preview renderer shows a quiet placeholder instead of the wordy
     /// "press Enter" page, which otherwise flashes for the connect
     /// window on every selection.
-    #[cfg(feature = "serve")]
     pub(in crate::tui) structured_preview_pending: bool,
     /// Session to force-remove after the confirmation dialog is accepted
     pub(super) pending_force_remove_session: Option<String>,
@@ -486,9 +533,7 @@ pub struct HomeView {
 
     // Structured (ACP) rows: the tmux poller above bails on them, so their
     // status comes from the daemon instead. See `daemon_status_poller`.
-    #[cfg(feature = "serve")]
     pub(super) daemon_status_poller: super::daemon_status_poller::DaemonStatusPoller,
-    #[cfg(feature = "serve")]
     pub(super) pending_daemon_status_refresh: bool,
 
     // Performance: background deletion
@@ -527,6 +572,16 @@ pub struct HomeView {
     /// Suppresses the StatusPoller's missing-tmux Error transition until the
     /// worker reports back via `apply_restart_results`.
     pub(super) restart_in_flight: std::collections::HashSet<String>,
+
+    // Performance: background sandbox store move. A session still on the
+    // shared store copies it before its first launch, which can take
+    // minutes; see `tui::store_move_poller`.
+    store_move_poller: crate::tui::store_move_poller::StoreMovePoller,
+    store_move_in_flight: Option<store_move::StoreMoveInFlight>,
+    /// A session whose container a move found already up. Its next launch
+    /// goes ahead on the shared store instead of deferring to another move,
+    /// which would find the same container and hand the launch back again.
+    store_move_bypass: Option<String>,
 
     // Performance: background attach-a-project (#3103). `git worktree add`, an
     // optional fetch and submodule init, the worker bounce and the container
