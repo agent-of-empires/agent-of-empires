@@ -194,6 +194,23 @@ impl AgentRegistry {
                 env_allowlist: default_env_allowlist("prime-agent"),
             },
         );
+        // DeepSeek Harness `dsh`: the `acp` profile is one of the shipped
+        // profiles upstream, started the same way `headless`/`web`/`tui`
+        // start, by passing `--profile acp` (see `packages/acp/README.md`).
+        // We register it under the `dsh` key to match the agent name in
+        // `src/agents.rs::AGENTS`, so the structured view spawn path can map
+        // `instance.tool = "dsh"` directly to this entry.
+        reg.agents.insert(
+            "dsh".into(),
+            AgentSpec {
+                command: "dsh".into(),
+                args: vec!["--profile".into(), "acp".into()],
+                description:
+                    "DeepSeek Harness `dsh`, native ACP via `dsh --profile acp` (npm i -g @deepseek-ai/dsh)"
+                        .into(),
+                env_allowlist: default_env_allowlist("dsh"),
+            },
+        );
         reg.agents.insert(
             "aoe-agent".into(),
             AgentSpec {

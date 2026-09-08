@@ -1512,7 +1512,23 @@ pub const AGENTS: &[AgentDef] = &[
         // via `AgentConfigMount`, hour 3). The host-side path lives under
         // `$HOME/.dsh`; in-container it is the per-uid mount.
         container_env: &[],
-        hook_config: None,
+        // Status comes from dsh's `hooks-claude-code` package, which runs
+        // the same hook schema as Claude Code. The generic installer handles
+        // the JSON-settings shape unchanged — the only differences from the
+        // Claude entry are the config dir ($DSH_HOME rather than
+        // $CLAUDE_CONFIG_DIR) and the relative path (.dsh/settings.json). The
+        // events list is the canonical Claude event set so PreToolUse writes
+        // Running, Stop writes Idle, Notification handles permission prompts,
+        // etc.; the structured view shows the same lifecycle shapes as a
+        // Claude session. Identity field is the standard SessionId capture,
+        // letting AoE back the pane-scoped sidecar the same way it does for
+        // Claude.
+        hook_config: Some(AgentHookConfig {
+            settings_rel_path: ".dsh/settings.json",
+            config_dir_env_var: Some("DSH_HOME"),
+            events: CLAUDE_HOOK_EVENTS,
+            format: HookFormat::JsonSettings,
+        }),
         sidecar_hooks: None,
         // Resume argv and capture backend are unverified for dsh; leaving
         // `session_support` absent keeps `aoe session capture` and `aoe
@@ -2922,6 +2938,13 @@ mod tests {
             let expected = match agent.name {
                 "claude" => Some(HookIdentityField::SessionId),
                 "cursor" => Some(HookIdentityField::ConversationIdOrSessionId),
+                // dsh's `hooks-claude-code` package runs the Claude Code hook
+                // schema verbatim, so the upstream SessionStart / UserPromptSubmit
+                // payloads still carry a session_id field. Until the field is
+                // confirmed against a real dsh capture we declare the same shape
+                // claude uses; a divergent payload would fail this assertion and
+                // force the call site to pick a more specific field.
+                "dsh" => Some(HookIdentityField::SessionId),
                 _ => None,
             };
             let fields = agent
@@ -3012,6 +3035,10 @@ mod tests {
             install_hint("prime-agent"),
             Some("curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh")
         );
+        assert_eq!(
+            install_hint("dsh"),
+            Some("npm install -g @deepseek-ai/dsh")
+        );
         assert!(install_hint("unknown").is_none());
     }
 
@@ -3026,6 +3053,9 @@ mod tests {
             ("codex", HookFormat::CodexJson),
             ("gemini", HookFormat::JsonSettings),
             ("qwen", HookFormat::JsonSettings),
+            // dsh's hooks-claude-code runs the Claude Code hook schema verbatim,
+            // so the JSON settings.json format applies without modification.
+            ("dsh", HookFormat::JsonSettings),
         ];
         for (name, fmt) in expected {
             let agent = get_agent(name).unwrap_or_else(|| panic!("missing agent {name}"));

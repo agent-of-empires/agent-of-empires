@@ -34,6 +34,10 @@ pub fn install_hint_for(binary: &str) -> Option<&'static str> {
         "prime-agent" => {
             "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh  (then `/login` once)"
         }
+        // dsh is published on npm as @deepseek-ai/dsh; the upstream README
+        // recommends `npm i -g @deepseek-ai/dsh`, which exposes the `dsh`
+        // binary the AoE ACP registration calls (see agent_registry.rs).
+        "dsh" => "npm install -g @deepseek-ai/dsh  (then `dsh --profile acp`)",
         _ => return None,
     })
 }
@@ -169,6 +173,7 @@ mod tests {
             "kimi",
             "omp",
             "prime-agent",
+            "dsh",
         ] {
             assert!(
                 install_hint_for(binary).is_some(),
