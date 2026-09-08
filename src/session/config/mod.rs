@@ -956,6 +956,20 @@ pub struct SessionConfig {
     #[setting(label = "Show system health strip", widget = "toggle")]
     pub show_diagnostics_pane: bool,
 
+    /// Read the session state the `aoe serve` daemon owns (structured session
+    /// status) from the running daemon, the way the web dashboard does, instead
+    /// of from the local session store. With no daemon running the sidebar uses
+    /// the local store alone and daemon-owned state keeps its last value. Off
+    /// keeps the sidebar on the local store only.
+    #[serde(default = "default_true")]
+    #[setting(
+        label = "Daemon-sourced sidebar",
+        widget = "toggle",
+        global_only,
+        advanced
+    )]
+    pub daemon_sidebar: bool,
+
     /// Forward AoE's whole environment to host sessions instead of just the
     /// desktop vars (DISPLAY, XDG_*, DBUS). Lets vars like GOPATH reach an
     /// agent without naming each one in the Host Environment list. AoE's own
@@ -1675,6 +1689,7 @@ impl Default for SessionConfig {
             yolo_mode_default: false,
             pre_trust_agent_folders: false,
             show_diagnostics_pane: false,
+            daemon_sidebar: true,
             inherit_host_environment: false,
             agent_extra_args: HashMap::new(),
             agent_command_override: HashMap::new(),
