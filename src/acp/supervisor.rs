@@ -2149,11 +2149,8 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// respawn only when no newer generation has been admitted since it was
     /// written; anything else is stale authority and is discarded.
     pub fn take_late_restart_marker(&self, session_id: &str) -> bool {
-        if !crate::process::worker_registry::restart_marker_present(session_id) {
-            return false;
-        }
-        let Some(marker) = crate::process::worker_registry::peek_restart_marker(session_id) else {
-            crate::process::worker_registry::clear_restart_marker(session_id);
+        let Some(Some(marker)) = crate::process::worker_registry::claim_restart_marker(session_id)
+        else {
             return false;
         };
         let on_disk = crate::process::worker_registry::load(session_id)
@@ -2167,7 +2164,6 @@ impl<S: BroadcastSink> Supervisor<S> {
         // A zero marker was written for a runner from a pre-generation
         // build; it is honored only while nothing newer has been admitted.
         let honored = marker >= known;
-        crate::process::worker_registry::clear_restart_marker(session_id);
         if !honored {
             debug!(
                 target: "acp.supervisor",

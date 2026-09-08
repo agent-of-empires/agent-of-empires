@@ -210,17 +210,25 @@ pub fn any_live_runner_for(agent_binary: &str) -> bool {
     })
 }
 
-/// Whether a restart marker file exists, malformed or not. One stat, for
-/// the reconciler's per-tick probe of pinned sessions.
-pub fn restart_marker_present(session_id: &str) -> bool {
-    restart_marker_path(session_id).is_ok_and(|p| p.exists())
-}
-
 /// Generation named by the marker, without consuming it. `None` when
 /// there is no marker or it names no generation.
 pub fn peek_restart_marker(session_id: &str) -> Option<u64> {
     let path = restart_marker_path(session_id).ok()?;
     crate::process::worker::read_restart_marker(&path)
+}
+
+/// Consume the marker atomically: it is renamed aside before it is read,
+/// so a marker written for a newer runner between the read and the delete
+/// is left for its own consumer instead of being erased. `None` when
+/// there was no marker; `Some(None)` for one that names no generation. One
+/// failed rename for the reconciler's per-tick probe of pinned sessions.
+pub fn claim_restart_marker(session_id: &str) -> Option<Option<u64>> {
+    let path = restart_marker_path(session_id).ok()?;
+    let claim = path.with_extension(format!("restart.claim-{}", std::process::id()));
+    std::fs::rename(&path, &claim).ok()?;
+    let generation = crate::process::worker::read_restart_marker(&claim);
+    let _ = std::fs::remove_file(&claim);
+    Some(generation)
 }
 
 /// Consume the marker. Returns `true` only when it named `generation`; a
@@ -229,9 +237,7 @@ pub fn peek_restart_marker(session_id: &str) -> Option<u64> {
 /// upgrade. The file is removed either way so a stale marker cannot poison
 /// a later stop.
 pub fn take_restart_marker(session_id: &str, generation: u64) -> bool {
-    let found = peek_restart_marker(session_id);
-    clear_restart_marker(session_id);
-    found == Some(generation)
+    claim_restart_marker(session_id).flatten() == Some(generation)
 }
 
 pub fn clear_restart_marker(session_id: &str) {
@@ -1400,6 +1406,21 @@ mod tests {
                 None,
                 "an empty legacy marker is unbound"
             );
+            assert_eq!(
+                claim_restart_marker("m"),
+                Some(None),
+                "a malformed marker is claimed and reported unbound"
+            );
+            assert!(!path.exists(), "a claim leaves nothing behind");
+            assert_eq!(claim_restart_marker("m"), None, "nothing left to claim");
+
+            // A marker written after a claim is a newer runner's authority
+            // and survives it.
+            mark_restart_pending("m", 8);
+            let claimed = claim_restart_marker("m");
+            mark_restart_pending("m", 9);
+            assert_eq!(claimed, Some(Some(8)));
+            assert_eq!(peek_restart_marker("m"), Some(9));
             clear_restart_marker("m");
             assert!(!path.exists());
         });
