@@ -13,7 +13,7 @@ pub use container_interface::{
     ContainerConfig, EnvEntry, NamedVolumeMount, RunPolicy, VolumeMount,
 };
 use error::Result;
-pub use runtime::ContainerRuntime;
+pub use runtime::{ContainerRuntime, ContainerState};
 
 /// Returns the CLI binary name for the configured container runtime.
 pub fn runtime_binary() -> &'static str {
@@ -27,6 +27,10 @@ pub fn runtime_binary() -> &'static str {
         "docker"
     }
 }
+
+/// Name prefix every aoe sandbox container carries. Also the filter a batch
+/// listing passes to the runtime, so the two cannot drift.
+pub const SANDBOX_NAME_PREFIX: &str = "aoe-sandbox-";
 
 pub fn get_container_runtime() -> ContainerRuntime {
     if let Ok(cfg) = Config::load() {
@@ -44,7 +48,7 @@ pub fn get_container_runtime() -> ContainerRuntime {
 /// Returns a map of container name -> is_running.
 pub fn batch_container_health() -> HashMap<String, bool> {
     let start = std::time::Instant::now();
-    let map = get_container_runtime().batch_running_states("aoe-sandbox-");
+    let map = get_container_runtime().batch_running_states(SANDBOX_NAME_PREFIX);
     tracing::debug!(
         target: "containers.runtime",
         count = map.len(),
@@ -54,12 +58,27 @@ pub fn batch_container_health() -> HashMap<String, bool> {
     map
 }
 
+/// The listed state of every aoe sandbox container, in a single subprocess
+/// call. See [`ContainerRuntime::batch_container_states`] for what an absent
+/// name means.
+pub fn batch_container_states() -> HashMap<String, ContainerState> {
+    let start = std::time::Instant::now();
+    let map = get_container_runtime().batch_container_states(SANDBOX_NAME_PREFIX);
+    tracing::debug!(
+        target: "containers.runtime",
+        count = map.len(),
+        duration_ms = start.elapsed().as_millis() as u64,
+        "batch container states fetched",
+    );
+    map
+}
+
 /// Resource usage of every aoe sandbox container, in a single subprocess call.
 /// Returns a map of container name -> stats; a container the runtime has no
 /// usable sample for is absent rather than zeroed.
 pub fn batch_container_stats() -> stats::StatsMap {
     let start = std::time::Instant::now();
-    let map = get_container_runtime().batch_stats("aoe-sandbox-");
+    let map = get_container_runtime().batch_stats(SANDBOX_NAME_PREFIX);
     tracing::debug!(
         target: "containers.runtime",
         count = map.len(),
@@ -142,7 +161,7 @@ impl DockerContainer {
     }
 
     pub fn generate_name(session_id: &str) -> String {
-        format!("aoe-sandbox-{}", truncate_id(session_id, 8))
+        format!("{SANDBOX_NAME_PREFIX}{}", truncate_id(session_id, 8))
     }
 
     pub fn from_session_id(session_id: &str) -> Self {

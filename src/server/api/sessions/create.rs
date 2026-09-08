@@ -1246,6 +1246,11 @@ pub(super) fn apply_post_restart_identity_sync(
     {
         live.resume_probe_failed_sid = started.resume_probe_failed_sid.clone();
     }
+    // A running restart poller means the working clone's repair schedule was
+    // cleared on start; the live row must not keep the stale backoff.
+    if started.session_id_poller_is_running() {
+        live.poller_repair.reset();
+    }
     live.lifecycle_generation = started.lifecycle_generation;
 }
 

@@ -907,6 +907,9 @@ pub struct Quiesced {
     /// A structured worker was signalled to stop. Its restart marker is
     /// deliberately not written here; see [`quiesce_for_conversion`].
     pub worker_was_running: bool,
+    /// Generation of the stopped worker, so the restart marker written after
+    /// the move authorizes only that runner's respawn.
+    pub worker_generation: u64,
     /// The tmux session was killed, so the pane has to be recreated. Recreated
     /// rather than left alone because the pane's shell (and the agent in it) was
     /// launched in the directory the conversion moves.
@@ -936,6 +939,7 @@ pub fn quiesce_for_conversion(storage: &Storage, instance: &super::Instance) -> 
         crate::process::worker_registry::delete(&instance.id).ok();
         crate::process::worker::terminate_process_group(record.pid);
         quiesced.worker_was_running = true;
+        quiesced.worker_generation = record.generation;
     }
 
     if instance.tmux_session().is_ok_and(|s| s.exists()) {
@@ -1014,7 +1018,10 @@ pub fn resume_after_conversion(
     }
 
     if quiesced.worker_was_running {
-        crate::process::worker_registry::mark_restart_pending(session_id);
+        crate::process::worker_registry::mark_restart_pending(
+            session_id,
+            quiesced.worker_generation,
+        );
     }
 
     warnings

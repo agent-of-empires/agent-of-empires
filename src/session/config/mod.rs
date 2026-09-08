@@ -652,8 +652,7 @@ impl Default for AcpConfig {
     }
 }
 
-/// Built-in `acp.default_agent`. `aoe-agent` is not packaged yet (#3553), so
-/// the default has to be an adapter `aoe acp doctor --fix` can install.
+/// Built-in `acp.default_agent`.
 pub const DEFAULT_ACP_AGENT: &str = "claude-code";
 
 fn default_agent() -> String {
@@ -1195,6 +1194,23 @@ pub struct SessionConfig {
     )]
     pub snooze_duration_minutes: u32,
 
+    /// Ceiling on concurrent session-id poller threads in one aoe process
+    /// (the daemon or a TUI). Each poller keeps one session's agent
+    /// session id live; with more live sessions than this, the overflow's
+    /// ids stop refreshing until another session stops. Process-wide:
+    /// applied once at startup from the effective config of the profile the
+    /// process was launched with, so a change takes effect on the next
+    /// start. 0 keeps the default (50).
+    #[serde(default = "default_session_id_poller_max_threads")]
+    #[setting(
+        label = "Session-id poller threads (restart req.)",
+        widget = "number",
+        min = 0,
+        global_only,
+        advanced
+    )]
+    pub session_id_poller_max_threads: u32,
+
     /// Move deleted sessions to the trash instead of purging them
     /// immediately. When enabled (default), `delete`/`rm` and the TUI/web
     /// delete actions stop the session and hide it in a recoverable trash
@@ -1677,6 +1693,7 @@ impl Default for SessionConfig {
             agent_acp_cmd: HashMap::new(),
             strict_hotkeys: false,
             snooze_duration_minutes: 30,
+            session_id_poller_max_threads: default_session_id_poller_max_threads(),
             delete_to_trash: true,
             confirm_delete: true,
             trash_retention_days: default_trash_retention_days(),
@@ -1703,6 +1720,10 @@ impl Default for SessionConfig {
 
 fn default_snooze_duration_minutes() -> u32 {
     30
+}
+
+fn default_session_id_poller_max_threads() -> u32 {
+    crate::session::poller::DEFAULT_SESSION_ID_POLLER_MAX_THREADS
 }
 
 fn default_trash_retention_days() -> u32 {
@@ -2702,11 +2723,12 @@ pub struct TmuxConfig {
     )]
     pub socket_name: Option<String>,
 
-    /// Render native agent and tool previews from a persistent VT channel
-    /// (`tmux pipe-pane` into an in-process terminal grid) instead of polling
-    /// `capture-pane` and forking `send-keys` per keystroke. Terminal previews,
-    /// including the web terminal, always use tmux's rendered capture and keep
-    /// OSC 52 forwarding through a raw observer.
+    /// Render agent previews and the web dashboard's agent terminal from a
+    /// persistent VT channel (`tmux pipe-pane` into an in-process terminal
+    /// grid) instead of polling `capture-pane` and forking `send-keys` per
+    /// keystroke. The paired host and container shells, split windows, and
+    /// every fallback keep tmux's rendered capture, with OSC 52 forwarding
+    /// through a raw observer.
     #[serde(default = "default_true")]
     #[setting(label = "VT Live Transport", widget = "toggle", advanced, global_only)]
     pub vt_live: bool,
@@ -3914,6 +3936,15 @@ mod tests {
     }
 
     // Tests for Config defaults
+    #[test]
+    fn session_id_poller_max_threads_defaults_and_parses() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.session.session_id_poller_max_threads, 50);
+        let config: Config =
+            toml::from_str("[session]\nsession_id_poller_max_threads = 400\n").unwrap();
+        assert_eq!(config.session.session_id_poller_max_threads, 400);
+    }
+
     #[test]
     fn test_config_default() {
         let config = Config::default();

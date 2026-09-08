@@ -68,6 +68,7 @@ pub use flags::{is_valid_session_color, SessionBucket, SESSION_COLORS};
 pub(crate) use lifecycle::NEWER_GENERATION_BUSY_REASON;
 pub use lifecycle::{LifecycleOperation, LifecycleReservation, LifecycleReservationError};
 pub(crate) use omp::persist_omp_session_to_storage;
+pub use polling::PollerStart;
 pub use ready::{EnsureReadyError, EnsureReadyOutcome};
 pub(crate) use resume::ResumeAttemptPolicy;
 pub(crate) use sid_persist::{persist_session_to_storage, SidPersistOutcome, SidWrite};
@@ -367,12 +368,12 @@ pub struct Instance {
     /// pre-existing rows deserialising unchanged, so no migration is needed.
     /// Only the structured-view resume path populates it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub pending_initial_turn_attachments: Vec<crate::acp::state::PromptAttachmentRef>,
+    pub pending_initial_turn_attachments: Vec<crate::daemon::PromptAttachmentRef>,
 
     /// Server-owned follow-ups, ordered by `QueuedPromptEntry::seq`. Persisted
     /// here so the daemon can drain them without a connected client.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub queued_prompts: Vec<crate::acp::state::QueuedPromptEntry>,
+    pub queued_prompts: Vec<crate::daemon::QueuedPromptEntry>,
 
     /// Monotonic counter for `QueuedPromptEntry::seq`, so ordering is stable
     /// even after rows drain or are removed. Never reused within a session.
@@ -674,6 +675,12 @@ pub struct Instance {
     pub last_error: Option<String>,
     #[serde(skip)]
     pub session_id_poller: Option<Arc<Mutex<SessionPoller>>>,
+    /// Retry schedule for replacing a missing session-id poller when the
+    /// process-wide thread budget (or a start failure) blocked the last
+    /// attempt. Runtime-only; carried across reloads like the poller.
+    #[serde(skip)]
+    pub(crate) poller_repair: crate::session::poller::PollerRepairBackoff,
+
     /// Runtime backoff after managed-store ownership or lease contention.
     #[serde(skip)]
     pub(crate) session_id_poller_retry_after: Option<std::time::Instant>,

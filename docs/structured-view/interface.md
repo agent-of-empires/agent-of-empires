@@ -22,7 +22,8 @@ stay in sync.
   you already have running). The TUI does not start a daemon for you, so
   the choice between localhost, tunnel, and named tunnel stays explicit.
 - **Sessions started in tmux mode** work in both surfaces. The TUI
-  attaches to the pane; the dashboard renders the pane via xterm.js.
+  attaches to the pane; the dashboard streams the pane's rendered rows and
+  draws them as text (see [Terminal view](../guides/web/terminal.md)).
 - **Switching views** (the per-session "Switch to terminal" / "Switch to
   structured view" action in the web sidebar or the TUI context menu)
   keeps the git worktree, files on disk, and any commits. For a **claude**

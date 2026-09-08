@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { pickWorkerStoppedVariant } from "./workerStoppedBanner";
+import { pickWorkerStoppedVariant, showWorkerStoppingBanner } from "./workerStoppedBanner";
 
 describe("pickWorkerStoppedVariant", () => {
   it("returns 'none' when the worker is not stopped", () => {
@@ -162,5 +162,28 @@ describe("pickWorkerStoppedVariant", () => {
         snoozedUntil: "2099-01-01T00:00:00Z",
       }),
     ).toBe("snoozed");
+  });
+});
+
+describe("worker stopping (#3487)", () => {
+  it("yields the generic stopped banner to the stopping banner, but not the triage ones", () => {
+    const base = { workerStopped: true, startupError: null, trashedAt: null, archivedAt: null, snoozedUntil: null };
+    expect(pickWorkerStoppedVariant({ ...base, workerStopping: true })).toBe("none");
+    expect(pickWorkerStoppedVariant({ ...base, workerStopping: false })).toBe("generic");
+    expect(pickWorkerStoppedVariant({ ...base, workerStopping: true, archivedAt: "2026-01-01T00:00:00Z" })).toBe(
+      "archived",
+    );
+  });
+
+  it("shows the stopping banner only while stopping and without a startup error", () => {
+    const cases: Array<[string, string | null, boolean]> = [
+      ["stopping", null, true],
+      ["stopping", "missing API key", false],
+      ["resuming", null, false],
+      ["absent", null, false],
+    ];
+    for (const [acpWorkerState, startupError, expected] of cases) {
+      expect(showWorkerStoppingBanner({ acpWorkerState, startupError })).toBe(expected);
+    }
   });
 });

@@ -396,9 +396,26 @@ async fn run(
     // TUI mode handles migrations with a spinner. CLI commands report progress
     // on stderr only when a migration actually does work, so a quick command
     // stays quiet and a long store move never looks like a hang.
+    // Hidden machine-spawned subcommands get no reporter, so nothing lands in
+    // a detached worker's redirected stderr; see the `command_name` gate below.
     if cli.command.is_some() {
-        migrations::run_migrations_with(Some(cli::migrate::stderr_reporter()))?;
+        let reporter = cli
+            .command
+            .as_ref()
+            .and_then(cli::command_name)
+            .is_some()
+            .then(cli::migrate::stderr_reporter);
+        migrations::run_migrations_with(reporter)?;
     }
+
+    // Process-wide poller budget: the daemon and every TUI each run their own
+    // set of session-id poller threads, capped per process. Applied from the
+    // launch profile's effective config (global plus that profile's override,
+    // which is where the dashboard persists it) before any session is loaded,
+    // so the first repair walk already sees the configured ceiling.
+    agent_of_empires::session::poller::configure_session_id_poller_max_threads(
+        agent_of_empires::session::poller::configured_session_id_poller_max_threads(&profile),
+    );
 
     // Surface config diagnostics on stderr for user-visible CLI commands
     // (`add`/`list`/`ps`/`status`/`session`/`remove`/`send`/`killall`/`group`/
@@ -448,6 +465,9 @@ async fn run(
         Some(Commands::Cityhall { command }) => cli::cityhall::run(command),
         Some(Commands::Serve(args)) => cli::serve::run(&profile, args).await,
         Some(Commands::Url(args)) => cli::url::run(args),
+        // After the migration prework: a pending store transition is finished
+        // by then, so the pass is not refused for work `aoe` was about to do.
+        Some(Commands::Sandbox { command }) => cli::sandbox::run(command),
         Some(Commands::Acp { command }) => cli::acp::run(command).await,
         Some(Commands::AcpRunner(args)) => agent_of_empires::process::runner::run(*args).await,
         None => {

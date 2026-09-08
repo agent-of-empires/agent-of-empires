@@ -20,10 +20,9 @@ pub(super) fn runner_socket_deadline() -> std::time::Duration {
     if let Ok(raw) = std::env::var("AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS") {
         if let Ok(ms) = raw.parse::<u64>() {
             // Clamp to a floor of 100ms so a typo like
-            // `AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS=0` does not make
-            // wait_for_socket fail immediately and surface as a
-            // mysterious "runner socket did not appear" without ever
-            // polling.
+            // `AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS=0` does not make the
+            // control dial fail before it has retried even once, surfacing
+            // as a mysterious "does not speak control protocol".
             return std::time::Duration::from_millis(ms.max(100));
         }
     }
@@ -69,8 +68,7 @@ pub(super) fn spawn_runner_detached(
     socket_path: &std::path::Path,
     session_id: String,
     session_sandbox: Option<&SessionSandbox>,
-) -> Result<(), AcpError> {
-    use std::process::Command as StdCommand;
+) -> Result<u32, AcpError> {
     let current_exe =
         std::env::current_exe().map_err(|e| AcpError::Spawn(format!("current_exe: {e}")))?;
     let log_path = crate::process::worker_registry::log_path_for(&session_id)
@@ -143,7 +141,7 @@ pub(super) fn spawn_runner_detached(
             (None, None) => (config.spec.command.clone(), Vec::new()),
         };
 
-    let mut cmd = StdCommand::new(&current_exe);
+    let mut cmd = tokio::process::Command::new(&current_exe);
     cmd.arg("__acp-runner")
         .arg("--socket")
         .arg(socket_path)
@@ -179,6 +177,7 @@ pub(super) fn spawn_runner_detached(
     if let Some(stored) = &config.stored_acp_session_id {
         cmd.arg("--stored-acp-session-id").arg(stored);
     }
+    cmd.arg("--generation").arg(config.generation.to_string());
     cmd.arg("--");
     if let Some(s) = &sandbox_argv {
         cmd.arg(&s.docker_binary);
@@ -201,7 +200,7 @@ pub(super) fn spawn_runner_detached(
     // filter pass needed). AOE_TOKEN is stripped here so it never reaches
     // either process.
     cmd.env_clear();
-    apply_env_filter(&mut cmd, config);
+    apply_env_filter(cmd.as_std_mut(), config);
     // Trusted `Config.environment`, destined for the adapter only. It rides
     // one reserved carrier key rather than the runner's own environment
     // because HOME / PATH / XDG_CONFIG_HOME are legal entries here: setting
@@ -270,7 +269,6 @@ pub(super) fn spawn_runner_detached(
     // own signal handlers.
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt;
         unsafe {
             cmd.pre_exec(|| {
                 nix::unistd::setsid().map_err(std::io::Error::other)?;
@@ -297,7 +295,7 @@ pub(super) fn spawn_runner_detached(
         "spawning detached structured view runner"
     );
 
-    cmd.spawn().map_err(|e| {
+    let mut child = cmd.spawn().map_err(|e| {
         warn!(
             target: "acp.protocol.spawn",
             session = %session_id,
@@ -305,39 +303,14 @@ pub(super) fn spawn_runner_detached(
         );
         AcpError::Spawn(format!("spawn runner: {e}"))
     })?;
-    // Drop the std::process::Child here. std::process::Command doesn't
-    // wait on drop, so the runner stays alive. setsid + nohup-equivalent
-    // make this an actual detach.
-    Ok(())
-}
-
-/// Poll the socket file's existence with `connect()` until a deadline.
-/// Used by `connect_via_socket` to wait for the runner to finish binding
-/// before the daemon dials in.
-pub(super) async fn wait_for_socket(
-    path: &std::path::Path,
-    deadline: std::time::Duration,
-) -> Result<tokio::net::UnixStream, AcpError> {
-    let started = std::time::Instant::now();
-    let mut delay_ms = 20_u64;
-    loop {
-        if path.exists() {
-            match tokio::net::UnixStream::connect(path).await {
-                Ok(s) => return Ok(s),
-                Err(e) if matches!(e.kind(), std::io::ErrorKind::ConnectionRefused) => {
-                    // Listener not yet ready; back off and retry.
-                }
-                Err(e) => return Err(AcpError::Spawn(format!("connect {}: {e}", path.display()))),
-            }
-        }
-        if started.elapsed() >= deadline {
-            return Err(AcpError::Spawn(format!(
-                "runner socket {} did not appear within {}s",
-                path.display(),
-                deadline.as_secs()
-            )));
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-        delay_ms = (delay_ms * 2).min(200);
-    }
+    let pid = child
+        .id()
+        .ok_or_else(|| AcpError::Spawn("runner exited before it could be identified".into()))?;
+    // setsid above detaches the runner; reap it on exit so a finished runner
+    // does not linger as a zombie that still answers `kill(pid, 0)`, which
+    // would keep a teardown from ever proving the process gone.
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
+    Ok(pid)
 }

@@ -36,10 +36,11 @@
             # assets/pi, the extension src/session/instance.rs materializes so
             # pi can publish its own conversation id, and
             # docker/Dockerfile, which the agent_compat test embeds to pin the
-            # sandbox npm floor, and acp-worker/aoe-agent/package.json, which
-            # the acp::node test embeds to pin `engines.node` to
-            # MIN_NODE_MAJOR (the aoe-test and aoe-clippy checks compile test
-            # code, so they need these even though the packages do not).
+            # sandbox npm floor, and acp-worker/aoe-agent (manifest, lock and
+            # sources), which src/acp/adapters.rs embeds to install the
+            # in-tree agent and the acp::node test reads to pin `engines.node`
+            # to the Node floor (the aoe-test and aoe-clippy checks compile
+            # test code, so they need these even though the packages do not).
             # `scripts/check-nix-embedded-assets.py` fails CI if a new embedded
             # asset lands without being added here.
             src = pkgs.lib.fileset.toSource {
@@ -48,6 +49,8 @@
                 (craneLib.fileset.commonCargoSources ./.)
                 ./acp-worker/adapters
                 ./acp-worker/aoe-agent/package.json
+                ./acp-worker/aoe-agent/package-lock.json
+                ./acp-worker/aoe-agent/src
                 ./assets
                 ./docker
               ];
@@ -81,7 +84,9 @@
                 Supports Claude Code, OpenCode, Mistral Vibe, Codex CLI, and Gemini CLI.
               '';
               homepage = "https://github.com/agent-of-empires/agent-of-empires";
-              license = licenses.mit;
+              # MIT throughout, plus Apache-2.0 for the herdr-derived state
+              # machine in src/tui/hyperlink.rs (see THIRD_PARTY_NOTICES.md).
+              license = with licenses; [ mit asl20 ];
               platforms = platforms.unix;
               mainProgram = "aoe";
             };
@@ -97,7 +102,7 @@
             pname = "agent-of-empires-web";
             version = "0";
             src = ./web;
-            npmDepsHash = "sha256-io9zO/wjWtpdGSBLiRhLouf7qexAsBHb27GZ317r89M=";
+            npmDepsHash = "sha256-BPXewTk9mR3evSa3U7MXin2oe8XkKMPcVqsAGDGlsD0=";
             # tsc -b && vite build; output goes to web/dist
             installPhase = ''
               mkdir $out

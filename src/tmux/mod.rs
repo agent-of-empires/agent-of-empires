@@ -3,6 +3,7 @@
 pub(crate) mod composite;
 pub(crate) mod detect;
 pub(crate) mod env;
+pub(crate) mod osc8;
 mod session;
 pub mod status_bar;
 pub(crate) mod status_detection;
@@ -24,7 +25,37 @@ pub use status_detection::{
 };
 pub use terminal_session::{kill_all_terminals_for_id, ContainerTerminalSession, TerminalSession};
 pub use tool_session::{kill_all_tool_sessions_for_id, ToolSession};
-pub use utils::tmux_prefix_display;
+pub use utils::{attach_return_hint, tmux_prefix_display};
+
+/// OSC 8 hyperlinks the live VT channel for `session` has seen, oldest first.
+/// Always empty off unix, where there is no channel and the capture fallback
+/// carries the sequences in the frame text.
+/// How many times `session`'s advertised links have changed. Zero off unix and
+/// whenever no channel is armed, which is stable, so a consumer comparing it
+/// against its own copy simply never re-collects on those transports.
+pub(crate) fn pane_links_generation(session: &str) -> u64 {
+    #[cfg(unix)]
+    {
+        vt::pane_links_generation(session)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = session;
+        0
+    }
+}
+
+pub(crate) fn pane_links(session: &str) -> Vec<osc8::PaneLink> {
+    #[cfg(unix)]
+    {
+        vt::pane_links(session)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = session;
+        Vec::new()
+    }
+}
 
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]

@@ -182,7 +182,9 @@ describe("DeleteSessionDialog keyboard affordances", () => {
     expect(container.textContent).toMatch(/Removes the workspace worktree for branch "feature\/foo"/);
     expect(container.textContent).toMatch(/Removes the workspace branch "feature\/foo"/);
     expect(container.textContent).toMatch(/Delete containers/);
-    expect(container.textContent).toMatch(/Removes Docker sandbox containers for all sessions in this workspace/);
+    expect(container.textContent).toMatch(
+      /Removes Docker sandbox containers, and any private agent store, for all sessions in this workspace/,
+    );
     expect(container.textContent).toMatch(/Keep scratch directories/);
     expect(container.textContent).toMatch(/Leaves scratch directories on disk; session records are still removed/);
   });
@@ -197,7 +199,7 @@ describe("DeleteSessionDialog keyboard affordances", () => {
     });
 
     expect(container.textContent).toMatch(
-      /Removes Docker sandbox containers for 1 sandboxed session in this workspace/,
+      /Removes Docker sandbox containers, and any private agent store, for 1 sandboxed session in this workspace/,
     );
   });
 
@@ -331,6 +333,14 @@ describe("DeleteSessionDialog keyboard affordances", () => {
       delete_sandbox: true,
       force_delete: false,
     });
+  });
+
+  it("says the sandbox checkbox removes the agent store, not just the container", () => {
+    const { container } = setup({ hasManagedWorktree: false, isSandboxed: true });
+
+    expect(container.textContent).toMatch(
+      /Removes the Docker sandbox container and any private agent store it has \(including the saved agent login\)/,
+    );
   });
 
   it("no-options session (no worktree, no sandbox) confirms with an all-false body", () => {

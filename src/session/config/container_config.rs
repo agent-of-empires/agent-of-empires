@@ -824,6 +824,57 @@ pub(crate) fn sandbox_store_migration_paths(
     }
     Ok(paths)
 }
+
+/// Every private store root an agent can own: one per config mount, or the
+/// single declared root when the profile points the agent elsewhere. This is
+/// the directory whose children are per-instance stores.
+pub(crate) fn sandbox_store_roots(
+    tool: &str,
+    home: &Path,
+    declared_config_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for mount in AGENT_CONFIG_MOUNTS
+        .iter()
+        .filter(|mount| mount.tool_name == tool)
+    {
+        let root = declared_config_dir
+            .map(|dir| dir.join(SANDBOX_PRIVATE_SUBDIR))
+            .unwrap_or_else(|| home.join(mount.host_rel).join(SANDBOX_PRIVATE_SUBDIR));
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
+/// Every private store one instance owns. [`sandbox_store_dir`] answers for
+/// the mount an agent launches from; reclaiming has to reach the rest too,
+/// since agents such as OpenCode mount config and data separately.
+pub(crate) fn sandbox_store_dirs(
+    tool: &str,
+    home: &Path,
+    declared_config_dir: Option<&Path>,
+    instance_id: &str,
+) -> Result<Vec<PathBuf>> {
+    crate::session::validate_instance_id(instance_id)?;
+    Ok(sandbox_store_roots(tool, home, declared_config_dir)
+        .into_iter()
+        .map(|root| root.join(instance_id))
+        .collect())
+}
+
+/// Tool names with a config mount, deduplicated in table order.
+pub(crate) fn agent_config_mount_tools() -> Vec<&'static str> {
+    let mut tools: Vec<&'static str> = Vec::new();
+    for mount in AGENT_CONFIG_MOUNTS {
+        if !tools.contains(&mount.tool_name) {
+            tools.push(mount.tool_name);
+        }
+    }
+    tools
+}
+
 /// Seed a newly isolated Codex home from the legacy shared sandbox only for the
 /// credential that prior AoE versions migrated there. SQLite state is deliberately
 /// not copied: it is process-local and is the source of the single-instance lock.
@@ -1340,7 +1391,7 @@ fn refresh_codex_sandbox_hooks(
             return;
         }
     };
-    if let Err(e) = crate::hooks::install_hooks(
+    if let Err(e) = crate::hooks::install_codex_json_hooks(
         &hooks_path,
         &events,
         crate::hooks::HookInstallTarget::Sandbox,
@@ -2167,8 +2218,14 @@ pub(crate) fn build_container_config(
                         });
                 if let Some(settings_file) = settings_file {
                     let result = match hook_cfg.format {
-                        crate::agents::HookFormat::CodexJson
-                        | crate::agents::HookFormat::JsonSettings => crate::hooks::install_hooks(
+                        crate::agents::HookFormat::CodexJson => {
+                            crate::hooks::install_codex_json_hooks(
+                                &settings_file,
+                                &events,
+                                crate::hooks::HookInstallTarget::Sandbox,
+                            )
+                        }
+                        crate::agents::HookFormat::JsonSettings => crate::hooks::install_hooks(
                             &settings_file,
                             &events,
                             crate::hooks::HookInstallTarget::Sandbox,
@@ -5961,6 +6018,33 @@ trusted_hash = "keep"
         );
         assert!(hooks_text.contains("aoe-hooks"));
         crate::hooks::cleanup_hook_status_dir(instance_id);
+    }
+
+    #[test]
+    fn test_refresh_codex_sandbox_hooks_honors_codex_feature_opt_out() {
+        let temp = TempDir::new().unwrap();
+        let profile_config = crate::session::config::Config::default();
+        let mount = AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|mount| mount.tool_name == "codex")
+            .unwrap();
+
+        let writes = [
+            ("hooks-off", "[features]\nhooks = false\n"),
+            ("legacy-hooks-off", "[features]\ncodex_hooks = false\n"),
+            ("hooks-on", "[features]\nhooks = true\n"),
+        ]
+        .map(|(case, config)| {
+            let sandbox_dir = temp.path().join(case);
+            fs::create_dir_all(&sandbox_dir).unwrap();
+            fs::write(sandbox_dir.join("config.toml"), config).unwrap();
+
+            refresh_codex_sandbox_hooks(mount, &sandbox_dir, &profile_config);
+
+            sandbox_dir.join("hooks.json").exists()
+        });
+
+        assert_eq!(writes, [false, false, true]);
     }
 
     #[test]

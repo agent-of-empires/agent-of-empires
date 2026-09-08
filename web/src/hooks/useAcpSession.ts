@@ -42,7 +42,6 @@ import {
   STATE_TTL_MS,
   clearQueueCount,
   setQueueCount,
-  setRateLimit,
   type PersistedEntry,
 } from "../lib/acpStateStorage";
 import { getToken } from "../lib/token";
@@ -223,7 +222,6 @@ function persistState(sessionId: string, state: AcpState): void {
   } satisfies PersistedEntry);
   if (safeSetItem(key, body)) {
     setQueueCount(sessionId, state.queuedPrompts.length);
-    setRateLimit(sessionId, state.rateLimit);
     return;
   }
   // Storage write failed (likely QuotaExceeded). Evict a single oldest
@@ -233,7 +231,6 @@ function persistState(sessionId: string, state: AcpState): void {
   if (!evictOldestPersistedAcpState(key)) return;
   if (safeSetItem(key, body)) {
     setQueueCount(sessionId, state.queuedPrompts.length);
-    setRateLimit(sessionId, state.rateLimit);
   }
 }
 
@@ -933,7 +930,7 @@ export function useAcpSession(
    *  When not `"running"`, the drain effect parks queued prompts so they
    *  don't dispatch into a worker that isn't online yet. Defaults to
    *  `"running"` so non-structured view / pre-#1088 call sites keep working. */
-  workerState: "absent" | "resuming" | "running" = "running",
+  workerState: "absent" | "resuming" | "running" | "stopping" = "running",
   /** RFC3339 archived-at, or null. `sendPrompt` clears this server-side
    *  (via PATCH /api/sessions/{id}/archive) before enqueueing so the
    *  reconciler stops skipping the session and respawns the worker.
@@ -1668,7 +1665,9 @@ export function useAcpSession(
   }, [sessionId, fetchReplay, clearRetryTimers]);
 
   const resolveApproval = useCallback(
-    async (nonce: string, decision: ApprovalDecision) => {
+    // `optionId` answers with the agent's own option instead of letting
+    // the daemon pick by option kind.
+    async (nonce: string, decision: ApprovalDecision, optionId?: string) => {
       if (!sessionId) return;
       try {
         const res = await fetch(
@@ -1676,7 +1675,7 @@ export function useAcpSession(
           {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ decision }),
+            body: JSON.stringify(optionId === undefined ? { decision } : { decision, option_id: optionId }),
           },
         );
         const detail = res.ok ? "" : await safeText(res);

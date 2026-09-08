@@ -1,14 +1,16 @@
 # Terminal View
 
-For tmux-backed sessions the dashboard renders a real terminal in the page: the agent's pane streamed over a WebSocket PTY relay, plus an optional paired shell. This page covers both terminals, reconnect behavior, and the close codes you may see when a connection fails. For the structured-view rendering used by ACP sessions, see the [Structured view overview](../../structured-view.md).
+For tmux-backed sessions the dashboard renders the agent's pane as a live terminal in the page, plus an optional paired shell. This page covers both terminals, how they are streamed, reconnect behavior, and the close codes you may see when a connection fails. For the structured-view rendering used by ACP sessions, see the [Structured view overview](../../structured-view.md).
 
-![The agent terminal rendered in the browser via the PTY relay](../../assets/web/terminal.png)
+![The agent terminal rendered in the browser](../../assets/web/terminal.png)
 
 ## Agent terminal
 
-The main terminal attaches to the session's tmux pane through an xterm.js front end. The server spawns `tmux attach-session` inside a PTY and relays the raw byte stream bidirectionally over the WebSocket, so every key sequence, color, and scrollback line behaves like `tmux attach` over SSH.
+The agent pane is streamed the same way on desktop and on a phone. The server renders the pane and pushes its rows over a WebSocket; the dashboard draws them as real text, so scrolling, selection and zoom are the browser's own. There is no xterm.js and no PTY attach.
 
-Scrolling up into history pauses the live tail and surfaces a **Back to live** button; scrolling back to the bottom (or clicking it) resumes the tail.
+Where it can, the server renders from the [VT live transport](../live-mode.md#the-vt-live-transport): the pane's output streams through `tmux pipe-pane` into an in-process terminal grid, a frame is published the moment the grid changes, and keystrokes travel back over the same socket. Full-screen agents that bracket each repaint in synchronized output (Claude Code's fullscreen renderer, for example) are published only between brackets, so the page never paints a half-drawn screen. Only rows that changed are sent after the first frame. When the transport is unavailable (tmux older than 3.4, `[tmux] vt_live = false`, a split window, or a pane whose grid could not be seeded), the server falls back to `tmux capture-pane` snapshots on a 50 ms cadence and delivers input with `tmux send-keys`. The fallback cannot withhold a half-drawn repaint. Add `?livedebug=1` to the URL to see which transport a session is using.
+
+Scrolling up into history widens the window the server sends and surfaces a **Back to live** button; scrolling back to the bottom (or clicking it) returns to the live tail. The agent keeps running while you read.
 
 ## Copy and scroll
 
@@ -35,15 +37,11 @@ If the WebSocket drops (network blip, tunnel re-auth, daemon restart), the termi
 
 When the browser fails to reach a working terminal, the disconnect banner shows the close code returned by the server:
 
-| Code | Reason string         | Meaning                                                                                                | Client behavior            |
-| ---- | --------------------- | ------------------------------------------------------------------------------------------------------ | -------------------------- |
-| 1001 | `server shutdown`     | Daemon is shutting down (SIGINT/SIGTERM).                                                               | Retry with normal backoff. |
-| 1011 | `openpty_failed`      | Server could not allocate a PTY.                                                                        | Retry with normal backoff. |
-| 1011 | `attach_spawn_failed` | Server could not spawn the `tmux attach-session` child process.                                        | Retry with normal backoff. |
-| 1011 | `pty_reader_failed`   | Server could not clone the PTY reader handle.                                                           | Retry with normal backoff. |
-| 1011 | `pty_writer_failed`   | Server could not take the PTY writer handle.                                                            | Retry with normal backoff. |
-| 1013 | `tmux_not_ready`      | Pane did not become attachable within 2s. Usually a benign warm-up on first session open.              | Retry with normal backoff. |
-| 4001 | `pty_dead`            | PTY relay was running but the pane permanently exited.                                                  | Show "Click retry" banner. |
+| Code | Reason string     | Meaning                                                                                   | Client behavior            |
+| ---- | ----------------- | ----------------------------------------------------------------------------------------- | -------------------------- |
+| 1001 | `server shutdown` | Daemon is shutting down (SIGINT/SIGTERM).                                                 | Retry with normal backoff. |
+| 1013 | `tmux_not_ready`  | Pane did not become capturable within 2s. Usually a benign warm-up on first session open. | Retry with normal backoff. |
+| 4001 | `pty_dead`        | The live view was running but the pane permanently exited.                                | Show "Click retry" banner. |
 
 ## Read-only mode
 
@@ -51,11 +49,13 @@ When the server runs with `aoe serve --read-only`, the terminal renders the live
 
 ## On mobile
 
-On touch devices the agent pane uses a different architecture, mirroring the TUI's live mode: instead of attaching a PTY, the server streams `tmux capture-pane` snapshots over the WebSocket and the dashboard renders them as real text. That makes the phone experience native:
+The phone renders the same live view, tuned for touch:
 
-- **Scrolling is the browser's own scroll**: momentum, rubber-banding, and finger-true tracking, over the pane's real tmux scrollback. No copy-mode round trips, and the agent keeps running while you read history.
+- **Scrolling is the browser's own scroll**: momentum, rubber-banding, and finger-true tracking, over the pane's real scrollback. For a full-screen agent, whose scrollback lives inside the app, a drag is forwarded to the app as wheel input instead, one line at a time and paced to the app's redraws.
 - **Text selection is native**: long-press to select and copy, like any web page.
-- **Typing** goes back over the same WebSocket and is delivered with `tmux send-keys`; tapping anywhere on the terminal brings up the soft keyboard, the floating keyboard button toggles it open and closed, and the terminal toolbar provides arrows, Tab, Esc, a `Ctrl` modifier toggle, interrupt, and paste.
-- **Pinch** adjusts the font size; the pane resizes the tmux window to the resulting grid.
+- **Typing** goes back over the same WebSocket; tapping anywhere on the terminal brings up the soft keyboard, the floating keyboard button toggles it open and closed, and the terminal toolbar provides arrows, Tab, Esc, a `Ctrl` modifier toggle, interrupt, and paste. Opening the keyboard never resizes the agent's pane.
+- **Pinch** adjusts the font size; the pane is resized to the resulting grid once, when the gesture ends.
 
-A "Back to live" pill appears while you are scrolled up; tapping it (or scrolling to the bottom) returns to the live tail. The pane stays mounted while you switch views so the connection and scroll position survive. Desktop keeps the full xterm.js PTY relay described above.
+A "Back to live" pill appears while you are scrolled up; tapping it (or scrolling to the bottom) returns to the live tail. The pane stays mounted while you switch views so the connection and scroll position survive.
+
+Add `?livedebug=1` to the dashboard URL to overlay frame rate, arrival-to-paint latency, and the share of updates that arrived as row patches.
