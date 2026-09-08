@@ -1,3 +1,4 @@
+#[derive(Clone, Debug)]
 pub struct VolumeMount {
     pub host_path: String,
     pub container_path: String,
@@ -82,6 +83,25 @@ pub fn docker_env_args(entries: &[EnvEntry]) -> (Vec<String>, Vec<(String, Strin
     (argv, inherit)
 }
 
+/// A Docker-style `run` flag supported by a container runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunFlag {
+    Privileged,
+    CapAdd,
+    CapDrop,
+    SecurityOpt,
+}
+
+/// Container run-policy flags mapped from `[sandbox]` settings.
+#[derive(Debug, Default, Clone)]
+pub struct RunPolicy {
+    pub privileged: bool,
+    pub cap_add: Vec<String>,
+    pub cap_drop: Vec<String>,
+    pub security_opt: Vec<String>,
+    pub extra_run_args: Vec<String>,
+}
+
 #[derive(Default)]
 pub struct ContainerConfig {
     pub working_dir: String,
@@ -89,6 +109,14 @@ pub struct ContainerConfig {
     pub anonymous_volumes: Vec<String>,
     /// Named volumes for volume_ignores when strategy = "named". Cleaned up explicitly on session delete.
     pub named_ignore_volumes: Vec<NamedVolumeMount>,
+    /// Whether these paths, `working_dir` included, follow from the project's real
+    /// layout rather than from the collapsed fallback a failed `find_main_repo` takes.
+    ///
+    /// Gates the volume reclaim in `stranded_named_ignore_volumes`, which reads a
+    /// changed `working_dir` as a move; under the fallback that change may be nothing
+    /// but the failure. Defaults to false, so a config that has not positively
+    /// established its paths never drives a deletion.
+    pub named_ignore_volumes_authoritative: bool,
     pub environment: Vec<EnvEntry>,
     pub cpu_limit: Option<String>,
     pub memory_limit: Option<String>,
@@ -101,11 +129,91 @@ pub struct ContainerConfig {
     /// can access them on SELinux-enforcing hosts (Fedora, RHEL). Set from
     /// `sandbox.selinux_relabel`; only emitted for runtimes that support it.
     pub selinux_relabel: bool,
+    /// Runtime-only evidence that this config installed an identity publisher.
+    pub identity_publisher_installed: bool,
+    pub run_policy: RunPolicy,
+}
+
+impl ContainerConfig {
+    pub(crate) fn mount_fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+
+        let mut digest = Sha256::new();
+        for volume in &self.volumes {
+            for value in [&volume.host_path, &volume.container_path] {
+                digest.update((value.len() as u64).to_le_bytes());
+                digest.update(value.as_bytes());
+            }
+            digest.update([u8::from(volume.read_only)]);
+        }
+        if let Some(home) = self.environment.iter().find(|entry| entry.key() == "HOME") {
+            digest.update(b"HOME");
+            digest.update((home.value().len() as u64).to_le_bytes());
+            digest.update(home.value().as_bytes());
+        } else {
+            digest.update(b"NO_HOME");
+        }
+        digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    pub(crate) fn path_is_mounted(
+        &self,
+        host_path: &std::path::Path,
+        container_path: &std::path::Path,
+        writable: bool,
+    ) -> bool {
+        self.volumes
+            .iter()
+            .filter_map(|volume| {
+                container_path
+                    .strip_prefix(std::path::Path::new(&volume.container_path))
+                    .ok()
+                    .map(|relative| (volume, relative))
+            })
+            .max_by_key(|(volume, _)| volume.container_path.len())
+            .is_some_and(|(volume, relative)| {
+                (!writable || !volume.read_only)
+                    && std::path::Path::new(&volume.host_path).join(relative) == host_path
+            })
+    }
+
+    pub(crate) fn uses_default_container_home(&self) -> bool {
+        self.environment
+            .iter()
+            .find(|entry| entry.key() == "HOME")
+            .is_some_and(|entry| entry.value() == "/root")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publisher_home_must_be_explicit_and_is_fingerprinted() {
+        let missing = ContainerConfig::default();
+        assert!(!missing.uses_default_container_home());
+
+        let mut root = ContainerConfig::default();
+        root.environment.push(EnvEntry::Literal {
+            key: "HOME".to_string(),
+            value: "/root".to_string(),
+        });
+        assert!(root.uses_default_container_home());
+
+        let mut alternate = ContainerConfig::default();
+        alternate.environment.push(EnvEntry::Literal {
+            key: "HOME".to_string(),
+            value: "/alternate".to_string(),
+        });
+        assert!(!alternate.uses_default_container_home());
+        assert_ne!(root.mount_fingerprint(), alternate.mount_fingerprint());
+        assert_ne!(missing.mount_fingerprint(), root.mount_fingerprint());
+    }
 
     #[test]
     fn docker_env_args_inherit_keeps_value_out_of_argv() {

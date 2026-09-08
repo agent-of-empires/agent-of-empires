@@ -3,6 +3,7 @@
 pub(crate) mod composite;
 pub(crate) mod detect;
 pub(crate) mod env;
+pub(crate) mod osc8;
 mod session;
 pub mod status_bar;
 pub(crate) mod status_detection;
@@ -24,7 +25,37 @@ pub use status_detection::{
 };
 pub use terminal_session::{kill_all_terminals_for_id, ContainerTerminalSession, TerminalSession};
 pub use tool_session::{kill_all_tool_sessions_for_id, ToolSession};
-pub use utils::tmux_prefix_display;
+pub use utils::{attach_return_hint, tmux_prefix_display};
+
+/// OSC 8 hyperlinks the live VT channel for `session` has seen, oldest first.
+/// Always empty off unix, where there is no channel and the capture fallback
+/// carries the sequences in the frame text.
+/// How many times `session`'s advertised links have changed. Zero off unix and
+/// whenever no channel is armed, which is stable, so a consumer comparing it
+/// against its own copy simply never re-collects on those transports.
+pub(crate) fn pane_links_generation(session: &str) -> u64 {
+    #[cfg(unix)]
+    {
+        vt::pane_links_generation(session)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = session;
+        0
+    }
+}
+
+pub(crate) fn pane_links(session: &str) -> Vec<osc8::PaneLink> {
+    #[cfg(unix)]
+    {
+        vt::pane_links(session)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = session;
+        Vec::new()
+    }
+}
 
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
@@ -573,6 +604,17 @@ fn resolved_agent_existence(
 /// per-session title and lifecycle locks through this call; rekeying before
 /// commit can strand the pane when persistence fails.
 pub(crate) fn rekey_session(id: &str, old_title: &str, new_title: &str) -> anyhow::Result<bool> {
+    let renamed = rekey_session_name(id, old_title, new_title)?;
+    if renamed {
+        // Every `Ok(true)` path leaves the session under the new derived name.
+        status_bar::refresh_session_title(&Session::generate_name(id, new_title), new_title);
+    }
+    Ok(renamed)
+}
+
+/// The rename half of [`rekey_session`]: resolves the live session for `id`
+/// and moves it to the name derived from `new_title`.
+fn rekey_session_name(id: &str, old_title: &str, new_title: &str) -> anyhow::Result<bool> {
     // Name resolution is cache-backed. Force an authoritative scan first so a
     // process-local snapshot from before another writer's rename cannot point
     // this mutation at the old title-derived name.
@@ -1629,7 +1671,11 @@ fn session_existence_from_cache(name: &str) -> Option<SessionExistence> {
         None => SessionExistence::Unknown,
     })
 }
-
+/// Read the current session cache without refreshing it. A stale or poisoned
+/// snapshot remains unknown so async request handlers never spawn tmux.
+pub(crate) fn cached_session_existence(name: &str) -> SessionExistence {
+    session_existence_from_cache(name).unwrap_or(SessionExistence::Unknown)
+}
 /// Probe whether an aoe tmux session exists, distinguishing "confirmed
 /// absent" from "couldn't tell because the tmux server was unreachable".
 ///
@@ -2719,6 +2765,16 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn cached_session_existence_keeps_stale_snapshot_unknown() {
+        let guard = SessionCacheGuard::capture();
+        let name = format!("{P}cached_stale_abc12345");
+        guard.force_present(&[&name]);
+        guard.force_stale();
+
+        assert_eq!(cached_session_existence(&name), SessionExistence::Unknown);
+    }
+    #[test]
+    #[serial_test::serial]
     fn rekey_classification_treats_confirmed_no_server_as_absent() {
         let guard = SessionCacheGuard::capture();
         let id = "noserverdeadbeef";
@@ -3454,6 +3510,45 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn rekey_session_refreshes_the_status_bar_title() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let start_name = Session::generate_name(ID, "Britons");
+        let final_name = Session::generate_name(ID, "Fix detach hint");
+        let start_guard = TmuxTestSession::from_name(start_name.clone());
+        let final_guard = TmuxTestSession::from_name(final_name.clone());
+        let created = tmux_command()
+            .args(["new-session", "-d", "-s", start_guard.name(), "sleep 60"])
+            .output()
+            .expect("tmux new-session");
+        assert!(created.status.success());
+        // Seed the option the way `apply_status_bar` does at session start.
+        let seeded = tmux_command()
+            .args(["set-option", "-t", &start_name, "@aoe_title", "Britons"])
+            .output()
+            .expect("tmux set-option @aoe_title");
+        assert!(seeded.status.success());
+        refresh_session_cache();
+
+        assert!(rekey_session(ID, "Britons", "Fix detach hint").unwrap());
+
+        // `status-right` renders `#{@aoe_title}`, so a stale value keeps the
+        // pre-rename title on the bar until the session is restarted.
+        let shown = tmux_command()
+            .args(["show-options", "-t", &final_name, "-v", "@aoe_title"])
+            .output()
+            .expect("tmux show-options @aoe_title");
+        assert_eq!(
+            String::from_utf8_lossy(&shown.stdout).trim(),
+            "Fix detach hint"
+        );
+        drop((start_guard, final_guard));
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn rekey_session_reports_false_for_vanished_pane() {
         if !tmux_available() {
             eprintln!("Skipping test: tmux not available");
@@ -3570,36 +3665,49 @@ mod tests {
             .expect("tmux new-session");
         assert!(output.status.success(), "Failed to create tmux session");
 
-        // Wait for printenv to run and exit
-        std::thread::sleep(std::time::Duration::from_millis(1000));
+        // Poll rather than sleep a fixed interval. On a loaded runner the
+        // pane can take longer than any one sleep to spawn, exec, and render,
+        // and the blank capture that follows reads as a failed export rather
+        // than as "not yet". `remain-on-exit on` holds the output after the
+        // process dies, so waiting past the exit never loses it.
+        let capture_pane = || {
+            let capture = tmux_command()
+                .args([
+                    "capture-pane",
+                    "-t",
+                    &format!("{}:^.0", session_name),
+                    "-p",
+                    "-S",
+                    "-10",
+                ])
+                .output()
+                .expect("capture-pane");
+            String::from_utf8_lossy(&capture.stdout).into_owned()
+        };
+        let pane_is_dead = || {
+            let dead_check = tmux_command()
+                .args(["display-message", "-t", &session_name, "-p", "#{pane_dead}"])
+                .output()
+                .expect("pane dead check");
+            String::from_utf8_lossy(&dead_check.stdout).trim() == "1"
+        };
 
-        // Capture pane output: should contain the secret value
-        let capture = tmux_command()
-            .args([
-                "capture-pane",
-                "-t",
-                &format!("{}:^.0", session_name),
-                "-p",
-                "-S",
-                "-10",
-            ])
-            .output()
-            .expect("capture-pane");
-        let pane_content = String::from_utf8_lossy(&capture.stdout);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut pane_content = capture_pane();
+        while std::time::Instant::now() < deadline
+            && !(pane_content.contains(secret_value) && pane_is_dead())
+        {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            pane_content = capture_pane();
+        }
+
         assert!(
             pane_content.contains(secret_value),
-            "Expected secret value in pane output (proves export reached exec'd process).\nPane:\n{}",
-            pane_content
+            "Expected secret value in pane output (proves export reached exec'd process).\nPane:\n{pane_content}"
         );
-
         // Pane should be dead (exec replaced the shell, printenv exited)
-        let dead_check = tmux_command()
-            .args(["display-message", "-t", &session_name, "-p", "#{pane_dead}"])
-            .output()
-            .expect("pane dead check");
-        let is_dead = String::from_utf8_lossy(&dead_check.stdout).trim().eq("1");
         assert!(
-            is_dead,
+            pane_is_dead(),
             "Pane should be dead after exec'd command exits (lifecycle preserved)"
         );
     }

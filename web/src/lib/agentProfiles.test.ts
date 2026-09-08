@@ -55,6 +55,25 @@ describe("resolveAgentProfile", () => {
     expect(p.parentMetaNamespaces).toEqual([]);
   });
 
+  it("aoe-agent claims no claude specials despite bundling claude as a provider", () => {
+    // Regression for #1904: this profile used to spread CLAUDE, so the view
+    // advertised subagent indentation, the claude specialised cards, and the
+    // legacy mode picker for an adapter whose surface is Read / Write / Bash.
+    const p = resolveAgentProfile("aoe-agent");
+    expect(p.capabilities).toEqual({
+      todos: false,
+      skills: false,
+      wakeup: false,
+      subagents: false,
+      legacyModeFallback: false,
+      heartbeatKeepalives: false,
+    });
+    expect(p.parentMetaNamespaces).toEqual([]);
+    expect(p.specialTitles).toEqual({ skillNames: [], scheduleNames: [], harnessNames: [] });
+    // No subagent card by wire name either: nothing actually runs.
+    expect(isSubagentToolName("task", p)).toBe(false);
+  });
+
   it("omp uses its native ACP clear boundary without guessed capabilities", () => {
     const p = resolveAgentProfile("omp");
     expect(p.capabilities.todos).toBe(false);

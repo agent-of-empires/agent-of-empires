@@ -652,8 +652,7 @@ impl Default for AcpConfig {
     }
 }
 
-/// Built-in `acp.default_agent`. `aoe-agent` is not packaged yet (#3553), so
-/// the default has to be an adapter `aoe acp doctor --fix` can install.
+/// Built-in `acp.default_agent`.
 pub const DEFAULT_ACP_AGENT: &str = "claude-code";
 
 fn default_agent() -> String {
@@ -902,15 +901,29 @@ pub struct AppStateConfig {
 
 /// Session-related configuration defaults
 #[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
-#[setting_section(name = "session", category = "Session")]
+// `repo_default = "deny"`: most of this section is personal preference, but
+// several fields name or build the command AoE hands to tmux
+// (`custom_agents`, `agent_command_override`, `agent_extra_args`,
+// `agent_acp_cmd`, `smart_rename_agent`, `smart_rename_model`) or weaken the
+// agent's own permission gate (`yolo_mode_default`). Honoring those from a
+// checked-out repo is arbitrary host command execution at session launch, the
+// hazard that already keeps `host_hooks` out of `REPO_OVERRIDABLE_SECTIONS`.
+// Denying by default means a field added here later stays repo-denied until
+// someone marks it `repo = "allow"` (#3154).
+#[setting_section(name = "session", category = "Session", repo_default = "deny")]
 pub struct SessionConfig {
     /// Default coding tool for new sessions. If not set or the tool is
-    /// unavailable, falls back to the first available tool.
+    /// unavailable, falls back to the first available tool. Repo-denied: the
+    /// launch path exact-matches the user's `custom_agents` before built-ins,
+    /// so a repo could name a user-defined host command, and validating
+    /// against built-in names would not help because custom agents may
+    /// shadow them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[setting(
         label = "Default Tool",
         widget = "custom:default-tool",
-        category = "Agents"
+        category = "Agents",
+        repo = "deny"
     )]
     pub default_tool: Option<String>,
 
@@ -967,8 +980,8 @@ pub struct SessionConfig {
     )]
     pub agent_extra_args: HashMap<String, String>,
 
-    /// Per-agent command override replacing the binary (e.g.
-    /// claude=my-wrapper).
+    /// Per-agent command override. Native conversation resume requires the
+    /// resolved agent binary first; wrappers and shell syntax disable it.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[setting(
         label = "Agent Command Override",
@@ -1074,15 +1087,11 @@ pub struct SessionConfig {
         category = "Agents"
     )]
     pub auto_resume_on_restart: bool,
-
-    /// Pre-assign opencode's session id before launch instead of capturing it
-    /// afterward by polling opencode's SQLite store. AoE creates the session up
-    /// front through a short-lived `opencode serve` HTTP call, so the id is
-    /// known before the first prompt (symmetric with Claude's `--session-id`).
-    /// Eliminates the post-launch capture race, at the cost of spawning a
-    /// throwaway server (~2s) on each new host opencode launch. Off by default;
-    /// the SQLite poller stays the fallback. Host sessions only, a sandboxed
-    /// agent cannot reach the loopback server.
+    /// Pre-assign OpenCode's session id before launch so AoE knows the exact
+    /// native identity before the first prompt. AoE creates the session through
+    /// a short-lived `opencode serve` call. This avoids guessing from the shared
+    /// SQLite store, at the cost of about two seconds on each new host launch.
+    /// Off by default. Sandboxed OpenCode automatic capture is unsupported.
     #[serde(default)]
     #[setting(
         label = "Pre-assign opencode session id",
@@ -1091,7 +1100,6 @@ pub struct SessionConfig {
         advanced
     )]
     pub opencode_preassign_session_id: bool,
-
     /// Request xterm mouse tracking so the TUI handles the scroll wheel
     /// (preview-pane scroll) and click-to-select rows. Disable to hand the
     /// wheel and text selection back to the terminal, e.g. iOS Mosh +
@@ -1122,7 +1130,8 @@ pub struct SessionConfig {
         label = "Agent Detect As",
         widget = "list",
         web = "local_only:part of the agent-command surface, edited locally only",
-        category = "Agents"
+        category = "Agents",
+        repo = "allow"
     )]
     pub agent_detect_as: HashMap<String, String>,
 
@@ -1144,15 +1153,12 @@ pub struct SessionConfig {
     )]
     pub agent_acp_cmd: HashMap<String, String>,
 
-    /// Config directory an agent reads instead of its built-in default, keyed
-    /// by the agent name the session runs (e.g. `claude-personal =
-    /// "~/.claude-personal"` for a wrapper that exports `CLAUDE_CONFIG_DIR`).
-    /// The value is a host path in both contexts: host sessions use the
-    /// directory itself, sandboxed sessions its `sandbox` subdirectory, which
-    /// is the layout AoE already uses for the built-in agents. Consulted for
-    /// folder-trust records and for native MCP discovery, so the servers AoE
-    /// reconciles are the ones the agent actually loads; status hooks keep
-    /// resolving their config dir from the agent's own env var.
+    /// Config directory read by the session's agent instead of its built-in
+    /// default. Host sessions use the directory directly. Sandboxed sessions
+    /// use its `sandbox` subdirectory, which AoE mounts at the resolved
+    /// built-in config path and uses for hooks, credentials, and native-session
+    /// capture. Native MCP discovery reads it too, so AoE reconciles the
+    /// servers the agent loads.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[setting(
         label = "Agent Config Dir",
@@ -1187,6 +1193,23 @@ pub struct SessionConfig {
         validate = "range:1:43200"
     )]
     pub snooze_duration_minutes: u32,
+
+    /// Ceiling on concurrent session-id poller threads in one aoe process
+    /// (the daemon or a TUI). Each poller keeps one session's agent
+    /// session id live; with more live sessions than this, the overflow's
+    /// ids stop refreshing until another session stops. Process-wide:
+    /// applied once at startup from the effective config of the profile the
+    /// process was launched with, so a change takes effect on the next
+    /// start. 0 keeps the default (50).
+    #[serde(default = "default_session_id_poller_max_threads")]
+    #[setting(
+        label = "Session-id poller threads (restart req.)",
+        widget = "number",
+        min = 0,
+        global_only,
+        advanced
+    )]
+    pub session_id_poller_max_threads: u32,
 
     /// Move deleted sessions to the trash instead of purging them
     /// immediately. When enabled (default), `delete`/`rm` and the TUI/web
@@ -1329,14 +1352,11 @@ pub struct SessionConfig {
     )]
     pub live_send_leader: String,
 
-    /// How the TUI attaches to a terminal-mode session: what Enter (and
-    /// double-click) does on a session row in the Agent view, and what
-    /// happens immediately after a new session finishes creating. `Tmux`
-    /// (default) drops into the tmux attach view, the historical behavior.
-    /// `LiveSend` enters live-send mode instead, so the home list stays
-    /// visible and keystrokes pipe through to the agent; users who never
-    /// want to be inside tmux directly pick this. Terminal/Tool views and
-    /// acp sessions ignore this setting.
+    /// How the TUI activates an existing terminal-mode session when you press
+    /// Enter or double-click its row. `Tmux` (default) opens the tmux attach
+    /// view. `LiveSend` enters live-send mode, so the home list stays visible
+    /// and keystrokes go to the agent. Terminal/Tool views and acp sessions
+    /// ignore this setting.
     #[serde(default)]
     #[setting(
         label = "Attach Mode",
@@ -1345,6 +1365,16 @@ pub struct SessionConfig {
         category = "Interaction"
     )]
     pub default_attach_mode: AttachMode,
+
+    /// How the TUI opens a terminal-mode session after it is created.
+    #[serde(default)]
+    #[setting(
+        label = "New Session Mode",
+        widget = "select",
+        options = "match_default:Match default attach,tmux:Tmux,live_send:Live mode",
+        category = "Interaction"
+    )]
+    pub new_session_mode: NewSessionMode,
 
     /// Automatically start live-send when switching into Terminal or Tool
     /// view, instead of requiring a separate Enter/Tab/click.
@@ -1588,8 +1618,19 @@ pub enum ClickAction {
     SelectOnly,
 }
 
-/// How the TUI attaches to a terminal-mode session, both on activating an
-/// existing row and right after creating a new session. See
+/// How the TUI opens a terminal-mode session after creation. `MatchDefault`
+/// preserves the historical behavior by using
+/// `SessionConfig::default_attach_mode`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NewSessionMode {
+    #[default]
+    MatchDefault,
+    Tmux,
+    LiveSend,
+}
+
+/// How the TUI activates an existing terminal-mode session. See
 /// `SessionConfig::default_attach_mode`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1652,6 +1693,7 @@ impl Default for SessionConfig {
             agent_acp_cmd: HashMap::new(),
             strict_hotkeys: false,
             snooze_duration_minutes: 30,
+            session_id_poller_max_threads: default_session_id_poller_max_threads(),
             delete_to_trash: true,
             confirm_delete: true,
             trash_retention_days: default_trash_retention_days(),
@@ -1663,6 +1705,7 @@ impl Default for SessionConfig {
             live_send_exit_chord: default_live_send_exit_chord(),
             live_send_leader: default_live_send_leader(),
             default_attach_mode: AttachMode::default(),
+            new_session_mode: NewSessionMode::default(),
             live_send_on_view_switch: false,
             click_action: ClickAction::default(),
             confirm_before_quit: true,
@@ -1677,6 +1720,10 @@ impl Default for SessionConfig {
 
 fn default_snooze_duration_minutes() -> u32 {
     30
+}
+
+fn default_session_id_poller_max_threads() -> u32 {
+    crate::session::poller::DEFAULT_SESSION_ID_POLLER_MAX_THREADS
 }
 
 fn default_trash_retention_days() -> u32 {
@@ -2272,7 +2319,8 @@ pub struct SandboxConfig {
     #[setting(
         label = "Enabled by Default",
         widget = "toggle",
-        web = "elevation:sandbox config affects host isolation"
+        web = "elevation:sandbox config affects host isolation",
+        repo = "deny"
     )]
     pub enabled_by_default: bool,
 
@@ -2281,7 +2329,8 @@ pub struct SandboxConfig {
     #[setting(
         label = "Default Image",
         widget = "text",
-        web = "elevation:sandbox config affects host isolation"
+        web = "elevation:sandbox config affects host isolation",
+        repo = "deny"
     )]
     pub default_image: String,
 
@@ -2292,6 +2341,7 @@ pub struct SandboxConfig {
         widget = "list",
         validate = "volume_list",
         web = "elevation:sandbox config affects host isolation",
+        repo = "deny",
         advanced
     )]
     pub extra_volumes: Vec<String>,
@@ -2362,8 +2412,8 @@ pub struct SandboxConfig {
     /// via the runtime's bridge), "none" for no network (isolates the agent but
     /// also cuts off its own model API unless a proxy is routed in), or a named
     /// network to attach a user-defined network with its own egress filtering.
-    /// "host" is rejected because sharing the host network namespace defeats
-    /// sandbox isolation.
+    /// "host" and namespace-sharing forms ("container:", "ns:") are rejected
+    /// because they defeat sandbox isolation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[setting(
         label = "Network",
@@ -2412,7 +2462,8 @@ pub struct SandboxConfig {
     #[setting(
         label = "Mount SSH",
         widget = "toggle",
-        web = "elevation:sandbox config affects host isolation"
+        web = "elevation:sandbox config affects host isolation",
+        repo = "deny"
     )]
     pub mount_ssh: bool,
 
@@ -2424,9 +2475,90 @@ pub struct SandboxConfig {
         label = "SELinux Relabel",
         widget = "toggle",
         web = "elevation:sandbox config affects host isolation",
+        repo = "deny",
         advanced
     )]
     pub selinux_relabel: bool,
+
+    /// Run the container with `--privileged`: full device access and all
+    /// capabilities. Needed to run a container engine (rootless podman,
+    /// dockerd) inside the sandbox.
+    #[serde(default)]
+    #[setting(
+        label = "Privileged",
+        widget = "toggle",
+        web = "local_only:grants the container full host privileges",
+        repo = "deny",
+        advanced
+    )]
+    pub privileged: bool,
+
+    /// Capabilities to add to the container (`--cap-add`), e.g. "SYS_ADMIN".
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "super::serde_helpers::string_or_vec"
+    )]
+    #[setting(
+        label = "Add Capabilities",
+        widget = "list",
+        validate = "capability_list",
+        web = "local_only:grants the container extra Linux capabilities",
+        repo = "deny",
+        advanced
+    )]
+    pub cap_add: Vec<String>,
+
+    /// Capabilities to drop from the container (`--cap-drop`), e.g. "ALL".
+    /// A write replaces rather than adds, so clearing it undoes hardening.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "super::serde_helpers::string_or_vec"
+    )]
+    #[setting(
+        label = "Drop Capabilities",
+        widget = "list",
+        validate = "capability_list",
+        web = "local_only:a write replaces the list, so it can undo hardening",
+        repo = "deny",
+        advanced
+    )]
+    pub cap_drop: Vec<String>,
+
+    /// Security options for the container (`--security-opt`), e.g.
+    /// "seccomp=unconfined" or "no-new-privileges:true".
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "super::serde_helpers::string_or_vec"
+    )]
+    #[setting(
+        label = "Security Options",
+        widget = "list",
+        validate = "security_opt_list",
+        web = "local_only:relaxes the container security profile",
+        repo = "deny",
+        advanced
+    )]
+    pub security_opt: Vec<String>,
+
+    /// Extra arguments appended verbatim to the container `run` invocation,
+    /// before the image. Unvalidated, so entries bypass `sandbox.network`'s
+    /// refusal of `host`.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "super::serde_helpers::string_or_vec"
+    )]
+    #[setting(
+        label = "Extra Run Args",
+        widget = "list",
+        web = "local_only:arbitrary container runtime argv, a host execution surface",
+        repo = "deny",
+        advanced
+    )]
+    pub extra_run_args: Vec<String>,
 
     /// Custom instruction text appended to the agent's system prompt in
     /// sandboxed sessions (Claude, Codex only).
@@ -2445,7 +2577,8 @@ pub struct SandboxConfig {
         label = "Container Runtime",
         widget = "select",
         options = "docker:Docker,podman:Podman,apple_container:Apple Container",
-        web = "elevation:sandbox config affects host isolation"
+        web = "elevation:sandbox config affects host isolation",
+        global_only
     )]
     pub container_runtime: ContainerRuntimeName,
 }
@@ -2492,6 +2625,11 @@ impl Default for SandboxConfig {
             volume_ignores_strategy: VolumeIgnoresStrategy::default(),
             mount_ssh: false,
             selinux_relabel: false,
+            privileged: false,
+            cap_add: Vec::new(),
+            cap_drop: Vec::new(),
+            security_opt: Vec::new(),
+            extra_run_args: Vec::new(),
             custom_instruction: None,
             container_runtime: ContainerRuntimeName::default(),
         }
@@ -2585,11 +2723,12 @@ pub struct TmuxConfig {
     )]
     pub socket_name: Option<String>,
 
-    /// Render native agent and tool previews from a persistent VT channel
-    /// (`tmux pipe-pane` into an in-process terminal grid) instead of polling
-    /// `capture-pane` and forking `send-keys` per keystroke. Terminal previews,
-    /// including the web terminal, always use tmux's rendered capture and keep
-    /// OSC 52 forwarding through a raw observer.
+    /// Render agent previews and the web dashboard's agent terminal from a
+    /// persistent VT channel (`tmux pipe-pane` into an in-process terminal
+    /// grid) instead of polling `capture-pane` and forking `send-keys` per
+    /// keystroke. The paired host and container shells, split windows, and
+    /// every fallback keep tmux's rendered capture, with OSC 52 forwarding
+    /// through a raw observer.
     #[serde(default = "default_true")]
     #[setting(label = "VT Live Transport", widget = "toggle", advanced, global_only)]
     pub vt_live: bool,
@@ -3798,6 +3937,15 @@ mod tests {
 
     // Tests for Config defaults
     #[test]
+    fn session_id_poller_max_threads_defaults_and_parses() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.session.session_id_poller_max_threads, 50);
+        let config: Config =
+            toml::from_str("[session]\nsession_id_poller_max_threads = 400\n").unwrap();
+        assert_eq!(config.session.session_id_poller_max_threads, 400);
+    }
+
+    #[test]
     fn test_config_default() {
         let config = Config::default();
         // An unset default_profile deserializes empty: "not explicitly
@@ -4361,6 +4509,36 @@ mod tests {
             "vt_live is machine-level (the server reads global config); a \
              profile override would desync the TUI and web transports"
         );
+    }
+
+    #[test]
+    fn test_new_session_mode_in_settings_schema() {
+        // The single-source schema must expose the select so the TUI and
+        // web settings both render it (docs/development/adding-settings.md).
+        // The option values are hand-written in the `#[setting(...)]`
+        // attribute, so each one is round-tripped through `NewSessionMode`:
+        // a typo would offer a choice that the config layer rejects on save.
+        let schema = crate::session::config::settings_schema::schema();
+        let field = schema
+            .iter()
+            .find(|f| f.section == "session" && f.field == "new_session_mode")
+            .expect("new_session_mode field in session schema section");
+        let settings_schema::WidgetKind::Select { options } = &field.widget else {
+            panic!("new_session_mode must render as a select");
+        };
+        let values: Vec<&str> = options.iter().map(|o| o.value.as_str()).collect();
+        assert_eq!(values, ["match_default", "tmux", "live_send"]);
+        for value in values {
+            let parsed: NewSessionMode = serde_json::from_str(&format!("\"{value}\""))
+                .unwrap_or_else(|e| {
+                    panic!("select option {value:?} must deserialize into NewSessionMode: {e}")
+                });
+            assert_eq!(
+                serde_json::to_string(&parsed).unwrap(),
+                format!("\"{value}\""),
+                "select option {value:?} must round-trip"
+            );
+        }
     }
 
     // Tests for DiffConfig

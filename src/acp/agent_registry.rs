@@ -197,11 +197,11 @@ impl AgentRegistry {
         reg.agents.insert(
             "aoe-agent".into(),
             AgentSpec {
-                command: "${aoe_data_dir}/acp-worker/dist/aoe-agent".into(),
+                // Installed into the app dir like the npm adapters and found
+                // through `bundled_adapter_bin` (#3553).
+                command: AOE_AGENT_BINARY.into(),
                 args: vec![],
                 description: "aoe's bundled multi-provider agent (Vercel AI SDK)".into(),
-                // Shared binary token, NOT `command` (which carries an
-                // unresolved `${aoe_data_dir}` placeholder here).
                 env_allowlist: default_env_allowlist(AOE_AGENT_BINARY),
             },
         );
@@ -300,9 +300,8 @@ mod tests {
     /// One row asserts a specific negative for `aoe-agent`: it must NOT
     /// receive `GEMINI_API_KEY` (that's the CLI-native name; the bundled
     /// AI-SDK agent reads `GOOGLE_GENERATIVE_AI_API_KEY` instead). The
-    /// negative row catches the "keyed on `spec.command` instead of the
-    /// binary token" bug, where `${aoe_data_dir}/...` would never match
-    /// and every `aoe-agent` provider key would drop.
+    /// negative row catches a registry keyed on something other than the
+    /// binary token, where every `aoe-agent` provider key would drop.
     #[test]
     fn default_env_allowlists_match_verified_providers() {
         let reg = AgentRegistry::with_defaults();
@@ -436,11 +435,7 @@ mod tests {
             ("omp", "omp", &["acp"]),
             ("kimi", "kimi", &["acp"]),
             ("prime-agent", "prime-agent", &["--mode", "acp"]),
-            (
-                "aoe-agent",
-                "${aoe_data_dir}/acp-worker/dist/aoe-agent",
-                &[],
-            ),
+            ("aoe-agent", "aoe-agent", &[]),
         ];
         for (name, command, args) in expected {
             let spec = reg

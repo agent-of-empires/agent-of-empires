@@ -1,16 +1,9 @@
-/// Tests for the post-create half of the `default_attach_mode` setting:
-/// a freshly-created session enters tmux or live-send mode per the same
-/// resolver as Enter/double-click. The unit under test is
-/// `HomeView::default_attach_mode` as consumed by the post-create
-/// dispatch, plus the invariant that the sync create path emits the
-/// routed action variant (so it doesn't bypass the setting the way
-/// `Action::AttachSession` would).
+/// Tests for the mode that opens a newly-created terminal-mode session. The
+/// default follows `default_attach_mode`, preserving historical behavior. An
+/// explicit mode applies only after creation.
 use super::*;
-use crate::session::config::{update_config, AttachMode};
+use crate::session::config::{update_config, AttachMode, NewSessionMode};
 
-/// Add a session to the home view, return its id. The instance's
-/// `source_profile` is set to "test" so the resolver reads the
-/// test profile's config.
 fn add_session(view: &mut HomeView, title: &str) -> String {
     let mut inst = Instance::new(title, "/tmp/test");
     inst.source_profile = "test".to_string();
@@ -19,44 +12,45 @@ fn add_session(view: &mut HomeView, title: &str) -> String {
     id
 }
 
-/// Write a global config.toml with the given attach mode so the
-/// resolver under test reads the user-configured value. Other
-/// fields stay at default.
-fn write_global_attach_mode(mode: AttachMode) {
+fn write_session_modes(default_attach_mode: AttachMode, new_session_mode: NewSessionMode) {
     update_config(|config| {
-        config.session.default_attach_mode = mode;
+        config.session.default_attach_mode = default_attach_mode;
+        config.session.new_session_mode = new_session_mode;
     })
     .unwrap();
 }
 
 #[test]
 #[serial]
-fn defaults_to_tmux_when_no_config_present() {
-    // Fresh install: no config.toml exists, no profile override.
-    // The setting must resolve to Tmux (historical behavior); a
-    // None or LiveSend default would silently change every existing
-    // user's UX on upgrade.
+fn resolves_new_session_mode() {
     let mut env = create_test_env_empty();
-    let id = add_session(&mut env.view, "session-one");
-    let mode = env.view.default_attach_mode(&id);
-    assert_eq!(
-        mode,
-        Some(AttachMode::Tmux),
-        "default must be Tmux to preserve existing UX"
-    );
-}
-
-#[test]
-#[serial]
-fn returns_live_send_when_globally_configured() {
-    // User saved `default_attach_mode = "live_send"` in their
-    // global config. The resolver must pick it up so the dispatch
-    // path in app.rs routes to live mode instead of tmux attach.
-    let mut env = create_test_env_empty();
-    write_global_attach_mode(AttachMode::LiveSend);
-    let id = add_session(&mut env.view, "session-one");
-    let mode = env.view.default_attach_mode(&id);
-    assert_eq!(mode, Some(AttachMode::LiveSend));
+    let cases = [
+        (
+            AttachMode::Tmux,
+            NewSessionMode::MatchDefault,
+            AttachMode::Tmux,
+        ),
+        (
+            AttachMode::LiveSend,
+            NewSessionMode::MatchDefault,
+            AttachMode::LiveSend,
+        ),
+        (
+            AttachMode::Tmux,
+            NewSessionMode::LiveSend,
+            AttachMode::LiveSend,
+        ),
+        (AttachMode::LiveSend, NewSessionMode::Tmux, AttachMode::Tmux),
+    ];
+    for (default_attach_mode, new_session_mode, expected) in cases {
+        write_session_modes(default_attach_mode, new_session_mode);
+        let id = add_session(&mut env.view, "session-one");
+        assert_eq!(
+            env.view.new_session_attach_mode(&id),
+            Some(expected),
+            "{new_session_mode:?} with {default_attach_mode:?}"
+        );
+    }
 }
 
 #[test]
@@ -67,7 +61,7 @@ fn returns_none_for_missing_instance() {
     // signals the caller to fall back to the structured view-aware
     // attach_session path rather than try to attach to a ghost.
     let env = create_test_env_empty();
-    let mode = env.view.default_attach_mode("nonexistent-id");
+    let mode = env.view.new_session_attach_mode("nonexistent-id");
     assert!(mode.is_none());
 }
 
@@ -79,12 +73,12 @@ fn returns_none_for_acp_session() {
     // dispatch picks the (no-op) fallback explicitly, regardless of
     // what the user configured globally.
     let mut env = create_test_env_empty();
-    write_global_attach_mode(AttachMode::LiveSend);
+    write_session_modes(AttachMode::LiveSend, NewSessionMode::MatchDefault);
     let id = add_session(&mut env.view, "acp-one");
     env.view.mutate_instance(&id, |inst| {
         inst.view = crate::session::View::Structured;
     });
-    let mode = env.view.default_attach_mode(&id);
+    let mode = env.view.new_session_attach_mode(&id);
     assert!(mode.is_none(), "structured view sessions must return None");
 }
 

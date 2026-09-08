@@ -36,14 +36,14 @@ impl HomeView {
 
     /// Show the profile picker dialog with fresh data from disk.
     pub(in crate::tui) fn show_profile_picker(&mut self) {
-        use crate::session::list_profiles;
+        use crate::session::list_profiles_for_display;
         use crate::tui::dialogs::{ProfileEntry, ProfilePickerDialog};
 
         let current_profile = self
             .active_profile
             .clone()
             .unwrap_or_else(|| "all".to_string());
-        let profiles = list_profiles()
+        let profiles = list_profiles_for_display()
             .unwrap_or_else(|_| vec![crate::session::config::resolve_default_profile()]);
         let mut entries: Vec<ProfileEntry> = profiles
             .iter()

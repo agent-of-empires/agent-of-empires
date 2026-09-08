@@ -1,5 +1,6 @@
-use super::container_interface::{docker_env_args, ContainerConfig};
+use super::container_interface::{docker_env_args, ContainerConfig, RunFlag};
 use super::error::{sanitize_stderr, DockerError, Result};
+use std::collections::HashSet;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -57,6 +58,10 @@ pub(crate) struct RuntimeBase {
     /// `run` does not take these modes, so a configured `sandbox.network` is
     /// skipped with a warning there rather than emitting a flag that fails.
     pub supports_network_mode: bool,
+    /// Whether `run --label key=value` and label inspection are supported.
+    pub supports_labels: bool,
+    /// Which Docker-style `run` flags this runtime accepts (see [`RunFlag`]).
+    pub supported_run_flags: &'static [RunFlag],
     /// Case-insensitive stderr substrings that identify a "container does not
     /// exist" error for this runtime. Each runtime words it differently (Docker
     /// "No such container", Apple Container "notFound … not found"), so the
@@ -85,6 +90,14 @@ pub(crate) struct RuntimeBase {
     pub permission_denied_markers: &'static [&'static str],
 }
 
+/// Docker-style run flags supported by Docker and Podman.
+const ALL_RUN_FLAGS: &[RunFlag] = &[
+    RunFlag::Privileged,
+    RunFlag::CapAdd,
+    RunFlag::CapDrop,
+    RunFlag::SecurityOpt,
+];
+
 impl RuntimeBase {
     pub const DOCKER: Self = Self {
         binary: "docker",
@@ -97,6 +110,8 @@ impl RuntimeBase {
         supports_named_volumes: true,
         supports_selinux_relabel: true,
         supports_network_mode: true,
+        supports_labels: true,
+        supported_run_flags: ALL_RUN_FLAGS,
         not_found_markers: &["no such container"],
         // moby/moby client/errors.go connectionFailed() is the single source
         // of this message across every Docker OS variant (macOS Desktop, Linux
@@ -124,6 +139,10 @@ impl RuntimeBase {
         supports_named_volumes: false,
         supports_selinux_relabel: false,
         supports_network_mode: false,
+        supports_labels: true,
+        // `--cap-add`/`--cap-drop` exist since container 0.12; there is no
+        // `--privileged` or `--security-opt`.
+        supported_run_flags: &[RunFlag::CapAdd, RunFlag::CapDrop],
         // Apple Container surfaces a missing container with two distinct
         // wordings depending on the subcommand:
         // - `container delete`/`container logs`: `notFound: "container with
@@ -168,6 +187,8 @@ impl RuntimeBase {
         supports_named_volumes: true,
         supports_selinux_relabel: true,
         supports_network_mode: true,
+        supports_labels: true,
+        supported_run_flags: ALL_RUN_FLAGS,
         not_found_markers: &["no such container"],
         // Two distinct daemon-down wordings observed in real Podman output:
         // - "connect to Podman socket" fires on Linux socket mode
@@ -432,6 +453,16 @@ impl RuntimeBase {
             config.working_dir.clone(),
         ];
 
+        if self.supports_labels {
+            args.push("--label".to_string());
+            args.push("com.agent-of-empires.sandbox-store-generation=2".to_string());
+            args.push("--label".to_string());
+            args.push(format!(
+                "com.agent-of-empires.mount-fingerprint={}",
+                config.mount_fingerprint()
+            ));
+        }
+
         for vol in &config.volumes {
             if !self.supports_read_only_volumes && vol.read_only {
                 tracing::warn!(target: "containers.runtime",
@@ -536,6 +567,51 @@ impl RuntimeBase {
             args.push("-m".to_string());
             args.push(mem.clone());
         }
+
+        let policy = &config.run_policy;
+        let pairs = |flag: &str, values: &[String]| -> Vec<String> {
+            values
+                .iter()
+                .flat_map(|v| [flag.to_string(), v.clone()])
+                .collect()
+        };
+        for (flag, config_key, argv) in [
+            (
+                RunFlag::Privileged,
+                "privileged",
+                Vec::from_iter(policy.privileged.then(|| "--privileged".to_string())),
+            ),
+            (
+                RunFlag::CapAdd,
+                "cap_add",
+                pairs("--cap-add", &policy.cap_add),
+            ),
+            (
+                RunFlag::CapDrop,
+                "cap_drop",
+                pairs("--cap-drop", &policy.cap_drop),
+            ),
+            (
+                RunFlag::SecurityOpt,
+                "security_opt",
+                pairs("--security-opt", &policy.security_opt),
+            ),
+        ] {
+            if argv.is_empty() {
+                continue;
+            }
+            if self.supported_run_flags.contains(&flag) {
+                args.extend(argv);
+            } else {
+                tracing::warn!(
+                    target: "containers.runtime",
+                    "ignoring sandbox.{config_key}: {} does not support it",
+                    self.name
+                );
+            }
+        }
+
+        args.extend(policy.extra_run_args.iter().cloned());
 
         args.push(image.to_string());
         args.push("sleep".to_string());
@@ -645,6 +721,28 @@ impl RuntimeBase {
     ///
     /// This is a no-op on runtimes that don't support named volumes (e.g. Apple Container).
     pub fn remove_named_ignore_volumes(&self, prefix: &str) -> Result<()> {
+        self.remove_named_ignore_volumes_where(prefix, |_| true)
+    }
+
+    /// Remove the named ignore volumes under `prefix` that are in `names`.
+    ///
+    /// The targeted counterpart to [`Self::remove_named_ignore_volumes`], for reclaiming
+    /// the volumes a worktree move stranded. `names` is an allowlist, so a volume the
+    /// caller did not name is never touched; see
+    /// [`DockerContainer::remove_stranded_named_ignore_volumes`](crate::containers::DockerContainer::remove_stranded_named_ignore_volumes).
+    pub fn remove_named_ignore_volumes_in(
+        &self,
+        prefix: &str,
+        names: &HashSet<&str>,
+    ) -> Result<()> {
+        self.remove_named_ignore_volumes_where(prefix, |name| names.contains(name))
+    }
+
+    fn remove_named_ignore_volumes_where(
+        &self,
+        prefix: &str,
+        select: impl Fn(&str) -> bool,
+    ) -> Result<()> {
         if !self.supports_named_volumes {
             return Ok(());
         }
@@ -667,12 +765,7 @@ impl RuntimeBase {
         }
 
         let stdout = String::from_utf8_lossy(&list_output.stdout);
-        // Filter in Rust to exact prefix match (docker's --filter is substring-based).
-        let names: Vec<&str> = stdout
-            .lines()
-            .map(str::trim)
-            .filter(|n| !n.is_empty() && n.starts_with(prefix))
-            .collect();
+        let names = selected_named_ignore_volumes(&stdout, prefix, select);
 
         if names.is_empty() {
             return Ok(());
@@ -732,10 +825,26 @@ impl RuntimeBase {
     }
 }
 
+/// Pick the volumes to remove out of a `volume ls -q` listing.
+///
+/// Re-filters on the prefix in Rust because docker's `--filter name=` is a substring
+/// match, so `aoe-vi-sess1-` also lists `aoe-vi-sess10-...`.
+fn selected_named_ignore_volumes<'a>(
+    listing: &'a str,
+    prefix: &str,
+    select: impl Fn(&str) -> bool,
+) -> Vec<&'a str> {
+    listing
+        .lines()
+        .map(str::trim)
+        .filter(|n| !n.is_empty() && n.starts_with(prefix) && select(n))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::containers::container_interface::{EnvEntry, VolumeMount};
+    use crate::containers::container_interface::{EnvEntry, RunPolicy, VolumeMount};
 
     // Real stderr captured from `<runtime> rm/delete <missing>` on 2026-07-01.
     // These pin the per-runtime not-found classification that `remove()` and
@@ -1340,6 +1449,76 @@ mod tests {
     }
 
     #[test]
+    fn test_build_create_args_run_policy_flags() {
+        let base = RuntimeBase::DOCKER;
+        let config = ContainerConfig {
+            working_dir: "/workspace/project".to_string(),
+            run_policy: RunPolicy {
+                privileged: true,
+                cap_add: vec!["SYS_ADMIN".to_string()],
+                cap_drop: vec!["NET_RAW".to_string()],
+                security_opt: vec!["seccomp=unconfined".to_string()],
+                extra_run_args: vec!["--isolation".to_string(), "chroot".to_string()],
+            },
+            ..Default::default()
+        };
+
+        let args = base.build_create_args("c", "alpine:latest", &config);
+
+        assert!(args.contains(&"--privileged".to_string()));
+        assert_eq!(arg_after(&args, "--cap-add"), Some("SYS_ADMIN"));
+        assert_eq!(arg_after(&args, "--cap-drop"), Some("NET_RAW"));
+        assert_eq!(
+            arg_after(&args, "--security-opt"),
+            Some("seccomp=unconfined")
+        );
+        let isolation = args.iter().position(|a| a == "--isolation").unwrap();
+        let image = args.iter().position(|a| a == "alpine:latest").unwrap();
+        assert_eq!(args[isolation + 1], "chroot");
+        assert_eq!(isolation + 2, image);
+    }
+
+    #[test]
+    fn test_build_create_args_run_policy_skipped_on_unsupported_runtime() {
+        let base = RuntimeBase::APPLE_CONTAINER;
+        let config = ContainerConfig {
+            working_dir: "/workspace/project".to_string(),
+            run_policy: RunPolicy {
+                privileged: true,
+                cap_add: vec!["SYS_ADMIN".to_string()],
+                cap_drop: vec!["ALL".to_string()],
+                security_opt: vec!["seccomp=unconfined".to_string()],
+                extra_run_args: vec!["--virtiofs".to_string()],
+            },
+            ..Default::default()
+        };
+
+        let args = base.build_create_args("c", "alpine:latest", &config);
+
+        for flag in ["--privileged", "--security-opt"] {
+            assert!(!args.contains(&flag.to_string()), "unexpected {flag}");
+        }
+        assert_eq!(arg_after(&args, "--cap-add"), Some("SYS_ADMIN"));
+        assert_eq!(arg_after(&args, "--cap-drop"), Some("ALL"));
+        assert!(args.contains(&"--virtiofs".to_string()));
+    }
+
+    #[test]
+    fn test_build_create_args_no_run_policy_by_default() {
+        let base = RuntimeBase::DOCKER;
+        let config = ContainerConfig {
+            working_dir: "/workspace/project".to_string(),
+            ..Default::default()
+        };
+
+        let args = base.build_create_args("c", "alpine:latest", &config);
+
+        for flag in ["--privileged", "--cap-add", "--cap-drop", "--security-opt"] {
+            assert!(!args.contains(&flag.to_string()), "unexpected {flag}");
+        }
+    }
+
+    #[test]
     fn test_exec_command_with_options() {
         let base = RuntimeBase::DOCKER;
         let cmd = base.exec_command("my-container", Some("-w /workspace"), "my-agent");
@@ -1492,6 +1671,57 @@ mod tests {
     }
 
     #[test]
+    fn selected_named_ignore_volumes_never_reaches_outside_the_prefix() {
+        // The reporter's own listing (#3742): a sibling-worktree layout whose
+        // session moved from otari-worktrees/905 to otari-worktrees/rev-912.
+        // The hash suffixes are real `named_volume_for` output, kept literal on
+        // purpose: `DefaultHasher` is not stable across Rust releases, and a bump
+        // that changed it would orphan every existing named volume, so these
+        // constants are the canary for that.
+        const MAIN: &str = "aoe-vi-sess1-workspace-otari-target-8ec07926d6b0";
+        const PRE_MOVE: &str = "aoe-vi-sess1-workspace-otari-worktrees-905-target-31ddd0322290";
+        const POST_MOVE: &str =
+            "aoe-vi-sess1-workspace-otari-worktrees-rev-912-target-873cf2685e47";
+
+        let moved = format!("{MAIN}\n{PRE_MOVE}\n{POST_MOVE}\n");
+        // docker's `--filter name=` is a substring match, so a listing under
+        // `aoe-vi-sess1-` can carry a longer session id this prefix must not claim.
+        let other_session =
+            format!("{PRE_MOVE}\naoe-vi-sess10-workspace-a-target-c8c9b4754ab1\n\n");
+
+        // `None` selects everything, the shape the session-deletion sweep uses.
+        let cases = [
+            (
+                // The reclaim: only the name the caller computed for the moved path,
+                // never the main repo's volume or the one the new container mounts.
+                "an allowlist of one stranded name",
+                moved.as_str(),
+                Some(HashSet::from([PRE_MOVE])),
+                vec![PRE_MOVE],
+            ),
+            (
+                "the deletion sweep",
+                moved.as_str(),
+                None::<HashSet<&str>>,
+                vec![MAIN, PRE_MOVE, POST_MOVE],
+            ),
+            (
+                "a longer session id in the listing",
+                other_session.as_str(),
+                None,
+                vec![PRE_MOVE],
+            ),
+        ];
+
+        for (case, listing, allowed, expected) in cases {
+            let selected = selected_named_ignore_volumes(listing, "aoe-vi-sess1-", |name| {
+                allowed.as_ref().is_none_or(|names| names.contains(name))
+            });
+            assert_eq!(selected, expected, "{case}");
+        }
+    }
+
+    #[test]
     fn test_named_ignore_volumes_rendered_as_name_colon_path_on_docker() {
         use crate::containers::container_interface::NamedVolumeMount;
         let base = RuntimeBase::DOCKER;
@@ -1568,6 +1798,21 @@ mod tests {
             !volume_args.iter().any(|a| a.contains("aoe-vi-")),
             "Apple Container must not use the volume name in -v args"
         );
+    }
+
+    #[test]
+    fn store_generation_label_is_emitted_by_supported_runtimes() {
+        let config = ContainerConfig::default();
+        for base in [
+            RuntimeBase::DOCKER,
+            RuntimeBase::PODMAN,
+            RuntimeBase::APPLE_CONTAINER,
+        ] {
+            let args = base.build_create_args("c", "image", &config);
+            assert!(args.windows(2).any(|pair| {
+                pair == ["--label", "com.agent-of-empires.sandbox-store-generation=2"]
+            }));
+        }
     }
 
     #[test]

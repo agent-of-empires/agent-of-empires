@@ -155,3 +155,8 @@ Maintained by the Agent of Empires community, with support from [Mozilla.ai](htt
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.
+
+One file, `src/tui/hyperlink.rs`, contains code derived from
+[herdr](https://github.com/herdrdev/herdr) under the Apache License 2.0. See
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and
+[licenses/Apache-2.0.txt](licenses/Apache-2.0.txt).

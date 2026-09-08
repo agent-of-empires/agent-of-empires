@@ -34,7 +34,7 @@ async fn resolve(request: ApprovalRequest) -> ApprovalResult {
     let resolution = match require_daemon().await {
         Ok(endpoint) => match HttpClient::new(endpoint) {
             Ok(client) => match client
-                .resolve_approval(&session_id, &nonce, request.decision)
+                .resolve_approval(&session_id, &nonce, request.decision, None)
                 .await
             {
                 Ok(()) => ApprovalResolution::Resolved,

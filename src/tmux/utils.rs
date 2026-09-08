@@ -332,6 +332,34 @@ pub fn is_pane_running_shell(session_name: &str) -> bool {
     )
 }
 
+/// Stock tmux keys, under the prefix, that take a client out of a session:
+/// `L` is `switch-client -l`, `d` is `detach-client`.
+pub(crate) const SWITCH_BACK_KEY: &str = "L";
+pub(crate) const DETACH_KEY: &str = "d";
+
+/// Whether this process runs inside a tmux client. Attaching from inside is a
+/// `switch-client` of that client; from outside it is a fresh `attach-session`.
+pub(crate) fn inside_tmux() -> bool {
+    std::env::var("TMUX").is_ok()
+}
+
+/// The key hint for coming back to aoe after this process attaches in tmux
+/// mode. From outside tmux the attach is an `attach-session`, undone by
+/// `prefix d`. From inside tmux it is a `switch-client`, undone by
+/// `prefix L`, but with no client to switch (an inherited `TMUX`) it falls
+/// back to `attach-session`, so the hint names both keys.
+pub fn attach_return_hint() -> String {
+    attach_return_hint_for(inside_tmux())
+}
+
+pub(crate) fn attach_return_hint_for(inside_tmux: bool) -> String {
+    if inside_tmux {
+        format!("{SWITCH_BACK_KEY} (or {DETACH_KEY})")
+    } else {
+        DETACH_KEY.to_string()
+    }
+}
+
 /// Returns the tmux prefix key formatted for display (e.g. "Ctrl+a", "Ctrl+b").
 /// Reads `tmux show-option -gv prefix` once on first call and caches the
 /// result; falls back to "Ctrl+b" if tmux is unavailable or the option can't
@@ -402,6 +430,12 @@ mod tests {
     /// One tmux `set-option` write form emits exactly its tmux tokens: scope
     /// flags, `-q` when quiet, and no target for the server scope. This pins
     /// the emitted-args contract the table rows must keep (issue #3349).
+    #[test]
+    fn attach_return_hint_names_both_keys_inside_tmux() {
+        assert_eq!(attach_return_hint_for(true), "L (or d)");
+        assert_eq!(attach_return_hint_for(false), "d");
+    }
+
     #[test]
     fn test_tmux_option_write_emission() {
         use crate::session::config::TmuxOptionWrite;

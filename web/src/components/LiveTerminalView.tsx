@@ -293,6 +293,8 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
       >
         <MobileLiveTerminal
           frame={live.state.frame}
+          liveStats={live.state.stats}
+          transport={live.state.transport}
           armAgentClipboard={armAgentClipboard}
           connected={live.state.connected}
           active={active}
@@ -303,6 +305,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
           enterReading={live.enterReading}
           returnToLive={live.returnToLive}
           sendData={live.sendData}
+          typedWordRef={live.typedWordRef}
           uploadPastedImage={uploadPastedImage}
           forwardWheel={live.forwardWheel}
           forwardButton={live.forwardButton}

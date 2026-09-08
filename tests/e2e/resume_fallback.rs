@@ -8,7 +8,7 @@ use serial_test::parallel;
 use crate::harness::{require_tmux, TuiTestHarness};
 
 const TITLE: &str = "ResumeFallbackE2E";
-const FAKE_AGENT: &str = "aoe-resume-fallback-agent";
+const FAKE_AGENT: &str = "claude";
 const STALE_SID: &str = "11111111-1111-4111-8111-111111111111";
 
 fn new_harness(test_name: &str) -> TuiTestHarness {

@@ -1138,7 +1138,9 @@ pub async fn list_profiles(State(state): State<Arc<AppState>>) -> Json<Vec<Profi
         } else {
             active_profile
         };
-        let profiles = crate::session::list_profiles().unwrap_or_default();
+        // Picker order (`default` last); `active` came from the plain
+        // enumeration.
+        let profiles = crate::session::list_profiles_for_display().unwrap_or_default();
         profiles
             .into_iter()
             .map(|name| {
@@ -2455,15 +2457,26 @@ mod tests {
 
     #[test]
     fn acp_command_fields_substitute_data_dir() {
-        let registry = crate::acp::AgentRegistry::with_defaults();
         let dir = std::path::Path::new("/tmp/aoe-data");
-        let (cmd, _) = acp_command_fields(registry.get("aoe-agent"), Some(dir));
-        let cmd = cmd.expect("aoe-agent has a registry command");
+        let spec = crate::acp::AgentSpec {
+            command: "${aoe_data_dir}/bin/custom-acp".into(),
+            args: vec![],
+            description: "custom".into(),
+            env_allowlist: None,
+        };
+        let (cmd, _) = acp_command_fields(Some(&spec), Some(dir));
+        let cmd = cmd.expect("spec has a command");
         assert!(
             !cmd.contains("${aoe_data_dir}"),
             "placeholder must be substituted"
         );
         assert!(cmd.starts_with("/tmp/aoe-data/"));
+
+        // The bundled agent resolves through the adapter install, so its
+        // command is the bare binary token, not a data-dir path (#3553).
+        let registry = crate::acp::AgentRegistry::with_defaults();
+        let (cmd, _) = acp_command_fields(registry.get("aoe-agent"), Some(dir));
+        assert_eq!(cmd.as_deref(), Some("aoe-agent"));
     }
 
     #[test]

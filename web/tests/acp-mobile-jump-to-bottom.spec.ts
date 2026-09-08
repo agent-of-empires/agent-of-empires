@@ -41,7 +41,7 @@ test.describe("mobile jump-to-bottom", () => {
     const viewport = page.getByTestId("acp-viewport");
     const button = page.getByTestId("acp-jump-to-bottom");
 
-    // On load, autoScroll pins to the bottom, so the button is not shown.
+    // On load, scroll restoration pins to the bottom, so the button is not shown.
     await expect(button).toBeHidden();
 
     // Scroll to the top (real gesture): the button appears.

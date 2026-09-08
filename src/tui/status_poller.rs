@@ -181,9 +181,12 @@ pub(super) fn poll_statuses_once(
     if has_sandboxed && state.last_credential_refresh.elapsed() >= state.credential_refresh_interval
     {
         state.last_credential_refresh = Instant::now();
-        crate::session::config::container_config::refresh_shared_agent_configs();
-        for instance in instances.iter().filter(|inst| inst.is_sandboxed()) {
-            crate::session::config::container_config::refresh_codex_agent_config_for_instance(
+        for instance in instances.iter().filter(|inst| {
+            inst.is_sandboxed()
+                && inst.sandbox_store_generation
+                    >= crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION
+        }) {
+            crate::session::config::container_config::refresh_agent_configs_for_instance(
                 &instance.effective_profile(),
                 &instance.id,
                 &instance.tool,

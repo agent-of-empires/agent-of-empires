@@ -201,9 +201,12 @@ impl Instance {
             "agent launch command prepared"
         );
 
-        if self.capture_agent_name() == Some("claude") {
-            let _ = crate::hooks::unlink_session_id_via_guard(&self.id);
+        if !prepared.is_existing {
+            if let Some(prior_sid) = prepared.expected_prior_sid.as_ref() {
+                self.retroactive_capture_excludes.insert(prior_sid.clone());
+            }
         }
+        self.clear_pane_identity_sidecar();
 
         let mut omp_capture_metadata = if let Some(plan) = prepared.omp_capture_plan {
             let launched_at_ms = SystemTime::now()
@@ -251,6 +254,7 @@ impl Instance {
                 metadata.launch_id.clone(),
             ));
         }
+        self.capture_started_at = Some(SystemTime::now());
         session.create_with_size_env_and_container_env(
             &self.project_path,
             prepared.command.as_deref(),

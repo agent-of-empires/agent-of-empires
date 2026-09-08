@@ -6,6 +6,10 @@ pub(super) fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
+pub(super) fn is_zero_u8(value: &u8) -> bool {
+    *value == 0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TerminalInfo {
     #[serde(default)]
@@ -99,6 +103,12 @@ pub struct WorkspaceInfo {
     pub created_at: DateTime<Utc>,
     #[serde(default = "default_true")]
     pub cleanup_on_delete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SandboxStoreTransitionPath {
+    pub(crate) source: PathBuf,
+    pub(crate) destination: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

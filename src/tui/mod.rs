@@ -4,6 +4,7 @@ mod app;
 mod approval_poller;
 mod attach_project_poller;
 mod attached_status_hooks;
+mod boot_spinner;
 pub(crate) mod clipboard;
 mod components;
 mod creation_poller;
@@ -12,6 +13,8 @@ mod deletion_poller;
 pub mod dialogs;
 pub mod diff;
 pub(crate) mod home;
+pub mod hyperlink;
+pub(crate) mod links;
 pub(crate) mod markdown;
 mod metrics_poller;
 pub(crate) mod open_url;
@@ -23,6 +26,7 @@ mod restart_poller;
 pub mod settings;
 mod status_poller;
 mod stop_poller;
+mod store_move_poller;
 pub(crate) mod structured_view;
 pub(crate) mod styles;
 mod trash_poller;
@@ -57,7 +61,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::prelude::*;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 
 use crate::migrations;
 
@@ -228,24 +232,50 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
         return remote_home::run_standalone(endpoint).await;
     }
 
-    // Run pending migrations with a spinner so users see progress
-    if migrations::has_pending_migrations() {
-        const SPINNER_FRAMES: &[char] = &['◐', '◓', '◑', '◒'];
-        let migration_handle = tokio::task::spawn_blocking(migrations::run_migrations);
+    // Opening the local session store creates the profile directory, so an
+    // unknown name is refused first (#148); the remote client above never
+    // touches local profiles.
+    crate::session::require_known_profile(profile)?;
+
+    // Run pending migrations with a spinner that names the migration, its
+    // current step and the elapsed time, and keeps the notices a migration
+    // emits (what is being moved, how to defer it) on screen. Unconditional
+    // because the spinner writes nothing until a migration reports something,
+    // so the schema-current path costs nothing. This covers the startup pass
+    // only: v027's per-session store move runs from a launch, on the store
+    // move poller, and narrates itself on the home status line.
+    {
+        let console = std::sync::Arc::new(std::sync::Mutex::new(
+            migrations::progress::ConsoleProgress::default(),
+        ));
+        let reporter: migrations::progress::Reporter = {
+            let console = console.clone();
+            std::sync::Arc::new(move |event| {
+                console
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .apply(event);
+            })
+        };
+        let migration_handle =
+            tokio::task::spawn_blocking(move || migrations::run_migrations_with(Some(reporter)));
         tokio::pin!(migration_handle);
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(120));
         let mut frame = 0usize;
+        let mut spinner = boot_spinner::BootSpinner::default();
         loop {
             tokio::select! {
                 result = &mut migration_handle => {
-                    print!("\r\x1b[2K");
-                    let _ = io::stdout().flush();
+                    let mut console = console.lock().unwrap_or_else(|e| e.into_inner());
+                    let _ = spinner.finish(&mut io::stdout(), &mut console);
+                    drop(console);
                     result??;
                     break;
                 }
                 _ = tick.tick() => {
-                    print!("\r  {} Running data migrations...", SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]);
-                    let _ = io::stdout().flush();
+                    let width = crate::terminal::get_size().map_or(80, |(w, _)| w as usize);
+                    let mut console = console.lock().unwrap_or_else(|e| e.into_inner());
+                    let _ = spinner.draw(&mut io::stdout(), &mut console, frame, width);
                     frame += 1;
                 }
             }
@@ -315,8 +345,6 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
         .unwrap_or_default();
     let enable_mouse = mouse_capture_requested(&startup_session_config) && !mosh_active;
     let _terminal_guard = TerminalGuard::enter(enable_mouse, mosh_active)?;
-    let backend = CrosstermBackend::new(io::stdout());
-    let mut terminal = Terminal::new(backend)?;
 
     // Combine the caller-supplied startup warning (e.g. debug-log file
     // failures) with any config-parse failures we detect at startup.
@@ -364,6 +392,10 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
     if let Some(warning) = combined_warning {
         app.show_startup_warning(&warning);
     }
+    // Built after `App` so it can share the map the renderer fills: the
+    // backend re-emits OSC 8 around whatever cells the frame marked as links.
+    let backend = crate::tui::hyperlink::HyperlinkBackend::new(io::stdout(), app.hyperlink_cells());
+    let mut terminal = Terminal::new(backend)?;
     let result = app.run(&mut terminal).await;
 
     crate::session::clear_tui_heartbeat();

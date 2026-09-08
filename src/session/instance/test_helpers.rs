@@ -22,7 +22,7 @@ pub(super) fn force_session_absent() -> crate::tmux::SessionCacheGuard {
 /// `install_from_config` replaces the whole profile's state and the
 /// registry outlives every test, so the caller must keep the returned
 /// guard alive for the duration of its reads.
-pub(super) fn install_aliases(
+pub(crate) fn install_aliases(
     profile: &str,
     aliases: &[(&str, &str)],
 ) -> crate::tmux::status_rules::ProfileRegistryGuard {

@@ -36,6 +36,7 @@ pub struct Schema {
     events_table: String,
     attachments_table: String,
     pending_attachments_table: String,
+    rate_limit_budgets_table: String,
 }
 
 impl Schema {
@@ -50,6 +51,7 @@ impl Schema {
             events_table: format!("{prefix}_events"),
             attachments_table: format!("{prefix}_attachments"),
             pending_attachments_table: format!("{prefix}_pending_attachments"),
+            rate_limit_budgets_table: format!("{prefix}_rate_limit_budgets"),
         })
     }
 
@@ -69,6 +71,14 @@ impl Schema {
     /// them under the real event seq and deletes the pending copy.
     pub fn pending_attachments_table(&self) -> &str {
         &self.pending_attachments_table
+    }
+
+    /// Durable per-session rate-limit redelivery budget. One row per
+    /// session, deliberately outside the seq-keyed retention prune: the
+    /// redelivery cap must survive `prune_retention` at every supported
+    /// history cap (#3688), so it cannot live in the pruned transcript.
+    pub fn rate_limit_budgets_table(&self) -> &str {
+        &self.rate_limit_budgets_table
     }
 }
 
@@ -130,6 +140,7 @@ pub fn open(db_path: &Path, schema: &Schema) -> Result<Connection> {
     let events = schema.events_table();
     let attachments = schema.attachments_table();
     let pending_attachments = schema.pending_attachments_table();
+    let rate_limit_budgets = schema.rate_limit_budgets_table();
     conn.execute_batch(&format!(
         "CREATE TABLE IF NOT EXISTS {events} (
             session_id   TEXT    NOT NULL,
@@ -170,7 +181,12 @@ pub fn open(db_path: &Path, schema: &Schema) -> Result<Connection> {
         CREATE INDEX IF NOT EXISTS idx_{pending_attachments}_session_ref
             ON {pending_attachments}(session_id, ref_id);
         CREATE INDEX IF NOT EXISTS idx_{pending_attachments}_created_at
-            ON {pending_attachments}(created_at);"
+            ON {pending_attachments}(created_at);
+        CREATE TABLE IF NOT EXISTS {rate_limit_budgets} (
+            session_id    TEXT    NOT NULL PRIMARY KEY,
+            spent         INTEGER NOT NULL,
+            armed         INTEGER NOT NULL
+        );"
     ))
     .context("create event log schema")?;
     ensure_discriminant_column(&conn, events)?;
@@ -859,6 +875,15 @@ pub fn delete_topic(conn: &Connection, schema: &Schema, topic: &str) -> usize {
         params![topic],
     ) {
         warn!(target: "events", "delete pending attachments {topic}: {e}");
+    }
+    if let Err(e) = conn.execute(
+        &format!(
+            "DELETE FROM {} WHERE session_id = ?1",
+            schema.rate_limit_budgets_table()
+        ),
+        params![topic],
+    ) {
+        warn!(target: "events", "delete rate-limit budget {topic}: {e}");
     }
     deleted
 }
