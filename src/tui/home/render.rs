@@ -2954,7 +2954,8 @@ impl HomeView {
                 .and_then(|id| self.get_instance(id))
                 .is_some_and(|inst| inst.is_trashed());
 
-        let selected_stopped = !selected_archived
+        let selected_stopped = !live_send_active
+            && !selected_archived
             && !selected_trashed
             && matches!(self.view_mode, ViewMode::Structured)
             && self
@@ -2971,7 +2972,8 @@ impl HomeView {
         // pane forever, so short-circuit to an explanatory placeholder
         // instead. Only in the Structured (agent output) view; Terminal
         // and Tool views show their own, independently-live panes.
-        let selected_structured = !selected_archived
+        let selected_structured = !live_send_active
+            && !selected_archived
             && !selected_trashed
             && matches!(self.view_mode, ViewMode::Structured)
             && self
