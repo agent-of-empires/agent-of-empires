@@ -11,11 +11,17 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::daemon::{
+    CleanupDefaults, ContextResumeAvailability, ContextResumeIndeterminateReason,
+    ContextResumeUnavailableReason, ListSessionsQuery, PlanSummary, SessionResponse,
+    SessionsEnvelope, WorkspaceRepoSummary,
+};
+
 use crate::git::error::GitError;
 use crate::session::config::SessionConfig;
 use crate::session::{
     duplicate_session_error, is_duplicate_session, EnsureReadyError, EnsureReadyOutcome, Instance,
-    LifecycleOperation, Status, Storage,
+    LifecycleOperation, Status, Storage, TerminalContextResume,
 };
 
 use super::validate_display_label;
@@ -42,7 +48,7 @@ pub use diff::*;
 pub use ensure::*;
 pub use lifecycle::*;
 pub use list::*;
-pub use model::*;
+use model::*;
 pub use rename::*;
 pub use search::*;
 pub use send::*;

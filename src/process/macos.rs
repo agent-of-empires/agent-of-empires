@@ -42,13 +42,17 @@ pub(super) fn build_children_map() -> HashMap<u32, Vec<u32>> {
 /// One `ps -A -ww -E -o command=` fork deciding, for each candidate `i`,
 /// whether a live process belongs to it: a whitespace-delimited token exactly
 /// equals `env_needles[i]` (anchored, matching the `KEY=VAL` env tokens `-E`
-/// appends), or the line contains `cmdline_needles[i]`. `-ww` disables column
+/// appends), and the line contains `cmdline_needles[i]` when both are supplied.
+/// An executable needle matches an exact argv-token basename. A candidate with
+/// one signal uses that one; otherwise every supplied signal must match.
+/// `-ww` disables column
 /// truncation; `-E` appends each owner-owned process's environment. If a `ps`
 /// build rejects `-E`, the call fails closed to all `false` and recovery falls
 /// back to the ledger. Best-effort: a failed `ps` yields all `false`.
 pub(super) fn processes_matching(
     env_needles: &[String],
     cmdline_needles: &[Option<String>],
+    executable_needles: &[Option<String>],
 ) -> Vec<bool> {
     let n = env_needles.len();
     let mut found = vec![false; n];
@@ -63,16 +67,40 @@ pub(super) fn processes_matching(
     }
     let text = String::from_utf8_lossy(&output.stdout);
     for line in text.lines() {
-        let tokens: std::collections::HashSet<&str> = line.split_whitespace().collect();
+        let tokens: Vec<&str> = line.split_whitespace().collect();
         for i in 0..n {
             if found[i] {
                 continue;
             }
-            let env_hit = !env_needles[i].is_empty() && tokens.contains(env_needles[i].as_str());
+            let env_position = (!env_needles[i].is_empty())
+                .then(|| tokens.iter().position(|token| *token == env_needles[i]))
+                .flatten();
+            let env_hit = env_position.is_some();
             let cmd_hit = cmdline_needles[i]
                 .as_deref()
                 .is_some_and(|s| !s.is_empty() && line.contains(s));
-            if env_hit || cmd_hit {
+            let command_end = env_position.unwrap_or(tokens.len());
+            let executable_hit = executable_needles[i].as_deref().is_some_and(|needle| {
+                !needle.is_empty()
+                    && tokens[..command_end].iter().any(|token| {
+                        std::path::Path::new(token)
+                            .file_name()
+                            .and_then(|value| value.to_str())
+                            == Some(needle)
+                    })
+            });
+            let has_env = !env_needles[i].is_empty();
+            let has_cmd = cmdline_needles[i]
+                .as_deref()
+                .is_some_and(|value| !value.is_empty());
+            let has_executable = executable_needles[i]
+                .as_deref()
+                .is_some_and(|value| !value.is_empty());
+            let matched = (has_env || has_cmd || has_executable)
+                && (!has_env || env_hit)
+                && (!has_cmd || cmd_hit)
+                && (!has_executable || executable_hit);
+            if matched {
                 found[i] = true;
             }
         }

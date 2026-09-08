@@ -59,6 +59,9 @@ export const HOST_STATE_VARS = new Set([
   "AOE_ACP_AGENT_ENV", // the daemon -> runner env carrier, decoded into agents
   "AOE_ACP_NODE", // an arbitrary host Node executable for the ACP runner
   "AOE_CITYHALL_MODE", // serves the daemon as a client of a host CityHall
+  // Defers the sandbox store migration; a host shell exporting it would make
+  // every live spec skip v027 and run against the pre-migration layout.
+  "AOE_DEFER_SANDBOX_MIGRATION",
   // `apply_cityhall_bundle` runs on the boot path: a host URL is fetched and
   // applied as config, and a first boot that cannot reach it aborts the
   // daemon outright.

@@ -98,7 +98,14 @@ pub(super) fn validate_overrides_typecheck(overrides: &serde_json::Value) -> Res
 /// already-loaded `ProfileConfig` so the caller does not read+parse the
 /// profile file a second time.
 pub(crate) fn profile_config_ignored_keys(cfg: &ProfileConfig) -> Vec<String> {
-    let Ok(base) = merged_onto_default(&cfg.overrides_value()) else {
+    overrides_ignored_keys(&cfg.overrides_value())
+}
+
+/// Dotted paths of keys in a sparse override object that `Config` does not
+/// recognize. Shared by the profile probe above and the repo-config loader,
+/// whose `#[serde(flatten)]` maps absorb unknown keys the same way.
+pub(crate) fn overrides_ignored_keys(overrides: &serde_json::Value) -> Vec<String> {
+    let Ok(base) = merged_onto_default(overrides) else {
         return Vec::new();
     };
     let mut ignored = Vec::new();
@@ -242,6 +249,27 @@ pub fn validate_port_mapping_format(mapping: &str) -> Result<(), String> {
     } else {
         Err("Must be port:port (e.g. 3000:3000)".to_string())
     }
+}
+
+/// Validate a Linux capability name (`sandbox.cap_add` / `sandbox.cap_drop`).
+pub fn validate_capability_format(cap: &str) -> Result<(), String> {
+    let re = regex::Regex::new(r"^[A-Z][A-Z_]+$").unwrap();
+    if re.is_match(cap) {
+        Ok(())
+    } else {
+        Err("Must be a capability name, e.g. ALL, SYS_ADMIN, CAP_NET_RAW".to_string())
+    }
+}
+
+/// Validate a `--security-opt` entry (`sandbox.security_opt`).
+pub fn validate_security_opt_format(opt: &str) -> Result<(), String> {
+    if opt.is_empty() || opt.chars().any(char::is_whitespace) || opt.starts_with('-') {
+        return Err(
+            "Must be a security option, e.g. seccomp=unconfined or no-new-privileges:true"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Validate a container network mode (`sandbox.network`). Empty (unset),

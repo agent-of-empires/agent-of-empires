@@ -331,9 +331,29 @@ const PRIME_AGENT: AgentProfile = {
   specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
 };
 
+// aoe's own multi-provider agent (Vercel AI SDK 7), at
+// `acp-worker/aoe-agent/src/index.ts`. It used to spread CLAUDE, which claimed
+// the whole claude specials set; the adapter's actual surface is three tools
+// (Read, Write, Bash) reported with real ToolKinds, no `_meta` on any
+// notification, no TodoWrite / Skill / ScheduleWakeup, no mode channel, and no
+// heartbeats. Everything below is off rather than guessed, so tools land on
+// the generic kind path. Its `task` calls arrive as `kind: "think"` from the
+// adapter itself, so they need no alias here. See #1904.
 const AOE_AGENT: AgentProfile = {
-  ...CLAUDE,
   key: "aoe-agent",
+  subagentToolNames: [],
+  capabilities: {
+    todos: false,
+    skills: false,
+    wakeup: false,
+    subagents: false,
+    legacyModeFallback: false,
+    heartbeatKeepalives: false,
+  },
+  parentMetaNamespaces: [],
+  mcpPrefixes: ["mcp__"],
+  aliases: {},
+  specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
 };
 
 /** Permissive fallback for unknown agent keys: kind-only dispatch with

@@ -292,6 +292,63 @@ impl ContainerRuntime {
             })
     }
 
+    fn apple_container_inspect_label<'a>(payload: &'a Value, key: &str) -> Result<Option<&'a str>> {
+        let Some(labels) = payload.pointer("/0/configuration/labels") else {
+            return Ok(None);
+        };
+        let labels = labels.as_object().ok_or_else(|| {
+            DockerError::InspectFailed(
+                "apple container inspect: /0/configuration/labels is not an object".to_string(),
+            )
+        })?;
+        let Some(value) = labels.get(key) else {
+            return Ok(None);
+        };
+        value.as_str().map(Some).ok_or_else(|| {
+            DockerError::InspectFailed(format!(
+                "apple container inspect: label {key} is not a string"
+            ))
+        })
+    }
+
+    fn inspect_container_label(&self, name: &str, key: &str) -> Result<Option<String>> {
+        let mut cmd = self.base.command();
+        match self.kind {
+            RuntimeKind::Docker | RuntimeKind::Podman => {
+                cmd.args([
+                    "container",
+                    "inspect",
+                    "-f",
+                    &format!(r#"{{{{index .Config.Labels "{key}"}}}}"#),
+                    name,
+                ]);
+            }
+            RuntimeKind::AppleContainer => {
+                cmd.args(["inspect", name]);
+            }
+        }
+        let output = self
+            .base
+            .probe_output(&mut cmd)
+            .map_err(|error| DockerError::InspectFailed(error.to_string()))?;
+        if !output.status.success() {
+            return Err(DockerError::InspectFailed(
+                String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            ));
+        }
+        match self.kind {
+            RuntimeKind::Docker | RuntimeKind::Podman => {
+                let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                Ok((!value.is_empty()).then_some(value))
+            }
+            RuntimeKind::AppleContainer => {
+                let payload: Value = serde_json::from_slice(&output.stdout)
+                    .map_err(|error| DockerError::InspectFailed(error.to_string()))?;
+                Ok(Self::apple_container_inspect_label(&payload, key)?.map(str::to_owned))
+            }
+        }
+    }
+
     /// The container's configured working directory (`Config.WorkingDir`), or
     /// `None` if it can't be determined (container gone, inspect failed, or the
     /// field is empty). Used to backfill the create-time-pinned workdir for
@@ -313,6 +370,26 @@ impl ContainerRuntime {
         }
         let wd = String::from_utf8_lossy(&output.stdout).trim().to_string();
         (!wd.is_empty()).then_some(wd)
+    }
+
+    pub fn sandbox_store_generation_matches(&self, name: &str) -> Result<Option<bool>> {
+        if !self.base.supports_labels {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.inspect_container_label(name, "com.agent-of-empires.sandbox-store-generation")?
+                .is_some_and(|value| value == "2"),
+        ))
+    }
+
+    pub fn mount_fingerprint_matches(&self, name: &str, expected: &str) -> Result<Option<bool>> {
+        if !self.base.supports_labels {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.inspect_container_label(name, "com.agent-of-empires.mount-fingerprint")?
+                .is_some_and(|value| value == expected),
+        ))
     }
 
     pub fn build_create_args(
@@ -381,7 +458,7 @@ impl ContainerRuntime {
             }
             RuntimeKind::AppleContainer => {
                 // Apple Container has a very limited initial PATH, so we wrap
-                // the command in `sh -c` to get a proper shell environment.
+                // the command in `/bin/sh -c` to get a proper shell environment.
                 // Single-quote with escaped embedded quotes to avoid issues
                 // with double-quote metacharacters ($, `, \, !) in the command.
                 let escaped = cmd.replace('\'', "'\\''");
@@ -394,13 +471,13 @@ impl ContainerRuntime {
                         "-it",
                         opt_str,
                         name,
-                        "sh",
+                        "/bin/sh",
                         "-c",
                         &cmd_str,
                     ]
                     .join(" ")
                 } else {
-                    ["container", "exec", "-it", name, "sh", "-c", &cmd_str].join(" ")
+                    ["container", "exec", "-it", name, "/bin/sh", "-c", &cmd_str].join(" ")
                 }
             }
         }
@@ -427,7 +504,7 @@ impl ContainerRuntime {
                 // is `$0`; the command starts at `$1`.
                 let mut argv = self.base.build_exec_argv(name, workdir, &[]);
                 argv.extend([
-                    "sh".to_string(),
+                    "/bin/sh".to_string(),
                     "-c".to_string(),
                     "exec \"$@\"".to_string(),
                     "sh".to_string(),
@@ -442,7 +519,22 @@ impl ContainerRuntime {
         self.base.exec(name, cmd)
     }
 
+    /// Whether each container named with `prefix` is in the `running` state,
+    /// in a single subprocess call. Paused and restarting containers read as
+    /// not running here; use [`Self::batch_container_states`] where inspect's
+    /// `State.Running` is the question.
     pub fn batch_running_states(&self, prefix: &str) -> HashMap<String, bool> {
+        self.batch_container_states(prefix)
+            .into_iter()
+            .map(|(name, state)| (name, state == ContainerState::Running))
+            .collect()
+    }
+
+    /// The listed state of every container named with `prefix`, in a single
+    /// subprocess call. Empty when the runtime cannot list (Apple's CLI has no
+    /// state column), so a caller must treat an absent name as unknown, not
+    /// as stopped.
+    pub fn batch_container_states(&self, prefix: &str) -> HashMap<String, ContainerState> {
         match self.kind {
             RuntimeKind::Docker | RuntimeKind::Podman => {
                 let mut cmd = self.base.command();
@@ -458,22 +550,7 @@ impl ContainerRuntime {
                     Ok(output) if output.status.success() => output,
                     _ => return HashMap::new(),
                 };
-
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                stdout
-                    .lines()
-                    .filter_map(|line| {
-                        let mut parts = line.splitn(2, '\t');
-                        let name = parts.next()?.trim();
-                        let state = parts.next()?.trim();
-                        // Docker/Podman's --filter name= does substring matching, so
-                        // post-filter to ensure we only include exact prefix matches.
-                        if name.is_empty() || !name.starts_with(prefix) {
-                            return None;
-                        }
-                        Some((name.to_string(), state == "running"))
-                    })
-                    .collect()
+                parse_batch_states(&String::from_utf8_lossy(&output.stdout), prefix)
             }
             RuntimeKind::AppleContainer => {
                 let _ = prefix;
@@ -524,9 +601,105 @@ impl ContainerRuntime {
     }
 }
 
+/// A container's state as `ps --format {{.State}}` lists it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContainerState {
+    Running,
+    Paused,
+    Restarting,
+    Created,
+    Exited,
+    Dead,
+    /// A transitional (`removing`, `stopping`) or unrecognised state.
+    Other,
+}
+
+impl ContainerState {
+    pub fn from_listing(state: &str) -> Self {
+        match state {
+            "running" => Self::Running,
+            "paused" => Self::Paused,
+            "restarting" => Self::Restarting,
+            "created" => Self::Created,
+            "exited" => Self::Exited,
+            "dead" => Self::Dead,
+            _ => Self::Other,
+        }
+    }
+
+    /// Inspect's `State.Running`, which Moby keeps true while a container is
+    /// paused or restarting: the process is alive and its mounts are in use.
+    /// `None` for a state that says nothing certain either way, so a caller
+    /// that must not guess inspects the container instead.
+    pub fn is_live(self) -> Option<bool> {
+        match self {
+            Self::Running | Self::Paused | Self::Restarting => Some(true),
+            Self::Created | Self::Exited | Self::Dead => Some(false),
+            Self::Other => None,
+        }
+    }
+}
+
+/// Parse `{{.Names}}\t{{.State}}` lines. Docker and Podman's `--filter name=`
+/// matches substrings, so names are post-filtered to the exact prefix.
+fn parse_batch_states(stdout: &str, prefix: &str) -> HashMap<String, ContainerState> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(2, '\t');
+            let name = parts.next()?.trim();
+            let state = parts.next()?.trim();
+            if name.is_empty() || !name.starts_with(prefix) {
+                return None;
+            }
+            Some((name.to_string(), ContainerState::from_listing(state)))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every state the listing can report, including ones the parser has not
+    /// heard of. Paused and restarting are live, like `State.Running` says;
+    /// anything transitional stays undecided rather than reading as stopped.
+    #[test]
+    fn batch_listing_states_keep_inspect_liveness() {
+        let listing = "aoe-sandbox-a\trunning\n\
+                       aoe-sandbox-b\tpaused\n\
+                       aoe-sandbox-c\trestarting\n\
+                       aoe-sandbox-d\texited\n\
+                       aoe-sandbox-e\tcreated\n\
+                       aoe-sandbox-f\tdead\n\
+                       aoe-sandbox-g\tremoving\n\
+                       aoe-sandbox-h\tsomething-new\n\
+                       other-aoe-sandbox-i\trunning\n\
+                       aoe-sandbox-j\n";
+        let states = parse_batch_states(listing, "aoe-sandbox-");
+        let cases = [
+            ("aoe-sandbox-a", ContainerState::Running, Some(true)),
+            ("aoe-sandbox-b", ContainerState::Paused, Some(true)),
+            ("aoe-sandbox-c", ContainerState::Restarting, Some(true)),
+            ("aoe-sandbox-d", ContainerState::Exited, Some(false)),
+            ("aoe-sandbox-e", ContainerState::Created, Some(false)),
+            ("aoe-sandbox-f", ContainerState::Dead, Some(false)),
+            ("aoe-sandbox-g", ContainerState::Other, None),
+            ("aoe-sandbox-h", ContainerState::Other, None),
+        ];
+        assert_eq!(states.len(), cases.len(), "{states:?}");
+        for (name, state, live) in cases {
+            assert_eq!(states[name], state, "{name}");
+            assert_eq!(state.is_live(), live, "{name}");
+        }
+        // The health map keeps its strict reading: only `running` is running.
+        let running: HashMap<String, bool> = states
+            .iter()
+            .map(|(name, state)| (name.clone(), *state == ContainerState::Running))
+            .collect();
+        assert!(running["aoe-sandbox-a"]);
+        assert!(!running["aoe-sandbox-b"]);
+    }
     #[test]
     fn runtime_timeout_classification_matches_io_error_kind() {
         let cases = [
@@ -691,6 +864,28 @@ mod tests {
                 None => assert!(result.is_err(), "expected Err for {payload}"),
             }
         }
+
+        let key = "com.agent-of-empires.mount-fingerprint";
+        let payload = json!([{"configuration": {"labels": {(key): "expected"}}}]);
+        assert_eq!(
+            ContainerRuntime::apple_container_inspect_label(&payload, key).unwrap(),
+            Some("expected")
+        );
+        for payload in [json!([{}]), json!([{"configuration": {"labels": {}}}])] {
+            assert_eq!(
+                ContainerRuntime::apple_container_inspect_label(&payload, key).unwrap(),
+                None
+            );
+        }
+        for payload in [
+            json!([{"configuration": {"labels": []}}]),
+            json!([{"configuration": {"labels": {(key): 3}}}]),
+        ] {
+            assert!(
+                ContainerRuntime::apple_container_inspect_label(&payload, key).is_err(),
+                "expected Err for {payload}"
+            );
+        }
     }
 
     #[test]
@@ -721,6 +916,19 @@ mod tests {
         let rt = ContainerRuntime::podman();
         let cmd = rt.exec_command("aoe-sandbox-test1234", None, "claude");
         assert_eq!(cmd, "podman exec -it aoe-sandbox-test1234 claude");
+    }
+
+    #[test]
+    fn apple_container_exec_command_uses_absolute_shell() {
+        let cmd = ContainerRuntime::apple_container().exec_command(
+            "aoe-sandbox-test1234",
+            None,
+            "printf ok",
+        );
+        assert_eq!(
+            cmd,
+            "container exec -it aoe-sandbox-test1234 /bin/sh -c 'printf ok'"
+        );
     }
 
     /// A title one-shot argv: the agent, its flags, and a prompt full of shell
@@ -782,7 +990,7 @@ mod tests {
                 "-w",
                 "/workspace",
                 "aoe-sandbox-test1234",
-                "sh",
+                "/bin/sh",
                 "-c",
                 "exec \"$@\"",
                 "sh",
@@ -791,6 +999,31 @@ mod tests {
         // The shell program is a fixed literal and the command follows it as
         // separate elements, so the prompt is never shell-parsed.
         assert_eq!(&argv[9..], &oneshot_argv()[..]);
+
+        // `printf` sits in /usr/bin on macOS and in /bin on most Linux
+        // images. The probe is about an absolute path running without a
+        // usable PATH, not about where that path happens to be, so resolve it
+        // rather than hardcoding one layout and failing on the other.
+        let printf = ["/usr/bin/printf", "/bin/printf"]
+            .into_iter()
+            .find(|candidate| std::path::Path::new(candidate).exists())
+            .expect("an absolute printf to prove PATH independence with");
+        let executable = ContainerRuntime::apple_container().build_exec_argv(
+            "aoe-sandbox-test1234",
+            "",
+            &[printf.to_string(), "PATH_INDEPENDENT".to_string()],
+        );
+        let output = std::process::Command::new(&executable[3])
+            .args(&executable[4..])
+            .env_clear()
+            .env("PATH", "/definitely-missing")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{printf} must run with no usable PATH, got {output:?}"
+        );
+        assert_eq!(output.stdout, b"PATH_INDEPENDENT");
     }
 
     #[test]

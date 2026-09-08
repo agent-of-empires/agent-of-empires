@@ -27,6 +27,12 @@ pub enum AcpError {
     /// `result_large_err`).
     #[error("incompatible agent: {0}")]
     IncompatibleAgent(Box<IncompatibleAgentError>),
+    /// The agent rejected the handshake with a provider rate limit. Carried
+    /// as a typed failure so the caller parks the session on
+    /// `RateLimit` + `Stopped { rate_limited }` instead of a generic startup
+    /// error that would burn the respawn budget against the same limit.
+    #[error("agent is rate-limited during startup: {}", .0.status)]
+    RateLimited(Box<crate::acp::state::RateLimitInfo>),
     #[error("transport error: {0}")]
     Transport(String),
     #[error("protocol violation: {0}")]
@@ -110,9 +116,7 @@ impl AcpError {
     }
 }
 
-/// Build a crate `Error` carrying `message`, for the v2 control path where
-/// the daemon's handshake round-trip fails at the control channel rather
-/// than at a crate `send_request`.
+/// Build a crate error for a control v3 handshake failure.
 pub(super) fn acp_internal_error(message: String) -> agent_client_protocol::Error {
     let mut err = agent_client_protocol::Error::internal_error();
     err.message = message;
@@ -132,7 +136,6 @@ pub(super) fn acp_error_from_value(error: serde_json::Value) -> agent_client_pro
 #[cfg(test)]
 mod tests {
     use super::*;
-
     /// Belt-and-suspenders: even if the pre-flight raced (cwd vanishes
     /// between `cwd.exists()` and `Command::spawn`), the classifier turns
     /// the raw ENOENT into `ProjectPathMissing` rather than the generic

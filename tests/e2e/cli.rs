@@ -1490,22 +1490,27 @@ fn test_cli_rm_kills_agent_tmux_session() {
 /// Initialize a bare-minimum git repo at the given path so worktree operations work.
 fn init_git_repo(path: &Path) {
     std::fs::create_dir_all(path).expect("create repo dir");
-    let init = Command::new("git")
-        .args(["init"])
-        .current_dir(path)
-        .output()
-        .expect("git init");
-    assert!(init.status.success(), "git init failed");
-
-    // Need at least one commit for worktree creation.
-    let _ = Command::new("git")
-        .args(["commit", "--allow-empty", "-m", "init"])
-        .current_dir(path)
-        .env("GIT_AUTHOR_NAME", "test")
-        .env("GIT_AUTHOR_EMAIL", "test@test.com")
-        .env("GIT_COMMITTER_NAME", "test")
-        .env("GIT_COMMITTER_EMAIL", "test@test.com")
-        .output();
+    for args in [
+        &["init", "-q"][..],
+        &["commit", "--allow-empty", "-q", "-m", "init"],
+    ] {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test.com")
+            .output()
+            .expect("run isolated git fixture command");
+        assert!(
+            output.status.success(),
+            "git fixture command {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 /// Regression test for #591: repo on_create hooks should execute for multi-repo

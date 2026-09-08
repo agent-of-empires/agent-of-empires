@@ -2,10 +2,11 @@ import { test, expect } from "./helpers/mockedTest";
 import { Page } from "@playwright/test";
 
 // Wizard Extra repos picker (#1219). Lives under the Project step once
-// a primary path is selected. Covers chip toggle on registered
-// projects, free-text path add via input + Enter / Add button, removal
-// via the X button on selected chips, and the primary-path filtering
-// rule that hides the selected project from the registered list.
+// a primary path is selected. Covers chip toggle on saved projects, the
+// shared search box over saved + recent projects (#3743), free-text path
+// add via input + Enter / Add button, removal via the X button on selected
+// chips, and the primary-path filtering rule that hides the selected
+// project from the picker.
 
 interface MockOptions {
   projects?: Array<{ name: string; path: string; scope: "global" | "profile" }>;
@@ -43,6 +44,7 @@ async function mockApis(page: Page, opts: MockOptions = {}) {
       ],
     }),
   );
+  await page.route("**/api/recent-projects", (r) => r.fulfill({ json: { projects: [] } }));
   await page.route("**/api/sessions", (r) =>
     r.fulfill({
       json: {
@@ -94,7 +96,7 @@ test.describe("Wizard extra repos picker (#1219)", () => {
     // projects list (#3461), so page-wide or wizard-wide button locators are
     // ambiguous.
     const picker = page.getByTestId("extra-repos-picker");
-    await expect(picker.getByText("Registered projects")).toBeVisible();
+    await expect(picker.getByText("Saved projects")).toBeVisible();
     // The primary entry (matching /tmp/example) is hidden from the picker
     // so users can't accidentally duplicate it.
     await expect(picker.getByRole("button").filter({ hasText: /^primary/ })).toHaveCount(0);
@@ -147,6 +149,20 @@ test.describe("Wizard extra repos picker (#1219)", () => {
     await expect(addBtn).toBeEnabled();
     await addBtn.click();
     await expect(page.getByText("1 selected")).toBeVisible();
+  });
+
+  // #3743: extra repos should be just as searchable as the main Project step.
+  test("the picker's own search box filters its saved-projects list", async ({ page }) => {
+    await mockApis(page);
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.goto("/");
+    await openProjectStepWithPath(page);
+    const picker = page.getByTestId("extra-repos-picker");
+    // Scoped to the picker: the step's own Recent-tab search box (#3461)
+    // shares the same accessible name and is visible on the same screen.
+    await picker.getByLabel("Search projects").fill("shared");
+    await expect(picker.getByRole("button").filter({ hasText: /^shared-lib/ })).toBeVisible();
+    await expect(picker.getByRole("button").filter({ hasText: /^docs/ })).toHaveCount(0);
   });
 
   test("attempting to add the primary path as a free-text entry is a no-op", async ({ page }) => {

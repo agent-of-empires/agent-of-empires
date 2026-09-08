@@ -1,11 +1,11 @@
-//! Full-stack e2e for #3638: a custom agent that wraps a supported one
+//! Full-stack e2e for #3638: a custom agent mapped to a supported one
 //! (`custom_agents` + `agent_detect_as`) launches with its own pinned
-//! conversation id and resumes that same conversation on restart.
+//! conversation id and preserves that identity across restart.
 //!
 //! Teeth: the shim records every launch's argv and writes no transcript, so
 //! nothing on disk can be scanned for an identity. Capture and resume used to
-//! key off `Instance::tool` raw, which names the wrapper and resolves to no
-//! built-in, so a wrapper launched with no id, stored none, and started a
+//! key off `Instance::tool` raw, which names the custom alias and resolves to
+//! no built-in, so the alias launched with no id, stored none, and started a
 //! fresh conversation on every restart.
 //!
 //! Daemon-free, so no feature gate. Run via:
@@ -22,42 +22,43 @@ use serial_test::parallel;
 
 use crate::harness::{app_dir_in, require_tmux, TuiTestHarness};
 
-const WRAPPER: &str = "claude-personal";
+const CUSTOM_AGENT: &str = "claude-personal";
+const SHIM_BINARY: &str = "claude";
 
-/// Install a wrapper stub that appends every launch's argv to
-/// `$HOME/wrapper-launches` and then parks so the pane stays alive. It writes
+/// Install a Claude-shaped stub that appends every launch's argv to
+/// `$HOME/alias-launches` and then parks so the pane stays alive. It writes
 /// no Claude transcript: a pane nobody prompted is the case whose identity has
 /// to survive a restart, and the only place it can come from is the flag AoE
 /// put on the launch line.
-fn install_wrapper_shim(h: &mut TuiTestHarness) {
-    let bin = h.install_path_command(WRAPPER);
+fn install_alias_shim(h: &mut TuiTestHarness) {
+    let bin = h.install_path_command(SHIM_BINARY);
     // The `launch:` prefix keeps an argv-less launch on its own recorded line,
     // so a launch that pinned nothing fails on the missing flag rather than
     // reading as no launch at all.
     let script = r#"#!/bin/sh
-printf 'launch: %s\n' "$*" >> "$HOME/wrapper-launches"
+printf 'launch: %s\n' "$*" >> "$HOME/alias-launches"
 exec sleep 600
 "#;
-    let path = bin.join(WRAPPER);
-    std::fs::write(&path, script).expect("write wrapper shim");
+    let path = bin.join(SHIM_BINARY);
+    std::fs::write(&path, script).expect("write alias shim");
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod shim");
 }
 
-/// Declare the wrapper as a custom agent inheriting Claude's behavior, the
-/// configuration the issue reports.
+/// Declare a custom agent whose direct Claude command inherits Claude's
+/// behavior. Differently named or path-qualified wrappers fail closed; the
+/// test shim stands in for the `claude` command resolved by the launch `PATH`.
 fn declare_custom_agent(h: &TuiTestHarness) {
     let app_dir = app_dir_in(h.home_path());
     std::fs::create_dir_all(&app_dir).expect("create app dir");
-    std::fs::write(
-        app_dir.join("config.toml"),
-        format!(
-            "[session]\n\
-             custom_agents = {{ \"{WRAPPER}\" = \"{WRAPPER}\" }}\n\
-             agent_detect_as = {{ \"{WRAPPER}\" = \"claude\" }}\n"
-        ),
-    )
-    .expect("write config.toml");
+    let config_path = app_dir.join("config.toml");
+    let mut config = std::fs::read_to_string(&config_path).expect("read harness config.toml");
+    config.push_str(&format!(
+        "\n[session]\n\
+         custom_agents = {{ \"{CUSTOM_AGENT}\" = \"{SHIM_BINARY}\" }}\n\
+         agent_detect_as = {{ \"{CUSTOM_AGENT}\" = \"claude\" }}\n"
+    ));
+    std::fs::write(config_path, config).expect("extend config.toml");
 }
 
 /// Every profile's `sessions.json`, so the lookup does not depend on which
@@ -99,7 +100,7 @@ const SHIM_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Block until the shim has recorded `expected` launches, then return them
 /// oldest first.
 fn wait_for_launches(h: &TuiTestHarness, expected: usize) -> Vec<String> {
-    let path = h.home_path().join("wrapper-launches");
+    let path = h.home_path().join("alias-launches");
     let deadline = Instant::now() + SHIM_DEADLINE;
     loop {
         let lines: Vec<String> = std::fs::read_to_string(&path)
@@ -143,15 +144,15 @@ fn parse_session_id(add_stdout: &str) -> String {
 }
 
 fn add_session(h: &TuiTestHarness, project: &Path, title: &str) -> String {
-    // `--tool` names a configured custom agent; `--cmd` would run the
-    // built-in substring match and resolve this wrapper to plain `claude`.
+    // `--tool` keeps the configured custom-agent identity. `--cmd claude`
+    // would select the built-in directly and would not exercise alias resolution.
     let add = h.run_cli(&[
         "add",
         project.to_str().expect("utf8 project"),
         "-t",
         title,
         "--tool",
-        WRAPPER,
+        CUSTOM_AGENT,
     ]);
     assert!(
         add.status.success(),
@@ -176,16 +177,16 @@ fn custom_agent_resume() {
     require_tmux!();
 
     let mut h = TuiTestHarness::new_in_tmp("custom_agent_resume");
-    install_wrapper_shim(&mut h);
+    install_alias_shim(&mut h);
     declare_custom_agent(&h);
 
-    // Two wrapper sessions in ONE project directory, so a launch that picked
+    // Two alias sessions in ONE project directory, so a launch that picked
     // up the wrong conversation would show as a shared id.
     let project = h.home_path().join("shared-project");
     std::fs::create_dir_all(&project).expect("mkdir project");
 
-    let id_a = add_session(&h, &project, "wrapper-A");
-    let id_b = add_session(&h, &project, "wrapper-B");
+    let id_a = add_session(&h, &project, "alias-A");
+    let id_b = add_session(&h, &project, "alias-B");
 
     // Started one at a time so each recorded launch is attributable to the
     // session that produced it.
@@ -195,27 +196,28 @@ fn custom_agent_resume() {
     let launch_b = wait_for_launches(&h, 2).remove(1);
 
     let pinned_a = flag_value(&launch_a, "--session-id")
-        .unwrap_or_else(|| panic!("wrapper A launched with no conversation id: {launch_a}"));
+        .unwrap_or_else(|| panic!("alias A launched with no conversation id: {launch_a}"));
     let pinned_b = flag_value(&launch_b, "--session-id")
-        .unwrap_or_else(|| panic!("wrapper B launched with no conversation id: {launch_b}"));
+        .unwrap_or_else(|| panic!("alias B launched with no conversation id: {launch_b}"));
     assert_ne!(
         pinned_a, pinned_b,
-        "co-located wrappers must pin different conversations"
+        "co-located aliases must pin different conversations"
     );
 
-    let stored_a = agent_session_id_of(&h, &id_a).expect("wrapper A persisted no id");
-    let stored_b = agent_session_id_of(&h, &id_b).expect("wrapper B persisted no id");
+    let stored_a = agent_session_id_of(&h, &id_a).expect("alias A persisted no id");
+    let stored_b = agent_session_id_of(&h, &id_b).expect("alias B persisted no id");
     assert_eq!(stored_a, pinned_a);
     assert_eq!(stored_b, pinned_b);
 
-    // The restart continues the same conversation rather than starting fresh.
+    // The shim writes no transcript. Relaunching the same pin avoids a
+    // guaranteed-failing `--resume` while preserving the conversation identity.
     run_session_cli(&h, "stop", &id_a);
     run_session_cli(&h, "start", &id_a);
     let relaunch = wait_for_launches(&h, 3).remove(2);
     assert_eq!(
-        flag_value(&relaunch, "--resume").as_deref(),
+        flag_value(&relaunch, "--session-id").as_deref(),
         Some(&*stored_a),
-        "a restart must resume the conversation the session already owns, got: {relaunch}"
+        "an empty-thread restart must preserve the session's pinned identity, got: {relaunch}"
     );
     assert_eq!(agent_session_id_of(&h, &id_a).as_deref(), Some(&*stored_a));
     assert_eq!(

@@ -12,12 +12,20 @@ struct Cleanup(Vec<String>);
 
 impl Drop for Cleanup {
     fn drop(&mut self) {
+        let socket = crate::common::tmux_socket();
         for name in &self.0 {
             let _ = Command::new("tmux")
                 .arg("-S")
-                .arg(crate::common::tmux_socket())
+                .arg(&socket)
                 .args(["kill-session", "-t", name])
                 .output();
+        }
+        // tmux removes the socket asynchronously after its last session exits.
+        for _ in 0..40 {
+            if !socket.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
         }
     }
 }

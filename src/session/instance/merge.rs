@@ -5,7 +5,7 @@ use super::*;
 
 impl Instance {
     /// Mutates launch-owned state. A strictly newer lifecycle generation also
-    /// imports its status timestamps and error snapshot as one unit.
+    /// imports its status timestamps, capture floor, and error snapshot as one unit.
     pub fn merge_post_start(&mut self, src: &Self) {
         if src.lifecycle_generation < self.lifecycle_generation {
             return;
@@ -18,7 +18,13 @@ impl Instance {
         }
         self.lifecycle_generation = src.lifecycle_generation;
         self.status = src.status;
+        // A launch decided before a peer archived the row reports a pane
+        // the archive tore down.
+        if self.is_archived() {
+            self.settle_archived_status();
+        }
         self.sandbox_info = src.sandbox_info.clone();
+        self.capture_started_at = src.capture_started_at;
     }
 
     /// Same fields as `merge_post_start`. Resume-probe failure markers are
@@ -48,6 +54,7 @@ impl Instance {
         if generation_can_merge {
             self.omp_capture_generation = src.omp_capture_generation.clone();
             self.session_id_poller = src.session_id_poller.clone();
+            self.session_id_poller_retry_after = src.session_id_poller_retry_after;
             if sid_unchanged {
                 self.agent_session_id = src.agent_session_id.clone();
             }
@@ -61,6 +68,11 @@ impl Instance {
         if generation_can_merge && marker_unchanged && self.agent_session_id == src.agent_session_id
         {
             self.resume_probe_failed_sid = src.resume_probe_failed_sid.clone();
+        }
+        // `install_poller` cleared the working clone's repair schedule when
+        // its poller started; the live row must not keep the stale backoff.
+        if src.session_id_poller_is_running() {
+            self.poller_repair.reset();
         }
     }
 
@@ -105,7 +117,10 @@ impl Instance {
         self.last_error_check = previous.last_error_check;
         self.last_start_time = previous.last_start_time;
         self.session_id_poller = previous.session_id_poller.clone();
+        self.poller_repair = previous.poller_repair.clone();
+        self.session_id_poller_retry_after = previous.session_id_poller_retry_after;
         self.retroactive_capture_excludes = previous.retroactive_capture_excludes.clone();
+        self.acp_load_session_capable = previous.acp_load_session_capable;
     }
 
     /// Carry every in-process field from a pre-move live row onto the
@@ -144,6 +159,11 @@ impl Instance {
             self.status = src.status;
             self.last_accessed_at = self.last_accessed_at.max(src.last_accessed_at);
             self.idle_entered_at = src.idle_entered_at;
+            // A snapshot taken before a peer archived the row carries a
+            // pre-archive observation of a pane that no longer exists.
+            if self.is_archived() {
+                self.settle_archived_status();
+            }
         }
         // Launch-config fields are TUI-authoritative and only mutated after
         // creation by the restart dialog (engine / command / args swap). They
@@ -211,6 +231,7 @@ impl Instance {
             .unwrap_or_default();
         self.agent_session_id = restored.agent_session_id;
         self.acp_session_id = restored.acp_session_id;
+        self.acp_load_session_capable = None;
         self.resume_probe_failed_sid = None;
         // A pin/clear/fork directive names an id in the old agent's namespace,
         // so it cannot survive the swap either.
@@ -277,6 +298,13 @@ impl Instance {
         self.lifecycle_generation = patch.lifecycle_generation;
         self.status = patch.status;
         self.idle_entered_at = patch.idle_entered_at;
+        // A patch decided from a pane observed before a concurrent archive
+        // landed is stale by construction: the archive tore the tmux down.
+        // Writing its Running/Waiting verbatim would resurrect the frozen
+        // pending-permission row the archived poll guard settles.
+        if self.is_archived() {
+            self.settle_archived_status();
+        }
         let Some(incoming) = patch.last_accessed_at else {
             return;
         };
@@ -432,6 +460,13 @@ impl Instance {
         if self.archived_at.is_some() {
             self.snoozed_until = None;
         }
+        // archive(): a row whose tmux archive tore down (#1868) cannot hold a
+        // live-interaction status. `status` has no splice arm above, so the
+        // Idle that `archive()` settled on `post` never travels here on its
+        // own; settle disk's own copy instead, whichever writer archived it.
+        if self.is_archived() {
+            self.settle_archived_status();
+        }
     }
 }
 
@@ -458,6 +493,47 @@ mod tests {
         let mut disk2 = pre2.clone();
         disk2.merge_user_action_diff(&pre2, &post2);
         assert!(!disk2.unread);
+    }
+
+    #[test]
+    fn test_merge_user_action_diff_archive_settles_live_status_on_disk() {
+        // The TUI archives through this splice, which deliberately has no
+        // `status` arm, so the Idle that `archive()` settled in memory never
+        // reaches disk on its own. The disk row must still leave the merge
+        // settled: an archived row has no tmux behind it, so a persisted
+        // Waiting is a pending-permission row nothing can clear.
+        for status in [Status::Running, Status::Waiting, Status::Starting] {
+            let mut pre = Instance::new("t", "/tmp");
+            pre.status = status;
+            let mut post = pre.clone();
+            post.archive();
+            // A peer refreshed the disk row's status after `pre` was read.
+            let mut disk = pre.clone();
+            disk.status = Status::Waiting;
+            disk.merge_user_action_diff(&pre, &post);
+            assert!(disk.archived_at.is_some());
+            assert_eq!(
+                disk.status,
+                Status::Idle,
+                "{status:?} archived through the user-action splice must settle on disk"
+            );
+        }
+        // A resting status survives the same archive.
+        let mut pre = Instance::new("t", "/tmp");
+        pre.status = Status::Error;
+        let mut post = pre.clone();
+        post.archive();
+        let mut disk = pre.clone();
+        disk.merge_user_action_diff(&pre, &post);
+        assert_eq!(disk.status, Status::Error);
+        // A row the diff leaves unarchived keeps its live status untouched.
+        let mut pre = Instance::new("t", "/tmp");
+        pre.status = Status::Waiting;
+        let mut post = pre.clone();
+        post.title = "renamed".to_string();
+        let mut disk = pre.clone();
+        disk.merge_user_action_diff(&pre, &post);
+        assert_eq!(disk.status, Status::Waiting);
     }
 
     #[test]
@@ -488,12 +564,16 @@ mod tests {
         live.status = Status::Starting;
         live.idle_entered_at = Some(stale_idle);
         live.last_error = Some("stale pane observation".to_string());
+        let stale_floor = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        live.capture_started_at = Some(stale_floor);
 
         let mut disk = live.clone();
         disk.lifecycle_generation = 8;
         disk.status = Status::Stopped;
         disk.idle_entered_at = None;
         disk.last_error = None;
+        let launched_floor = std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000);
+        disk.capture_started_at = Some(launched_floor);
 
         live.merge_post_start(&disk);
 
@@ -501,6 +581,7 @@ mod tests {
         assert_eq!(live.status, Status::Stopped);
         assert_eq!(live.idle_entered_at, None);
         assert_eq!(live.last_error, None);
+        assert_eq!(live.capture_started_at, Some(launched_floor));
     }
 
     #[test]
@@ -510,6 +591,9 @@ mod tests {
         previous.status = Status::Starting;
         previous.idle_entered_at = Some(Utc::now());
         previous.last_error = Some("old observation".to_string());
+        let previous_floor = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        previous.capture_started_at = Some(previous_floor);
+        previous.acp_load_session_capable = Some(true);
 
         previous.detection = DetectionState {
             pending: Some(Status::Idle),
@@ -521,20 +605,38 @@ mod tests {
         reloaded.status = Status::Stopped;
         reloaded.idle_entered_at = None;
         reloaded.last_error = None;
+        let committed_floor = std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000);
+        reloaded.capture_started_at = Some(committed_floor);
         // A disk load leaves every `#[serde(skip)]` field at its default.
         reloaded.detection = DetectionState::default();
+        reloaded.acp_load_session_capable = None;
         reloaded.merge_runtime_from_reload(&previous);
 
         // Generation-governed fields: the strictly-newer disk snapshot wins.
         assert_eq!(reloaded.lifecycle_generation, 4);
         assert_eq!(reloaded.status, Status::Stopped);
         assert_eq!(reloaded.idle_entered_at, None);
-        // last_error is runtime-only: the in-memory poller value survives even a
-        // newer generation, since no lifecycle writer persists last_error.
+        // Runtime-only values survive a newer generation because no lifecycle
+        // writer persists them.
         assert_eq!(reloaded.last_error.as_deref(), Some("old observation"));
+        assert_eq!(
+            reloaded.capture_started_at,
+            Some(committed_floor),
+            "reload must retain the exact launch-owned floor from disk"
+        );
+        assert_eq!(reloaded.acp_load_session_capable, Some(true));
         // So is the detection bookkeeping: a reload between two poll cycles
         // must not drop a proposal awaiting its confirming poll (#3642).
         assert_eq!(reloaded.detection.pending, Some(Status::Idle));
+
+        let mut same_generation_disk = previous.clone();
+        same_generation_disk.capture_started_at = Some(committed_floor);
+        same_generation_disk.merge_runtime_from_reload(&previous);
+        assert_eq!(
+            same_generation_disk.capture_started_at,
+            Some(committed_floor),
+            "a stale same-generation runtime snapshot must not replace a committed disk floor"
+        );
 
         let mut deleting = Instance::new("deleting", "/tmp/test");
         deleting.lifecycle_generation = 3;
@@ -617,7 +719,11 @@ mod tests {
 
         stored.merge_post_start(&working);
 
-        assert_eq!(stored.status, Status::Starting);
+        assert_eq!(
+            stored.status,
+            Status::Idle,
+            "an archived row must not import a live status"
+        );
         assert!(stored.is_archived(), "peer archive must survive merge");
         assert_eq!(
             stored.agent_session_id.as_deref(),
@@ -625,12 +731,25 @@ mod tests {
             "peer-written sid must survive merge"
         );
 
+        working.status = Status::Waiting;
+        stored.merge_post_restart(&working);
+        assert_eq!(
+            stored.status,
+            Status::Idle,
+            "restart merge inherits the archived settle"
+        );
+
         stored.lifecycle_generation = 2;
         stored.status = Status::Stopped;
+        let winning_floor = std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000);
+        stored.capture_started_at = Some(winning_floor);
         working.lifecycle_generation = 1;
         working.status = Status::Starting;
+        working.capture_started_at =
+            Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000));
         stored.merge_post_start(&working);
         assert_eq!(stored.status, Status::Stopped);
+        assert_eq!(stored.capture_started_at, Some(winning_floor));
         stored.merge_from_tui(&working);
         assert_eq!(
             stored.status,
@@ -666,7 +785,10 @@ mod tests {
         let mut restarted = before.clone();
         restarted.omp_capture_generation = Some("generation-b".to_string());
         let mut poller = crate::session::poller::SessionPoller::new("omp-restarted".to_string());
-        assert!(poller.start(before.id.clone(), Box::new(|| None), Box::new(|_| {}), None,));
+        assert_eq!(
+            poller.start(before.id.clone(), Box::new(|| None), Box::new(|_| {}), None,),
+            crate::session::poller::PollerSpawn::Spawned
+        );
         let restarted_poller = std::sync::Arc::new(std::sync::Mutex::new(poller));
         restarted.session_id_poller = Some(restarted_poller.clone());
         let mut live = before.clone();
@@ -698,6 +820,59 @@ mod tests {
                 .expect("running restart poller"),
             &restarted_poller,
         ));
+        restarted_poller
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .stop();
+    }
+
+    #[test]
+    fn test_merge_post_restart_clears_repair_backoff_when_restart_poller_runs() {
+        let mut before = Instance::new("omp-session", "/tmp/test");
+        before.omp_capture_generation = Some("generation-a".to_string());
+        let now = std::time::Instant::now();
+        before.poller_repair.defer(now);
+        before.poller_repair.defer(now);
+        assert_eq!(before.poller_repair.deferrals(), 2);
+
+        let mut restarted = before.clone();
+        restarted.omp_capture_generation = Some("generation-b".to_string());
+        restarted.poller_repair.reset();
+        let mut poller = crate::session::poller::SessionPoller::new("omp-restarted".to_string());
+        assert_eq!(
+            poller.start(before.id.clone(), Box::new(|| None), Box::new(|_| {}), None,),
+            crate::session::poller::PollerSpawn::Spawned
+        );
+        let restarted_poller = std::sync::Arc::new(std::sync::Mutex::new(poller));
+        restarted.session_id_poller = Some(restarted_poller.clone());
+
+        let mut live = before.clone();
+        live.merge_post_restart_with_baseline(&before, &restarted);
+        assert_eq!(
+            live.poller_repair.deferrals(),
+            0,
+            "a successful restart must clear the live row's repair backoff"
+        );
+
+        let mut peer_relaunched = before.clone();
+        peer_relaunched.omp_capture_generation = Some("peer-generation".to_string());
+        peer_relaunched.merge_post_restart_with_baseline(&before, &restarted);
+        assert_eq!(
+            peer_relaunched.poller_repair.deferrals(),
+            0,
+            "the kept running poller carries a cleared schedule"
+        );
+
+        let mut not_started = before.clone();
+        not_started.omp_capture_generation = Some("generation-b".to_string());
+        not_started.session_id_poller = None;
+        let mut live = before.clone();
+        live.merge_post_restart_with_baseline(&before, &not_started);
+        assert_eq!(
+            live.poller_repair.deferrals(),
+            2,
+            "a restart without a running poller leaves the schedule alone"
+        );
         restarted_poller
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1108,6 +1283,43 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_passive_status_patch_settles_live_status_on_archived_row() {
+        // A poll tick that observed the pane before a concurrent archive
+        // landed flushes its patch after it. The archive already tore the
+        // tmux down, so the observation is stale by construction; writing
+        // it verbatim would resurrect the frozen-Waiting row the archive
+        // guard settles, and nothing would revisit it until the next tick.
+        for status in [Status::Running, Status::Waiting, Status::Starting] {
+            let mut disk = Instance::new("session", "/tmp/test");
+            disk.status = Status::Idle;
+            disk.archived_at = Some(Utc::now());
+            let patch = PassiveStatusPatch {
+                lifecycle_generation: 0,
+                status,
+                idle_entered_at: None,
+                last_accessed_at: None,
+            };
+            disk.merge_passive_status_patch(&disk.id.clone(), &patch);
+            assert_eq!(
+                disk.status,
+                Status::Idle,
+                "{status:?} from a stale poll must not land on an archived row"
+            );
+        }
+        // Unarchived rows still take the live status verbatim.
+        let mut disk = Instance::new("session", "/tmp/test");
+        disk.status = Status::Idle;
+        let patch = PassiveStatusPatch {
+            lifecycle_generation: 0,
+            status: Status::Waiting,
+            idle_entered_at: None,
+            last_accessed_at: None,
+        };
+        disk.merge_passive_status_patch(&disk.id.clone(), &patch);
+        assert_eq!(disk.status, Status::Waiting);
+    }
+
+    #[test]
     fn test_merge_passive_status_patch_never_fabricates_last_accessed_at() {
         // The source Instance was never touched by a user (last_accessed_at
         // itself None); the patch must preserve that rather than fabricate
@@ -1373,6 +1585,27 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_from_tui_settles_live_status_on_archived_row() {
+        // `save()` folds a TUI snapshot's status onto disk. When a peer
+        // archived the row in between, the snapshot's Running/Waiting is a
+        // pre-archive observation of a pane that no longer exists.
+        for status in [Status::Running, Status::Waiting, Status::Starting] {
+            let mut stored = Instance::new("session", "/tmp/test");
+            stored.status = Status::Idle;
+            stored.archived_at = Some(Utc::now());
+            let mut src = Instance::new("session", "/tmp/test");
+            src.id = stored.id.clone();
+            src.status = status;
+            stored.merge_from_tui(&src);
+            assert_eq!(
+                stored.status,
+                Status::Idle,
+                "{status:?} from a stale TUI snapshot must not land on an archived row"
+            );
+        }
+    }
+
+    #[test]
     fn test_merge_from_tui_takes_max_last_accessed() {
         let earlier = Utc::now() - chrono::Duration::minutes(5);
         let later = Utc::now();
@@ -1499,6 +1732,7 @@ mod tests {
         inst.tool = "claude".to_string();
         inst.agent_session_id = Some("claude-session-123".to_string());
         inst.acp_session_id = Some("acp-claude-1".to_string());
+        inst.acp_load_session_capable = Some(true);
         inst.resume_probe_failed_sid = Some("claude-session-123".to_string());
         inst.acp_effort = Some("high".to_string());
         inst.agent_model = Some("claude-opus-4-7".to_string());
@@ -1512,6 +1746,7 @@ mod tests {
             "a Claude sid would make pi launch with --resume <foreign-sid>"
         );
         assert_eq!(inst.acp_session_id, None);
+        assert_eq!(inst.acp_load_session_capable, None);
         assert_eq!(inst.acp_effort, None);
         assert_eq!(inst.agent_model, None);
         assert_eq!(inst.agent_name, None);
@@ -1520,6 +1755,7 @@ mod tests {
 
         // pi runs and captures a sid of its own, then the user swaps back.
         inst.agent_session_id = Some("pi-session-9".to_string());
+        inst.acp_load_session_capable = Some(false);
         inst.swap_tool("claude");
         assert_eq!(
             inst.agent_session_id.as_deref(),
@@ -1527,6 +1763,7 @@ mod tests {
             "swapping back must resume the parked Claude conversation"
         );
         assert_eq!(inst.acp_session_id.as_deref(), Some("acp-claude-1"));
+        assert_eq!(inst.acp_load_session_capable, None);
         assert_eq!(
             inst.prior_tool_session_ids["pi"]
                 .agent_session_id

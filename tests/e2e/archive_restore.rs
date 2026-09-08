@@ -509,3 +509,119 @@ fn test_tui_bulk_archive_group_tears_down_all_tmux_off_thread() {
         );
     }
 }
+
+/// A row archived while `Waiting` has no pane behind it (archive tears the
+/// tmux down, #1868) and the poller never revisits archived rows (#2206), so
+/// the persisted status used to stand forever: `aoe ps` kept listing a
+/// pending-permission row that nothing could clear. Seeds that persisted
+/// shape straight onto disk and checks both layers on the real binary: the
+/// archived poll guard settles the row on read, and migration v028 settles
+/// the stored row once for installs that predate the fix. A resting status
+/// (`error`) on an archived row is the control: neither layer touches it.
+#[test]
+#[parallel]
+fn test_archived_waiting_row_reads_idle_and_migrates_once() {
+    require_tmux!();
+
+    let h = TuiTestHarness::new("archive_waiting_zombie");
+    let app_dir = crate::harness::app_dir_in(h.home_path());
+    let profile_dir = app_dir.join("profiles").join("default");
+    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let sessions_path = profile_dir.join("sessions.json");
+    let version_path = app_dir.join(".schema_version");
+
+    // First boot stamps the build's schema version, so the read below
+    // exercises the in-process guard alone rather than the migration.
+    let boot = h.run_cli(&["ps", "--json"]);
+    assert!(
+        boot.status.success(),
+        "aoe ps failed: {}",
+        String::from_utf8_lossy(&boot.stderr)
+    );
+    let stamped: u32 = std::fs::read_to_string(&version_path)
+        .expect("first boot stamps .schema_version")
+        .trim()
+        .parse()
+        .expect("schema version is a number");
+    assert!(stamped >= 28, "build must carry v028, stamped {stamped}");
+
+    // `aoe ps` joins rows to instances by the 8-char id suffix of the tmux
+    // name, so the ids must be underscore-free like real session ids.
+    let project = h.project_path();
+    let project = project.to_str().unwrap();
+    let row = |id: &str, title: &str, status: &str| {
+        format!(
+            r#"{{"id":"{id}","title":"{title}","project_path":"{project}","group_path":"","command":"","tool":"claude","yolo_mode":false,"status":"{status}","archived_at":"2026-07-13T22:17:21Z","created_at":"2026-01-01T00:00:00Z"}}"#
+        )
+    };
+    let frozen = format!(
+        "[{},{}]",
+        row("frozen0waiting01", "Frozen", "waiting"),
+        row("resting0error001", "Resting", "error")
+    );
+    std::fs::write(&sessions_path, &frozen).expect("write sessions.json");
+
+    // No tmux pane exists for either row. The archived guard must settle the
+    // frozen Waiting to idle on read and leave the resting Error alone.
+    let ps = h.run_cli(&["ps", "--json", "--dead"]);
+    assert!(
+        ps.status.success(),
+        "aoe ps failed: {}",
+        String::from_utf8_lossy(&ps.stderr)
+    );
+    let rows: serde_json::Value =
+        serde_json::from_slice(&ps.stdout).expect("aoe ps --json emits JSON");
+    let state_of = |id: &str| {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["session"] == id)
+            .unwrap_or_else(|| panic!("{id} missing from aoe ps --json: {rows}"))["state"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(
+        state_of("frozen0waiting01"),
+        "idle",
+        "an archived row must never read as a pending-permission row"
+    );
+    assert_eq!(state_of("resting0error001"), "dead");
+
+    // An install that predates v028 boots on the same stored rows: the
+    // migration settles the frozen row once and leaves the control alone.
+    std::fs::write(&sessions_path, &frozen).expect("rewrite sessions.json");
+    std::fs::write(&version_path, "27").expect("rewind .schema_version");
+    let migrated = h.run_cli(&["ps", "--json"]);
+    assert!(
+        migrated.status.success(),
+        "aoe ps failed: {}",
+        String::from_utf8_lossy(&migrated.stderr)
+    );
+    let stored = read_sessions_json(&h);
+    let stored_row = |id: &str| {
+        stored
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == id)
+            .unwrap_or_else(|| panic!("{id} missing from sessions.json: {stored}"))
+            .clone()
+    };
+    let healed = stored_row("frozen0waiting01");
+    assert_eq!(healed["status"], "idle", "v028 settles the stored row");
+    assert_eq!(
+        healed["archived_at"], "2026-07-13T22:17:21Z",
+        "the archive itself survives the settle"
+    );
+    assert_eq!(stored_row("resting0error001")["status"], "error");
+    let after: u32 = std::fs::read_to_string(&version_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        after, stamped,
+        "the rewound install converges on the build's version"
+    );
+}

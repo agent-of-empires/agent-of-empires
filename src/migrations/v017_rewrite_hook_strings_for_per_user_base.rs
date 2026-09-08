@@ -548,7 +548,7 @@ mod tests {
                     if !cmd.contains("aoe-hooks") {
                         continue;
                     }
-                    if cmd.contains("aoe __extract-session-id") {
+                    if cmd.contains("__extract-session-id") {
                         continue;
                     }
                     status_writers += 1;

@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 
 use super::{
     FieldDescriptor, ObjectFieldDescriptor, ObjectFieldWidget, OptionSource as SchemaOptionSource,
-    SelectOption, ValidationKind, WebWritePolicy, WidgetKind,
+    RepoPolicy, SelectOption, ValidationKind, WebWritePolicy, WidgetKind,
 };
 
 /// Prefix marking a virtual plugin settings section.
@@ -117,6 +117,8 @@ pub fn plugin_field_descriptors(
                 // Plugin settings are not host-execution surfaces; the settings
                 // PATCH endpoint is already elevation-gated by the auth layer.
                 web_write: WebWritePolicy::Allow,
+                // Plugin sections are not repo-overridable.
+                repo_policy: RepoPolicy::Deny,
                 // Plugin settings are global, with no profile override.
                 profile_overridable: false,
                 validation,

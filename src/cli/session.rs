@@ -445,7 +445,8 @@ async fn set_color_session(profile: &str, args: SetColorArgs) -> Result<()> {
         other => Some(other.to_string()),
     };
 
-    let storage = Storage::new_unwatched(profile)?;
+    // Patching an existing session never creates the profile (#148).
+    let storage = Storage::open_unwatched(profile)?;
     let (title, color) = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
             inst.set_color(new_color.clone())
@@ -1503,6 +1504,16 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     Ok(())
 }
 
+fn supervise_attach_capture(
+    inst: &mut Instance,
+    attach: impl FnOnce(&Instance) -> Result<()>,
+) -> Result<()> {
+    inst.maybe_start_poller();
+    let result = attach(inst);
+    inst.stop_and_flush_poller();
+    result
+}
+
 async fn attach_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
     let (instances, _) = storage.load_with_groups()?;
@@ -1518,8 +1529,9 @@ async fn attach_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         );
     }
 
-    tmux_session.attach()?;
-    Ok(())
+    let mut working = inst.clone();
+    working.source_profile = profile.to_string();
+    supervise_attach_capture(&mut working, |_| tmux_session.attach())
 }
 
 async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
@@ -2374,13 +2386,9 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
         crate::session::ResumeIntent::Use(id) => {
             println!("✓ Set resume target for '{}': {}", title, id);
             if let Some(agent) = crate::agents::get_agent(&tool) {
-                if matches!(
-                    agent.resume_strategy,
-                    crate::agents::ResumeStrategy::Unsupported
-                ) {
+                if agent.session_support.is_none() {
                     eprintln!(
-                        "Warning: session resume is disabled for {} in AoE; this ID will be stored but not used.",
-                        tool
+                        "Warning: {tool} does not support exact native session resume; this ID will be stored but not used."
                     );
                 }
             }
@@ -2635,13 +2643,67 @@ fn resolve_base_target(inst: &crate::session::Instance, repo: Option<&str>) -> R
 
 #[cfg(test)]
 mod restart_args_tests {
-    use super::SessionCommands;
+    use super::{supervise_attach_capture, SessionCommands};
     use clap::Parser;
 
     #[derive(Parser)]
     struct Cli {
         #[command(subcommand)]
         cmd: SessionCommands,
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn attach_supervision_starts_before_attach_and_flushes_every_return() {
+        let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::session::test_support::isolate_app_dir_at(home.path());
+        let profile = "attach-capture-supervision";
+        let mut inst = crate::session::Instance::new("attach", "/tmp/attach");
+        inst.source_profile = profile.to_string();
+        inst.tool = "pi".to_string();
+        inst.agent_session_id = Some("d38740e4-bd1f-43d7-8727-485652e4678e".to_string());
+        inst.mark_pi_extension_launched_for_test();
+        let storage = crate::session::Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|instances, _| {
+                *instances = vec![inst.clone()];
+                Ok(())
+            })
+            .unwrap();
+
+        let first = "01a053b6-c470-78de-9d8f-bc00ef05332a";
+        supervise_attach_capture(&mut inst, |live| {
+            assert!(
+                live.session_id_poller_is_running(),
+                "capture must be supervised before the blocking attach call"
+            );
+            crate::hooks::write_session_id_via_guard(&live.id, first).unwrap();
+            Ok(())
+        })
+        .unwrap();
+        assert!(inst.session_id_poller.is_none());
+        assert_eq!(
+            storage.load().unwrap()[0].agent_session_id.as_deref(),
+            Some(first)
+        );
+
+        let second = "01a053b6-c470-78de-9d8f-bc00ef05332b";
+        let result = supervise_attach_capture(&mut inst, |live| {
+            crate::hooks::write_session_id_via_guard(&live.id, second).unwrap();
+            Err(anyhow::anyhow!("fake attach failure"))
+        });
+
+        assert_eq!(result.unwrap_err().to_string(), "fake attach failure");
+        assert!(
+            inst.session_id_poller.is_none(),
+            "an immediate nested attach return must not orphan its poller"
+        );
+        assert_eq!(
+            storage.load().unwrap()[0].agent_session_id.as_deref(),
+            Some(second),
+            "the final /new identity must be durable even when attach returns an error"
+        );
     }
 
     #[test]
@@ -3016,6 +3078,34 @@ mod set_color_tests {
         // The rejected write must not have touched disk.
         let loaded = storage.load().unwrap();
         assert_eq!(loaded.iter().find(|i| i.id == id).unwrap().color, None);
+    }
+
+    /// `session set-color -p <unknown>` refuses the profile instead of
+    /// creating it and then failing on the missing session (#148).
+    #[tokio::test]
+    #[serial]
+    async fn set_color_refuses_unknown_profile_without_vivifying_it() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let profiles = crate::session::get_app_dir().unwrap().join("profiles");
+        std::fs::create_dir_all(profiles.join("real")).unwrap();
+
+        let result = set_color_session(
+            "ghost-profile",
+            SetColorArgs {
+                identifier: "whatever".to_string(),
+                color: "red".to_string(),
+            },
+        )
+        .await;
+        let msg = result.expect_err("unknown profile must error").to_string();
+        assert!(
+            msg.contains("does not exist"),
+            "expected the unknown-profile error, got: {msg}"
+        );
+        assert!(
+            !profiles.join("ghost-profile").exists(),
+            "set-color must not mint profiles/ghost-profile"
+        );
     }
 }
 

@@ -22,6 +22,7 @@ import { openai } from "@ai-sdk/openai";
 import { google } from "@ai-sdk/google";
 import { z } from "zod";
 import { appendTurn, loadTranscript } from "./transcript.ts";
+import { classifyKind } from "./toolKind.ts";
 
 const DEFAULT_MODEL = "claude-opus-4-7";
 
@@ -266,19 +267,6 @@ function buildTools(sessionId: string, client: acp.AgentContext) {
       },
     }),
   };
-}
-
-function classifyKind(toolName: string): acp.ToolKind {
-  switch (toolName) {
-    case "Read":
-      return "read";
-    case "Write":
-      return "edit";
-    case "Bash":
-      return "execute";
-    default:
-      return "other";
-  }
 }
 
 function serialiseToolOutput(output: unknown): Record<string, unknown> {

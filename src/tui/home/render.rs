@@ -849,6 +849,15 @@ impl HomeView {
         self.footer_buttons.clear();
         self.collapse_button_area = Rect::default();
         self.expand_strip_area = Rect::default();
+        // Hyperlink cells are per-frame: a takeover view or a preview that
+        // paints no link must leave none behind for the backend to re-emit.
+        // Recover from poison rather than skip, matching the backend: if the
+        // renderer stopped clearing while the backend kept emitting, the last
+        // recorded set would be re-wrapped over unrelated cells indefinitely.
+        self.hyperlink_cells
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
 
         // Settings view takes over the whole screen
         if let Some(ref mut settings) = self.settings_view {
@@ -1359,7 +1368,7 @@ impl HomeView {
             .enumerate()
         {
             let abs_idx = i + scroll.scroll_offset;
-            let is_selected = abs_idx == self.cursor;
+            let is_selected = self.is_sidebar_item_selected(item, abs_idx);
             let is_hovered = !is_selected && Some(abs_idx) == hover_idx;
             let is_match =
                 !self.search_matches.is_empty() && self.search_matches.contains(&abs_idx);
@@ -1434,7 +1443,7 @@ impl HomeView {
                 .enumerate()
             {
                 let abs_idx = list_len + sscroll.scroll_offset + i;
-                let is_selected = abs_idx == self.cursor;
+                let is_selected = self.is_sidebar_item_selected(item, abs_idx);
                 let is_hovered = !is_selected && Some(abs_idx) == hover_idx;
                 let is_match =
                     !self.search_matches.is_empty() && self.search_matches.contains(&abs_idx);
@@ -2016,11 +2025,24 @@ impl HomeView {
         }
     }
 
+    pub(super) fn is_sidebar_item_selected(&self, item: &Item, index: usize) -> bool {
+        // A reload can hide the live row while the cursor falls onto a peer.
+        match (&self.live_send, &self.selected_session, item) {
+            (Some(_), Some(selected), Item::Session { id, .. }) => id == selected,
+            (Some(_), Some(_), _) => false,
+            _ => index == self.cursor,
+        }
+    }
+
     /// tmux session name backing the pane the preview currently shows, as a
     /// function of the selected session and view mode (and, for Terminal,
-    /// the host/container sub-mode). `None` when nothing is selected. Drives
+    /// the host/container sub-mode). Live-send pins the pane captured at entry,
+    /// independent of storage-driven selection changes. Drives
     /// `sync_preview_capture_worker`.
     pub(super) fn displayed_pane_tmux_name(&self) -> Option<String> {
+        if let Some(state) = &self.live_send {
+            return Some(state.tmux_name.clone());
+        }
         let id = self.selected_session.as_ref()?;
         let inst = self.get_instance(id)?;
         let name = match &self.view_mode {
@@ -2905,11 +2927,13 @@ impl HomeView {
         // live to capture. Short-circuit every view mode to a calm "Archived"
         // placeholder instead of forking captures that come back empty and
         // surface as "No output available".
-        let selected_archived = self
-            .selected_session
-            .as_ref()
-            .and_then(|id| self.get_instance(id))
-            .is_some_and(|inst| inst.is_archived());
+        let live_send_active = self.live_send.is_some();
+        let selected_archived = !live_send_active
+            && self
+                .selected_session
+                .as_ref()
+                .and_then(|id| self.get_instance(id))
+                .is_some_and(|inst| inst.is_archived());
 
         // A session whose pane is simply gone (killed, exited, server reboot)
         // with no diagnostic detail carries the generic gone-error. Present
@@ -2923,13 +2947,15 @@ impl HomeView {
         // must not hide that pane's output there.
         // A trashed session's pane was also killed (on trash). Same calm
         // placeholder treatment as archived, with a restore hint.
-        let selected_trashed = self
-            .selected_session
-            .as_ref()
-            .and_then(|id| self.get_instance(id))
-            .is_some_and(|inst| inst.is_trashed());
+        let selected_trashed = !live_send_active
+            && self
+                .selected_session
+                .as_ref()
+                .and_then(|id| self.get_instance(id))
+                .is_some_and(|inst| inst.is_trashed());
 
-        let selected_stopped = !selected_archived
+        let selected_stopped = !live_send_active
+            && !selected_archived
             && !selected_trashed
             && matches!(self.view_mode, ViewMode::Structured)
             && self
@@ -2946,7 +2972,8 @@ impl HomeView {
         // pane forever, so short-circuit to an explanatory placeholder
         // instead. Only in the Structured (agent output) view; Terminal
         // and Tool views show their own, independently-live panes.
-        let selected_structured = !selected_archived
+        let selected_structured = !live_send_active
+            && !selected_archived
             && !selected_trashed
             && matches!(self.view_mode, ViewMode::Structured)
             && self
@@ -3073,11 +3100,12 @@ impl HomeView {
         match self.view_mode {
             ViewMode::Structured => {
                 // Check if selected session is being created (show hook progress)
-                let is_creating = self
-                    .selected_session
-                    .as_ref()
-                    .and_then(|id| self.get_instance(id))
-                    .is_some_and(|inst| inst.status == Status::Creating);
+                let is_creating = !live_send_active
+                    && self
+                        .selected_session
+                        .as_ref()
+                        .and_then(|id| self.get_instance(id))
+                        .is_some_and(|inst| inst.status == Status::Creating);
 
                 if is_creating {
                     self.render_creating_preview(frame, inner, theme);
@@ -3358,12 +3386,74 @@ impl HomeView {
             frame.set_cursor_position(pos);
         }
 
+        // Hyperlink underlines go under the selection highlight: a link inside
+        // a drag should still read as selected.
+        self.paint_preview_links(frame.buffer_mut());
+
         // Selection highlight goes last so it sits on top of whatever
         // the active ViewMode painted into the inner area. The handlers
         // only populate `preview_selection` while a drag is live or a
         // finalized highlight is showing, so this branch is a no-op
         // otherwise.
         self.paint_preview_selection(frame, theme);
+    }
+
+    /// Underline the hyperlink spans on the visible preview rows.
+    ///
+    /// Without this a link whose visible text is not itself a URL is
+    /// indistinguishable from surrounding output: the host terminal never sees
+    /// the OSC 8 (the grid drops it) and has no URL to match on either, so
+    /// nothing marks the text as clickable. The underline is the affordance for
+    /// `preview_link_at`, which opens the target on a plain click.
+    pub(super) fn paint_preview_links(&self, buf: &mut Buffer) {
+        // Same guard as `preview_link_at`: an overlay swallows the click, so
+        // underlining behind it would advertise an affordance that does
+        // nothing, and the dialog paints over these cells after this runs,
+        // leaving the backend to wrap the dialog's own text in OSC 8.
+        if self.has_non_live_send_overlay() {
+            return;
+        }
+        let view = self.preview_text_view;
+        let pane = view.pane;
+        if pane.width == 0 || pane.height == 0 {
+            return;
+        }
+        let cache = self.active_preview_cache();
+        let Some(text) = cache.parsed_text.as_ref() else {
+            return;
+        };
+        let buf_area = buf.area;
+        let mut cells = Some(
+            self.hyperlink_cells
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        for row_offset in 0..pane.height {
+            let Some(line) = text.lines.get(view.first_line + row_offset as usize) else {
+                break;
+            };
+            for span in crate::tui::links::link_spans_for_line(line, pane.width, &cache.links) {
+                for col in span.start..span.end {
+                    let pos = (pane.x + col, pane.y + row_offset);
+                    if !buf_area.contains(Position::from(pos)) {
+                        continue;
+                    }
+                    buf[pos].modifier |= Modifier::UNDERLINED;
+                    // The URI lives outside the `Buffer`, so ratatui's diff
+                    // cannot see a target change on otherwise identical cells:
+                    // the same label repointed from A to B would leave the
+                    // terminal holding A while the hit-test resolves B. Hand
+                    // linked cells to the backend on every frame instead.
+                    buf[pos].set_diff_option(ratatui::buffer::CellDiffOption::AlwaysUpdate);
+                    // Hand the target to the backend as well, so the host
+                    // terminal gets a real hyperlink and not just an
+                    // underline it cannot act on.
+                    if let Some(cells) = cells.as_mut() {
+                        cells.insert(pos.0, pos.1, &span.uri);
+                    }
+                }
+            }
+        }
     }
 
     /// Where to paint the live-send cursor this frame, or `None` to paint no
@@ -3789,6 +3879,59 @@ impl HomeView {
         // a stale rect can't make a footer click open tips when the badge is
         // hidden (live-send, nothing unseen, or no room).
         self.tips_badge_rect = None;
+        // A flash is one-shot feedback on something the user just did, so it
+        // takes the row for its few seconds; a hovered link's target takes it
+        // for as long as the pointer rests there. The flash wins the overlap,
+        // because it reports the click the user just made on that same link.
+        // In live-send the LIVE chip stays either way: which pane keystrokes
+        // land on must never be hidden, not even briefly.
+        // A hovered target is only shown while an overlay is not covering the
+        // preview: the click is inert there, so advertising one would be a lie.
+        // Resolved per frame, so it cannot outlive the row it described.
+        // Suppressed while the leader is armed: the which-key menu below is a
+        // discoverability affordance a resting pointer must not hide.
+        let hovered = (!self.live_send_pending_leader)
+            .then(|| self.hovered_link())
+            .flatten()
+            .map(|uri| format!("\u{1f517} {uri}"));
+        let transient = self.status_flash_text().map(str::to_string).or(hovered);
+        if let Some(text) = transient {
+            let mut spans = Vec::new();
+            let mut budget = area.width as usize;
+            // In live-send the chip and the way out both stay. A flash lasts
+            // three seconds, but a hovered target lasts as long as the pointer
+            // rests there, and leaving the user with no visible exit chord for
+            // that long is not a trade worth making.
+            let exit = self.live_send.as_ref().map(|state| {
+                let chord = if state.exit_chords.is_empty() {
+                    "?".to_string()
+                } else {
+                    live_send::display_chord_list(&state.exit_chords)
+                };
+                format!(" {chord} to exit ")
+            });
+            if self.live_send.is_some() {
+                let chip = " \u{25CF} LIVE ";
+                budget = budget.saturating_sub(unicode_width::UnicodeWidthStr::width(chip));
+                spans.push(Span::styled(
+                    chip,
+                    Style::default()
+                        .fg(theme.background)
+                        .bg(theme.running)
+                        .bold(),
+                ));
+            }
+            if let Some(exit) = exit.as_deref() {
+                budget = budget.saturating_sub(unicode_width::UnicodeWidthStr::width(exit));
+            }
+            let text = truncate_to_width(&format!(" {text} "), budget);
+            spans.push(Span::styled(text, Style::default().fg(theme.accent).bold()));
+            if let Some(exit) = exit {
+                spans.push(Span::styled(exit, Style::default().fg(theme.dimmed)));
+            }
+            frame.render_widget(Paragraph::new(Line::from(spans)), area);
+            return;
+        }
         // Live-send banner takes over the status bar so the user has an
         // always-visible reminder that keystrokes are being relayed to
         // the pane (and how to get out). Distinct color + bold so it

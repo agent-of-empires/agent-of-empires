@@ -107,11 +107,38 @@ fn create_pane(name: &str, typed: &str) {
         .status()
         .expect("tmux new-session");
     assert!(status.success(), "tmux new-session failed for {name}");
-    let _ = Command::new("tmux")
+    let send = Command::new("tmux")
         .arg("-S")
         .arg(tmux_socket())
         .args(["send-keys", "-t", name, "-l", typed])
-        .output();
+        .output()
+        .expect("tmux send-keys");
+    assert!(
+        send.status.success(),
+        "tmux send-keys failed for {name}: {}",
+        String::from_utf8_lossy(&send.stderr)
+    );
+
+    let mut pane = String::new();
+    let mut ready = false;
+    for _ in 0..40 {
+        let output = Command::new("tmux")
+            .arg("-S")
+            .arg(tmux_socket())
+            .args(["capture-pane", "-t", name, "-p"])
+            .output()
+            .expect("tmux capture-pane");
+        pane = String::from_utf8_lossy(&output.stdout).into_owned();
+        if output.status.success() && pane.contains(typed) {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        ready,
+        "typed first-turn context never reached tmux pane {name}:\n{pane}"
+    );
     tmux::refresh_session_cache();
 }
 

@@ -106,6 +106,9 @@ pub struct SpawnConfig {
     /// same substitution warning the initial spawn logged, one line per
     /// launch.
     pub wrapper_substitution: Option<(String, String)>,
+    /// Lifecycle epoch stamped on the runner's registry record; the
+    /// supervisor sets it from the lease that admitted the spawn.
+    pub generation: u64,
 }
 
 /// Reject `provider_env` request entries whose key would either escape
@@ -543,6 +546,7 @@ mod tests {
             stored_acp_session_id: None,
             fork_from: None,
             seed_history_replay: false,
+            generation: 0,
             artifact_dir: None,
             sandbox_info: None,
             source_profile: None,
@@ -582,6 +586,7 @@ mod tests {
             stored_acp_session_id: None,
             fork_from: None,
             seed_history_replay: false,
+            generation: 0,
             artifact_dir: None,
             sandbox_info: None,
             source_profile: None,
@@ -923,24 +928,22 @@ mod tests {
             assert_eq!(scrub_stderr_secrets(line), line);
         }
     }
-    /// Scripted stdio ACP agent for the resume-rejection recovery test:
-    /// answers `initialize` (loadSession:false) and `session/new` (mints
-    /// `sid-1`), then rejects every `session/prompt` with the exact error
-    /// OMP returns for a stored id it no longer holds. Mirrors the verified
-    /// failure: the session establishes, then the first prompt is rejected.
+    /// Scripted stdio agent: completes `initialize` and `session/load`, then
+    /// rejects every `session/prompt` the way OMP rejects a stored session
+    /// id it no longer holds.
     #[cfg(unix)]
     fn write_unsupported_session_fake_agent(dir: &std::path::Path) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
-        let capture = dir.join("capture.ndjson");
         let script_path = dir.join("fake-unsupported-session-agent.sh");
         let script = r#"#!/bin/sh
-CAPTURE=__CAPTURE__
 while IFS= read -r line; do
-  printf '%s\n' "$line" >> "$CAPTURE"
   id=$(printf '%s' "$line" | sed -En 's/.*"id":("[^"]*"|[0-9]+).*/\1/p')
   case $line in
     *'"method":"initialize"'*)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":false}}}\n' "$id"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}\n' "$id"
+      ;;
+    *'"method":"session/load"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
       ;;
     *'"method":"session/new"'*)
       printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sid-1"}}\n' "$id"
@@ -950,22 +953,16 @@ while IFS= read -r line; do
       ;;
   esac
 done
-"#
-        .replace("__CAPTURE__", capture.to_str().expect("utf8 tmp path"));
+"#;
         std::fs::write(&script_path, script).expect("write fake agent script");
         std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
             .expect("chmod fake agent script");
         script_path
     }
 
-    /// Behavior contract for the resume-rejection recovery: when a
-    /// `session/prompt` is rejected because the agent no longer holds the
-    /// session (OMP: "Unsupported ACP session"), the connection task must
-    /// emit `SessionContextReset` BEFORE ending on the error, so the
-    /// supervisor clears the stored id and the respawn opens a fresh
-    /// session/new (transcript preserved for replay) instead of terminating
-    /// with no recovery. Drives a real prompt round-trip against a scripted
-    /// agent rather than unit-testing the classifier in isolation.
+    /// #3560: a prompt rejected because the agent no longer holds the
+    /// resumed session emits `SessionContextReset` before the connection
+    /// ends on the error, so the respawn opens a fresh `session/new`.
     #[cfg(unix)]
     #[tokio::test]
     async fn unsupported_session_prompt_rejection_emits_context_reset_before_error() {
@@ -975,17 +972,19 @@ done
         let dir = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         let script = write_unsupported_session_fake_agent(dir.path());
-        let config = reset_fake_spawn_config(&script, cwd.path());
+        let mut config = reset_fake_spawn_config(&script, cwd.path());
+        config.stored_acp_session_id = Some("sid-stored".into());
         let mut client = AcpClient::spawn(config, AcpSessionId("resume-reject".into()))
             .await
             .expect("spawn fake agent");
         client
-            .send_prompt("enrich the kb", &[])
+            .send_prompt("continue", &[])
             .await
             .expect("queue prompt");
 
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut saw_reset = false;
+        let mut terminal = None;
         loop {
             let ev = tokio::time::timeout_at(deadline, client.next_event())
                 .await
@@ -998,17 +997,87 @@ done
                     );
                     saw_reset = true;
                 }
-                // The event channel closes once the connection task takes the
-                // error path. Reaching it having seen the reset proves the
-                // ordering (reset emitted, THEN the error ended the task).
+                Some(Event::Stopped { reason }) => terminal = Some(reason),
+                Some(Event::AgentStartupError { message }) => {
+                    panic!("a recoverable reset must not surface a startup error: {message}")
+                }
+                // The channel closes once the connection task takes the
+                // error path: reaching it after the reset pins the order.
                 None => break,
                 _ => {}
             }
         }
         assert!(
             saw_reset,
-            "an unsupported-session prompt rejection must emit SessionContextReset before ending on the error"
+            "the rejection must emit SessionContextReset before ending"
         );
+        assert_eq!(
+            terminal.as_deref(),
+            Some("stored_session_rejected"),
+            "the connection ends on a soft stop the respawn recovers from"
+        );
+        let _ = client.shutdown().await;
+    }
+
+    /// Scripted stdio agent: completes `initialize`, then rejects
+    /// `session/new` with the adapter's rate-limit fingerprint.
+    #[cfg(unix)]
+    fn write_handshake_rate_limited_fake_agent(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script_path = dir.join("fake-handshake-rate-limit-agent.sh");
+        let script = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -En 's/.*"id":("[^"]*"|[0-9]+).*/\1/p')
+  case $line in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":false}}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"Internal error","data":{"details":"You have hit your limit","errorKind":"rate_limit"}}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+        std::fs::write(&script_path, script).expect("write fake agent script");
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake agent script");
+        script_path
+    }
+
+    /// #3514: a limit hit at `session/new` parks the session (`RateLimit`
+    /// then `Stopped { rate_limited }`) instead of surfacing a startup
+    /// error that the restart budget would then burn through.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn handshake_rate_limit_parks_the_session_instead_of_failing_startup() {
+        use crate::acp::acp_client::test_helpers::reset_fake_spawn_config;
+        use crate::acp::Event;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let script = write_handshake_rate_limited_fake_agent(dir.path());
+        let config = reset_fake_spawn_config(&script, cwd.path());
+        let mut client = AcpClient::spawn(config, AcpSessionId("handshake-limit".into()))
+            .await
+            .expect("ready fires after initialize, before session/new");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut kinds = Vec::new();
+        loop {
+            let ev = tokio::time::timeout_at(deadline, client.next_event())
+                .await
+                .expect("timed out waiting for the park");
+            match ev {
+                Some(Event::RateLimit { info }) => kinds.push(format!("rate_limit:{}", info.kind)),
+                Some(Event::Stopped { reason }) => kinds.push(format!("stopped:{reason}")),
+                Some(Event::AgentStartupError { message }) => {
+                    panic!("a handshake limit must park, not fail startup: {message}")
+                }
+                None => break,
+                _ => {}
+            }
+        }
+        assert_eq!(kinds, vec!["rate_limit:rate_limit", "stopped:rate_limited"]);
         let _ = client.shutdown().await;
     }
 }

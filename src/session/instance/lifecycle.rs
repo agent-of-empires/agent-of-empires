@@ -172,6 +172,7 @@ impl Instance {
             stored.idle_entered_at = self.idle_entered_at;
             stored.last_accessed_at = self.last_accessed_at;
             stored.sandbox_info = self.sandbox_info.clone();
+            stored.capture_started_at = self.capture_started_at;
             if restart && stored.agent_session_id == self.agent_session_id {
                 stored.resume_probe_failed_sid = self.resume_probe_failed_sid.clone();
             }
@@ -680,7 +681,9 @@ mod tests {
             )
             .unwrap();
         let reserved_generation = committed.lifecycle_generation;
+        let capture_floor = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_234_567);
         committed.status = Status::Running;
+        committed.capture_started_at = Some(capture_floor);
         committed.commit_lifecycle_launch(&storage, false).unwrap();
         let disk = storage
             .load()
@@ -691,6 +694,7 @@ mod tests {
         assert_eq!(committed.lifecycle_generation, reserved_generation);
         assert_eq!(disk.lifecycle_generation, committed.lifecycle_generation);
         assert_eq!(disk.status, Status::Running);
+        assert_eq!(disk.capture_started_at, Some(capture_floor));
 
         stale
             .acquire_lifecycle_reservation(
@@ -701,6 +705,8 @@ mod tests {
             .unwrap();
         let stale_token = stale.lifecycle_generation;
         stale.status = Status::Running;
+        stale.capture_started_at =
+            Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(9_999_999));
         storage
             .update(|instances, _groups| {
                 let peer = instances
@@ -709,6 +715,7 @@ mod tests {
                     .unwrap();
                 peer.lifecycle_generation = stale_token + 1;
                 peer.status = Status::Stopped;
+                peer.capture_started_at = Some(capture_floor);
                 Ok(())
             })
             .unwrap();
@@ -723,6 +730,11 @@ mod tests {
         assert_eq!(stale.lifecycle_generation, stale_token);
         assert_eq!(disk.lifecycle_generation, stale_token + 1);
         assert_eq!(disk.status, Status::Stopped);
+        assert_eq!(
+            disk.capture_started_at,
+            Some(capture_floor),
+            "a stale launch token must not overwrite the winning floor"
+        );
 
         assert!(overflow
             .acquire_lifecycle_reservation(

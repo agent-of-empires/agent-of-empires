@@ -22,6 +22,7 @@ use super::profile::ProfileCommands;
 use super::project::ProjectCommands;
 use super::ps::PsArgs;
 use super::remove::RemoveArgs;
+use super::sandbox::SandboxCommands;
 use super::send::SendArgs;
 use super::serve::ServeArgs;
 use super::session::SessionCommands;
@@ -49,7 +50,11 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
     Run without arguments to launch the TUI dashboard."
 )]
 pub struct Cli {
-    /// Profile to use (separate workspace with its own sessions)
+    /// Profile to use (separate workspace with its own sessions). Commands that
+    /// consume or create profile state require an existing profile: an unknown
+    /// name is refused, not created (make one with `aoe profile create`).
+    /// Profile-independent commands such as `list --all` and `serve --stop`
+    /// ignore it
     #[arg(short = 'p', long, global = true, env = "AGENT_OF_EMPIRES_PROFILE")]
     pub profile: Option<String>,
 
@@ -148,6 +153,12 @@ pub enum Commands {
         command: ProjectCommands,
     },
 
+    /// Inspect and reclaim per-session sandbox agent stores
+    Sandbox {
+        #[command(subcommand)]
+        command: SandboxCommands,
+    },
+
     /// Manage git worktrees for parallel development
     Worktree {
         #[command(subcommand)]
@@ -233,6 +244,13 @@ pub enum Commands {
     /// Update aoe to the latest release
     Update(UpdateArgs),
 
+    /// Run pending data migrations now, showing progress. A sandboxed session
+    /// moves its own agent store when it starts; use this to move every
+    /// eligible store at once instead. Trashed and archived sessions are
+    /// skipped; each moves when it is started, or restore or unarchive it
+    /// and run this again.
+    Migrate,
+
     /// Generate shell completions
     Completion {
         /// Shell to generate completions for
@@ -264,6 +282,7 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
     "plugin",
     "profile",
     "project",
+    "sandbox",
     "worktree",
     "tmux",
     "sounds",
@@ -278,6 +297,7 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
     "acp",
     "uninstall",
     "update",
+    "migrate",
     "completion",
 ];
 
@@ -311,6 +331,7 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         Commands::Plugin { .. } => "plugin",
         Commands::Profile { .. } => "profile",
         Commands::Project { .. } => "project",
+        Commands::Sandbox { .. } => "sandbox",
         Commands::Worktree { .. } => "worktree",
         Commands::Tmux { .. } => "tmux",
         Commands::Sounds { .. } => "sounds",
@@ -328,6 +349,7 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         Commands::ExtractSessionId(_) => return None,
         Commands::Uninstall(_) => "uninstall",
         Commands::Update(_) => "update",
+        Commands::Migrate => "migrate",
         Commands::Completion { .. } => "completion",
     })
 }

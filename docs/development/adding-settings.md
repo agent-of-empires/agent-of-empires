@@ -39,7 +39,9 @@ surfaces.
 ## Choosing the section and widget
 
 The section is the struct's `#[setting_section(name = "...", category = "...")]`.
-`name` is the `[section]` table in `config.toml`; `category` is the TUI tab.
+`name` is the `[section]` table in `config.toml`; `category` is the TUI tab. An
+optional `repo_default = "allow" | "deny"` sets the repo-config policy every
+field in the section inherits.
 
 Pick a `widget` for the field's type:
 
@@ -60,7 +62,8 @@ Pick a `widget` for the field's type:
 `select`), `min` / `max` / `step`, `multiline` / `mono`, plus:
 
 - `validate`: server-authoritative value check (`range:MIN[:MAX]`, `nonempty`,
-  `memory_limit`, `volume_list`, `env_list`, `port_mapping_list`). Add a new
+  `memory_limit`, `volume_list`, `env_list`, `port_mapping_list`,
+  `capability_list`, `security_opt_list`, `network`). Add a new
   `ValidationKind` variant (`src/session/config/settings_schema/`) and a `validate=`
   keyword (`aoe-settings-derive`) if none fits; that is what drives both the
   client UX validator and the server gate from one rule.
@@ -68,6 +71,10 @@ Pick a `widget` for the field's type:
   web) or `local_only:<reason>` (host-execution surface the server rejects and
   the dashboard never renders, e.g. a binary path or command argv). Omit for a
   plain allow.
+- `repo`: `allow` or `deny`; whether a repo's `.agent-of-empires/config.toml`
+  may override the field. If absent, the field inherits the `repo_default` its
+  `#[setting_section(...)]` declares (`allow` unless stated; `session` declares
+  `deny`). Global-only fields are never repo-settable.
 - `category`: override the section's default TUI tab.
 - `advanced`: group the field under an "Advanced" fold on both surfaces.
 - `global_only`: shown but not profile-overridable (the dashboard adds an
