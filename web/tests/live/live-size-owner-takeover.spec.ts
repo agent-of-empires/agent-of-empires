@@ -30,10 +30,16 @@ async function openLiveView(page: Page, baseUrl: string) {
  *  asserted-equal object reports its mismatched value, so the offset that
  *  identifies the fault survives into the failure message.
  *
- *  The count is asserted, not navigated around: the agent redraws its prompt in
- *  place on every SIGWINCH, so a second prompt row means the grid put the
- *  cursor somewhere the pane never had it and the redraw landed there (#3824).
- *  Picking the last row instead would have hidden that. */
+ *  The count is asserted, not navigated around. The fixture's WINCH handler
+ *  redraws with a bare carriage return and never a newline, so the pane cannot
+ *  hold two prompt rows; a second one means the grid put the cursor on a row the
+ *  pane never had and the redraw landed there (#3824).
+ *
+ *  This supersedes #3826, which read that second row as a pre-resize prompt left
+ *  behind in the scrollback and measured against the last match instead. It is
+ *  not scrollback: at the failing checkpoint tmux reports history_size=0 and a
+ *  single prompt row while the grid shows two. Measuring against the last match
+ *  made this spec pass with the grid-side duplicate still live. */
 async function promptAlignment(page: Page): Promise<{ promptRows: number; cursor: string }> {
   return page.evaluate((prompt) => {
     const content = document.querySelector("[data-live-content]");
