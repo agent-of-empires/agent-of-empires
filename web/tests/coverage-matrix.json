@@ -215,12 +215,15 @@
         "src/lib/clipboard.test.ts",
         "src/hooks/useLiveTerminal.forward.test.ts",
         "src/components/__tests__/MobileLiveTerminal.paste.test.tsx",
-        "src/components/__tests__/MobileLiveTerminal.clipboard.test.tsx"
+        "src/components/__tests__/MobileLiveTerminal.clipboard.test.tsx",
+        "src/components/__tests__/MobileLiveTerminal.rowIdentity.test.tsx",
+        "src/components/__tests__/MobileTerminalToolbar.test.tsx"
       ],
       "components": [
         "web/src/lib/clipboard.ts",
         "web/src/hooks/useLiveTerminal.ts",
-        "web/src/components/MobileLiveTerminal.tsx"
+        "web/src/components/MobileLiveTerminal.tsx",
+        "web/src/components/MobileTerminalToolbar.tsx"
       ]
     },
     {
