@@ -8,9 +8,9 @@
 //! Both are deliberately narrow, because the thing being deleted is a copy of a
 //! live credential:
 //!
-//! - A store is an orphan only when its id resolves in *no* profile. A registry
-//!   that cannot be read is never "a profile with no sessions"; the pass fails
-//!   and deletes nothing.
+//! - A store is an orphan only when its id resolves in no profile of either
+//!   build namespace. A registry that cannot be read is never "a profile with
+//!   no sessions"; the pass fails and deletes nothing.
 //! - Liveness is v027's judgement, not a second one: a store whose container is
 //!   running, or whose path is not a plain directory, is preserved, and a
 //!   container runtime that cannot answer reads as live.
@@ -61,7 +61,8 @@ pub struct Plan {
     pub orphans: Vec<Orphan>,
     /// Stores that resolve in no profile but were kept.
     pub preserved: Vec<(PathBuf, Preserved)>,
-    /// Session rows that claim a store id, across every profile.
+    /// Session rows that claim a store id, across every profile of both
+    /// build namespaces.
     pub owners: usize,
 }
 
