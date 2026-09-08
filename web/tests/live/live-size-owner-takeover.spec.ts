@@ -26,14 +26,24 @@ async function openLiveView(page: Page, baseUrl: string) {
 }
 
 /** Vertical distance (px) between the cursor overlay and the top of the
- *  rendered row containing the prompt. 0 means perfectly aligned. */
+ *  rendered row containing the live prompt. 0 means perfectly aligned.
+ *
+ *  The *last* matching row, not the first. A hand-off resizes the pane, the
+ *  agent redraws its prompt on SIGWINCH, and when the pane grows the redraw
+ *  lands on a new row while the pre-resize prompt stays behind in the
+ *  scrollback. Both rows then contain the prompt, and measuring against the
+ *  stale one reports the distance between the two prompts rather than any
+ *  cursor drift. That is a fixed 76.75px here, so it never converges and the
+ *  poll always times out. A cursor that really did sit one row off the live
+ *  prompt is still one row height away, well over the threshold. */
 async function cursorToPromptDelta(page: Page): Promise<number> {
   return page.evaluate((prompt) => {
     const content = document.querySelector("[data-live-content]");
     const cursor = document.querySelector("[data-live-cursor]");
     if (!content || !cursor) return Number.NaN;
     const rows = Array.from(content.children).filter((el) => !el.hasAttribute("data-live-cursor"));
-    const promptRow = rows.find((el) => (el.textContent ?? "").includes(prompt));
+    const promptRows = rows.filter((el) => (el.textContent ?? "").includes(prompt));
+    const promptRow = promptRows[promptRows.length - 1];
     if (!promptRow) return Number.NaN;
     const c = cursor.getBoundingClientRect();
     const r = promptRow.getBoundingClientRect();
