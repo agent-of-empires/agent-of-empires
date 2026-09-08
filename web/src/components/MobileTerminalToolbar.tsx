@@ -4,6 +4,14 @@ import { useLongPressDrag, type DragAxis } from "../hooks/useLongPressDrag";
 import { bracketedPaste, readClipboardText } from "../lib/clipboard";
 import { toastBus } from "../lib/toastBus";
 
+function execCommandPaste(): boolean {
+  try {
+    return document.execCommand("paste");
+  } catch {
+    return false;
+  }
+}
+
 interface Props {
   sendData: (data: string) => void;
   keyboardOpen: boolean;
@@ -118,17 +126,25 @@ export function MobileTerminalToolbar({ sendData, keyboardOpen, ctrlActive, onCt
         className={btnBase}
         onClick={async () => {
           haptic();
+          const t = toastBus.handler;
+          if (!window.isSecureContext) {
+            // No Clipboard API on a plain-HTTP origin. WebKit still honours
+            // execCommand("paste") from a tap, behind its own Paste prompt,
+            // when an editable is focused: the paste event lands on the
+            // terminal's input, whose handler brackets it. Other engines
+            // return false. Must run before any await to stay in the gesture.
+            const active = document.activeElement;
+            const editable = active instanceof HTMLTextAreaElement || active instanceof HTMLInputElement;
+            if (keyboardOpen && editable && execCommandPaste()) return;
+            t?.error("Paste needs HTTPS. Run `aoe serve --remote` for a Tailscale or Cloudflare HTTPS URL.");
+            return;
+          }
           const text = await readClipboardText();
           if (text) {
             sendData(bracketedPaste(text));
             return;
           }
-          const t = toastBus.handler;
-          if (!window.isSecureContext) {
-            t?.error("Paste needs HTTPS. Run `aoe serve --remote` for a Tailscale or Cloudflare HTTPS URL.");
-          } else {
-            t?.error("Couldn't read clipboard. Try copying again, or open this dashboard in Safari.");
-          }
+          t?.error("Couldn't read clipboard. Try copying again, or open this dashboard in Safari.");
         }}
       >
         <svg

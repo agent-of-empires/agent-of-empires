@@ -71,6 +71,35 @@ describe("MobileTerminalToolbar", () => {
     await waitFor(() => expect(sendData).toHaveBeenCalledWith("\x1b[200~line 1\nline 2\x1b[201~"));
   });
 
+  it("on a plain-HTTP origin pastes through execCommand into the focused input, else explains HTTPS", async () => {
+    secureContext(false);
+    const error = vi.fn();
+    toastBus.handler = { push: vi.fn(), error, info: vi.fn(), openLink: vi.fn() };
+    const editable = document.createElement("textarea");
+    document.body.appendChild(editable);
+    editable.focus();
+    const paste = screen.getByLabelText.bind(screen);
+
+    for (const [granted, toasts] of [
+      [true, 0],
+      [false, 1],
+    ] as const) {
+      error.mockClear();
+      const execCommand = vi.fn(() => granted);
+      Object.defineProperty(document, "execCommand", { value: execCommand, configurable: true });
+      const { sendData, unmount } = renderToolbar({ keyboardOpen: true });
+      fireEvent.click(paste("Paste from clipboard"));
+      await new Promise((r) => setTimeout(r, 0));
+      expect(execCommand).toHaveBeenCalledWith("paste");
+      // The focused input's own paste handler sends; the toolbar never does.
+      expect(sendData).not.toHaveBeenCalled();
+      expect(error).toHaveBeenCalledTimes(toasts);
+      unmount();
+    }
+    document.body.removeChild(editable);
+    toastBus.handler = null;
+  });
+
   it("reports an unreadable clipboard instead of sending anything", async () => {
     secureContext(true);
     Object.defineProperty(navigator, "clipboard", {

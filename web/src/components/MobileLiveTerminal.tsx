@@ -852,6 +852,8 @@ export function MobileLiveTerminal({
     const rows: AnsiSegment[][] = [];
     // Visual row index where each pane line starts (for cursor math).
     const lineStartRow: number[] = new Array(lines.length);
+    // Pane line and wrap offset of each visual row (for row identity).
+    const source: Array<{ line: number; wrap: number }> = [];
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i]!;
       let wrapped = wrapCache.get(line);
@@ -860,9 +862,12 @@ export function MobileLiveTerminal({
         wrapCache.set(line, wrapped);
       }
       lineStartRow[i] = rows.length;
-      for (const row of wrapped.rows) rows.push(row);
+      for (let wrap = 0; wrap < wrapped.rows.length; wrap++) {
+        rows.push(wrapped.rows[wrap]!);
+        source.push({ line: i, wrap });
+      }
     }
-    return { rows, lineStartRow };
+    return { rows, lineStartRow, source };
   }, [lines, renderCols, wrapCache]);
   const screenRows = frame?.rows ?? 0;
   const history = frame?.history ?? 0;
@@ -2041,18 +2046,18 @@ export function MobileLiveTerminal({
             padLines > 0 ? (
               <div key={`pad-${block}`} style={{ height: `${padLines * lineH}px` }} aria-hidden="true" />
             ) : null,
-            // Rows are keyed by ABSOLUTE buffer position (spacer + window
-            // row), which is invariant as the agent appends: history grows by
-            // k, the capture window slides by k, and a given content line
-            // keeps spacer+index. The pads sit beside them in one flat list
-            // because any wrapper keyed on the mounted range would remount
-            // every row (and drop the user's selection) each time the range
-            // moved by a line.
+            // Rows are keyed by pane line (spacer + window line, invariant as
+            // the agent appends: history grows by k and the window slides by
+            // k) plus wrap offset, so a wrapped row keeps its identity too.
+            // The pads sit beside them in one flat list because any wrapper
+            // keyed on the mounted range would remount every row (and drop
+            // the user's selection) each time the range moved by a line.
             ...visual.rows.slice(start, end).map((segs, j) => {
               const i = start + j;
+              const src = visual.source[i]!;
               return (
                 <Row
-                  key={effectiveSpacerLines + i}
+                  key={`${effectiveSpacerLines + src.line}:${src.wrap}`}
                   segs={segs}
                   cursorCol={i === cursorRow ? live.col : null}
                   focused={i === cursorRow && focused}
