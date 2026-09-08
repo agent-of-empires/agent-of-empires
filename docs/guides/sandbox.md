@@ -345,8 +345,9 @@ variable or run `aoe migrate` before launching it.
 ### Reclaiming stores
 
 Permanently deleting a sandboxed session removes its store along with its
-container. Stores stranded before that (or by a delete that kept the container)
-are found by their instance id resolving in no profile:
+container. Stores stranded before that, by a delete that kept the container, or
+by a delete that failed part-way and kept the session, are found by their
+instance id resolving in no profile:
 
 ```bash
 aoe sandbox reclaim            # report what would go, and how much it frees

@@ -720,18 +720,15 @@ fn perform_deletion_core(
     // Stage 3: container removal. Releases the bind mount on the
     // worktree so the host can finish cleanup without racing in-
     // container processes.
+    let mut container_gone = false;
     if request.delete_sandbox && is_sandboxed {
         tracing::debug!(target: "session.delete", session_id = %request.session_id, stage = "container_remove", "perform_deletion: stage");
         let outcome = teardown(&request.instance.id);
         // A failed teardown can leave the container live with the store still
-        // bind mounted, and aborts the purge, so the session keeps running on
-        // the store: only remove it once the container is provably gone. One
-        // stranded by a failed purge is the reclaim pass's job.
-        let container_gone = !matches!(outcome, crate::containers::Teardown::Failed(_));
+        // bind mounted, so the store may only go once the container is
+        // provably gone.
+        container_gone = !matches!(outcome, crate::containers::Teardown::Failed(_));
         deletion_messages_for(outcome, &mut messages, &mut errors);
-        if container_gone {
-            stage_remove_agent_stores(request, &mut messages, &mut errors);
-        }
     }
 
     stage_remove_worktrees_and_branches(
@@ -744,6 +741,14 @@ fn perform_deletion_core(
     );
 
     stage_cleanup_scratch(request, &mut errors, &mut messages);
+
+    // Last, and only when nothing else failed: any error here rolls the purge
+    // back (`PurgeTransaction::complete_inner`), and a session that survives
+    // its own purge must survive with the store holding its login and history.
+    // One stranded by a rolled-back purge is the reclaim pass's job.
+    if container_gone && errors.is_empty() {
+        stage_remove_agent_stores(request, &mut messages);
+    }
 
     // Stage 6: hook status cleanup
     tracing::debug!(target: "session.delete", session_id = %request.session_id, stage = "hook_status_cleanup", "perform_deletion: stage");
@@ -1201,18 +1206,18 @@ fn stage_cleanup_scratch(
     }
 }
 
-/// Stage 4: the session's own agent stores. Each holds a copy of the agent's
-/// credentials and is named by an instance id that stops resolving with this
-/// purge, so leaving it behind strands a credential nothing will ever open.
+/// Final stage: the session's own agent stores. Each holds a copy of the
+/// agent's credentials and is named by an instance id that stops resolving
+/// with this purge, so leaving it behind strands a credential nothing will
+/// ever open.
 ///
 /// Runs with the container already removed, and only then: the store is bind
-/// mounted into it, so a kept container keeps its store. One that is stranded
-/// anyway is the reclaim pass's job.
-fn stage_remove_agent_stores(
-    request: &DeletionRequest,
-    messages: &mut Vec<String>,
-    errors: &mut Vec<String>,
-) {
+/// mounted into it, so a kept container keeps its store.
+///
+/// Reports rather than fails. An error here would roll the purge back and
+/// keep the session, which is the outcome this stage exists to avoid; a store
+/// left behind is the reclaim pass's job instead.
+fn stage_remove_agent_stores(request: &DeletionRequest, messages: &mut Vec<String>) {
     tracing::debug!(target: "session.delete", session_id = %request.session_id, stage = "agent_store_remove", "perform_deletion: stage");
     match crate::session::sandbox_store_reclaim::remove_stores_for(&request.instance) {
         Ok((removed, _)) if removed.is_empty() => {}
@@ -1220,7 +1225,13 @@ fn stage_remove_agent_stores(
             "Agent store removed ({})",
             crate::migrations::progress::format_bytes(freed)
         )),
-        Err(error) => errors.push(format!("Agent store: {error}")),
+        Err(error) => {
+            tracing::warn!(target: "session.store",
+                "leaving the agent store of {}: {error}", request.session_id);
+            messages.push(format!(
+                "Agent store kept ({error}); `aoe sandbox reclaim` removes it later"
+            ));
+        }
     }
 }
 
@@ -1768,6 +1779,42 @@ mod tests {
 
             assert!(store.exists(), "a failed teardown took the store with it");
             assert!(!result.success);
+        }
+
+        /// A purge that fails after the container came down is rolled back by
+        /// `PurgeTransaction::complete_inner`, so the session survives. Its
+        /// store must survive with it, or the session is left logged out with
+        /// its history gone.
+        #[test]
+        #[serial_test::serial]
+        fn a_purge_that_fails_after_teardown_leaves_the_store() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+            let mut request = sandboxed_request();
+            request.delete_worktree = true;
+            request.instance.worktree_info = Some(crate::session::WorktreeInfo {
+                branch: "feature/x".to_string(),
+                main_repo_path: temp.path().join("not-a-repo").display().to_string(),
+                managed_by_aoe: true,
+                created_at: chrono::Utc::now(),
+                base_branch: None,
+            });
+            let store = temp
+                .path()
+                .join(".claude")
+                .join("sandbox-v2")
+                .join(&request.instance.id);
+            std::fs::create_dir_all(&store).unwrap();
+            std::fs::write(store.join(".credentials.json"), b"token").unwrap();
+
+            let result = perform_deletion_with(&request, |_id| Teardown::Removed);
+
+            assert!(!result.success, "{:?}", result.messages);
+            assert!(
+                store.exists(),
+                "a purge that will be rolled back took the store with it: {:?}",
+                result.errors
+            );
         }
     }
 
