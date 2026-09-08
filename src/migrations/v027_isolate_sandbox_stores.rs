@@ -2016,7 +2016,14 @@ fn copy_tree_no_links(
                 Ok(existing) if overwrite_newer && existing.is_file() => {
                     metadata.modified()? > existing.modified()?
                 }
-                Ok(_) => false,
+                // Fails closed as the Unix path does. Skipping instead would
+                // leave the overlay's file out of the private store while
+                // `retire_legacy_children` still counted it as replicated and
+                // removed the only other copy.
+                Ok(_) => bail!(
+                    "v027 copy destination has conflicting type: {}",
+                    target.display()
+                ),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
                 Err(error) => return Err(error.into()),
             };
