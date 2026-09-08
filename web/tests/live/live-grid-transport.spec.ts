@@ -142,7 +142,6 @@ test("synchronized-output brackets publish whole frames only", async ({ browser 
   try {
     const ctx = await browser.newContext({ ...devices["iPhone 13"] });
     const page = await ctx.newPage();
-    await holdClientResize(page);
     await page.goto(`${serve.baseUrl}/?livedebug=1`);
     await openMobileSidebar(page);
     await clickSidebarSession(page, "sync-app");
@@ -185,7 +184,7 @@ test("synchronized-output brackets publish whole frames only", async ({ browser 
   }
 });
 
-test("resize fallback keeps OSC 52 forwarding on the same WebSocket", async ({ browser }, testInfo) => {
+test("a resize keeps the live grid and its OSC 52 forwarding", async ({ browser }, testInfo) => {
   test.setTimeout(90_000);
   const serve = await spawnAoeServe({
     authMode: "none",
@@ -213,14 +212,16 @@ test("resize fallback keeps OSC 52 forwarding on the same WebSocket", async ({ b
       if (!socket) throw new Error("live WebSocket was not captured");
       socket.send(JSON.stringify({ type: "resize", cols: cols + 1, rows }));
     }, geometry);
-    await expectTransport(page, "snapshot");
+    // The reseed installs behind the drain fence, so the grid stays in
+    // service: a resize must not cost the viewer the live transport.
+    await expectTransport(page, "grid");
 
     await page.locator("[data-live-terminal]").click();
     await page.keyboard.type("c");
     await expect
       .poll(() => page.evaluate(() => navigator.clipboard.readText()), {
         timeout: 30_000,
-        message: "OSC 52 emitted after retirement reached the same viewer",
+        message: "OSC 52 emitted after the resize reached the same viewer",
       })
       .toBe("after-resize");
   } finally {
@@ -239,7 +240,6 @@ test("a streaming agent is delivered as row patches after the first frame", asyn
   try {
     const ctx = await browser.newContext({ ...devices["iPhone 13"] });
     const page = await ctx.newPage();
-    await holdClientResize(page);
     await page.goto(`${serve.baseUrl}/?livedebug=1`);
     await openMobileSidebar(page);
     await clickSidebarSession(page, "patch-stream");

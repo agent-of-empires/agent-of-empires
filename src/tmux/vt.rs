@@ -1009,7 +1009,6 @@ fn lf_to_crlf(raw: &[u8]) -> Vec<u8> {
 pub(crate) enum VtRefreshResult {
     Refreshed,
     Busy,
-    Retired,
     Failed,
 }
 
@@ -1020,8 +1019,6 @@ pub(crate) enum VtLifecycle {
     Starting,
     /// The reader is connected and the grid may be sampled.
     Live,
-    /// A reseed boundary intentionally moved all viewers to capture-only.
-    Retired,
     /// The forwarder disconnected and callers may try to recover.
     Failed,
 }
@@ -1030,7 +1027,6 @@ impl VtLifecycle {
     fn load(state: &AtomicU8) -> Self {
         match state.load(Ordering::Acquire) {
             x if x == Self::Live as u8 => Self::Live,
-            x if x == Self::Retired as u8 => Self::Retired,
             x if x == Self::Failed as u8 => Self::Failed,
             _ => Self::Starting,
         }
@@ -1040,10 +1036,10 @@ impl VtLifecycle {
         state.store(self as u8, Ordering::Release);
     }
 
-    fn fail_unless_retired(state: &AtomicU8) {
+    fn fail(state: &AtomicU8) {
         let mut current = state.load(Ordering::Acquire);
         loop {
-            if current == Self::Retired as u8 || current == Self::Failed as u8 {
+            if current == Self::Failed as u8 {
                 return;
             }
             match state.compare_exchange_weak(
@@ -1084,9 +1080,16 @@ struct SeedSink<'a> {
     links: &'a LinkTable,
 }
 
+/// Only a landed swap may move the channel's recorded geometry: a Busy or
+/// Failed refresh left the previous grid in service.
+fn refresh_commits_geometry(result: VtRefreshResult) -> bool {
+    result == VtRefreshResult::Refreshed
+}
+
 fn seed_parser(
     target: &str,
     sink: SeedSink<'_>,
+    since: Option<u64>,
     size: (u16, u16),
     deadline: &crate::tmux::TmuxCommandDeadline,
     guard: SeedGuard<'_>,
@@ -1099,7 +1102,7 @@ fn seed_parser(
     let (Some(snapshot), Some(socket), Some(control)) =
         (fence.snapshot, fence.socket, fence.control)
     else {
-        return swap_seeded_parser(sink, None, &stream, size, guard);
+        return swap_seeded_parser(sink, since, &stream, size, guard);
     };
     let Ok(_snapshot) = snapshot.lock() else {
         return VtRefreshResult::Failed;
@@ -1113,7 +1116,7 @@ fn seed_parser(
     };
     swap_drained_seeded_parser(
         sink,
-        None,
+        since,
         &stream,
         size,
         DrainedSeedGuard { guard, control },
@@ -1132,6 +1135,13 @@ fn capture_seed_stream(
     Some(assemble_seed_stream(&body, &state, rows))
 }
 
+fn pipe_has_unread_bytes(pipe: &UnixStream) -> bool {
+    let mut unread: libc::c_int = 0;
+    // FIONREAD writes one c_int through this valid pointer without consuming
+    // the socket's receive queue.
+    unsafe { libc::ioctl(pipe.as_raw_fd(), libc::FIONREAD, &mut unread) != 0 || unread > 0 }
+}
+
 /// Replace `parser` with a fresh grid built from `stream`, unless the reader
 /// applied a chunk since generation `since` or has not settled the expected
 /// chunk sequence.
@@ -1148,13 +1158,6 @@ fn capture_seed_stream(
 /// the newer output, so leaving it alone is the safe side, and initial arming
 /// retries on its own cadence. `since` of `None` disables only the
 /// generation guard for callers whose current grid is stale by definition.
-fn pipe_has_unread_bytes(pipe: &UnixStream) -> bool {
-    let mut unread = 0;
-    // FIONREAD writes one c_int through this valid pointer without consuming
-    // the socket's receive queue.
-    unsafe { libc::ioctl(pipe.as_raw_fd(), libc::FIONREAD, &mut unread) != 0 || unread > 0 }
-}
-
 fn swap_seeded_parser(
     sink: SeedSink<'_>,
     since: Option<u64>,
@@ -1860,12 +1863,18 @@ pub(crate) struct LinkTable {
 /// frame text instead, so the TUI reads those straight off the content.
 ///
 /// Only a live channel answers. A retired or failed one no longer describes
-/// what is on screen: its table froze at teardown while the pane kept moving,
-/// and the consumer unions this ahead of the links it reads out of the frame
-/// (`Preview::collect_links`). A label the pane has since repointed would
-/// still resolve through the stale entry, because the dedupe key is
-/// (text, uri) and the two do not collide. Falling silent hands the capture
-/// fallback the same clean slate it gets when no channel ever armed.
+/// what is on screen, and with no reseed left to run, `reconcile_links` never
+/// revisits its table: it froze at teardown while the pane kept moving.
+///
+/// The damage is to labels the frame can no longer speak for. Where the pane
+/// still advertises a target, `Preview::collect_links` offers both and
+/// `resolve_overlaps` prefers the capture-derived one on rank, so that case
+/// resolves correctly either way. But a label reprinted as plain text, or one
+/// whose sequence scrolled out of the captured window, leaves no fresh
+/// candidate at all, and the frozen entry is still `advertised`, so it beats
+/// a bare-URL match and keeps the label clickable against a URI the pane has
+/// stopped offering. Falling silent hands the capture fallback the same clean
+/// slate it gets when no channel ever armed.
 pub(crate) fn pane_links(session: &str) -> Vec<PaneLink> {
     lookup(session)
         .filter(|c| c.lifecycle() == VtLifecycle::Live)
@@ -1911,7 +1920,7 @@ fn stop_and_wake_reader(stop: &AtomicBool, sock_path: &std::path::Path) {
 /// pipe EOF, socket error, or `stop`.
 fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
     let Ok((conn, _)) = listener.accept() else {
-        VtLifecycle::fail_unless_retired(&ctx.lifecycle);
+        VtLifecycle::fail(&ctx.lifecycle);
         return;
     };
     // Publish the writable half so input dispatch can reach the pane.
@@ -2049,7 +2058,7 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
     // Reader is exiting (pipe EOF / socket error / stop): the
     // forwarder is gone, so the channel is no longer the live
     // single-writer. Input dispatch and capture both fall back.
-    VtLifecycle::fail_unless_retired(&ctx.lifecycle);
+    VtLifecycle::fail(&ctx.lifecycle);
     // Wake parked viewers so they observe the death promptly
     // instead of waiting out their heartbeat sleep.
     ctx.signals.end_hold();
@@ -2089,6 +2098,13 @@ pub(crate) struct VtChannel {
     /// Number of chunks the reader has parsed. `0` means none yet, so
     /// `chunk_timing` reports `None` and the caller leaves pacing untouched.
     chunk_seq: Arc<AtomicU64>,
+    /// Read sequences the reader has finished applying, plus the mutex and
+    /// forwarder control channel that fence a snapshot against them. Held for
+    /// the channel's life, not just across arming, because a reseed installs
+    /// through the same fence the arm-time seed uses.
+    settled_chunk_seq: Arc<AtomicU64>,
+    snapshot: Arc<Mutex<()>>,
+    drain: Arc<Mutex<DrainControl>>,
     /// Arrival of the most recent chunk (millis since `CHUNK_CLOCK`), stamped
     /// by the reader thread on every chunk.
     last_chunk_ms: Arc<AtomicU64>,
@@ -2221,10 +2237,6 @@ pub(crate) struct VtRowsSample {
 }
 
 impl VtChannel {
-    pub(crate) fn lifecycle_for_session(session: &str) -> Option<VtLifecycle> {
-        lookup(session).map(|channel| channel.lifecycle())
-    }
-
     /// Get the shared channel for `session`, arming a new one if none is live.
     /// Returns `None` if tmux is too old or the pane is gone or any tmux/socket
     /// step fails; callers then use the legacy capture/send-keys path. The
@@ -2243,10 +2255,8 @@ impl VtChannel {
         // Reuse only a live entry. Failure permits recovery, while retirement
         // suppresses rearming until the viewers holding that generation drop.
         if let Some(ch) = lookup(session) {
-            match ch.lifecycle() {
-                VtLifecycle::Live => return Some(ch),
-                VtLifecycle::Retired => return None,
-                VtLifecycle::Starting | VtLifecycle::Failed => {}
+            if ch.lifecycle() == VtLifecycle::Live {
+                return Some(ch);
             }
         }
         // Serialize arming per session: take (or create) this session's arm
@@ -2263,12 +2273,10 @@ impl VtChannel {
         let result = {
             let _armed = arm_lock.lock().unwrap();
             if let Some(ch) = lookup(session) {
-                match ch.lifecycle() {
-                    VtLifecycle::Live => Some(ch),
-                    VtLifecycle::Retired => None,
-                    VtLifecycle::Starting | VtLifecycle::Failed => {
-                        Self::arm_and_register(session, deadline)
-                    }
+                if ch.lifecycle() == VtLifecycle::Live {
+                    Some(ch)
+                } else {
+                    Self::arm_and_register(session, deadline)
                 }
             } else {
                 // No `?` here: an arm failure must still fall through to the
@@ -2477,6 +2485,7 @@ impl VtChannel {
                     grid_gen: &grid_gen,
                     links: &links,
                 },
+                None,
                 (cols, rows),
                 deadline,
                 SeedGuard {
@@ -2490,9 +2499,7 @@ impl VtChannel {
                 },
             );
             match seed_result {
-                VtRefreshResult::Refreshed | VtRefreshResult::Retired | VtRefreshResult::Failed => {
-                    break
-                }
+                VtRefreshResult::Refreshed | VtRefreshResult::Failed => break,
                 VtRefreshResult::Busy => {}
             }
         }
@@ -2537,6 +2544,9 @@ impl VtChannel {
             armed_at: Instant::now(),
             sock_dir,
             sock_path,
+            settled_chunk_seq: settled_chunk_seq.clone(),
+            snapshot: snapshot.clone(),
+            drain: drain.clone(),
             stop,
             reader: Mutex::new(Some(reader)),
             cols: AtomicU16::new(cols),
@@ -2572,8 +2582,9 @@ impl VtChannel {
     /// Reconcile the parser with the pane at most once a second (one
     /// `display-message` fork; rate-limited so it adds no periodic hitch).
     ///
-    /// Two triggers that retire the live grid into `capture-pane` fallback,
-    /// because tmux reflows on resize while pipe-pane carries no reflow redraw:
+    /// Two triggers, both ending in a reseed from `capture-pane` rather than a
+    /// bare `set_size`, because tmux reflows on resize while pipe-pane carries
+    /// no reflow redraw (see `seed_parser`):
     ///
     /// - **geometry changed**, the original trigger.
     /// - **the cursor drifted** and stayed drifted across a pass with no output
@@ -2625,7 +2636,10 @@ impl VtChannel {
                 }
             }
             GridReconcile::Resize => {
-                self.retire_live_channel(deadline);
+                if refresh_commits_geometry(self.reseed(c, r, false, deadline)) {
+                    self.cols.store(c, Ordering::Relaxed);
+                    self.rows.store(r, Ordering::Relaxed);
+                }
             }
             GridReconcile::Reseed => {
                 tracing::debug!(
@@ -2633,9 +2647,9 @@ impl VtChannel {
                     pane = %self.target,
                     tmux_cursor = ?(cx, cy),
                     grid_cursor = ?(gcx, gcy),
-                    "vt: grid diverged from pane; retiring live channel",
+                    "vt: grid diverged from pane; reseeding",
                 );
-                self.retire_live_channel(deadline);
+                self.reseed(c, r, true, deadline);
             }
         }
     }
@@ -2655,14 +2669,49 @@ impl VtChannel {
     /// its own pipe queue, beyond the forwarder's ordering fence. Replacing the
     /// parser would replay that output when tmux flushes it, so consumers must
     /// use the capture-only fallback instead.
-    fn retire_live_channel(&self, deadline: &crate::tmux::TmuxCommandDeadline) -> VtRefreshResult {
-        match self.lifecycle() {
-            VtLifecycle::Retired => return VtRefreshResult::Retired,
-            VtLifecycle::Starting | VtLifecycle::Failed => return VtRefreshResult::Failed,
-            VtLifecycle::Live => VtLifecycle::Retired.store(&self.lifecycle),
+    /// Rebuild the grid from `capture-pane` and clear any armed drift after a
+    /// successful swap.
+    ///
+    /// `guarded` makes the swap conditional on the generation sampled before
+    /// the capture. Healing reseeds are guarded because the current grid owns
+    /// any concurrent output; resize reseeds are not, because tmux has reflowed
+    /// and made the pre-resize grid stale. Both install through the same fence
+    /// as the arm-time seed, so the forwarder's backlog is on the socket and
+    /// the reader's queue is drained before the parser is replaced.
+    fn reseed(
+        &self,
+        cols: u16,
+        rows: u16,
+        guarded: bool,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> VtRefreshResult {
+        let since = guarded.then(|| self.grid_gen.load(Ordering::Relaxed));
+        let expected_chunk_seq = self.chunk_seq.load(Ordering::Acquire);
+        let result = seed_parser(
+            &self.target,
+            SeedSink {
+                parser: &self.parser,
+                app_cursor: &self.app_cursor,
+                grid_gen: &self.grid_gen,
+                links: &self.links,
+            },
+            since,
+            (cols, rows),
+            deadline,
+            SeedGuard {
+                chunk: Some((&self.chunk_seq, &self.settled_chunk_seq, expected_chunk_seq)),
+                pipe: None,
+            },
+            SeedInstallFence {
+                snapshot: Some(&self.snapshot),
+                socket: Some(&self.stream),
+                control: Some(&self.drain),
+            },
+        );
+        if result == VtRefreshResult::Refreshed {
+            self.clear_drift();
         }
-        self.shutdown_with_deadline(deadline);
-        VtRefreshResult::Retired
+        result
     }
 
     /// Retire the live grid for authoritative capture fallback even when cursor
@@ -2671,7 +2720,12 @@ impl VtChannel {
         &self,
         deadline: &crate::tmux::TmuxCommandDeadline,
     ) -> VtRefreshResult {
-        self.retire_live_channel(deadline)
+        self.reseed(
+            self.cols.load(Ordering::Relaxed),
+            self.rows.load(Ordering::Relaxed),
+            true,
+            deadline,
+        )
     }
     /// Serialize up to max_lines of (scrollback + screen) to per-row ANSI,
     /// plus the authoritative cursor (with history_size set to the full
@@ -2849,7 +2903,14 @@ impl VtChannel {
         {
             return VtRefreshResult::Refreshed;
         }
-        self.retire_live_channel(deadline)
+        self.expect_grid_size(cols, rows);
+        let result = self.reseed(cols, rows, false, deadline);
+        if refresh_commits_geometry(result) {
+            self.cols.store(cols, Ordering::Relaxed);
+            self.rows.store(rows, Ordering::Relaxed);
+            self.signals.bump_changed();
+        }
+        result
     }
 
     /// Declare the geometry the pane is being resized to, before the resize
@@ -3559,6 +3620,7 @@ mod tests {
                     grid_gen: &grid_gen,
                     links: &LinkTable::default(),
                 },
+                None,
                 (80, 24),
                 &deadline,
                 SeedGuard {
@@ -3828,6 +3890,9 @@ mod tests {
             clipboard: Arc::new(Mutex::new(None)),
             links: Arc::new(LinkTable::default()),
             chunk_seq: Arc::new(AtomicU64::new(0)),
+            settled_chunk_seq: Arc::new(AtomicU64::new(0)),
+            snapshot: Arc::new(Mutex::new(())),
+            drain: Arc::new(Mutex::new(DrainControl::default())),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
             prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
             grid_gen: Arc::new(AtomicU64::new(0)),
@@ -3849,8 +3914,13 @@ mod tests {
         (ch, lifecycle)
     }
 
+    /// An authoritative refresh reinstalls the grid rather than standing the
+    /// channel down. The install goes through the same fence as the arm-time
+    /// seed, so a snapshot still cannot land ahead of bytes the forwarder or
+    /// the reader socket are holding; a refresh that cannot capture reports
+    /// Failed and leaves the current grid in service.
     #[test]
-    fn authoritative_refresh_retires_live_channel_before_snapshot() {
+    fn authoritative_refresh_reseeds_rather_than_standing_down() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (channel, lifecycle) = dummy_channel("aoe_test_vt_fallback", dir.path());
         VtLifecycle::Live.store(&lifecycle);
@@ -3859,52 +3929,48 @@ mod tests {
         let deadline = crate::tmux::TmuxCommandDeadline::with_timeout(Duration::ZERO);
         assert_eq!(
             channel.refresh_authoritatively(&deadline),
-            VtRefreshResult::Retired,
-            "a live channel must stand down instead of installing an unfenceable snapshot"
+            VtRefreshResult::Failed,
+            "a capture that cannot run reports Failed, not a stand-down"
         );
-        assert!(
-            !channel.is_alive(),
-            "consumers must fall back to capture-only after an authoritative refresh"
-        );
-        assert_eq!(channel.lifecycle(), VtLifecycle::Retired);
-        VtLifecycle::fail_unless_retired(&lifecycle);
         assert_eq!(
             channel.lifecycle(),
-            VtLifecycle::Retired,
-            "reader shutdown must not erase intentional retirement",
+            VtLifecycle::Live,
+            "a failed refresh must leave the live grid in service"
         );
     }
 
+    /// A channel whose forwarder disconnected is recoverable: the pane usually
+    /// comes back under the same tmux name after a restart, so `acquire` must
+    /// re-arm rather than hand out the corpse.
     #[test]
-    fn retired_registry_entry_suppresses_rearming_until_its_viewers_drop() {
-        let name = format!("aoe_test_vt_retired_{}", std::process::id());
+    fn failed_registry_entry_is_rearmed_rather_than_reused() {
+        let name = format!("aoe_test_vt_failed_{}", std::process::id());
         let dir = tempfile::tempdir().expect("tempdir");
         let (channel, lifecycle) = dummy_channel(&name, dir.path());
-        VtLifecycle::Retired.store(&lifecycle);
+        VtLifecycle::fail(&lifecycle);
         REGISTRY
             .lock()
             .unwrap()
             .insert(name.clone(), Arc::downgrade(&channel));
 
-        assert!(VtChannel::acquire(&name).is_none());
         assert_eq!(
-            VtChannel::lifecycle_for_session(&name),
-            Some(VtLifecycle::Retired),
+            lookup(&name).map(|c| c.lifecycle()),
+            Some(VtLifecycle::Failed),
         );
-        assert!(
-            !ARM_LOCKS.lock().unwrap().contains_key(&name),
-            "a retired channel must not enter the arm path",
-        );
+        // No tmux pane backs this name, so the re-arm fails and yields None;
+        // the point is that it was attempted rather than short-circuited.
+        assert!(VtChannel::acquire(&name).is_none());
 
         REGISTRY.lock().unwrap().remove(&name);
     }
 
-    /// A channel that stops describing the screen must stop answering for it.
-    /// Its table froze at teardown while the pane kept moving, and
-    /// `Preview::collect_links` unions this ahead of the links it reads out of
-    /// the frame, so a stale entry would win the row-text match for a label the
-    /// pane has since repointed. Retired and failed both fall silent; the
-    /// generation drops to the no-channel zero, which is the re-collect signal.
+    /// A channel whose forwarder disconnected no longer describes the screen,
+    /// and `reconcile_links` cannot revisit its table without a reader. Where
+    /// the pane still advertises a target the capture-derived entry wins on
+    /// rank anyway, so the case that bites is a label reprinted as plain text:
+    /// no fresh candidate, and the frozen entry still `advertised`. It must
+    /// fall silent, and the generation drop to the no-channel zero is the
+    /// consumer's re-collect signal.
     #[test]
     fn only_a_live_channel_answers_for_pane_links() {
         let name = format!("aoe_test_vt_links_{}", std::process::id());
@@ -3927,8 +3993,9 @@ mod tests {
         let live_generation = pane_links_generation(&name);
         assert_ne!(live_generation, 0, "a recorded link moved the generation");
 
-        for gone in [VtLifecycle::Retired, VtLifecycle::Failed] {
-            gone.store(&lifecycle);
+        {
+            let gone = VtLifecycle::Failed;
+            VtLifecycle::fail(&lifecycle);
             assert!(
                 pane_links(&name).is_empty(),
                 "{gone:?} must not serve the table it froze at teardown",
@@ -3946,7 +4013,7 @@ mod tests {
     #[test]
     fn reader_failure_does_not_look_like_intentional_retirement() {
         let lifecycle = AtomicU8::new(VtLifecycle::Live as u8);
-        VtLifecycle::fail_unless_retired(&lifecycle);
+        VtLifecycle::fail(&lifecycle);
         assert_eq!(VtLifecycle::load(&lifecycle), VtLifecycle::Failed);
     }
 

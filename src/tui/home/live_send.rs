@@ -770,35 +770,6 @@ fn authoritative_capture_due(
 enum AuthoritativeRefreshAction {
     None,
     Schedule(std::time::Duration),
-    CaptureOnly,
-}
-
-#[cfg(unix)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VtLifecycleAction {
-    None,
-    CaptureOnly,
-    Recover,
-}
-
-#[cfg(unix)]
-fn vt_lifecycle_action(lifecycle: Option<crate::tmux::vt::VtLifecycle>) -> VtLifecycleAction {
-    match lifecycle {
-        Some(crate::tmux::vt::VtLifecycle::Retired) => VtLifecycleAction::CaptureOnly,
-        Some(crate::tmux::vt::VtLifecycle::Failed) => VtLifecycleAction::Recover,
-        Some(crate::tmux::vt::VtLifecycle::Starting | crate::tmux::vt::VtLifecycle::Live)
-        | None => VtLifecycleAction::None,
-    }
-}
-
-#[cfg(unix)]
-fn capture_worker_observes_osc52(
-    vt_enabled: bool,
-    vt_capture_only: bool,
-    forward_empty: bool,
-    clipboard_enabled: bool,
-) -> bool {
-    clipboard_enabled && (vt_capture_only || (!vt_enabled && forward_empty))
 }
 
 fn authoritative_refresh_action(
@@ -807,9 +778,6 @@ fn authoritative_refresh_action(
 ) -> AuthoritativeRefreshAction {
     match (due, result) {
         (false, _) => AuthoritativeRefreshAction::None,
-        (true, Some(crate::tmux::vt::VtRefreshResult::Retired)) => {
-            AuthoritativeRefreshAction::CaptureOnly
-        }
         // Busy still consumed an authoritative capture attempt. Defer the
         // next one so continuous output cannot turn self-heal into a fork loop.
         (
@@ -1378,12 +1346,6 @@ impl LiveCaptureWorker {
             // worker also falls back to capture for that pane.
             #[cfg(unix)]
             let mut vt_source: Option<std::sync::Arc<crate::tmux::vt::VtChannel>> = None;
-            // A healthy grid may intentionally retire when an authoritative
-            // snapshot would cross tmux's unfenceable pipe queue. That is not
-            // a broken forwarder: this target stays on capture until retarget
-            // or an explicit VT setting reset.
-            #[cfg(unix)]
-            let mut vt_capture_only = false;
             // Terminal snapshots do not include raw OSC 52 escapes. When VT is
             // intentionally off for a terminal pane, this observer restores
             // clipboard forwarding without constructing a grid or seed.
@@ -1484,7 +1446,6 @@ impl LiveCaptureWorker {
                     #[cfg(unix)]
                     {
                         stale_vt.extend(vt_source.take());
-                        vt_capture_only = false;
                         last_vt_arm = None;
                         arm_after = Some(std::time::Instant::now() + CHANNEL_ARM_SETTLE);
                         next_authoritative_capture = None;
@@ -1531,23 +1492,8 @@ impl LiveCaptureWorker {
                 #[cfg(unix)]
                 if !vt_enabled {
                     shutdown_vt_source(&mut vt_source, &command_deadline);
-                    vt_capture_only = false;
                     last_vt_arm = None;
                     next_authoritative_capture = None;
-                }
-                #[cfg(unix)]
-                if vt_enabled {
-                    match vt_lifecycle_action(vt_source.as_ref().map(|source| source.lifecycle())) {
-                        VtLifecycleAction::CaptureOnly => {
-                            vt_capture_only = true;
-                            next_authoritative_capture = None;
-                        }
-                        VtLifecycleAction::Recover => {
-                            shutdown_vt_source(&mut vt_source, &command_deadline);
-                            next_authoritative_capture = None;
-                        }
-                        VtLifecycleAction::None => {}
-                    }
                 }
                 #[cfg(unix)]
                 if !clipboard_capture_enabled {
@@ -1557,15 +1503,6 @@ impl LiveCaptureWorker {
                 }
                 if lines > 0 && !name.is_empty() {
                     let forward_empty_policy = forward_empty_cell.load(Ordering::Relaxed);
-                    #[cfg(unix)]
-                    if vt_enabled
-                        && !vt_capture_only
-                        && crate::tmux::vt::VtChannel::lifecycle_for_session(&name)
-                            == Some(crate::tmux::vt::VtLifecycle::Retired)
-                    {
-                        vt_capture_only = true;
-                        next_authoritative_capture = None;
-                    }
                     // Keep a lazy count of the target window's panes so a
                     // hand-made split stops being invisible. One tiny fork
                     // every couple of seconds on the single previewed pane.
@@ -1591,12 +1528,8 @@ impl LiveCaptureWorker {
                     // since the last cycle. Published below under the same
                     // retarget guard as the cursor.
                     #[cfg(unix)]
-                    let observe_osc52 = capture_worker_observes_osc52(
-                        vt_enabled,
-                        vt_capture_only,
-                        forward_empty_policy,
-                        clipboard_capture_enabled,
-                    );
+                    let observe_osc52 =
+                        !vt_enabled && forward_empty_policy && clipboard_capture_enabled;
                     #[cfg(unix)]
                     if !observe_osc52 {
                         shutdown_osc52_source(&mut osc52_source, &command_deadline);
@@ -1628,21 +1561,10 @@ impl LiveCaptureWorker {
                         osc52_seen = 0;
                     }
                     #[cfg(unix)]
-                    let mut clipboard_now = vt_source.as_ref().and_then(|source| {
-                        if source.is_alive()
-                            || source.lifecycle() == crate::tmux::vt::VtLifecycle::Retired
-                        {
-                            source.take_clipboard()
-                        } else {
-                            None
-                        }
+                    let mut clipboard_now = osc52_source.as_ref().and_then(|source| {
+                        source.refresh_owner_heartbeat_with_deadline(&command_deadline);
+                        source.clipboard_after(&mut osc52_seen)
                     });
-                    if clipboard_now.is_none() {
-                        clipboard_now = osc52_source.as_ref().and_then(|source| {
-                            source.refresh_owner_heartbeat_with_deadline(&command_deadline);
-                            source.clipboard_after(&mut osc52_seen)
-                        });
-                    }
                     #[cfg(not(unix))]
                     let clipboard_now: Option<String> = None;
                     // Acquire one frame + cursor. Default: sample the in-process
@@ -1660,14 +1582,12 @@ impl LiveCaptureWorker {
                     let forward_empty = forward_empty_policy || !live_cell.load(Ordering::Relaxed);
                     #[cfg(unix)]
                     let (capture, cursor_now) = if vt_enabled {
-                        if !vt_capture_only
-                            && channel_arm_due(
-                                arm_after,
-                                vt_source.is_some() || pending_vt_arm.is_some(),
-                                last_vt_arm,
-                                std::time::Instant::now(),
-                            )
-                        {
+                        if channel_arm_due(
+                            arm_after,
+                            vt_source.is_some() || pending_vt_arm.is_some(),
+                            last_vt_arm,
+                            std::time::Instant::now(),
+                        ) {
                             last_vt_arm = Some(std::time::Instant::now());
                             pending_vt_arm = Some(PendingArm::spawn(
                                 name.clone(),
@@ -1676,7 +1596,17 @@ impl LiveCaptureWorker {
                                 crate::tmux::vt::VtChannel::acquire_with_deadline,
                             ));
                         }
-                        let authoritative_due = vt_source.as_ref().is_some_and(|v| v.is_alive())
+                        // A channel whose forwarder has disconnected stops
+                        // updating its grid; drop it and fall back to capture
+                        // for this pane. The arm throttle above then re-arms
+                        // after `VT_REARM_INTERVAL` (a session restart reuses
+                        // the tmux name, so the pane usually comes back)
+                        // without thrashing on a permanently broken pane.
+                        if vt_source.as_ref().is_some_and(|v| !v.is_alive()) {
+                            shutdown_vt_source(&mut vt_source, &command_deadline);
+                            next_authoritative_capture = None;
+                        }
+                        let authoritative_due = vt_source.is_some()
                             && authoritative_capture_due(
                                 next_authoritative_capture,
                                 std::time::Instant::now(),
@@ -1696,13 +1626,10 @@ impl LiveCaptureWorker {
                                 next_authoritative_capture =
                                     Some(std::time::Instant::now() + after);
                             }
-                            AuthoritativeRefreshAction::CaptureOnly => {
-                                vt_capture_only = true;
-                                next_authoritative_capture = None;
-                            }
                         }
                         match vt_source.as_ref() {
-                            Some(v) if v.is_alive() => {
+                            Some(v) => {
+                                clipboard_now = v.take_clipboard();
                                 if composite {
                                     capture_composited_over_grid(
                                         &name,
@@ -1731,10 +1658,10 @@ impl LiveCaptureWorker {
                             }
                             // No grid for pane 0, so every pane comes from the
                             // fork instead.
-                            Some(_) | None if composite => {
+                            None if composite => {
                                 capture_composited(&name, lines, forward_empty, &command_deadline)
                             }
-                            Some(_) | None => {
+                            None => {
                                 capture_via_tmux(&name, lines, forward_empty, &command_deadline)
                             }
                         }
@@ -1754,10 +1681,7 @@ impl LiveCaptureWorker {
                     // capture-pane fallback and non-unix, which leaves pacing to
                     // the publish floor alone.
                     #[cfg(unix)]
-                    let vt_timing = vt_source
-                        .as_ref()
-                        .filter(|source| source.is_alive())
-                        .and_then(|source| source.chunk_timing());
+                    let vt_timing = vt_source.as_ref().and_then(|v| v.chunk_timing());
                     #[cfg(not(unix))]
                     let vt_timing: Option<(u64, u64)> = None;
                     // Recheck the target once for both publishes: a retarget
@@ -3904,11 +3828,6 @@ mod tests {
             ),
             (
                 true,
-                Some(VtRefreshResult::Retired),
-                AuthoritativeRefreshAction::CaptureOnly,
-            ),
-            (
-                true,
                 Some(VtRefreshResult::Failed),
                 AuthoritativeRefreshAction::Schedule(VT_REARM_INTERVAL),
             ),
@@ -3922,32 +3841,6 @@ mod tests {
             assert_eq!(authoritative_refresh_action(due, result), expected);
         }
     }
-
-    #[cfg(unix)]
-    #[test]
-    fn capture_worker_keeps_retirement_distinct_from_recoverable_failure() {
-        use crate::tmux::vt::VtLifecycle;
-
-        assert_eq!(
-            vt_lifecycle_action(Some(VtLifecycle::Retired)),
-            VtLifecycleAction::CaptureOnly,
-            "resize, drift, and shared-viewer retirements must latch capture-only",
-        );
-        assert_eq!(
-            vt_lifecycle_action(Some(VtLifecycle::Failed)),
-            VtLifecycleAction::Recover,
-            "a disconnected forwarder must retain automatic recovery",
-        );
-        assert_eq!(
-            vt_lifecycle_action(Some(VtLifecycle::Live)),
-            VtLifecycleAction::None,
-        );
-        assert!(capture_worker_observes_osc52(true, true, false, true));
-        assert!(capture_worker_observes_osc52(false, false, true, true));
-        assert!(!capture_worker_observes_osc52(true, false, false, true));
-        assert!(!capture_worker_observes_osc52(true, true, false, false));
-    }
-
     #[test]
     fn publish_floor_first_change_after_quiet_publishes_immediately() {
         // The typed-echo case: no prior publish (or one long past) must never
