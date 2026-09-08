@@ -9,6 +9,7 @@
 //! 3. Add it to the `MIGRATIONS` array below
 
 pub mod progress;
+mod store_fs;
 mod v001_xdg_linux;
 mod v002_seed_sandbox_from_volumes;
 mod v003_yolo_mode_config;

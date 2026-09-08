@@ -31,18 +31,23 @@ fn defer_requested_by(value: Option<&std::ffi::OsStr>) -> bool {
     value.is_some_and(|value| !value.is_empty())
 }
 
-/// Files and bytes copied by one store move, for the progress line. Per move
-/// rather than process-wide: per-root cohort locks let moves copy at the same
-/// time, each reporting to the reporter installed on its own thread (#3777).
+/// What one store move carries between entries: the progress counters, and
+/// whether this filesystem pair has already refused a copy-on-write clone.
+/// Per move rather than process-wide: per-root cohort locks let moves copy at
+/// the same time, each reporting to the reporter installed on its own thread
+/// (#3777).
 #[derive(Default)]
-struct CopyProgress {
+struct CopyState {
     files: u64,
     bytes: u64,
+    /// Only the Unix copy path clones; the portable fallback uses `fs::copy`.
+    #[cfg(unix)]
+    clone: super::store_fs::CloneSupport,
 }
 
-impl CopyProgress {
-    /// One regular file copied. Reports every 100 files so a large store shows
-    /// movement without flooding the reporter.
+impl CopyState {
+    /// One regular file copied or cloned. Reports every 100 files so a large
+    /// store shows movement without flooding the reporter.
     fn copied_file(&mut self, bytes: u64) {
         self.files += 1;
         self.bytes += bytes;
@@ -933,19 +938,11 @@ fn run_pass(
                 orphan_blocked_roots.insert(root.clone());
                 continue;
             }
-            progress::step(format!("copying unregistered store {}", source.display()));
+            progress::step(format!("moving unregistered store {}", source.display()));
             if gated_roots.insert(root.clone()) {
                 copy_gate(root);
             }
-            publish_store(
-                &source,
-                &destination_parent.join(orphan),
-                excluded_by_root
-                    .get(root)
-                    .context("missing orphan cleanup-root exclusions")?,
-                Some(root),
-                false,
-            )?;
+            relocate_store(&source, &destination_parent.join(orphan))?;
             orphan_ready_ids.insert((root.clone(), id.into_owned()));
         }
     }
@@ -1189,7 +1186,21 @@ fn run_pass(
             });
         if !defer_source_retirement && !blocked_roots.contains(root) && all_ready {
             progress::step(format!("retiring shared agent store {}", root.display()));
-            retire_legacy(root)?;
+            if private_roots.contains(root) {
+                let replicated = excluded_by_root
+                    .get(root)
+                    .context("missing cleanup-root exclusions")?;
+                if let Some(kept) = retire_legacy_children(root, replicated)? {
+                    progress::notice(format!(
+                        "Kept {}: it holds shared agent state (other sessions' history, caches, logs) \
+                         that is not per-session, so no private store received a copy of it. Nothing \
+                         was deleted; remove it yourself when you no longer want it.",
+                        kept.display()
+                    ));
+                }
+            } else {
+                retire_legacy(root)?;
+            }
         } else {
             pending.push(root.to_string_lossy().into_owned());
         }
@@ -1571,48 +1582,60 @@ fn publish_store(
             return Err(error).with_context(|| format!("inspecting {}", source.display()))
         }
     };
-    let layout_root = parent.parent().context("private layout has no parent")?;
-    fs::create_dir_all(layout_root)?;
-    let anchored_parent = crate::session::AnchoredDir::create(parent)?;
-    fs::File::open(layout_root)?.sync_all()?;
-    let leaf = destination
-        .file_name()
-        .context("private store has no leaf")?;
-    let stage_leaf = format!(".v027-stage-{}", leaf.to_string_lossy());
-    let stage = anchored_parent.path().join(&stage_leaf);
-    let quarantine_leaf = format!(".v027-quarantine-{}", leaf.to_string_lossy());
-    let quarantine = anchored_parent.path().join(&quarantine_leaf);
-    remove_tree_no_links(&stage)?;
-    remove_tree_no_links(&quarantine)?;
+    let publication = Publication::prepare(destination)?;
     if !source_exists {
-        anchored_parent.ensure_dir(Path::new(leaf))?;
+        publication.anchored_parent.ensure_dir(Path::new(
+            destination
+                .file_name()
+                .context("private store has no leaf")?,
+        ))?;
         fs::File::open(parent)?.sync_all()?;
         return Ok(());
     }
-    fs::create_dir(&stage)?;
-    let mut copied = CopyProgress::default();
+    let stage = &publication.stage;
+    fs::create_dir(stage)?;
+    let mut copied = CopyState::default();
     copy_tree_no_links(
         source,
-        &stage,
+        stage,
         exclude_source_children.then_some(excluded_root_children),
+        false,
         false,
         &mut copied,
     )?;
     if let Some(overlay) = overlay_shared_root {
+        // Files only. The overlay folds a shared agent home into a session
+        // that already has a private one of its own, so what it has to carry
+        // is the credentials, config and state files that home kept at its
+        // root. Its directories are the shared home's own accumulation:
+        // conversation history belonging to other sessions, caches, logs and
+        // plugin trees. Replicating those per session is what turned a 17 MB
+        // legacy store into a 252 MB private one, and none of it is the
+        // single-instance lock this migration exists to unshare (#3819). What
+        // is not folded in is not deleted either: `retire_legacy_children`
+        // leaves the shared root holding it.
         copy_tree_no_links(
             overlay,
-            &stage,
+            stage,
             Some(excluded_root_children),
+            true,
             true,
             &mut copied,
         )?;
     }
-    fs::set_permissions(&stage, fs::symlink_metadata(source)?.permissions())?;
-    sync_tree(&stage)?;
+    fs::set_permissions(stage, fs::symlink_metadata(source)?.permissions())?;
+    sync_tree(stage)?;
+    // One barrier for the whole tree, in place of a full drive flush per
+    // file. Everything above reached the drive as it was written; this orders
+    // all of it ahead of the rename below, so a crash can lose the publish
+    // but cannot expose a published store whose bytes never reached the
+    // media. The parent sync after the rename is what makes the publish
+    // itself durable.
+    super::store_fs::barrier(&fs::File::open(stage)?)?;
 
     let destination_exists = match fs::symlink_metadata(destination) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
-            remove_tree_no_links(&stage)?;
+            remove_tree_no_links(stage)?;
             bail!("v027 destination is a symlink: {}", destination.display());
         }
         Ok(_) => true,
@@ -1622,11 +1645,94 @@ fn publish_store(
         }
     };
     if destination_exists {
-        fs::rename(destination, &quarantine)?;
+        fs::rename(destination, &publication.quarantine)?;
     }
-    fs::rename(&stage, destination)?;
+    fs::rename(stage, destination)?;
     fs::File::open(parent)?.sync_all()?;
-    remove_tree_no_links(&quarantine)?;
+    remove_tree_no_links(&publication.quarantine)?;
+    fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+/// The staging and quarantine paths one destination publishes through, with
+/// whatever an interrupted pass left at them already removed.
+///
+/// Shared by the copy and the rename so both publish through the same
+/// artifacts and both clear the same debris: a killed `aoe migrate` leaves a
+/// half-written `.v027-stage-<id>` behind, and the pass that picks the store
+/// up again must not build on it or leave it sitting in the private layout.
+struct Publication {
+    anchored_parent: crate::session::AnchoredDir,
+    stage: PathBuf,
+    quarantine: PathBuf,
+}
+
+impl Publication {
+    fn prepare(destination: &Path) -> Result<Self> {
+        let parent = destination
+            .parent()
+            .context("private store has no parent")?;
+        let layout_root = parent.parent().context("private layout has no parent")?;
+        fs::create_dir_all(layout_root)?;
+        let anchored_parent = crate::session::AnchoredDir::create(parent)?;
+        fs::File::open(layout_root)?.sync_all()?;
+        let leaf = destination
+            .file_name()
+            .context("private store has no leaf")?
+            .to_string_lossy()
+            .into_owned();
+        let stage = anchored_parent.path().join(format!(".v027-stage-{leaf}"));
+        let quarantine = anchored_parent
+            .path()
+            .join(format!(".v027-quarantine-{leaf}"));
+        remove_tree_no_links(&stage)?;
+        remove_tree_no_links(&quarantine)?;
+        Ok(Self {
+            anchored_parent,
+            stage,
+            quarantine,
+        })
+    }
+}
+
+/// Move a store that belongs to no session into the private layout.
+///
+/// An unregistered legacy child is nobody's store: no row names it, nothing
+/// will start it, and folding the shared agent home into it buys a dead
+/// session a private copy of live sessions' history. Renaming it preserves it
+/// exactly at the cost of one syscall, where copying it cost a full store
+/// each: an interrupted `aoe migrate` wrote 16 GB across 63 such stores, none
+/// of which resolved to a session (#3819).
+///
+/// The publish protocol is [`publish_store`]'s: stale staging is cleared
+/// first, an existing destination is quarantined, and the parent is synced
+/// around the rename, so a crash leaves either the old destination or the new
+/// one. A rename that cannot reach the destination, across filesystems or
+/// otherwise, falls back to the copy.
+fn relocate_store(source: &Path, destination: &Path) -> Result<()> {
+    let parent = destination
+        .parent()
+        .context("private store has no parent")?;
+    let publication = Publication::prepare(destination)?;
+    match fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!("v027 destination is a symlink: {}", destination.display())
+        }
+        Ok(_) => fs::rename(destination, &publication.quarantine)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspecting {}", destination.display()))
+        }
+    }
+    if let Err(error) = fs::rename(source, destination) {
+        tracing::warn!(
+            "v027 copying {} instead of moving it: {error}",
+            source.display()
+        );
+        return publish_store(source, destination, &BTreeSet::new(), None, false);
+    }
+    fs::File::open(parent)?.sync_all()?;
+    remove_tree_no_links(&publication.quarantine)?;
     fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
@@ -1637,7 +1743,8 @@ fn copy_tree_no_links(
     destination: &Path,
     excluded_children: Option<&BTreeSet<std::ffi::OsString>>,
     overwrite_newer: bool,
-    copied: &mut CopyProgress,
+    files_only: bool,
+    copied: &mut CopyState,
 ) -> Result<()> {
     use nix::fcntl::{open, OFlag};
     use nix::sys::stat::Mode;
@@ -1652,6 +1759,7 @@ fn copy_tree_no_links(
         excluded_children,
         Path::new(""),
         overwrite_newer,
+        files_only,
         copied,
     )
 }
@@ -1663,7 +1771,8 @@ fn copy_tree_from_fd(
     excluded_children: Option<&BTreeSet<std::ffi::OsString>>,
     relative: &Path,
     overwrite_newer: bool,
-    copied: &mut CopyProgress,
+    files_only: bool,
+    copied: &mut CopyState,
 ) -> Result<()> {
     use nix::dir::Dir;
     use nix::fcntl::{openat, readlinkat, AtFlags, OFlag};
@@ -1725,6 +1834,9 @@ fn copy_tree_from_fd(
             continue;
         }
         if kind == nix::libc::S_IFDIR {
+            if files_only {
+                continue;
+            }
             let child = openat(
                 &dir,
                 name,
@@ -1755,6 +1867,7 @@ fn copy_tree_from_fd(
                 None,
                 &relative.join(name),
                 overwrite_newer,
+                false,
                 copied,
             )?;
             if !existed || source_stat_is_newer(&stat, &target)? {
@@ -1792,23 +1905,34 @@ fn copy_tree_from_fd(
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
                 Err(error) => return Err(error.into()),
             };
-            let mut options = fs::OpenOptions::new();
-            options.write(true);
+            // A clone has to create its own destination, so an entry being
+            // replaced is unlinked rather than truncated and both paths take
+            // the same `create_new` route.
             if target_exists {
-                options.truncate(true);
-            } else {
-                options.create_new(true);
+                fs::remove_file(&target)?;
             }
-            let mut output = options.open(&target)?;
-            let bytes = std::io::copy(&mut input, &mut output)?;
-            copied.copied_file(bytes);
-            output.set_permissions(fs::Permissions::from_mode(opened.st_mode as u32))?;
-            futimens(
-                &output,
-                &TimeSpec::new(opened.st_atime, opened.st_atime_nsec),
-                &TimeSpec::new(opened.st_mtime, opened.st_mtime_nsec),
-            )?;
-            output.sync_all()?;
+            let output = match copied.clone.clone_file(&input, &opened, &target) {
+                Some(output) => {
+                    copied.copied_file(opened.st_size.max(0) as u64);
+                    output
+                }
+                None => {
+                    let mut output = fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&target)?;
+                    let bytes = std::io::copy(&mut input, &mut output)?;
+                    copied.copied_file(bytes);
+                    output.set_permissions(fs::Permissions::from_mode(opened.st_mode as u32))?;
+                    futimens(
+                        &output,
+                        &TimeSpec::new(opened.st_atime, opened.st_atime_nsec),
+                        &TimeSpec::new(opened.st_mtime, opened.st_mtime_nsec),
+                    )?;
+                    output
+                }
+            };
+            super::store_fs::sync_to_drive(&output)?;
         }
     }
     Ok(())
@@ -1846,7 +1970,8 @@ fn copy_tree_no_links(
     destination: &Path,
     excluded_children: Option<&BTreeSet<std::ffi::OsString>>,
     overwrite_newer: bool,
-    copied: &mut CopyProgress,
+    files_only: bool,
+    copied: &mut CopyState,
 ) -> Result<()> {
     for entry in fs::read_dir(source)? {
         let entry = entry?;
@@ -1862,13 +1987,16 @@ fn copy_tree_no_links(
         }
         let target = destination.join(entry.file_name());
         if metadata.is_dir() {
+            if files_only {
+                continue;
+            }
             match fs::create_dir(&target) {
                 Ok(()) => {}
                 Err(error)
                     if overwrite_newer && error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(error.into()),
             }
-            copy_tree_no_links(&entry.path(), &target, None, overwrite_newer, copied)?;
+            copy_tree_no_links(&entry.path(), &target, None, overwrite_newer, false, copied)?;
             fs::set_permissions(&target, metadata.permissions())?;
         } else if metadata.is_file() {
             let should_copy = match fs::symlink_metadata(&target) {
@@ -1882,13 +2010,17 @@ fn copy_tree_no_links(
             if should_copy {
                 copied.copied_file(fs::copy(entry.path(), &target)?);
                 fs::set_permissions(&target, metadata.permissions())?;
-                fs::File::open(&target)?.sync_all()?;
+                super::store_fs::sync_to_drive(&fs::File::open(&target)?)?;
             }
         }
     }
     Ok(())
 }
 
+/// Push every directory of the staged tree to the drive. Its regular files
+/// were pushed as they were created; this covers the directory entries that
+/// name them. What makes the whole tree durable is the barrier
+/// [`publish_store`] issues afterwards, not these calls.
 fn sync_tree(path: &Path) -> Result<()> {
     for entry in fs::read_dir(path)? {
         let entry = entry?;
@@ -1897,8 +2029,60 @@ fn sync_tree(path: &Path) -> Result<()> {
             sync_tree(&entry.path())?;
         }
     }
-    fs::File::open(path)?.sync_all()?;
+    super::store_fs::sync_to_drive(&fs::File::open(path)?)?;
     Ok(())
+}
+
+/// Retire a legacy root by removing only what the private stores received.
+///
+/// Every per-instance child moved into the private layout, and every
+/// top-level file was folded into each of them, so both go. The root's other
+/// directories are what [`publish_store`]'s overlay deliberately did not
+/// replicate: other sessions' conversation history, caches, logs and plugin
+/// trees. This is now the only copy of them, so deleting them to reclaim
+/// space would destroy state that belongs to no single session. Returns the
+/// root when anything was kept, so the caller can say where it is.
+///
+/// Each entry is renamed aside before it is removed. A crash here leaves rows
+/// still at their pending generation, and a half-deleted store those rows
+/// would copy back over the published one is the failure that protocol
+/// prevents: an entry is either wholly there or wholly gone.
+fn retire_legacy_children(
+    root: &Path,
+    replicated: &BTreeSet<std::ffi::OsString>,
+) -> Result<Option<PathBuf>> {
+    let mut kept = false;
+    let names: Vec<std::ffi::OsString> = fs::read_dir(root)?
+        .map(|entry| Ok(entry?.file_name()))
+        .collect::<Result<_>>()?;
+    for name in names {
+        let leaf = name.to_string_lossy().into_owned();
+        let path = root.join(&name);
+        let quarantine = root.join(format!(".{leaf}.v027-quarantine"));
+        let metadata = fs::symlink_metadata(&path)?;
+        let stale_quarantine = leaf.starts_with('.') && leaf.ends_with(".v027-quarantine");
+        if stale_quarantine {
+            remove_tree_no_links(&path)?;
+            continue;
+        }
+        if metadata.is_dir()
+            && !metadata.file_type().is_symlink()
+            && !replicated.contains(name.as_os_str())
+        {
+            kept = true;
+            continue;
+        }
+        remove_tree_no_links(&quarantine)?;
+        fs::rename(&path, &quarantine)?;
+        fs::File::open(root)?.sync_all()?;
+        remove_tree_no_links(&quarantine)?;
+        fs::File::open(root)?.sync_all()?;
+    }
+    if !kept {
+        retire_legacy(root)?;
+        return Ok(None);
+    }
+    Ok(Some(root.to_path_buf()))
 }
 
 fn retire_legacy(source: &Path) -> Result<()> {
@@ -3365,7 +3549,7 @@ gemini = "{}"
 
     #[test]
     #[serial_test::serial]
-    fn orphan_store_is_preserved_without_contaminating_a_peer() {
+    fn an_unregistered_store_moves_without_being_expanded() {
         let temp = tempfile::tempdir().unwrap();
         let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
         let app = crate::session::get_app_dir().unwrap();
@@ -3375,9 +3559,11 @@ gemini = "{}"
         let orphan = "2222222222222222";
         fs::create_dir_all(root.join(peer)).unwrap();
         fs::create_dir_all(root.join(orphan)).unwrap();
+        fs::create_dir_all(root.join("sessions")).unwrap();
         fs::write(root.join(peer).join("peer"), b"peer").unwrap();
         fs::write(root.join(orphan).join("orphan"), b"orphan").unwrap();
         fs::write(root.join("common"), b"common").unwrap();
+        fs::write(root.join("sessions").join("other"), b"other").unwrap();
         fs::write(
             app.join("sessions.json"),
             format!(r#"[{{"id":"{peer}","tool":"codex","sandbox_info":{{"enabled":true}}}}]"#),
@@ -3392,19 +3578,106 @@ gemini = "{}"
             b"peer"
         );
         assert_eq!(
+            fs::read(destination.join(peer).join("common")).unwrap(),
+            b"common",
+            "a shared root file still reaches the session that had no copy of it"
+        );
+        assert!(
+            !destination.join(peer).join("sessions").exists(),
+            "another session's history must not be replicated into a private store"
+        );
+        assert_eq!(
+            fs::read(destination.join(orphan).join("orphan")).unwrap(),
+            b"orphan",
+            "a store no session claims is preserved as it was"
+        );
+        assert!(
+            !destination.join(orphan).join("common").exists(),
+            "a store no session claims must not be expanded with the shared root"
+        );
+        assert!(!destination.join(peer).join(orphan).exists());
+        assert!(!root.join(peer).exists());
+        assert!(!root.join(orphan).exists());
+        assert!(!root.join("common").exists());
+        assert_eq!(
+            fs::read(root.join("sessions").join("other")).unwrap(),
+            b"other",
+            "what no private store received is the only copy left, so it stays"
+        );
+    }
+
+    /// The shared root goes when everything in it was replicated, exactly as
+    /// it did before the overlay stopped folding directories in.
+    #[test]
+    #[serial_test::serial]
+    fn a_fully_replicated_shared_root_is_still_retired() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        let home = dirs::home_dir().unwrap();
+        let root = home.join(".codex/sandbox");
+        let peer = "1111111111111111";
+        fs::create_dir_all(root.join(peer)).unwrap();
+        fs::write(root.join(peer).join("peer"), b"peer").unwrap();
+        fs::write(root.join("common"), b"common").unwrap();
+        fs::write(
+            app.join("sessions.json"),
+            format!(r#"[{{"id":"{peer}","tool":"codex","sandbox_info":{{"enabled":true}}}}]"#),
+        )
+        .unwrap();
+
+        run_in(&app, &home, &|_| Ok(false)).unwrap();
+
+        assert_eq!(
+            fs::read(home.join(".codex/sandbox-v2").join(peer).join("common")).unwrap(),
+            b"common"
+        );
+        assert!(!root.exists());
+    }
+
+    /// A killed `aoe migrate` leaves a half-written staging directory in the
+    /// private layout. The pass that picks that store up again must clear it,
+    /// including on the rename path, which never opens the staging directory
+    /// it has to remove.
+    #[test]
+    #[serial_test::serial]
+    fn an_interrupted_stage_is_cleared_when_an_unregistered_store_moves() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        let home = dirs::home_dir().unwrap();
+        let root = home.join(".codex/sandbox");
+        let peer = "1111111111111111";
+        let orphan = "2222222222222222";
+        let destination = home.join(".codex/sandbox-v2");
+        fs::create_dir_all(root.join(peer)).unwrap();
+        fs::create_dir_all(root.join(orphan)).unwrap();
+        fs::write(root.join(orphan).join("orphan"), b"orphan").unwrap();
+        let stage = destination.join(format!(".v027-stage-{orphan}"));
+        fs::create_dir_all(stage.join("half")).unwrap();
+        fs::write(stage.join("half").join("written"), b"partial").unwrap();
+        fs::create_dir_all(destination.join(orphan)).unwrap();
+        fs::write(destination.join(orphan).join("stale"), b"stale").unwrap();
+        fs::write(
+            app.join("sessions.json"),
+            format!(r#"[{{"id":"{peer}","tool":"codex","sandbox_info":{{"enabled":true}}}}]"#),
+        )
+        .unwrap();
+
+        run_in(&app, &home, &|_| Ok(false)).unwrap();
+
+        assert!(!stage.exists(), "the interrupted staging tree must be gone");
+        assert!(!destination
+            .join(format!(".v027-quarantine-{orphan}"))
+            .exists());
+        assert_eq!(
             fs::read(destination.join(orphan).join("orphan")).unwrap(),
             b"orphan"
         );
-        assert_eq!(
-            fs::read(destination.join(peer).join("common")).unwrap(),
-            b"common"
+        assert!(
+            !destination.join(orphan).join("stale").exists(),
+            "the interrupted run's destination must be replaced, not merged into"
         );
-        assert_eq!(
-            fs::read(destination.join(orphan).join("common")).unwrap(),
-            b"common"
-        );
-        assert!(!destination.join(peer).join(orphan).exists());
-        assert!(!root.exists());
     }
 
     /// A registry row shaped like a real `Instance`, so `Storage::update`
