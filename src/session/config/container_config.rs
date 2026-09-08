@@ -659,12 +659,31 @@ fn parse_credential_expires_at(content: &str) -> Option<u64> {
     value.get("claudeAiOauth")?.get("expiresAt")?.as_u64()
 }
 
+/// The furthest `expiresAt` a real token carries. The shared file is writable
+/// from inside every sandbox, so a planted timestamp beyond this would
+/// otherwise outrank every later login for good.
+const CREDENTIAL_EXPIRY_HORIZON: std::time::Duration =
+    std::time::Duration::from_secs(400 * 24 * 60 * 60);
+
+fn plausible_credential_expires_at(content: &str, now_ms: u64) -> Option<u64> {
+    parse_credential_expires_at(content).filter(|expires_at| {
+        *expires_at <= now_ms.saturating_add(CREDENTIAL_EXPIRY_HORIZON.as_millis() as u64)
+    })
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
 /// Decide whether an incoming credential should overwrite the existing one,
 /// based on `expiresAt` timestamps. Returns `true` if the incoming credential
 /// should be written.
 fn should_overwrite_credential(existing_content: &str, incoming_content: &str) -> bool {
-    let existing_exp = parse_credential_expires_at(existing_content);
-    let incoming_exp = parse_credential_expires_at(incoming_content);
+    let now = now_ms();
+    let existing_exp = plausible_credential_expires_at(existing_content, now);
+    let incoming_exp = plausible_credential_expires_at(incoming_content, now);
 
     match (existing_exp, incoming_exp) {
         (Some(existing), Some(incoming)) => incoming > existing,
@@ -746,28 +765,29 @@ fn shared_credential_path(sandbox_dir: &Path, name: &str) -> Option<PathBuf> {
 /// runtime leaves under a file mount). The store is container-writable, so a
 /// link planted there is not followed; the host file is the user's own.
 fn read_credential_file(dir: &Path, name: &str, follow: SymlinkPolicy) -> Option<String> {
-    let content = match follow {
-        SymlinkPolicy::Follow => std::fs::read_to_string(dir.join(name)).ok(),
-        SymlinkPolicy::Never => crate::session::read_file_no_follow(dir, Path::new(name))
-            .ok()
-            .flatten(),
-    };
-    content.filter(|content| !content.trim().is_empty())
+    follow
+        .read(&dir.join(name))
+        .ok()
+        .flatten()
+        .filter(|content| !content.trim().is_empty())
 }
 
 /// Fold the freshest credential into the file every store of this agent
-/// mounts. The store's own copy is left for a container built before the file
-/// was shared, which still reads it; [`remove_shadowed_credential_copies`]
-/// drops it once a container mounting the shared file exists.
+/// mounts. This is a come-up fold rather than a migration because a container
+/// built before the file was shared keeps refreshing its store copy while it
+/// runs, so which copy is freshest is only known at come-up. That copy is left
+/// for such a container; [`remove_shadowed_credential_copies`] drops it once a
+/// container mounting the shared file exists.
 ///
 /// Candidates are the store's private copy (left by the v027 move or by a
 /// login before the file was shared), the host file and the macOS Keychain;
 /// each replaces the current content only when its `expiresAt` is newer, so a
 /// login made inside a container survives a stale host copy and a host
-/// re-login reaches every container at its next start. The file is written in
-/// place: a rename would leave every running container's bind mount on the
-/// old inode. An absent file is created empty-but-valid so the mount has a
-/// source; the agent's own login fills it.
+/// re-login reaches every container at its next start. Only the winner's
+/// `claudeAiOauth` replaces the file's, so what the agent keeps beside it
+/// survives. The file is written in place: a rename would leave every running
+/// container's bind mount on the old inode. An absent file is created
+/// empty-but-valid so the mount has a source; the agent's own login fills it.
 fn sync_shared_credential(
     mount: &AgentConfigMount,
     host_dir: &Path,
@@ -781,7 +801,6 @@ fn sync_shared_credential(
         return Ok(None);
     };
     std::fs::create_dir_all(root)?;
-    let existing = read_credential_file(root, name, SymlinkPolicy::Never);
 
     let mut candidates = Vec::new();
     candidates.extend(read_credential_file(
@@ -801,20 +820,43 @@ fn sync_shared_credential(
         }
     }
 
-    let mut chosen = existing.clone();
-    for candidate in candidates {
-        let fresher = chosen
-            .as_deref()
-            .is_none_or(|current| should_overwrite_credential(current, &candidate));
-        if fresher {
-            chosen = Some(candidate);
+    // The candidates are gathered outside the lock (the Keychain read is a
+    // subprocess); the file is read again under it, right before the write,
+    // so another come-up or a container's own refresh in between is seen.
+    crate::hooks::with_config_lock_policy(&shared, "lock", SymlinkPolicy::Never, || {
+        let existing = read_credential_file(root, name, SymlinkPolicy::Never);
+        let mut winner: Option<&str> = None;
+        for candidate in &candidates {
+            let current = winner.or(existing.as_deref());
+            if current.is_none_or(|current| should_overwrite_credential(current, candidate)) {
+                winner = Some(candidate);
+            }
         }
-    }
-    let chosen = chosen.unwrap_or_else(|| "{}".to_string());
-    if existing.as_deref() != Some(chosen.as_str()) {
-        write_credential_in_place(&shared, &chosen)?;
-    }
+        match (existing.as_deref(), winner) {
+            (None, None) => write_credential_in_place(&shared, "{}"),
+            (_, None) => Ok(()),
+            (existing, Some(winner)) => {
+                write_credential_in_place(&shared, &merge_credential(existing, winner))
+            }
+        }
+    })?;
     Ok(Some(shared))
+}
+
+/// `winner` with everything `existing` held beside `claudeAiOauth` kept, so a
+/// host copy that wins on expiry does not drop what the agent stored in the
+/// file inside a container. Anything that is not two JSON objects is replaced
+/// whole.
+fn merge_credential(existing: Option<&str>, winner: &str) -> String {
+    let parsed = |content: &str| {
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(content).ok()
+    };
+    let merged = existing.and_then(parsed).and_then(|mut merged| {
+        let oauth = parsed(winner)?.remove("claudeAiOauth")?;
+        merged.insert("claudeAiOauth".to_string(), oauth);
+        serde_json::to_string(&merged).ok()
+    });
+    merged.unwrap_or_else(|| winner.to_string())
 }
 
 /// Drop each store's own copy of a credential the container mounts the shared
@@ -851,19 +893,23 @@ pub(crate) fn remove_shadowed_credential_copies(config: &ContainerConfig) {
     }
 }
 
-/// Truncate-and-write, never rename: containers bind-mount this inode.
+/// Write in place, never rename: containers bind-mount this inode. The new
+/// content lands before the old tail is cut, so a concurrent reader never
+/// sees an empty file.
 fn write_credential_in_place(path: &Path, content: &str) -> Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
-        .truncate(true)
+        .truncate(false)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
         .with_context(|| format!("opening shared credential {}", path.display()))?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     file.write_all(content.as_bytes())
+        .and_then(|()| file.set_len(content.len() as u64))
         .with_context(|| format!("writing shared credential {}", path.display()))
 }
 
@@ -4268,6 +4314,27 @@ mod tests {
         format!(r#"{{"claudeAiOauth":{{"expiresAt":{expires_at}}}}}"#)
     }
 
+    #[test]
+    fn an_implausible_expiry_never_outranks_a_real_one() {
+        let far = credential(now_ms() + 2 * CREDENTIAL_EXPIRY_HORIZON.as_millis() as u64);
+        let real = credential(now_ms());
+        assert!(!should_overwrite_credential(&real, &far));
+        assert!(should_overwrite_credential(&far, &real));
+    }
+
+    #[test]
+    fn merge_keeps_what_the_file_held_beside_the_oauth_token() {
+        let existing = r#"{"claudeAiOauth":{"expiresAt":1},"designOauth":{"k":"v"}}"#;
+        let winner = r#"{"claudeAiOauth":{"expiresAt":2}}"#;
+        let merged: serde_json::Value =
+            serde_json::from_str(&merge_credential(Some(existing), winner)).unwrap();
+        assert_eq!(merged["claudeAiOauth"]["expiresAt"], 2);
+        assert_eq!(merged["designOauth"]["k"], "v");
+        assert_eq!(merge_credential(Some("{}"), winner), winner);
+        assert_eq!(merge_credential(Some("not json"), winner), winner);
+        assert_eq!(merge_credential(None, winner), winner);
+    }
+
     /// The Claude mount without its Keychain source, so a developer's own
     /// login never reaches the assertions on macOS.
     fn claude_mount_without_keychain() -> AgentConfigMount {
@@ -4344,8 +4411,9 @@ mod tests {
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
         let host = temp_home.path().join(".claude");
         fs::create_dir_all(&host).unwrap();
-        // Beats any real credential the macOS Keychain contributes.
-        let cred = credential(9_999_999_999_999_999);
+        // Beats any real credential the macOS Keychain contributes while
+        // staying inside the horizon a real token can carry.
+        let cred = credential(now_ms() + 300 * 24 * 60 * 60 * 1000);
         fs::write(host.join(".credentials.json"), &cred).unwrap();
 
         let project_dir = TempDir::new().unwrap();

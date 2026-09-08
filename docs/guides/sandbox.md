@@ -151,6 +151,8 @@ volume_ignores_strategy = "named"
 | `~/.gitconfig` | `/root/.gitconfig` | RO | Git config |
 | `~/.ssh/` | `/root/.ssh/` | RO | SSH keys |
 | `~/.config/opencode/` | `/root/.config/opencode/` | RO | OpenCode config |
+| `<agent config>/sandbox-v2/<instance-id>/` | the agent's config path, e.g. `/root/.claude/` | RW | [Per-session agent store](#per-session-agent-stores) |
+| `~/.claude/sandbox-v2/.credentials.json` | `/root/.claude/.credentials.json` | RW | [Shared Claude Code credential](#shared-credentials) |
 
 ## Environment Variables
 
@@ -357,12 +359,14 @@ macOS, `~/.claude/.credentials.json` elsewhere, and any copy left in the
 session's store by an earlier layout, each taken only when its expiry is later
 than what the file holds. Logging in on the host and starting or restarting
 one sandboxed session re-authenticates all of them; a login made inside a
-container is never overwritten by a staler host copy. A container created
-before this layout mounts only its store, so it is recreated at its next
-start, as it was for the store move; restart any that is still running to put
-it on the shared file too. Running `/logout` inside a sandbox revokes the token
-for every sandbox but cannot remove the mounted file, so the revoked token
-stays there until the next login.
+container is never overwritten by a staler host copy. The host itself stays a
+separate chain: a refresh inside a sandbox still rotates the token the host
+holds, as it did before. A container created before this layout mounts only
+its store, so a stopped one is recreated at its next start, as it was for the
+store move, and a running one refuses to relaunch until it is stopped. Running
+`/logout` inside a sandbox revokes the token for every sandbox but cannot
+remove the mounted file, so the revoked token stays there until the next
+login.
 
 ### Reclaiming stores
 
