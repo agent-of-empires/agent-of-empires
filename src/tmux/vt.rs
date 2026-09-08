@@ -2181,19 +2181,69 @@ pub(crate) struct VtChannel {
     /// so `sample` refreshes at a fraction of `VT_OWNER_TTL` instead of
     /// forking `set-option` every call.
     last_owner_hb: Mutex<Instant>,
-    /// Geometry the parser still has to be rebuilt at, packed by [`pack_size`];
-    /// 0 when its grid describes the pane. tmux reflows on resize while
+    /// The pane's resize bookkeeping; see [`ResizeState`].
+    resize: Mutex<ResizeState>,
+}
+
+/// What the parser still owes the pane after a resize, plus enough about the
+/// resizes themselves to say who owes it and whether anyone is still working.
+///
+/// One lock over all three, because every viewer of the channel shares this
+/// gate and any of them may declare a resize: split across atomics, a
+/// declaration's identity, the resizes still running, and the retirement of an
+/// expectation can be read apart, and one viewer then retires another's
+/// outstanding work (#3817).
+#[derive(Default)]
+struct ResizeState {
+    /// Geometry the parser has to be rebuilt at, packed by [`pack_size`]; 0
+    /// when its grid describes the pane. tmux reflows on resize while
     /// `pipe-pane` carries no reflow redraw, so between the pane changing size
-    /// and the reseed landing the grid renders a layout the pane no longer has.
-    /// A reseed that comes back `Busy` or `Failed` leaves it that way, and the
-    /// channel is shared: this belongs here, not in one viewer's state, or the
-    /// viewers that did not drive the resize keep publishing the stale grid.
-    resync_target: AtomicU64,
-    /// Seqlock over pane resizes: odd while one is in flight, and bumped again
-    /// when it finishes. A geometry probe that straddles a resize describes
-    /// either side of it, so it cannot be trusted to retire the expectation
-    /// that resize declared (see [`VtChannel::observe_pane_geometry`]).
-    resize_seq: AtomicU64,
+    /// and the reseed landing the grid renders a layout the pane no longer
+    /// has. A reseed that comes back `Busy` or `Failed` leaves it that way.
+    target: u64,
+    /// Which declaration installed `target`. Monotonic and never reused, so a
+    /// withdrawal names its own declaration: two viewers resizing to the same
+    /// geometry are two declarations, and the geometry cannot tell them apart.
+    token: u64,
+    /// Resizes still running. A count, not a parity: two overlapping
+    /// declarations must not read as none in flight.
+    in_flight: usize,
+    /// Bumped by every declaration and every resize that finishes, so a probe
+    /// can tell whether any of it moved while the probe was in flight.
+    epoch: u64,
+}
+
+impl ResizeState {
+    /// Install `target` under a fresh identity and return it.
+    fn declare(&mut self, target: u64) -> u64 {
+        self.epoch += 1;
+        self.token += 1;
+        self.target = target;
+        self.token
+    }
+
+    fn begin(&mut self, target: u64) -> u64 {
+        self.in_flight += 1;
+        self.declare(target)
+    }
+
+    fn end(&mut self) {
+        self.epoch += 1;
+        self.in_flight = self.in_flight.saturating_sub(1);
+    }
+
+    /// Whether nothing about the resize state moved since `probe` and nothing
+    /// is moving now, i.e. whatever that probe read still describes the pane.
+    fn settled_since(&self, probe: ResizeObservation) -> bool {
+        self.in_flight == 0 && self.epoch == probe.epoch
+    }
+}
+
+/// The resize state as it stood before a geometry probe, handed back to
+/// [`VtChannel::observe_pane_geometry`] with what the probe read.
+#[derive(Clone, Copy)]
+struct ResizeObservation {
+    epoch: u64,
 }
 
 fn pack_size(cols: u16, rows: u16) -> u64 {
@@ -2234,11 +2284,13 @@ impl VtSample {
     }
 }
 
-/// A pane resize in progress. Holding one marks [`VtChannel::resize_seq`] odd,
-/// so a geometry probe overlapping it knows not to retire the expectation the
-/// resize declared; dropping it closes the window.
+/// A pane resize in progress. Holding one keeps the channel counting a resize
+/// in flight, so a geometry probe overlapping it knows not to retire the
+/// expectation the resize declared; dropping it closes the window.
 pub(crate) struct ResizeInFlight<'a> {
     channel: &'a VtChannel,
+    /// The declaration this resize opened, so [`Self::abandon`] withdraws that
+    /// one and not whatever has since replaced it.
     token: u64,
 }
 
@@ -2252,7 +2304,7 @@ impl ResizeInFlight<'_> {
 
 impl Drop for ResizeInFlight<'_> {
     fn drop(&mut self) {
-        self.channel.resize_seq.fetch_add(1, Ordering::Release);
+        self.channel.resize_state().end();
     }
 }
 
@@ -2584,8 +2636,7 @@ impl VtChannel {
             last_size_check: Mutex::new(Instant::now()),
             pending_drift: Mutex::new(None),
             last_owner_hb: Mutex::new(Instant::now()),
-            resync_target: AtomicU64::new(0),
-            resize_seq: AtomicU64::new(0),
+            resize: Mutex::new(ResizeState::default()),
         })
     }
 
@@ -2633,7 +2684,7 @@ impl VtChannel {
         drop(guard);
         // Before the probe: a resize that starts or finishes while it is in
         // flight makes what it read obsolete.
-        let probe_seq = self.resize_seq();
+        let probe = self.resize_observation();
         let Some((c, r, cx, cy)) = pane_size_cursor(&self.target, deadline) else {
             return;
         };
@@ -2656,7 +2707,7 @@ impl VtChannel {
         drop(p);
         // tmux has just told us the pane's real size, which is what any
         // outstanding resize expectation was a guess at.
-        self.observe_pane_geometry((c, r), probe_seq);
+        self.observe_pane_geometry((c, r), probe);
         let pending = self.pending_drift.lock().ok().and_then(|guard| *guard);
         match reconcile_step((c, r, cx, cy), (gc, gr, gcx, gcy), pending, grid_gen) {
             GridReconcile::InSync => self.clear_drift(),
@@ -2955,14 +3006,19 @@ impl VtChannel {
         result
     }
 
+    /// The channel's resize bookkeeping. Recovers a poisoned lock rather than
+    /// propagating the panic: every field is a counter this module maintains,
+    /// and the gate it drives is display-only.
+    fn resize_state(&self) -> std::sync::MutexGuard<'_, ResizeState> {
+        self.resize.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Declare the geometry the pane is being resized to, before the resize
     /// runs. [`Self::grid_resync_pending`] holds every viewer off the grid from
     /// this moment until the parser is rebuilt at it, so no one can publish a
     /// frame laid out for the size the pane just left.
-    fn expect_grid_size(&self, cols: u16, rows: u16) -> u64 {
-        let target = pack_size(cols, rows);
-        self.resync_target.store(target, Ordering::Relaxed);
-        target
+    fn expect_grid_size(&self, cols: u16, rows: u16) {
+        self.resize_state().declare(pack_size(cols, rows));
     }
 
     /// Open the window in which the pane's size is changing: declare the
@@ -2971,18 +3027,19 @@ impl VtChannel {
     /// concurrent geometry probe can tell that what it read may already be
     /// obsolete.
     pub(crate) fn begin_resize(&self, cols: u16, rows: u16) -> ResizeInFlight<'_> {
-        self.resize_seq.fetch_add(1, Ordering::Release);
-        let token = self.expect_grid_size(cols, rows);
+        let token = self.resize_state().begin(pack_size(cols, rows));
         ResizeInFlight {
             channel: self,
             token,
         }
     }
 
-    /// The resize seqlock, for a caller that is about to read the pane's
-    /// geometry and will hand the value back to [`Self::observe_pane_geometry`].
-    pub(crate) fn resize_seq(&self) -> u64 {
-        self.resize_seq.load(Ordering::Acquire)
+    /// The resize state, for a caller that is about to read the pane's geometry
+    /// and will hand the value back to [`Self::observe_pane_geometry`].
+    fn resize_observation(&self) -> ResizeObservation {
+        ResizeObservation {
+            epoch: self.resize_state().epoch,
+        }
     }
 
     /// Resolve any outstanding expectation against the geometry tmux just
@@ -3002,14 +3059,16 @@ impl VtChannel {
     /// and gating the grid on it would put the channel into a retry loop over
     /// something the same reconcile pass is already fixing.
     ///
-    /// `probe_seq` is [`Self::resize_seq`] read BEFORE the probe. Matching
-    /// dimensions only retire an expectation when no resize overlapped it: one
-    /// viewer's probe can read the pane before another viewer's resize lands
-    /// and come back to a grid that still agrees with it, which says nothing
-    /// about the resize now in flight. Re-aiming is left unguarded because it
-    /// keeps the gate up, which is the safe direction for a stale read.
-    fn observe_pane_geometry(&self, pane: (u16, u16), probe_seq: u64) {
-        if self.resync_target.load(Ordering::Relaxed) == 0 {
+    /// `probe` is [`Self::resize_observation`] read BEFORE the probe. Matching
+    /// dimensions only retire an expectation when nothing about the resize
+    /// state moved across it: one viewer's probe can read the pane before
+    /// another viewer's resize lands and come back to a grid that still agrees
+    /// with it, which says nothing about the resize now in flight. Re-aiming is
+    /// left unguarded because it keeps the gate up, which is the safe direction
+    /// for a stale read.
+    fn observe_pane_geometry(&self, pane: (u16, u16), probe: ResizeObservation) {
+        let mut state = self.resize_state();
+        if state.target == 0 {
             return;
         }
         if pane
@@ -3018,25 +3077,23 @@ impl VtChannel {
                 self.rows.load(Ordering::Relaxed),
             )
         {
-            self.expect_grid_size(pane.0, pane.1);
+            state.declare(pack_size(pane.0, pane.1));
             return;
         }
-        if probe_seq % 2 == 0 && probe_seq == self.resize_seq() {
-            self.clear_resync_target();
+        if state.settled_since(probe) {
+            state.target = 0;
         }
     }
 
     /// Drop an expectation whose resize never happened (the caller turned out
-    /// not to own the pane size). Conditional, so a resize that another viewer
-    /// declared in the meantime is left standing.
+    /// not to own the pane size). Keyed on the declaration's own identity, so a
+    /// resize another viewer declared in the meantime is left standing even
+    /// when it asked for the very same geometry.
     fn abandon_expected_grid(&self, token: u64) {
-        let _ = self
-            .resync_target
-            .compare_exchange(token, 0, Ordering::Relaxed, Ordering::Relaxed);
-    }
-
-    fn clear_resync_target(&self) {
-        self.resync_target.store(0, Ordering::Relaxed);
+        let mut state = self.resize_state();
+        if state.token == token {
+            state.target = 0;
+        }
     }
 
     /// True while the parser has not been rebuilt at the geometry the pane was
@@ -3050,22 +3107,24 @@ impl VtChannel {
     /// The geometry still owed, for a caller that wants to drive the reseed
     /// rather than wait for the periodic reconcile.
     pub(crate) fn pending_resync_target(&self) -> Option<(u16, u16)> {
-        let target = self.resync_target.load(Ordering::Relaxed);
-        if target == 0 {
+        let mut state = self.resize_state();
+        if state.target == 0 {
             return None;
         }
-        if target
+        if state.target
             == pack_size(
                 self.cols.load(Ordering::Relaxed),
                 self.rows.load(Ordering::Relaxed),
             )
         {
             // Reached, by whichever path got there: reconcile, another viewer's
-            // resize, or this channel rearming.
-            self.clear_resync_target();
+            // resize, or this channel rearming. Read and cleared under the one
+            // lock, so a declaration landing between the two is not retired by
+            // a decision taken before it existed.
+            state.target = 0;
             return None;
         }
-        Some(((target >> 16) as u16, target as u16))
+        Some(((state.target >> 16) as u16, state.target as u16))
     }
 
     /// Re-read the pane and reconcile the grid with it from a caller that is
@@ -3950,8 +4009,7 @@ mod tests {
             last_size_check: Mutex::new(Instant::now()),
             pending_drift: Mutex::new(None),
             last_owner_hb: Mutex::new(Instant::now()),
-            resync_target: AtomicU64::new(0),
-            resize_seq: AtomicU64::new(0),
+            resize: Mutex::new(ResizeState::default()),
         });
         (ch, lifecycle)
     }
@@ -6365,6 +6423,24 @@ mod tests {
         );
         drop(theirs);
 
+        // Same again with both viewers asking for the SAME geometry (#3817).
+        // An ownership handover is exactly that shape, and the geometry cannot
+        // tell the two declarations apart: the loser's withdrawal must not take
+        // the winner's still-pending resize with it.
+        let mine = ch.begin_resize(100, 30);
+        let theirs = ch.begin_resize(100, 30);
+        mine.abandon();
+        assert_eq!(
+            ch.pending_resync_target(),
+            Some((100, 30)),
+            "an identical declaration is still someone else's"
+        );
+        drop(theirs);
+        assert!(
+            ch.grid_resync_pending(),
+            "and it outlives the resize window"
+        );
+
         // tmux is the authority on whether the grid is behind, and reconcile
         // hands its answer here. A pane that already matches the grid owes
         // nothing: this expectation described a resize tmux refused or clamped,
@@ -6375,19 +6451,19 @@ mod tests {
             ch.cols.load(Ordering::Relaxed),
             ch.rows.load(Ordering::Relaxed),
         );
-        ch.observe_pane_geometry(grid, ch.resize_seq());
+        ch.observe_pane_geometry(grid, ch.resize_observation());
         assert!(!ch.grid_resync_pending(), "an unmet request is dropped");
 
         // With nothing outstanding, a probe opens no gate of its own: ordinary
         // drift is the reseed's job, not this one's.
-        ch.observe_pane_geometry((132, 43), ch.resize_seq());
+        ch.observe_pane_geometry((132, 43), ch.resize_observation());
         assert!(!ch.grid_resync_pending(), "reconcile opens no expectation");
 
         // A pane that disagrees while one IS outstanding is a real divergence:
         // it is re-aimed at tmux's own geometry and holds for as long as the
         // reseed takes, however many attempts that is.
         drop(ch.begin_resize(1, 1));
-        ch.observe_pane_geometry((132, 43), ch.resize_seq());
+        ch.observe_pane_geometry((132, 43), ch.resize_observation());
         assert_eq!(ch.pending_resync_target(), Some((132, 43)));
         for _ in 0..10 {
             // Every failed reseed re-declares the same target; none of them
@@ -6419,11 +6495,11 @@ mod tests {
         // Owner: resize to 100x30 declared, tmux has not applied it yet.
         let in_flight = ch.begin_resize(100, 30);
         // Follower: probe starts here and reads the pane's pre-resize size.
-        let probe_seq = ch.resize_seq();
+        let probe = ch.resize_observation();
         // Owner: tmux applies the resize, the reseed fails, the window closes.
         drop(in_flight);
 
-        ch.observe_pane_geometry(settled, probe_seq);
+        ch.observe_pane_geometry(settled, probe);
         assert_eq!(
             ch.pending_resync_target(),
             Some((100, 30)),
@@ -6432,15 +6508,51 @@ mod tests {
 
         // A probe taken wholly inside the window is no better.
         let in_flight = ch.begin_resize(100, 30);
-        let probe_seq = ch.resize_seq();
-        ch.observe_pane_geometry(settled, probe_seq);
+        let probe = ch.resize_observation();
+        ch.observe_pane_geometry(settled, probe);
         assert!(ch.grid_resync_pending(), "nor one taken mid-resize");
         drop(in_flight);
 
+        // Nor one taken while TWO viewers are resizing (#3817). An ownership
+        // handover leaves the old caller's declaration open while the new
+        // owner opens its own, and counting resizes by parity reads that pair
+        // as quiescent: the follower would retire an expectation with both
+        // resizes still running and go straight back to the old layout.
+        let old_owner = ch.begin_resize(100, 30);
+        let new_owner = ch.begin_resize(100, 30);
+        let probe = ch.resize_observation();
+        ch.observe_pane_geometry(settled, probe);
+        assert!(
+            ch.grid_resync_pending(),
+            "overlapping resizes must not read as none in flight"
+        );
+        // The new owner's resize lands, its reseed comes back Busy, and the old
+        // caller then loses the ownership check and withdraws. Both resize
+        // windows are closed now, but the grid is still laid out for the size
+        // the pane left, so every follower stays gated: the withdrawal names
+        // the old caller's own declaration, not the identical live one.
+        drop(new_owner);
+        old_owner.abandon();
+        let probe = ch.resize_observation();
+        ch.observe_pane_geometry((100, 30), probe);
+        assert_eq!(
+            ch.pending_resync_target(),
+            Some((100, 30)),
+            "a follower stays gated while the reseed still owes the geometry"
+        );
+        // The retry lands and the gate opens for every viewer.
+        ch.cols.store(100, Ordering::Relaxed);
+        ch.rows.store(30, Ordering::Relaxed);
+        assert!(
+            !ch.grid_resync_pending(),
+            "a landed reseed resumes the grid"
+        );
+
         // A probe with no resize anywhere near it is the case that may retire
         // an expectation, and still does.
-        let probe_seq = ch.resize_seq();
-        ch.observe_pane_geometry(settled, probe_seq);
+        ch.expect_grid_size(80, 24);
+        let probe = ch.resize_observation();
+        ch.observe_pane_geometry((100, 30), probe);
         assert!(
             !ch.grid_resync_pending(),
             "a quiescent probe still resolves a request the pane never took"
