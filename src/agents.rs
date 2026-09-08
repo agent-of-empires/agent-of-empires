@@ -1472,6 +1472,60 @@ pub const AGENTS: &[AgentDef] = &[
         permission_response: None,
         lifecycle: AgentLifecycle::Active,
     },
+    AgentDef {
+        name: "dsh",
+        // DeepSeek Harness `dsh` (deepseek-ai/deepseek-harness). Headless and
+        // ACP profiles both come from a single binary; the launcher wires the
+        // chosen profile through `--profile headless|acp`. ACP surface ships
+        // upstream in `packages/acp` and is reached by `pnpm dsh --profile acp`
+        // (or `npx --yes @deepseek-ai/dsh --profile acp` from a fresh checkout).
+        oneshot_flag: None,
+        binary: "dsh",
+        launch_subcommand: None,
+        aliases: &["deepseek-harness", "deepseek_harness"],
+        detection: DetectionMethod::Which("dsh"),
+        // Upstream `dsh` models its approval gate on Claude's, but does not
+        // ship a documented CLI flag that bypasses it (`--yolo` /
+        // `--dangerously-skip-permissions` are absent). The deployment-supplied
+        // profile patch (wired in via dsh config + `bin/aoe-runtime`) carries
+        // the permission preset instead, so the AoE side leaves approval
+        // to the patch and treats the agent as `AlwaysYolo` for the `aoe
+        // agents` matrix. Native resume argv and fork argv are also unverified
+        // and stay Unsupported until a verified contract is observed end-to-end.
+        yolo: Some(YoloMode::AlwaysYolo),
+        // `dsh` reads configuration from a YAML profile via `--profile <name>`
+        // and `--patch <file.yml>`; instruction injection rides on a profile
+        // patch, not a CLI flag, so leave `instruction_flag` None.
+        instruction_flag: None,
+        set_default_command: false,
+        // Level 1 stub for hour 1 of R2: appears in `aoe agents`, sessions
+        // launch, status reads Idle from the pane fallback. Level 2/3 status
+        // comes via the `hooks-claude-code` package (dsh runs the Claude Code
+        // hook schema verbatim), wired in hour 2 through `hook_config`; the
+        // pane-stub is intentionally a no-op while that work is outstanding
+        // (per the R2 plan, status comes from hooks or ACP, never from the
+        // stub once hour 2 ships).
+        detect_status: status_detection::detect_hook_only_status,
+        // dsh reads `$DSH_HOME` for session persistence and config; when the
+        // binary runs inside the AoE sandbox image the path must point at the
+        // mounted config volume (set up in `src/session/config/container_config.rs`
+        // via `AgentConfigMount`, hour 3). The host-side path lives under
+        // `$HOME/.dsh`; in-container it is the per-uid mount.
+        container_env: &[],
+        hook_config: None,
+        sidecar_hooks: None,
+        // Resume argv and capture backend are unverified for dsh; leaving
+        // `session_support` absent keeps `aoe session capture` and `aoe
+        // resume` fail-closed until a verified contract is observed.
+        session_support: None,
+        fork_strategy: ForkStrategy::Unsupported,
+        host_only: false,
+        send_keys_enter_delay_ms: 0,
+        ready_marker: None,
+        install_hint: "npm install -g @deepseek-ai/dsh",
+        permission_response: None,
+        lifecycle: AgentLifecycle::Active,
+    },
 ];
 
 /// Look up an agent by canonical name.
@@ -2488,7 +2542,8 @@ mod tests {
                 "antigravity",
                 "kimi",
                 "omp",
-                "prime-agent"
+                "prime-agent",
+                "dsh"
             ]
         );
     }
@@ -2526,6 +2581,9 @@ mod tests {
             resolve_tool_name("prime-agent --mode acp"),
             Some("prime-agent")
         );
+        assert_eq!(resolve_tool_name("dsh"), Some("dsh"));
+        assert_eq!(resolve_tool_name("deepseek-harness"), Some("dsh"));
+        assert_eq!(resolve_tool_name("deepseek_harness"), Some("dsh"));
         assert_eq!(resolve_tool_name("unknown-tool"), None);
     }
 
@@ -2546,6 +2604,7 @@ mod tests {
         assert_eq!(settings_index_from_name(Some("kimi")), 15);
         assert_eq!(settings_index_from_name(Some("omp")), 16);
         assert_eq!(settings_index_from_name(Some("prime-agent")), 17);
+        assert_eq!(settings_index_from_name(Some("dsh")), 18);
 
         assert_eq!(name_from_settings_index(0), None);
         assert_eq!(name_from_settings_index(1), Some("claude"));
@@ -2562,6 +2621,7 @@ mod tests {
         assert_eq!(name_from_settings_index(15), Some("kimi"));
         assert_eq!(name_from_settings_index(16), Some("omp"));
         assert_eq!(name_from_settings_index(17), Some("prime-agent"));
+        assert_eq!(name_from_settings_index(18), Some("dsh"));
         assert_eq!(name_from_settings_index(99), None);
     }
 
@@ -2829,6 +2889,7 @@ mod tests {
                     Context::ManagedExclusiveStore,
                 )),
             ),
+            ("dsh", None),
         ];
         assert_eq!(expected.len(), AGENTS.len());
         for (name, expected) in expected {
