@@ -157,7 +157,7 @@ fn every_runtime_probe(announce: bool) -> impl Fn(&str) -> Result<bool> {
     let probes: Vec<Box<v027::RunningProbe<'static>>> = constructors
         .into_iter()
         .map(|new| {
-            Box::new(v027::batched_running_probe_with(
+            Box::new(presence_probe(
                 move || new().batch_container_states(crate::containers::SANDBOX_NAME_PREFIX),
                 move |id| probe_exists_with(new(), id),
                 announce,
@@ -165,6 +165,29 @@ fn every_runtime_probe(announce: bool) -> impl Fn(&str) -> Result<bool> {
         })
         .collect();
     move |id: &str| any_retained(&probes, id)
+}
+
+/// One runtime's presence answer, batched.
+///
+/// Every listed state counts as present, including `Exited` and `Created`. The
+/// migration's probe reads the same listing for *liveness*, where a stopped
+/// container is `Some(false)` and short-circuits before the fallback; reusing
+/// that here would let an ordinary stopped container read as absent and take
+/// its store with it. Only a container the listing does not mention reaches
+/// the inspect fallback, which is the sole path that can tell "absent" from
+/// "could not be asked".
+fn presence_probe(
+    batch: impl Fn() -> std::collections::HashMap<String, crate::containers::ContainerState>,
+    inspect: impl Fn(&str) -> Result<(bool, bool)>,
+    announce: bool,
+) -> impl Fn(&str) -> Result<bool> {
+    v027::batched_probe_with(
+        batch,
+        |_| Some(true),
+        inspect,
+        "checking which sandbox containers exist",
+        announce,
+    )
 }
 
 /// Retained if any runtime says so. Short-circuits, so a runtime that cannot
@@ -879,6 +902,65 @@ mod tests {
         assert!(
             any_retained(&[angry], "1111111111111111").is_err(),
             "a real fault must fail the pass, not read as quiescent"
+        );
+    }
+
+    /// The batch listing is read for presence, not liveness. A stopped
+    /// container is listed, and the migration's own probe answers `Some(false)`
+    /// for it and short-circuits before the existence fallback; reading the
+    /// listing that way here would let every ordinary stopped container's
+    /// store be reclaimed out from under a restart.
+    ///
+    /// Drives the composed probe with an injected listing rather than a final
+    /// boolean, which is the layer the bug lived in.
+    #[test]
+    fn a_listed_stopped_container_counts_as_present() {
+        use crate::containers::{ContainerState, DockerContainer};
+
+        let id = "2222222222222222";
+        let listed = |state: ContainerState| {
+            let probe = presence_probe(
+                move || {
+                    let mut states = std::collections::HashMap::new();
+                    states.insert(DockerContainer::generate_name(id), state);
+                    states
+                },
+                // Would report the container absent. Reaching it at all for a
+                // listed container is the defect.
+                |_| Ok((false, false)),
+                false,
+            );
+            probe(id).unwrap()
+        };
+
+        for state in [
+            ContainerState::Exited,
+            ContainerState::Created,
+            ContainerState::Dead,
+            ContainerState::Running,
+            ContainerState::Paused,
+            ContainerState::Restarting,
+            ContainerState::Other,
+        ] {
+            v027::refresh_liveness();
+            assert!(listed(state), "{state:?} was read as absent");
+        }
+
+        // Not listed at all: only then does the fallback decide, and it is the
+        // one answer that can distinguish absent from unanswerable.
+        v027::refresh_liveness();
+        let absent = presence_probe(
+            std::collections::HashMap::new,
+            |_| Ok((false, false)),
+            false,
+        );
+        assert!(!absent(id).unwrap());
+        v027::refresh_liveness();
+        let unanswerable =
+            presence_probe(std::collections::HashMap::new, |_| Ok((true, true)), false);
+        assert!(
+            unanswerable(id).unwrap(),
+            "an unreachable runtime must keep the store"
         );
     }
 

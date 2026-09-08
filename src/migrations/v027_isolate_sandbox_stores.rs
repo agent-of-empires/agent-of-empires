@@ -111,6 +111,29 @@ pub(crate) fn batched_running_probe_with(
     inspect: impl Fn(&str) -> Result<(bool, bool)>,
     announce: bool,
 ) -> impl Fn(&str) -> Result<bool> {
+    batched_probe_with(
+        batch,
+        crate::containers::ContainerState::is_live,
+        inspect,
+        "checking which sandbox containers are running",
+        announce,
+    )
+}
+
+/// [`batched_running_probe_with`] over an arbitrary reading of a listed state.
+///
+/// A caller that asks a different question of the same listing reuses the
+/// batching and the fail-closed inspect fallback without changing what the
+/// migration asks. `listed` answers for a state the listing reported; `None`
+/// falls through to `inspect`, which is the only path that can distinguish
+/// "absent" from "could not be asked".
+pub(crate) fn batched_probe_with(
+    batch: impl Fn() -> std::collections::HashMap<String, crate::containers::ContainerState>,
+    listed: impl Fn(crate::containers::ContainerState) -> Option<bool>,
+    inspect: impl Fn(&str) -> Result<(bool, bool)>,
+    step: &'static str,
+    announce: bool,
+) -> impl Fn(&str) -> Result<bool> {
     let snapshot: std::cell::RefCell<
         Option<(
             u64,
@@ -122,7 +145,7 @@ pub(crate) fn batched_running_probe_with(
         let epoch = LIVENESS_EPOCH.with(std::cell::Cell::get);
         let mut snapshot = snapshot.borrow_mut();
         if !matches!(&*snapshot, Some((at, _)) if *at == epoch) {
-            progress::step("checking which sandbox containers are running");
+            progress::step(step);
             *snapshot = Some((epoch, batch()));
         }
         let listed = snapshot
@@ -130,7 +153,7 @@ pub(crate) fn batched_running_probe_with(
             .and_then(|(_, states)| {
                 states.get(&crate::containers::DockerContainer::generate_name(id))
             })
-            .and_then(|state| state.is_live());
+            .and_then(|state| listed(*state));
         drop(snapshot);
         if let Some(live) = listed {
             return Ok(live);
@@ -381,11 +404,13 @@ pub(crate) fn transition_in_flight(app_dir: &Path) -> Result<bool> {
         let Some(rows) = registry.value.as_array() else {
             continue;
         };
-        if rows
-            .iter()
-            .any(|row| transition_paths(row).ok().flatten().is_some())
-        {
-            return Ok(true);
+        // Not `.ok()`: metadata the migration cannot parse is state we cannot
+        // validate, and reading it as "no transition" would let a reclaim run
+        // against a store move it cannot see.
+        for row in rows {
+            if transition_paths(row)?.is_some() {
+                return Ok(true);
+            }
         }
     }
     Ok(false)
@@ -2356,6 +2381,17 @@ mod tests {
         .unwrap();
 
         assert!(transition_in_flight(&app).unwrap());
+
+        // Metadata the migration cannot parse is state it cannot validate, so
+        // it fails rather than reading as "no transition" and letting a
+        // reclaim run against a move it cannot see.
+        fs::write(
+            app.join("sessions.json"),
+            r#"[{"id":"1111111111111111","sandbox_info":{"enabled":true},"sandbox_store_transition_paths":5}]"#,
+        )
+        .unwrap();
+
+        assert!(transition_in_flight(&app).is_err());
     }
 
     /// A machine whose container runtime is absent or unreachable must still
