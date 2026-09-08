@@ -2722,6 +2722,7 @@ mod tests {
     /// (a "still loading" screen can look "settled" long before the agent is
     /// really listening).
     #[test]
+    #[serial_test::serial]
     fn wait_until_ready_blocks_until_the_marker_appears() {
         if !tmux_available() {
             eprintln!("Skipping test: tmux not available");
@@ -2731,6 +2732,8 @@ mod tests {
         let name = guard.name().to_string();
         let temp = tempfile::tempdir().expect("release tempdir");
         let release = temp.path().join("release");
+        let quote =
+            |p: &std::path::Path| format!("'{}'", p.to_string_lossy().replace('\'', r#"'\''"#));
         // The pane holds a screen the generic fallback would accept (over 20
         // characters, unchanging) and prints the marker only once this test
         // creates the release file, so the marker's arrival is caused here
@@ -2739,8 +2742,8 @@ mod tests {
         // `append_pane_base_index_args` so the `^.0` capture target resolves
         // on hosts with `pane-base-index 1` set globally (#488, #2231).
         let script = format!(
-            "echo 'booting, please wait ...'; while [ ! -f '{}' ]; do sleep 0.02; done; echo 'ask anything...'; sleep 30",
-            release.display()
+            "echo 'booting, please wait ...'; until [ -f {} ]; do sleep 0.02; done; echo 'ask anything...'; sleep 30",
+            quote(&release)
         );
         let status = crate::tmux::tmux_command()
             .args([
@@ -2768,53 +2771,58 @@ mod tests {
         refresh_session_cache();
 
         let (returned_tx, returned_rx) = std::sync::mpsc::channel();
-        let waiter_name = name.clone();
-        let waiter = std::thread::spawn(move || {
-            Session::from_name(&waiter_name)
-                .wait_until_ready(std::time::Duration::from_secs(20), Some("ask anything"));
-            let _ = returned_tx.send(());
+        let session = Session::from_name(&name);
+        // Observations are collected, not asserted, inside the scope: the
+        // release below then always runs, so no failure path leaves the waiter
+        // forking against a killed session and the scope's join stays prompt.
+        let (settled, last, premature, early, released) = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                Session::from_name(&name)
+                    .wait_until_ready(std::time::Duration::from_secs(15), Some("ask anything"));
+                let _ = returned_tx.send(());
+            });
+            // Negative claim, so it needs a window: hold the settled markerless
+            // screen across several of the waiter's 200ms polls, which is the
+            // state an early return would key on. Bounded by sample count, not
+            // wall time, so a slow host lengthens the window the waiter has to
+            // survive instead of starving the loop of samples.
+            let mut settled = 0;
+            let mut last: Option<String> = None;
+            let mut premature = None;
+            for _ in 0..12 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let now = session.capture_pane(5).expect("capture pane");
+                if now.to_lowercase().contains("ask anything") {
+                    premature = Some(now.clone());
+                }
+                if now.trim().len() > 20 && last.as_deref() == Some(now.as_str()) {
+                    settled += 1;
+                }
+                last = Some(now);
+            }
+            let early = returned_rx.try_recv();
+            std::fs::write(&release, b"").expect("release the pane");
+            // Far above the ~200ms poll interval the marker path returns on,
+            // far below the waiter's budget, so this separates "the marker
+            // fired" from both "it idled" and "it gave up".
+            let released = returned_rx.recv_timeout(std::time::Duration::from_secs(2));
+            (settled, last, premature, early, released)
         });
 
-        let session = Session::from_name(&name);
-        // Negative claim, so it needs a window: hold the settled markerless
-        // screen past several of the waiter's 200ms polls, which is the state
-        // an early return would key on.
-        let observe_until = std::time::Instant::now() + std::time::Duration::from_millis(1500);
-        let mut settled = 0;
-        let mut last: Option<String> = None;
-        while std::time::Instant::now() < observe_until {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            let now = session.capture_pane(5).unwrap_or_default();
-            assert!(
-                !now.to_lowercase().contains("ask anything"),
-                "the pane printed the marker before the test released it: {now:?}"
-            );
-            if now.trim().len() > 20 && last.as_deref() == Some(now.as_str()) {
-                settled += 1;
-            }
-            last = Some(now);
-        }
+        assert!(
+            premature.is_none(),
+            "the pane printed the marker before the test released it: {premature:?}"
+        );
         assert!(
             settled >= 2,
             "pane never held a screen the settle fallback would accept: {last:?}"
         );
         assert!(
-            matches!(
-                returned_rx.try_recv(),
-                Err(std::sync::mpsc::TryRecvError::Empty)
-            ),
+            matches!(early, Err(std::sync::mpsc::TryRecvError::Empty)),
             "returned on the static screen, before the marker appeared"
         );
-
-        std::fs::write(&release, b"").expect("release the pane");
-        // Well inside the 20s budget, so returning here is the marker firing
-        // rather than the wait giving up.
-        returned_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("did not return once the marker appeared");
-        waiter.join().expect("waiter thread");
+        released.expect("did not return promptly once the marker appeared");
     }
-
     #[test]
     fn chrome_rows_accounts_for_status_bar_and_ignores_splits() {
         // #2766: the reporter's tmux yields a pane one row shorter than the
