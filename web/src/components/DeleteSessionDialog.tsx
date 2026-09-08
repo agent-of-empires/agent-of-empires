@@ -73,11 +73,13 @@ export function DeleteSessionDialog({
       ? `Removes the workspace branch "${branchName}"`
       : `Removes branch "${branchName}"`
     : undefined;
+  // The agent store holds that session's saved agent login and history, and
+  // goes with the container it is mounted into.
   const sandboxDetail = isWorkspaceDelete
     ? sandboxedSessionCount > 0 && sandboxedSessionCount < sessions.length
-      ? `Removes Docker sandbox containers for ${sandboxedSessionCount} sandboxed ${sandboxedSessionLabel} in this workspace`
-      : "Removes Docker sandbox containers for all sessions in this workspace"
-    : "Removes the Docker sandbox container";
+      ? `Removes Docker sandbox containers and agent stores for ${sandboxedSessionCount} sandboxed ${sandboxedSessionLabel} in this workspace`
+      : "Removes Docker sandbox containers and agent stores for all sessions in this workspace"
+    : "Removes the Docker sandbox container and the session's agent store (its saved agent login)";
   const scratchDetail = isWorkspaceDelete
     ? "Leaves scratch directories on disk; session records are still removed"
     : "Leaves the scratch directory on disk; session record is still removed";

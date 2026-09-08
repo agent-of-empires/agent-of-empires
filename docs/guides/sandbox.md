@@ -356,7 +356,7 @@ aoe sandbox reclaim --delete   # remove it
 The report is the default because a store holds a copy of the agent's
 credentials. A store whose container is still running is kept, as is one when
 the container runtime cannot be asked, and the pass refuses to run while a
-store move is still pending.
+store move is in flight.
 
 ## Worktrees and Sandboxing
 

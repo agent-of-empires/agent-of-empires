@@ -14,9 +14,11 @@
 //! - Liveness is v027's judgement, not a second one: a store whose container is
 //!   running, or whose path is not a plain directory, is preserved, and a
 //!   container runtime that cannot answer reads as live.
-//! - The pass runs under v027's transition lock and refuses while that
-//!   migration has work outstanding, so it cannot delete a store `aoe migrate`
-//!   is mid-copy of.
+//! - The pass runs under v027's transition lock and refuses while a store move
+//!   is mid-flight. It cannot see a half-copied store either way: v027 copies
+//!   into `.v027-stage-<id>` and renames, and only a bare 16-hex name is ever a
+//!   candidate here, so a store appears to this pass whole or not at all.
+//!   Widening that name filter would break the guarantee.
 
 use crate::migrations::v027_isolate_sandbox_stores as v027;
 use anyhow::{bail, Context, Result};
@@ -88,7 +90,12 @@ pub fn report() -> Result<Plan> {
     let app_dir = crate::session::get_app_dir()?;
     let home = dirs::home_dir().context("home directory unavailable for store reclaim")?;
     let _lock = guard(&app_dir)?;
-    plan_in(&app_dir, &home, &v027::batched_running_probe(true))
+    plan_in(
+        &app_dir,
+        &also_owned(&app_dir),
+        &home,
+        &v027::batched_running_probe(true),
+    )
 }
 
 /// Remove every store [`report`] would name.
@@ -96,16 +103,38 @@ pub fn reclaim() -> Result<Outcome> {
     let app_dir = crate::session::get_app_dir()?;
     let home = dirs::home_dir().context("home directory unavailable for store reclaim")?;
     let _lock = guard(&app_dir)?;
-    reclaim_in(&app_dir, &home, &v027::batched_running_probe(true))
+    reclaim_in(
+        &app_dir,
+        &also_owned(&app_dir),
+        &home,
+        &v027::batched_running_probe(true),
+    )
 }
 
-/// Hold v027's transition lock for the pass and refuse while that migration
-/// still has work. The lock is exclusive, and `Storage::update` takes it
-/// shared, so no session row can appear or vanish underneath a pass either.
+/// App dirs beyond our own whose sessions still claim a store under these
+/// roots. Debug and release builds keep separate app dirs but share `$HOME`,
+/// and so share the store roots under it: reading only our own registry would
+/// call every session of the other build an orphan and delete its credentials.
+fn also_owned(app_dir: &Path) -> Vec<PathBuf> {
+    crate::session::sibling_namespace_app_dir()
+        .filter(|sibling| sibling != app_dir)
+        .into_iter()
+        .collect()
+}
+
+/// Hold v027's transition lock for the pass and refuse while a store move is
+/// mid-flight. The lock is exclusive, and `Storage::update` takes it shared,
+/// so no session row can appear or vanish underneath a pass either.
+///
+/// A row that is merely still on the shared store does not block the pass: it
+/// owns no private store to reclaim yet, and the one it will own carries its
+/// id, which this pass reads as claimed. Blocking on that instead would refuse
+/// forever on any machine holding an archived or trashed pre-transition
+/// session, since those keep their shared store until they are started again.
 fn guard(app_dir: &Path) -> Result<crate::session::StorageFlock> {
     fs::create_dir_all(app_dir)?;
     let lock = crate::session::acquire_storage_flock(app_dir, v027::LOCK)?;
-    if v027::transition_may_be_pending(app_dir)? {
+    if v027::transition_in_flight(app_dir)? {
         bail!(
             "the sandbox store migration is still moving stores; run `aoe migrate` and try again"
         );
@@ -119,13 +148,16 @@ fn guard(app_dir: &Path) -> Result<crate::session::StorageFlock> {
 /// with no sessions; a registry that exists but cannot be read, parsed, or
 /// understood is a profile whose sessions we cannot see, and treating its
 /// stores as unowned would delete them.
-fn owned_ids(app_dir: &Path) -> Result<BTreeSet<String>> {
-    let paths = registry_paths(app_dir)?;
+fn owned_ids(app_dir: &Path, also: &[PathBuf]) -> Result<BTreeSet<String>> {
+    let mut paths = registry_paths(app_dir)?;
     if paths.is_empty() {
         bail!(
             "no session registry under {}; refusing to treat every agent store as unowned",
             app_dir.display()
         );
+    }
+    for dir in also {
+        paths.extend(registry_paths(dir)?);
     }
     let mut ids = BTreeSet::new();
     for path in paths {
@@ -195,7 +227,7 @@ fn store_roots(app_dir: &Path, home: &Path) -> Result<Vec<PathBuf>> {
         );
     }
     for path in registry_paths(app_dir)? {
-        let profile = profile_of(app_dir, &path);
+        let profile = v027::profile_for_registry(app_dir, &path);
         let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
         for tool in &tools {
             let declared = config.session.agent_config_dir_for(tool, home);
@@ -213,18 +245,13 @@ fn store_roots(app_dir: &Path, home: &Path) -> Result<Vec<PathBuf>> {
     Ok(roots.into_iter().collect())
 }
 
-fn profile_of(app_dir: &Path, registry: &Path) -> String {
-    registry
-        .strip_prefix(app_dir.join("profiles"))
-        .ok()
-        .and_then(|relative| relative.components().next())
-        .and_then(|component| component.as_os_str().to_str())
-        .unwrap_or("")
-        .to_string()
-}
-
-fn plan_in(app_dir: &Path, home: &Path, is_running: &v027::RunningProbe<'_>) -> Result<Plan> {
-    let owned = owned_ids(app_dir)?;
+fn plan_in(
+    app_dir: &Path,
+    also_owned: &[PathBuf],
+    home: &Path,
+    is_running: &v027::RunningProbe<'_>,
+) -> Result<Plan> {
+    let owned = owned_ids(app_dir, also_owned)?;
     let roots = store_roots(app_dir, home)?;
     let mut plan = Plan {
         owners: owned.len(),
@@ -244,7 +271,7 @@ fn plan_in(app_dir: &Path, home: &Path, is_running: &v027::RunningProbe<'_>) -> 
             match classify(&path, &id, is_running)? {
                 Some(reason) => plan.preserved.push((path, reason)),
                 None => {
-                    let bytes = directory_bytes(&path)?;
+                    let bytes = directory_bytes(&path);
                     plan.orphans.push(Orphan { id, path, bytes });
                 }
             }
@@ -272,8 +299,13 @@ fn classify(
     Ok(None)
 }
 
-fn reclaim_in(app_dir: &Path, home: &Path, is_running: &v027::RunningProbe<'_>) -> Result<Outcome> {
-    let plan = plan_in(app_dir, home, is_running)?;
+fn reclaim_in(
+    app_dir: &Path,
+    also_owned: &[PathBuf],
+    home: &Path,
+    is_running: &v027::RunningProbe<'_>,
+) -> Result<Outcome> {
+    let plan = plan_in(app_dir, also_owned, home, is_running)?;
     let mut outcome = Outcome {
         plan,
         ..Outcome::default()
@@ -313,19 +345,21 @@ fn reclaim_in(app_dir: &Path, home: &Path, is_running: &v027::RunningProbe<'_>) 
 
 /// Bytes held by a directory tree, counting symlinks themselves rather than
 /// what they point at.
-fn directory_bytes(root: &Path) -> Result<u64> {
+fn directory_bytes(root: &Path) -> u64 {
     let mut total = 0;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error).with_context(|| format!("reading {}", dir.display())),
+        // Sizing is advisory, so a subtree that cannot be read is counted as
+        // zero rather than failing the report. A store that cannot be read
+        // also cannot be removed, and that failure is reported per store.
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
         };
-        for entry in entries {
-            let entry = entry?;
+        for entry in entries.flatten() {
             // `DirEntry::metadata` does not traverse symlinks.
-            let metadata = entry.metadata()?;
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
             if metadata.is_dir() {
                 stack.push(entry.path());
             } else {
@@ -333,7 +367,7 @@ fn directory_bytes(root: &Path) -> Result<u64> {
             }
         }
     }
-    Ok(total)
+    total
 }
 
 /// Remove the stores of one session being purged.
@@ -378,7 +412,7 @@ pub(crate) fn remove_stores_for(
                 return Err(error).with_context(|| format!("inspecting {}", path.display()))
             }
         }
-        let bytes = directory_bytes(&path).unwrap_or(0);
+        let bytes = directory_bytes(&path);
         fs::remove_dir_all(&path).with_context(|| format!("removing {}", path.display()))?;
         freed += bytes;
         removed.push(path);
@@ -423,7 +457,7 @@ mod tests {
         store(&home, "1111111111111111", 10);
         let orphan = store(&home, "2222222222222222", 40);
 
-        let plan = plan_in(&app, &home, &quiescent).unwrap();
+        let plan = plan_in(&app, &[], &home, &quiescent).unwrap();
 
         assert_eq!(
             plan.orphans.iter().map(|o| &o.path).collect::<Vec<_>>(),
@@ -448,7 +482,7 @@ mod tests {
         .unwrap();
         store(&home, "2222222222222222", 40);
 
-        let plan = plan_in(&app, &home, &quiescent).unwrap();
+        let plan = plan_in(&app, &[], &home, &quiescent).unwrap();
 
         assert!(plan.orphans.is_empty(), "{:?}", plan.orphans);
         assert_eq!(plan.owners, 1);
@@ -466,7 +500,7 @@ mod tests {
 
         for content in [r#"{"not":"an array"}"#, "{", r#"[{"title":"no id"}]"#] {
             fs::write(broken.join("sessions.json"), content).unwrap();
-            let error = plan_in(&app, &home, &quiescent).unwrap_err();
+            let error = plan_in(&app, &[], &home, &quiescent).unwrap_err();
             assert!(
                 error.chain().any(|cause| {
                     let text = cause.to_string();
@@ -485,7 +519,7 @@ mod tests {
         fs::create_dir_all(&app).unwrap();
         store(&home, "2222222222222222", 40);
 
-        let error = plan_in(&app, &home, &quiescent).unwrap_err();
+        let error = plan_in(&app, &[], &home, &quiescent).unwrap_err();
 
         assert!(error.to_string().contains("refusing"), "{error:#}");
     }
@@ -499,7 +533,7 @@ mod tests {
         app_with_rows(&app, &[]);
         let path = store(&home, "2222222222222222", 40);
 
-        let outcome = reclaim_in(&app, &home, &live).unwrap();
+        let outcome = reclaim_in(&app, &[], &home, &live).unwrap();
 
         assert!(outcome.removed.is_empty());
         assert_eq!(
@@ -525,7 +559,7 @@ mod tests {
         let link = root.join("2222222222222222");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        let outcome = reclaim_in(&app, &home, &quiescent).unwrap();
+        let outcome = reclaim_in(&app, &[], &home, &quiescent).unwrap();
 
         assert_eq!(
             outcome.plan.preserved,
@@ -544,12 +578,61 @@ mod tests {
         let kept = store(&home, "1111111111111111", 10);
         let orphan = store(&home, "2222222222222222", 40);
 
-        let outcome = reclaim_in(&app, &home, &quiescent).unwrap();
+        let outcome = reclaim_in(&app, &[], &home, &quiescent).unwrap();
 
         assert!(!orphan.exists());
         assert!(kept.exists());
         assert_eq!(outcome.freed(), 40);
         assert!(outcome.failures.is_empty());
+    }
+
+    #[test]
+    fn a_move_in_flight_blocks_the_pass_but_a_parked_session_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("app");
+        fs::create_dir_all(&app).unwrap();
+        // Archived and trashed rows keep their shared store until they are
+        // started again, so this one is pending for as long as it exists.
+        fs::write(
+            app.join("sessions.json"),
+            r#"[{"id":"1111111111111111","sandbox_info":{"enabled":true},"archived_at":"2026-01-01T00:00:00Z"}]"#,
+        )
+        .unwrap();
+
+        guard(&app).expect("a parked pre-transition session must not block the pass");
+
+        fs::write(
+            app.join("sessions.json"),
+            r#"[{"id":"1111111111111111","sandbox_info":{"enabled":true},"sandbox_store_transition_paths":[{"source":"/a","destination":"/b"}]}]"#,
+        )
+        .unwrap();
+
+        assert!(guard(&app).is_err(), "a move in flight must block the pass");
+    }
+
+    /// Debug and release builds keep separate app dirs but share `$HOME`, so
+    /// a pass that read only its own registry would delete the credentials of
+    /// every session belonging to the other build.
+    #[test]
+    fn a_session_of_the_other_build_namespace_is_not_an_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("app");
+        let sibling = dir.path().join("app-dev");
+        let home = dir.path().join("home");
+        fs::create_dir_all(&app).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        app_with_rows(&app, &[]);
+        fs::write(
+            sibling.join("sessions.json"),
+            r#"[{"id":"2222222222222222"}]"#,
+        )
+        .unwrap();
+        let store = store(&home, "2222222222222222", 40);
+
+        let outcome = reclaim_in(&app, &[sibling], &home, &quiescent).unwrap();
+
+        assert!(outcome.removed.is_empty(), "{:?}", outcome.removed);
+        assert!(store.exists(), "the other build's store was reclaimed");
     }
 
     #[test]
@@ -565,7 +648,7 @@ mod tests {
             .join(".v027-staging");
         fs::create_dir_all(&staging).unwrap();
 
-        let outcome = reclaim_in(&app, &home, &quiescent).unwrap();
+        let outcome = reclaim_in(&app, &[], &home, &quiescent).unwrap();
 
         assert!(staging.exists());
         assert!(outcome.plan.orphans.is_empty());

@@ -339,7 +339,7 @@ fn reconcile_scoped(
     Ok(())
 }
 
-pub(crate) fn transition_may_be_pending(app_dir: &Path) -> Result<bool> {
+fn transition_may_be_pending(app_dir: &Path) -> Result<bool> {
     if app_dir.join(JOURNAL).exists() {
         return Ok(true);
     }
@@ -361,6 +361,30 @@ pub(crate) fn transition_may_be_pending(app_dir: &Path) -> Result<bool> {
                     )
                     || transition_paths(row).ok().flatten().is_some())
         }) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether a row's store move is published but not yet finished, so its
+/// private store is being written.
+///
+/// Narrower than [`transition_may_be_pending`], which also answers yes for a
+/// row merely still on the shared store and for a journal naming a legacy root
+/// not yet retired. A parked row holds both of those for as long as it stays
+/// archived or trashed, so neither ever goes back to `false` and neither can
+/// gate a user-facing command. Both describe the legacy `sandbox` root, which
+/// no reclaim pass reads.
+pub(crate) fn transition_in_flight(app_dir: &Path) -> Result<bool> {
+    for registry in load_registries(app_dir)? {
+        let Some(rows) = registry.value.as_array() else {
+            continue;
+        };
+        if rows
+            .iter()
+            .any(|row| transition_paths(row).ok().flatten().is_some())
+        {
             return Ok(true);
         }
     }
@@ -1527,7 +1551,7 @@ fn load_registries(app_dir: &Path) -> Result<Vec<Registry>> {
     load_registry_paths(registry_paths(app_dir)?)
 }
 
-fn profile_for_registry(app_dir: &Path, path: &Path) -> String {
+pub(crate) fn profile_for_registry(app_dir: &Path, path: &Path) -> String {
     path.strip_prefix(app_dir.join("profiles"))
         .ok()
         .and_then(|relative| relative.components().next())
@@ -2304,6 +2328,34 @@ mod tests {
         }
         assert_eq!(batches.get(), 1, "one listing per pass");
         assert_eq!(*inspected.borrow(), ["removing", "missing"]);
+    }
+
+    /// A parked row keeps its shared store, and the journal keeps naming the
+    /// legacy root it holds, for as long as it stays archived. Neither says a
+    /// private store is being written, so neither may gate `aoe sandbox
+    /// reclaim`, which would otherwise refuse on such a machine forever.
+    #[test]
+    fn only_a_published_transition_counts_as_in_flight() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        fs::create_dir_all(&app).unwrap();
+        fs::write(
+            app.join("sessions.json"),
+            r#"[{"id":"1111111111111111","sandbox_info":{"enabled":true},"archived_at":"2026-01-01T00:00:00Z"}]"#,
+        )
+        .unwrap();
+        fs::write(app.join(JOURNAL), br#"["/home/u/.claude/sandbox"]"#).unwrap();
+
+        assert!(transition_may_be_pending(&app).unwrap());
+        assert!(!transition_in_flight(&app).unwrap());
+
+        fs::write(
+            app.join("sessions.json"),
+            r#"[{"id":"1111111111111111","sandbox_info":{"enabled":true},"sandbox_store_transition_paths":[{"source":"/a","destination":"/b"}]}]"#,
+        )
+        .unwrap();
+
+        assert!(transition_in_flight(&app).unwrap());
     }
 
     /// A machine whose container runtime is absent or unreachable must still

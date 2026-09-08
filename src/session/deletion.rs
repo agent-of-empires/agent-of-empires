@@ -722,8 +722,16 @@ fn perform_deletion_core(
     // container processes.
     if request.delete_sandbox && is_sandboxed {
         tracing::debug!(target: "session.delete", session_id = %request.session_id, stage = "container_remove", "perform_deletion: stage");
-        deletion_messages_for(teardown(&request.instance.id), &mut messages, &mut errors);
-        stage_remove_agent_stores(request, &mut messages, &mut errors);
+        let outcome = teardown(&request.instance.id);
+        // A failed teardown can leave the container live with the store still
+        // bind mounted, and aborts the purge, so the session keeps running on
+        // the store: only remove it once the container is provably gone. One
+        // stranded by a failed purge is the reclaim pass's job.
+        let container_gone = !matches!(outcome, crate::containers::Teardown::Failed(_));
+        deletion_messages_for(outcome, &mut messages, &mut errors);
+        if container_gone {
+            stage_remove_agent_stores(request, &mut messages, &mut errors);
+        }
     }
 
     stage_remove_worktrees_and_branches(
@@ -1735,6 +1743,31 @@ mod tests {
             perform_deletion_with(&request, |_id| Teardown::Removed);
 
             assert!(store.exists());
+        }
+
+        /// A teardown that failed leaves the container, and the purge is
+        /// rolled back, so the session keeps running on the store it still
+        /// has mounted.
+        #[test]
+        #[serial_test::serial]
+        fn a_failed_teardown_leaves_the_store_for_the_reclaim_pass() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+            let request = sandboxed_request();
+            let store = temp
+                .path()
+                .join(".claude")
+                .join("sandbox-v2")
+                .join(&request.instance.id);
+            std::fs::create_dir_all(&store).unwrap();
+            std::fs::write(store.join(".credentials.json"), b"token").unwrap();
+
+            let result = perform_deletion_with(&request, |_id| {
+                Teardown::Failed(crate::containers::error::DockerError::DaemonNotRunning)
+            });
+
+            assert!(store.exists(), "a failed teardown took the store with it");
+            assert!(!result.success);
         }
     }
 

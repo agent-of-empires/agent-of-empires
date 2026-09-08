@@ -324,6 +324,35 @@ pub fn debug_namespace_drift() -> Option<(PathBuf, PathBuf)> {
     }
 }
 
+/// The app dir of the *other* build namespace: the release dir from a debug
+/// build, the dev dir from a release build.
+///
+/// Debug and release builds keep separate app dirs but share `$HOME`, and so
+/// share the agent store roots under it. Anything that decides whether a store
+/// is owned has to read both registries or it will call the other build's
+/// sessions orphans. `None` when the paths cannot be resolved.
+pub(crate) fn sibling_namespace_app_dir() -> Option<PathBuf> {
+    let (xdg, other) = if cfg!(debug_assertions) {
+        ("agent-of-empires", ".agent-of-empires")
+    } else {
+        ("agent-of-empires-dev", ".agent-of-empires-dev")
+    };
+    #[cfg(target_os = "linux")]
+    {
+        let _ = other;
+        xdg_config_base().ok().map(|base| base.join(xdg))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_app_dir(xdg, other)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = xdg;
+        dirs::home_dir().map(|home| home.join(other))
+    }
+}
+
 /// Format the user-facing warning shown when `debug_namespace_drift()`
 /// fires. Shared between the CLI stderr print and the TUI startup popup so
 /// both surfaces say exactly the same thing.
