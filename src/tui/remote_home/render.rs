@@ -9,10 +9,10 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use super::RemoteHomeState;
-use crate::plugin::ui_state::Tone;
-use crate::server::api::sessions::{
+use crate::daemon::{
     ContextResumeAvailability, ContextResumeIndeterminateReason, ContextResumeUnavailableReason,
 };
+use crate::plugin::ui_state::Tone;
 use crate::tui::components::truncate_to_width;
 use crate::tui::plugin_ui;
 use crate::tui::styles::{has_min_contrast, Theme};

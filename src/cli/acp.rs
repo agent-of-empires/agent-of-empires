@@ -1090,7 +1090,7 @@ async fn approve(session: &str, nonce: &str, always: bool, deny: bool) -> Result
     let endpoint = require_daemon().await?;
     let client = HttpClient::new(endpoint)?;
     client
-        .resolve_approval(session, nonce, decision)
+        .resolve_approval(session, nonce, decision, None)
         .await
         .map_err(map_http)?;
     println!("approval {nonce} -> {decision:?}");

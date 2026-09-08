@@ -193,7 +193,7 @@ impl ToolSession {
             bail!("Tool session does not exist: {}", self.name);
         }
 
-        if std::env::var("TMUX").is_ok() {
+        if crate::tmux::utils::inside_tmux() {
             let status = crate::tmux::tmux_command()
                 .args(["switch-client", "-t", &self.name])
                 .status()?;

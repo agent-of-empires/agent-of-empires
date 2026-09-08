@@ -961,6 +961,8 @@ mod tests {
                             diffs: Vec::new(),
                         },
                         destructive: false,
+                        options: Vec::new(),
+                        choice: false,
                         requested_at: Utc::now(),
                         resolved: None,
                     },

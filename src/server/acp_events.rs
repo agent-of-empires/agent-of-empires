@@ -145,10 +145,8 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
         // the "needs approval" notification that the request push raised, so
         // a backgrounded phone or second computer does not keep showing a
         // stale alert for an already-resolved request. See #2491.
-        if matches!(
-            frame.event.as_ref(),
-            crate::acp::state::Event::ApprovalResolved { .. }
-        ) {
+        if let crate::acp::state::Event::ApprovalResolved { decision, .. } = frame.event.as_ref() {
+            record_approval_decision(&state, *decision);
             let state_for_push = state.clone();
             let session_id = frame.session_id.clone();
             let seq = frame.seq;
@@ -466,6 +464,29 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             }
         }
     }
+}
+
+/// Tally a resolved approval for the opt-in telemetry snapshot.
+///
+/// Counted here rather than at the HTTP endpoint because only the
+/// permission handler knows which option the user's answer resolved to:
+/// an answered option list posts an allow-shaped decision whatever the
+/// option means, and a stale option id cancels instead of resolving.
+/// This event carries the decision that actually reached the agent.
+///
+/// `Cancelled` is not a user decision (the daemon-restart sweep and the
+/// stale-option path both emit it), so it counts as nothing; it is
+/// matched explicitly so a new variant is a compile error here.
+fn record_approval_decision(state: &AppState, decision: crate::acp::approvals::ApprovalDecision) {
+    use crate::acp::approvals::ApprovalDecision;
+    use std::sync::atomic::Ordering::Relaxed;
+    let counter = match decision {
+        ApprovalDecision::Allow => &state.telemetry_structured.approvals_allow,
+        ApprovalDecision::AllowAlways => &state.telemetry_structured.approvals_allow_always,
+        ApprovalDecision::Deny => &state.telemetry_structured.approvals_deny,
+        ApprovalDecision::Cancelled => return,
+    };
+    counter.fetch_add(1, Relaxed);
 }
 
 /// Seed each acp-enabled session's `Instance.status` from the most
@@ -950,6 +971,36 @@ mod tests {
     use super::*;
     use crate::acp::protocol::AcpBroadcastFrame;
     use crate::server::test_support;
+
+    /// #3741: the tally follows the decision that reached the agent, and
+    /// a cancellation is not a user decision, so it counts as nothing.
+    /// The endpoint cannot do this itself: an answered option list posts
+    /// an allow-shaped decision whatever the option turns out to mean.
+    #[test]
+    fn approval_tally_counts_the_effective_decision_and_skips_cancellations() {
+        use crate::acp::approvals::ApprovalDecision;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let state = test_support::build_test_app_state(vec![]);
+        let counts = || {
+            let c = &state.telemetry_structured;
+            (
+                c.approvals_allow.load(Relaxed),
+                c.approvals_allow_always.load(Relaxed),
+                c.approvals_deny.load(Relaxed),
+            )
+        };
+        assert_eq!(counts(), (0, 0, 0));
+
+        record_approval_decision(&state, ApprovalDecision::Allow);
+        record_approval_decision(&state, ApprovalDecision::AllowAlways);
+        record_approval_decision(&state, ApprovalDecision::Deny);
+        record_approval_decision(&state, ApprovalDecision::Deny);
+        assert_eq!(counts(), (1, 1, 2));
+
+        record_approval_decision(&state, ApprovalDecision::Cancelled);
+        assert_eq!(counts(), (1, 1, 2), "a cancellation is not a decision");
+    }
 
     /// #3181: the automatic mark's predicate for a structured row, driven off
     /// the live ACP turn-end event. One table rather than a test per case, per
@@ -1782,7 +1833,7 @@ mod tests {
         );
         assert_eq!(
             derive_acp_status(&Event::ApprovalRequested {
-                approval: build_approval(tool_call.clone()),
+                approval: build_approval(tool_call.clone(), Vec::new()),
             }),
             Some(StatusIntent::Set(Status::Waiting))
         );

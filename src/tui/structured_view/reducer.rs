@@ -162,6 +162,12 @@ pub struct PendingApproval {
     pub kind: String,
     pub args: String,
     pub destructive: bool,
+    /// Options the agent offered, kept so the option picker can render
+    /// their labels and submit the chosen `option_id`. See #3741.
+    pub options: Vec<crate::acp::approvals::ApprovalOption>,
+    /// The options carry a question, so `a` opens the option picker
+    /// instead of resolving allow-once.
+    pub choice: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -355,6 +361,8 @@ impl AcpTranscript {
                 kind: a.tool_call.kind,
                 args: a.tool_call.args_preview,
                 destructive: a.destructive,
+                options: a.options,
+                choice: a.choice,
             })
             .collect();
         self.pending_elicitations = state
@@ -441,6 +449,8 @@ mod tests {
             nonce: Nonce(nonce.into()),
             tool_call: tool("t-1", "Edit a file"),
             destructive: true,
+            options: Vec::new(),
+            choice: false,
             requested_at: Utc::now(),
             resolved: None,
         }

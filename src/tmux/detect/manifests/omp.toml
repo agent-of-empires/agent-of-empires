@@ -55,6 +55,7 @@ all = [
   { region = "bottom_non_empty_lines(4)", any = [
     { line_regex = ['(?i)^\s*(?:⎋|\x{f12b7}|esc)\s+\S'] },
     { line_regex = ['(?i)^\s*\S+\s+working(?:…|\.\.\.)'] },
+    { line_regex = ['(?i)^\s*(?:[\x{2800}-\x{28FF}]|[-\\|/])\s+.*\(esc to cancel\)'] },
     { line_regex = ['(?i)^ {2}cancel\s+\S'] },
   ] },
 ]
@@ -77,6 +78,7 @@ all = [
   { region = "above(composer_top, 2)", any = [
     { line_regex = ['(?i)^\s*(?:⎋|\x{f12b7}|esc)\s+\S'] },
     { line_regex = ['(?i)^\s*\S+\s+working(?:…|\.\.\.)'] },
+    { line_regex = ['(?i)^\s*(?:[\x{2800}-\x{28FF}]|[-\\|/])\s+.*\(esc to cancel\)'] },
     { line_regex = ['(?i)^ {2}cancel\s+\S'] },
   ] },
   { region = "after(composer_top)", regex = ['\A(?:[^\S\n]*│[^\n]*│[^\S\n]*\n)+[^\S\n]*╰[─-][^\n]*╯[^\S\n]*\z'] },
@@ -84,6 +86,53 @@ all = [
 not = [
   { line_regex = ['^\s*╭[─-]*\s*(?:⏱|\x{f017}|◷|◴|⌛)\s+'] },
   { line_regex = ['^\s*╭[─-]*\s*\p{Ll}\s+(?:0|[1-9]\d*)[smh]\s+\p{Ll}'] },
+]
+
+# Bottom status rows pair a braille turn timer with a nearby activity hint.
+# Unicode boxed headers belong to active_brand and active_composer.
+[[rules]]
+id = "active_statusline"
+state = "running"
+priority = 960
+positional = true
+region = "bottom_non_empty_lines(3)"
+visible = true
+line_regex = ['^\s*(?:\+[=-]*\s*)?[\x{2800}-\x{28FF}]\s+(?:0|[1-9]\d*)[smh](?:\s|$)']
+all = [
+  { region = "bottom_non_empty_lines(8)", any = [
+    { line_regex = ['(?i)^\s*(?:⎋|\x{f12b7}|esc)\s+\S'] },
+    { line_regex = ['(?i)^\s*\S+\s+working(?:…|\.\.\.)'] },
+    { line_regex = ['(?i)^\s*(?:[\x{2800}-\x{28FF}]|[-\\|/])\s+.*\(esc to cancel\)'] },
+    { line_regex = ['(?i)^ {2}cancel\s+\S'] },
+  ] },
+]
+not = [
+  { line_regex = ['^\s*(?:(?:╭[─-]*|\+[=-]*)\s*)?(?:\x{e0b6}\s+)?(?:⏱|\x{f017}|◷|◴|⌛)\s+'] },
+  # A blocked panel keeps the composer and status row below it; the panel's
+  # own rules must win, so a genuine live dialog silences this rule.
+  # Require the panel's option/cursor structure alongside footer hints so
+  # that quoted or draft footer phrases do not suppress active status.
+  # Live approve/deny panel
+  { region = "bottom_non_empty_lines(12)", all = [
+    { line_regex = ['(?i)^\s*[│|][^\n]*(?:up/down navigate|enter select|esc cancel)'] },
+    { line_regex = ['(?i)^\s*[│|]\s*(?:[\x{276F}\x{f054}>]\s*)?approve\s*[│|]?\s*$'] },
+    { line_regex = ['(?i)^\s*[│|]\s*(?:[\x{276F}\x{f054}>]\s*)?deny\s*[│|]?\s*$'] },
+  ] },
+  # Live plan panel
+  { region = "bottom_non_empty_lines(12)", all = [
+    { line_regex = ['(?i)^\s*[│|][^\n]*(?:tab regions|esc cancel)'] },
+    { line_regex = ['(?i)^\s*[│|]\s*(?:[\x{276F}\x{f054}>]\s*)?approve and execute'] },
+  ] },
+  # Live ask panel
+  { region = "bottom_non_empty_lines(12)", all = [
+    { line_regex = ['(?i)^\s*(?:╭[─-]*|\+[=-]*)\s*ask\b'] },
+    { line_regex = ['^\s*[│|].*[│|]\s*$'], contains_any = [
+      "enter select · n note",
+      "space toggle · enter ",
+      "enter submit · ↑/↓ scroll",
+      "current prompt to answer",
+    ] },
+  ] },
 ]
 
 # Presets without the pi segment expose one bottommost interrupt row.

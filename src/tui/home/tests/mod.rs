@@ -33,6 +33,7 @@ mod permission_response_dialog;
 mod pickers_groups_sort;
 mod post_create_attach_mode;
 mod preview_drag_select;
+mod preview_links;
 mod profile_duplicate_reconciliation;
 mod render_and_save;
 mod right_click_context_menu;
@@ -82,7 +83,15 @@ async fn config_watch_keys_distinguish_global_from_profile_named_global() {
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
     let profile_name = "<global>";
-    let _storage = Storage::new_unwatched(profile_name).unwrap();
+    // `<` and `>` are outside the create grammar, so lay the directory down
+    // directly: a legacy profile of this shape still opens, and that is what
+    // the key must keep apart from the app-wide subscription.
+    let profile_dir = crate::session::get_app_dir()
+        .unwrap()
+        .join("profiles")
+        .join(profile_name);
+    std::fs::create_dir_all(&profile_dir).unwrap();
+    let _storage = Storage::open_unwatched(profile_name).unwrap();
     let tools = AvailableTools::with_tools(&["claude"]);
     let view = HomeView::new(
         Some(profile_name.to_string()),

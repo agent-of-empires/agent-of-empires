@@ -49,7 +49,11 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
     Run without arguments to launch the TUI dashboard."
 )]
 pub struct Cli {
-    /// Profile to use (separate workspace with its own sessions)
+    /// Profile to use (separate workspace with its own sessions). Commands that
+    /// consume or create profile state require an existing profile: an unknown
+    /// name is refused, not created (make one with `aoe profile create`).
+    /// Profile-independent commands such as `list --all` and `serve --stop`
+    /// ignore it
     #[arg(short = 'p', long, global = true, env = "AGENT_OF_EMPIRES_PROFILE")]
     pub profile: Option<String>,
 
