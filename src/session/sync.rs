@@ -400,6 +400,11 @@ fn drain_and_persist_session_ids_inner(
             } else {
                 inst.resume_probe_failed_sid = None;
             }
+            // The transcript path belongs with the id it names. Recording it
+            // here is what makes it durable while the pane is still running:
+            // the sidecar it comes from lives in the host temp directory, and
+            // the only other writer is teardown, which a reboot never reaches.
+            inst.absorb_published_pi_session();
         }
     }
     for rb in &to_rollback {
