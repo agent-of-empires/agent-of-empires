@@ -1569,6 +1569,23 @@ impl SessionService {
         TurnAdmissionError,
     > {
         let guard = self.admit_prompt_submission(caller, id).await?;
+        let dispatch = self
+            .prompt_dispatch_under_submission(id, idle_dormant)
+            .await;
+        Ok((guard, dispatch))
+    }
+
+    /// [`Self::begin_prompt_submission`]'s second half, for a caller that
+    /// already holds the guard. The user prompt handlers claim submission
+    /// authority on entry (before the wake, so `/acp/cancel` cannot overtake
+    /// the prompt it is meant to stop, and so they take the two locks in the
+    /// order [`Self::prompt_submission`] documents) and only then have an
+    /// `idle_dormant` to decide with.
+    pub(crate) async fn prompt_dispatch_under_submission(
+        &self,
+        id: &str,
+        idle_dormant: bool,
+    ) -> crate::acp::dispatch::PromptDispatch {
         let running = self.acp_supervisor.is_running(id).await;
         // Settled here, under the guard, rather than probed by each handler
         // before it claims one: a reconciler park landing between a handler's
@@ -1582,8 +1599,7 @@ impl SessionService {
             idle_dormant,
             rate_limit_exhausted,
         };
-        let dispatch = crate::acp::dispatch::decide(&self.fold_control_state(id).await, liveness);
-        Ok((guard, dispatch))
+        crate::acp::dispatch::decide(&self.fold_control_state(id).await, liveness)
     }
 
     /// Whether the session is parked on the redelivery cap (#3688). Off the
