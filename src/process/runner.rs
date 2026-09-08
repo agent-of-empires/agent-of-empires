@@ -3107,7 +3107,11 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn watchdog_teardown_preserves_replacement_registry_owner() {
-        let _app_dir = crate::session::test_support::isolate_app_dir();
+        // Rooted under /tmp, not $TMPDIR: macOS resolves the latter to
+        // /var/folders/<uid hash>/T/, which leaves the control socket past the
+        // 104-byte sun_path limit once <app_dir>/acp-workers/<id> is appended.
+        let app_root = tempfile::TempDir::with_prefix_in("aoe-wd-", "/tmp").unwrap();
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(app_root.path());
         let session_id = "watchdog-replacement";
         let socket = worker_registry::socket_path_for(session_id).unwrap();
         let control_socket = crate::process::worker::control_socket_sibling(&socket);
