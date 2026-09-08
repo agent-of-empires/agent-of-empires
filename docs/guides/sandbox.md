@@ -16,7 +16,8 @@ Docker sandboxing runs your AI coding agents (Claude Code, OpenCode, Mistral Vib
 
 Agent credentials are seeded from the host config into a private per-session
 sandbox directory, so agents authenticate without re-login. Containers do not
-share a writable agent store.
+share a writable agent store; Claude Code's credential file is the one
+exception, see [Shared credentials](#shared-credentials).
 
 ## CLI vs TUI Behavior
 
@@ -341,6 +342,24 @@ one of them is started or brought back.
 container is still running carries on unaffected, on the shared store. One
 whose container is stopped cannot start until its store has moved, so drop the
 variable or run `aoe migrate` before launching it.
+
+### Shared credentials
+
+Claude Code rotates its refresh token every time it refreshes, and the old
+token stops working. A per-session copy of `.credentials.json` therefore logs
+out as soon as any other copy refreshes, and logging in inside one container
+would fix only that container. So every Claude Code session mounts the one
+`sandbox-v2/.credentials.json` at its config path instead of keeping a copy in
+its store, and a refresh or login in any container is seen by the rest.
+
+Each start folds the freshest credential into that file: the Keychain entry on
+macOS, `~/.claude/.credentials.json` elsewhere, and any copy left in the
+session's store by an earlier layout, each taken only when its expiry is later
+than what the file holds. Logging in on the host and starting or restarting
+one sandboxed session re-authenticates all of them; a login made inside a
+container is never overwritten by a staler host copy. A container created
+before this layout mounts only its store, so it is recreated at its next
+start, as it was for the store move.
 
 ### Reclaiming stores
 

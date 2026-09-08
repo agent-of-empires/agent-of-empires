@@ -201,7 +201,13 @@ impl Instance {
         }
 
         if container.exists()? {
-            if container.sandbox_store_generation_matches()? == Some(false) {
+            let legacy_store = container.sandbox_store_generation_matches()? == Some(false);
+            // Built before its agent shared a credential file, so it mounts
+            // only the store, whose copy the come-up no longer refreshes.
+            let unshared_credentials = !legacy_store
+                && container.shared_credential_mounts_match(&self.build_container_config()?)?
+                    == Some(false);
+            if legacy_store || unshared_credentials {
                 container.remove(false)?;
             } else {
                 // Restart of a stopped container is a come-up: refresh so a
@@ -251,6 +257,7 @@ impl Instance {
         );
         container.remove_stranded_named_ignore_volumes(&self.id, &stranded);
         let container_id = container.create(&config)?;
+        container_config::remove_shadowed_credential_copies(&config);
         self.identity_publisher_launched = config.identity_publisher_installed
             && identity_publisher_dependencies_available(&container)
             && self.hook_session_publisher_allowed_by_argv();
