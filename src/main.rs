@@ -465,6 +465,9 @@ async fn run(
         Some(Commands::Cityhall { command }) => cli::cityhall::run(command),
         Some(Commands::Serve(args)) => cli::serve::run(&profile, args).await,
         Some(Commands::Url(args)) => cli::url::run(args),
+        // After the migration prework: a pending store transition is finished
+        // by then, so the pass is not refused for work `aoe` was about to do.
+        Some(Commands::Sandbox { command }) => cli::sandbox::run(command),
         Some(Commands::Acp { command }) => cli::acp::run(command).await,
         Some(Commands::AcpRunner(args)) => agent_of_empires::process::runner::run(*args).await,
         None => {

@@ -67,6 +67,8 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe project list`↴](#aoe-project-list)
 * [`aoe project add`↴](#aoe-project-add)
 * [`aoe project remove`↴](#aoe-project-remove)
+* [`aoe sandbox`↴](#aoe-sandbox)
+* [`aoe sandbox reclaim`↴](#aoe-sandbox-reclaim)
 * [`aoe worktree`↴](#aoe-worktree)
 * [`aoe worktree list`↴](#aoe-worktree-list)
 * [`aoe worktree info`↴](#aoe-worktree-info)
@@ -149,6 +151,7 @@ Run without arguments to launch the TUI dashboard.
 * `plugin` — Manage plugins (list, info, enable, disable, install, update, uninstall)
 * `profile` — Manage profiles (separate workspaces)
 * `project` — Manage the project registry used by multi-repo session pickers
+* `sandbox` — Inspect and reclaim per-session sandbox agent stores
 * `worktree` — Manage git worktrees for parallel development
 * `tmux` — tmux integration utilities
 * `sounds` — Manage sound effects for agent state transitions
@@ -1103,6 +1106,30 @@ Remove a project from the registry
 
   Possible values: `global`, `profile`
 
+
+
+
+## `aoe sandbox`
+
+Inspect and reclaim per-session sandbox agent stores
+
+**Usage:** `aoe sandbox <COMMAND>`
+
+###### **Subcommands:**
+
+* `reclaim` — Report per-session agent stores whose session no longer exists in any profile, and how much disk they hold. Reports only unless `--delete` is given: each store holds a copy of that agent's credentials
+
+
+
+## `aoe sandbox reclaim`
+
+Report per-session agent stores whose session no longer exists in any profile, and how much disk they hold. Reports only unless `--delete` is given: each store holds a copy of that agent's credentials
+
+**Usage:** `aoe sandbox reclaim [OPTIONS]`
+
+###### **Options:**
+
+* `--delete` — Remove the reported stores instead of only naming them
 
 
 

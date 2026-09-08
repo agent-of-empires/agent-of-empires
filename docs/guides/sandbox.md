@@ -342,6 +342,22 @@ container is still running carries on unaffected, on the shared store. One
 whose container is stopped cannot start until its store has moved, so drop the
 variable or run `aoe migrate` before launching it.
 
+### Reclaiming stores
+
+Permanently deleting a sandboxed session removes its store along with its
+container. Stores stranded before that (or by a delete that kept the container)
+are found by their instance id resolving in no profile:
+
+```bash
+aoe sandbox reclaim            # report what would go, and how much it frees
+aoe sandbox reclaim --delete   # remove it
+```
+
+The report is the default because a store holds a copy of the agent's
+credentials. A store whose container is still running is kept, as is one when
+the container runtime cannot be asked, and the pass refuses to run while a
+store move is still pending.
+
 ## Worktrees and Sandboxing
 
 Git worktrees need the bare repo pattern so the container can reach the repo's git directory. See [Worktrees](worktrees.md#bare-repos).

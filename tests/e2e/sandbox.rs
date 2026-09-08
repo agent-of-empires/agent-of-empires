@@ -100,3 +100,58 @@ fn test_cli_add_sandbox_on_create_hooks_run_in_container() {
         marker
     );
 }
+
+/// `aoe sandbox reclaim` reports the stores whose session resolves in no
+/// profile, and removes them only when asked. The stub `docker` on PATH
+/// answers "not running" for every container, which is the quiescent arm; the
+/// unstubbed runtime fails closed to "live" and would preserve everything.
+#[test]
+#[parallel]
+fn sandbox_reclaim_reports_before_it_removes() {
+    let mut h = TuiTestHarness::new("sandbox_reclaim");
+    h.install_path_command("docker");
+    let project = h.project_path();
+
+    let add = h.run_cli(&["add", project.to_str().unwrap(), "-t", "Reclaim Owner"]);
+    assert!(
+        add.status.success(),
+        "aoe add failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    let registry = crate::harness::app_dir_in(h.home_path()).join("profiles/default/sessions.json");
+    let rows: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&registry).expect("read registry"))
+            .expect("parse registry");
+    let owned_id = rows[0]["id"].as_str().expect("session id").to_string();
+
+    let root = h.home_path().join(".claude").join("sandbox-v2");
+    let owned = root.join(&owned_id);
+    let orphan = root.join("2222222222222222");
+    for store in [&owned, &orphan] {
+        std::fs::create_dir_all(store).expect("create store");
+        std::fs::write(store.join(".credentials.json"), vec![b'x'; 4096]).expect("write store");
+    }
+
+    let report = h.run_cli(&["sandbox", "reclaim"]);
+    assert!(
+        report.status.success(),
+        "aoe sandbox reclaim failed: {}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+    let reported = String::from_utf8_lossy(&report.stdout);
+    assert!(
+        reported.contains("2222222222222222") && !reported.contains(&owned_id),
+        "report should name only the orphan.\nOutput:\n{reported}"
+    );
+    assert!(orphan.exists(), "a bare report must delete nothing");
+
+    let deleted = h.run_cli(&["sandbox", "reclaim", "--delete"]);
+    assert!(
+        deleted.status.success(),
+        "aoe sandbox reclaim --delete failed: {}",
+        String::from_utf8_lossy(&deleted.stderr)
+    );
+    assert!(!orphan.exists(), "the orphaned store was not removed");
+    assert!(owned.exists(), "a claimed store must survive the pass");
+}

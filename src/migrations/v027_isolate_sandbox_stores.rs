@@ -76,7 +76,7 @@ impl CopyState {
 /// `announce` lets the fallback probe say once, per pass, that the runtime
 /// could not be asked; the per-startup reconcile passes `false` so a machine
 /// whose runtime is down is not told the same thing on every command.
-fn batched_running_probe(announce: bool) -> impl Fn(&str) -> Result<bool> {
+pub(crate) fn batched_running_probe(announce: bool) -> impl Fn(&str) -> Result<bool> {
     batched_running_probe_with(
         crate::containers::batch_container_states,
         probe_container_running,
@@ -164,7 +164,7 @@ fn probe_container_running(id: &str) -> Result<(bool, bool)> {
 
 /// Reports whether a migrated row's container is live. See
 /// [`probe_container_running`] for what an unreachable runtime answers.
-type RunningProbe<'a> = dyn Fn(&str) -> Result<bool> + 'a;
+pub(crate) type RunningProbe<'a> = dyn Fn(&str) -> Result<bool> + 'a;
 
 /// Reaps the stopped container of a row whose store has moved. `Ok(false)`
 /// leaves the row pending; see [`reap_migrated_container`].
@@ -339,7 +339,7 @@ fn reconcile_scoped(
     Ok(())
 }
 
-fn transition_may_be_pending(app_dir: &Path) -> Result<bool> {
+pub(crate) fn transition_may_be_pending(app_dir: &Path) -> Result<bool> {
     if app_dir.join(JOURNAL).exists() {
         return Ok(true);
     }
@@ -1536,7 +1536,7 @@ fn profile_for_registry(app_dir: &Path, path: &Path) -> String {
         .to_string()
 }
 
-fn instance_children(root: &Path) -> Result<BTreeSet<std::ffi::OsString>> {
+pub(crate) fn instance_children(root: &Path) -> Result<BTreeSet<std::ffi::OsString>> {
     match fs::symlink_metadata(root) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
         Ok(_) => bail!(

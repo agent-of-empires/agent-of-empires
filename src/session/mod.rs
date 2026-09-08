@@ -27,6 +27,7 @@ pub mod poller;
 pub mod projects;
 pub(crate) mod recovery;
 pub mod restart;
+pub mod sandbox_store_reclaim;
 pub mod scope;
 pub mod scratch;
 pub(crate) mod serde_helpers;
