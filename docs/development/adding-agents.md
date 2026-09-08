@@ -92,7 +92,7 @@ Cursor uses version 1 `.cursor/hooks.json`, with direct command entries under `h
 
 ### Codex (`hooks.json`)
 
-The generic JSON payload above is written to `hooks.json` in Codex's config directory rather than to a settings file. Set `hook_config: Some(AgentHookConfig { settings_rel_path: ".codex/hooks.json", format: HookFormat::CodexJson, ... })`. `codex_hooks_json_path_in()` resolves `CODEX_HOME` or falls back to `~/.codex`. `install_codex_json_hooks()` checks the adjacent `config.toml` feature opt-out before delegating to the generic JSON installer. Empty-event cleanup still removes existing AoE entries while preserving user hooks when the Codex feature is disabled.
+The generic JSON payload above is written to `hooks.json` in Codex's config directory rather than to a settings file. Set `hook_config: Some(AgentHookConfig { settings_rel_path: ".codex/hooks.json", format: HookFormat::CodexJson, ... })`. `codex_hooks_json_path_in()` resolves `CODEX_HOME` or falls back to `~/.codex`. `install_codex_json_hooks()` checks the adjacent `config.toml` feature opt-out before delegating to the generic JSON installer. Empty-event cleanup still removes existing AoE entries while preserving user hooks when the Codex feature is disabled. Codex status weighs the hook write against its manifest rules by declared priority, so a prompt on screen outranks a `running` write.
 
 Host configuration links are supported. Sandbox installation refuses linked or unreadable configuration files without following them; only a genuinely absent configuration retains the default opt-in behavior.
 
