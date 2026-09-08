@@ -64,7 +64,7 @@ impl DaemonEndpoint {
     }
 
     /// Session-list client for this endpoint, carrying the credential as
-    /// resolved now (see [`Self::resolved_token`]).
+    /// resolved now (see `resolved_token`).
     pub fn daemon_client(&self) -> Result<DaemonClient, DaemonClientError> {
         let token = self.resolved_token();
         DaemonClient::new(&self.base_url, token.as_deref())
