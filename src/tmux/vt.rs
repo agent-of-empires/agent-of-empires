@@ -1845,9 +1845,11 @@ fn record_links(slot: &LinkTable, found: Vec<PaneLink>) {
 ///
 /// Only an ACCEPTED seed reaches here, under the parser lock beside the grid it
 /// describes, so the table and the frame it speaks for are installed together.
-/// The reader's half is the mirror of that (see `run_reader`), which is what
+/// The install holds the snapshot fence across all of that, and `run_reader`
+/// holds the same fence from before `recv` through its own parse, which is what
 /// stops a replacement landing between a target being recorded and the label
-/// that needs it reaching the grid (#3818).
+/// that needs it reaching the grid (#3818). The parser lock pairs the table
+/// with its frame; the fence is what orders the two writers.
 fn reconcile_links(slot: &LinkTable, found: Vec<PaneLink>) {
     let Ok(mut table) = slot.table.lock() else {
         return;
@@ -2184,11 +2186,11 @@ pub(crate) struct VtChannel {
 /// What the parser still owes the pane after a resize, plus enough about the
 /// resizes themselves to say who owes it and whether anyone is still working.
 ///
-/// One lock over all three, because every viewer of the channel shares this
-/// gate and any of them may declare a resize: split across atomics, a
-/// declaration's identity, the resizes still running, and the retirement of an
-/// expectation can be read apart, and one viewer then retires another's
-/// outstanding work (#3817).
+/// One lock over the three concerns #3817 named, because every viewer of the
+/// channel shares this gate and any of them may declare a resize: split across
+/// atomics, a declaration's identity, the resizes still running, and the
+/// retirement of an expectation can be read apart, and one viewer then retires
+/// another's outstanding work.
 #[derive(Default)]
 struct ResizeState {
     /// Geometry the parser has to be rebuilt at, packed by [`pack_size`]; 0
@@ -2196,8 +2198,9 @@ struct ResizeState {
     /// `pipe-pane` carries no reflow redraw, so between the pane changing size
     /// and the reseed landing the grid renders a layout the pane no longer
     /// has. A reseed that comes back `Busy` or `Failed` leaves it that way.
-    target: u64,
-    /// Which declaration installed `target`. Monotonic and never reused, so a
+    /// Not `target`, which on [`VtChannel`] is the tmux pane this all describes.
+    owed: u64,
+    /// Which declaration installed `owed`. Monotonic and never reused, so a
     /// withdrawal names its own declaration: two viewers resizing to the same
     /// geometry are two declarations, and the geometry cannot tell them apart.
     token: u64,
@@ -2210,25 +2213,35 @@ struct ResizeState {
 }
 
 impl ResizeState {
-    /// Install `target` under a fresh identity and return it.
-    fn declare(&mut self, target: u64) -> u64 {
+    /// Owe `geometry` under a fresh identity, and return that identity.
+    fn declare(&mut self, geometry: u64) -> u64 {
         self.epoch += 1;
         self.token += 1;
-        self.target = target;
+        self.owed = geometry;
         self.token
     }
 
-    fn begin(&mut self, target: u64) -> u64 {
+    /// Declare `geometry` and open a resize window over it, which stays open
+    /// until the matching [`Self::finish`].
+    fn begin(&mut self, geometry: u64) -> u64 {
         self.in_flight += 1;
-        self.declare(target)
+        self.declare(geometry)
     }
 
     /// Close a resize's window, and withdraw the declaration it opened when
     /// `withdrawn` names it: one caller's resize never ran, so its expectation
-    /// goes with it, while a newer declaration for the same geometry stands.
+    /// goes with it.
+    ///
+    /// Only the last resize standing may withdraw. Naming the declaration is
+    /// enough to protect a NEWER one, which has replaced this token, but not an
+    /// older one still running behind it: two viewers declare before either
+    /// learns who owns the pane size, so the one that declared second can be
+    /// the one that turns out not to own it. Leaving the expectation up is the
+    /// safe direction either way, and a probe retires it a pass later if
+    /// nothing owed it after all.
     fn finish(&mut self, withdrawn: Option<u64>) {
-        if withdrawn == Some(self.token) {
-            self.target = 0;
+        if withdrawn == Some(self.token) && self.in_flight == 1 {
+            self.owed = 0;
         }
         self.epoch += 1;
         self.in_flight -= 1;
@@ -3076,7 +3089,7 @@ impl VtChannel {
     /// for a stale read.
     fn observe_pane_geometry(&self, pane: (u16, u16), probe: ResizeObservation) {
         let mut state = self.resize_state();
-        if state.target == 0 {
+        if state.owed == 0 {
             return;
         }
         if pane
@@ -3089,7 +3102,7 @@ impl VtChannel {
             return;
         }
         if state.settled_since(probe) {
-            state.target = 0;
+            state.owed = 0;
         }
     }
 
@@ -3105,10 +3118,10 @@ impl VtChannel {
     /// rather than wait for the periodic reconcile.
     pub(crate) fn pending_resync_target(&self) -> Option<(u16, u16)> {
         let mut state = self.resize_state();
-        if state.target == 0 {
+        if state.owed == 0 {
             return None;
         }
-        if state.target
+        if state.owed
             == pack_size(
                 self.cols.load(Ordering::Relaxed),
                 self.rows.load(Ordering::Relaxed),
@@ -3118,10 +3131,10 @@ impl VtChannel {
             // resize, or this channel rearming. Read and cleared under the one
             // lock, so a declaration landing between the two is not retired by
             // a decision taken before it existed.
-            state.target = 0;
+            state.owed = 0;
             return None;
         }
-        Some(((state.target >> 16) as u16, state.target as u16))
+        Some(((state.owed >> 16) as u16, state.owed as u16))
     }
 
     /// Re-read the pane and reconcile the grid with it from a caller that is
@@ -5308,16 +5321,16 @@ mod tests {
         )
     }
 
-    /// The seed and the capture fallback both read `capture-pane -e`, and the
-    /// whole fix rests on tmux re-emitting a stored hyperlink there. Assert it
-    /// against a real tmux rather than a hand-built fixture, so a change in how
-    /// tmux serializes hyperlinks fails here instead of silently making every
-    /// preview link inert.
     /// What an accepted seed swap does to the table, without the swap.
     fn record_seed_links(slot: &LinkTable, stream: &[u8]) {
         reconcile_links(slot, crate::tmux::osc8::extract_links(stream));
     }
 
+    /// The seed and the capture fallback both read `capture-pane -e`, and the
+    /// whole fix rests on tmux re-emitting a stored hyperlink there. Assert it
+    /// against a real tmux rather than a hand-built fixture, so a change in how
+    /// tmux serializes hyperlinks fails here instead of silently making every
+    /// preview link inert.
     #[test]
     #[serial_test::serial]
     fn real_tmux_capture_carries_hyperlinks_into_the_link_table() {
@@ -5485,16 +5498,18 @@ mod tests {
     }
 
     /// The install's half of #3818's ordering: it takes the snapshot fence
-    /// before its drain and still holds it when it replaces the link table.
-    /// The reader cannot show this, and the seed's chunk guard would keep
-    /// catching the erase on its own, so a fence narrowed to the drain alone
-    /// would leave `reconcile_links` racing the reader again with nothing red.
+    /// before its drain and still holds it inside the swap, where it replaces
+    /// the link table. The reader cannot show this, and the seed's chunk guard
+    /// would keep catching the erase on its own, so a fence narrowed to either
+    /// side would leave `reconcile_links` racing the reader again with nothing
+    /// red.
     ///
-    /// Deterministic without any waiting: the drain cannot complete until the
-    /// forwarder answers, so the forwarder probes the fence knowing the install
-    /// is parked mid-install.
+    /// Probed at both ends, because one end does not imply the other. The
+    /// forwarder probes during the drain, which cannot complete until it
+    /// answers. The link table is then held so the install parks inside the
+    /// swap, and the parser lock going away is the install arriving there.
     #[test]
-    fn an_install_holds_the_snapshot_fence_across_its_drain() {
+    fn an_install_holds_the_snapshot_fence_across_its_swap() {
         use std::io::Write;
 
         let (_data_reader, data_forwarder) = UnixStream::pair().expect("data pair");
@@ -5519,32 +5534,55 @@ mod tests {
         let app_cursor = AtomicBool::new(false);
         let grid_gen = AtomicU64::new(0);
         let links = LinkTable::default();
-        assert_eq!(
-            install_seeded_parser(
-                SeedSink {
-                    parser: &parser,
-                    app_cursor: &app_cursor,
-                    grid_gen: &grid_gen,
-                    links: &links,
-                },
-                None,
-                b"\x1b]8;;https://example.com/seeded\x1b\\docs\x1b]8;;\x1b\\\r\n",
-                (40, 6),
-                SeedGuard {
-                    chunk: None,
-                    pipe: None,
-                },
-                SeedInstallFence {
-                    snapshot: Some(&snapshot),
-                    socket: Some(&socket),
-                    control: Some(&control),
-                },
-            ),
-            VtRefreshResult::Refreshed,
-        );
+
+        // Park the install inside the swap: `reconcile_links` waits on this.
+        let in_swap = links.table.lock().expect("hold the link table");
+        let (result, fenced_in_swap) = std::thread::scope(|scope| {
+            let install = scope.spawn(|| {
+                install_seeded_parser(
+                    SeedSink {
+                        parser: &parser,
+                        app_cursor: &app_cursor,
+                        grid_gen: &grid_gen,
+                        links: &links,
+                    },
+                    None,
+                    b"\x1b]8;;https://example.com/seeded\x1b\\docs\x1b]8;;\x1b\\\r\n",
+                    (40, 6),
+                    SeedGuard {
+                        chunk: None,
+                        pipe: None,
+                    },
+                    SeedInstallFence {
+                        snapshot: Some(&snapshot),
+                        socket: Some(&socket),
+                        control: Some(&control),
+                    },
+                )
+            });
+            // The install takes the parser lock only inside the swap, so losing
+            // it here is the install past its drain and into the replacement.
+            let arrival = Instant::now() + Duration::from_secs(5);
+            while parser.try_lock().is_ok() {
+                assert!(
+                    Instant::now() < arrival,
+                    "the install never reached the swap"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let fenced = snapshot.try_lock().is_err();
+            drop(in_swap);
+            (install.join().expect("install thread"), fenced)
+        });
+
+        assert_eq!(result, VtRefreshResult::Refreshed);
         assert!(
             forwarder.join().expect("forwarder thread"),
-            "the install must hold the fence from before its drain through the swap"
+            "the install must hold the fence across its drain"
+        );
+        assert!(
+            fenced_in_swap,
+            "and still hold it inside the swap, where the link table is replaced"
         );
         // The accepted snapshot's targets landed with the grid they describe.
         assert_eq!(
@@ -5688,7 +5726,10 @@ mod tests {
         // interleaving #3818 describes, and there is no state in which the
         // target is recorded and its bytes are not yet applied.
         assert!(
-            probed_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            matches!(
+                probed_rx.recv_timeout(Duration::from_millis(200)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
             "the install must not run its drain inside another holder's fence"
         );
         assert_eq!(
@@ -6700,6 +6741,26 @@ mod tests {
             ch.grid_resync_pending(),
             "and it outlives the resize window"
         );
+
+        // The mirror of it: naming the declaration protects a NEWER one, which
+        // has replaced this token, but not an older resize still running behind
+        // it. Both viewers declare before either learns who owns the pane size,
+        // so the one that declared second is as likely to be the one that turns
+        // out not to own it.
+        ch.cols.store(100, Ordering::Relaxed);
+        ch.rows.store(30, Ordering::Relaxed);
+        let owner = ch.begin_resize(132, 43);
+        let follower = ch.begin_resize(132, 43);
+        follower.abandon();
+        assert_eq!(
+            ch.pending_resync_target(),
+            Some((132, 43)),
+            "a live resize still owes its geometry after a later one withdraws"
+        );
+        drop(owner);
+        ch.cols.store(40, Ordering::Relaxed);
+        ch.rows.store(10, Ordering::Relaxed);
+        ch.expect_grid_size(100, 30);
 
         // tmux is the authority on whether the grid is behind, and reconcile
         // hands its answer here. A pane that already matches the grid owes
