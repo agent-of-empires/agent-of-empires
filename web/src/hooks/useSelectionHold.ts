@@ -16,6 +16,11 @@ import type { RefObject } from "react";
 export function useSelectionHold<T>(
   value: T,
   containerRef: RefObject<HTMLElement | null>,
+  /** Fold context that only became reachable after the hold began into the
+   *  held value, so it is frozen from then on like everything else behind the
+   *  hold. Must return null once there is nothing left to fold: each fold
+   *  re-renders, and a callback that always returns a value will not settle. */
+  absorb?: (held: T, next: T) => T | null,
 ): { value: T; held: boolean } {
   const subscribe = useCallback((onChange: () => void) => {
     document.addEventListener("selectionchange", onChange);
@@ -48,6 +53,10 @@ export function useSelectionHold<T>(
     // value, on the path this component is built to keep cheap.
     // eslint-disable-next-line react-hooks/refs
     if (held === null) setHeld({ value: painted.current });
+    else {
+      const absorbed = absorb?.(held.value, value) ?? null;
+      if (absorbed !== null) setHeld({ value: absorbed });
+    }
   } else if (held !== null) {
     setHeld(null);
   }

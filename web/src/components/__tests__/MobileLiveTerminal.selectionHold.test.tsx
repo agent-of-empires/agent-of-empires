@@ -85,6 +85,25 @@ function historyFrame(captured: number): LiveFrame {
   };
 }
 
+/** The same pane once the VT scrollback is FULL: appending a line evicts the
+ *  oldest, so the reported history depth and the captured length both stay
+ *  put while every line shifts up one. */
+function evictedFrame(): LiveFrame {
+  const lines = [];
+  for (let i = 2; i <= 10; i++) lines.push(`h${String(i).padStart(3, "0")}`);
+  lines.push("s1", "s2", "s3", "s4");
+  return {
+    content: lines.join("\n") + "\n",
+    lines,
+    rows: 3,
+    history: 10,
+    cursor: null,
+    altScreen: false,
+    mouse: false,
+    mouseSgr: false,
+  };
+}
+
 function terminal(f: LiveFrame, reading = false) {
   return (
     <MobileLiveTerminal
@@ -198,4 +217,23 @@ it("lets uncaptured scrollback populate under a live selection", () => {
   const text = container.querySelector("[data-live-content]")?.textContent ?? "";
   expect(text).toContain("h001");
   expect(selection.toString()).toBe("s2");
+});
+
+it("holds newly exposed history once the selection can reach it", () => {
+  // Once the VT scrollback is capped and full, a new output line evicts the
+  // oldest: history depth and capture length are unchanged, so the exposed
+  // prefix keeps its row keys while its text shifts by a line. Re-deriving
+  // that prefix per frame would rewrite it under a selection extended into
+  // it, which is the collapse the hold exists to prevent.
+  const { container, rerender } = mount(historyFrame(1));
+  selectRowText("s2");
+  rerender(terminal(historyFrame(1), true));
+  rerender(terminal(historyFrame(10), true));
+
+  // Extend into the history the scroll just exposed.
+  const selection = selectRowText("h005");
+  rerender(terminal(evictedFrame(), true));
+
+  expect(selection.toString()).toBe("h005");
+  expect(container.querySelector("[data-live-content]")?.textContent).toContain("h001");
 });

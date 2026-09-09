@@ -658,27 +658,33 @@ export function MobileLiveTerminal({
   // go, so no row is rewritten out from under the range (see the hook).
   // Everything below renders that held frame; only the stream
   // acknowledgements read `streamFrame`.
-  const { value: heldFrame, held: selectionHeld } = useSelectionHold(streamFrame, scrollerRef);
   // Dragging a selection upward past the top edge scrolls into scrollback,
   // which asks the server for a wider capture window. Holding that response
-  // whole would extend the drag into the blank history spacer instead of the
-  // text it just requested, so newly captured lines ABOVE the held window are
-  // spliced in front of it. They are older scrollback: immutable, and no row
-  // already on screen changes. Keeping the held frame's `history` shrinks the
-  // spacer by exactly the spliced count, so every held row keeps its key
-  // (spacer + line) and its pixel position, and the selection with them.
-  const frame = useMemo(() => {
-    // Reading mode is the only thing that widens the window, and it is also
-    // what mounts every row: outside it the debounced row count lags a
-    // sudden jump in height and virtualization would unmount the selected
-    // row, which is the collapse this whole change exists to prevent.
-    if (!selectionHeld || !reading || !heldFrame || !streamFrame || heldFrame === streamFrame) return heldFrame;
-    const held = frameLines(heldFrame);
-    const next = frameLines(streamFrame);
-    const older = heldFrame.history - held.length - (streamFrame.history - next.length);
-    if (older <= 0) return heldFrame;
-    return { ...heldFrame, lines: next.slice(0, Math.min(older, next.length)).concat(held) };
-  }, [selectionHeld, reading, heldFrame, streamFrame]);
+  // out would extend the drag into the blank history spacer instead of the
+  // text it just requested, so lines newly exposed ABOVE the held window are
+  // folded into the held frame. Folded in, not re-derived per frame: a capped
+  // VT scrollback evicts its oldest line on every append, which slides the
+  // exposed text under unchanged row keys, and re-deriving would rewrite the
+  // very rows the selection was extended onto. Keeping the held frame's
+  // `history` shrinks the spacer by exactly the folded count, so every row
+  // keeps its key and its pixel position; the fold settles because it leaves
+  // nothing older outstanding.
+  const absorbExposedHistory = useCallback(
+    (held: LiveFrame | null, next: LiveFrame | null) => {
+      // Reading mode is the only thing that widens the window, and the only
+      // state that mounts every row: outside it the debounced row count lags
+      // a sudden jump in height and virtualization would unmount the selected
+      // row, the collapse this whole change exists to prevent.
+      if (!reading || !held || !next) return null;
+      const heldLines = frameLines(held);
+      const nextLines = frameLines(next);
+      const older = held.history - heldLines.length - (next.history - nextLines.length);
+      if (older <= 0) return null;
+      return { ...held, lines: nextLines.slice(0, Math.min(older, nextLines.length)).concat(heldLines) };
+    },
+    [reading],
+  );
+  const { value: frame, held: selectionHeld } = useSelectionHold(streamFrame, scrollerRef, absorbExposedHistory);
   const measureRef = useRef<HTMLSpanElement>(null);
   const keyboardLayoutRef = useRef<KeyboardLayoutReader | null>(null);
   useEffect(() => {
