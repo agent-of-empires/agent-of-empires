@@ -767,41 +767,21 @@ mod tests {
         assert!(command.find("printf").unwrap() < command.rfind("exec sh -c").unwrap());
     }
 
-    /// The shim dir, then the caller's `PATH`. Shim first, so the fake `tmux`
-    /// wins over any real one; inherited, so a host whose coreutils sit
-    /// outside the FHS layout still resolves them. `OsString` throughout: a
-    /// `PATH` entry need not be UTF-8.
-    #[cfg(unix)]
-    fn test_path_with_shim(bin: &std::path::Path) -> std::ffi::OsString {
-        // An unset or empty PATH is handled separately: `split_paths("")`
-        // yields one EMPTY entry, and an empty PATH element means the current
-        // directory, so joining it would hand the child `<shim>:` and put cwd
-        // on its PATH.
-        let Some(inherited) = std::env::var_os("PATH").filter(|p| !p.is_empty()) else {
-            return bin.as_os_str().to_os_string();
-        };
-        let entries = std::iter::once(bin.to_path_buf())
-            .chain(std::env::split_paths(&inherited))
-            .collect::<Vec<_>>();
-        std::env::join_paths(entries).expect("PATH entries contain no separator")
-    }
-
-    /// `#[serial]` because this reads the inherited PATH, and every test that
-    /// scrubs PATH process-globally carries that same default-key annotation:
-    /// `crate::acp::node`, `crate::acp::acp_client`, and
-    /// `crate::update::install`.
-    /// Not an `EnvGuard` lock: none of them takes `test_support::ENV_LOCK`, so
-    /// a guard would exclude unrelated guard users and leave this window open.
-    /// A future PATH mutator outside the default serial group would reopen it.
+    /// The shim dir goes first on `PATH` so the fake `tmux` wins over any real
+    /// one, and the inherited entries stay so a host whose coreutils sit
+    /// outside the FHS layout still resolves them. Since #3469 the guard both
+    /// applies that and holds `ENV_LOCK`, so the inherited half cannot be read
+    /// while another test has `PATH` scrubbed; `#[serial]` only ever excluded
+    /// the scrubbers that happened to share its key.
     #[cfg(unix)]
     #[test]
-    #[serial_test::serial]
     fn omp_capture_gate_executes_nested_stdin_scripts() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().unwrap();
         let bin = temp.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
+        let _path = crate::session::test_support::path_prepended(&bin);
         let tmux = bin.join("tmux");
         let expected = format!(
             "{}=launch-unit-123",
@@ -822,7 +802,6 @@ mod tests {
         std::fs::write(&script, outer).unwrap();
         let status = std::process::Command::new("sh")
             .arg(&script)
-            .env("PATH", test_path_with_shim(&bin))
             .env("TMUX_PANE", "%1")
             .status()
             .unwrap();
@@ -844,7 +823,6 @@ mod tests {
         std::fs::write(&script, large_outer).unwrap();
         let status = std::process::Command::new("sh")
             .arg(&script)
-            .env("PATH", test_path_with_shim(&bin))
             .env("TMUX_PANE", "%1")
             .status()
             .unwrap();

@@ -168,6 +168,18 @@ impl EnvGuard {
         guard
     }
 
+    /// Take [`ENV_LOCK`] without mutating anything, for a test that only
+    /// *reads* the process environment and must not observe another guard's
+    /// mutation mid-read. `#[serial]` cannot do that job: it excludes only
+    /// tests sharing its key, which is what left the reads in
+    /// `session::instance::omp` and `tmux::session` open (#3469).
+    pub(crate) fn read_lock() -> Self {
+        Self {
+            prev: Vec::new(),
+            _lock: acquire_env_lock(),
+        }
+    }
+
     fn snapshot(&mut self, key: &'static str) {
         self.prev.push((key, std::env::var_os(key)));
     }
@@ -190,6 +202,25 @@ impl Drop for EnvGuard {
             ENV_LOCK_HELD.with(|held| held.set(false));
         }
     }
+}
+
+/// Put `dir` first on `PATH` for the rest of the scope.
+///
+/// The hand-rolled save/restore pairs this replaces excluded each other by
+/// `#[serial]` key rather than through [`ENV_LOCK`], so a guard user carrying
+/// a different key could read a scrubbed `PATH` mid-test (#3469). They also
+/// restored with `set_var` unconditionally, which leaves an empty `PATH`
+/// behind on a host that inherited none; [`EnvGuard`] removes it instead.
+pub(crate) fn path_prepended(dir: &Path) -> EnvGuard {
+    // An empty `PATH` is dropped rather than split: `split_paths("")` yields
+    // one empty entry, and an empty entry means the current directory, so
+    // keeping it would put the caller's cwd on the test's `PATH`.
+    let inherited = std::env::var_os("PATH").filter(|value| !value.is_empty());
+    let path = std::env::join_paths(
+        std::iter::once(dir.to_path_buf()).chain(inherited.iter().flat_map(std::env::split_paths)),
+    )
+    .expect("join test PATH");
+    EnvGuard::set(&[("PATH", path)])
 }
 
 /// Install a PATH command that remains first after the test pane starts its
@@ -517,6 +548,60 @@ mod tests {
         fn capture(key: &'static str) -> Self {
             Self(key, std::env::var_os(key))
         }
+    }
+
+    /// #3469: [`ENV_LOCK`] must exclude a reader from a peer guard's
+    /// mutation. That is the property a `#[serial]` key could not provide,
+    /// and the reason the process-global `PATH` scrubbers had to move onto
+    /// the guard: a reader carrying one key saw the scrub of a writer
+    /// carrying another.
+    ///
+    /// No `#[serial]` here on purpose. The claim is that the lock alone is
+    /// enough, so an annotation would hide what is being measured.
+    #[test]
+    fn env_lock_excludes_a_reader_from_a_peer_guards_mutation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let ambient = std::env::var_os("PATH");
+        let shim = TempDir::new().unwrap();
+        let scrubbed = AtomicBool::new(false);
+        let releasing = AtomicBool::new(false);
+        let reader_waiting = AtomicBool::new(false);
+
+        // Collected inside the scope, asserted after it joins, so a failure
+        // cannot leave the peer thread running against a dropped guard.
+        let (observed_path, released_first) = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let scrub = path_prepended(shim.path());
+                scrubbed.store(true, Ordering::SeqCst);
+                while !reader_waiting.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+                // Widens the window rather than timing anything: a reader
+                // that waits for the lock reads the restored value however
+                // long this is, so only a reader that does not wait can lose
+                // here. Both observations below stay valid at any duration.
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                releasing.store(true, Ordering::SeqCst);
+                drop(scrub);
+            });
+
+            while !scrubbed.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            reader_waiting.store(true, Ordering::SeqCst);
+            let _read = EnvGuard::read_lock();
+            (std::env::var_os("PATH"), releasing.load(Ordering::SeqCst))
+        });
+
+        assert_eq!(
+            observed_path, ambient,
+            "a peer guard's PATH mutation was visible under ENV_LOCK"
+        );
+        assert!(
+            released_first,
+            "the reader entered ENV_LOCK while a peer guard still held it"
+        );
     }
 
     /// Locks #2751: a non-UTF-8 prior value MUST round-trip through the
