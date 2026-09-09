@@ -71,6 +71,43 @@ describe("MobileTerminalToolbar", () => {
     await waitFor(() => expect(sendData).toHaveBeenCalledWith("\x1b[200~line 1\nline 2\x1b[201~"));
   });
 
+  it("out-of-band sends (Tab and drag-repeat arrows) drop the retained IME shadow", () => {
+    vi.useFakeTimers();
+    try {
+      const sendData = vi.fn();
+      const shadow = document.createElement("textarea");
+      shadow.value = "\u314e"; // retained intermediate syllable
+      const inputElRef = { current: shadow as HTMLTextAreaElement };
+      render(
+        <MobileTerminalToolbar
+          sendData={sendData}
+          inputElRef={inputElRef}
+          keyboardOpen={false}
+          ctrlActive={false}
+          onCtrlToggle={vi.fn()}
+        />,
+      );
+
+      // Tab bypasses the textarea's beforeinput: the shadow must be cleared
+      // before the PTY sees the key, or the next Korean keystroke rewrites
+      // the stale syllable into the new prompt.
+      fireEvent.click(screen.getByLabelText("Tab"));
+      expect(sendData).toHaveBeenCalledWith("\t");
+      expect(shadow.value).toBe("");
+
+      // Drag-repeat arrows take the same out-of-band path.
+      shadow.value = "\u314e";
+      const up = screen.getByLabelText("Arrow up");
+      fireEvent.pointerDown(up, { pointerId: 1, clientX: 10, clientY: 10, isPrimary: true });
+      vi.advanceTimersByTime(400); // LONG_PRESS_DELAY 300 + one repeat tick
+      expect(sendData).toHaveBeenCalledWith("\x1b[A");
+      expect(shadow.value).toBe("");
+      fireEvent.pointerUp(up);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("on a plain-HTTP origin pastes through execCommand into the focused input, else explains HTTPS", async () => {
     secureContext(false);
     const error = vi.fn();
