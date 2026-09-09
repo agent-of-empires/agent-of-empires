@@ -474,9 +474,9 @@ impl SessionService {
     /// any archive, snooze or idle-dormant park, in memory and on disk,
     /// under the instance lock so it serializes with other lifecycle edits.
     /// Returns whether the session was idle-dormant, which callers pass to
-    /// `begin_prompt_submission` and `send_turn` so the wake forces a
+    /// `prompt_dispatch_under_submission` and `send_turn` so the wake forces a
     /// resume. Shared by the user prompt handlers and the plugin turn path
-    /// (#3686).
+    /// (#3686), which all run it under their submission guard.
     pub(crate) async fn touch_and_wake_on_prompt(&self, id: &str) -> bool {
         let inst_lock = self.instance_lock(id).await;
         let _guard = inst_lock.lock().await;
@@ -1453,15 +1453,11 @@ impl SessionService {
     ///    the resume it waits for builds its spawn request under `instance_lock`
     ///    (`acp_reconciler::build_spawn_request`). A submitter that held that
     ///    lock would stall the very resume it is waiting for and give up after
-    ///    `WORKER_READY_TIMEOUT`. This lock is deliberately distinct so the two
-    ///    never overlap; where both are genuinely needed, take this one first.
-    ///
-    /// One input escapes the hold: `acp_prompt` samples `woke_idle_dormant`
-    /// from `touch_and_wake_on_prompt` before claiming the guard,
-    /// because that helper takes `instance_lock`. A stale `true` only forces
-    /// `send_turn`'s resume trigger, which answers `AlreadyResuming` or
-    /// `AlreadyRunning` for a worker that is already there, so it costs a
-    /// lookup rather than a wrong disposition.
+    ///    `WORKER_READY_TIMEOUT`. Where both are genuinely needed, take this
+    ///    one first and release `instance_lock` before the wait: the prompt
+    ///    handlers claim this guard on entry and wake under it, and
+    ///    `touch_and_wake_on_prompt` drops `instance_lock` before returning.
+    ///    Never the reverse order.
     pub(crate) async fn prompt_submission(&self, id: &str) -> tokio::sync::OwnedMutexGuard<()> {
         #[cfg(test)]
         if let Some(tap) = self.submission_claims.get() {
@@ -1496,7 +1492,7 @@ impl SessionService {
     /// teardown and removes the session row before dropping its lock, so both
     /// a waiter parked on that lock and one that vivified a fresh entry after
     /// `forget_prompt_lock` observe the removal and decline.
-    async fn admit_prompt_submission(
+    pub(crate) async fn admit_prompt_submission(
         &self,
         caller: &SessionCaller,
         id: &str,
@@ -1551,36 +1547,15 @@ impl SessionService {
             .ok()
     }
 
-    /// Claim the session's submission authority and settle the prompt's
-    /// disposition under it, so every turn-starting surface decides and
-    /// dispatches as one step instead of dispatching unconditionally after
-    /// the wait (#3649). Admission is decided first, so the disposition is
-    /// only ever computed for a caller entitled to see it.
-    pub(crate) async fn begin_prompt_submission(
-        &self,
-        caller: &SessionCaller,
-        id: &str,
-        idle_dormant: bool,
-    ) -> Result<
-        (
-            tokio::sync::OwnedMutexGuard<()>,
-            crate::acp::dispatch::PromptDispatch,
-        ),
-        TurnAdmissionError,
-    > {
-        let guard = self.admit_prompt_submission(caller, id).await?;
-        let dispatch = self
-            .prompt_dispatch_under_submission(id, idle_dormant)
-            .await;
-        Ok((guard, dispatch))
-    }
-
-    /// [`Self::begin_prompt_submission`]'s second half, for a caller that
-    /// already holds the guard. The user prompt handlers claim submission
-    /// authority on entry (before the wake, so `/acp/cancel` cannot overtake
-    /// the prompt it is meant to stop, and so they take the two locks in the
-    /// order [`Self::prompt_submission`] documents) and only then have an
-    /// `idle_dormant` to decide with.
+    /// Settle the prompt's disposition under a submission guard the caller
+    /// already holds, so every turn-starting surface decides and dispatches as
+    /// one step instead of dispatching unconditionally after the wait (#3649).
+    ///
+    /// Separate from the claim because the two are not adjacent: every caller
+    /// takes [`Self::admit_prompt_submission`] on entry (a `/acp/cancel` must
+    /// not be able to overtake the prompt it is meant to stop, see
+    /// `api::acp::acp_cancel`) and only has an `idle_dormant` to decide with
+    /// after the wake it runs under the hold.
     pub(crate) async fn prompt_dispatch_under_submission(
         &self,
         id: &str,
