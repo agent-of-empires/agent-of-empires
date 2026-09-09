@@ -359,14 +359,21 @@ macOS, `~/.claude/.credentials.json` elsewhere, and any copy left in the
 session's store by an earlier layout, each taken only when its expiry is later
 than what the file holds. Logging in on the host and starting or restarting
 one sandboxed session re-authenticates all of them; a login made inside a
-container is never overwritten by a staler host copy. The host itself stays a
-separate chain: a refresh inside a sandbox still rotates the token the host
-holds, as it did before. A container created before this layout mounts only
-its store, so a stopped one is recreated at its next start, as it was for the
-store move, and a running one refuses to relaunch until it is stopped. Running
-`/logout` inside a sandbox revokes the token for every sandbox but cannot
-remove the mounted file, so the revoked token stays there until the next
-login.
+container is never overwritten by a staler host copy. Between starts the file
+belongs to the containers: the TUI's periodic refresh only seeds a file that
+holds no credential, so a host refresh never replaces a token the sandboxes
+are rotating mid-session.
+
+The host and the sandboxes are not separate chains once a start has copied
+the host's token in: both then hold the same refresh token, and whichever
+refreshes first logs the other out, as it did before this layout. A login
+made inside a container starts a chain of its own, which the next start
+replaces again if the host's token is fresher by then. A container created
+before this layout mounts only its store, so a stopped one is recreated at its
+next start, as it was for the store move, and a running one refuses to
+relaunch until it is stopped. Running `/logout` inside a sandbox revokes the
+token for every sandbox but cannot remove the mounted file, so the revoked
+token stays there until the next login.
 
 ### Reclaiming stores
 

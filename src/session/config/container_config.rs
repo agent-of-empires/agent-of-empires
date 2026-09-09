@@ -790,6 +790,23 @@ fn read_credential_candidate(dir: &Path, name: &str, follow: SymlinkPolicy) -> O
     })
 }
 
+/// Which credentials a fold may put in the shared file.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CredentialFold {
+    /// A come-up, create or start: the freshest candidate replaces what the
+    /// file holds.
+    Freshest,
+    /// Off a come-up: a file holding a credential is left to the containers'
+    /// own rotation, so a fresher host token never re-couples them to the host
+    /// chain mid-session. Only a file holding none is seeded.
+    SeedOnly,
+}
+
+/// Whether `content` carries a credential a container could use.
+fn holds_credential(content: &str) -> bool {
+    plausible_credential_expires_at(content, now_ms()).is_some()
+}
+
 /// Fold the freshest credential into the file every store of this agent
 /// mounts. This is a come-up fold rather than a migration because a container
 /// built before the file was shared keeps refreshing its store copy while it
@@ -811,6 +828,7 @@ fn sync_shared_credential(
     host_dir: &Path,
     sandbox_dir: &Path,
     name: &str,
+    fold: CredentialFold,
 ) -> Result<Option<PathBuf>> {
     let Some(shared) = shared_credential_path(sandbox_dir, name) else {
         return Ok(None);
@@ -847,8 +865,10 @@ fn sync_shared_credential(
     // so another come-up or a container's own refresh in between is seen.
     crate::hooks::with_config_lock_policy(&shared, "lock", SymlinkPolicy::Never, || {
         let existing = read_credential_file(root, name, SymlinkPolicy::Never)?;
+        let replaceable =
+            fold == CredentialFold::Freshest || !existing.as_deref().is_some_and(holds_credential);
         let mut winner: Option<&str> = None;
-        for candidate in &candidates {
+        for candidate in candidates.iter().filter(|_| replaceable) {
             let current = winner.or(existing.as_deref());
             if current.is_none_or(|current| should_overwrite_credential(current, candidate)) {
                 winner = Some(candidate);
@@ -1161,10 +1181,11 @@ fn prepare_sandbox_dir(
     mount: &AgentConfigMount,
     home: &Path,
     instance_id: Option<&str>,
+    fold: CredentialFold,
 ) -> Result<PathBuf> {
     let host_dir = home.join(mount.host_rel);
     let sandbox_dir = sandbox_dir_for(mount, home, instance_id)?;
-    prepare_sandbox_dir_from(mount, host_dir, sandbox_dir, home)
+    prepare_sandbox_dir_from(mount, host_dir, sandbox_dir, home, fold)
 }
 
 fn prepare_sandbox_dir_from(
@@ -1172,6 +1193,7 @@ fn prepare_sandbox_dir_from(
     host_dir: PathBuf,
     sandbox_dir: PathBuf,
     home: &Path,
+    fold: CredentialFold,
 ) -> Result<PathBuf> {
     // Remove stale files before syncing. This prevents leftovers from a previous
     // session (e.g. a SQLite database created by an older tool version) from
@@ -1260,7 +1282,7 @@ fn prepare_sandbox_dir_from(
     }
 
     for &name in mount.shared_credential_files {
-        if let Err(e) = sync_shared_credential(mount, &host_dir, &sandbox_dir, name) {
+        if let Err(e) = sync_shared_credential(mount, &host_dir, &sandbox_dir, name, fold) {
             tracing::warn!(target: "session.profile",
                 "Failed to sync shared credential {} for {}: {}", name, mount.host_rel, e);
         }
@@ -1600,6 +1622,7 @@ pub(crate) fn refresh_agent_configs_for_instance(
     instance_id: &str,
     tool: &str,
     detect_as: Option<&str>,
+    fold: CredentialFold,
 ) {
     let Some(home) = dirs::home_dir() else {
         return;
@@ -1619,8 +1642,9 @@ pub(crate) fn refresh_agent_configs_for_instance(
                 directory.clone(),
                 directory.join(SANDBOX_PRIVATE_SUBDIR).join(instance_id),
                 &home,
+                fold,
             ),
-            None => prepare_sandbox_dir(mount, &home, Some(instance_id)),
+            None => prepare_sandbox_dir(mount, &home, Some(instance_id), fold),
         };
         match result {
             Ok(sandbox_dir) => {
@@ -1884,6 +1908,8 @@ pub(crate) struct ContainerAgentSelection<'a> {
     /// running a user's own agent still reports status (Kiro has no global
     /// hooks). `None` for the default / no selection.
     selected_agent: Option<&'a str>,
+    /// How the launch treats the credential file the agent's sandboxes share.
+    credential_fold: CredentialFold,
 }
 
 impl<'a> ContainerAgentSelection<'a> {
@@ -1892,7 +1918,15 @@ impl<'a> ContainerAgentSelection<'a> {
             tool,
             detect_as,
             selected_agent: None,
+            credential_fold: CredentialFold::Freshest,
         }
+    }
+
+    /// Set how the launch treats the shared credential file (see
+    /// [`CredentialFold`]).
+    pub(crate) fn with_credential_fold(mut self, fold: CredentialFold) -> Self {
+        self.credential_fold = fold;
+        self
     }
 
     /// Set the user-selected agent name (see [`Self::selected_agent`]).
@@ -2320,8 +2354,14 @@ pub(crate) fn build_container_config(
                 directory.clone(),
                 directory.join(SANDBOX_PRIVATE_SUBDIR).join(instance_id),
                 &home,
+                agent_selection.credential_fold,
             ),
-            None => prepare_sandbox_dir(mount, &home, Some(instance_id)),
+            None => prepare_sandbox_dir(
+                mount,
+                &home,
+                Some(instance_id),
+                agent_selection.credential_fold,
+            ),
         };
         let sandbox_dir = match sandbox_dir {
             Ok(dir) => dir,
@@ -3437,7 +3477,8 @@ mod tests {
             .iter()
             .find(|m| m.tool_name == "hermes")
             .unwrap();
-        let sandbox = prepare_sandbox_dir(mount, dir.path(), None).unwrap();
+        let sandbox =
+            prepare_sandbox_dir(mount, dir.path(), None, CredentialFold::Freshest).unwrap();
 
         assert!(sandbox.join("config.yaml").exists());
         assert!(sandbox.join(".env").exists());
@@ -3512,7 +3553,7 @@ mod tests {
             .iter()
             .find(|m| m.tool_name == "opencode" && m.host_rel == ".local/share/opencode")
             .expect("opencode data-dir mount");
-        let out = prepare_sandbox_dir(mount, dir.path(), None).unwrap();
+        let out = prepare_sandbox_dir(mount, dir.path(), None, CredentialFold::Freshest).unwrap();
         assert_eq!(out, sandbox);
 
         assert!(
@@ -3911,7 +3952,8 @@ mod tests {
             .iter()
             .find(|m| m.tool_name == "prime-agent")
             .expect("prime-agent mount must exist");
-        let sandbox = prepare_sandbox_dir(prime_mount, home.path(), None).unwrap();
+        let sandbox =
+            prepare_sandbox_dir(prime_mount, home.path(), None, CredentialFold::Freshest).unwrap();
 
         assert_eq!(
             fs::read_to_string(sandbox.join("skills/reviewing/SKILL.md")).unwrap(),
@@ -4426,8 +4468,16 @@ mod tests {
         fs::create_dir_all(&store).unwrap();
         // A failed sync is logged and the launch goes on; the file must be
         // left exactly as it was.
-        let prepare =
-            || prepare_sandbox_dir_from(&mount, host.clone(), store.clone(), home.path()).unwrap();
+        let prepare = || {
+            prepare_sandbox_dir_from(
+                &mount,
+                host.clone(),
+                store.clone(),
+                home.path(),
+                CredentialFold::Freshest,
+            )
+            .unwrap()
+        };
 
         // Root reads a write-only file regardless, so the case cannot fail there.
         if !nix::unistd::geteuid().is_root() {
@@ -4494,8 +4544,16 @@ mod tests {
         let store = root.join("aaaaaaaaaaaaaaaa");
         let shared = root.join(".credentials.json");
         let private = store.join(".credentials.json");
-        let prepare =
-            || prepare_sandbox_dir_from(&mount, host.clone(), store.clone(), home.path()).unwrap();
+        let prepare = || {
+            prepare_sandbox_dir_from(
+                &mount,
+                host.clone(),
+                store.clone(),
+                home.path(),
+                CredentialFold::Freshest,
+            )
+            .unwrap()
+        };
 
         // Nothing to seed: the mount source still has to exist.
         prepare();
@@ -4530,6 +4588,42 @@ mod tests {
         fs::write(&private, "").unwrap();
         prepare();
         assert_eq!(fs::read_to_string(&shared).unwrap(), credential(300));
+    }
+
+    #[test]
+    fn off_a_come_up_the_fold_only_seeds() {
+        let home = TempDir::new().unwrap();
+        let host = home.path().join(".claude");
+        fs::create_dir_all(&host).unwrap();
+        let mount = claude_mount_without_keychain();
+        let root = host.join(SANDBOX_PRIVATE_SUBDIR);
+        let store = root.join("aaaaaaaaaaaaaaaa");
+        let shared = root.join(".credentials.json");
+        fs::create_dir_all(&store).unwrap();
+        let prepare = |fold| {
+            prepare_sandbox_dir_from(&mount, host.clone(), store.clone(), home.path(), fold)
+                .unwrap()
+        };
+
+        // A file holding no usable credential is seeded from the host.
+        fs::write(host.join(".credentials.json"), credential(100)).unwrap();
+        for unusable in ["", "{}", "not json"] {
+            fs::write(&shared, unusable).unwrap();
+            prepare(CredentialFold::SeedOnly);
+            assert_eq!(
+                fs::read_to_string(&shared).unwrap(),
+                credential(100),
+                "{unusable:?}"
+            );
+        }
+
+        // A fresher host login waits for a come-up: between starts the file
+        // holds the containers' own rotation.
+        fs::write(host.join(".credentials.json"), credential(200)).unwrap();
+        prepare(CredentialFold::SeedOnly);
+        assert_eq!(fs::read_to_string(&shared).unwrap(), credential(100));
+        prepare(CredentialFold::Freshest);
+        assert_eq!(fs::read_to_string(&shared).unwrap(), credential(200));
     }
 
     #[test]
@@ -5810,6 +5904,7 @@ trust_level = "trusted"
             instance_id,
             "codex",
             None,
+            CredentialFold::Freshest,
         );
         let refreshed: toml::Value =
             toml::from_str(&fs::read_to_string(codex_sandbox.join("config.toml")).unwrap())
@@ -5861,6 +5956,7 @@ trust_level = "trusted"
             "gemini-yolo-refresh-test",
             "gemini",
             None,
+            CredentialFold::Freshest,
         );
         let refreshed: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(gemini_sandbox.join("settings.json")).unwrap(),
@@ -6559,6 +6655,7 @@ trusted_hash = "keep"
             instance_id,
             "codex",
             None,
+            CredentialFold::Freshest,
         );
 
         let config_text = fs::read_to_string(&sandbox_config_path).unwrap();
@@ -6676,7 +6773,13 @@ trusted_hash = "keep"
                 profile,
             )
             .unwrap();
-            refresh_agent_configs_for_instance(profile, instance_id, "codex", None);
+            refresh_agent_configs_for_instance(
+                profile,
+                instance_id,
+                "codex",
+                None,
+                CredentialFold::Freshest,
+            );
         }
 
         for (instance_id, _, expected_status) in instances {
@@ -7188,7 +7291,7 @@ volume_ignores = ["target"]
             clean_files: &["opencode.db", "opencode.db-wal", "opencode.db-shm"],
         };
 
-        prepare_sandbox_dir(&mount, home.path(), None).unwrap();
+        prepare_sandbox_dir(&mount, home.path(), None, CredentialFold::Freshest).unwrap();
 
         assert!(!sandbox_dir.join("opencode.db").exists());
         assert!(!sandbox_dir.join("opencode.db-wal").exists());
@@ -7226,7 +7329,7 @@ volume_ignores = ["target"]
             clean_files: &[],
         };
 
-        prepare_sandbox_dir(&mount, home.path(), None).unwrap();
+        prepare_sandbox_dir(&mount, home.path(), None, CredentialFold::Freshest).unwrap();
 
         assert!(
             !sandbox_dir.join("opencode.db").exists(),
@@ -7259,7 +7362,7 @@ volume_ignores = ["target"]
         };
 
         // Should not panic or error when files don't exist
-        prepare_sandbox_dir(&mount, home.path(), None).unwrap();
+        prepare_sandbox_dir(&mount, home.path(), None, CredentialFold::Freshest).unwrap();
     }
 
     // --- GCP credential mount tests ---

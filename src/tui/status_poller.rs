@@ -176,8 +176,10 @@ pub(super) fn poll_statuses_once(
         false
     };
 
-    // Periodically re-sync sandbox credentials from the macOS Keychain
-    // so long-lived sessions don't lose auth mid-run.
+    // Periodically seed a shared credential file that holds no credential,
+    // and refresh the rest of each store. A file holding a credential is
+    // left to the containers' own rotation: pushing a fresher host token
+    // in would put every sandbox back on the host's chain mid-session.
     if has_sandboxed && state.last_credential_refresh.elapsed() >= state.credential_refresh_interval
     {
         state.last_credential_refresh = Instant::now();
@@ -213,6 +215,7 @@ pub(super) fn poll_statuses_once(
                 &instance.id,
                 &instance.tool,
                 Some(&instance.detect_as),
+                crate::session::config::container_config::CredentialFold::SeedOnly,
             );
         }
     }
