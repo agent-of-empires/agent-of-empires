@@ -18,6 +18,7 @@ import type { LiveFrame, LiveStats } from "../hooks/useLiveTerminal";
 import { useWebSettings } from "../hooks/useWebSettings";
 import { useIsCoarsePointer } from "../hooks/useIsCoarsePointer";
 import { useTerminalGestureBoundary } from "../hooks/useTerminalGestureBoundary";
+import { useSelectionHold } from "../hooks/useSelectionHold";
 
 // Mobile rendering of a tmux agent pane, mirroring the TUI's live mode:
 // the server streams `capture-pane` snapshots (src/server/live_ws.rs)
@@ -591,7 +592,7 @@ export const Row = memo(function Row({
 });
 
 export function MobileLiveTerminal({
-  frame,
+  frame: streamFrame,
   liveStats,
   transport,
   armAgentClipboard,
@@ -644,6 +645,11 @@ export function MobileLiveTerminal({
     setFontSize(configuredFontSize);
   }
   const scrollerRef = useRef<HTMLDivElement>(null);
+  // A selection anywhere in the grid pins the painted frame until the user
+  // lets go, so no row is rewritten out from under the range. Everything
+  // below renders that held frame; only the stream acknowledgements read
+  // `streamFrame`.
+  const frame = useSelectionHold(streamFrame, scrollerRef);
   const measureRef = useRef<HTMLSpanElement>(null);
   const keyboardLayoutRef = useRef<KeyboardLayoutReader | null>(null);
   useEffect(() => {
@@ -1167,8 +1173,8 @@ export function MobileLiveTerminal({
   // is a transport event, not derived state, so an effect is the right hook.
   useEffect(() => {
     // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler
-    if (frame) notchPacer.onFrame();
-  }, [frame, notchPacer]);
+    if (streamFrame) notchPacer.onFrame();
+  }, [streamFrame, notchPacer]);
 
   const onWheel = useCallback(
     (e: React.WheelEvent) => {
@@ -1605,8 +1611,8 @@ export function MobileLiveTerminal({
 
   const [frameTiming] = useState(() => new FrameTimingProbe());
   useLayoutEffect(() => {
-    if (LIVE_DEBUG && frame) frameTiming.record(performance.now(), frame.receivedAt);
-  }, [frame, frameTiming]);
+    if (LIVE_DEBUG && streamFrame) frameTiming.record(performance.now(), streamFrame.receivedAt);
+  }, [streamFrame, frameTiming]);
 
   // --- bottom pinning ---------------------------------------------------------
   useLayoutEffect(() => {
