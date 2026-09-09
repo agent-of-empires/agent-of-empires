@@ -920,17 +920,30 @@ pub(crate) fn place_shadowed_credential_mountpoints(config: &ContainerConfig) {
         if Path::new(&store.host_path).parent() != Path::new(&shared.host_path).parent() {
             continue;
         }
-        let copy = Path::new(&store.host_path).join(name);
-        // Emptying the copy is only safe once the fold has landed a credential
-        // in the shared file; short of that (a failed fold, or the empty seed
-        // `sync_shared_credential` writes when it found none) the copy may be
-        // the only one left, and it already serves as the mountpoint.
-        let folded = std::fs::read_to_string(&shared.host_path)
-            .is_ok_and(|content| !matches!(content.trim(), "" | "{}"));
+        let store_dir = Path::new(&store.host_path);
+        let copy = store_dir.join(name);
+        let folded = Path::new(&shared.host_path)
+            .parent()
+            .zip(name.to_str())
+            .is_some_and(|(root, name)| shadowed_copy_is_folded(root, store_dir, name));
         if let Err(e) = place_credential_mountpoint(&copy, folded) {
             tracing::warn!(target: "session.profile",
                 "Failed to place credential mountpoint {}: {}", copy.display(), e);
         }
+    }
+}
+
+/// Whether the shared file holds a credential at least as fresh as the store's
+/// own copy, so the copy can be emptied. Read now rather than remembered from
+/// the fold: a fold that failed, or a copy it could not read, leaves the copy
+/// the only chain there is, and a plain file already serves as the
+/// mountpoint. Either side that cannot be read keeps the copy.
+fn shadowed_copy_is_folded(shared_root: &Path, store: &Path, name: &str) -> bool {
+    let shared = read_credential_file(shared_root, name, SymlinkPolicy::Never);
+    let copy = read_credential_file(store, name, SymlinkPolicy::Never);
+    match (shared, copy) {
+        (Ok(Some(shared)), Ok(Some(copy))) => !should_overwrite_credential(&shared, &copy),
+        _ => false,
     }
 }
 
@@ -4595,7 +4608,7 @@ mod tests {
         let store = root.join("aaaaaaaaaaaaaaaa");
         let shared = root.join(".credentials.json");
         fs::create_dir_all(&store).unwrap();
-        fs::write(&shared, "shared").unwrap();
+        fs::write(&shared, credential(2)).unwrap();
         let config_for = |dir: &Path| ContainerConfig {
             shared_credential_mounts: vec!["/root/.claude/.credentials.json".to_string()],
             volumes: vec![
@@ -4616,22 +4629,31 @@ mod tests {
         // mount; its host copy is the user's own login, not a shadowed one.
         for (dir, emptied) in [(&store, true), (&host, false)] {
             let copy = dir.join(".credentials.json");
-            fs::write(&copy, "token").unwrap();
+            fs::write(&copy, credential(1)).unwrap();
             place_shadowed_credential_mountpoints(&config_for(dir));
-            let kept = fs::read_to_string(&copy).unwrap() == "token";
+            let kept = fs::read_to_string(&copy).unwrap() == credential(1);
             assert_eq!(!kept, emptied, "{}", dir.display());
         }
 
-        // A shared file the fold landed no credential in leaves the copy alone:
-        // it is still the only one, and already the mountpoint the mount needs.
+        // The copy is kept while it is the only chain there is: the shared
+        // file holds no credential, or one the copy is fresher than because
+        // the fold did not land it. A plain file is already the mountpoint.
         let copy = store.join(".credentials.json");
-        for unfolded in ["", "{}"] {
+        for (unfolded, copy_content) in [
+            ("", credential(1)),
+            ("{}", credential(1)),
+            (&credential(2), credential(3)),
+        ] {
             fs::write(&shared, unfolded).unwrap();
-            fs::write(&copy, "token").unwrap();
+            fs::write(&copy, &copy_content).unwrap();
             place_shadowed_credential_mountpoints(&config_for(&store));
-            assert_eq!(fs::read_to_string(&copy).unwrap(), "token", "{unfolded:?}");
+            assert_eq!(
+                fs::read_to_string(&copy).unwrap(),
+                copy_content,
+                "{unfolded:?}"
+            );
         }
-        fs::write(&shared, "shared").unwrap();
+        fs::write(&shared, credential(2)).unwrap();
 
         // The store is container-writable, so a link planted at the mountpoint
         // is replaced rather than followed.
