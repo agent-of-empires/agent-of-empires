@@ -458,6 +458,15 @@ function specialKeySequence(e: TerminalKeyLike): string | null {
   }
 }
 
+/** A frame's rows as raw strings. `lines` is authoritative when present (a
+ *  patched frame never re-splits its window); `content` carries a
+ *  terminating newline that is not a row. */
+function frameLines(frame: LiveFrame): string[] {
+  if (frame.lines) return frame.lines;
+  const content = frame.content.endsWith("\n") ? frame.content.slice(0, -1) : frame.content;
+  return content.split("\n");
+}
+
 export const Row = memo(function Row({
   segs,
   cursorCol,
@@ -649,7 +658,27 @@ export function MobileLiveTerminal({
   // go, so no row is rewritten out from under the range (see the hook).
   // Everything below renders that held frame; only the stream
   // acknowledgements read `streamFrame`.
-  const { value: frame, held: selectionHeld } = useSelectionHold(streamFrame, scrollerRef);
+  const { value: heldFrame, held: selectionHeld } = useSelectionHold(streamFrame, scrollerRef);
+  // Dragging a selection upward past the top edge scrolls into scrollback,
+  // which asks the server for a wider capture window. Holding that response
+  // whole would extend the drag into the blank history spacer instead of the
+  // text it just requested, so newly captured lines ABOVE the held window are
+  // spliced in front of it. They are older scrollback: immutable, and no row
+  // already on screen changes. Keeping the held frame's `history` shrinks the
+  // spacer by exactly the spliced count, so every held row keeps its key
+  // (spacer + line) and its pixel position, and the selection with them.
+  const frame = useMemo(() => {
+    // Reading mode is the only thing that widens the window, and it is also
+    // what mounts every row: outside it the debounced row count lags a
+    // sudden jump in height and virtualization would unmount the selected
+    // row, which is the collapse this whole change exists to prevent.
+    if (!selectionHeld || !reading || !heldFrame || !streamFrame || heldFrame === streamFrame) return heldFrame;
+    const held = frameLines(heldFrame);
+    const next = frameLines(streamFrame);
+    const older = heldFrame.history - held.length - (streamFrame.history - next.length);
+    if (older <= 0) return heldFrame;
+    return { ...heldFrame, lines: next.slice(0, Math.min(older, next.length)).concat(held) };
+  }, [selectionHeld, reading, heldFrame, streamFrame]);
   const measureRef = useRef<HTMLSpanElement>(null);
   const keyboardLayoutRef = useRef<KeyboardLayoutReader | null>(null);
   useEffect(() => {
@@ -888,7 +917,19 @@ export function MobileLiveTerminal({
   const forwardMode = altScreen && (frame?.mouse ?? false);
   const mouseSgr = frame?.mouseSgr ?? false;
   const effectiveSpacerLines = forwardMode ? 0 : spacerLines;
-  const { forwardModeRef, mouseSgrRef } = useTerminalGestureBoundary({ scrollerRef, forwardMode, mouseSgr });
+  // Gesture forwarding, unlike the layout above, yields to a live selection.
+  // Forward mode owns every touch (touch-action: none plus a non-passive
+  // preventDefault) so a drag becomes wheel notches instead of a page pan;
+  // that is also what WebKit needs left alone to drag a selection's handles,
+  // so with it on the callout comes up and its handles will not move. The
+  // layout keeps using `forwardMode` on purpose: `effectiveSpacerLines` feeds
+  // the row keys, and flipping it mid-selection would remount every row.
+  const forwardGestures = forwardMode && !selectionHeld;
+  const { forwardModeRef, mouseSgrRef } = useTerminalGestureBoundary({
+    scrollerRef,
+    forwardMode: forwardGestures,
+    mouseSgr,
+  });
   // Sub-notch scroll remainder (px) carried across events, and the last
   // touch Y while forwarding a single-finger drag.
   const wheelAccumRef = useRef(0);
@@ -2019,7 +2060,7 @@ export function MobileLiveTerminal({
             // wheel scrolls the app, the double-scroll clunk. touch-action:
             // none stops the browser from starting any pan or zoom for
             // touches on the terminal; JS still receives every touch event.
-            touchAction: forwardMode ? "none" : undefined,
+            touchAction: forwardGestures ? "none" : undefined,
             // Do NOT set `-webkit-overflow-scrolling: touch` here. It promotes
             // this opaque scroll region to a composited layer that macOS/iOS
             // Safari rasterizes at 1x, making the DOM terminal text look

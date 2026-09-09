@@ -30,7 +30,7 @@ function altFrame(n: number) {
 const content = (page: Page) => page.locator("[data-live-content]");
 const selection = (page: Page) => page.evaluate(() => window.getSelection()?.toString() ?? "");
 
-test("a selection over a full-screen agent survives its repaints", async ({ page }) => {
+async function setup(page: Page) {
   await installTerminalSpies(page);
   const handle = await mockTerminalApis(page);
   await page.goto("/");
@@ -40,17 +40,19 @@ test("a selection over a full-screen agent survives its repaints", async ({ page
   await clickSidebarSession(page, "pinch-test");
   await page.locator("[data-live-terminal]").waitFor({ state: "visible", timeout: 10_000 });
   await expect.poll(() => handle.liveMessages.length, { timeout: 5_000 }).toBeGreaterThan(0);
+  // Let the client's opening window/cadence messages settle: the mock answers
+  // each one with a default (normal-screen) frame, which would clobber the
+  // alt-screen frames these tests push.
+  await page.waitForTimeout(400);
+  return handle;
+}
 
-  handle.pushLiveFrame(altFrame(1));
-  await expect.poll(() => content(page).textContent()).toContain("line 1");
-
-  // Both endpoints inside the row's text node, the way a long-press word
-  // selection anchors. Anchoring on the row element instead would put them
-  // outside the rewritten data and survive a repaint a real gesture cannot.
-  await page.evaluate(() => {
-    const row = Array.from(document.querySelectorAll("[data-live-content] > div")).find(
-      (r) => r.textContent === "line 2",
-    );
+// Both endpoints inside the row's text node, the way a long-press word
+// selection anchors. Anchoring on the row element instead would put them
+// outside the rewritten data and survive a repaint a real gesture cannot.
+async function selectRow(page: Page, text: string) {
+  await page.evaluate((t) => {
+    const row = Array.from(document.querySelectorAll("[data-live-content] > div")).find((r) => r.textContent === t);
     if (!row) throw new Error("row not rendered");
     const node = document.createTreeWalker(row, NodeFilter.SHOW_TEXT).nextNode() as Text;
     const range = document.createRange();
@@ -59,7 +61,16 @@ test("a selection over a full-screen agent survives its repaints", async ({ page
     const sel = window.getSelection()!;
     sel.removeAllRanges();
     sel.addRange(range);
-  });
+  }, text);
+}
+
+test("a selection over a full-screen agent survives its repaints", async ({ page }) => {
+  const handle = await setup(page);
+
+  handle.pushLiveFrame(altFrame(1));
+  await expect.poll(() => content(page).textContent()).toContain("line 1");
+
+  await selectRow(page, "line 2");
   expect(await selection(page)).toBe("line 2");
 
   handle.pushLiveFrame(altFrame(2));
@@ -72,4 +83,33 @@ test("a selection over a full-screen agent survives its repaints", async ({ page
   await page.evaluate(() => window.getSelection()?.removeAllRanges());
   handle.pushLiveFrame(altFrame(4));
   await expect.poll(() => content(page).textContent()).toContain("line 6");
+});
+
+// A full-screen MOUSE app additionally owns every touch, so the drag that
+// adjusts a selection's handles never reaches WebKit: the callout comes up
+// and its handles will not move (reported on iOS 26 Safari and the PWA).
+// Forwarding yields while a selection is live; the layout does not, so the
+// row keys are untouched and the hold above still stands.
+test("a live selection releases the full-screen app's grip on touch gestures", async ({ page }) => {
+  const handle = await setup(page);
+  handle.pushLiveFrame({ ...altFrame(1), mouse: true, mouseSgr: true });
+  await expect.poll(() => content(page).textContent()).toContain("line 1");
+
+  const scroller = page.locator("[data-live-terminal] > div").first();
+  const touchMoveCancelled = () =>
+    scroller.evaluate((el) => !el.dispatchEvent(new Event("touchmove", { cancelable: true })));
+  const touchAction = () => scroller.evaluate((el) => getComputedStyle(el).touchAction);
+
+  await expect.poll(touchAction).toBe("none");
+  await expect.poll(touchMoveCancelled).toBe(true);
+
+  await selectRow(page, "line 2");
+
+  await expect.poll(touchAction).not.toBe("none");
+  await expect.poll(touchMoveCancelled).toBe(false);
+
+  // Dropping it hands the app its gestures back.
+  await page.evaluate(() => window.getSelection()?.removeAllRanges());
+  await expect.poll(touchAction).toBe("none");
+  await expect.poll(touchMoveCancelled).toBe(true);
 });

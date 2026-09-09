@@ -64,13 +64,34 @@ function altFrame(n: number): LiveFrame {
   };
 }
 
-function terminal(f: LiveFrame) {
+// A normal-buffer pane whose capture window is far smaller than its history:
+// `captured` screen rows plus one line of scrollback at first, then the full
+// history once reading widens the window.
+function historyFrame(captured: number): LiveFrame {
+  const rows = 3;
+  const history = 10;
+  const lines = [];
+  for (let i = history - captured + 1; i <= history; i++) lines.push(`h${String(i).padStart(3, "0")}`);
+  lines.push("s1", "s2", "s3");
+  return {
+    content: lines.join("\n") + "\n",
+    lines,
+    rows,
+    history,
+    cursor: null,
+    altScreen: false,
+    mouse: false,
+    mouseSgr: false,
+  };
+}
+
+function terminal(f: LiveFrame, reading = false) {
   return (
     <MobileLiveTerminal
       frame={f}
       connected
       active
-      reading={false}
+      reading={reading}
       sendResize={vi.fn()}
       setWindow={vi.fn()}
       setCadence={vi.fn()}
@@ -159,4 +180,22 @@ it("offers the back-to-live control while a frame is held, and releasing catches
 
   expect(document.getSelection()?.isCollapsed ?? true).toBe(true);
   expect(container.querySelector("[data-live-content]")?.textContent).toContain("line 5");
+});
+
+it("lets uncaptured scrollback populate under a live selection", () => {
+  // Selecting at the live edge and dragging upward past the top scrolls into
+  // scrollback (enterReading widens the capture window). The hold must not
+  // swallow that wider frame, or the drag extends into the blank spacer
+  // instead of the older text it just asked for.
+  const { container, rerender } = mount(historyFrame(1));
+  const selection = selectRowText("s2");
+
+  // Scrolling up flips the pane into reading mode first; the wider capture
+  // window lands a frame later.
+  rerender(terminal(historyFrame(1), true));
+  rerender(terminal(historyFrame(10), true));
+
+  const text = container.querySelector("[data-live-content]")?.textContent ?? "";
+  expect(text).toContain("h001");
+  expect(selection.toString()).toBe("s2");
 });
