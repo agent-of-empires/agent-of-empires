@@ -997,7 +997,16 @@ done
                     );
                     saw_reset = true;
                 }
-                Some(Event::Stopped { reason }) => terminal = Some(reason),
+                Some(Event::Stopped { reason }) => {
+                    // The reset must precede the terminal event: a terminal
+                    // first would mean the connection died before the
+                    // recovery signal the supervisor keys on.
+                    assert!(
+                        saw_reset,
+                        "terminal event must arrive after the SessionContextReset, got stopped={reason:?} first"
+                    );
+                    terminal = Some(reason);
+                }
                 Some(Event::AgentStartupError { message }) => {
                     panic!("a recoverable reset must not surface a startup error: {message}")
                 }

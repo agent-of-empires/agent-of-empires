@@ -1968,45 +1968,30 @@ pub(super) async fn run_connection_task<W, R>(
                                                 break;
                                             }
                                             // A resumed worker reuses the stored
-                                            // acp_session_id without session/load; an
-                                            // agent that dropped that session rejects
-                                            // the first prompt. Reset the context so
-                                            // the respawn opens a fresh session/new
-                                            // (the transcript is preserved for replay)
-                                            // instead of terminating the runner (#3560).
-                                            if this_prompt_epoch == 1
-                                                && session_from_storage
-                                                && is_unsupported_session_error(&e)
-                                            {
-                                                warn!(
-                                                    target: "acp.protocol",
-                                                    session = %session_label,
-                                                    "resumed ACP session rejected; resetting context so the respawn starts fresh: {e}"
-                                                );
-                                                let _ = event_tx_for_block
-                                                    .send(Event::SessionContextReset {
-                                                        reason: format!(
-                                                            "resumed session no longer available: {e}"
-                                                        ),
-                                                    })
-                                                    .await;
-                                                context_reset_emitted_for_block
-                                                    .store(true, Ordering::Relaxed);
-                                            }
-                                            // A resumed worker reuses the stored
                                             // acp_session_id without re-issuing
                                             // session/load; if the agent dropped
                                             // that session across the interruption
-                                            // it rejects the first prompt (OMP:
-                                            // "Unsupported ACP session"). Emit the
-                                            // established SessionContextReset so the
-                                            // supervisor clears the persisted id and
-                                            // the respawn opens a fresh session/new
-                                            // (the SQLite transcript is preserved for
-                                            // replay), then return the original error
-                                            // to end this connection so the restart
-                                            // fires. See resume-rejection recovery.
-                                            if is_unsupported_session_error(&e) {
+                                            // it rejects the prompt (OMP:
+                                            // "Unsupported ACP session"), on the
+                                            // first prompt or any later one. Emit
+                                            // exactly one SessionContextReset so
+                                            // the supervisor clears the persisted
+                                            // id and the respawn opens a fresh
+                                            // session/new (the SQLite transcript
+                                            // is preserved for replay), flag the
+                                            // block so the outer handler ends with
+                                            // Stopped{stored_session_rejected}
+                                            // instead of AgentStartupError, then
+                                            // return the original error to end
+                                            // this connection so the restart
+                                            // fires. Sessions created by
+                                            // session/new are excluded: resetting
+                                            // them would throw away a context the
+                                            // agent never rejected. See
+                                            // resume-rejection recovery.
+                                            if session_from_storage
+                                                && is_unsupported_session_error(&e)
+                                            {
                                                 warn!(
                                                     target: "acp.protocol",
                                                     session = %session_label,
@@ -2020,6 +2005,8 @@ pub(super) async fn run_connection_task<W, R>(
                                                         ),
                                                     })
                                                     .await;
+                                                context_reset_emitted_for_block
+                                                    .store(true, Ordering::Relaxed);
                                             }
                                             return Err(e);
                                         }
