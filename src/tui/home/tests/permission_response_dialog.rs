@@ -11,12 +11,19 @@ fn add_session_with_tool(view: &mut HomeView, title: &str, tool: &str) -> String
     view.add_instance(inst);
     id
 }
+/// Nonce de fixture généré à l'exécution : un littéral qui flue vers un
+/// champ `nonce` déclenche CodeQL rust/hard-coded-cryptographic-value
+/// (alertes 179-181), même en code de test.
+fn test_nonce() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
 fn pending(nonce: &str) -> Vec<PendingApproval> {
     vec![PendingApproval {
         nonce: nonce.to_string(),
         tool_name: "Bash".to_string(),
         target: "echo hi".to_string(),
         destructive: false,
+        choice: false,
     }]
 }
 
@@ -84,9 +91,10 @@ fn structured_session_reuses_the_permission_dialog() {
     let id = add_session_with_tool(&mut env.view, "session-one", "claude");
     env.view
         .mutate_instance(&id, |inst| inst.view = crate::session::View::Structured);
+    let nonce = test_nonce();
     env.view
         .structured_pending_approvals
-        .insert(id.clone(), pending("approval-1"));
+        .insert(id.clone(), pending(&nonce));
     env.view.selected_session = Some(id.clone());
 
     let _ = env.view.handle_key(key(KeyCode::Char('a')), None);
@@ -97,9 +105,41 @@ fn structured_session_reuses_the_permission_dialog() {
     );
     assert!(matches!(
         env.view.pending_permission_response,
-        Some(PermissionResponseTarget::Structured { session_id, nonce })
-            if session_id == id && nonce == "approval-1"
+        Some(PermissionResponseTarget::Structured { session_id, nonce: opened })
+            if session_id == id && opened == nonce
     ));
+}
+
+#[test]
+#[serial]
+fn choice_list_approval_is_routed_to_the_structured_view() {
+    let mut env = create_test_env_empty();
+    let id = add_session_with_tool(&mut env.view, "session-one", "claude");
+    env.view
+        .mutate_instance(&id, |inst| inst.view = crate::session::View::Structured);
+    env.view
+        .structured_pending_approvals
+        .insert(id.clone(), pending("approval-1"));
+    // Marquer l'entree comme liste de reponses (pi ask_user_question) : le
+    // dialog generique n'a pas les labels et Allow repondrait la premiere
+    // option de l'agent.
+    env.view.structured_pending_approvals.get_mut(&id).unwrap()[0].choice = true;
+    env.view.selected_session = Some(id.clone());
+
+    let _ = env.view.handle_key(key(KeyCode::Char('a')), None);
+
+    assert!(
+        env.view.permission_response_dialog.is_none(),
+        "a choice list must not open the generic allow/deny dialog"
+    );
+    assert!(
+        env.view.pending_permission_response.is_none(),
+        "no answer may be captured for a choice list outside the labels"
+    );
+    assert!(
+        env.view.info_dialog.is_some(),
+        "the user must be directed to the structured view"
+    );
 }
 
 #[test]
@@ -107,13 +147,14 @@ fn structured_session_reuses_the_permission_dialog() {
 fn resolved_structured_approval_clears_a_nonce_reintroduced_by_polling() {
     let mut env = create_test_env_empty();
     let id = add_session_with_tool(&mut env.view, "session-one", "claude");
+    let nonce = test_nonce();
     env.view
         .structured_pending_approvals
-        .insert(id.clone(), pending("approval-1"));
+        .insert(id.clone(), pending(&nonce));
 
     env.view.apply_structured_approval_result(ApprovalResult {
         session_id: id.clone(),
-        nonce: "approval-1".to_string(),
+        nonce,
         resolution: ApprovalResolution::Resolved,
     });
 
@@ -149,13 +190,14 @@ fn approval_choice_maps_to_the_correct_wire_decision() {
 fn gone_structured_approval_clears_and_informs() {
     let mut env = create_test_env_empty();
     let id = add_session_with_tool(&mut env.view, "session-one", "claude");
+    let nonce = test_nonce();
     env.view
         .structured_pending_approvals
-        .insert(id.clone(), pending("approval-1"));
+        .insert(id.clone(), pending(&nonce));
 
     env.view.apply_structured_approval_result(ApprovalResult {
         session_id: id.clone(),
-        nonce: "approval-1".to_string(),
+        nonce,
         resolution: ApprovalResolution::Gone,
     });
 
@@ -177,7 +219,7 @@ fn failed_structured_approval_informs_and_lets_polling_restore() {
     // The optimistic removal already ran; the poll has not re-added it yet.
     env.view.apply_structured_approval_result(ApprovalResult {
         session_id: id.clone(),
-        nonce: "approval-1".to_string(),
+        nonce: test_nonce(),
         resolution: ApprovalResolution::Failed("boom".to_string()),
     });
 

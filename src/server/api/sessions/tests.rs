@@ -3753,6 +3753,7 @@ async fn list_sessions_projects_pending_approvals_only_for_running_workers() {
             tool_name: "shell".to_string(),
             target: "echo hello".to_string(),
             destructive: false,
+            choice: false,
         }]
     );
 }

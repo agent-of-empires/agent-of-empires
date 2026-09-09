@@ -344,15 +344,24 @@ impl HomeView {
         use crate::session::Status;
         use crate::tui::status_poller::IdleIntent;
 
-        let (is_structured, applies, was_stopped) = match self.get_instance(&update.id) {
+        let (is_structured, applies, was_stopped, sunk) = match self.get_instance(&update.id) {
             Some(inst) => (
                 inst.is_structured(),
                 self.daemon_status_applies_to(inst),
                 inst.status == Status::Stopped,
+                inst.is_archived() || inst.is_trashed(),
             ),
             None => return,
         };
         if !is_structured || !applies {
+            // Archived and trashed rows stay in `instances`, so their cached
+            // approvals would outlive every state the daemon can refresh: the
+            // refresh path returns here. Dropping the cache on the transition
+            // keeps the permission action from opening an approval the
+            // resolver can only 404 on.
+            if sunk {
+                self.structured_pending_approvals.remove(&update.id);
+            }
             return;
         }
         if update.pending_approvals.is_empty() {

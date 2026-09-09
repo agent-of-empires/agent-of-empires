@@ -107,6 +107,7 @@ pub async fn list_sessions(
                         ),
                         tool_name: approval.tool_call.name,
                         destructive: approval.destructive,
+                        choice: approval.choice,
                     })
                     .collect();
             }

@@ -154,6 +154,13 @@ pub struct PendingApproval {
     pub tool_name: String,
     pub target: String,
     pub destructive: bool,
+    /// True when the options are a list of answers (`is_choice_list`), not
+    /// an allow/deny vocabulary. The home dialog must not answer these by
+    /// kind; the user picks from the labeled options in the structured
+    /// view. Defaults false for daemons that predate the field, matching
+    /// the pre-#3741 projection.
+    #[serde(default)]
+    pub choice: bool,
 }
 
 /// One session as `GET /api/sessions` reports it.

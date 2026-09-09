@@ -16,13 +16,15 @@
 //! resolves it, and the turn only completes (recording `ApprovalResolved`)
 //! once the resolve round-trips through the daemon.
 //!
-//! Compiled only with the `web` feature (structured view +
-//! `aoe add --structured-view` don't exist otherwise). Run via:
+//! Runs with the plain e2e feature set (ACP and the structured TUI are core;
+//! the `web` feature only adds the dashboard, which this test does not
+//! exercise). The fake agent is a Node script read from
+//! `web/tests/helpers/fakeAcpAgent.mjs` at runtime, not a build dependency.
+//! Auto-skips when Node or tmux is unavailable. Run via:
 //!
 //! ```sh
 //! cargo test --features e2e-tests --test e2e -- acp_home_approval
 //! ```
-#![cfg(feature = "web")]
 
 use std::time::{Duration, Instant};
 

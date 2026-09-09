@@ -2719,6 +2719,14 @@ impl<S: BroadcastSink> Supervisor<S> {
                     }
                     drop(reservation);
 
+                    // The respawned client starts with an empty
+                    // `pending_responders`, so requests still unresolved in
+                    // the log are orphaned by the crashed worker it replaced.
+                    // Same sweep the spawn/attach paths run, now that the new
+                    // client owns the session.
+                    cancel_orphaned_approvals_on(&*sink, &next_seqs, &session_id);
+                    cancel_orphaned_elicitations_on(&*sink, &next_seqs, &session_id);
+
                     info!(
                         target: "acp.supervisor",
                         session = %session_id,
@@ -3443,31 +3451,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// separately by the runner's outstanding-request cancellation on
     /// detach. No-op when there are no stale nonces.
     fn cancel_orphaned_approvals(&self, session_id: &str) {
-        let stale_nonces = self.sink.unresolved_approval_nonces(session_id);
-        if stale_nonces.is_empty() {
-            return;
-        }
-        info!(
-            target: "acp.supervisor",
-            session = %session_id,
-            stale = stale_nonces.len(),
-            "cancelling approvals orphaned by daemon restart"
-        );
-        for nonce in stale_nonces {
-            self.publish_next(
-                session_id,
-                &Event::ApprovalResolved {
-                    nonce,
-                    decision: ApprovalDecision::Cancelled,
-                },
-            );
-        }
-        self.publish_next(
-            session_id,
-            &Event::Stopped {
-                reason: "approval_cancelled_on_restart".to_string(),
-            },
-        );
+        cancel_orphaned_approvals_on(&*self.sink, &self.next_seqs, session_id);
     }
 
     /// Cancel elicitations (AskUserQuestion) that were on screen when the
@@ -3484,26 +3468,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// without an approval rides whatever turn state the replay rebuilt.
     /// No-op when there are no stale nonces.
     fn cancel_orphaned_elicitations(&self, session_id: &str) {
-        let stale_nonces = self.sink.unresolved_elicitation_nonces(session_id);
-        if stale_nonces.is_empty() {
-            return;
-        }
-        info!(
-            target: "acp.supervisor",
-            session = %session_id,
-            stale = stale_nonces.len(),
-            "cancelling elicitations orphaned by daemon restart"
-        );
-        for nonce in stale_nonces {
-            self.publish_next(
-                session_id,
-                &Event::ElicitationResolved {
-                    nonce,
-                    outcome: ElicitationOutcome::Cancelled,
-                    answers: Vec::new(),
-                },
-            );
-        }
+        cancel_orphaned_elicitations_on(&*self.sink, &self.next_seqs, session_id);
     }
 
     /// Whether this session has a structured view worker up or coming up.
@@ -3996,6 +3961,75 @@ async fn restart_decision(
 /// both used to start at seq=1 and collide in the replay buffer
 /// after a retry, which the client-side dedupe then rendered as a
 /// silently-lost first message.
+/// Cancel approvals left unresolved in the durable log by a dead worker:
+/// its replacement starts with an empty `pending_responders`, so the
+/// parked responders are gone and the cards would 404 on submit. Shared
+/// by the spawn/attach paths (`Supervisor` wrappers) and the drain task's
+/// respawn path, which owns its state and has no `&self`.
+fn cancel_orphaned_approvals_on<S: BroadcastSink>(sink: &S, next_seqs: &SeqMap, session_id: &str) {
+    let stale_nonces = sink.unresolved_approval_nonces(session_id);
+    if stale_nonces.is_empty() {
+        return;
+    }
+    info!(
+        target: "acp.supervisor",
+        session = %session_id,
+        stale = stale_nonces.len(),
+        "cancelling approvals orphaned by daemon restart"
+    );
+    for nonce in stale_nonces {
+        let seq = next_seq(next_seqs, session_id);
+        sink.publish(
+            session_id,
+            seq,
+            &Event::ApprovalResolved {
+                nonce,
+                decision: ApprovalDecision::Cancelled,
+            },
+        );
+    }
+    let seq = next_seq(next_seqs, session_id);
+    sink.publish(
+        session_id,
+        seq,
+        &Event::Stopped {
+            reason: "approval_cancelled_on_restart".to_string(),
+        },
+    );
+}
+
+/// Elicitation parallel of [`cancel_orphaned_approvals_on`]; no synthetic
+/// `Stopped` here because the approvals helper already emits one when the
+/// same restart had a parked approval.
+fn cancel_orphaned_elicitations_on<S: BroadcastSink>(
+    sink: &S,
+    next_seqs: &SeqMap,
+    session_id: &str,
+) {
+    let stale_nonces = sink.unresolved_elicitation_nonces(session_id);
+    if stale_nonces.is_empty() {
+        return;
+    }
+    info!(
+        target: "acp.supervisor",
+        session = %session_id,
+        stale = stale_nonces.len(),
+        "cancelling elicitations orphaned by daemon restart"
+    );
+    for nonce in stale_nonces {
+        let seq = next_seq(next_seqs, session_id);
+        sink.publish(
+            session_id,
+            seq,
+            &Event::ElicitationResolved {
+                nonce,
+                outcome: ElicitationOutcome::Cancelled,
+                answers: Vec::new(),
+            },
+        );
+    }
+}
+
 fn next_seq(next_seqs: &SeqMap, session_id: &str) -> u64 {
     let mut guard = match next_seqs.lock() {
         Ok(g) => g,

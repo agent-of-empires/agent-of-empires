@@ -6514,7 +6514,13 @@ impl HomeView {
         let Some(inst) = self.get_instance(&id) else {
             return;
         };
-        if matches!(inst.status, Status::Creating | Status::Deleting) {
+        // Archived and trashed rows keep no live worker, so any cached
+        // approval they might still carry is stale and its resolve can only
+        // 404.
+        if matches!(inst.status, Status::Creating | Status::Deleting)
+            || inst.is_archived()
+            || inst.is_trashed()
+        {
             return;
         }
         let title = inst.title.clone();
@@ -6532,6 +6538,16 @@ impl HomeView {
                 ));
                 return;
             };
+            // A choice list is answers, not allow/deny: the generic dialog
+            // has no labels to show and its Allow would answer the agent's
+            // first option. Send the user where the choices are rendered.
+            if approval.choice {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Answer in the Structured View",
+                    "This request offers several answers, not allow/deny.                      Open the structured view to pick one.",
+                ));
+                return;
+            }
             self.permission_response_dialog =
                 Some(crate::tui::dialogs::PermissionResponseDialog::structured(
                     &title,
