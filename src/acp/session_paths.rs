@@ -1,24 +1,21 @@
 //! Display helpers for session-scoped file paths.
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub struct SessionPathRoots {
     pub id: String,
     pub project_path: String,
     pub main_repo_path: Option<String>,
-    #[serde(default)]
     pub workspace_repos: Vec<WorkspaceRepoRoot>,
 }
 
-/// Session metadata the native structured view needs alongside its path roots.
-/// All fields come from the existing `/api/sessions` payload, so one fetch can
-/// hydrate both the friendly header and repo-relative tool paths.
-#[derive(Debug, Clone, serde::Deserialize)]
+/// Session metadata the native structured view needs alongside its path roots,
+/// projected from one `/api/sessions` row so a single fetch hydrates both the
+/// friendly header and repo-relative tool paths.
+#[derive(Debug, Clone)]
 pub struct SessionViewInfo {
     pub title: String,
     pub tool: String,
-    #[serde(default)]
     pub acp_agent: Option<String>,
-    #[serde(flatten)]
     pub paths: SessionPathRoots,
 }
 
@@ -28,7 +25,30 @@ impl SessionViewInfo {
     }
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+impl From<crate::daemon::SessionResponse> for SessionViewInfo {
+    fn from(session: crate::daemon::SessionResponse) -> Self {
+        Self {
+            title: session.title,
+            tool: session.tool,
+            acp_agent: session.acp_agent,
+            paths: SessionPathRoots {
+                id: session.id,
+                project_path: session.project_path,
+                main_repo_path: session.main_repo_path,
+                workspace_repos: session
+                    .workspace_repos
+                    .into_iter()
+                    .map(|repo| WorkspaceRepoRoot {
+                        name: repo.name,
+                        source_path: repo.source_path,
+                    })
+                    .collect(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct WorkspaceRepoRoot {
     pub name: String,
     pub source_path: String,

@@ -583,7 +583,7 @@ pub(crate) fn apply_status_intent(
     inst.status = target;
     let now = chrono::Utc::now();
     // last_accessed_at is deliberately NOT stamped here (#3465 residual):
-    // the value relays through DaemonStatusPoller into TUI memory, and
+    // the value relays through SessionFeed into TUI memory, and
     // save()'s merge_from_tui monotone max persists it ungated, so the
     // touched arm of merge_user_action_diff wiped concurrent archives.
     // Structured rows take real touches from user prompts instead.
@@ -2054,7 +2054,7 @@ mod tests {
     fn status_intent_transitions_preserve_last_accessed_at() {
         // #3465 residual: the intent applier used to restamp
         // last_accessed_at on every transition. The value relays through
-        // DaemonStatusPoller into TUI memory and save()'s merge_from_tui
+        // SessionFeed into TUI memory and save()'s merge_from_tui
         // monotone max persists it, so a phantom stamp here wiped
         // concurrent archives through merge_user_action_diff's touched
         // arm. Structured rows take real touches from user prompts

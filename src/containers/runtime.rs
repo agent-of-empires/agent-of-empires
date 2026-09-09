@@ -382,6 +382,29 @@ impl ContainerRuntime {
         ))
     }
 
+    /// Whether `name` was created with the shared credential mounts `config`
+    /// carries. An agent that shares none matches every container.
+    pub fn shared_credential_mounts_match(
+        &self,
+        name: &str,
+        config: &ContainerConfig,
+    ) -> Result<Option<bool>> {
+        if config.shared_credential_mounts.is_empty() {
+            return Ok(Some(true));
+        }
+        if !self.base.supports_labels {
+            return Ok(None);
+        }
+        let expected = config.shared_credential_label();
+        Ok(Some(
+            self.inspect_container_label(
+                name,
+                crate::containers::container_interface::SHARED_CREDENTIAL_MOUNTS_LABEL,
+            )?
+            .is_some_and(|value| value == expected),
+        ))
+    }
+
     pub fn mount_fingerprint_matches(&self, name: &str, expected: &str) -> Result<Option<bool>> {
         if !self.base.supports_labels {
             return Ok(None);

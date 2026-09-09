@@ -71,7 +71,7 @@ const PAGES = [
   {
     source: "docs/guides/web-dashboard.md",
     dest: "guides/web-dashboard.md",
-    title: "Web Dashboard (Experimental)",
+    title: "Web Dashboard",
     description:
       "Remote access to AI coding agent sessions from any browser with Agent of Empires.",
   },

@@ -131,8 +131,15 @@ pub struct ContainerConfig {
     pub selinux_relabel: bool,
     /// Runtime-only evidence that this config installed an identity publisher.
     pub identity_publisher_installed: bool,
+    /// Container paths of the credential files every store of the agent
+    /// shares, one bind mount each. Labelled at create, so a container built
+    /// before a file was shared, which mounts only the store, can be told apart.
+    pub shared_credential_mounts: Vec<String>,
     pub run_policy: RunPolicy,
 }
+
+pub(crate) const SHARED_CREDENTIAL_MOUNTS_LABEL: &str =
+    "com.agent-of-empires.shared-credential-mounts";
 
 impl ContainerConfig {
     pub(crate) fn mount_fingerprint(&self) -> String {
@@ -158,6 +165,10 @@ impl ContainerConfig {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect()
+    }
+
+    pub(crate) fn shared_credential_label(&self) -> String {
+        self.shared_credential_mounts.join(",")
     }
 
     pub(crate) fn path_is_mounted(

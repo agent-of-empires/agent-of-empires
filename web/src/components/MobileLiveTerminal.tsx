@@ -13,7 +13,7 @@ import {
 } from "../lib/liveTermLines";
 import { cursorLineIndex, pointerPaneCell, wheelNotches } from "../lib/liveMouse";
 import { registerMobileKeyboardProxyReceiver, type MobileKeyboardProxyInput } from "../lib/mobileKeyboardProxy";
-import { writeClipboard } from "../lib/clipboard";
+import { bracketedPaste, writeClipboard } from "../lib/clipboard";
 import type { LiveFrame, LiveStats } from "../hooks/useLiveTerminal";
 import { useWebSettings } from "../hooks/useWebSettings";
 import { useIsCoarsePointer } from "../hooks/useIsCoarsePointer";
@@ -852,6 +852,8 @@ export function MobileLiveTerminal({
     const rows: AnsiSegment[][] = [];
     // Visual row index where each pane line starts (for cursor math).
     const lineStartRow: number[] = new Array(lines.length);
+    // Pane line and wrap offset of each visual row (for row identity).
+    const source: Array<{ line: number; wrap: number }> = [];
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i]!;
       let wrapped = wrapCache.get(line);
@@ -860,9 +862,12 @@ export function MobileLiveTerminal({
         wrapCache.set(line, wrapped);
       }
       lineStartRow[i] = rows.length;
-      for (const row of wrapped.rows) rows.push(row);
+      for (let wrap = 0; wrap < wrapped.rows.length; wrap++) {
+        rows.push(wrapped.rows[wrap]!);
+        source.push({ line: i, wrap });
+      }
     }
-    return { rows, lineStartRow };
+    return { rows, lineStartRow, source };
   }, [lines, renderCols, wrapCache]);
   const screenRows = frame?.rows ?? 0;
   const history = frame?.history ?? 0;
@@ -1675,12 +1680,7 @@ export function MobileLiveTerminal({
           typedWordRef.current = dropLastCodePoint(run);
           break;
         case "insertFromPaste": {
-          const text = input.data ?? "";
-          if (text) {
-            // Bracketed paste so agents treat embedded newlines as
-            // pasted text, not per-line submits.
-            sendData(`\x1b[200~${text}\x1b[201~`);
-          }
+          if (input.data) sendData(bracketedPaste(input.data));
           break;
         }
         default:
@@ -1783,8 +1783,7 @@ export function MobileLiveTerminal({
       e.preventDefault();
 
       if (imageFiles.length === 0) {
-        // Bracketed paste so agents treat embedded newlines as pasted text.
-        if (text) sendData(`\x1b[200~${text}\x1b[201~`);
+        if (text) sendData(bracketedPaste(text));
         return;
       }
 
@@ -1799,7 +1798,7 @@ export function MobileLiveTerminal({
         if (parts.length === 0) return;
         // Leading and trailing spaces keep the path from gluing onto queued
         // text or the user's next keystroke. No newline: never auto-submit.
-        sendData(`\x1b[200~ ${parts.join(" ")} \x1b[201~`);
+        sendData(bracketedPaste(` ${parts.join(" ")} `));
       })();
     },
     [sendData, uploadPastedImage],
@@ -2043,30 +2042,29 @@ export function MobileLiveTerminal({
             opt out (`bottomAlign=false`) so a near-empty bash prompt sits at
             the top like a normal terminal. */}
         <div className={`relative whitespace-pre ${bottomAlign ? "mt-auto" : ""}`} data-live-content>
-          {mounted.blocks.map(({ padLines, start, end }) => {
-            return (
-              <Fragment key={`${start}-${end}`}>
-                {padLines > 0 && <div style={{ height: `${padLines * lineH}px` }} aria-hidden="true" />}
-                {visual.rows.slice(start, end).map((segs, j) => {
-                  const i = start + j;
-                  // Keyed by ABSOLUTE buffer position (spacer + window row),
-                  // which is invariant as the agent appends: history grows by
-                  // k, the capture window slides by k, and a given content
-                  // line keeps spacer+index. With a viewport-relative key an
-                  // append shifted every row onto a new key and re-rendered
-                  // the entire mounted slice per streamed frame.
-                  return (
-                    <Row
-                      key={effectiveSpacerLines + i}
-                      segs={segs}
-                      cursorCol={i === cursorRow ? live.col : null}
-                      focused={i === cursorRow && focused}
-                    />
-                  );
-                })}
-              </Fragment>
-            );
-          })}
+          {mounted.blocks.flatMap(({ padLines, start, end }, block) => [
+            padLines > 0 ? (
+              <div key={`pad-${block}`} style={{ height: `${padLines * lineH}px` }} aria-hidden="true" />
+            ) : null,
+            // Rows are keyed by pane line (spacer + window line, invariant as
+            // the agent appends: history grows by k and the window slides by
+            // k) plus wrap offset, so a wrapped row keeps its identity too.
+            // The pads sit beside them in one flat list because any wrapper
+            // keyed on the mounted range would remount every row (and drop
+            // the user's selection) each time the range moved by a line.
+            ...visual.rows.slice(start, end).map((segs, j) => {
+              const i = start + j;
+              const src = visual.source[i]!;
+              return (
+                <Row
+                  key={`${effectiveSpacerLines + src.line}:${src.wrap}`}
+                  segs={segs}
+                  cursorCol={i === cursorRow ? live.col : null}
+                  focused={i === cursorRow && focused}
+                />
+              );
+            }),
+          ])}
           {bottomPadLines > 0 && <div style={{ height: `${bottomPadLines * lineH}px` }} aria-hidden="true" />}
         </div>
       </div>

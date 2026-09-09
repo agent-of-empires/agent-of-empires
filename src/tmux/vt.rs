@@ -773,7 +773,9 @@ fn sh_quote(s: &str) -> String {
 
 /// The pane's geometry AND cursor in one `display-message` fork:
 /// `(pane_width, pane_height, cursor_x, cursor_y)`, the cursor 0-based in
-/// visible-screen coordinates (the space `assemble_seed_stream`'s CUP uses).
+/// visible-screen coordinates, the space [`reconcile_step`] compares the grid's
+/// cursor in once the two agree on geometry. [`seeded_cursor_row`] is what maps
+/// it onto a grid whose height differs.
 ///
 /// Folded into the geometry probe rather than run as a second fork because
 /// [`VtChannel::reconcile_grid`] needs both on the same once-a-second budget:
@@ -890,8 +892,9 @@ fn reconcile_step(
 /// state before and after the `capture-pane` fork and retries while the two
 /// disagree, so a pane that scrolled, moved its cursor, or flipped screens
 /// mid-seed can't stamp a stale position into the fresh grid. `history_size`
-/// and `pane_height` exist for that comparison alone, mirroring the drift
-/// fields `merge_cursor_probes` trusts on the legacy capture path.
+/// exists for that comparison alone, mirroring the drift fields
+/// `merge_cursor_probes` trusts on the legacy capture path; `pane_height` also
+/// anchors [`seeded_cursor_row`].
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct PaneSeedState {
     alt: bool,
@@ -916,7 +919,8 @@ struct PaneSeedState {
     /// pane that scrolled between the probes grew its history, even when the
     /// cursor stayed pinned to the same bottom row.
     history_size: u32,
-    /// `#{pane_height}`: resize detector for the same check; a resize mid-seed
+    /// `#{pane_height}`: resize detector for the same check, and the height
+    /// [`seeded_cursor_row`] counts `cursor_y` back from; a resize mid-seed
     /// invalidates the coordinate space `cursor_y` was reported in.
     pane_height: u16,
     /// `#{pane_width}`: the other resize axis. A width-only resize rewraps the
@@ -1095,8 +1099,7 @@ fn seed_parser(
     guard: SeedGuard<'_>,
     fence: SeedInstallFence<'_>,
 ) -> VtRefreshResult {
-    let (_, rows) = size;
-    let Some(stream) = capture_seed_stream(target, rows, deadline) else {
+    let Some(stream) = capture_seed_stream(target, size, deadline) else {
         return VtRefreshResult::Failed;
     };
     install_seeded_parser(sink, since, &stream, size, guard, fence)
@@ -1154,10 +1157,11 @@ fn install_seeded_parser(
 /// generation check `swap_seeded_parser` needs.
 fn capture_seed_stream(
     target: &str,
-    rows: u16,
+    size: (u16, u16),
     deadline: &crate::tmux::TmuxCommandDeadline,
 ) -> Option<Vec<u8>> {
-    let (body, state) = capture_seed_snapshot(target, deadline)?;
+    let (cols, rows) = size;
+    let (body, state) = capture_seed_snapshot(target, (cols, rows), deadline)?;
     Some(assemble_seed_stream(&body, &state, rows))
 }
 
@@ -1236,10 +1240,11 @@ fn swap_drained_seeded_parser(
     swap_seeded_parser(sink, since, stream, size, drained_guard.guard)
 }
 /// How many times [`capture_seed_snapshot`] re-runs the probe/capture/probe
-/// round before settling for its last (possibly raced) snapshot. Each retry
-/// costs two forks plus a short settle sleep, and only fires while the pane is
-/// actively changing under the seed, so the bound is about capping seed latency
-/// on a pane that streams continuously, not about a steady state.
+/// round before settling for its last (possibly raced or off-geometry)
+/// snapshot. Each retry costs two forks plus a short settle sleep, and only
+/// fires while the pane is changing or is not yet at the size being seeded, so
+/// the bound is about capping seed latency on a pane that streams continuously
+/// or is mid-resize, not about a steady state.
 const SEED_PROBE_ATTEMPTS: usize = 3;
 
 /// Pause between disagreeing seed attempts, letting a mid-flight burst (a
@@ -1273,6 +1278,7 @@ const SEED_INSTALL_RETRY: Duration = Duration::from_millis(20);
 /// residue).
 fn capture_seed_snapshot(
     target: &str,
+    want: (u16, u16),
     deadline: &crate::tmux::TmuxCommandDeadline,
 ) -> Option<(Vec<u8>, PaneSeedState)> {
     let seed_start = format!("-{SCROLLBACK_LINES}");
@@ -1324,16 +1330,24 @@ fn capture_seed_snapshot(
         }
         let post = parse_seed_state(probe_line);
         let agreed = pre == post;
+        // A capture taken at the geometry we are seeding at needs no mapping and
+        // lays its cells out for the grid that will hold them, so it is worth
+        // one more probe. Bounded by the same attempt budget and only ever
+        // entered while the pane disagrees, so the settled case still returns on
+        // the first pass.
+        let at_want = (post.pane_width, post.pane_height) == want;
         last = Some((body.to_vec(), post));
-        if agreed {
+        if agreed && at_want {
             return last;
         }
     }
-    if last.is_some() {
+    if let Some((_, state)) = last.as_ref() {
         tracing::debug!(
             %target,
             attempts = SEED_PROBE_ATTEMPTS,
-            "vt seed: bracketing probes never agreed; seeding from last snapshot"
+            probe = ?(state.pane_width, state.pane_height),
+            want = ?want,
+            "vt seed: no settled snapshot at the target geometry; seeding from last"
         );
     }
     last
@@ -1384,16 +1398,16 @@ fn split_seed_capture(raw: &[u8]) -> (&[u8], &str) {
 /// absolute CUP and the DECTCEM show/hide.
 ///
 /// The body is fed faithfully, including the blank rows capture-pane pads out to
-/// the full pane height, so the parser's visible screen is a pixel-for-pixel
-/// replica of the pane. Only the single trailing line terminator is dropped:
+/// the full pane height, so the parser's visible screen replicates the pane
+/// whenever the two are the same height. When they are not, the surplus rows
+/// scroll into the grid's history and [`seeded_cursor_row`] carries the cursor
+/// with them; the cells stay offset until a reseed at matching geometry. Only the single trailing line terminator is dropped:
 /// with it, the final `\n` would push the whole screen up one row (the top row
-/// scrolls into history) and misplace every cell. Because the visible screen is
-/// faithful, the CUP is a plain 1-based `#{cursor_y}` / `#{cursor_x}`, which
-/// addresses the visible screen regardless of how much scrollback sits behind
-/// it (that is the coordinate space tmux reports the cursor in). Without this,
-/// the parser's cursor lands after the last replayed glyph, bottom-right for a
-/// full-screen app, until the first live chunk carries the app's own escapes
-/// (issue #2902).
+/// scrolls into history) and misplace every cell. The CUP that follows carries
+/// `#{cursor_x}` and the row [`seeded_cursor_row`] maps `#{cursor_y}` onto.
+/// Without it the parser's cursor lands after the last replayed glyph,
+/// bottom-right for a full-screen app, until the first live chunk carries the
+/// app's own escapes (issue #2902).
 fn assemble_seed_stream(body: &[u8], state: &PaneSeedState, rows: u16) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::with_capacity(body.len() + 32);
     if state.alt {
@@ -1418,10 +1432,9 @@ fn assemble_seed_stream(body: &[u8], state: &PaneSeedState, rows: u16) -> Vec<u8
         out.extend_from_slice(b"\x1b[?1h");
     }
     out.extend_from_slice(&lf_to_crlf(strip_trailing_row_terminator(body)));
-    // 1-based CUP in visible-screen coordinates, clamped to the grid so a stale
-    // query (the pane moved between the state read and this seed) can't push the
-    // cursor off-screen; the first live chunk re-syncs it either way.
-    let cy = state.cursor_y.min(rows.saturating_sub(1)) + 1;
+    // 1-based CUP, clamped to the grid so a state read this far off can't push
+    // the cursor off-screen; the first live chunk re-syncs it either way.
+    let cy = seeded_cursor_row(body, state, rows).min(rows.saturating_sub(1)) + 1;
     let cx = state.cursor_x + 1;
     out.extend_from_slice(format!("\x1b[{cy};{cx}H").as_bytes());
     out.extend_from_slice(if state.cursor_visible {
@@ -1430,6 +1443,40 @@ fn assemble_seed_stream(body: &[u8], state: &PaneSeedState, rows: u16) -> Vec<u8
         b"\x1b[?25l"
     });
     out
+}
+
+/// The seeded grid's own row for the pane cursor tmux reported at
+/// `state.cursor_y`.
+///
+/// tmux counts `cursor_y` from the top of the pane's visible screen, so that is
+/// the grid's row only while the grid is exactly as tall as the pane the body
+/// came from. A reseed racing a `resize-window` breaks that: the capture reads
+/// the pane at its old, taller height, the surplus rows scroll off the top of
+/// the shorter grid and carry the pane's content up with them, and a bare
+/// `cursor_y` leaves the cursor parked that many rows BELOW the content. The
+/// app's next redraw prints its prompt there, so the grid ends up holding two
+/// prompt rows where the pane has one, and no reconcile can see it: grid and
+/// pane still agree on geometry and on the cursor, only the cells differ.
+///
+/// Bottom-anchoring the row survives a mismatch either way, and reduces to
+/// `cursor_y` whenever the two heights agree. A `pane_height` of 0 means the
+/// probe carried no geometry, so keep the plain mapping there.
+///
+/// `tui::home::render::map_live_preview_cursor` bottom-anchors the same pane
+/// cursor onto the TUI preview rect (#2742, #3515); keep the two in step.
+fn seeded_cursor_row(body: &[u8], state: &PaneSeedState, rows: u16) -> u16 {
+    if state.pane_height == 0 {
+        return state.cursor_y;
+    }
+    let fed = strip_trailing_row_terminator(body);
+    let body_rows = if fed.is_empty() {
+        0
+    } else {
+        u16::try_from(fed.iter().filter(|&&b| b == b'\n').count() + 1).unwrap_or(u16::MAX)
+    };
+    // Rows of the body the grid still shows; the rest scrolled into history.
+    let visible = body_rows.min(rows);
+    visible.saturating_sub(state.pane_height.saturating_sub(state.cursor_y))
 }
 
 /// Drop the single trailing line terminator (`\n` or `\r\n`) from a
@@ -3819,6 +3866,7 @@ mod tests {
             cursor_x: 3,
             cursor_y: 1,
             cursor_visible: true,
+            pane_height: rows,
             ..Default::default()
         };
         let mut p = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
@@ -3879,6 +3927,7 @@ mod tests {
             cursor_x: 2,
             cursor_y: 1,
             cursor_visible: true,
+            pane_height: rows,
             ..Default::default()
         };
         let mut p = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
@@ -3895,6 +3944,90 @@ mod tests {
             "newest row must be on the visible screen:\n{}",
             p.screen().contents()
         );
+    }
+
+    #[test]
+    fn seed_keeps_cursor_on_the_prompt_when_the_pane_outgrows_the_grid() {
+        // #3824. A reseed that runs before `resize-window` lands captures the
+        // pane at its OLD height, so the body is taller than the grid being
+        // built and its top rows scroll into history, carrying the content up.
+        // The cursor has to travel with them; left at a bare `#{cursor_y}` it
+        // parks below the prompt, and the app's next SIGWINCH redraw prints a
+        // second prompt row there that no reconcile can see (grid and pane
+        // agree on geometry and cursor, only the cells differ).
+        let rows: u16 = 6;
+        let cols: u16 = 20;
+        // Pane is two rows taller than the grid: three content rows, a prompt,
+        // and the blank rows capture-pane pads to the pane height.
+        let pane_height: u16 = 8;
+        let mut body = Vec::new();
+        for i in 0..3 {
+            body.extend_from_slice(format!("line-{i}\n").as_bytes());
+        }
+        body.extend_from_slice(b"READY> \n");
+        for _ in 4..pane_height {
+            body.extend_from_slice(b"\n");
+        }
+        let state = PaneSeedState {
+            cursor_x: 7,
+            cursor_y: 3,
+            cursor_visible: true,
+            pane_height,
+            ..Default::default()
+        };
+        let mut p = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
+        p.process(&assemble_seed_stream(&body, &state, rows));
+
+        // Two body rows scrolled off, so the prompt sits on row 1 and the
+        // cursor must be on it, not two rows below on row 3.
+        assert_eq!(
+            p.screen().cursor_position(),
+            (1, 7),
+            "cursor must follow the prompt row the taller body pushed up:\n{}",
+            p.screen().contents()
+        );
+        assert!(
+            p.screen().contents().contains("READY>"),
+            "prompt must be on the visible screen:\n{}",
+            p.screen().contents()
+        );
+    }
+
+    #[test]
+    fn seeded_cursor_row_reduces_to_cursor_y_when_heights_agree() {
+        // The mapping must be the identity on the normal path (any scrollback
+        // depth, grid as tall as the pane) and fall back to it when the probe
+        // reported no geometry at all.
+        let body = |rows: usize| -> Vec<u8> {
+            let mut out = Vec::new();
+            for i in 0..rows {
+                out.extend_from_slice(format!("r{i}\n").as_bytes());
+            }
+            out
+        };
+        // (body rows, pane_height, cursor_y, grid rows, expected row)
+        let cases: [(usize, u16, u16, u16, u16); 4] = [
+            (4, 4, 2, 4, 2),
+            // Six rows of scrollback ahead of a 4-row pane.
+            (10, 4, 2, 4, 2),
+            // No geometry in the probe: keep the plain mapping.
+            (4, 0, 2, 4, 2),
+            // Grid taller than the pane, so nothing scrolled off: the body's
+            // own history still offsets the cursor by its depth.
+            (4, 2, 1, 6, 3),
+        ];
+        for (body_rows, pane_height, cursor_y, rows, want) in cases {
+            let state = PaneSeedState {
+                cursor_y,
+                pane_height,
+                ..Default::default()
+            };
+            assert_eq!(
+                seeded_cursor_row(&body(body_rows), &state, rows),
+                want,
+                "body_rows={body_rows} pane_height={pane_height} cursor_y={cursor_y} rows={rows}"
+            );
+        }
     }
 
     #[test]
@@ -5326,6 +5459,78 @@ mod tests {
     fn record_seed_links(slot: &LinkTable, stream: &[u8]) {
         reconcile_links(slot, crate::tmux::osc8::extract_links(stream));
     }
+    /// The unit tests hand-build a `PaneSeedState`; this drives the real
+    /// probe/capture/seed path against a live pane whose height differs from
+    /// the grid being seeded, which is the shape #3824 turned on. Skips when
+    /// tmux is unavailable, like the OSC 8 test below.
+    #[test]
+    #[serial_test::serial]
+    fn real_tmux_seed_lands_the_cursor_on_the_prompt_at_a_shorter_grid() {
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
+            eprintln!("Skipping test: tmux unavailable");
+            return;
+        }
+        let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_seed_geom");
+        // The live spec's fixture: scrollback, then a prompt the cursor parks on.
+        let script = "for i in $(seq 1 20); do echo \"line-$i\"; done; printf 'READY> '; sleep 30";
+        let out = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                guard.name(),
+                "-x",
+                "80",
+                "-y",
+                "40",
+                script,
+            ])
+            .output()
+            .expect("tmux new-session");
+        assert!(out.status.success());
+        let target = format!("{}:^.0", guard.name());
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+
+        // Wait for the prompt to be painted before seeding.
+        let mut probe = PaneSeedState::default();
+        for _ in 0..50 {
+            probe = pane_seed_state(&target, &deadline).unwrap_or_default();
+            if probe.cursor_y == 20 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(
+            (probe.pane_height, probe.cursor_y),
+            (40, 20),
+            "fixture must park the cursor on the prompt row of a 40-row pane"
+        );
+
+        // Seed a grid SHORTER than the pane, the racing shape: the body's top
+        // rows scroll into history and take the prompt with them.
+        let rows: u16 = 24;
+        let stream =
+            capture_seed_stream(&target, (80, rows), &deadline).expect("capture seed stream");
+        let mut p = vt100::Parser::new(rows, 80, SCROLLBACK_LINES);
+        p.process(&stream);
+
+        let (cy, cx) = p.screen().cursor_position();
+        let contents = p.screen().contents();
+        let prompt_row = contents
+            .lines()
+            .position(|l| l.contains("READY>"))
+            .expect("prompt must be on the visible screen");
+        assert_eq!(
+            (cy as usize, cx),
+            (prompt_row, 7),
+            "cursor must sit on the prompt row the shorter grid pushed up:\n{contents}"
+        );
+        assert_eq!(
+            contents.lines().filter(|l| l.contains("READY>")).count(),
+            1,
+            "one prompt row only:\n{contents}"
+        );
+    }
 
     /// The seed and the capture fallback both read `capture-pane -e`, and the
     /// whole fix rests on tmux re-emitting a stored hyperlink there. Assert it
@@ -5367,7 +5572,7 @@ mod tests {
         let deadline = crate::tmux::TmuxCommandDeadline::new();
         let mut stream = Vec::new();
         for _ in 0..50 {
-            stream = capture_seed_stream(&target, 24, &deadline).unwrap_or_default();
+            stream = capture_seed_stream(&target, (80, 24), &deadline).unwrap_or_default();
             if !crate::tmux::osc8::extract_links(&stream).is_empty() {
                 break;
             }

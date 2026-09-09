@@ -11,7 +11,7 @@ use crate::session::sandbox_store_reclaim as reclaim;
 pub enum SandboxCommands {
     /// Report per-session agent stores whose session no longer exists in any
     /// profile, and how much disk they hold. Reports only unless `--delete`
-    /// is given: each store holds a copy of that agent's credentials.
+    /// is given: a store can hold a copy of that agent's credentials.
     Reclaim(ReclaimArgs),
 }
 
