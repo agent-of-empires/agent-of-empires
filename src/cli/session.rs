@@ -208,6 +208,10 @@ pub struct RenameArgs {
     /// Off by default; ignored for untied / non-worktree sessions.
     #[arg(long)]
     rename_branch: bool,
+
+    /// Rename only the branch to this exact Git ref; preserve the workspace directory
+    #[arg(long, conflicts_with = "rename_branch")]
+    branch: Option<String>,
 }
 
 #[derive(Args)]
@@ -1729,8 +1733,8 @@ fn rename_success_message(
 }
 
 async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
-    if args.title.is_none() && args.group.is_none() {
-        bail!("At least one of --title or --group must be specified");
+    if args.title.is_none() && args.group.is_none() && args.branch.is_none() {
+        bail!("At least one of --title, --group or --branch must be specified");
     }
 
     let storage = Storage::open_unwatched(profile)?;
@@ -1761,7 +1765,7 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
 
     let id = inst.id.clone();
     let title_requested = args.title.is_some();
-    let session_lock_required = title_requested || args.rename_branch;
+    let session_lock_required = title_requested || args.rename_branch || args.branch.is_some();
 
     // The initial load only resolves the requested row. Serialize every
     // identity-changing rename from the fresh duplicate check through external
@@ -1818,7 +1822,7 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
     // the two cannot drift. Decided per-session from the resolved setting.
     let config = crate::session::config::profile_config::resolve_config_or_warn(profile);
     let tied = inst.tie_workdir_applies(config.session.tie_workdir_to_name);
-    let tied_edit = tied && (args.title.is_some() || args.rename_branch);
+    let tied_edit = tied && args.branch.is_none() && (args.title.is_some() || args.rename_branch);
     let duplicate_path = if tied_edit {
         crate::session::worktree_edit::derived_worktree_path(
             std::path::Path::new(&inst.project_path),
@@ -1842,7 +1846,27 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
 
     let mut new_path: Option<String> = None;
     let mut new_branch: Option<String> = None;
-    if tied_edit {
+    if let Some(branch) = &args.branch {
+        let info = inst
+            .worktree_info
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Branch-only rename requires a managed worktree"))?;
+        if authoritative_instances.iter().any(|other| {
+            other.id != id
+                && other.worktree_info.as_ref().is_some_and(|wt| {
+                    wt.main_repo_path == info.main_repo_path && wt.branch == info.branch
+                })
+        }) {
+            bail!("Another session shares this branch; rename is not isolated");
+        }
+        if crate::session::worktree_edit::rename_worktree_branch(
+            info,
+            std::path::Path::new(&inst.project_path),
+            branch,
+        )? {
+            new_branch = Some(branch.clone());
+        }
+    } else if tied_edit {
         let current_path = inst.project_path.clone();
         let worktree_info = inst
             .worktree_info
@@ -1950,6 +1974,30 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
     let (persisted_old_title, committed_title) = match persist {
         Ok(titles) => titles,
         Err(error) => {
+            if args.branch.is_some() {
+                if let Some(branch) = &new_branch {
+                    let info = inst
+                        .worktree_info
+                        .as_ref()
+                        .expect("branch rename checked worktree metadata");
+                    let stored = storage.load().map_err(|_| anyhow::anyhow!("Session metadata write failed ({error}) and its state cannot be read. Branch is {branch}; directory unchanged. Inspect before retrying."))?;
+                    let persisted_branch = stored
+                        .iter()
+                        .find(|row| row.id == id)
+                        .and_then(|row| row.worktree_info.as_ref())
+                        .map(|wt| wt.branch.as_str());
+                    if persisted_branch == Some(info.branch.as_str()) {
+                        let git = crate::git::GitWorktree::new(std::path::PathBuf::from(
+                            &info.main_repo_path,
+                        ))?;
+                        if let Err(rollback) = git.rename_branch(branch, &info.branch) {
+                            bail!("Session metadata failed: {error}; branch rollback also failed: {rollback}. The directory is unchanged; inspect Git and session metadata before continuing.");
+                        }
+                    } else if persisted_branch != Some(branch.as_str()) {
+                        bail!("Session metadata failed: {error}; its branch changed concurrently. Directory unchanged; inspect before continuing.");
+                    }
+                }
+            }
             // When the git move already landed, surface that the disk and
             // metadata are out of sync rather than a bare persist error.
             if let Some(path) = &new_path {
@@ -1984,6 +2032,11 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
             println!("  Branch renamed to: {}", branch);
         }
     }
+    if args.branch.is_some() {
+        if let Some(branch) = &new_branch {
+            println!("✓ Branch renamed to: {branch} (directory unchanged)");
+        }
+    }
     println!(
         "{}",
         rename_success_message(&persisted_old_title, &committed_title, title_requested,)
@@ -1997,6 +2050,145 @@ mod rename_tests {
     use super::{rename_session, rename_success_message, RenameArgs};
     use crate::session::{Instance, Status, Storage};
     use serial_test::serial;
+
+    #[tokio::test]
+    #[serial]
+    async fn explicit_branch_rename_keeps_directory_and_commits_session_metadata() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let worktree = temp.path().join("wt-stable-id");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init", "--initial-branch=main"]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ]);
+        git(&[
+            "worktree",
+            "add",
+            "-b",
+            "experiment",
+            worktree.to_str().unwrap(),
+        ]);
+        std::fs::write(worktree.join("uncommitted.txt"), "keep this exactly").unwrap();
+        let mut instance = Instance::new("Experiment", worktree.to_str().unwrap());
+        instance.status = Status::Running;
+        instance.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "experiment".into(),
+            main_repo_path: repo.to_string_lossy().into(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: Some("main".into()),
+        });
+        let id = instance.id.clone();
+        let storage = Storage::new_unwatched("stable-branch").unwrap();
+        storage
+            .update(|instances, _| {
+                instances.push(instance);
+                Ok(())
+            })
+            .unwrap();
+        rename_session(
+            "stable-branch",
+            RenameArgs {
+                identifier: Some(id.clone()),
+                title: Some("BEMLO-123".into()),
+                group: None,
+                rename_branch: false,
+                branch: Some("olof/bemlo-123-exact-ticket".into()),
+            },
+        )
+        .await
+        .unwrap();
+        let rows = storage.load().unwrap();
+        let renamed = rows.iter().find(|i| i.id == id).unwrap();
+        assert_eq!(renamed.project_path, worktree.to_string_lossy());
+        assert_eq!(renamed.title, "BEMLO-123");
+        assert_eq!(
+            renamed.worktree_info.as_ref().unwrap().branch,
+            "olof/bemlo-123-exact-ticket"
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("uncommitted.txt")).unwrap(),
+            "keep this exactly"
+        );
+        assert_eq!(
+            crate::git::GitWorktree::get_current_branch(&worktree).unwrap(),
+            "olof/bemlo-123-exact-ticket"
+        );
+        git(&["remote", "add", "origin", "."]);
+        git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/olof/bemlo-123-exact-ticket",
+        ]);
+        let protected = rename_session(
+            "stable-branch",
+            RenameArgs {
+                identifier: Some(id.clone()),
+                title: None,
+                group: None,
+                rename_branch: false,
+                branch: Some("blocked-default".into()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(protected.to_string().contains("default branch"));
+        assert_eq!(
+            crate::git::GitWorktree::get_current_branch(&worktree).unwrap(),
+            "olof/bemlo-123-exact-ticket"
+        );
+        git(&["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"]);
+        git(&["branch", "occupied"]);
+        let failure = rename_session(
+            "stable-branch",
+            RenameArgs {
+                identifier: Some(id.clone()),
+                title: Some("Must not apply".into()),
+                group: None,
+                rename_branch: false,
+                branch: Some("occupied".into()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(failure.to_string().contains("already exists"));
+        assert_eq!(
+            storage
+                .load()
+                .unwrap()
+                .iter()
+                .find(|i| i.id == id)
+                .unwrap()
+                .title,
+            "BEMLO-123"
+        );
+        assert_eq!(
+            crate::git::GitWorktree::get_current_branch(&worktree).unwrap(),
+            "olof/bemlo-123-exact-ticket"
+        );
+    }
 
     // Three duplicate-identity behaviors kept in one test on purpose: they
     // share the costly setup that forces `#[serial]` (an isolated app dir plus
@@ -2025,6 +2217,7 @@ mod rename_tests {
                 title: Some("main branch".to_string()),
                 group: None,
                 rename_branch: false,
+                branch: None,
             },
         )
         .await
@@ -2040,6 +2233,7 @@ mod rename_tests {
                 title: None,
                 group: Some("work".to_string()),
                 rename_branch: false,
+                branch: None,
             },
         )
         .await
@@ -2080,6 +2274,7 @@ mod rename_tests {
                 title: Some("main branch".to_string()),
                 group: None,
                 rename_branch: false,
+                branch: None,
             },
         )
         .await
@@ -2124,6 +2319,7 @@ mod rename_tests {
                 title: Some("Main Branch".to_string()),
                 group: None,
                 rename_branch: false,
+                branch: None,
             },
         )
         .await
