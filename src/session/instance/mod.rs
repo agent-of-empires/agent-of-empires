@@ -31,7 +31,7 @@ use crate::session::capture::{
     resolve_omp_store_layout, resolve_omp_store_layout_in_container_with_environment,
     resolve_omp_store_layout_with_environment, try_capture_omp_session_id_in_container,
     validate_omp_capture_metadata, validated_session_id, OmpCaptureMetadata, OmpCapturePlan,
-    OmpCliCaptureOptions, OmpStoreKind,
+    OmpCliCaptureOptions, OmpStoreKind, PrimeRootPublication,
 };
 mod accessors;
 mod container;

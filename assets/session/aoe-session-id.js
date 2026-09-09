@@ -1,14 +1,6 @@
-// Loaded by AoE as an agent extension. Publishes the pane's current
-// conversation to the per-instance sidecar AoE reads, so a conversation
-// started inside the pane is attributed to that pane rather than guessed from
-// a store keyed by cwd alone.
-//
-// Two files: `session_id` (the uuid) and `session_path` (the transcript
-// path). Prime root-only publications normalize the path to absolute so it
-// survives a worktree move when the agent indexes sessions by starting cwd.
-//
-// `session_start` covers startup, resume, fork, and new. Failures are
-// swallowed: publishing identity must never interfere with the agent.
+// Publishes native conversation IDs and transcript paths for AoE.
+// Pi keeps its existing behavior; Prime publishes only depth-zero roots.
+// Publication does not imply that the transcript has been materialized.
 import { mkdirSync, writeFileSync, renameSync, unlinkSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
@@ -37,18 +29,19 @@ export default function (pi) {
   pi.on("session_start", async (_event, ctx) => {
     if (!idTarget) return;
     try {
-      // Prime writes rlmDepth into every child header; depth zero owns the pane.
-      if (rootOnly && ctx?.sessionManager?.getHeader?.()?.rlmDepth !== 0) return;
+      const header = rootOnly ? ctx?.sessionManager?.getHeader?.() : undefined;
+      if (rootOnly && header?.rlmDepth !== 0) return;
       const id = ctx?.sessionManager?.getSessionId?.();
       if (!id) return;
       const file = ctx?.sessionManager?.getSessionFile?.();
-      const publishedFile = rootOnly && file ? resolve(file) : file;
-      writeAtomic(idTarget, id);
-      if (publishedFile) {
-        writeAtomic(join(dirname(idTarget), "session_path"), publishedFile);
-      }
       if (rootOnly) {
-        writeAtomic(join(dirname(idTarget), "root_only"), "1");
+        if (!file) return;
+        writeAtomic(join(dirname(idTarget), "root_session"), JSON.stringify({
+          id, path: resolve(file), cwd: header.cwd, rlmDepth: header.rlmDepth,
+        }));
+      } else {
+        writeAtomic(idTarget, id);
+        if (file) writeAtomic(join(dirname(idTarget), "session_path"), file);
       }
     } catch {
       // never block the agent

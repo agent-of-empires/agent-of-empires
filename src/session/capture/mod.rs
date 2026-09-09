@@ -1140,10 +1140,7 @@ const PRIME_AGENT_MTIME_FLOOR_SLACK_MS: f64 = 0.0;
 /// fails to parse and the file is skipped until the next poll.
 const PRIME_AGENT_HEADER_SCAN_BYTES: u64 = 64 * 1024;
 
-/// One Prime Agent session, parsed from the first line of a
-/// `~/.prime/agent/sessions/<uuid>.jsonl` file. The header carries both the
-/// resume id and the working directory; the file name is a different uuid,
-/// so the id must come from the header, never from the path.
+/// A Prime root transcript header supplies the resume ID and working directory.
 struct PrimeAgentSession {
     id: String,
     cwd: String,
@@ -1294,10 +1291,16 @@ pub(crate) fn prime_agent_poll_fn_sandboxed_store(
     }
 }
 
-/// Prefer a validated root-only publication, falling back to the private store
-/// with the same exclusion snapshot when the publication is absent or excluded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PrimeRootPublication {
+    Ready(String),
+    /// A root publication whose transcript is positively absent, not unreadable.
+    Pending(String),
+}
+
+/// A pending root preserves an empty-conversation boundary instead of scanning older history.
 pub(crate) fn prime_agent_poll_fn_sandboxed(
-    preferred_sidecar: Box<dyn Fn() -> Option<String> + Send + 'static>,
+    preferred_sidecar: Box<dyn Fn() -> Option<PrimeRootPublication> + Send + 'static>,
     store: PathBuf,
     session_dir: PathBuf,
     container_workdir: String,
@@ -1307,17 +1310,17 @@ pub(crate) fn prime_agent_poll_fn_sandboxed(
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
         let exclusion = compose_exclusion(&instance_id, &extra_excludes);
-        preferred_sidecar()
-            .filter(|id| !exclusion.contains(id))
-            .or_else(|| {
-                prime_agent_store_session_id(
-                    &store,
-                    &session_dir,
-                    &container_workdir,
-                    &exclusion,
-                    launch_time_ms,
-                )
-            })
+        match preferred_sidecar() {
+            Some(PrimeRootPublication::Ready(id)) if !exclusion.contains(&id) => Some(id),
+            Some(PrimeRootPublication::Pending(id)) if !exclusion.contains(&id) => None,
+            _ => prime_agent_store_session_id(
+                &store,
+                &session_dir,
+                &container_workdir,
+                &exclusion,
+                launch_time_ms,
+            ),
+        }
     }
 }
 
@@ -2649,7 +2652,7 @@ mod tests {
         assert_eq!(poll().as_deref(), Some("prime_fresh"));
 
         let preferred = prime_agent_poll_fn_sandboxed(
-            Box::new(|| Some("prime_parent".to_string())),
+            Box::new(|| Some(PrimeRootPublication::Ready("prime_parent".to_string()))),
             tmp.path().to_path_buf(),
             session_dir.clone(),
             "/workspace".to_string(),
@@ -2660,7 +2663,7 @@ mod tests {
         assert_eq!(preferred().as_deref(), Some("prime_parent"));
 
         let excluded_preferred = prime_agent_poll_fn_sandboxed(
-            Box::new(|| Some("prime_parent".to_string())),
+            Box::new(|| Some(PrimeRootPublication::Ready("prime_parent".to_string()))),
             tmp.path().to_path_buf(),
             session_dir.clone(),
             "/workspace".to_string(),
@@ -2671,7 +2674,7 @@ mod tests {
         assert_eq!(excluded_preferred().as_deref(), Some("prime_fresh"));
 
         let all_excluded = prime_agent_poll_fn_sandboxed(
-            Box::new(|| Some("prime_parent".to_string())),
+            Box::new(|| Some(PrimeRootPublication::Ready("prime_parent".to_string()))),
             tmp.path().to_path_buf(),
             session_dir,
             "/workspace".to_string(),

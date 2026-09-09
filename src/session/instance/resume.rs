@@ -231,7 +231,7 @@ impl Instance {
         let result = (|| {
             if restart {
                 self.kill_clean_locked()?;
-                prepared = self.refresh_prepared_prime_launch_after_quiescence(prepared)?;
+                prepared = self.refresh_prepared_prime_launch_after_pane_stop(prepared)?;
             }
             let launch_outcome = self.spawn_prepared_launch(size, &profile, prepared)?;
             let outcome =

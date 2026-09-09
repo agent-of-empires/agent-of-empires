@@ -381,8 +381,8 @@ impl Instance {
         })
     }
 
-    /// Rebuild a restart command if the quiesced Prime pane published a newer root.
-    pub(super) fn refresh_prepared_prime_launch_after_quiescence(
+    /// Refresh after pane teardown; Prime resident workers may still be running.
+    pub(super) fn refresh_prepared_prime_launch_after_pane_stop(
         &mut self,
         mut prepared: PreparedLaunch,
     ) -> Result<PreparedLaunch> {

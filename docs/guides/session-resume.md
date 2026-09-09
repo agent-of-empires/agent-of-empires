@@ -24,9 +24,11 @@ Runtime conversation changes such as `/clear`, `/new`, fork, continue, or a fres
 | Antigravity | No | No | None verified |
 | Kimi CLI | No | Yes | Isolated managed store |
 | OMP | Yes | Yes | Pane-scoped routed terminal store |
-| Prime Agent | No | Yes | Isolated managed store |
+| Prime Agent | No | Yes | Root-only publication and isolated managed store |
 
 `No` means automatic identity discovery is unsupported in that environment. OpenCode host capture additionally requires `session.opencode_preassign_session_id = true`. AoE does not scan a shared store or infer an identity from recency. For an agent with native resume support, a user-provided exact ID remains authoritative and can still be passed explicitly in an unsupported automatic-capture environment. Agents with no verified native resume contract reject automatic resume entirely.
+
+Prime Agent captures depth-zero roots, not child RLM sessions. If a root publishes a new conversation whose transcript is confirmed absent, automatic restart starts an empty conversation instead of resuming the previous history. This boundary survives launch attempts, but the unwritten native ID is not preserved. Once the transcript exists and its root header is validated, normal resume uses that ID. An explicitly pinned ID remains authoritative.
 
 Sandbox config and conversation stores are staged under a separate directory for each AoE instance, including custom `agent_config_dir` roots. A cross-process lease guards each managed store. Two sessions in the same working directory therefore cannot claim each other's conversation.
 
