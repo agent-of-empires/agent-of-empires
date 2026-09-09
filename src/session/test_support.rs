@@ -617,7 +617,16 @@ mod tests {
     /// the old value under [`ENV_LOCK`] as well. Reading first and calling
     /// [`EnvGuard::set`] afterwards leaves the helper racing the very scrub it
     /// exists to be excluded from, and bakes that scrub into what it installs.
+    /// `#[serial]` on the default key, unlike its sibling above: this one
+    /// *removes* `PATH` for the width of the window rather than prepending to
+    /// it, and the tmux tests that resolve a bare `tmux` through `PATH` carry
+    /// that key without taking `ENV_LOCK`. Where tmux lives outside the
+    /// execvp fallback path (Homebrew, Nix), an overlap makes
+    /// `tmux_available()` skip silently. The key does not weaken this test's
+    /// own oracle: `serial_test` orders whole tests, so the peer thread and
+    /// the reader below still need `ENV_LOCK` to exclude each other.
     #[test]
+    #[serial]
     fn path_prepended_derives_its_value_under_the_lock() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
