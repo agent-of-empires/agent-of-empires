@@ -186,6 +186,28 @@ pub(super) fn poll_statuses_once(
                 && inst.sandbox_store_generation
                     >= crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION
         }) {
+            // A running container built before its agent shared a credential
+            // file is still rotating the copy in its store; folding that in
+            // would log every sandbox on the shared file out.
+            let container = crate::containers::DockerContainer::from_session_id(&instance.id);
+            let running = state
+                .container_states
+                .get(&crate::containers::DockerContainer::generate_name(
+                    &instance.id,
+                ))
+                .copied()
+                .unwrap_or(false);
+            if running {
+                match instance.predates_shared_credential(&container, &instance.detect_as) {
+                    Ok(false) => {}
+                    Ok(true) => continue,
+                    Err(error) => {
+                        tracing::warn!(target: "session.profile",
+                            "Skipping credential refresh for {}: {error:#}", instance.id);
+                        continue;
+                    }
+                }
+            }
             crate::session::config::container_config::refresh_agent_configs_for_instance(
                 &instance.effective_profile(),
                 &instance.id,

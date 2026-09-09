@@ -196,6 +196,10 @@ impl DockerContainer {
             .shared_credential_mounts_match(&self.name, config)
     }
 
+    pub fn carries_shared_credential_label(&self) -> Result<Option<bool>> {
+        self.runtime.carries_shared_credential_label(&self.name)
+    }
+
     pub fn mount_fingerprint_matches(&self, config: &ContainerConfig) -> Result<Option<bool>> {
         self.runtime
             .mount_fingerprint_matches(&self.name, &config.mount_fingerprint())

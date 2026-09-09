@@ -1564,6 +1564,24 @@ fn compute_workspace_volume_paths(
 }
 
 /// Re-sync the current instance's physically isolated agent config.
+/// Whether the agent `tool` resolves to under `profile` shares a credential
+/// file across its sandboxes.
+pub(crate) fn agent_shares_credential_file(
+    profile: &str,
+    tool: &str,
+    detect_as: Option<&str>,
+) -> bool {
+    let profile_config = super::profile_config::resolve_config_or_warn(profile);
+    resolve_active_agent(tool, detect_as, &profile_config.session)
+        .is_some_and(|agent| agent_mounts_share_credential_file(agent.name))
+}
+
+fn agent_mounts_share_credential_file(agent: &str) -> bool {
+    AGENT_CONFIG_MOUNTS
+        .iter()
+        .any(|mount| mount.tool_name == agent && !mount.shared_credential_files.is_empty())
+}
+
 pub(crate) fn refresh_agent_configs_for_instance(
     profile: &str,
     instance_id: &str,

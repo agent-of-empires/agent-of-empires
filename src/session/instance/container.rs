@@ -170,6 +170,15 @@ impl Instance {
                 self.backfill_container_workdir(&container);
                 return Ok(container);
             }
+            // Still rotating the copy in its store. The refresh below would
+            // fold that copy into the shared file and log every sandbox on
+            // it out at the copy's next rotation, so refuse first.
+            if self.predates_shared_credential(&container, &detect_as)? {
+                anyhow::bail!(
+                    "running sandbox {} predates the shared credential file; stop it, then relaunch to rebuild it",
+                    self.id
+                );
+            }
             container_config::refresh_agent_configs_for_instance(
                 &self.effective_profile(),
                 &self.id,
@@ -177,14 +186,6 @@ impl Instance {
                 Some(detect_as.as_str()),
             );
             let config = self.build_container_config()?;
-            // Still refreshing its own store copy, which rotates the token
-            // away from every sandbox on the shared file.
-            if container.shared_credential_mounts_match(&config)? == Some(false) {
-                anyhow::bail!(
-                    "running sandbox {} predates the shared credential file; stop it, then relaunch to rebuild it",
-                    self.id
-                );
-            }
             self.identity_publisher_launched = config.identity_publisher_installed
                 && identity_publisher_mount_matches(&container, &config)?
                 && identity_publisher_dependencies_available(&container)
@@ -285,6 +286,25 @@ impl Instance {
         }
 
         Ok(container)
+    }
+
+    /// Whether the session's container was created before its agent shared a
+    /// credential file, so the copy in its store is a token chain the
+    /// container is still rotating. Read from the create-time label rather
+    /// than from the config, since building the config folds that copy in.
+    pub(crate) fn predates_shared_credential(
+        &self,
+        container: &DockerContainer,
+        detect_as: &str,
+    ) -> Result<bool> {
+        if !container_config::agent_shares_credential_file(
+            &self.effective_profile(),
+            &self.tool,
+            Some(detect_as),
+        ) {
+            return Ok(false);
+        }
+        Ok(container.carries_shared_credential_label()? == Some(false))
     }
 
     fn ensure_container_hook_mount_source(&self) {
