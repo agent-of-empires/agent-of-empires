@@ -352,7 +352,8 @@ token stops working. A per-session copy of `.credentials.json` therefore logs
 out as soon as any other copy refreshes, and logging in inside one container
 would fix only that container. So every Claude Code session mounts the one
 `sandbox-v2/.credentials.json` at its config path instead of keeping a copy in
-its store, and a refresh or login in any container is seen by the rest.
+its store, and a refresh or login in any container is seen by the rest. The
+store keeps an empty file at that path for the mount to land on.
 
 Each start folds the freshest credential into that file: the Keychain entry on
 macOS, `~/.claude/.credentials.json` elsewhere, and any copy left in the

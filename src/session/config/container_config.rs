@@ -890,9 +890,8 @@ fn merge_credential(existing: Option<&str>, winner: &str) -> String {
 /// the host store, outside the container's rootfs. Docker Desktop refuses it
 /// there with `create mountpoint for ... is outside of rootfs` yet leaves the
 /// file behind, which is why a store without it failed every first create and
-/// worked on the retry (#3845, upstream docker/for-mac#7853). Placing the
-/// file ourselves is what makes the first create work, and keeps the runtime
-/// from having to create a mountpoint through a bind mount at all.
+/// worked on the retry (#3845, upstream docker/for-mac#7853). Placing the file
+/// ourselves means no runtime has to create a mountpoint through a bind mount.
 ///
 /// Empty rather than carrying the copy's old content: [`read_credential_file`]
 /// reads an empty file as no credential, so a copy [`sync_shared_credential`]
@@ -925,8 +924,13 @@ pub(crate) fn place_shadowed_credential_mountpoints(config: &ContainerConfig) {
         // in the shared file; short of that (a failed fold, or the empty seed
         // `sync_shared_credential` writes when it found none) the copy may be
         // the only one left, and it already serves as the mountpoint.
-        let folded = std::fs::read_to_string(&shared.host_path)
-            .is_ok_and(|content| !matches!(content.trim(), "" | "{}"));
+        let shared_path = Path::new(&shared.host_path);
+        let folded = shared_path.parent().is_some_and(|root| {
+            read_credential_file(root, &name.to_string_lossy(), SymlinkPolicy::Never)
+                .ok()
+                .flatten()
+                .is_some_and(|content| content.trim() != "{}")
+        });
         if let Err(e) = place_credential_mountpoint(&copy, folded) {
             tracing::warn!(target: "session.profile",
                 "Failed to place credential mountpoint {}: {}", copy.display(), e);
