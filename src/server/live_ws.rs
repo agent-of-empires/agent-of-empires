@@ -5,7 +5,8 @@
 //! bytes stream through `pipe-pane` into an in-process grid, frames publish
 //! the moment the grid changes (held while the app is inside a DEC 2026
 //! synchronized-output bracket, so a half-drawn repaint is never shipped),
-//! and keystrokes go back over the same socket. The paired host and
+//! and on tmux 3.8 or newer keystrokes go back over the same socket
+//! (older tmux delivers them with `send-keys`). The paired host and
 //! container shells, and every fallback, poll `tmux capture-pane` snapshots
 //! on a cadence and deliver input with `tmux send-keys -H`. Either way there
 //! is no PTY and no `tmux attach`: scrollback is just a bigger window the
@@ -429,6 +430,18 @@ fn translate_cursor_keys(bytes: &[u8], app_cursor: bool) -> std::borrow::Cow<'_,
         }
     }
     std::borrow::Cow::Owned(out)
+}
+
+/// Bytes the pane should receive for `raw` browser input. Neither transport
+/// translates keys (the socket bypasses tmux, `send-keys -H` is literal), so
+/// cursor keys are re-encoded for the pane's DECCKM state whenever a live grid
+/// knows it, including an output-only channel on tmux older than 3.8.
+#[cfg(unix)]
+fn pane_input_bytes(tmux_name: &str, raw: Vec<u8>) -> Vec<u8> {
+    match crate::tmux::vt::cursor_mode(tmux_name) {
+        Some(app_cursor) => translate_cursor_keys(&raw, app_cursor).into_owned(),
+        None => raw,
+    }
 }
 
 /// Split a frame's content into rows. Both transports terminate every row,
@@ -1413,18 +1426,19 @@ async fn handle_live_ws(
                         let send_nudge = Arc::clone(&nudge);
                         let name = tmux_name.clone();
                         let bytes = data.to_vec();
-                        // A live VT channel (ours or another surface's) is the
-                        // pane's single input writer and bypasses tmux's key
-                        // translation, so cursor keys are encoded for the
-                        // pane's DECCKM state here. Otherwise input goes
-                        // through tmux send-keys.
+                        // A live VT channel with socket input (ours or another
+                        // surface's) is the pane's single input writer;
+                        // otherwise input goes through tmux send-keys. Cursor
+                        // keys are re-encoded for the pane's DECCKM state
+                        // before either.
                         let _ = tokio::task::spawn_blocking(move || {
                             #[cfg(unix)]
-                            if let Some(app_cursor) = crate::tmux::vt::input_mode(&name) {
-                                let bytes = translate_cursor_keys(&bytes, app_cursor);
-                                if crate::tmux::vt::try_send_input(&name, &bytes) {
-                                    return;
-                                }
+                            let bytes = pane_input_bytes(&name, bytes);
+                            #[cfg(unix)]
+                            if crate::tmux::vt::input_mode(&name).is_some()
+                                && crate::tmux::vt::try_send_input(&name, &bytes)
+                            {
+                                return;
                             }
                             let session = crate::tmux::Session::from_name(&name);
                             if let Err(e) = session.send_raw_bytes(&bytes) {
@@ -2191,6 +2205,21 @@ mod tests {
         );
         // A trailing partial sequence is passed through untouched.
         assert_eq!(&*translate_cursor_keys(b"\x1b[", true), b"\x1b[");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pane_input_bytes_translates_cursor_keys_for_an_output_only_live_grid() {
+        // tmux < 3.8 arms output-only channels, so input takes `send-keys -H`,
+        // which is as literal as the socket: the DECCKM re-encoding must still
+        // happen, driven by the live grid's mode.
+        let name = format!("aoe_test_ws_cursor_{}", std::process::id());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _channel = crate::tmux::vt::register_live_for_test(&name, dir.path(), false, true);
+        assert_eq!(pane_input_bytes(&name, b"\x1b[A".to_vec()), b"\x1bOA");
+        crate::tmux::vt::unregister_for_test(&name);
+        // No live grid: nothing knows the mode, bytes pass through.
+        assert_eq!(pane_input_bytes(&name, b"\x1b[A".to_vec()), b"\x1b[A");
     }
 
     #[test]

@@ -2740,10 +2740,11 @@ pub struct TmuxConfig {
 
     /// Render agent previews and the web dashboard's agent terminal from a
     /// persistent VT channel (`tmux pipe-pane` into an in-process terminal
-    /// grid) instead of polling `capture-pane` and forking `send-keys` per
-    /// keystroke. The paired host and container shells, split windows, and
-    /// every fallback keep tmux's rendered capture, with OSC 52 forwarding
-    /// through a raw observer.
+    /// grid) instead of polling `capture-pane`. On tmux 3.8 or newer
+    /// keystrokes ride the same socket; older tmux keeps the `send-keys` fork
+    /// per keystroke. The paired host and container shells and every fallback
+    /// keep tmux's rendered capture, with OSC 52 forwarding through a raw
+    /// observer; a split window is composited from captured panes.
     #[serde(default = "default_true")]
     #[setting(label = "VT Live Transport", widget = "toggle", advanced, global_only)]
     pub vt_live: bool,
