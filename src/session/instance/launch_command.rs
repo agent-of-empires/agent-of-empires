@@ -920,14 +920,11 @@ mod tests {
     ///
     /// No `#[serial]` key: since #3469 every process-global `PATH` mutation in
     /// the crate goes through `EnvGuard`, so `ENV_LOCK` excludes them all for
-    /// this test's whole body. The outer guard is taken before the `which` so
-    /// the resolution is inside that window too.
+    /// this test's whole body. The lock is taken before the `which` so the
+    /// resolution is inside that window too.
     #[test]
     fn test_wrap_command_reasserts_working_dir_after_login_shell() {
-        // Placeholder value: the guard exists to hold `ENV_LOCK` across the
-        // `PATH` read below, and the inner guard overwrites `SHELL` with the
-        // resolved path a moment later.
-        let _lock = EnvGuard::set(&[("SHELL", "/bin/sh")]);
+        let _lock = EnvGuard::read_lock();
         // The wrapper execs `$SHELL`, so it has to be a shell that exists here.
         let Ok(bash) = which::which("bash") else {
             eprintln!("skipping: bash not found on PATH");

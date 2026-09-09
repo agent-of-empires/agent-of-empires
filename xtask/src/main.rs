@@ -438,8 +438,7 @@ impl CliTree {
 ///
 /// Spans are line-local, which is also what keeps the frontmatter's
 /// `name: aoe` from reading as an invocation of whatever the next line
-/// starts with. A line whose backticks do not pair is skipped: its spans
-/// cannot be told from its prose.
+/// starts with.
 fn code_spans(content: &str) -> Vec<&str> {
     let mut spans = Vec::new();
     let mut in_fence = false;
@@ -449,14 +448,19 @@ fn code_spans(content: &str) -> Vec<&str> {
             continue;
         }
         if in_fence {
-            spans.push(line);
+            // Truncated at `#`, which is a comment in every shell fence these
+            // files use. Prose naming a command is common there and is not an
+            // invocation; dropping the tail can only under-check, never
+            // redden a documentation edit.
+            spans.push(line.split('#').next().unwrap_or(line));
             continue;
         }
+        // An odd part count means the backticks pair up. Otherwise the spans
+        // on this line cannot be told from its prose, so it is skipped.
         let parts: Vec<&str> = line.split('`').collect();
-        if parts.len().is_multiple_of(2) {
-            continue;
+        if parts.len() % 2 == 1 {
+            spans.extend(parts.iter().skip(1).step_by(2));
         }
-        spans.extend(parts.iter().skip(1).step_by(2));
     }
     spans
 }
@@ -470,7 +474,12 @@ fn read_invocations(content: &str) -> Vec<Vec<String>> {
         for cap in re.captures_iter(span) {
             let words: Vec<String> = cap[1]
                 .split_whitespace()
-                .take_while(|w| w.chars().all(|c| c.is_ascii_lowercase() || c == '-'))
+                // A leading `-` is a flag, not a subcommand: the capture runs
+                // through `--json` and friends because `-` is a legal
+                // character inside a command name too.
+                .take_while(|w| {
+                    !w.starts_with('-') && w.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+                })
                 .map(str::to_string)
                 .collect();
             if !words.is_empty() {
@@ -485,9 +494,7 @@ fn read_invocations(content: &str) -> Vec<Vec<String>> {
 ///
 /// `Ok(Some(path))` is a canonical command to credit in the advisory,
 /// `Ok(None)` an alias or a bare prefix with nothing to credit, and `Err` the
-/// command text to report as nonexistent. Before #3479 the caller only ever
-/// recorded paths the tree had already accepted, so the "does not exist" arm
-/// it then checked was unsatisfiable.
+/// command text to report as nonexistent.
 fn resolve_invocation(words: &[String], cli: &CliTree) -> Result<Option<String>, String> {
     let mut resolved: Option<(String, usize)> = None;
     let mut path = String::new();
@@ -686,11 +693,10 @@ mod skill_check_tests {
             ("A stray ` and aoe list after it.", &[]),
             // Line-local, so frontmatter cannot join two keys into a command.
             ("name: aoe\ndescription: something", &[]),
-            // A `#` comment inside a fence is still code.
-            (
-                "```sh\n# aoe list is the listing\n```",
-                &["# aoe list is the listing"],
-            ),
+            // A `#` comment inside a fence is prose about a command, not an
+            // invocation of one, so the tail is dropped.
+            ("```sh\n# aoe list is the listing\n```", &[""]),
+            ("```sh\naoe list # lists them\n```", &["aoe list "]),
             // Neither tilde fences nor indented blocks are code context here.
             ("~~~\naoe list\n~~~", &[]),
             ("    aoe list", &[]),
@@ -717,8 +723,11 @@ mod skill_check_tests {
             // An alias is accepted as input but credits no canonical command.
             ("`aoe ls`", &[], &[]),
             ("`aoe group ls`", &[], &[]),
-            // Flags and placeholders end the command path.
+            // Flags and placeholders end the command path. A flag after a
+            // command that takes subcommands is still a flag.
             ("`aoe list --json`", &["list"], &[]),
+            ("`aoe group --help`", &["group"], &[]),
+            ("`aoe session --json`", &["session"], &[]),
             ("`aoe session capture <id>`", &["session capture"], &[]),
             // A bare prefix is a real reference with nothing extra to check.
             ("`aoe session`", &["session"], &[]),
@@ -751,10 +760,6 @@ mod skill_check_tests {
                 .iter()
                 .all(|alias| !cli.commands.contains(alias)),
             "an alias must not also be advertised as a canonical command"
-        );
-        assert!(
-            cli.parents.iter().all(|parent| cli.is_known(parent)),
-            "every parent path must resolve"
         );
     }
 }

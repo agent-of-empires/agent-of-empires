@@ -2670,15 +2670,25 @@ mod tests {
     /// `#[serial_test::serial]` key, so the global is exclusive for the
     /// guard's lifetime. Construct it only once a session exists: both
     /// `set-option -g` and `show-options -g` fail against a stopped server.
-    struct GlobalPaneBaseIndex(String);
+    struct GlobalPaneBaseIndex(Option<String>);
 
     impl GlobalPaneBaseIndex {
         fn set(value: &str) -> Self {
-            let previous = crate::tmux::tmux_command()
+            // A failed read would restore an empty string, and
+            // `set-option -g pane-base-index ""` leaves the global at `value`
+            // for the rest of the binary's run: every later unpinned session
+            // then numbers panes from 1 and the `.0` targets fall through to
+            // the active pane.
+            let read = crate::tmux::tmux_command()
                 .args(["show-options", "-g", "-v", "pane-base-index"])
                 .output()
                 .expect("tmux show-options -g pane-base-index");
-            let previous = String::from_utf8_lossy(&previous.stdout).trim().to_string();
+            assert!(
+                read.status.success(),
+                "failed to read the global pane-base-index: {}",
+                String::from_utf8_lossy(&read.stderr)
+            );
+            let previous = String::from_utf8_lossy(&read.stdout).trim().to_string();
             let applied = crate::tmux::tmux_command()
                 .args(["set-option", "-g", "pane-base-index", value])
                 .output()
@@ -2687,15 +2697,19 @@ mod tests {
                 applied.status.success(),
                 "failed to set a global pane-base-index of {value}"
             );
-            Self(previous)
+            Self(Some(previous).filter(|previous| !previous.is_empty()))
         }
     }
 
     impl Drop for GlobalPaneBaseIndex {
         fn drop(&mut self) {
-            let _ = crate::tmux::tmux_command()
-                .args(["set-option", "-g", "pane-base-index", &self.0])
-                .output();
+            // `-u` where the option had no value, so the restore never writes
+            // an empty string tmux would reject.
+            let restore = match &self.0 {
+                Some(previous) => vec!["set-option", "-g", "pane-base-index", previous],
+                None => vec!["set-option", "-gu", "pane-base-index"],
+            };
+            let _ = crate::tmux::tmux_command().args(restore).output();
         }
     }
 
@@ -4946,9 +4960,7 @@ mod tests {
     ///
     /// The global option is what a user actually sets: aoe's own pin is
     /// session-level, and a window-level value would win over it rather than
-    /// lose to it. Before #3368 this test set no `pane-base-index 1` anywhere,
-    /// so it duplicated [`test_status_checks_target_pane_zero_with_split_panes`]
-    /// and covered nothing of its own.
+    /// lose to it.
     #[test]
     #[serial_test::serial]
     fn test_status_checks_with_split_panes_and_pane_base_index_1() {
