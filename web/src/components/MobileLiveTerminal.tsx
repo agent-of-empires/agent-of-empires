@@ -679,8 +679,13 @@ export function MobileLiveTerminal({
       const heldLines = frameLines(held);
       const nextLines = frameLines(next);
       const older = held.history - heldLines.length - (next.history - nextLines.length);
-      if (older <= 0) return null;
-      return { ...held, lines: nextLines.slice(0, Math.min(older, nextLines.length)).concat(heldLines) };
+      // A frame too short to carry the whole exposed prefix would fold part of
+      // it and leave the rest outstanding, folding the same lines again on
+      // every following pass until React's re-render limit trips. The pane's
+      // scrollback collapsing mid-selection (a `clear`, or the window gaining
+      // a second pane, both of which report history 0) is what reaches this.
+      if (older <= 0 || older > nextLines.length) return null;
+      return { ...held, lines: nextLines.slice(0, older).concat(heldLines) };
     },
     [reading],
   );

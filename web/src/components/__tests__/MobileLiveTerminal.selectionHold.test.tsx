@@ -104,6 +104,37 @@ function evictedFrame(): LiveFrame {
   };
 }
 
+/** A pane whose scrollback is far deeper than the live capture window, and
+ *  the same pane after that scrollback goes away: tmux reports history 0 for
+ *  a `clear` (ED3) and for a window that has gained a second pane. */
+function deepFrame(): LiveFrame {
+  const lines = ["h1999", "h2000", "s1", "s2", "s3"];
+  return {
+    content: lines.join("\n") + "\n",
+    lines,
+    rows: 3,
+    history: 2000,
+    cursor: null,
+    altScreen: false,
+    mouse: false,
+    mouseSgr: false,
+  };
+}
+
+function clearedFrame(): LiveFrame {
+  const lines = ["s1", "s2", "s3"];
+  return {
+    content: lines.join("\n") + "\n",
+    lines,
+    rows: 3,
+    history: 0,
+    cursor: null,
+    altScreen: false,
+    mouse: false,
+    mouseSgr: false,
+  };
+}
+
 function terminal(f: LiveFrame, reading = false) {
   return (
     <MobileLiveTerminal
@@ -236,4 +267,17 @@ it("holds newly exposed history once the selection can reach it", () => {
 
   expect(selection.toString()).toBe("h005");
   expect(container.querySelector("[data-live-content]")?.textContent).toContain("h001");
+});
+
+it("holds through the pane's scrollback collapsing mid-selection", () => {
+  // A selection taken at the live edge holds a window far shallower than the
+  // history, so the fold is waiting on a prefix that a cleared pane can never
+  // send. Folding what did arrive would leave the rest outstanding and repeat
+  // every pass, past React's re-render limit.
+  const { rerender } = mount(deepFrame());
+  const selection = selectRowText("s2");
+  rerender(terminal(deepFrame(), true));
+  rerender(terminal(clearedFrame(), true));
+
+  expect(selection.toString()).toBe("s2");
 });
