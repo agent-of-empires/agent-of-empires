@@ -238,6 +238,28 @@ impl Instance {
         if !self.supports_session_poller() {
             return PollerStart::NotApplicable;
         }
+        // Exact eligibility before the budget check: an instance whose backend
+        // arm would return NotApplicable anyway must not consume a budget slot
+        // or schedule a repair warning that masks a genuinely starved session.
+        // These checks are cheap (in-memory or path computation); the expensive
+        // exclusion-set setup stays after the budget gate.
+        let exactly_eligible = match backend {
+            crate::agents::SessionCaptureBackend::Codex
+            | crate::agents::SessionCaptureBackend::Gemini
+            | crate::agents::SessionCaptureBackend::Hermes
+            | crate::agents::SessionCaptureBackend::Kimi
+            | crate::agents::SessionCaptureBackend::PrimeAgent => {
+                self.sandbox_capture_store_dir().is_some()
+            }
+            crate::agents::SessionCaptureBackend::Omp => self.omp_capture_options().is_some(),
+            crate::agents::SessionCaptureBackend::Pi => self.pi_sidecar_source().is_some(),
+            crate::agents::SessionCaptureBackend::Claude
+            | crate::agents::SessionCaptureBackend::HookSidecar => true,
+            crate::agents::SessionCaptureBackend::OpenCode => false,
+        };
+        if !exactly_eligible {
+            return PollerStart::NotApplicable;
+        }
         // The exclusion-set build below loads `sessions.json` and canonicalizes
         // a path per stored peer; report the spent budget before paying for it.
         // BudgetExhausted routes to the caller's repair schedule, which owns
