@@ -44,6 +44,7 @@ describe("MobileLiveTerminal OSC 52 clipboard", () => {
         enterReading={vi.fn()}
         returnToLive={vi.fn()}
         sendData={vi.fn()}
+        typedWordRef={{ current: "" }}
         uploadPastedImage={vi.fn().mockResolvedValue(null)}
         forwardWheel={vi.fn()}
         forwardButton={vi.fn()}

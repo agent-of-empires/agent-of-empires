@@ -16,7 +16,7 @@ use super::validate_profile_name;
 use super::AppState;
 use crate::server::auth::AuthenticatedTokenHash;
 use crate::server::auth::{handler_elevated, AuthenticatedSession, LoopbackTrusted};
-use crate::session::settings_schema::{
+use crate::session::config::settings_schema::{
     clear_path, rewrite_plugin_sections, runtime_schema, strip_local_only, validate_patch,
     validate_patch_with, PatchRejection, Scope,
 };
@@ -174,7 +174,7 @@ fn build_custom_agent_infos(
 pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentInfo>> {
     let profile = state.profile.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let config = crate::session::profile_config::resolve_config_or_warn(&profile);
+        let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
         let custom_agents = config.session.custom_agents;
         let agent_acp_cmd = config.session.agent_acp_cmd;
         let agent_detect_as = config.session.agent_detect_as;
@@ -320,7 +320,7 @@ pub async fn update_settings(
         .map(|obj| {
             obj.iter()
                 .filter_map(|(section, value)| {
-                    let id = crate::session::settings_schema::section_plugin_id(section)?;
+                    let id = crate::session::config::settings_schema::section_plugin_id(section)?;
                     let keys: Vec<String> = value
                         .as_object()
                         .map(|m| m.keys().cloned().collect())
@@ -337,7 +337,7 @@ pub async fn update_settings(
     let result = tokio::task::spawn_blocking(move || {
         crate::session::update_config(|config| -> anyhow::Result<()> {
             let mut current = serde_json::to_value(&*config)?;
-            crate::session::settings_schema::merge_json(&mut current, &body);
+            crate::session::config::settings_schema::merge_json(&mut current, &body);
             *config = serde_json::from_value(current)?;
             Ok(())
         })
@@ -360,7 +360,6 @@ pub async fn update_settings(
             }
             // Tell each touched plugin's worker its settings changed (#2897),
             // after the durable write. Best-effort; config.get is the fallback.
-            #[cfg(feature = "serve")]
             if !plugin_changes.is_empty() {
                 if let Some(host) = &state.plugin_host {
                     host.emit_settings_changed(&plugin_changes).await;
@@ -446,7 +445,8 @@ pub async fn get_cityhall_bundle(
 /// per-field JSX, so a new config field appears on the web automatically. No
 /// secrets: descriptors are pure metadata (labels, widgets, validation, write
 /// policy), so this needs no elevation, only normal authentication.
-pub async fn get_settings_schema() -> Json<Vec<crate::session::settings_schema::FieldDescriptor>> {
+pub async fn get_settings_schema(
+) -> Json<Vec<crate::session::config::settings_schema::FieldDescriptor>> {
     Json(runtime_schema())
 }
 
@@ -455,10 +455,10 @@ pub async fn get_settings_schema() -> Json<Vec<crate::session::settings_schema::
 /// default for core; stored value > manifest default for plugin settings). The
 /// dashboard uses it to show where a value comes from. Pure metadata derived
 /// from the same schema the surfaces render, so only normal authentication.
-pub async fn get_settings_resolved() -> Json<Vec<crate::session::settings_schema::ResolvedSetting>>
-{
+pub async fn get_settings_resolved(
+) -> Json<Vec<crate::session::config::settings_schema::ResolvedSetting>> {
     Json(
-        tokio::task::spawn_blocking(crate::session::settings_schema::resolve_all)
+        tokio::task::spawn_blocking(crate::session::config::settings_schema::resolve_all)
             .await
             .unwrap_or_default(),
     )
@@ -1138,7 +1138,9 @@ pub async fn list_profiles(State(state): State<Arc<AppState>>) -> Json<Vec<Profi
         } else {
             active_profile
         };
-        let profiles = crate::session::list_profiles().unwrap_or_default();
+        // Picker order (`default` last); `active` came from the plain
+        // enumeration.
+        let profiles = crate::session::list_profiles_for_display().unwrap_or_default();
         profiles
             .into_iter()
             .map(|name| {
@@ -1474,7 +1476,8 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
     let passphrase_enabled = state.login_manager.is_enabled();
     let auth_mode =
         crate::server::resolve_auth_mode(&state.token_manager, &state.login_manager).await;
-    let acp_cfg = crate::session::profile_config::resolve_config_or_warn(&state.profile).acp;
+    let acp_cfg =
+        crate::session::config::profile_config::resolve_config_or_warn(&state.profile).acp;
     let acp_show_tool_durations = acp_cfg.show_tool_durations;
     let acp_replay_events = acp_cfg.replay_events;
     let acp_compaction_reminder = acp_cfg.compaction_reminder;
@@ -1536,7 +1539,7 @@ pub struct UpdateStatusResponse {
 }
 
 pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<UpdateStatusResponse> {
-    let cfg = crate::session::profile_config::resolve_config_or_warn(&state.profile);
+    let cfg = crate::session::config::profile_config::resolve_config_or_warn(&state.profile);
     let current = env!("CARGO_PKG_VERSION").to_string();
     let mode = cfg.updates.update_check_mode;
 
@@ -2454,15 +2457,26 @@ mod tests {
 
     #[test]
     fn acp_command_fields_substitute_data_dir() {
-        let registry = crate::acp::AgentRegistry::with_defaults();
         let dir = std::path::Path::new("/tmp/aoe-data");
-        let (cmd, _) = acp_command_fields(registry.get("aoe-agent"), Some(dir));
-        let cmd = cmd.expect("aoe-agent has a registry command");
+        let spec = crate::acp::AgentSpec {
+            command: "${aoe_data_dir}/bin/custom-acp".into(),
+            args: vec![],
+            description: "custom".into(),
+            env_allowlist: None,
+        };
+        let (cmd, _) = acp_command_fields(Some(&spec), Some(dir));
+        let cmd = cmd.expect("spec has a command");
         assert!(
             !cmd.contains("${aoe_data_dir}"),
             "placeholder must be substituted"
         );
         assert!(cmd.starts_with("/tmp/aoe-data/"));
+
+        // The bundled agent resolves through the adapter install, so its
+        // command is the bare binary token, not a data-dir path (#3553).
+        let registry = crate::acp::AgentRegistry::with_defaults();
+        let (cmd, _) = acp_command_fields(registry.get("aoe-agent"), Some(dir));
+        assert_eq!(cmd.as_deref(), Some("aoe-agent"));
     }
 
     #[test]

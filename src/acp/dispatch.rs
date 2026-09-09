@@ -45,6 +45,10 @@ pub struct WorkerLiveness {
     /// The session was auto-stopped for inactivity. The prompt POST is itself
     /// the wake path, so this is emphatically not "worker down".
     pub idle_dormant: bool,
+    /// The session is parked on the rate-limit redelivery cap. Same shape as
+    /// `idle_dormant`: no worker, but the POST is the documented recovery, so
+    /// it must not park on "worker down".
+    pub rate_limit_exhausted: bool,
 }
 
 /// Decide what to do with a prompt arriving for `state`.
@@ -55,6 +59,10 @@ pub struct WorkerLiveness {
 ///   POST clears dormancy, the reconciler respawns, and `send_turn` waits for
 ///   the fresh worker. Parking instead leaves the prompt in a queue whose
 ///   drain is waiting for the very worker nothing is going to start.
+/// - **#3688**: nor may a session parked on the rate-limit redelivery cap.
+///   That park is terminal by design, so nothing un-parks it on a timer and
+///   the queue drain would wait forever; the banner tells the user a fresh
+///   prompt recovers it, and this is the gate that makes that true.
 /// - **#2805**: a steerable agent takes a mid-turn prompt directly. Parking it
 ///   reintroduces the queue-after behavior steering exists to replace.
 /// - **#1727**: except while a cancel is pending. The daemon reads a prompt
@@ -69,7 +77,7 @@ pub struct WorkerLiveness {
 /// path that is not positively classified as sendable falls through to
 /// `Queued`.
 pub fn decide(state: &AcpState, worker: WorkerLiveness) -> PromptDispatch {
-    if !worker.running && !worker.idle_dormant {
+    if !worker.running && !worker.idle_dormant && !worker.rate_limit_exhausted {
         return PromptDispatch::Queued {
             reason: QueueReason::WorkerDown,
         };
@@ -103,6 +111,7 @@ mod tests {
         WorkerLiveness {
             running: true,
             idle_dormant: false,
+            rate_limit_exhausted: false,
         }
     }
 
@@ -124,7 +133,7 @@ mod tests {
     #[test]
     fn dispatch_table_covers_every_incident_by_name() {
         let queued = |r| PromptDispatch::Queued { reason: r };
-        let cases: [(&str, AcpState, WorkerLiveness, PromptDispatch); 10] = [
+        let cases: [(&str, AcpState, WorkerLiveness, PromptDispatch); 12] = [
             (
                 "idle turn, live worker: ordinary send",
                 state(false, false, false, false),
@@ -171,6 +180,7 @@ mod tests {
                 WorkerLiveness {
                     running: false,
                     idle_dormant: true,
+                    rate_limit_exhausted: false,
                 },
                 PromptDispatch::Sent,
             ),
@@ -180,6 +190,7 @@ mod tests {
                 WorkerLiveness {
                     running: false,
                     idle_dormant: false,
+                    rate_limit_exhausted: false,
                 },
                 queued(QueueReason::WorkerDown),
             ),
@@ -190,6 +201,7 @@ mod tests {
                 WorkerLiveness {
                     running: false,
                     idle_dormant: false,
+                    rate_limit_exhausted: false,
                 },
                 queued(QueueReason::WorkerDown),
             ),
@@ -200,6 +212,30 @@ mod tests {
                 WorkerLiveness {
                     running: false,
                     idle_dormant: true,
+                    rate_limit_exhausted: false,
+                },
+                queued(QueueReason::TurnActive),
+            ),
+            (
+                "#3688 a session parked on the redelivery cap sends: nothing \
+                 un-parks it on a timer, so queueing strands the prompt the \
+                 banner asked for",
+                state(false, false, false, false),
+                WorkerLiveness {
+                    running: false,
+                    idle_dormant: false,
+                    rate_limit_exhausted: true,
+                },
+                PromptDispatch::Sent,
+            ),
+            (
+                "#3688 the cap park does not override the turn gates either, \
+                 so a stale turn_active latch still parks",
+                state(true, false, false, false),
+                WorkerLiveness {
+                    running: false,
+                    idle_dormant: false,
+                    rate_limit_exhausted: true,
                 },
                 queued(QueueReason::TurnActive),
             ),

@@ -11,7 +11,6 @@
 //! convert it to a GIF via `agg`. Recordings are saved to
 //! `target/e2e-recordings/`. Both `asciinema` and `agg` must be on `$PATH`.
 
-#[cfg(feature = "serve")]
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -122,19 +121,27 @@ macro_rules! require_tmux {
 }
 pub(crate) use require_tmux;
 
-#[cfg(feature = "serve")]
-pub fn node_available() -> bool {
-    Command::new("node")
-        .arg("--version")
+/// Resolve Node before the daemon drops host launcher state. PATH shims such as
+/// Volta can recurse when invoked inside the worker's filtered environment.
+fn node_executable() -> Option<PathBuf> {
+    let output = Command::new("node")
+        .args(["-p", "process.execPath"])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
+    path.is_file().then_some(path)
+}
+
+pub fn node_available() -> bool {
+    node_executable().is_some()
 }
 
 /// Skip the calling test if Node.js is not installed. Acp e2e tests
 /// drive the shared `web/tests/helpers/fakeAcpAgent.mjs` fake agent, which
 /// is a Node script; without Node the worker can't speak ACP.
-#[cfg(feature = "serve")]
 macro_rules! require_node {
     () => {
         if !$crate::harness::node_available() {
@@ -143,7 +150,6 @@ macro_rules! require_node {
         }
     };
 }
-#[cfg(feature = "serve")]
 pub(crate) use require_node;
 
 // ---------------------------------------------------------------------------
@@ -161,7 +167,6 @@ pub(crate) use require_node;
 /// whichever daemon lost. Remembering what we have already issued closes the
 /// in-process half of the race; the ephemeral bind still covers ports taken by
 /// unrelated processes.
-#[cfg(feature = "serve")]
 pub fn pick_free_port() -> u16 {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
@@ -185,7 +190,6 @@ pub fn pick_free_port() -> u16 {
 /// `aoe serve --daemon` returns as soon as it has spawned the child, so a
 /// successful exit doesn't prove the child bound the port; this is the
 /// real signal that the daemon is up.
-#[cfg(feature = "serve")]
 pub fn wait_for_port(port: u16, timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
@@ -354,6 +358,7 @@ update_check_mode = "off"
 [app_state]
 has_seen_welcome = true
 has_responded_to_telemetry = true
+has_acknowledged_agent_hooks = true
 last_seen_version = "{}"
 "#,
             env!("CARGO_PKG_VERSION")
@@ -439,6 +444,8 @@ last_seen_version = "{}"
     /// shim (the daemon -> runner -> node spawn chain does not reliably
     /// propagate process env). Also sets the runner-socket timeout high
     /// so a contended CI box doesn't trip the spawn deadline.
+    /// The generated shim embeds Node's real executable because the isolated
+    /// home cannot initialize user-scoped version-manager shims.
     pub fn install_acp_shim(&mut self, fake_acp_script: &Path) {
         self.install_acp_shim_inner(fake_acp_script, None);
     }
@@ -465,6 +472,7 @@ last_seen_version = "{}"
             fake_agent.display()
         );
         let debug_log = app_dir_in(self.home_dir.path()).join("fake-acp.log");
+        let node = node_executable().expect("resolve Node.js executable");
         // Bake the fork-fail knob into the shim (not the daemon env) so it
         // survives the daemon's env_clear + allowlist when spawning the worker.
         let fork_fail_line = if self.acp_fork_fail {
@@ -479,11 +487,12 @@ last_seen_version = "{}"
             })
             .unwrap_or_default();
         let script = format!(
-            "#!/bin/sh\nexport FAKE_ACP_SCRIPT=\"{}\"\nexport FAKE_ACP_DEBUG_LOG=\"{}\"\n{}{}exec node \"{}\" \"$@\"\n",
+            "#!/bin/sh\nexport FAKE_ACP_SCRIPT=\"{}\"\nexport FAKE_ACP_DEBUG_LOG=\"{}\"\n{}{}exec \"{}\" \"{}\" \"$@\"\n",
             fake_acp_script.display(),
             debug_log.display(),
             fork_fail_line,
             capture_line,
+            node.display(),
             fake_agent.display(),
         );
         for name in ["claude", "claude-agent-acp", "aoe-agent"] {
@@ -775,16 +784,52 @@ last_seen_version = "{}"
 
     /// Capture the current screen contents as plain text (no ANSI escapes).
     pub fn capture_screen(&self) -> String {
+        self.capture_pane(false)
+    }
+
+    /// Same as [`capture_screen`](Self::capture_screen) but keeps the escape
+    /// sequences, so a test can assert on styling the TUI painted (an
+    /// underline, a color) and not just on the text.
+    pub fn capture_screen_styled(&self) -> String {
+        self.capture_pane(true)
+    }
+
+    /// Whether this tmux stores and re-emits OSC 8 hyperlinks through
+    /// `capture-pane -e`, which arrived in tmux 3.4. aoe still supports older
+    /// tmux on the capture fallback, so a link test skips there rather than
+    /// failing on a capability the host does not have.
+    pub fn tmux_reemits_hyperlinks() -> bool {
+        let Ok(out) = Command::new("tmux").arg("-V").output() else {
+            return false;
+        };
+        if !out.status.success() {
+            return false;
+        }
+        let version = String::from_utf8_lossy(&out.stdout);
+        let digits: String = version
+            .chars()
+            .skip_while(|c| !c.is_ascii_digit())
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        let mut parts = digits.split('.');
+        let major: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        let minor: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        (major, minor) >= (3, 4)
+    }
+
+    fn capture_pane(&self, styled: bool) -> String {
         assert!(self.spawned, "must call spawn_tui() or spawn() first");
-        let output = Command::new("tmux")
-            .arg("-S")
+        let mut cmd = Command::new("tmux");
+        cmd.arg("-S")
             .arg(&self.socket_path)
             .arg("capture-pane")
             .arg("-t")
             .arg(&self.session_name)
-            .arg("-p")
-            .output()
-            .expect("failed to capture pane");
+            .arg("-p");
+        if styled {
+            cmd.arg("-e");
+        }
+        let output = cmd.output().expect("failed to capture pane");
         String::from_utf8_lossy(&output.stdout).to_string()
     }
 

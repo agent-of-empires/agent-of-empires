@@ -502,9 +502,7 @@ fn fork_from_unlaunched_fork_is_refused() {
 /// the combination up front, BEFORE provisioning a scratch directory, so the
 /// refusal leaks nothing. Using `--scratch` here makes that leak observable:
 /// were the rejection still buried in the post-creation view block, a scratch
-/// dir would already exist by the time it fired. This flag only exists in
-/// `--features serve`.
-#[cfg(feature = "serve")]
+/// dir would already exist by the time it fired.
 #[test]
 #[parallel]
 fn fork_from_with_structured_view_is_refused() {

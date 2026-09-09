@@ -20,6 +20,7 @@ use std::sync::{Arc, RwLock};
 use thiserror::Error;
 
 use crate::cli::serve::{daemon_pid, read_serve_urls, ServeUrl};
+use crate::daemon::{DaemonClient, DaemonClientError};
 
 /// A located daemon endpoint. `base_url` carries no query string so it
 /// is safe to log; the auth token (if any) travels separately and is
@@ -60,6 +61,13 @@ impl DaemonEndpoint {
     /// caller can hand it to `tokio_tungstenite::connect_async`.
     pub fn ws_base_url(&self) -> String {
         http_to_ws(&self.base_url)
+    }
+
+    /// Session-list client for this endpoint, carrying the credential as
+    /// resolved now (see `resolved_token`).
+    pub fn daemon_client(&self) -> Result<DaemonClient, DaemonClientError> {
+        let token = self.resolved_token();
+        DaemonClient::new(&self.base_url, token.as_deref())
     }
 
     /// Resolve the credential to send now rather than relying forever on the
@@ -182,17 +190,7 @@ fn is_loopback(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
     };
-    let Some(host) = parsed.host_str() else {
-        return false;
-    };
-    let ip_host = host
-        .strip_prefix('[')
-        .and_then(|host| host.strip_suffix(']'))
-        .unwrap_or(host);
-    host.eq_ignore_ascii_case("localhost")
-        || ip_host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
+    crate::daemon::is_loopback_url(&parsed)
 }
 
 fn trim_query(url: &str) -> &str {

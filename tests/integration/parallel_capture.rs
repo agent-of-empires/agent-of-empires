@@ -30,7 +30,7 @@ impl Drop for TmuxCleanup {
     }
 }
 
-/// Replicates the private `build_exclusion_set()` in `src/session/capture.rs`:
+/// Replicates the private `build_exclusion_set()` in `src/session/capture/mod.rs`:
 /// lists aoe_* tmux sessions and collects AOE_CAPTURED_SESSION_ID values from
 /// sessions owned by other instances. Update it when that algorithm changes.
 fn build_exclusion_set_for_test(current_instance_id: &str) -> HashSet<String> {

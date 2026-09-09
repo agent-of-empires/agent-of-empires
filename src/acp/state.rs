@@ -6,6 +6,7 @@
 //! `apply_event`. This eliminates the two-writer race condition that v3's
 //! sketch had.
 
+use crate::daemon::PromptAttachmentRef;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -186,6 +187,18 @@ pub struct RateLimitInfo {
     /// deserialize as `Some`.
     pub resets_at: Option<DateTime<Utc>>,
     pub kind: String,
+}
+
+impl RateLimitInfo {
+    /// A park whose reporting `RateLimit` event is gone (retention): still a
+    /// limit, with no reset time.
+    pub fn undated() -> Self {
+        Self {
+            status: "limited".into(),
+            resets_at: None,
+            kind: "rate_limit".into(),
+        }
+    }
 }
 
 /// Snapshot of the most recent ACP agent handoff. Stored on
@@ -619,89 +632,14 @@ pub struct DiffComment {
     pub updated_at: Option<String>,
 }
 
-/// Which ACP `ContentBlock` an attachment maps to. The string form
-/// (`"image"` / `"audio"` / `"resource"`) is the wire contract shared
-/// with the web composer and the prompt-request DTO in `protocol.rs`,
-/// so renaming a variant breaks the build on both sides rather than
-/// silently dropping attachments.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PromptAttachmentKind {
-    Image,
-    Audio,
-    Resource,
-}
-
-impl PromptAttachmentKind {
-    /// Stable lowercase tag, matching the serde wire form. Used by the
-    /// attachment store to persist the kind as a TEXT column.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            PromptAttachmentKind::Image => "image",
-            PromptAttachmentKind::Audio => "audio",
-            PromptAttachmentKind::Resource => "resource",
-        }
-    }
-
-    /// Parse the lowercase tag written by [`Self::as_str`], for reading the kind
-    /// back out of the attachment store's TEXT column. `None` on an unknown
-    /// tag (a corrupt or forward-version row), so the caller can skip it.
-    pub fn from_tag(tag: &str) -> Option<Self> {
-        match tag {
-            "image" => Some(PromptAttachmentKind::Image),
-            "audio" => Some(PromptAttachmentKind::Audio),
-            "resource" => Some(PromptAttachmentKind::Resource),
-            _ => None,
-        }
-    }
-}
-
-/// Replay-side view of one prompt attachment. Carries metadata only,
-/// never the bytes: the decoded blob lives in the `acp_attachments`
-/// table keyed by `(session_id, id)` and is fetched lazily over
-/// `GET /acp/attachments/{id}`. Keeping bytes out of the event log
-/// is what stops `event_json` (and every WS replay frame) from bloating
-/// to megabytes per screenshot. See #1000 / #965.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PromptAttachmentRef {
-    pub id: String,
-    pub kind: PromptAttachmentKind,
-    pub mime_type: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    /// Decoded byte length, for the UI to show a size hint without
-    /// fetching the blob.
-    pub size: u64,
-}
-
-/// One entry in a session's server-owned prompt queue: a follow-up the
-/// user lined up while a turn was busy. The daemon is the source of truth
-/// (persisted on the `Instance`), so the queue survives a client reload or
-/// a closed PWA and drains on turn-end with no tab open.
-///
-/// Attachments carry metadata only, exactly like [`PromptAttachmentRef`]
-/// on a live prompt: the bytes live in the event store's pending-attachment
-/// table keyed by `(session_id, prompt_id, attachment_id)` (outside the
-/// seq-keyed retention prune, since a queued prompt has no event seq yet) and
-/// are reloaded at drain time, so a queued screenshot does not bloat the
-/// session file.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct QueuedPromptEntry {
-    /// Client-minted stable id, unchanged across edits. Doubles as the
-    /// optimistic-echo reconcile key on the client.
-    pub id: String,
-    /// Server-assigned monotonic order; the queue drains by ascending `seq`.
-    pub seq: u64,
-    pub text: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub attachments: Vec<PromptAttachmentRef>,
-    /// RFC3339 enqueue time, for retention and provenance.
-    pub created_at: String,
-    /// Which device enqueued it, for multi-device provenance. `None` for
-    /// rows migrated from a pre-server-queue client localStorage.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub origin_device: Option<String>,
-}
+/// Terminal park reason the reconciler publishes when rate-limit auto-resume
+/// exhausts its redelivery budget (#3688). Distinct from the agent-reported
+/// `rate_limited` so the park predicates can hold the session without
+/// treating it as a fresh adapter park (no reset schedule applies), while a
+/// manual `/acp/spawn` resume and a new prompt both still recover it. Lives
+/// beside `Event::Stopped` because both the daemon and the transcript fold
+/// read it, and `src/acp/` must not import from `src/server/`.
+pub(crate) const RATE_LIMIT_EXHAUSTED_RETRIES_REASON: &str = "rate_limit_exhausted_retries";
 
 /// Discriminated union of state mutations. ACP `session/update`
 /// notifications become specific variants; client approval taps also
@@ -855,6 +793,14 @@ pub enum Event {
     /// rate-limit lock and drain any queued prompt. See #1722.
     RateLimitAutoResumed {
         resets_at: DateTime<Utc>,
+        /// True when a user drove the resume from RESUME NOW rather than the
+        /// reconciler's timer. The redelivery cap counts automatic resumes
+        /// only, so a user re-sending by hand does not spend the automatic
+        /// budget (#3688). Defaulted: breadcrumbs recorded before the cap
+        /// existed carry no flag and read as automatic, which is how they
+        /// were counted then.
+        #[serde(default)]
+        manual: bool,
     },
     /// Agent-reported context-window usage. Comes from ACP
     /// `SessionUpdate::UsageUpdate` (gated on the
@@ -1059,6 +1005,10 @@ pub enum Event {
         image: bool,
         audio: bool,
         embedded_context: bool,
+        /// Latest ACP initialize result for session/load. Missing on events
+        /// written before this field existed, which means unknown.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        load_session: Option<bool>,
         /// Whether the agent accepts `_session/steering`, so a prompt
         /// sent mid-turn is injected into the running turn instead of
         /// being parked in the composer's client-side queue. Gated on
@@ -1156,8 +1106,8 @@ pub enum Event {
     /// capabilities (`availableCommands`, `availableModes`, `plan`,
     /// `mode`) and cancels any open approvals; UI collapses rows above
     /// the divider behind a disclosure. Distinct from
-    /// `SessionContextReset` (which fires only on `session/load`
-    /// failure now) and `ConversationCompacted` because the
+    /// `SessionContextReset` (the agent no longer holds the stored
+    /// session) and `ConversationCompacted` because the
     /// user-experience contract differs: cleared is "the model has
     /// forgotten", reset is "the model has empty context", compacted
     /// is "the model has a summary". See #1101.
@@ -1333,7 +1283,10 @@ impl AcpState {
             // being respawned. Clear the rate-limit snapshot so a client
             // seeding state from the store (or the persistent reducer)
             // doesn't keep showing the parked banner after the resume.
-            Event::RateLimitAutoResumed { .. } => self.rate_limit = None,
+            // The park outlives the resume breadcrumb until the worker is
+            // back (`AcpSessionAssigned`), so a resume that fails to start
+            // keeps the park every surface reports (#3514).
+            Event::RateLimitAutoResumed { .. } => {}
             Event::UsageUpdated { usage } => self.usage = Some(usage),
             Event::ModeChanged { mode } => self.mode = mode,
             // The real ACP-advertised modes, reduced here so a client renders
@@ -1400,7 +1353,7 @@ impl AcpState {
             Event::CancelRequested { .. } => {
                 self.cancelling = true;
             }
-            Event::Stopped { .. } => {
+            Event::Stopped { ref reason } => {
                 // The turn is over however it ended (completion, cancel, killed
                 // worker), so clear every in-turn phase. This is the
                 // self-healing clear for a dropped compaction marker (#3219),
@@ -1412,6 +1365,11 @@ impl AcpState {
                 self.compacting = false;
                 self.in_flight_tool = None;
                 self.thinking = None;
+                // A stop for any other reason ends a rate-limit park, as it
+                // does for the durable park the sidebar reads.
+                if reason != "rate_limited" && reason != RATE_LIMIT_EXHAUSTED_RETRIES_REASON {
+                    self.rate_limit = None;
+                }
             }
             Event::AgentStartupError { .. } => {
                 self.turn_active = false;
@@ -1454,7 +1412,11 @@ impl AcpState {
                 // post-upgrade respawn unblocks the UI without a hard
                 // reload. Mirrors the frontend reducer's
                 // `incompatibleAgent = null` clear on the same event.
+                // The rate-limit park ends here, not on the resume
+                // breadcrumb, so a resume that fails to start keeps the
+                // park every surface reports (#3514).
                 self.startup_error = None;
+                self.rate_limit = None;
             }
             Event::SessionContextReset { .. } => {
                 // Agent's stored context is gone; clear the cached
@@ -1684,8 +1646,30 @@ mod tests {
             image: false,
             audio: false,
             embedded_context: false,
+            load_session: None,
             steering,
         }
+    }
+
+    #[test]
+    fn prompt_capabilities_accept_legacy_events_without_load_session() {
+        let event: Event = serde_json::from_value(serde_json::json!({
+            "PromptCapabilities": {
+                "image": false,
+                "audio": false,
+                "embedded_context": false,
+                "steering": false
+            }
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            event,
+            Event::PromptCapabilities {
+                load_session: None,
+                ..
+            }
+        ));
     }
 
     // The four turn flags ported from the TUI's AcpTranscript (Tier 1: the
@@ -2462,7 +2446,7 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_auto_resumed_clears_rate_limit_snapshot() {
+    fn rate_limit_snapshot_outlives_the_resume_breadcrumb_until_the_worker_is_back() {
         let mut s = fresh_state();
         s.apply_event(Event::RateLimit {
             info: RateLimitInfo {
@@ -2475,11 +2459,20 @@ mod tests {
         assert!(s.rate_limit.is_some(), "RateLimit seeds the park snapshot");
         s.apply_event(Event::RateLimitAutoResumed {
             resets_at: Utc::now(),
+            manual: false,
+        })
+        .unwrap();
+        assert!(
+            s.rate_limit.is_some(),
+            "a resume that has not come up yet keeps the park (#3514)"
+        );
+        s.apply_event(Event::AcpSessionAssigned {
+            acp_session_id: "acp-2".into(),
         })
         .unwrap();
         assert!(
             s.rate_limit.is_none(),
-            "RateLimitAutoResumed must clear the rate-limit snapshot"
+            "the worker coming back ends the park"
         );
     }
 }

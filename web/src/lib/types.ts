@@ -1,3 +1,4 @@
+import type { RateLimitInfo } from "./acpTypes";
 import type { RepoColor } from "./repoAppearance";
 import type { AgentLifecycleInfo } from "./agentProfiles";
 
@@ -127,6 +128,15 @@ export interface SessionResponse {
    *  the supervisor holds a live worker. Drives the sidebar `Resuming…`
    *  chip and the per-session banner in the acp view. See #1088. */
   acp_worker_state?: AcpWorkerState;
+  /** The provider rate limit the daemon has this session parked on, from
+   *  its durable event-store park. Absent when not parked. Drives the
+   *  sidebar badge, replacing the browser-side mirror that went stale when
+   *  a session resumed with no tab open (#3514). */
+  rate_limit?: RateLimitInfo;
+  /** Whether `[acp] rate_limit_auto_resume` is on for the session's
+   *  profile, so the rate-limit banner can say whether the park ends by
+   *  itself. */
+  rate_limit_auto_resume?: boolean;
   /** Smart-rename indicator for structured view sessions. `pending`: still
    *  default-named and eligible, will auto-name on the next prompt; `running`:
    *  a one-shot title call is in flight; `inactive`/absent otherwise. Drives
@@ -466,7 +476,7 @@ export interface ProfileInfo {
 
 /** Per-profile lifecycle-hook overrides, as returned by
  *  GET /api/profiles/:name/settings. Mirrors the Rust
- *  HooksConfigOverride (src/session/profile_config.rs): a field that is
+ *  HooksConfigOverride (src/session/config/profile_config.rs): a field that is
  *  absent/undefined means "inherit the global hooks"; an explicit array
  *  (including the empty array) means "override". Hooks are read-only on
  *  the dashboard; see HooksReadOnlyPanel and profileWritableSections. */
@@ -593,13 +603,13 @@ export interface ClaudeSessionSummary {
   cwd_exists: boolean;
 }
 
-/** Live acp worker lifecycle, mirrored from
- *  `crate::acp::supervisor::AcpWorkerState`. See #1088. */
-export type AcpWorkerState = "absent" | "resuming" | "running";
+/** Live ACP worker lifecycle, mirrored from
+ *  crate::daemon::AcpWorkerState. See #1088. */
+export type AcpWorkerState = "absent" | "resuming" | "running" | "stopping";
 
 // --- Settings schema (single source of truth, see #1692) ---
 //
-// Mirrors `crate::session::settings_schema`. `GET /api/settings/schema`
+// Mirrors `crate::session::config::settings_schema`. `GET /api/settings/schema`
 // returns `SettingsFieldDescriptor[]`; the generic settings renderer builds
 // the form from it instead of hand-written per-field JSX.
 
@@ -686,6 +696,8 @@ export type SettingsValidation =
   | { rule: "volume_list" }
   | { rule: "env_list" }
   | { rule: "port_mapping_list" }
+  | { rule: "capability_list" }
+  | { rule: "security_opt_list" }
   | { rule: "network" }
   | { rule: "cron" }
   | {

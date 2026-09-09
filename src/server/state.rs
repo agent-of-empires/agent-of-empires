@@ -14,16 +14,15 @@ use super::serve_snapshot::{
     FormFactorCounters, ReportedServeSignals, StructuredTelemetryCounters,
 };
 use super::token::TokenManager;
-use crate::server::{api, login, session_service};
+use crate::server::{login, session_service};
 
-#[cfg(feature = "serve")]
 pub(super) const ACP_CHANNEL_CAPACITY: usize = 256;
 
 /// Per-profile cleanup defaults with a refresh timestamp. Re-resolved from
 /// disk after `CLEANUP_DEFAULTS_TTL`.
 pub struct CleanupDefaultsCache {
     pub refreshed_at: std::time::Instant,
-    pub entries: std::collections::HashMap<String, api::CleanupDefaults>,
+    pub entries: std::collections::HashMap<String, crate::daemon::CleanupDefaults>,
 }
 
 pub const CLEANUP_DEFAULTS_TTL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -180,19 +179,13 @@ pub struct AppState {
     /// transitions to `Status::Error` for up to 8 seconds while the agent
     /// is still settling. Periodically GC'd by a background task.
     pub recently_restarted: crate::session::recovery::RecentlyRestarted,
-    /// Bumped once per committed membership change of the session set: a
-    /// removal, after the row is gone from both `sessions.json` and
-    /// `instances`, and a creation, after the row is in both. A reloader
-    /// reads it before its disk read and hands the value back to
-    /// `reload_state_instances_from_disk`, which drops the reload when the
-    /// value moved: the disk snapshot it is carrying predates the mutation,
-    /// so folding it in would resurrect a removed row or drop a created one.
-    /// See invariant 8 on that function.
-    ///
-    /// Membership only. A field edit on an existing row does not bump, because
-    /// the per-id merge already reconciles those; the epoch exists for the
-    /// two cases the merge cannot see, where the id itself is absent from one
-    /// side.
+    /// Bumped after a committed session membership or view transition is on
+    /// disk and mirrored in `instances`. Reloaders capture the epoch before
+    /// reading disk and drop snapshots whose epoch no longer matches under the
+    /// `instances` write lock. This prevents stale snapshots from resurrecting
+    /// rows, dropping rows, or restoring the previous execution backend.
+    /// Other field edits do not bump because their per-id merge may converge on
+    /// the next reload. See invariant 8 on `reload_state_instances_from_disk`.
     pub mutation_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Ids whose startup-recovery cascade is scheduled but not yet complete.
     /// Phase A seeds it; each Phase B worker drains its id on completion. The
@@ -236,7 +229,6 @@ pub struct AppState {
     /// channel carries `(session_id, serialized event JSON)` frames so
     /// clients can filter by session. Empty when no clients are
     /// connected; senders never need to check before emitting.
-    #[cfg(feature = "serve")]
     pub acp_events_tx: broadcast::Sender<AcpBroadcastFrame>,
     /// Disk-backed acp event log. The single source of truth for
     /// replay: `ChannelSink::publish` writes here on every event, the
@@ -244,20 +236,16 @@ pub struct AppState {
     /// endpoint reads from here, and `Supervisor::next_seqs` is seeded
     /// from here at startup so a fresh publish gets `max_seq + 1`
     /// rather than 1.
-    #[cfg(feature = "serve")]
     pub acp_event_store: Arc<crate::acp::event_store::EventStore>,
     /// Live control-state projection per session, folded at the publish choke
     /// point and shared with `ChannelSink`. Prompt dispatch reads it instead
     /// of replaying the log on every POST; see `crate::acp::control_cache`.
-    #[cfg(feature = "serve")]
     pub acp_control_cache: Arc<crate::acp::control_cache::ControlStateCache>,
     /// Owns the per-session ACP agent subprocesses.
-    #[cfg(feature = "serve")]
     pub acp_supervisor:
         Arc<crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>>,
     /// The Tier 1 plugin worker host. `None` in test harnesses that do not
     /// stand up a host; `Some` in a live daemon.
-    #[cfg(feature = "serve")]
     pub plugin_host: Option<Arc<crate::plugin::host::PluginHost>>,
     /// Tracks in-flight web plugin install / update / uninstall jobs so the
     /// dashboard can tail their host-side log. In-memory; see
@@ -463,7 +451,6 @@ mod tests {
     /// `idempotency_locks` must not grow for the daemon's lifetime: keys are
     /// caller-supplied and unbounded, so an entry nobody holds is pruned on
     /// the next miss. A key whose lock is still held must survive. See #3156.
-    #[cfg(feature = "serve")]
     #[tokio::test]
     async fn idempotency_lock_prunes_unreferenced_keys() {
         let state = test_support::build_test_app_state(vec![]);

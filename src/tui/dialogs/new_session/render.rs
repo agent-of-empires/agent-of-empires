@@ -248,7 +248,7 @@ impl NewSessionDialog {
         }
         ci += 1;
 
-        // Structured view checkbox (only for ACP-capable tools on serve builds)
+        // Structured view checkbox (only for ACP-capable tools)
         if has_structured {
             let is_focused = self.focused_field == structured_field;
             let label_style = if is_focused {

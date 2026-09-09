@@ -189,6 +189,25 @@ describe("ToolCard dispatch by kind", () => {
     expect(container.textContent).toContain("Reasoning");
   });
 
+  it("falls through to the error body for a failed think card", () => {
+    // The quiet think card has nowhere to render a failure, so a failed one
+    // used to show its name and nothing else. aoe-agent's `task` is never in
+    // its palette, so every call fails with a NoSuchToolError naming the
+    // tools that do exist, and that text is the whole point. See #1904.
+    const tool = toolWith({ kind: "think", name: "task", args_preview: JSON.stringify({ description: "delegate" }) });
+    const { container } = render(
+      <ToolCard
+        tool={tool}
+        result={errorRow(
+          "AI_NoSuchToolError: Model tried to call unavailable tool 'task'. Available tools: Read, Write, Bash.",
+        )}
+      />,
+    );
+    expect(container.textContent).toContain("failed");
+    expect(container.textContent).toContain("unavailable tool 'task'");
+    expect(container.textContent).toContain("Available tools: Read, Write, Bash.");
+  });
+
   it("renders the generic fallback for an unrecognised kind", () => {
     const tool = toolWith({
       kind: "weird",

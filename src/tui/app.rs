@@ -125,6 +125,10 @@ impl UpdateStatus {
     }
 }
 
+/// The terminal backend the TUI runs on: crossterm plus OSC 8 re-emission for
+/// the cells the renderer marked as hyperlinks.
+pub type TuiBackend = crate::tui::hyperlink::HyperlinkBackend<std::io::Stdout>;
+
 pub struct App {
     home: HomeView,
     should_quit: bool,
@@ -189,27 +193,22 @@ pub struct App {
     /// Set by `Action::OpenStructuredView` so the async main loop can pick it
     /// up and enter the acp view (which needs `event_stream` access
     /// the sync `execute_action` can't lend out).
-    #[cfg(feature = "serve")]
     pending_structured_view_open: Option<String>,
     /// Set by `Action::SwitchSessionView` so the async main loop can run
     /// the daemon switch POST (awaited; the sync handler can't).
-    #[cfg(feature = "serve")]
     pending_view_switch: Option<String>,
     /// Set by `Action::StartDaemonThenOpenStructured` (the Yes on the
     /// "start a local daemon?" confirm) so the async loop can spawn the
     /// daemon, wait for health, and then open the structured view.
-    #[cfg(feature = "serve")]
     pending_daemon_start_open: Option<String>,
     /// Set by `Action::SmartRenameNow` so the async loop can run the daemon
     /// `/smart-rename` POST for a structured session (#3039).
-    #[cfg(feature = "serve")]
     pending_smart_rename: Option<String>,
     /// Debounce for structured preview-on-select: the session the cursor
     /// settled on and when, so rapid list navigation doesn't connect a
     /// WebSocket per keystroke. The mounted view itself lives on
     /// `HomeView::structured_preview` (it is preview content); this App
     /// side only drives the async mount/unmount.
-    #[cfg(feature = "serve")]
     preview_mount_pending: Option<(String, std::time::Instant)>,
     /// Version of the install currently being attempted (auto or manual).
     /// Set when the install task is spawned; transferred to
@@ -413,6 +412,13 @@ impl App {
         }
     }
 
+    /// The per-frame hyperlink map the renderer fills, for the terminal backend
+    /// to re-emit as OSC 8. Handed out after construction so `run` can build the
+    /// backend around the same map the `HomeView` writes into.
+    pub fn hyperlink_cells(&self) -> crate::tui::hyperlink::SharedHyperlinks {
+        self.home.hyperlink_cells.clone()
+    }
+
     pub fn new(
         profile: &str,
         available_tools: AvailableTools,
@@ -507,15 +513,10 @@ impl App {
             mouse_captured: crate::tui::mouse_capture_requested(&config.session) && !mosh_active,
             mouse_capture_allowed: crate::tui::mouse_capture_requested(&config.session),
             mosh_active,
-            #[cfg(feature = "serve")]
             pending_structured_view_open: None,
-            #[cfg(feature = "serve")]
             pending_daemon_start_open: None,
-            #[cfg(feature = "serve")]
             preview_mount_pending: None,
-            #[cfg(feature = "serve")]
             pending_view_switch: None,
-            #[cfg(feature = "serve")]
             pending_smart_rename: None,
             pending_install_version: None,
             last_installed_version_in_session: None,
@@ -529,10 +530,7 @@ impl App {
     /// event-loop `Event::Key` arm and the tail of `with_raw_mode_disabled`
     /// cover this; new event sources that mutate dialog state need to call
     /// this too or mouse capture will lag a frame behind reality.
-    fn sync_mouse_capture(
-        &mut self,
-        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    ) -> Result<()> {
+    fn sync_mouse_capture(&mut self, terminal: &mut Terminal<TuiBackend>) -> Result<()> {
         // Mouse capture is on by default; the Mouse Capture setting (or the
         // AOE_MOUSE_CAPTURE=0 backstop) opts out so iOS Mosh + Termius/Blink
         // use the terminal app's native scrollback for touch-scroll (Mosh
@@ -571,21 +569,18 @@ impl App {
     /// because the only cursor set in that state is the remote live-preview
     /// pane caret, not a local IME candidate window, so there's nothing for
     /// the early Hide to protect.
-    fn draw(&mut self, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
+    fn draw(&mut self, terminal: &mut Terminal<TuiBackend>) -> Result<()> {
         // An ACTIVE embedded structured view sets a composer caret every
         // frame, just like the live-send preview caret: hiding it
         // before each ~30fps redraw makes it strobe (the reported "cursor
         // blinks really fast"). Skip the pre-draw Hide while it's active,
         // the same treatment live-send gets. A preview shows no caret, so
         // it needs no skip.
-        #[cfg(feature = "serve")]
         let embedded_active = self
             .home
             .structured_preview
             .as_ref()
             .is_some_and(|v| v.is_active());
-        #[cfg(not(feature = "serve"))]
-        let embedded_active = false;
         let skip_hide = embedded_active
             || skip_predraw_cursor_hide(
                 self.home.live_send.is_some(),
@@ -623,7 +618,7 @@ impl App {
     /// editors) have exclusive access to stdin, then creates a fresh one.
     fn with_raw_mode_disabled<F, R>(
         &mut self,
-        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        terminal: &mut Terminal<TuiBackend>,
         f: F,
     ) -> Result<R>
     where
@@ -701,7 +696,7 @@ impl App {
 
     fn with_attached_status_hooks<F, R>(
         &mut self,
-        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        terminal: &mut Terminal<TuiBackend>,
         f: F,
     ) -> Result<(R, Vec<StatusUpdate>)>
     where
@@ -757,10 +752,7 @@ impl App {
         self.needs_redraw = true;
     }
 
-    pub async fn run(
-        &mut self,
-        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    ) -> Result<()> {
+    pub async fn run(&mut self, terminal: &mut Terminal<TuiBackend>) -> Result<()> {
         // Keep the display snapshots (sessions, pane metadata) fresh off the
         // paint thread: every _for_display helper and the passive preview
         // resize executor answers from these snapshots and never forks in render.
@@ -858,9 +850,9 @@ impl App {
         const REFRESH_COOLDOWN: Duration = Duration::from_millis(15);
         let mut last_status_refresh = std::time::Instant::now();
         let mut last_metrics_sample = std::time::Instant::now();
-        #[cfg(feature = "serve")]
-        let mut last_daemon_status_refresh = std::time::Instant::now();
+        let mut last_session_feed_refresh = std::time::Instant::now();
         let mut last_disk_refresh = std::time::Instant::now();
+        let mut full_heartbeat_deferred = false;
         let mut last_spinner_redraw = std::time::Instant::now();
         let mut last_heartbeat = std::time::Instant::now();
         let mut last_presence_refresh = std::time::Instant::now();
@@ -875,8 +867,7 @@ impl App {
         // than from a local tmux scrape, and `/api/sessions` costs the daemon
         // a few SQLite lookups per structured row. Half the tmux cadence
         // keeps a status dot feeling live while halving that request rate.
-        #[cfg(feature = "serve")]
-        const DAEMON_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+        const SESSION_FEED_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
         const DISK_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
         // Diagnostics-strip sampling. 1s keeps the sparkline responsive to a
         // fast memory climb; request_metrics_refresh is a no-op unless the strip
@@ -943,10 +934,7 @@ impl App {
             // preview too (it streams into the pane), not just an active
             // view. Computed outside the select! so the arm's `expect` is
             // guarded by the same check that enables it.
-            #[cfg(feature = "serve")]
             let embedded_mounted = self.home.structured_preview.is_some();
-            #[cfg(not(feature = "serve"))]
-            let embedded_mounted = false;
 
             // All event sources are polled cooperatively via tokio::select!.
             // This ensures signal futures actually get scheduled (fixing #608
@@ -1041,7 +1029,6 @@ impl App {
                                         // composer, same as a real Paste
                                         // event. A merely-mounted preview
                                         // must not eat it.
-                                        #[cfg(feature = "serve")]
                                         if let Some(view) = self
                                             .home
                                             .structured_preview
@@ -1061,8 +1048,6 @@ impl App {
                                         } else {
                                             self.home.handle_paste(&paste_text);
                                         }
-                                        #[cfg(not(feature = "serve"))]
-                                        self.home.handle_paste(&paste_text);
                                     }
                                     if let Some(enter) = trailing_enter {
                                         if !self.should_quit {
@@ -1218,8 +1203,6 @@ impl App {
                             // transcript, which home cannot do), plus the
                             // "clicked off the pane while entered" drop back
                             // to preview so sidebar clicks keep selecting.
-                            #[cfg(feature = "serve")]
-                            {
                                 let in_pane = self.home.structured_preview.is_some()
                                     && self.home.preview_pane_area.contains(
                                         ratatui::layout::Position::from((
@@ -1274,7 +1257,6 @@ impl App {
                                     }
                                     continue;
                                 }
-                            }
                             // Footer toolbar: a left-click on a button
                             // synthesizes its shortcut and routes it through
                             // the full key handler, so clicking behaves
@@ -1320,7 +1302,6 @@ impl App {
                                 // Mirror the list double-click path: an acp
                                 // session only stashes its id, so drain and open
                                 // the structured view here too.
-                                #[cfg(feature = "serve")]
                                 if let Some(session_id) =
                                     self.pending_structured_view_open.take()
                                 {
@@ -1334,6 +1315,47 @@ impl App {
                                     self.draw(terminal)?;
                                 }
                                 continue;
+                            }
+                            // A hyperlink under the pointer opens in the
+                            // browser. aoe captures the mouse, so the host
+                            // terminal never sees this click and its own URL
+                            // matching cannot help; a plain press is therefore
+                            // the gesture. Runs ahead of the mouse forward so a
+                            // mouse-tracking agent doesn't swallow it, and skips
+                            // on Shift, which everywhere else on the preview
+                            // means "aoe stays out of the way".
+                            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                                && !mouse.modifiers.contains(KeyModifiers::SHIFT)
+                            {
+                                if let Some(url) =
+                                    self.home.preview_link_at(mouse.column, mouse.row)
+                                {
+                                    // The browser can open behind the terminal,
+                                    // so say what happened either way, and never
+                                    // claim an open that did not happen. When no
+                                    // browser the user could see is reachable
+                                    // (the normal case over SSH), the clipboard
+                                    // does reach their machine over OSC 52, so
+                                    // hand them the URL instead of a dead end.
+                                    let status = match crate::tui::open_url::open_url(&url) {
+                                        Ok(()) => format!("opened {url}"),
+                                        Err(e) => {
+                                            crate::tui::clipboard::copy_to_clipboard(&url);
+                                            format!("{e}; copied {url}")
+                                        }
+                                    };
+                                    self.home.flash_status(status);
+                                    // The press is consumed here, so it never
+                                    // reaches the drag-select path that would
+                                    // otherwise clear a finalized highlight.
+                                    let _ = self.home.clear_preview_selection();
+                                    // This press is spent; without forgetting
+                                    // it, clicking the link again pairs into a
+                                    // double-click and attaches the session.
+                                    self.home.forget_preview_click();
+                                    self.draw(terminal)?;
+                                    continue;
+                                }
                             }
                             // Mouse-tracking agent under the preview (live-send
                             // OR passive hover): forward the press / drag /
@@ -1475,8 +1497,14 @@ impl App {
                                     self.home.handle_diff_click(mouse.column, mouse.row);
                                     self.draw(terminal)?;
                                     None
+                                } else if self.home.clear_preview_selection() {
+                                    // A click on no surface at all still
+                                    // dismisses a finalized highlight, and
+                                    // nothing below repaints for a bare
+                                    // Down(Left), so draw the clear here.
+                                    self.draw(terminal)?;
+                                    None
                                 } else {
-                                    let _ = self.home.clear_preview_selection();
                                     None
                                 }
                             } else {
@@ -1536,6 +1564,13 @@ impl App {
                                     // overlay dialogs).
                                     let mut changed =
                                         self.home.handle_hover(mouse.column, mouse.row);
+                                    // Show where a link goes while the pointer
+                                    // rests on it: the click opens without
+                                    // confirmation, so this is the only look
+                                    // the user gets before committing.
+                                    changed |= self
+                                        .home
+                                        .update_hovered_link(mouse.column, mouse.row);
                                     if hit_diff {
                                         changed |= self
                                             .home
@@ -1564,7 +1599,6 @@ impl App {
                                 // `execute_action` can't lend. Drain here so a
                                 // double-click on an acp session actually
                                 // opens it.
-                                #[cfg(feature = "serve")]
                                 if let Some(session_id) = self.pending_structured_view_open.take() {
                                     self.open_structured_view(&session_id).await?;
                                 }
@@ -1579,18 +1613,15 @@ impl App {
                                 // A [Yes] click on the switch-view confirm
                                 // stashes the switch; run it now, since this
                                 // click path never reaches the key-path drain.
-                                #[cfg(feature = "serve")]
                                 if let Some(session_id) = self.pending_view_switch.take() {
                                     self.perform_view_switch(&session_id, terminal).await;
                                 }
                                 // Same for a [Yes] click on the start-daemon
                                 // confirm from a structured-view open.
-                                #[cfg(feature = "serve")]
                                 if let Some(session_id) = self.pending_daemon_start_open.take() {
                                     self.start_daemon_then_open(&session_id, terminal).await;
                                 }
                                 // Same for an "Auto-name now" palette/menu click.
-                                #[cfg(feature = "serve")]
                                 if let Some(session_id) = self.pending_smart_rename.take() {
                                     self.perform_smart_rename(&session_id).await;
                                 }
@@ -1604,7 +1635,6 @@ impl App {
                             // view). A merely-mounted preview must NOT eat
                             // it: the user is driving the home screen, and a
                             // paste belongs to whatever home surface is up.
-                            #[cfg(feature = "serve")]
                             if let Some(view) = self
                                 .home
                                 .structured_preview
@@ -1662,30 +1692,16 @@ impl App {
                 // runs in the arm body where it can no longer be raced,
                 // so a mid-replay cancellation cannot corrupt the state.
                 ev = async {
-                    #[cfg(feature = "serve")]
-                    {
                         self.home.structured_preview
                             .as_mut()
                             .expect("guarded by embedded_mounted")
                             .next_event()
                             .await
-                    }
-                    #[cfg(not(feature = "serve"))]
-                    {
-                        std::future::pending::<()>().await
-                    }
                 }, if embedded_mounted => {
-                    #[cfg(feature = "serve")]
-                    {
                         if let Some(view) = self.home.structured_preview.as_mut() {
                             view.apply_event(ev).await;
                         }
                         self.draw(terminal)?;
-                    }
-                    #[cfg(not(feature = "serve"))]
-                    {
-                        let _: () = ev;
-                    }
                 }
                 _ = refresh_interval.tick() => {}
                 _ = preview_wake.notified() => {
@@ -1755,6 +1771,14 @@ impl App {
             // updates, dialog ticks) get painted right away.
             let mut refresh_needed = false;
             let mut needs_full_refresh = false;
+
+            // A closed flash window needs exactly one repaint to clear the
+            // row; the loop already wakes on the ticker, so this costs a
+            // single frame rather than polling.
+            if self.home.expire_status_flash() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
 
             // Continuous edge auto-scroll for a preview drag-select. The
             // mouse-event arm `continue`s above, so this runs on the
@@ -1835,16 +1859,13 @@ impl App {
                 refresh_needed = true;
             }
 
-            #[cfg(feature = "serve")]
-            {
-                if last_daemon_status_refresh.elapsed() >= DAEMON_STATUS_REFRESH_INTERVAL {
-                    self.home.request_daemon_status_refresh();
-                    last_daemon_status_refresh = std::time::Instant::now();
-                }
-                if self.home.apply_daemon_status_updates() {
-                    refresh_needed = true;
-                    needs_full_refresh = true;
-                }
+            if last_session_feed_refresh.elapsed() >= SESSION_FEED_REFRESH_INTERVAL {
+                self.home.request_session_feed_refresh();
+                last_session_feed_refresh = std::time::Instant::now();
+            }
+            if self.home.apply_session_feed() {
+                refresh_needed = true;
+                needs_full_refresh = true;
             }
 
             if self.home.apply_deletion_results() {
@@ -1895,12 +1916,22 @@ impl App {
                 needs_full_refresh = true;
             }
 
+            let store_move = self.home.poll_store_move();
+            if store_move.changed {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+            if let Some(action) = store_move.resume {
+                self.execute_action(action, terminal)?;
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
             if let Some(session_id) = self.home.apply_creation_results() {
                 self.dispatch_new_session_attach(&session_id, terminal)?;
                 // A structured session routes the post-create attach into
                 // `pending_structured_view_open`; drain it here (this tick
                 // path sits outside the key/click drains).
-                #[cfg(feature = "serve")]
                 if let Some(sid) = self.pending_structured_view_open.take() {
                     self.open_structured_view(&sid).await?;
                 }
@@ -1921,20 +1952,9 @@ impl App {
                 needs_full_refresh = true;
             }
 
-            // Disk reload: heartbeat (defense-in-depth) plus the
-            // file-watch-driven kick. Both gate on `live_send.is_none()`
-            // so reloads never interrupt a paste-in-progress; the dirty
-            // flag stays latched (Acquire pairs with the forwarder/adapter
-            // Release) until the next eligible tick. The watcher is scoped
-            // to `sessions.json` / `groups.json`, so the watcher path calls
-            // `reload_storage_only` (storage + profile rediscovery only);
-            // the heartbeat path calls full `reload()` to refresh the
-            // status-hook config cache and mouse-capture toggle.
-            //
-            // Config kick runs before the storage-mirror block:
-            // `refresh_from_config` invalidates profile-derived state that
-            // the block reads. Same `live_idle` gate; recomputing
-            // `tool_hotkey_cache` mid live-send disrupts input.
+            // Full/config reloads stay deferred during live-send to preserve input
+            // policy and mouse-capture state. Storage-only reloads preserve the live
+            // target unless it drifts, in which case normal teardown restores sizing.
             let live_idle = self.home.live_send.is_none();
             let config_kick = take_config_refresh_kick(live_idle, &self.home.config_watch.dirty);
             if config_kick {
@@ -1948,22 +1968,19 @@ impl App {
             }
 
             let heartbeat_due = last_disk_refresh.elapsed() >= DISK_REFRESH_INTERVAL;
-            // Only consume the dirty latch when we're eligible to act on
-            // it (`live_idle`). When live-send is on, the latch must
-            // persist for the next eligible tick so a watcher kick that
-            // arrived during live-send is not silently lost.
-            let dirty = if live_idle {
-                self.home
-                    .disk_watch
-                    .dirty
-                    .swap(false, std::sync::atomic::Ordering::Acquire)
-            } else {
-                false
-            };
-            let refresh_decision = decide_disk_refresh(live_idle, heartbeat_due, dirty);
+            // Consume watcher notifications in every mode. The decision below routes
+            // live-send ticks to the storage-only reload.
+            let dirty = self
+                .home
+                .disk_watch
+                .dirty
+                .swap(false, std::sync::atomic::Ordering::Acquire);
+            let refresh_plan =
+                plan_disk_refresh(live_idle, heartbeat_due, dirty, full_heartbeat_deferred);
+            full_heartbeat_deferred = refresh_plan.full_heartbeat_deferred;
 
-            match refresh_decision {
-                DiskRefreshDecision::Heartbeat => {
+            match refresh_plan.decision {
+                DiskRefreshDecision::FullHeartbeat => {
                     let reload_result = self.home.reload();
                     let reload_ok = reload_result.is_ok();
                     handle_tick_reload_storage(reload_result, &mut self.home.reload_failure_state);
@@ -1981,9 +1998,12 @@ impl App {
                     refresh_needed = true;
                     needs_full_refresh = true;
                 }
-                DiskRefreshDecision::Watcher => {
+                DiskRefreshDecision::StorageOnly => {
                     let reload_result = self.home.reload_storage_only();
                     handle_tick_reload_storage(reload_result, &mut self.home.reload_failure_state);
+                    if heartbeat_due {
+                        last_disk_refresh = std::time::Instant::now();
+                    }
                     refresh_needed = true;
                     needs_full_refresh = true;
                 }
@@ -2066,7 +2086,6 @@ impl App {
 
             // Preview-on-select: mount/drop the streaming transcript
             // preview to track the selected structured session (debounced).
-            #[cfg(feature = "serve")]
             if self.reconcile_structured_preview().await {
                 refresh_needed = true;
                 needs_full_refresh = true;
@@ -2075,7 +2094,6 @@ impl App {
             // Embedded structured view: expire its toast, surface queued
             // plugin notifications, and repaint on the same 120ms cadence
             // the full-screen view used so the composer caret blinks.
-            #[cfg(feature = "serve")]
             if let Some(view) = self.home.structured_preview.as_mut() {
                 let toast_changed = view.tick();
                 if toast_changed || last_spinner_redraw.elapsed() >= SPINNER_REDRAW_INTERVAL {
@@ -2221,7 +2239,12 @@ impl App {
         if self.update_status.as_ref().is_some_and(|s| s.is_expired()) {
             self.update_status = None;
         }
-        let status_text = self.update_status.as_ref().map(|s| s.text.as_str());
+        let store_move_line = self.home.store_move_status_line();
+        let status_text = self
+            .update_status
+            .as_ref()
+            .map(|s| s.text.as_str())
+            .or(store_move_line.as_deref());
         // Only hand the renderer the image banner when it's actually the active
         // one; while a pull is in flight `image_banner_active` is false, so the
         // banner can't re-render under the "pulling…" toast and clobber itself
@@ -2587,7 +2610,7 @@ impl App {
         &mut self,
         method: crate::update::install::InstallMethod,
         version: String,
-        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        terminal: &mut Terminal<TuiBackend>,
     ) -> Result<()> {
         use crate::update::install::InstallMethod;
 
@@ -2735,30 +2758,55 @@ fn poll_update_receiver(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiskRefreshDecision {
-    Heartbeat,
-    Watcher,
+    FullHeartbeat,
+    StorageOnly,
     None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DiskRefreshPlan {
+    decision: DiskRefreshDecision,
+    full_heartbeat_deferred: bool,
 }
 
 fn take_config_refresh_kick(live_idle: bool, config_dirty: &std::sync::atomic::AtomicBool) -> bool {
     live_idle && config_dirty.swap(false, std::sync::atomic::Ordering::Acquire)
 }
 
-/// Pure refresh-policy decision. Inputs are plain values so this helper
-/// is side-effect free; callers are responsible for actually consuming
-/// the watcher latch (`AtomicBool::swap`) before invoking it. Keeping
-/// decision and mutation separate lets the unit tests below be
-/// table-driven without owning an atomic.
+/// Pure refresh-policy decision. Storage-only refreshes remain eligible during
+/// live-send, both for watcher notifications and as the periodic fallback. The
+/// full heartbeat reload requires an idle live-send state.
 fn decide_disk_refresh(live_idle: bool, heartbeat_due: bool, dirty: bool) -> DiskRefreshDecision {
-    if !live_idle {
-        return DiskRefreshDecision::None;
-    }
-    if heartbeat_due {
-        DiskRefreshDecision::Heartbeat
-    } else if dirty {
-        DiskRefreshDecision::Watcher
+    if live_idle && heartbeat_due {
+        DiskRefreshDecision::FullHeartbeat
+    } else if heartbeat_due || dirty {
+        DiskRefreshDecision::StorageOnly
     } else {
         DiskRefreshDecision::None
+    }
+}
+
+/// Preserve an overdue full heartbeat across storage-only timer resets, so it
+/// runs on the first idle tick after live-send exits.
+fn plan_disk_refresh(
+    live_idle: bool,
+    heartbeat_due: bool,
+    dirty: bool,
+    full_heartbeat_deferred: bool,
+) -> DiskRefreshPlan {
+    let decision = decide_disk_refresh(
+        live_idle,
+        heartbeat_due || (live_idle && full_heartbeat_deferred),
+        dirty,
+    );
+    let full_heartbeat_deferred = match decision {
+        DiskRefreshDecision::FullHeartbeat => false,
+        DiskRefreshDecision::StorageOnly if !live_idle && heartbeat_due => true,
+        _ => full_heartbeat_deferred,
+    };
+    DiskRefreshPlan {
+        decision,
+        full_heartbeat_deferred,
     }
 }
 
@@ -2864,7 +2912,7 @@ impl App {
     async fn handle_key(
         &mut self,
         key: KeyEvent,
-        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        terminal: &mut Terminal<TuiBackend>,
     ) -> Result<()> {
         // An ACTIVE embedded structured view owns the keyboard, just as
         // the full-screen view owned the whole event stream: letters must
@@ -2872,7 +2920,6 @@ impl App {
         // previewed view (mounted but not entered) does NOT capture: list
         // navigation keeps working, and Enter enters it. Ctrl+Q leaves
         // interactive mode back to the read-only preview.
-        #[cfg(feature = "serve")]
         if self
             .home
             .structured_preview
@@ -3001,22 +3048,18 @@ impl App {
         // ('y' / Enter on the switch-view confirm) stashes the id during
         // `execute_action` above, and draining before `handle_key` would
         // sit on it until the next keypress (#2925).
-        #[cfg(feature = "serve")]
         if let Some(session_id) = self.pending_view_switch.take() {
             self.perform_view_switch(&session_id, terminal).await;
         }
 
-        #[cfg(feature = "serve")]
         if let Some(session_id) = self.pending_daemon_start_open.take() {
             self.start_daemon_then_open(&session_id, terminal).await;
         }
 
-        #[cfg(feature = "serve")]
         if let Some(session_id) = self.pending_structured_view_open.take() {
             self.open_structured_view(&session_id).await?;
         }
 
-        #[cfg(feature = "serve")]
         if let Some(session_id) = self.pending_smart_rename.take() {
             self.perform_smart_rename(&session_id).await;
         }
@@ -3030,7 +3073,6 @@ impl App {
     /// structured-view WS and the file watcher refreshes the row, so the TUI
     /// mutates no session state itself. A no-daemon state surfaces as a
     /// transient status rather than failing the loop (#3039).
-    #[cfg(feature = "serve")]
     async fn perform_smart_rename(&mut self, session_id: &str) {
         use crate::acp::client::{require_daemon, HttpClient, ManagerError};
 
@@ -3082,12 +3124,7 @@ impl App {
     /// `aoe serve`, so the spawn is part of the consented action rather
     /// than a hidden side effect. `terminal` is borrowed to paint the
     /// "Starting…" status before the (up to several seconds) wait.
-    #[cfg(feature = "serve")]
-    async fn perform_view_switch(
-        &mut self,
-        session_id: &str,
-        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    ) {
+    async fn perform_view_switch(&mut self, session_id: &str, terminal: &mut Terminal<TuiBackend>) {
         use crate::acp::client::{require_daemon, HttpClient, ManagerError};
 
         let Some(inst) = self.home.get_instance(session_id) else {
@@ -3149,7 +3186,6 @@ impl App {
     /// when selected), connect now; and with no daemon at all, offer to
     /// start a localhost one (the Yes path resumes through
     /// `start_daemon_then_open`).
-    #[cfg(feature = "serve")]
     async fn open_structured_view(&mut self, session_id: &str) -> Result<()> {
         use crate::acp::client::{require_daemon, ManagerError};
 
@@ -3193,7 +3229,6 @@ impl App {
 
     /// Flip the mounted embedded view to interactive mode (exiting
     /// live-send first, since both own the preview pane and keyboard).
-    #[cfg(feature = "serve")]
     fn activate_embedded(&mut self) {
         self.home.exit_live_send_if_active();
         if let Some(v) = self.home.structured_preview.as_mut() {
@@ -3204,7 +3239,6 @@ impl App {
     /// Mount the embedded view against a located daemon in preview
     /// (read-only) state. The caller activates it if the user is
     /// entering rather than just previewing.
-    #[cfg(feature = "serve")]
     async fn connect_embedded_structured(
         &mut self,
         endpoint: crate::acp::client::DaemonEndpoint,
@@ -3232,7 +3266,6 @@ impl App {
     /// reported Ctrl+Q flash). The home view repaints the same preview
     /// rect the structured view drew into, so the ordinary diffed draw
     /// covers it cleanly, the same way exiting live-send does.
-    #[cfg(feature = "serve")]
     fn close_embedded_structured(&mut self) {
         self.home.structured_preview = None;
     }
@@ -3240,11 +3273,10 @@ impl App {
     /// The Yes path of the "start a local daemon?" confirm: spawn a
     /// localhost daemon with visible feedback, wait for it to become
     /// healthy, then mount + enter the embedded structured view.
-    #[cfg(feature = "serve")]
     async fn start_daemon_then_open(
         &mut self,
         session_id: &str,
-        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        terminal: &mut Terminal<TuiBackend>,
     ) {
         self.update_status = Some(UpdateStatus::transient("Starting local daemon…".into()));
         let _ = self.draw(terminal);
@@ -3269,7 +3301,6 @@ impl App {
     /// while a daemon is already reachable (a down daemon leaves the
     /// "press Enter" placeholder). An active (entered) view is never
     /// disturbed. Returns true if the mount set changed (needs redraw).
-    #[cfg(feature = "serve")]
     async fn reconcile_structured_preview(&mut self) -> bool {
         // An entered view owns the selection and keyboard; leave it be,
         // but only while its session is still a live structured row AND
@@ -3383,7 +3414,7 @@ impl App {
             now,
             &attached,
             |profile| {
-                crate::session::profile_config::resolve_config_or_warn(profile)
+                crate::session::config::profile_config::resolve_config_or_warn(profile)
                     .session
                     .auto_stop_idle_secs
             },
@@ -3440,7 +3471,7 @@ impl App {
     fn execute_action(
         &mut self,
         action: Action,
-        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        terminal: &mut Terminal<TuiBackend>,
     ) -> Result<()> {
         match action {
             Action::Quit => self.should_quit = true,
@@ -3568,7 +3599,6 @@ impl App {
             Action::RunBackgroundToolSession(id, tool_name) => {
                 self.run_background_tool_session(&id, &tool_name);
             }
-            #[cfg(feature = "serve")]
             Action::OpenStructuredView(id) => {
                 // Stash for the async main loop. The acp view needs
                 // `event_stream` access that this sync handler can't
@@ -3576,19 +3606,16 @@ impl App {
                 // we return.
                 self.pending_structured_view_open = Some(id);
             }
-            #[cfg(feature = "serve")]
             Action::SwitchSessionView(id) => {
                 // Same stash-for-the-async-loop pattern: the daemon POST
                 // must be awaited, which this sync handler can't do.
                 self.pending_view_switch = Some(id);
             }
-            #[cfg(feature = "serve")]
             Action::StartDaemonThenOpenStructured(id) => {
                 // Same stash pattern: spawning the daemon and waiting for
                 // its health check must be awaited.
                 self.pending_daemon_start_open = Some(id);
             }
-            #[cfg(feature = "serve")]
             Action::SmartRenameNow(id) => {
                 // Same stash pattern: the daemon POST must be awaited.
                 self.pending_smart_rename = Some(id);
@@ -3597,11 +3624,11 @@ impl App {
         Ok(())
     }
 
-    /// Route a freshly-created session through the user's
-    /// `default_attach_mode` setting. Shared by both creation paths
-    /// (synchronous `Action::AttachAfterCreate` and the async branch in
-    /// the main loop's `apply_creation_results` handler) so the setting
-    /// applies regardless of which one fired.
+    /// Route a freshly-created session through the configured new-session
+    /// mode. Shared by both creation paths (synchronous
+    /// `Action::AttachAfterCreate` and the async branch in the main loop's
+    /// `apply_creation_results` handler) so the mode applies regardless of
+    /// which one fired.
     ///
     /// A structured session skips the tmux modes entirely and opens its
     /// structured view (#2926): the wizard's Structured toggle is an
@@ -3613,9 +3640,8 @@ impl App {
     fn dispatch_new_session_attach(
         &mut self,
         session_id: &str,
-        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        terminal: &mut Terminal<TuiBackend>,
     ) -> Result<()> {
-        #[cfg(feature = "serve")]
         if self
             .home
             .get_instance(session_id)
@@ -3624,7 +3650,7 @@ impl App {
             self.pending_structured_view_open = Some(session_id.to_string());
             return Ok(());
         }
-        let mode = self.home.default_attach_mode(session_id);
+        let mode = self.home.new_session_attach_mode(session_id);
         tracing::debug!(target: "tui.input",
             session_id = %session_id,
             mode = ?mode,
@@ -3643,7 +3669,7 @@ impl App {
     fn attach_session(
         &mut self,
         session_id: &str,
-        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        terminal: &mut Terminal<TuiBackend>,
     ) -> Result<()> {
         let instance = match self.home.get_instance(session_id) {
             Some(inst) => inst.clone(),
@@ -3739,6 +3765,13 @@ impl App {
                 }
             }
 
+            if instance.is_sandboxed()
+                && self
+                    .defer_to_store_move(session_id, Action::AttachSession(session_id.to_string()))
+            {
+                return Ok(());
+            }
+
             // Get terminal size to pass to tmux session creation
             // This ensures the session starts at the correct size instead of 80x24 default
             let size = crate::terminal::get_size();
@@ -3794,7 +3827,7 @@ impl App {
         // preview geometry against the now-grown window instead of leaving the
         // top clipped.
         tmux_session.reset_size_to_latest_client();
-        self.home.clear_preview_pane_sync();
+        self.home.clear_preview_pane_sync(session_id);
         let (attach_result, attached_status_updates) =
             self.with_attached_status_hooks(terminal, || tmux_session.attach())?;
 
@@ -3833,11 +3866,27 @@ impl App {
         Ok(())
     }
 
+    /// If launching `session_id` would first copy its sandbox store, start
+    /// that copy on the worker and come back to `resume` once it is done,
+    /// returning `true`. The copy can take minutes; the status line narrates
+    /// it meanwhile.
+    fn defer_to_store_move(&mut self, session_id: &str, resume: Action) -> bool {
+        if !self.home.needs_store_move_before_launch(session_id) {
+            return false;
+        }
+        if !self.home.begin_store_move(session_id, Some(resume)) {
+            self.update_status = Some(UpdateStatus::transient(
+                "another agent store move is still in progress".into(),
+            ));
+        }
+        true
+    }
+
     fn attach_terminal(
         &mut self,
         session_id: &str,
         mode: TerminalMode,
-        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        terminal: &mut Terminal<TuiBackend>,
     ) -> Result<()> {
         let instance = match self.home.get_instance(session_id) {
             Some(inst) => inst.clone(),
@@ -3852,6 +3901,12 @@ impl App {
             TerminalMode::Container if instance.is_sandboxed() => {
                 let container_session = instance.container_terminal_tmux_session()?;
                 if !container_session.exists() || container_session.is_pane_dead() {
+                    if self.defer_to_store_move(
+                        session_id,
+                        Action::AttachTerminal(session_id.to_string(), mode),
+                    ) {
+                        return Ok(());
+                    }
                     if container_session.exists() {
                         let _ = container_session.kill();
                     }
@@ -3910,7 +3965,7 @@ impl App {
         &mut self,
         session_id: &str,
         tool_name: &str,
-        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        terminal: &mut Terminal<TuiBackend>,
     ) -> Result<()> {
         let instance = match self.home.get_instance(session_id) {
             Some(inst) => inst.clone(),
@@ -4041,7 +4096,7 @@ impl App {
     fn edit_file(
         &mut self,
         path: &std::path::Path,
-        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        terminal: &mut Terminal<TuiBackend>,
     ) -> Result<()> {
         // Determine which editor to use (prefer vim, fall back to nano)
         let editor = std::env::var("EDITOR")
@@ -4205,13 +4260,10 @@ pub enum Action {
     /// "Reviving..." toast before `ensure_pane_ready` runs, then the home
     /// view flips into the live-send capture state for subsequent keys.
     EnterLiveSend(String),
-    /// Attach to a session that was just created via the synchronous
-    /// create path (no sandbox, no hooks, no worktree). Routes through
-    /// the same `default_attach_mode` dispatch as the async path's
-    /// `apply_creation_results` so the user's "live mode by default"
-    /// setting applies in both cases. `AttachSession` deliberately
-    /// bypasses the setting because pressing Enter on a session row is
-    /// the user's explicit ask for a tmux attach.
+    /// Open a session that was just created via the synchronous create path
+    /// (no sandbox, hooks, or worktree). This action routes through the
+    /// new-session mode, like the async path in `apply_creation_results`.
+    /// `AttachSession` is already resolved for an existing session row.
     AttachAfterCreate(String),
     /// Attach to a tool session (lazygit, yazi, etc.) for the given agent
     /// session. The tool_name indexes into Config.tools.
@@ -4223,25 +4275,21 @@ pub enum Action {
     /// stashes the id in `pending_structured_view_open`; the main loop drains it
     /// after `execute_action` returns and runs the async acp loop
     /// against the borrowed terminal + event stream.
-    #[cfg(feature = "serve")]
     OpenStructuredView(String),
     /// Flip a session's persisted view (structured ↔ terminal) through the
     /// daemon's switch endpoints. Stashed in `pending_view_switch` (the
     /// POST needs the async loop) and drained alongside
     /// `pending_structured_view_open`; the daemon persists the change and
     /// the file watcher refreshes the row.
-    #[cfg(feature = "serve")]
     SwitchSessionView(String),
     /// The Yes on the "no daemon running, start a local one?" confirm
     /// shown when opening a structured view. Stashed in
     /// `pending_daemon_start_open` (spawn + health wait must be
     /// awaited) and drained alongside the other structured stashes.
-    #[cfg(feature = "serve")]
     StartDaemonThenOpenStructured(String),
     /// On-demand "Auto-name now" for a structured session. Stashed in
     /// `pending_smart_rename` (the daemon POST needs the async loop) and
     /// drained alongside the other structured stashes (#3039).
-    #[cfg(feature = "serve")]
     SmartRenameNow(String),
 }
 
@@ -4494,17 +4542,17 @@ mod tests {
     fn heartbeat_wins_when_both_disk_paths_are_ready() {
         assert_eq!(
             decide_disk_refresh(true, true, true),
-            DiskRefreshDecision::Heartbeat,
+            DiskRefreshDecision::FullHeartbeat,
             "when live-idle and both heartbeat and watcher are ready, the full reload wins"
         );
         assert_eq!(
             decide_disk_refresh(true, true, false),
-            DiskRefreshDecision::Heartbeat,
+            DiskRefreshDecision::FullHeartbeat,
             "heartbeat fires even without a watcher kick"
         );
         assert_eq!(
             decide_disk_refresh(true, false, true),
-            DiskRefreshDecision::Watcher,
+            DiskRefreshDecision::StorageOnly,
             "watcher kick alone fires the storage-only path"
         );
         assert_eq!(
@@ -4515,38 +4563,51 @@ mod tests {
     }
 
     #[test]
-    fn live_send_blocks_every_decision_branch() {
-        // The pure helper must return None for every (heartbeat_due,
-        // dirty) combination when live-send is on. Latch preservation is
-        // the caller's responsibility (see
-        // `caller_gating_preserves_dirty_latch_during_live_send`).
+    fn live_send_uses_storage_only_for_watcher_and_heartbeat() {
+        assert_eq!(
+            decide_disk_refresh(false, false, false),
+            DiskRefreshDecision::None,
+            "live-send with no refresh input must remain idle"
+        );
+        assert_eq!(
+            decide_disk_refresh(false, true, false),
+            DiskRefreshDecision::StorageOnly,
+            "live-send must use a storage-only heartbeat fallback"
+        );
         for &heartbeat in &[false, true] {
-            for &dirty in &[false, true] {
-                assert_eq!(
-                    decide_disk_refresh(false, heartbeat, dirty),
-                    DiskRefreshDecision::None,
-                    "live_send must block refresh (heartbeat={heartbeat}, dirty={dirty})"
-                );
-            }
+            assert_eq!(
+                decide_disk_refresh(false, heartbeat, true),
+                DiskRefreshDecision::StorageOnly,
+                "live-send must allow the storage-only watcher path (heartbeat={heartbeat})"
+            );
         }
     }
 
     #[test]
-    fn caller_gating_preserves_dirty_latch_during_live_send() {
-        // Mirrors the gating logic in the tick loop: only consume the
-        // latch when live_idle is true. A watcher kick that arrived
-        // during live-send must remain observable on the next eligible
-        // tick.
+    fn full_heartbeat_deferred_during_live_send_runs_on_exit() {
+        let live_plan = plan_disk_refresh(false, true, false, false);
+        assert_eq!(live_plan.decision, DiskRefreshDecision::StorageOnly);
+        assert!(live_plan.full_heartbeat_deferred);
+
+        let idle_plan = plan_disk_refresh(true, false, false, live_plan.full_heartbeat_deferred);
+        assert_eq!(idle_plan.decision, DiskRefreshDecision::FullHeartbeat);
+        assert!(!idle_plan.full_heartbeat_deferred);
+    }
+
+    #[test]
+    fn caller_consumes_dirty_latch_during_live_send() {
         let dirty_atomic = std::sync::atomic::AtomicBool::new(true);
-        let live_idle = false;
-        let _dirty = if live_idle {
-            dirty_atomic.swap(false, std::sync::atomic::Ordering::Acquire)
-        } else {
-            false
-        };
+        let dirty = dirty_atomic.swap(false, std::sync::atomic::Ordering::Acquire);
+
+        assert!(dirty, "live-send must consume the watcher kick");
         assert!(
-            dirty_atomic.load(std::sync::atomic::Ordering::Acquire),
-            "live_send tick must NOT consume the dirty latch; it must persist for the next tick"
+            !dirty_atomic.load(std::sync::atomic::Ordering::Acquire),
+            "a consumed watcher kick must not remain latched"
+        );
+        assert_eq!(
+            decide_disk_refresh(false, true, dirty),
+            DiskRefreshDecision::StorageOnly,
+            "the consumed kick must choose storage-only refresh while the full heartbeat remains deferred"
         );
     }
 
@@ -4576,7 +4637,7 @@ mod tests {
         let disk_decision = decide_disk_refresh(true, true, dirty);
 
         assert!(config_kick, "config refresh must be scheduled first");
-        assert_eq!(disk_decision, DiskRefreshDecision::Heartbeat);
+        assert_eq!(disk_decision, DiskRefreshDecision::FullHeartbeat);
         assert!(!config_dirty.load(std::sync::atomic::Ordering::Acquire));
         assert!(!disk_dirty.load(std::sync::atomic::Ordering::Acquire));
     }

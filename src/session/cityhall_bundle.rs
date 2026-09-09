@@ -40,12 +40,12 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use super::config::settings_schema::{
+    apply_changed_leaves, merge_json, schema, strip_local_only, validate_patch, Scope,
+};
 use super::config::{update_config, Config};
 use super::get_app_dir;
 use super::projects::{self, Project, ProjectScope};
-use super::settings_schema::{
-    apply_changed_leaves, merge_json, schema, strip_local_only, validate_patch, Scope,
-};
 
 /// Format version. [`apply`] refuses anything else rather than guessing at a
 /// document a future aoe wrote.

@@ -37,6 +37,7 @@ pub(super) fn env_test_spawn_config(cwd: std::path::PathBuf) -> SpawnConfig {
         stored_acp_session_id: None,
         fork_from: None,
         seed_history_replay: false,
+        generation: 0,
         artifact_dir: None,
         sandbox_info: None,
         source_profile: None,
@@ -44,6 +45,15 @@ pub(super) fn env_test_spawn_config(cwd: std::path::PathBuf) -> SpawnConfig {
     }
 }
 
+/// Spawn config for a `/bin/sh` fixture script.
+///
+/// The script is handed to `sh` as an argument rather than exec'd
+/// directly. `execve` on a file any process still holds open for writing
+/// fails with `ETXTBSY`, and a concurrent spawn elsewhere in the test
+/// binary can fork between the fixture writer's `open` and its `close`,
+/// leaving the child that writable descriptor until it execs. `sh` only
+/// ever opens the script for reading, which removes the window instead of
+/// retrying past it (#3790). Fixture writers therefore need no exec bit.
 #[cfg(unix)]
 pub(super) fn reset_fake_spawn_config(
     script: &std::path::Path,
@@ -54,8 +64,8 @@ pub(super) fn reset_fake_spawn_config(
         agent_key: "codex".into(),
         tool: "codex".into(),
         spec: AgentSpec {
-            command: script.to_string_lossy().into_owned(),
-            args: vec![],
+            command: "/bin/sh".into(),
+            args: vec![script.to_string_lossy().into_owned()],
             description: "scripted reset fake".into(),
             env_allowlist: None,
         },
@@ -69,6 +79,7 @@ pub(super) fn reset_fake_spawn_config(
         stored_acp_session_id: None,
         fork_from: None,
         seed_history_replay: false,
+        generation: 0,
         artifact_dir: None,
         sandbox_info: None,
         source_profile: None,

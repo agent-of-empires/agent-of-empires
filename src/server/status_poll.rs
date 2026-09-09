@@ -188,7 +188,6 @@ pub(super) async fn flush_passive_transition_writes(
 /// is guaranteed even on a tick whose scrape fails, and entries for a session
 /// that is merely paused (archived / snoozed / idle-dormant) are not needed to
 /// be re-derived here.
-#[cfg(feature = "serve")]
 pub(super) fn gc_reconciler_session_maps(
     live_ids: &std::collections::HashSet<&str>,
     attempted: &mut std::collections::HashSet<String>,
@@ -214,34 +213,26 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
     // queued ticks and collapse the 2s cooldown the per-tick work expects.
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    #[cfg(feature = "serve")]
     let mut attempted_acp_spawns: std::collections::HashSet<String> =
         std::collections::HashSet::new();
-    #[cfg(feature = "serve")]
     let mut acp_reap_cadence = acp_reconciler::ReapCadence::default();
-    #[cfg(feature = "serve")]
     let mut last_session_idle_reap: Option<std::time::Instant> = None;
     // Loop-local, single-owner sleep-inhibit assertion (single global toggle,
     // so one slot for the whole daemon). Kept off `AppState`, which is for
     // cross-task shared state; this is owned solely by the poll loop, like
     // `last_session_idle_reap`.
-    #[cfg(feature = "serve")]
     let mut sleep_inhibitor: Option<Box<dyn crate::process::SleepInhibit>> = None;
-    #[cfg(feature = "serve")]
     let mut last_sleep_inhibit_reconcile: Option<std::time::Instant> = None;
     // Per-session reconciler respawn budget + crash-loop park set (#1945).
     // Owned by the loop so they persist across ticks, swept against live
     // sessions inside the reconciler.
-    #[cfg(feature = "serve")]
     let mut acp_respawn_history: std::collections::HashMap<String, Vec<std::time::Instant>> =
         std::collections::HashMap::new();
-    #[cfg(feature = "serve")]
     let mut acp_parked: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Per-session capacity-deferred marker (#1027). A structured session
     // refused by `CapacityFull` is re-armed for retry every tick; this set
     // gates the capacity banner to publish once per transition and is cleared
     // once the session's worker comes online or leaves the live set.
-    #[cfg(feature = "serve")]
     let mut acp_capacity_deferred: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     loop {
@@ -257,18 +248,14 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
         // long-uptime daemon's footprint stays bounded by live-session count,
         // not by lifetime-observed sessions (#2758). Above the scrape guard so
         // the sweep still runs on a tick whose tmux scrape fails.
-        #[cfg(feature = "serve")]
-        {
-            let live_ids: std::collections::HashSet<&str> =
-                prev.keys().map(String::as_str).collect();
-            gc_reconciler_session_maps(
-                &live_ids,
-                &mut attempted_acp_spawns,
-                &mut acp_respawn_history,
-                &mut acp_parked,
-                &mut acp_capacity_deferred,
-            );
-        }
+        let live_ids: std::collections::HashSet<&str> = prev.keys().map(String::as_str).collect();
+        gc_reconciler_session_maps(
+            &live_ids,
+            &mut attempted_acp_spawns,
+            &mut acp_respawn_history,
+            &mut acp_parked,
+            &mut acp_capacity_deferred,
+        );
         // Snapshot of the prior tick's status bookkeeping, taken from the same
         // in-memory `state.instances` this tick's `load_all_instances()` call
         // is about to reset to defaults. Fed to `seed_tick_tracking` below,
@@ -394,7 +381,6 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
 
             drain_session_id_updates_in_state(&state).await;
 
-            #[cfg(feature = "serve")]
             acp_reconciler::reconcile_acp_workers(
                 &state,
                 &mut attempted_acp_spawns,
@@ -405,10 +391,8 @@ pub(super) async fn status_poll_loop(state: Arc<AppState>) {
             )
             .await;
 
-            #[cfg(feature = "serve")]
             reap_idle_sessions(&state, &mut last_session_idle_reap).await;
 
-            #[cfg(feature = "serve")]
             update_sleep_inhibit(
                 &state,
                 &mut sleep_inhibitor,
@@ -427,7 +411,6 @@ mod tests {
     /// #2758: the reconciler's persistent per-session maps must be swept
     /// against the live instance set every tick, so a deleted session's id
     /// does not linger and grow the daemon's footprint over its uptime.
-    #[cfg(feature = "serve")]
     #[test]
     fn gc_reconciler_session_maps_drops_deleted_session_ids() {
         use std::collections::{HashMap, HashSet};

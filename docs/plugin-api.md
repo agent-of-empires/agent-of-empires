@@ -302,7 +302,10 @@ created; a plugin cannot deliver turns to a user's or another plugin's session.
 **Busy sessions.** A turn aimed at a session whose agent is already running a
 non-steerable turn (or cancelling, or compacting) is refused with a retryable
 `agent_busy` rather than accepted and dropped. A stopped or dormant session is
-not busy: the host resumes it and waits.
+not busy: a turn is intent to continue, so the host wakes it the way a user
+prompt does (clearing an idle auto-stop, an archive or a snooze; a manual stop
+needs no clearing), closes any turn the previous worker left open with a synthetic
+`Stopped { orphaned_at_restart }`, resumes the worker and waits.
 
 **Idempotency.** `sessions.create` accepts an `idempotency_key` scoped to the
 plugin: retrying with the same key and payload returns the existing session

@@ -50,7 +50,7 @@ pub fn resolve_agent_command(
                     path = %path.display(),
                     "PATH copy is below the supported version floor; using the bundled pinned copy"
                 );
-                return Some(bundled_resolution(bundled_path, app_dir));
+                return Some(bundled_resolution(bundled_path, app_dir, command));
             }
             _ => {
                 let dir = path
@@ -67,7 +67,28 @@ pub fn resolve_agent_command(
 
     if let Some(path) = app_dir.and_then(|d| crate::acp::adapters::bundled_adapter_bin(d, command))
     {
-        return Some(bundled_resolution(path, app_dir));
+        if app_dir.is_some_and(|d| crate::acp::adapters::installed_copy_is_stale(d, command)) {
+            warn!(
+                target: "acp.adapters",
+                adapter = command,
+                "installed copy predates this aoe build; refusing it until it is reinstalled"
+            );
+            return None;
+        }
+        if let Some(found) =
+            app_dir.and_then(|d| crate::acp::adapters::runtime_too_old_for(d, command))
+        {
+            warn!(
+                target: "acp.adapters",
+                adapter = command,
+                found,
+                "Node cannot run this adapter's sources (needs {}.{}); refusing it",
+                crate::acp::node::MIN_NODE_MAJOR,
+                crate::acp::node::MIN_NODE_MINOR
+            );
+            return None;
+        }
+        return Some(bundled_resolution(path, app_dir, command));
     }
 
     for dir in node_search_dirs() {
@@ -89,12 +110,14 @@ pub fn resolve_agent_command(
 pub(super) fn bundled_resolution(
     path: std::path::PathBuf,
     app_dir: Option<&std::path::Path>,
+    command: &str,
 ) -> ResolvedAgentCommand {
     let mut prepend_paths = Vec::new();
     if let Some(dir) = path.parent() {
         prepend_paths.push(dir.to_path_buf());
     }
-    if let Some(node) = app_dir.and_then(|d| crate::acp::node::resolve("", d).ok()) {
+    let sources = crate::acp::adapters::ships_sources(command);
+    if let Some(node) = app_dir.and_then(|d| crate::acp::node::resolve_for("", d, sources).ok()) {
         if let Some(node_bin) = node.path.parent() {
             prepend_paths.push(node_bin.to_path_buf());
         }
@@ -108,7 +131,6 @@ pub(super) fn bundled_resolution(
 /// True when `path` reports a version below the adapter's startup floor.
 /// Conservative: any probe failure or unparseable output returns false, so
 /// an unknown version keeps the user's own copy rather than overriding it.
-#[cfg(feature = "serve")]
 pub(super) fn path_copy_below_floor(command: &str, path: &std::path::Path) -> bool {
     let Some(gate) = crate::acp::agent_compat::version_gate_for(
         crate::acp::agent_compat::ExpectedAgent::from_command(command),
@@ -132,7 +154,6 @@ pub(super) fn path_copy_below_floor(command: &str, path: &std::path::Path) -> bo
 /// otherwise block session spawn forever. It mirrors `version_probe`'s 2s
 /// budget; any failure or timeout yields `None` so the caller keeps the
 /// user's own copy.
-#[cfg(feature = "serve")]
 pub(super) fn probe_version_bounded(path: &std::path::Path) -> Option<String> {
     const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
@@ -172,11 +193,6 @@ pub(super) fn probe_version_bounded(path: &std::path::Path) -> Option<String> {
             Err(_) => return None,
         }
     }
-}
-
-#[cfg(not(feature = "serve"))]
-pub(super) fn path_copy_below_floor(_command: &str, _path: &std::path::Path) -> bool {
-    false
 }
 
 pub(super) fn find_in_path_env(binary: &str) -> Option<std::path::PathBuf> {
@@ -251,9 +267,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn resolve_agent_command_falls_back_to_bundled_when_not_on_path() {
-        // Tagged `#[serial]` and PATH-scrubbed because the adapter names are
-        // real: a dev machine with a global `claude-agent-acp` would
-        // (correctly) resolve that copy instead of the bundled one.
+        // PATH-scrubbed because the adapter names are real: a dev machine
+        // with a global `claude-agent-acp` would (correctly) resolve that
+        // copy instead of the bundled one.
         let app = tempfile::TempDir::new().unwrap();
         let name = "claude-agent-acp";
         let bin_dir = app
@@ -264,20 +280,9 @@ mod tests {
         std::fs::write(&bin, "#!/usr/bin/env node\n").unwrap();
 
         let empty = tempfile::TempDir::new().unwrap();
-        let prev = std::env::var_os("PATH");
-        // SAFETY: mutates the process-wide PATH; `#[serial]` keeps other
-        // PATH readers out of the way.
-        unsafe {
-            std::env::set_var("PATH", empty.path());
-        }
-        let resolved = resolve_agent_command(name, Some(app.path()));
-        if let Some(prev) = prev {
-            unsafe {
-                std::env::set_var("PATH", prev);
-            }
-        }
-
-        let resolved = resolved.expect("should resolve from the bundled adapter dir");
+        let _path = crate::session::test_support::EnvGuard::set(&[("PATH", empty.path())]);
+        let resolved = resolve_agent_command(name, Some(app.path()))
+            .expect("should resolve from the bundled adapter dir");
         assert_eq!(resolved.path, bin);
         assert_eq!(resolved.prepend_paths.first(), Some(&bin_dir));
     }
@@ -285,7 +290,7 @@ mod tests {
     /// A hanging adapter must not block session spawn: the probe has to give
     /// up on its deadline and report nothing, so the caller keeps the user's
     /// copy rather than waiting forever.
-    #[cfg(all(unix, feature = "serve"))]
+    #[cfg(unix)]
     #[test]
     fn probe_version_bounded_gives_up_on_a_hanging_binary() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -303,7 +308,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(unix, feature = "serve"))]
+    #[cfg(unix)]
     #[test]
     fn probe_version_bounded_reads_version_output() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -333,9 +338,6 @@ mod tests {
     #[serial_test::serial]
     fn resolve_agent_command_finds_binary_in_path_env() {
         // Build a temp dir with a fake binary, point PATH at it.
-        // Tagged `#[serial]` because the test mutates the process-wide
-        // PATH; any concurrent test that reads PATH (e.g. resolves a
-        // real binary) would race.
         let dir = tempfile::TempDir::new().unwrap();
         let bin = dir.path().join("aoe-test-resolver-fake");
         std::fs::write(&bin, "#!/bin/sh\n").unwrap();
@@ -344,27 +346,9 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let prev = std::env::var_os("PATH");
-        let new_path = format!(
-            "{}:{}",
-            dir.path().display(),
-            prev.as_ref()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        );
-        // SAFETY: this test mutates the process-wide PATH. Other PATH
-        // readers in the same test binary would race; `#[serial]` keeps
-        // them apart.
-        unsafe {
-            std::env::set_var("PATH", &new_path);
-        }
-        let resolved = resolve_agent_command("aoe-test-resolver-fake", None);
-        if let Some(prev) = prev {
-            unsafe {
-                std::env::set_var("PATH", prev);
-            }
-        }
-        let resolved = resolved.expect("binary should resolve from PATH");
+        let _path = crate::session::test_support::path_prepended(dir.path());
+        let resolved = resolve_agent_command("aoe-test-resolver-fake", None)
+            .expect("binary should resolve from PATH");
         assert_eq!(resolved.path, bin);
         assert_eq!(resolved.prepend_paths, vec![dir.path().to_path_buf()]);
     }

@@ -23,23 +23,6 @@ where
     run(cwd, args, false)
 }
 
-/// [`run_git`] for callers that have already classified a non-zero exit as
-/// an expected, no-op outcome (`git worktree unlock` on an entry that is
-/// already unlocked, `git submodule deinit` on a checkout with nothing
-/// initialised). Identical apart from the failure log, which drops to DEBUG
-/// so the routine case stops competing with real warnings in `debug.log`.
-///
-/// Only for call sites that discard or already diagnose the failure
-/// themselves. A caller that turns a non-zero exit into an error keeps
-/// [`run_git`], so the WARN stays with the failure it explains.
-pub fn run_git_quiet<I, S>(cwd: &Path, args: I) -> std::io::Result<Output>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    run(cwd, args, true)
-}
-
 fn run<I, S>(cwd: &Path, args: I, quiet: bool) -> std::io::Result<Output>
 where
     I: IntoIterator<Item = S>,
@@ -220,10 +203,10 @@ mod tests {
     use std::ffi::OsString;
     use tracing_test::traced_test;
 
-    /// The same failing command is a WARN through `run_git` and a DEBUG
-    /// through `run_git_quiet`; the quiet variant must not drop the record
-    /// entirely, since the stderr summary is what makes a surprise
-    /// diagnosable.
+    /// The same failing command is a WARN through `run_git_with_timeout` and a
+    /// DEBUG through `run_git_quiet_with_timeout`; the quiet variant must not
+    /// drop the record entirely, since the stderr summary is what makes a
+    /// surprise diagnosable.
     #[traced_test]
     #[test]
     fn run_git_quiet_demotes_expected_failure_to_debug() {
@@ -232,8 +215,13 @@ mod tests {
         // Not a repository, so `git worktree unlock` exits non-zero: the
         // shape `unlock_worktree` classifies as a harmless no-op.
         let args = ["worktree", "unlock", "/nonexistent"];
-        let loud = run_git(tmp.path(), args).expect("git should spawn");
-        let quiet = run_git_quiet(tmp.path(), args).expect("git should spawn");
+        let timeout = Duration::from_secs(30);
+        let loud = run_git_with_timeout(tmp.path(), args, timeout)
+            .expect("git should spawn")
+            .expect("git should not time out");
+        let quiet = run_git_quiet_with_timeout(tmp.path(), args, timeout)
+            .expect("git should spawn")
+            .expect("git should not time out");
         assert!(!loud.status.success());
         assert!(!quiet.status.success());
 

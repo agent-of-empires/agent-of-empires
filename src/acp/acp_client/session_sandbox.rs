@@ -42,8 +42,11 @@ impl SessionSandbox {
     ) -> Result<(Self, SandboxPathMap), AcpError> {
         let project_path_str = project_path.to_string_lossy().to_string();
         let (volumes, computed_workdir) =
-            crate::session::container_config::compute_volume_paths(project_path, &project_path_str)
-                .map_err(|e| AcpError::Spawn(format!("compute container workdir: {e}")))?;
+            crate::session::config::container_config::compute_volume_paths(
+                project_path,
+                &project_path_str,
+            )
+            .map_err(|e| AcpError::Spawn(format!("compute container workdir: {e}")))?;
         // The workdir must be what the container was actually created with, not
         // a live recompute. `compute_volume_paths` resolves the worktree's git
         // linkage and silently collapses to `/workspace/<basename>` once that
@@ -282,7 +285,7 @@ mod tests {
 
         // The pin is load-bearing: the live recompute on this orphaned worktree
         // collapses to the basename, which is the path that never got mounted.
-        let (_volumes, computed) = crate::session::container_config::compute_volume_paths(
+        let (_volumes, computed) = crate::session::config::container_config::compute_volume_paths(
             &worktree,
             &worktree.to_string_lossy(),
         )
@@ -353,6 +356,7 @@ mod tests {
             stored_acp_session_id: None,
             fork_from: None,
             seed_history_replay: false,
+            generation: 0,
             artifact_dir: None,
             sandbox_info: Some(sandbox.clone()),
             source_profile: None,
@@ -429,6 +433,7 @@ mod tests {
             stored_acp_session_id: None,
             fork_from: None,
             seed_history_replay: false,
+            generation: 0,
             artifact_dir: None,
             sandbox_info: Some(sandbox.clone()),
             source_profile: None,
@@ -526,6 +531,7 @@ mod tests {
             stored_acp_session_id: None,
             fork_from: None,
             seed_history_replay: false,
+            generation: 0,
             artifact_dir: None,
             sandbox_info: Some(sandbox.clone()),
             source_profile: None,

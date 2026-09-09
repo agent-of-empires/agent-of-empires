@@ -9,7 +9,7 @@
 //     --project /abs/path/to/repo [--port 8182] [--out path.gif]
 //
 // Recipe (the script does not stand up the backend):
-//   1. Build with the web dashboard:           cargo build --release --features serve
+//   1. Build with the web dashboard:           cargo build --release --features web
 //   2. Isolated profile with Claude creds:
 //        SB=/tmp/aoe-webdemo
 //        mkdir -p "$SB/home/.claude"

@@ -5,7 +5,7 @@
 ## Commands
 
 ```sh
-cargo build --features serve
+cargo build --features web
 cargo xtask dev
 cd web
 npm run format:check
@@ -13,8 +13,8 @@ npm run lint
 npx tsc -b
 ```
 
-`cargo xtask dev` runs the debug server on 8081 and Vite on 5173. A TUI-only
-build needs no JavaScript tooling. Use `npm run format` to fix oxfmt output;
+`cargo xtask dev` runs the debug server on 8081 and Vite on 5173. A build
+without `--features web` needs no JavaScript tooling. Use `npm run format` to fix oxfmt output;
 Prettier is not used.
 
 ## Tests

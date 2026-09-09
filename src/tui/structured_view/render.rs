@@ -317,34 +317,46 @@ fn render_approval_shelf(
         .border_style(Style::default().fg(accent));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let actions = approval_actions_line(theme, active);
+    let actions = approval_actions_line(theme, active, row.choice && !row.options.is_empty());
     frame.render_widget(Paragraph::new(actions), inner);
 }
 
-fn approval_actions_line(theme: &Theme, active: bool) -> Line<'static> {
+/// `choice` approvals carry a question in their option list, so `a`
+/// opens the option picker and the allow/always vocabulary does not
+/// apply. See #3741.
+fn approval_actions_line(theme: &Theme, active: bool, choice: bool) -> Line<'static> {
     if !active {
         return Line::from(Span::styled(
             "Enter to respond",
             Style::default().fg(theme.hint),
         ));
     }
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             "a",
             Style::default()
                 .fg(theme.running)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" allow once", Style::default().fg(theme.hint)),
-        Span::styled("  ·  ", Style::default().fg(theme.border)),
         Span::styled(
-            "A",
-            Style::default()
-                .fg(theme.running)
-                .add_modifier(Modifier::BOLD),
+            if choice { " answer" } else { " allow once" },
+            Style::default().fg(theme.hint),
         ),
-        Span::styled(" always", Style::default().fg(theme.hint)),
         Span::styled("  ·  ", Style::default().fg(theme.border)),
+    ];
+    if !choice {
+        spans.extend([
+            Span::styled(
+                "A",
+                Style::default()
+                    .fg(theme.running)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" always", Style::default().fg(theme.hint)),
+            Span::styled("  ·  ", Style::default().fg(theme.border)),
+        ]);
+    }
+    spans.extend([
         Span::styled(
             "d",
             Style::default()
@@ -358,7 +370,8 @@ fn approval_actions_line(theme: &Theme, active: bool) -> Line<'static> {
             Style::default().fg(theme.hint).add_modifier(Modifier::BOLD),
         ),
         Span::styled(" stop", Style::default().fg(theme.hint)),
-    ])
+    ]);
+    Line::from(spans)
 }
 
 fn approval_target(row: &PendingApproval, path_roots: Option<&SessionPathRoots>) -> String {
@@ -1052,7 +1065,7 @@ fn render_status(
         }
     }
     let hint = if active {
-        help_hint(state.focus)
+        help_hint(state.focus, selected_approval_is_choice(state))
     } else {
         " Enter reply · wheel history "
     };
@@ -1899,7 +1912,21 @@ fn render_generic_body(tool: &ToolCallRow) -> Vec<Line<'static>> {
     lines
 }
 
-fn help_hint(focus: Focus) -> &'static str {
+/// True when the approval the shelf has selected carries a question in
+/// its option list, so the key hints must offer answering rather than
+/// the allow/always vocabulary. See #3741.
+fn selected_approval_is_choice(state: &StructuredViewState) -> bool {
+    let Some(selected) = state.selected_approval.as_deref() else {
+        return false;
+    };
+    state
+        .transcript
+        .pending_approvals
+        .iter()
+        .any(|pending| pending.nonce == selected && pending.choice && !pending.options.is_empty())
+}
+
+fn help_hint(focus: Focus, approval_is_choice: bool) -> &'static str {
     match focus {
         // The composer is the resting state, so keep its hint to the two
         // things that aren't obvious from the placeholder: how to send
@@ -1911,6 +1938,7 @@ fn help_hint(focus: Focus) -> &'static str {
         // `len + 24` columns to spare, so a longer string silently drops the
         // whole hint (`Ctrl+Q`, the way out, included) on a narrow terminal.
         Focus::Transcript => " scroll · p pane · Ctrl+Q exit ",
+        Focus::Approval if approval_is_choice => " a answer · d deny · Esc stop ",
         Focus::Approval => " a allow · A always · d deny · Esc stop ",
         Focus::Pane => " scroll to read · Esc to close ",
     }
@@ -1965,7 +1993,7 @@ mod tests {
 
     #[test]
     fn approval_actions_read_as_key_hints_not_buttons() {
-        let line = approval_actions_line(&Theme::default(), true);
+        let line = approval_actions_line(&Theme::default(), true, false);
         let text: String = line
             .spans
             .iter()
@@ -1976,6 +2004,26 @@ mod tests {
         assert!(text.contains("d deny"), "{text:?}");
         assert!(!text.contains('['), "button chrome leaked: {text:?}");
         assert!(!text.contains(']'), "button chrome leaked: {text:?}");
+    }
+
+    /// A question option list has no allow-always meaning, so both the
+    /// shelf actions and the status hint offer answering instead of the
+    /// permission vocabulary. See #3741.
+    #[test]
+    fn choice_approval_actions_offer_answering() {
+        let line = approval_actions_line(&Theme::default(), true, true);
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(text.contains("a answer"), "{text:?}");
+        assert!(!text.contains("always"), "{text:?}");
+        assert!(text.contains("d deny"), "{text:?}");
+
+        assert!(help_hint(Focus::Approval, true).contains("a answer"));
+        assert!(!help_hint(Focus::Approval, true).contains("always"));
+        assert!(help_hint(Focus::Approval, false).contains("A always"));
     }
 
     /// Wrap one line and return the resulting row count.
@@ -2478,6 +2526,8 @@ mod tests {
             kind: "read".into(),
             args: r#"{"path":"src/lib.rs"}"#.into(),
             destructive: false,
+            options: Vec::new(),
+            choice: false,
         });
         t.server_rows = server_rows(&[crate::acp::state::Event::AgentMessageChunk {
             text: "working on it".into(),

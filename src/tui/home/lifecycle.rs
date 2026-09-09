@@ -194,6 +194,7 @@ impl HomeView {
             row_tag_mode: resolved.session.row_tag,
             agent_clipboard_forward: resolved.tmux.clipboard
                 != crate::session::config::TmuxSettingMode::Disabled,
+            hyperlink_cells: crate::tui::hyperlink::SharedHyperlinks::default(),
             vt_live_enabled: resolved.tmux.vt_live,
             profile_default_attach_mode: resolved.session.default_attach_mode,
             project_group_collapsed: user_config
@@ -251,7 +252,6 @@ impl HomeView {
             plugin_manager_dialog: None,
             skills_manager_dialog: None,
             command_palette: None,
-            #[cfg(feature = "serve")]
             serve_view: None,
             update_confirm_dialog: None,
             telemetry_consent_dialog: None,
@@ -275,6 +275,8 @@ impl HomeView {
             live_send_last_resize: None,
             live_send_resize_retry_at: None,
             live_send_pending_leader: false,
+            hover_cell: None,
+            status_flash: None,
             live_send_ctrl_c_flash_until: None,
             sidebar_collapsed: user_config
                 .as_ref()
@@ -284,7 +286,10 @@ impl HomeView {
             expand_strip_area: Rect::default(),
             footer_buttons: Vec::new(),
             footer_hover: None,
-            preview_pane_synced: None,
+            passive_pane_synced: std::collections::HashMap::new(),
+            passive_pane_declined: std::collections::HashMap::new(),
+            passive_pane_queued: std::collections::HashMap::new(),
+            passive_fleet_armed: None,
             preview_pane_pending: None,
             pending_paste: None,
             pending_attach_after_warning: None,
@@ -293,11 +298,8 @@ impl HomeView {
             pending_stop_tool: None,
             pending_image_pull: None,
             pending_switch_view_session: None,
-            #[cfg(feature = "serve")]
             pending_daemon_start_session: None,
-            #[cfg(feature = "serve")]
             structured_preview: None,
-            #[cfg(feature = "serve")]
             structured_preview_pending: false,
             pending_force_remove_session: None,
             pending_trash_session: None,
@@ -324,10 +326,10 @@ impl HomeView {
             system_health_discovered: user_config
                 .as_ref()
                 .is_some_and(|config| config.app_state.used_system_health),
-            #[cfg(feature = "serve")]
-            daemon_status_poller: crate::tui::daemon_status_poller::DaemonStatusPoller::new(),
-            #[cfg(feature = "serve")]
-            pending_daemon_status_refresh: false,
+            session_feed: crate::tui::session_feed::SessionFeed::new(),
+            pending_session_feed: false,
+            daemon_sidebar: resolved.session.daemon_sidebar,
+            sidebar_source: crate::tui::session_feed::SidebarSource::Storage,
             deletion_poller: DeletionPoller::new(),
             stop_poller: StopPoller::new(),
             trash_poller: crate::tui::trash_poller::TrashPoller::new(),
@@ -337,6 +339,9 @@ impl HomeView {
             reconcile_reload_retry_at: None,
             restart_poller: RestartPoller::new(),
             restart_in_flight: std::collections::HashSet::new(),
+            store_move_poller: crate::tui::store_move_poller::StoreMovePoller::new(),
+            store_move_in_flight: None,
+            store_move_bypass: None,
             attach_project_poller: crate::tui::attach_project_poller::AttachProjectPoller::new(),
             attach_project_in_flight: std::collections::HashSet::new(),
             creation_poller: CreationPoller::new(),
@@ -577,8 +582,8 @@ impl HomeView {
 
     /// Storage-only reload: profile rediscovery + per-profile load + tree
     /// rebuild + cursor restore. Skips the status-hook config-cache refresh,
-    /// which is driven by the full `reload()` path. Used by the watcher-
-    /// driven tick.
+    /// which is driven by the full `reload()` path. Used by watcher and
+    /// live-send heartbeat ticks.
     pub(in crate::tui) fn reload_storage_only(&mut self) -> anyhow::Result<()> {
         use crate::session::list_profiles;
 
@@ -749,14 +754,29 @@ impl HomeView {
             self.cursor = self.flat_items.len() - 1;
         }
 
+        // Storage rebuilds and search re-scoring must not move the live-send
+        // selection. Teardown reconciles it with the latest projection.
+        let preserve_live_selection = self.live_send.as_ref().is_some_and(|state| {
+            prev_selected_session.as_deref() == Some(state.session_id.as_str())
+        });
+
         if self.search_active && !self.search_query.value().is_empty() {
-            self.update_search();
+            if preserve_live_selection {
+                self.refresh_search_matches();
+            } else {
+                self.update_search();
+            }
         } else if !self.search_matches.is_empty() {
             // Recalculate match indices without moving the cursor
             self.refresh_search_matches();
         }
 
-        self.update_selected();
+        if !preserve_live_selection {
+            self.update_selected();
+        }
+        if let Some(state) = self.live_send.clone() {
+            self.end_live_send_on_drift(&state);
+        }
         Ok(())
     }
 
@@ -829,13 +849,11 @@ impl HomeView {
     ///   recorded for the same acknowledged burst). The ack latch
     ///   stays in place; the user is not re-notified for the same
     ///   ongoing burst.
-    /// * No-op: nothing failing, body unchanged, or an unrelated
-    ///   dialog (a `Watcher Warning` from `rewire_after_profile_delete`,
-    ///   or a profile create/delete `Error`) occupies the slot. In
-    ///   the foreign-dialog case the ack latch stays armed so the
-    ///   next tick can present once the foreign dialog is dismissed.
+    /// * No-op: live-send active, nothing failing, body unchanged, or an
+    ///   unrelated dialog occupies the slot. While live or another dialog is
+    ///   open, the ack latch stays armed so a later tick can present it.
     pub(in crate::tui) fn try_present_reload_failure_dialog(&mut self) -> bool {
-        if !self.reload_failure_state.has_any_failure() {
+        if self.live_send.is_some() || !self.reload_failure_state.has_any_failure() {
             return false;
         }
         let title = RELOAD_FAILED_TITLE;

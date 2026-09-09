@@ -697,7 +697,6 @@ impl HomeView {
         // is the exact failure mode the file lock is meant to prevent;
         // checking `daemon_pid()` first short-circuits the more expensive
         // lock acquisition in the common case.
-        #[cfg(feature = "serve")]
         if crate::cli::serve::daemon_pid().is_some() {
             return;
         }

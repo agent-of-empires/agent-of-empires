@@ -14,9 +14,9 @@ use tui_input::Input;
 
 use super::DialogResult;
 use crate::containers;
+use crate::session::config::profile_config::resolve_config_or_warn;
+use crate::session::config::repo_config::HookProgress;
 use crate::session::config::{load_config, update_app_state, DefaultTerminalMode, SandboxConfig};
-use crate::session::profile_config::resolve_config_or_warn;
-use crate::session::repo_config::HookProgress;
 #[cfg(test)]
 use crate::session::Config;
 use crate::tmux::AvailableTools;
@@ -124,7 +124,7 @@ pub struct NewSessionData {
     /// another. `None` for an ordinary new session.
     pub fork_seed: Option<crate::session::ForkSeed>,
     /// Create the session in the structured (ACP) view instead of a tmux
-    /// terminal. Only submitted true for ACP-capable tools on serve builds;
+    /// terminal. Only submitted true for ACP-capable tools;
     /// validated at submit time via
     /// `builder::structured::validate_structured_choice`.
     pub structured: bool,
@@ -199,7 +199,7 @@ pub struct NewSessionDialog {
     pub(super) structured_enabled: bool,
     /// Whether the currently selected tool can back a structured-view
     /// session (registry entry or `agent_acp_cmd`). Recomputed whenever
-    /// the tool or profile changes; always false on non-serve builds.
+    /// the tool or profile changes.
     /// Gates the Structured field's visibility, so the field-index chains
     /// treat it exactly like `has_yolo` / `has_sandbox`.
     pub(super) structured_capable: bool,
@@ -389,9 +389,7 @@ fn handle_editable_list_key(
 }
 
 /// Whether `tool` can back a structured-view (ACP) session, judged against
-/// the resolved config. Always false without the serve feature: the binary
-/// then has no structured view to open, so the wizard must not offer one.
-#[cfg(feature = "serve")]
+/// the resolved config.
 fn compute_structured_capable(tool: &str, config: &crate::session::Config) -> bool {
     // Gated behind an opt-in setting: the structured view is still
     // maturing, so the new-session toggle is hidden unless the user
@@ -399,10 +397,6 @@ fn compute_structured_capable(tool: &str, config: &crate::session::Config) -> bo
     // is gated on the same setting (see `session_switch_view_target`).
     config.acp.offer_structured_in_new_session
         && crate::session::builder::structured::tool_acp_capable(tool, config)
-}
-#[cfg(not(feature = "serve"))]
-fn compute_structured_capable(_tool: &str, _config: &crate::session::Config) -> bool {
-    false
 }
 
 /// Build label/value pairs for non-default inherited sandbox settings.
@@ -450,7 +444,7 @@ impl NewSessionDialog {
         let docker_available = containers::get_container_runtime().is_available();
 
         // Load resolved config (global + profile + repo overrides from cwd)
-        let config = crate::session::repo_config::resolve_config_with_repo_or_warn(
+        let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
             profile,
             std::path::Path::new(&current_dir),
         );
@@ -739,7 +733,7 @@ impl NewSessionDialog {
         if path.is_empty() {
             resolve_config_or_warn(profile)
         } else {
-            crate::session::repo_config::resolve_config_with_repo_or_warn(
+            crate::session::config::repo_config::resolve_config_with_repo_or_warn(
                 profile,
                 std::path::Path::new(path),
             )
@@ -2145,18 +2139,15 @@ impl NewSessionDialog {
         if !(self.structured_enabled && self.structured_capable) {
             return true;
         }
-        #[cfg(feature = "serve")]
-        {
-            let profile = self.selected_profile().to_string();
-            let config = self.resolve_config_for_path(&profile);
-            if let Err(msg) = crate::session::builder::structured::validate_structured_choice(
-                &self.available_tools[self.tool_index],
-                self.command_override.value(),
-                &config,
-            ) {
-                self.error_message = Some(msg);
-                return false;
-            }
+        let profile = self.selected_profile().to_string();
+        let config = self.resolve_config_for_path(&profile);
+        if let Err(msg) = crate::session::builder::structured::validate_structured_choice(
+            &self.available_tools[self.tool_index],
+            self.command_override.value(),
+            &config,
+        ) {
+            self.error_message = Some(msg);
+            return false;
         }
         true
     }

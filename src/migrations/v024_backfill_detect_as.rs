@@ -51,7 +51,7 @@ type AliasLookup<'a> = dyn Fn(&str) -> HashMap<String, String> + 'a;
 pub fn run() -> Result<()> {
     let app_dir = crate::session::get_app_dir()?;
     run_in(&app_dir, &|profile| {
-        crate::session::profile_config::resolve_config_or_warn(profile)
+        crate::session::config::profile_config::resolve_config_or_warn(profile)
             .session
             .agent_detect_as
     })

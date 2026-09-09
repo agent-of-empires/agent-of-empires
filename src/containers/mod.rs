@@ -5,13 +5,15 @@ mod runtime;
 pub(crate) mod runtime_base;
 pub mod stats;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::cli::truncate_id;
 use crate::session::{Config, ContainerRuntimeName};
-pub use container_interface::{ContainerConfig, EnvEntry, NamedVolumeMount, VolumeMount};
+pub use container_interface::{
+    ContainerConfig, EnvEntry, NamedVolumeMount, RunPolicy, VolumeMount,
+};
 use error::Result;
-pub use runtime::ContainerRuntime;
+pub use runtime::{ContainerRuntime, ContainerState};
 
 /// Returns the CLI binary name for the configured container runtime.
 pub fn runtime_binary() -> &'static str {
@@ -25,6 +27,10 @@ pub fn runtime_binary() -> &'static str {
         "docker"
     }
 }
+
+/// Name prefix every aoe sandbox container carries. Also the filter a batch
+/// listing passes to the runtime, so the two cannot drift.
+pub const SANDBOX_NAME_PREFIX: &str = "aoe-sandbox-";
 
 pub fn get_container_runtime() -> ContainerRuntime {
     if let Ok(cfg) = Config::load() {
@@ -42,7 +48,7 @@ pub fn get_container_runtime() -> ContainerRuntime {
 /// Returns a map of container name -> is_running.
 pub fn batch_container_health() -> HashMap<String, bool> {
     let start = std::time::Instant::now();
-    let map = get_container_runtime().batch_running_states("aoe-sandbox-");
+    let map = get_container_runtime().batch_running_states(SANDBOX_NAME_PREFIX);
     tracing::debug!(
         target: "containers.runtime",
         count = map.len(),
@@ -52,12 +58,27 @@ pub fn batch_container_health() -> HashMap<String, bool> {
     map
 }
 
+/// The listed state of every aoe sandbox container, in a single subprocess
+/// call. See [`ContainerRuntime::batch_container_states`] for what an absent
+/// name means.
+pub fn batch_container_states() -> HashMap<String, ContainerState> {
+    let start = std::time::Instant::now();
+    let map = get_container_runtime().batch_container_states(SANDBOX_NAME_PREFIX);
+    tracing::debug!(
+        target: "containers.runtime",
+        count = map.len(),
+        duration_ms = start.elapsed().as_millis() as u64,
+        "batch container states fetched",
+    );
+    map
+}
+
 /// Resource usage of every aoe sandbox container, in a single subprocess call.
 /// Returns a map of container name -> stats; a container the runtime has no
 /// usable sample for is absent rather than zeroed.
 pub fn batch_container_stats() -> stats::StatsMap {
     let start = std::time::Instant::now();
-    let map = get_container_runtime().batch_stats("aoe-sandbox-");
+    let map = get_container_runtime().batch_stats(SANDBOX_NAME_PREFIX);
     tracing::debug!(
         target: "containers.runtime",
         count = map.len(),
@@ -140,7 +161,7 @@ impl DockerContainer {
     }
 
     pub fn generate_name(session_id: &str) -> String {
-        format!("aoe-sandbox-{}", truncate_id(session_id, 8))
+        format!("{SANDBOX_NAME_PREFIX}{}", truncate_id(session_id, 8))
     }
 
     pub fn from_session_id(session_id: &str) -> Self {
@@ -164,6 +185,20 @@ impl DockerContainer {
     /// [`ContainerRuntime::container_working_dir`].
     pub fn working_dir(&self) -> Option<String> {
         self.runtime.container_working_dir(&self.name)
+    }
+
+    pub fn sandbox_store_generation_matches(&self) -> Result<Option<bool>> {
+        self.runtime.sandbox_store_generation_matches(&self.name)
+    }
+
+    pub fn shared_credential_mounts_match(&self, config: &ContainerConfig) -> Result<Option<bool>> {
+        self.runtime
+            .shared_credential_mounts_match(&self.name, config)
+    }
+
+    pub fn mount_fingerprint_matches(&self, config: &ContainerConfig) -> Result<Option<bool>> {
+        self.runtime
+            .mount_fingerprint_matches(&self.name, &config.mount_fingerprint())
     }
 
     pub fn build_create_args(&self, config: &ContainerConfig) -> Vec<String> {
@@ -232,6 +267,44 @@ impl DockerContainer {
         }
     }
 
+    /// Remove the named ignore volumes a worktree move stranded (#3742).
+    ///
+    /// `names` is an allowlist, and the caller owns what belongs in it;
+    /// `stranded_named_ignore_volumes` computes it. Must be called before the create,
+    /// while no container holds the volumes.
+    ///
+    /// Logs at `info`: this is an irreversible delete of a build cache, and a wrong one
+    /// would otherwise reach the user as an unexplained cold rebuild with nothing to
+    /// attribute it to. Runtimes without named volumes never reach that log, since
+    /// `named_ignore_volumes` stays populated there while the mounts render as
+    /// anonymous, so there is nothing to delete.
+    pub fn remove_stranded_named_ignore_volumes(&self, session_id: &str, names: &[String]) {
+        if names.is_empty() || !self.runtime.base.supports_named_volumes {
+            return;
+        }
+        tracing::info!(
+            target: "containers.runtime",
+            %session_id,
+            ?names,
+            "reclaiming named ignore volumes stranded by a worktree move"
+        );
+        let names: HashSet<&str> = names.iter().map(String::as_str).collect();
+        let prefix = format!("aoe-vi-{}-", session_id);
+        if let Err(e) = self
+            .runtime
+            .base
+            .remove_named_ignore_volumes_in(&prefix, &names)
+        {
+            tracing::warn!(
+                target: "containers.runtime",
+                name = %self.name,
+                %session_id,
+                error = %e,
+                "failed to remove stranded named ignore volumes"
+            );
+        }
+    }
+
     /// Force-remove this container, then sweep its named ignore volumes.
     ///
     /// Idempotent: a container that is already gone yields
@@ -253,9 +326,11 @@ impl DockerContainer {
     /// Idempotent counterpart to [`Self::teardown`]: same removal and
     /// classification, but the session-scoped named ignore volumes
     /// (`aoe-vi-{session_id}-*`, e.g. `target/`, `node_modules/`) are left
-    /// intact so the recreated container re-attaches them on next start.
-    /// Used on the worktree-move discard path where the container is dropped
-    /// to pick up a new bind mount and will be recreated immediately.
+    /// intact so the recreated container re-attaches the ones whose container
+    /// path is unchanged. Used on the worktree-move discard path where the
+    /// container is dropped to pick up a new bind mount and will be recreated
+    /// immediately; [`Self::remove_stranded_named_ignore_volumes`] reclaims the rest
+    /// at that create.
     ///
     /// The same invariant as [`Self::teardown`] applies: callers must invoke
     /// this unconditionally and act on the returned outcome; it must never

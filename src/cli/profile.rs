@@ -15,7 +15,8 @@ pub enum ProfileCommands {
     /// Create a new profile
     #[command(alias = "new")]
     Create {
-        /// Profile name
+        /// Profile name: letters, digits, `_` and `-` only, at most 64
+        /// characters; `all` is reserved
         name: String,
     },
 
@@ -31,7 +32,7 @@ pub enum ProfileCommands {
     Rename {
         /// Current profile name
         old_name: String,
-        /// New profile name
+        /// New profile name (same rules as `aoe profile create`)
         new_name: String,
     },
 
@@ -76,7 +77,9 @@ pub async fn run(profile: &str, command: Option<ProfileCommands>) -> Result<()> 
 }
 
 async fn list_profiles() -> Result<()> {
-    let profiles = session::list_profiles()?;
+    // Picker order (`default` last); resolution below stays on the plain
+    // enumeration.
+    let profiles = session::list_profiles_for_display()?;
 
     if profiles.is_empty() {
         println!("No profiles found.");
@@ -157,7 +160,7 @@ async fn show_profile_value(profile: &str, status_map: Option<&str>, json: bool)
         bail!("nothing to show; pass --status-map <agent>");
     };
     let effective_profile = session::resolve_existing_profile(profile)?;
-    let config = session::profile_config::resolve_config(&effective_profile)?;
+    let config = session::config::profile_config::resolve_config(&effective_profile)?;
     let map = crate::agents::effective_status_map(&config, agent)?;
 
     if json {

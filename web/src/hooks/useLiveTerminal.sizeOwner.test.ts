@@ -101,12 +101,21 @@ describe("useLiveTerminal size-owner", () => {
     socket.sent.length = 0;
 
     deliver(socket, { type: "size_owner", is_owner: false });
-    act(() => result.current.sendData("x"));
+    // The return value is what tells a caller the pane never got these bytes,
+    // so nothing downstream may record them as delivered.
+    let accepted: boolean | undefined;
+    act(() => {
+      accepted = result.current.sendData("x");
+    });
+    expect(accepted).toBe(false);
     expect(socket.sent).toHaveLength(0);
 
     deliver(socket, { type: "size_owner", is_owner: true });
     expect(socket.sent.some((m) => m instanceof Uint8Array)).toBe(false);
-    act(() => result.current.sendData("y"));
+    act(() => {
+      accepted = result.current.sendData("y");
+    });
+    expect(accepted).toBe(true);
     const typed = socket.sent.find((m): m is Uint8Array => m instanceof Uint8Array);
     expect(new TextDecoder().decode(typed)).toBe("y");
   });
@@ -114,7 +123,13 @@ describe("useLiveTerminal size-owner", () => {
   it("queues the first typed bytes until a newly selected session owns the pane", () => {
     const { result } = renderHook(() => useLiveTerminal("s1"));
     const socket = sockets[0];
-    act(() => result.current.sendData("first"));
+    // Queued during the unresolved handshake still counts as accepted: the
+    // flush on ownership delivers it.
+    let accepted: boolean | undefined;
+    act(() => {
+      accepted = result.current.sendData("first");
+    });
+    expect(accepted).toBe(true);
     expect(socket.sent).toHaveLength(0);
 
     open(socket);

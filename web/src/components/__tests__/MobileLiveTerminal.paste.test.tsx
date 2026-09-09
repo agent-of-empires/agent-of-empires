@@ -20,7 +20,8 @@ vi.mock("../../hooks/useWebSettings", () => ({
 }));
 
 const writeClipboard = vi.fn();
-vi.mock("../../lib/clipboard", () => ({
+vi.mock("../../lib/clipboard", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../lib/clipboard")>()),
   writeClipboard: (text: string) => writeClipboard(text),
 }));
 
@@ -57,6 +58,7 @@ function renderTerm(uploadPastedImage = vi.fn().mockResolvedValue(null)) {
       enterReading={vi.fn()}
       returnToLive={vi.fn()}
       sendData={sendData}
+      typedWordRef={{ current: "" }}
       uploadPastedImage={uploadPastedImage}
       forwardWheel={vi.fn()}
       forwardButton={vi.fn()}

@@ -14,13 +14,11 @@
 //! the client's decision, so the approval stays pending until the TUI
 //! resolves it.
 //!
-//! Compiled only with the default `serve` feature (excluded by `--no-default-features`) (structured view + `aoe add --structured-view`
-//! don't exist otherwise). Run via:
+//! Run via:
 //!
 //! ```sh
 //! cargo test --features e2e-tests --test e2e -- acp_focus_isolation
 //! ```
-#![cfg(feature = "serve")]
 
 use std::time::{Duration, Instant};
 

@@ -2,8 +2,8 @@
 //!
 //! This module is pure data plus selection logic, with no rendering or I/O, so
 //! every surface renders from one catalog. The TUI consumes it today; because
-//! it lives in the shared lib (not under `tui`), the `serve` server can expose
-//! the same catalog to the web dashboard later with no rework.
+//! it lives in the shared lib (not under `tui`), the daemon can expose the same
+//! catalog to the web dashboard later with no rework.
 //!
 //! Two kinds of tips:
 //! - **Rotation** tips are always eligible and surface passively (the badge +

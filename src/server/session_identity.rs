@@ -5,7 +5,15 @@ use std::sync::Arc;
 
 use super::state::AppState;
 
-pub(super) type SessionIdentityBaseline = (Option<String>, Option<String>, Option<String>);
+pub(super) type SessionIdentityBaseline = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<std::time::Instant>,
+    Option<std::time::SystemTime>,
+    u64,
+    crate::session::Status,
+);
 
 /// Merge a drained instance's captured identity back into live state, but only
 /// the identity fields and only if they are unchanged since the baseline. The
@@ -18,13 +26,36 @@ pub(super) fn apply_drained_identity_if_unchanged(
     drained: &Instance,
     baseline: &SessionIdentityBaseline,
 ) {
-    let (baseline_sid, baseline_marker, baseline_generation) = baseline;
+    let (baseline_sid, baseline_marker, baseline_generation, _, _, _, _) = baseline;
     if live.agent_session_id == *baseline_sid && live.omp_capture_generation == *baseline_generation
     {
         live.agent_session_id = drained.agent_session_id.clone();
         live.omp_capture_generation = drained.omp_capture_generation.clone();
+        // The drain also records the transcript path a Pi pane published.
+        // Guarded by the same sid baseline: the path names a conversation, so
+        // carrying it onto a row whose sid moved would pair two conversations.
+        live.pi_session_path = drained.pi_session_path.clone();
         if live.resume_probe_failed_sid == *baseline_marker {
             live.resume_probe_failed_sid = drained.resume_probe_failed_sid.clone();
+        }
+    }
+}
+
+fn apply_poller_runtime_if_unchanged(
+    live: &mut Instance,
+    repaired: &Instance,
+    baseline: &SessionIdentityBaseline,
+) {
+    if live.omp_capture_generation == repaired.omp_capture_generation
+        && live.session_id_poller_retry_after == baseline.3
+        && live.capture_started_at == baseline.4
+        && live.lifecycle_generation == baseline.5
+        && live.status == baseline.6
+        && !live.session_id_poller_is_running()
+    {
+        live.session_id_poller_retry_after = repaired.session_id_poller_retry_after;
+        if repaired.session_id_poller_is_running() {
+            live.session_id_poller = repaired.session_id_poller.clone();
         }
     }
 }
@@ -45,6 +76,10 @@ pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
                         inst.agent_session_id.clone(),
                         inst.resume_probe_failed_sid.clone(),
                         inst.omp_capture_generation.clone(),
+                        inst.session_id_poller_retry_after,
+                        inst.capture_started_at,
+                        inst.lifecycle_generation,
+                        inst.status,
                     ),
                 )
             })
@@ -59,18 +94,27 @@ pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
         // visits every instance, so a per-item `list-sessions` fork scales with
         // the store.
         let live = crate::tmux::LiveSessionSnapshot::new();
-        let repaired: std::collections::HashSet<String> = snapshot
+        let backoff_before = repair_backoffs(&snapshot);
+        let runtime_changed: std::collections::HashSet<String> = snapshot
             .iter_mut()
             .filter_map(|inst| {
-                inst.repair_session_id_poller_if_needed(&live)
+                let retry_before = inst.session_id_poller_retry_after;
+                let started = inst.repair_session_id_poller_if_needed(&live);
+                (started || inst.session_id_poller_retry_after != retry_before)
                     .then(|| inst.id.clone())
             })
             .collect();
-        (outcome, snapshot, baseline, repaired)
+        // The walk ran on a clone: a deferral recorded there must reach the
+        // live row, or the next tick re-probes (and re-warns) as if nothing
+        // had been scheduled.
+        let deferred = changed_repair_backoffs(&backoff_before, &snapshot);
+        (outcome, snapshot, baseline, runtime_changed, deferred)
     })
     .await
     {
-        Ok((outcome, mutated, baseline, repaired)) if outcome.touched() || !repaired.is_empty() => {
+        Ok((outcome, mutated, baseline, runtime_changed, deferred))
+            if outcome.touched() || !runtime_changed.is_empty() || !deferred.is_empty() =>
+        {
             let touched: std::collections::HashSet<&str> = outcome
                 .applied
                 .iter()
@@ -82,18 +126,17 @@ pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
                 let Some(dst) = guard.iter_mut().find(|i| i.id == src.id) else {
                     continue;
                 };
+                if let Some(backoff) = deferred.get(&src.id) {
+                    dst.poller_repair = backoff.clone();
+                }
                 let Some(identity_baseline) = baseline.get(&src.id) else {
                     continue;
                 };
                 if touched.contains(src.id.as_str()) {
                     apply_drained_identity_if_unchanged(dst, src, identity_baseline);
                 }
-                if repaired.contains(&src.id)
-                    && dst.omp_capture_generation == src.omp_capture_generation
-                    && !dst.session_id_poller_is_running()
-                    && src.session_id_poller_is_running()
-                {
-                    dst.session_id_poller = src.session_id_poller.clone();
+                if runtime_changed.contains(&src.id) {
+                    apply_poller_runtime_if_unchanged(dst, src, identity_baseline);
                 }
             }
         }
@@ -107,6 +150,29 @@ pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
     }
 }
 
+/// Snapshot each row's poller-repair schedule before the repair walk.
+fn repair_backoffs(
+    instances: &[crate::session::Instance],
+) -> std::collections::HashMap<String, crate::session::poller::PollerRepairBackoff> {
+    instances
+        .iter()
+        .map(|inst| (inst.id.clone(), inst.poller_repair.clone()))
+        .collect()
+}
+
+/// Rows whose poller-repair schedule the walk changed (a deferral recorded,
+/// or a reset after a successful start), keyed by id.
+fn changed_repair_backoffs(
+    before: &std::collections::HashMap<String, crate::session::poller::PollerRepairBackoff>,
+    after: &[crate::session::Instance],
+) -> std::collections::HashMap<String, crate::session::poller::PollerRepairBackoff> {
+    after
+        .iter()
+        .filter(|inst| before.get(&inst.id) != Some(&inst.poller_repair))
+        .map(|inst| (inst.id.clone(), inst.poller_repair.clone()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,6 +183,10 @@ mod tests {
             Some("old-sid".to_string()),
             Some("old-marker".to_string()),
             Some("generation-a".to_string()),
+            None,
+            None,
+            0,
+            crate::session::Status::Idle,
         );
         let mut drained = Instance::new("session", "/tmp/project");
         drained.agent_session_id = Some("captured-sid".to_string());
@@ -147,5 +217,49 @@ mod tests {
             marker_changed.resume_probe_failed_sid.as_deref(),
             Some("peer-marker")
         );
+    }
+
+    #[test]
+    fn poller_runtime_reapply_keeps_a_deferred_retry() {
+        let baseline: SessionIdentityBaseline = (
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            crate::session::Status::Idle,
+        );
+        let mut live = Instance::new("session", "/tmp/project");
+        let mut repaired = live.clone();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        repaired.session_id_poller_retry_after = Some(deadline);
+
+        apply_poller_runtime_if_unchanged(&mut live, &repaired, &baseline);
+
+        assert_eq!(live.session_id_poller_retry_after, Some(deadline));
+
+        let concurrent = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        live.session_id_poller_retry_after = Some(concurrent);
+        apply_poller_runtime_if_unchanged(&mut live, &repaired, &baseline);
+        assert_eq!(live.session_id_poller_retry_after, Some(concurrent));
+
+        live.session_id_poller_retry_after = None;
+        live.capture_started_at = Some(std::time::SystemTime::now());
+        apply_poller_runtime_if_unchanged(&mut live, &repaired, &baseline);
+        assert_eq!(
+            live.session_id_poller_retry_after, None,
+            "a concurrent non-OMP relaunch must reject the stale runtime state"
+        );
+
+        live.capture_started_at = None;
+        live.status = crate::session::Status::Stopped;
+        apply_poller_runtime_if_unchanged(&mut live, &repaired, &baseline);
+        assert_eq!(live.session_id_poller_retry_after, None);
+
+        live.status = crate::session::Status::Idle;
+        live.lifecycle_generation = 1;
+        apply_poller_runtime_if_unchanged(&mut live, &repaired, &baseline);
+        assert_eq!(live.session_id_poller_retry_after, None);
     }
 }

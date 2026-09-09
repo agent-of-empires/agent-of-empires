@@ -37,25 +37,19 @@ mod platform {
 pub(crate) mod metrics;
 
 /// Protocol-agnostic plumbing for supervised worker subprocesses, lifted
-/// out of `src/acp/` so the future plugin host can reuse it. Serve-gated
-/// because its only consumer today is the serve-gated `acp` module.
-#[cfg(feature = "serve")]
+/// out of `src/acp/` so the future plugin host can reuse it.
 pub mod worker;
 
 /// On-disk registry of detached ACP worker subprocesses (pid, socket path,
 /// build version, `stored_acp_session_id`). Colocated here with the
 /// protocol-agnostic `worker` substrate it builds on, so the plugin host can
 /// reuse that substrate directly. Dependency direction is one-way: consumers
-/// point down to `process`, never to each other. Serve-gated to match its
-/// consumers.
-#[cfg(feature = "serve")]
+/// point down to `process`, never to each other.
 pub mod worker_registry;
 
 /// The `aoe __acp-runner` shim: owns a detached ACP agent subprocess and
 /// outlives `aoe serve`. Colocated with `worker_registry` and the
-/// protocol-agnostic `worker` substrate they build on; serve-gated to match
-/// its consumers.
-#[cfg(feature = "serve")]
+/// protocol-agnostic `worker` substrate they build on.
 pub mod runner;
 
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -267,39 +261,51 @@ pub fn get_pane_pid(session_name: &str) -> Option<u32> {
 }
 
 /// For a single pass over the process table, decide for each candidate `i`
-/// whether a live process belongs to it. A process belongs to candidate `i`
-/// when an environment *entry* exactly equals `env_needles[i]` (anchored, so a
-/// longer id cannot prefix-collide) **or** the command line contains
-/// `cmdline_needles[i]` (when `Some`). The two slices must have equal length;
-/// the result has one `bool` per candidate. An empty env needle never matches.
-/// Best-effort: an unreadable process table yields all `false`.
+/// whether a live process belongs to it. Every supplied signal must match:
+/// an exact environment entry, a command-line substring, and/or an executable
+/// argv token whose basename is exact. The three slices must have equal length.
+/// Empty or absent signals never match on their own. Best-effort: an unreadable
+/// process table yields all `false`.
 ///
-/// Startup recovery uses this to detect an agent session a *prior* recovery
-/// pass already resumed on a tmux server this process can no longer see, e.g.
-/// the socket's `/tmp` dir was wiped mid-crash and the old server was orphaned
-/// (#2994). Two identity signals are checked so the match survives an agent
-/// that rewrites its own argv or process title:
-/// - `AOE_INSTANCE_ID=<id>` in the agent's environment (aoe-injected for
-///   hook-enabled agents; `/proc/<pid>/environ` is immune to argv rewrites),
-/// - the `agent_session_id` in the launch command line (fallback for non-hook
-///   agents; the host `docker exec` argv carries it for sandboxed sessions).
+/// Startup recovery uses this after losing an old tmux socket. Hook-enabled
+/// agents require their exact `AOE_INSTANCE_ID=<id>` marker plus their built-in
+/// executable token. This remains stable across native conversation rotation
+/// while rejecting helpers that only inherited the environment. Non-hook
+/// agents use the session id in the command line. The host `docker exec` argv
+/// carries both forms for sandboxed sessions.
 ///
 /// Batching keeps this to one `/proc` walk (or one `ps` fork) regardless of
 /// candidate count. Callers on an async runtime must wrap it in
 /// `tokio::task::spawn_blocking`.
-pub fn processes_matching(env_needles: &[String], cmdline_needles: &[Option<String>]) -> Vec<bool> {
+pub fn processes_matching(
+    env_needles: &[String],
+    cmdline_needles: &[Option<String>],
+    executable_needles: &[Option<String>],
+) -> Vec<bool> {
     debug_assert_eq!(env_needles.len(), cmdline_needles.len());
-    let n = env_needles.len().min(cmdline_needles.len());
+    debug_assert_eq!(env_needles.len(), executable_needles.len());
+    let n = env_needles
+        .len()
+        .min(cmdline_needles.len())
+        .min(executable_needles.len());
     if n == 0 {
         return Vec::new();
     }
     #[cfg(target_os = "linux")]
     {
-        linux::processes_matching(&env_needles[..n], &cmdline_needles[..n])
+        linux::processes_matching(
+            &env_needles[..n],
+            &cmdline_needles[..n],
+            &executable_needles[..n],
+        )
     }
     #[cfg(target_os = "macos")]
     {
-        macos::processes_matching(&env_needles[..n], &cmdline_needles[..n])
+        macos::processes_matching(
+            &env_needles[..n],
+            &cmdline_needles[..n],
+            &executable_needles[..n],
+        )
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -365,7 +371,6 @@ pub fn get_foreground_pid(shell_pid: u32) -> Option<u32> {
 /// `caffeinate -w <daemon_pid>` watches the daemon PID; the Linux `cat` sees
 /// EOF on the stdin pipe the daemon held), and init then reaps it. The
 /// `server` status loop is the only consumer.
-#[cfg(feature = "serve")]
 pub trait SleepInhibit: Send {
     /// Acquire the assertion by spawning and retaining the backing child.
     fn acquire(&mut self) -> anyhow::Result<()>;
@@ -380,7 +385,6 @@ pub trait SleepInhibit: Send {
 /// Build the platform sleep inhibitor: `caffeinate -i -w <daemon_pid>` on
 /// macOS, `systemd-inhibit --what=idle:sleep ... cat` on Linux, and a no-op
 /// on every other platform.
-#[cfg(feature = "serve")]
 pub fn sleep_inhibitor() -> Box<dyn SleepInhibit> {
     #[cfg(target_os = "macos")]
     {
@@ -400,10 +404,10 @@ pub fn sleep_inhibitor() -> Box<dyn SleepInhibit> {
 
 /// Sleep inhibitor for platforms with no supported backend: acquire and release
 /// are no-ops, and `is_held_alive` reports held to avoid pointless respawns.
-#[cfg(all(feature = "serve", not(any(target_os = "linux", target_os = "macos"))))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 struct NoopInhibitor;
 
-#[cfg(all(feature = "serve", not(any(target_os = "linux", target_os = "macos"))))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 impl SleepInhibit for NoopInhibitor {
     fn acquire(&mut self) -> anyhow::Result<()> {
         Ok(())
@@ -425,11 +429,11 @@ impl SleepInhibit for NoopInhibitor {
 /// builds a fresh inhibitor on every reacquire, so a per-instance guard could
 /// not remember across rebuilds; the backends read it to report the dead
 /// backend as held, which stops the reconciler respawning a doomed child.
-#[cfg(all(feature = "serve", any(target_os = "linux", target_os = "macos")))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 static SLEEP_INHIBIT_UNAVAILABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-#[cfg(all(feature = "serve", any(target_os = "linux", target_os = "macos")))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn sleep_inhibit_unavailable() -> bool {
     SLEEP_INHIBIT_UNAVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -443,7 +447,6 @@ fn sleep_inhibit_unavailable() -> bool {
 /// no logind), and false on platforms with only `NoopInhibitor`. The latch is
 /// monotonic and never resets for the daemon's lifetime, so this stays false
 /// until restart even if the missing tool is later installed.
-#[cfg(feature = "serve")]
 pub(crate) fn sleep_inhibit_backend_available() -> bool {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
@@ -458,7 +461,7 @@ pub(crate) fn sleep_inhibit_backend_available() -> bool {
 /// Latch the sleep-inhibit backend unavailable and warn exactly once. Shared
 /// by the platform backends so the warn-once policy lives in one place while
 /// each backend keeps only its own spawn and liveness mechanics.
-#[cfg(all(feature = "serve", any(target_os = "linux", target_os = "macos")))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn latch_sleep_inhibit_unavailable(reason: &str) {
     if !SLEEP_INHIBIT_UNAVAILABLE.swap(true, std::sync::atomic::Ordering::Relaxed) {
         tracing::warn!(target: "process.sleep_inhibit", "{reason}");
@@ -469,7 +472,7 @@ fn latch_sleep_inhibit_unavailable(reason: &str) {
 /// still holding the assertion. Shared by both platform backends because the
 /// exit-code discrimination is policy (like the warn-once latch), not per-OS
 /// mechanics, so the two copies cannot drift; only `exit_reason` differs.
-#[cfg(all(feature = "serve", any(target_os = "linux", target_os = "macos")))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn sleep_inhibit_child_held_alive(child: &mut Option<Child>, exit_reason: &str) -> bool {
     if sleep_inhibit_unavailable() {
         return true;
@@ -616,7 +619,7 @@ mod tests {
 
     #[test]
     fn processes_matching_empty_input_is_empty() {
-        assert!(processes_matching(&[], &[]).is_empty());
+        assert!(processes_matching(&[], &[], &[]).is_empty());
     }
 
     #[test]
@@ -658,7 +661,7 @@ mod tests {
         // kernel necessarily populates cmdline).
         let mut flags = vec![false, false];
         for _ in 0..100 {
-            flags = processes_matching(&env, &cmd);
+            flags = processes_matching(&env, &cmd, &[None, None]);
             if flags[0] {
                 break;
             }
@@ -706,8 +709,8 @@ mod tests {
         let mut found = false;
         let mut prefix_hit = true;
         for _ in 0..100 {
-            found = processes_matching(&env, &cmd)[0];
-            prefix_hit = processes_matching(&env_prefix, &cmd)[0];
+            found = processes_matching(&env, &cmd, &[None])[0];
+            prefix_hit = processes_matching(&env_prefix, &cmd, &[None])[0];
             if found {
                 break;
             }

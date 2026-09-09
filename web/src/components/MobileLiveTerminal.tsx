@@ -13,11 +13,12 @@ import {
 } from "../lib/liveTermLines";
 import { cursorLineIndex, pointerPaneCell, wheelNotches } from "../lib/liveMouse";
 import { registerMobileKeyboardProxyReceiver, type MobileKeyboardProxyInput } from "../lib/mobileKeyboardProxy";
-import { writeClipboard } from "../lib/clipboard";
-import type { LiveFrame } from "../hooks/useLiveTerminal";
+import { bracketedPaste, writeClipboard } from "../lib/clipboard";
+import type { LiveFrame, LiveStats } from "../hooks/useLiveTerminal";
 import { useWebSettings } from "../hooks/useWebSettings";
 import { useIsCoarsePointer } from "../hooks/useIsCoarsePointer";
 import { useTerminalGestureBoundary } from "../hooks/useTerminalGestureBoundary";
+import { useSelectionHold } from "../hooks/useSelectionHold";
 
 // Mobile rendering of a tmux agent pane, mirroring the TUI's live mode:
 // the server streams `capture-pane` snapshots (src/server/live_ws.rs)
@@ -106,12 +107,34 @@ const FLICK_VELOCITY_WINDOW_MS = 100;
 const MOMENTUM_DECAY_PER_MS = 0.992;
 /** Momentum ends when velocity decays below this (px/ms). */
 const MOMENTUM_STOP_VELOCITY = 0.05;
-/** A full-screen app redraws remotely, so send a bounded stream of wheel
- * reports rather than dumping an entire fast drag into one network burst. */
-const MAX_QUEUED_TOUCH_NOTCHES = 8;
+/** Backlog a drag may build up. A finger crossing the pane asks for more lines
+ *  than one round trip can deliver, and the excess used to be discarded, so a
+ *  long drag moved a fraction of what it asked for. Deep enough to hold a
+ *  full-screen drag, while still bounding what a flick can queue. */
+const MAX_QUEUED_TOUCH_NOTCHES = 64;
+/** Largest release. A burst costs one round trip whatever its size, because
+ *  the app drains every wheel report it has received before it repaints, so a
+ *  deep backlog is worth clearing in big steps. Bounded so a flick still
+ *  cannot outrun what the app can draw. */
+const NOTCH_BURST_MAX = 6;
+/** Backlog that each additional line in a burst is worth. A shallow queue,
+ *  which is what a slow drag builds, releases a line at a time and moves
+ *  smoothly; only a queue the finger is outrunning takes larger steps. */
+const NOTCH_BURST_DIVISOR = 4;
+/** Gap between releases when no frame comes back to acknowledge the last one.
+ *  One animation frame: the app acknowledges sooner than this whenever it can,
+ *  and a slower fallback made a drag feel sticky for as long as anything was
+ *  queued, which is most of a gesture. */
+const NOTCH_FALLBACK_GAP_MS = 16;
+/** Frames within this window feed the debug overlay's rate. */
+const DEBUG_RATE_WINDOW_MS = 2000;
 
 export interface MobileLiveTerminalProps {
   frame: LiveFrame | null;
+  /** Wire counters from the hook, shown by the `?livedebug=1` overlay. */
+  liveStats?: LiveStats;
+  /** Which transport the server is rendering with, for the same overlay. */
+  transport?: "grid" | "snapshot" | null;
   /** Arm the parent view's gesture-bound clipboard write before an agent
    *  selection release crosses the WebSocket. */
   armAgentClipboard?: () => void;
@@ -126,7 +149,10 @@ export interface MobileLiveTerminalProps {
   setCadence: (fast: boolean) => void;
   enterReading: (rows: number) => void;
   returnToLive: (rows: number) => void;
-  sendData: (data: string) => void;
+  /** Returns whether the pane will receive the data; see useLiveTerminal. */
+  sendData: (data: string) => boolean;
+  /** Shared IME word run; `sendData` clears it, see useLiveTerminal. */
+  typedWordRef: React.RefObject<string>;
   /** Upload a clipboard image pasted into the pane and resolve to the path
    *  the tmux pane can read (host path, or the container mount for sandboxed
    *  sessions), or null on failure. See #2678. */
@@ -213,11 +239,90 @@ function cellRunSpan(run: CellRun, style: AnsiStyle, key: string): ReactNode {
   );
 }
 
-// Diagnostic overlay for cursor-alignment field reports: open the dashboard
-// with `?livedebug=1` and the live view shows the geometry the overlay math
-// ran on (frame rows/history, content lines, spacer, computed line index).
-// Screenshot-friendly; no behavior changes.
+// Diagnostic overlay for field reports: open the dashboard with
+// `?livedebug=1` and the live view shows the geometry the overlay math ran on
+// (frame rows/history, content lines, spacer, computed line index) plus the
+// wire rate, patch share, and arrival-to-paint latency. Screenshot-friendly;
+// no behavior changes.
 const LIVE_DEBUG = typeof location !== "undefined" && new URLSearchParams(location.search).has("livedebug");
+
+/** Debug-only frame timing: arrivals inside the rate window and the mean
+ *  arrival-to-commit latency. An instance lives in a state initializer and is
+ *  mutated in place, so recording costs no renders. */
+class FrameTimingProbe {
+  private arrivals: number[] = [];
+  private latencySum = 0;
+  private latencyCount = 0;
+
+  record(now: number, receivedAt: number | undefined) {
+    this.arrivals.push(now);
+    while (this.arrivals.length > 0 && now - this.arrivals[0]! > DEBUG_RATE_WINDOW_MS) this.arrivals.shift();
+    if (receivedAt != null) {
+      this.latencySum += now - receivedAt;
+      this.latencyCount += 1;
+    }
+  }
+
+  fps(): number {
+    return (this.arrivals.length * 1000) / DEBUG_RATE_WINDOW_MS;
+  }
+
+  meanPaintMs(): number {
+    return this.latencySum / Math.max(1, this.latencyCount);
+  }
+}
+
+/** Paces forward-mode wheel notches to the remote app's redraws. The first
+ *  notch of a gesture goes out at once; each later one waits for a frame to
+ *  arrive (the app's acknowledgement) or for NOTCH_FALLBACK_GAP_MS, so a long
+ *  drag tracks what the app can actually show instead of racing ahead of it
+ *  as a wheel storm. Each release is sized to the backlog: a slow drag keeps
+ *  the queue shallow and moves a line at a time, while a queue the finger is
+ *  outrunning clears in larger steps, since the app coalesces the reports it
+ *  has received into one repaint either way. An emptied queue leaves nothing
+ *  pending, so the next line the finger earns goes out with no wait at all.
+ *  Opposite-direction input drops the pending run. */
+class NotchPacer {
+  private notches = 0;
+  private send: ((up: boolean, count: number) => void) | null = null;
+  private timer: ReturnType<typeof setTimeout> | null = null;
+  private awaiting = false;
+
+  enqueue(notches: number, send: (up: boolean, count: number) => void) {
+    if (this.notches !== 0 && Math.sign(this.notches) !== Math.sign(notches)) this.notches = 0;
+    this.notches = Math.max(-MAX_QUEUED_TOUCH_NOTCHES, Math.min(MAX_QUEUED_TOUCH_NOTCHES, this.notches + notches));
+    this.send = send;
+    if (!this.awaiting) this.flush();
+  }
+
+  /** A frame landed: release the next burst without waiting out the timer. */
+  onFrame() {
+    if (this.awaiting && this.notches !== 0) this.flush();
+  }
+
+  cancel() {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
+    this.notches = 0;
+    this.awaiting = false;
+  }
+
+  private flush() {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
+    this.awaiting = false;
+    if (this.notches === 0 || !this.send) return;
+    const up = this.notches < 0;
+    const pending = Math.abs(this.notches);
+    const burst = Math.min(NOTCH_BURST_MAX, Math.ceil(pending / NOTCH_BURST_DIVISOR));
+    this.send(up, burst);
+    this.notches += up ? burst : -burst;
+    if (this.notches !== 0) {
+      this.awaiting = true;
+      this.timer = setTimeout(() => this.flush(), NOTCH_FALLBACK_GAP_MS);
+    }
+  }
+}
 
 // Cursor drawn AS A CELL inside the text flow, the way a real terminal
 // renders it, rather than a separate absolutely-positioned block whose pixel
@@ -323,6 +428,21 @@ function navigationKeySequence(e: TerminalKeyLike): string | null {
   }
 }
 
+/** The word under the caret: the run of non-whitespace ending `run + typed`.
+ *  Uncapped, because a shorter run than the IME's own word fails the prefix
+ *  test and lets the whole word through twice. */
+function plainRunAfter(run: string, typed: string): string {
+  return /\S*$/.exec(run + typed)?.[0] ?? "";
+}
+
+/** Drop the last code point, so backspacing a surrogate pair or an emoji does
+ *  not leave half of it in the run and break the prefix test. */
+function dropLastCodePoint(run: string): string {
+  const points = Array.from(run);
+  points.pop();
+  return points.join("");
+}
+
 function specialKeySequence(e: TerminalKeyLike): string | null {
   switch (e.key) {
     case "Enter":
@@ -336,6 +456,15 @@ function specialKeySequence(e: TerminalKeyLike): string | null {
     default:
       return navigationKeySequence(e);
   }
+}
+
+/** A frame's rows as raw strings. `lines` is authoritative when present (a
+ *  patched frame never re-splits its window); `content` carries a
+ *  terminating newline that is not a row. */
+function frameLines(frame: LiveFrame): string[] {
+  if (frame.lines) return frame.lines;
+  const content = frame.content.endsWith("\n") ? frame.content.slice(0, -1) : frame.content;
+  return content.split("\n");
 }
 
 export const Row = memo(function Row({
@@ -472,7 +601,9 @@ export const Row = memo(function Row({
 });
 
 export function MobileLiveTerminal({
-  frame,
+  frame: streamFrame,
+  liveStats,
+  transport,
   armAgentClipboard,
   connected,
   active,
@@ -483,6 +614,7 @@ export function MobileLiveTerminal({
   enterReading,
   returnToLive,
   sendData: sendDataRaw,
+  typedWordRef,
   uploadPastedImage,
   forwardWheel,
   forwardButton,
@@ -522,6 +654,42 @@ export function MobileLiveTerminal({
     setFontSize(configuredFontSize);
   }
   const scrollerRef = useRef<HTMLDivElement>(null);
+  // A selection touching the grid pins the painted frame until the user lets
+  // go, so no row is rewritten out from under the range (see the hook).
+  // Everything below renders that held frame; only the stream
+  // acknowledgements read `streamFrame`.
+  // Dragging a selection upward past the top edge scrolls into scrollback,
+  // which asks the server for a wider capture window. Holding that response
+  // out would extend the drag into the blank history spacer instead of the
+  // text it just requested, so lines newly exposed ABOVE the held window are
+  // folded into the held frame. Folded in, not re-derived per frame: a capped
+  // VT scrollback evicts its oldest line on every append, which slides the
+  // exposed text under unchanged row keys, and re-deriving would rewrite the
+  // very rows the selection was extended onto. Keeping the held frame's
+  // `history` shrinks the spacer by exactly the folded count, so every row
+  // keeps its key and its pixel position; the fold settles because it leaves
+  // nothing older outstanding.
+  const absorbExposedHistory = useCallback(
+    (held: LiveFrame | null, next: LiveFrame | null) => {
+      // Reading mode is the only thing that widens the window, and the only
+      // state that mounts every row: outside it the debounced row count lags
+      // a sudden jump in height and virtualization would unmount the selected
+      // row, the collapse this whole change exists to prevent.
+      if (!reading || !held || !next) return null;
+      const heldLines = frameLines(held);
+      const nextLines = frameLines(next);
+      const older = held.history - heldLines.length - (next.history - nextLines.length);
+      // A frame too short to carry the whole exposed prefix would fold part of
+      // it and leave the rest outstanding, folding the same lines again on
+      // every following pass until React's re-render limit trips. The pane's
+      // scrollback collapsing mid-selection (a `clear`, or the window gaining
+      // a second pane, both of which report history 0) is what reaches this.
+      if (older <= 0 || older > nextLines.length) return null;
+      return { ...held, lines: nextLines.slice(0, older).concat(heldLines) };
+    },
+    [reading],
+  );
+  const { value: frame, held: selectionHeld } = useSelectionHold(streamFrame, scrollerRef, absorbExposedHistory);
   const measureRef = useRef<HTMLSpanElement>(null);
   const keyboardLayoutRef = useRef<KeyboardLayoutReader | null>(null);
   useEffect(() => {
@@ -575,8 +743,8 @@ export function MobileLiveTerminal({
   }, [remeasure]);
 
   // --- frame geometry -------------------------------------------------------
-  // `frame` always tracks the live stream; reading scrollback just widens
-  // the capture window (the hook owns that). Nothing is frozen.
+  // `frame` tracks the live stream except while a selection holds it; reading
+  // scrollback just widens the capture window (the hook owns that).
   const rowsRef = useRef(0);
   const readingRef = useRef(reading);
   useEffect(() => {
@@ -713,7 +881,7 @@ export function MobileLiveTerminal({
   // state initializer (never set) rather than a ref so the render-time
   // read is legal; re-running on the same frame converges (see the class).
   const [parseCache] = useState(() => new LineParseCache());
-  const lines = useMemo(() => (frame ? parseCache.lines(frame.content) : []), [frame, parseCache]);
+  const lines = useMemo(() => (frame ? parseCache.lines(frame.lines ?? frame.content) : []), [frame, parseCache]);
   // Columns this viewer renders at. Normally the pane is exactly this
   // wide and wrapping is the identity; when another writer resizes the
   // window wider (see the server-side drift re-assert), wrapping keeps
@@ -730,6 +898,8 @@ export function MobileLiveTerminal({
     const rows: AnsiSegment[][] = [];
     // Visual row index where each pane line starts (for cursor math).
     const lineStartRow: number[] = new Array(lines.length);
+    // Pane line and wrap offset of each visual row (for row identity).
+    const source: Array<{ line: number; wrap: number }> = [];
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i]!;
       let wrapped = wrapCache.get(line);
@@ -738,9 +908,12 @@ export function MobileLiveTerminal({
         wrapCache.set(line, wrapped);
       }
       lineStartRow[i] = rows.length;
-      for (const row of wrapped.rows) rows.push(row);
+      for (let wrap = 0; wrap < wrapped.rows.length; wrap++) {
+        rows.push(wrapped.rows[wrap]!);
+        source.push({ line: i, wrap });
+      }
     }
-    return { rows, lineStartRow };
+    return { rows, lineStartRow, source };
   }, [lines, renderCols, wrapCache]);
   const screenRows = frame?.rows ?? 0;
   const history = frame?.history ?? 0;
@@ -751,20 +924,31 @@ export function MobileLiveTerminal({
   // useless. Pin to the live edge (no spacer, no native scroll) and
   // forward the wheel to the app instead; the next frame reflects its
   // scroll. Mirrors the TUI's forward_wheel_to_live_pane.
-  const forwardMode = (frame?.altScreen ?? false) && (frame?.mouse ?? false);
+  const altScreen = frame?.altScreen ?? false;
+  const forwardMode = altScreen && (frame?.mouse ?? false);
   const mouseSgr = frame?.mouseSgr ?? false;
   const effectiveSpacerLines = forwardMode ? 0 : spacerLines;
-  const { forwardModeRef, mouseSgrRef } = useTerminalGestureBoundary({ scrollerRef, forwardMode, mouseSgr });
+  // Gesture forwarding, unlike the layout above, yields to a live selection.
+  // Forward mode owns every touch (touch-action: none plus a non-passive
+  // preventDefault) so a drag becomes wheel notches instead of a page pan;
+  // that is also what WebKit needs left alone to drag a selection's handles,
+  // so with it on the callout comes up and its handles will not move. The
+  // layout keeps using `forwardMode` on purpose: `effectiveSpacerLines` feeds
+  // the row keys, and flipping it mid-selection would remount every row.
+  const forwardGestures = forwardMode && !selectionHeld;
+  const { forwardModeRef, mouseSgrRef } = useTerminalGestureBoundary({
+    scrollerRef,
+    forwardMode: forwardGestures,
+    mouseSgr,
+  });
   // Sub-notch scroll remainder (px) carried across events, and the last
   // touch Y while forwarding a single-finger drag.
   const wheelAccumRef = useRef(0);
   const touchForwardYRef = useRef<number | null>(null);
-  const touchWheelQueueRef = useRef<{ notches: number; x: number; y: number; raf: number }>({
-    notches: 0,
-    x: 0,
-    y: 0,
-    raf: 0,
-  });
+  // Forward-mode notch pacing; see NotchPacer. A state initializer (never
+  // set) so the instance is stable and its in-place mutation stays off the
+  // render path.
+  const [notchPacer] = useState(() => new NotchPacer());
   // A custom forward-mode drag does not get native scroll cancellation, so
   // WebKit may still synthesize a click at its end. Remember meaningful touch
   // movement and consume that click instead of mistaking a swipe for a tap
@@ -946,6 +1130,9 @@ export function MobileLiveTerminal({
     const el = scrollerRef.current;
     if (el) el.scrollTop = liveScrollTarget(el);
     liveDetachedRef.current = false;
+    // Dropping the selection is what releases a held frame; a selection the
+    // user has stopped caring about would otherwise pin the view silently.
+    document.getSelection()?.removeAllRanges();
     returnToLive(rowsRef.current * LIVE_WINDOW_SCREENS);
   }, [returnToLive, liveScrollTarget]);
 
@@ -1019,49 +1206,30 @@ export function MobileLiveTerminal({
     [lineH, pointerCell, forwardWheel, mouseSgrRef, inputPaneMiddleRow],
   );
 
-  const cancelTouchWheelQueue = useCallback(() => {
-    const queued = touchWheelQueueRef.current;
-    if (queued.raf) cancelAnimationFrame(queued.raf);
-    queued.notches = 0;
-    queued.raf = 0;
-  }, []);
+  const cancelTouchWheelQueue = useCallback(() => notchPacer.cancel(), [notchPacer]);
   const enqueueTouchWheelDelta = useCallback(
     (deltaPx: number, clientX: number, clientY: number) => {
       wheelAccumRef.current += deltaPx;
       const { notches, remainder } = wheelNotches(wheelAccumRef.current, lineH || 16, MAX_QUEUED_TOUCH_NOTCHES);
       wheelAccumRef.current = remainder;
       if (notches === 0) return;
-
-      const queued = touchWheelQueueRef.current;
-      const direction = Math.sign(notches);
-      if (queued.notches && Math.sign(queued.notches) !== direction) queued.notches = 0;
-      queued.notches = Math.max(
-        -MAX_QUEUED_TOUCH_NOTCHES,
-        Math.min(MAX_QUEUED_TOUCH_NOTCHES, queued.notches + notches),
-      );
-      queued.x = clientX;
-      queued.y = clientY;
-
-      const flushOne = () => {
-        const state = touchWheelQueueRef.current;
-        state.raf = 0;
-        if (!forwardModeRef.current || state.notches === 0) return;
-        const { col } = pointerCell(state.x, state.y);
+      notchPacer.enqueue(notches, (up, count) => {
+        if (!forwardModeRef.current) return;
+        const { col } = pointerCell(clientX, clientY);
         const row = inputPaneMiddleRow();
-        const up = state.notches < 0;
-        forwardWheel(up, mouseSgrRef.current, col, row);
-        state.notches += up ? 1 : -1;
-        if (state.notches !== 0) state.raf = requestAnimationFrame(flushOne);
-      };
-
-      // The first notch starts immediately, so a short, quick swipe is not
-      // held for a frame. The rest drain one per frame, which makes a long
-      // swipe track remote redraws instead of arriving as a wheel storm.
-      if (!queued.raf) flushOne();
+        for (let i = 0; i < count; i++) forwardWheel(up, mouseSgrRef.current, col, row);
+      });
     },
-    [lineH, pointerCell, forwardWheel, forwardModeRef, mouseSgrRef, inputPaneMiddleRow],
+    [lineH, notchPacer, pointerCell, forwardWheel, forwardModeRef, mouseSgrRef, inputPaneMiddleRow],
   );
   useEffect(() => cancelTouchWheelQueue, [cancelTouchWheelQueue]);
+  // A frame after a forwarded notch is the app's acknowledgement: release the
+  // next queued notch now rather than waiting out the timeout. Frame arrival
+  // is a transport event, not derived state, so an effect is the right hook.
+  useEffect(() => {
+    // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler
+    if (streamFrame) notchPacer.onFrame();
+  }, [streamFrame, notchPacer]);
 
   const onWheel = useCallback(
     (e: React.WheelEvent) => {
@@ -1129,7 +1297,7 @@ export function MobileLiveTerminal({
     (data: string) => {
       stopMomentum();
       cancelTouchWheelQueue();
-      sendDataRaw(data);
+      return sendDataRaw(data);
     },
     [sendDataRaw, stopMomentum, cancelTouchWheelQueue],
   );
@@ -1197,6 +1365,10 @@ export function MobileLiveTerminal({
 
   // --- pinch zoom (two-finger) ---------------------------------------------
   const pinchRef = useRef<{ startDist: number; startSize: number; changed: boolean } | null>(null);
+  // Bumped when a pinch that changed the font ends, so the sizing effect
+  // re-runs and commits the resize once at gesture end instead of every
+  // 150 ms of stillness mid-gesture (each one repainted the whole remote app).
+  const [pinchGeneration, setPinchGeneration] = useState(0);
   const persistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Finger Y at the start of a single-finger capture-mode drag, used to tell a
   // real scroll from a tap before the native scroll has moved far.
@@ -1352,6 +1524,7 @@ export function MobileLiveTerminal({
         const changed = pinchRef.current.changed;
         pinchRef.current = null;
         if (!changed) return;
+        setPinchGeneration((g) => g + 1);
         if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
         persistTimerRef.current = setTimeout(() => {
           update({ [fontKey]: fontSize });
@@ -1381,6 +1554,7 @@ export function MobileLiveTerminal({
       const changed = pinchRef.current.changed;
       pinchRef.current = null;
       if (changed) {
+        setPinchGeneration((g) => g + 1);
         if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
         persistTimerRef.current = setTimeout(() => {
           update({ [fontKey]: fontSize });
@@ -1413,6 +1587,10 @@ export function MobileLiveTerminal({
       const height = el.clientHeight;
       if (width <= 0 || height <= 0) return;
       const cols = Math.floor(width / charW);
+      if (pinchRef.current) {
+        if (cols >= 20) setRenderCols(cols);
+        return;
+      }
       const latch = latchRef.current;
       const widthChanged = Math.abs(width - latch.width) > 1;
       // While the keyboard occludes the viewport, the measured height is
@@ -1456,7 +1634,7 @@ export function MobileLiveTerminal({
       ro.disconnect();
       if (timer) clearTimeout(timer);
     };
-  }, [active, charW, lineH, sendResize, setWindow, pinIfWasAtBottom, keyboardOpen]);
+  }, [active, charW, lineH, sendResize, setWindow, pinIfWasAtBottom, keyboardOpen, pinchGeneration]);
 
   // Opening the soft keyboard is an intent to type, not to continue reading
   // scrollback. Return to the live prompt before the keyboard reduces the
@@ -1486,6 +1664,11 @@ export function MobileLiveTerminal({
     return () => document.removeEventListener("visibilitychange", sync);
   }, [active, reading, setCadence]);
 
+  const [frameTiming] = useState(() => new FrameTimingProbe());
+  useLayoutEffect(() => {
+    if (LIVE_DEBUG && streamFrame) frameTiming.record(performance.now(), streamFrame.receivedAt);
+  }, [streamFrame, frameTiming]);
+
   // --- bottom pinning ---------------------------------------------------------
   useLayoutEffect(() => {
     // Refresh the cursor anchor before pinning so this commit pins
@@ -1511,6 +1694,12 @@ export function MobileLiveTerminal({
 
   // --- keyboard input -----------------------------------------------------------
   const composingRef = useRef(false);
+  // Whether the composition in flight took over already-typed text: null until
+  // its first update settles it. See handleCompositionUpdate.
+  const retroactiveRef = useRef<boolean | null>(null);
+  // Returns whether `data` itself reached the pane, so a caller can tell
+  // whether the run may record it. A Ctrl chord sends a control code instead,
+  // and a non-owner's keystrokes are dropped outright.
   const sendKeys = useCallback(
     (data: string) => {
       if (ctrlActiveRef.current && data.length === 1) {
@@ -1518,10 +1707,10 @@ export function MobileLiveTerminal({
         if (code >= 65 && code <= 90) {
           sendData(String.fromCharCode(code - 64));
           clearCtrl();
-          return;
+          return false;
         }
       }
-      sendData(data);
+      return sendData(data);
     },
     [sendData, ctrlActiveRef, clearCtrl],
   );
@@ -1532,31 +1721,34 @@ export function MobileLiveTerminal({
   const handleMobileKeyboardProxyInput = useCallback(
     (input: MobileKeyboardProxyInput) => {
       if (composingRef.current || input.isComposing) return;
+      const run = typedWordRef.current;
+      typedWordRef.current = "";
       switch (input.inputType) {
-        case "insertText":
-          if (input.data) sendKeys(input.data);
+        case "insertText": {
+          const data = input.data ?? "";
+          if (data && !sendKeys(data)) break;
+          typedWordRef.current = plainRunAfter(run, data);
           break;
+        }
         case "insertLineBreak":
         case "insertParagraph":
           sendKeys("\r");
           break;
         case "deleteContentBackward":
-          sendKeys("\x7f");
+          // One character, so the IME's word loses its last one too;
+          // `deleteWordBackward` is a separate input type and not forwarded.
+          if (!sendKeys("\x7f")) break;
+          typedWordRef.current = dropLastCodePoint(run);
           break;
         case "insertFromPaste": {
-          const text = input.data ?? "";
-          if (text) {
-            // Bracketed paste so agents treat embedded newlines as
-            // pasted text, not per-line submits.
-            sendData(`\x1b[200~${text}\x1b[201~`);
-          }
+          if (input.data) sendData(bracketedPaste(input.data));
           break;
         }
         default:
           break;
       }
     },
-    [sendKeys, sendData],
+    [sendKeys, sendData, typedWordRef],
   );
   const handleBeforeInput = useCallback(
     (ev: InputEvent) => {
@@ -1652,8 +1844,7 @@ export function MobileLiveTerminal({
       e.preventDefault();
 
       if (imageFiles.length === 0) {
-        // Bracketed paste so agents treat embedded newlines as pasted text.
-        if (text) sendData(`\x1b[200~${text}\x1b[201~`);
+        if (text) sendData(bracketedPaste(text));
         return;
       }
 
@@ -1668,7 +1859,7 @@ export function MobileLiveTerminal({
         if (parts.length === 0) return;
         // Leading and trailing spaces keep the path from gluing onto queued
         // text or the user's next keystroke. No newline: never auto-submit.
-        sendData(`\x1b[200~ ${parts.join(" ")} \x1b[201~`);
+        sendData(bracketedPaste(` ${parts.join(" ")} `));
       })();
     },
     [sendData, uploadPastedImage],
@@ -1676,14 +1867,42 @@ export function MobileLiveTerminal({
 
   const handleCompositionStart = useCallback(() => {
     composingRef.current = true;
+    retroactiveRef.current = null;
   }, []);
+  // A retroactive composition announces itself on its first update: SwiftKey
+  // adopts the word already typed, so that update carries the whole run
+  // (`compositionupdate "test"` right after `compositionstart ""` in #3746's
+  // trace). A composition genuinely starting here builds from its own first
+  // character instead, so it never matches and its result is sent whole.
+  const handleCompositionUpdate = useCallback(
+    (e: CompositionEvent) => {
+      if (retroactiveRef.current !== null) return;
+      const run = typedWordRef.current;
+      retroactiveRef.current = run !== "" && (e.data ?? "").startsWith(run);
+    },
+    [typedWordRef],
+  );
   const handleCompositionEnd = useCallback(
     (e: CompositionEvent) => {
       composingRef.current = false;
-      if (e.data) sendKeys(e.data);
+      const retroactive = retroactiveRef.current === true;
+      retroactiveRef.current = null;
+      const run = typedWordRef.current;
+      typedWordRef.current = "";
+      const data = e.data ?? "";
+      // Only a composition that took over the typed word may have its prefix
+      // dropped; anything else is new text and goes to the pane whole.
+      const rest = retroactive && data.startsWith(run) ? data.slice(run.length) : data;
+      // The typed word is still the one under the caret, so a second
+      // composition over it (a suggestion tap, then the space commit) has to
+      // be stripped against everything the pane has of that word. A
+      // composition that stood on its own leaves no typed word behind: its
+      // result must not become a run for the next composition to strip.
+      if (!rest) typedWordRef.current = run;
+      else if (sendKeys(rest) && retroactive) typedWordRef.current = plainRunAfter(run, rest);
       if (e.currentTarget instanceof HTMLTextAreaElement) e.currentTarget.value = "";
     },
-    [sendKeys],
+    [sendKeys, typedWordRef],
   );
 
   // Session selection focuses App's persistent, in-viewport keyboard input
@@ -1700,6 +1919,7 @@ export function MobileLiveTerminal({
     proxy.addEventListener("keydown", handleKeyDown);
     proxy.addEventListener("paste", handlePaste);
     proxy.addEventListener("compositionstart", handleCompositionStart);
+    proxy.addEventListener("compositionupdate", handleCompositionUpdate);
     proxy.addEventListener("compositionend", handleCompositionEnd);
     return () => {
       unregisterProxyInput();
@@ -1707,6 +1927,7 @@ export function MobileLiveTerminal({
       proxy.removeEventListener("keydown", handleKeyDown);
       proxy.removeEventListener("paste", handlePaste);
       proxy.removeEventListener("compositionstart", handleCompositionStart);
+      proxy.removeEventListener("compositionupdate", handleCompositionUpdate);
       proxy.removeEventListener("compositionend", handleCompositionEnd);
     };
   }, [
@@ -1716,6 +1937,7 @@ export function MobileLiveTerminal({
     handleMobileKeyboardProxyInput,
     handlePaste,
     handleCompositionStart,
+    handleCompositionUpdate,
     handleCompositionEnd,
   ]);
 
@@ -1723,11 +1945,13 @@ export function MobileLiveTerminal({
   // to box, and the column within it. -1 means draw nothing.
   const cursorRow = connected && !reading ? live.row : -1;
 
-  // Trim trailing blank rows (for bottom-align) ONLY at the live edge. While
-  // reading scrollback the spacer model keeps above-viewport pixels invariant
-  // so the position holds as the agent streams; trimming there would change
-  // scrollHeight under the reader and snap the viewport.
-  const visibleRowCount = reading ? visual.rows.length : Math.min(renderRowCount, visual.rows.length);
+  // Trim trailing blank rows (for bottom-align) ONLY at the live edge of the
+  // normal screen. While reading scrollback the spacer model keeps
+  // above-viewport pixels invariant so the position holds as the agent
+  // streams; trimming there would change scrollHeight under the reader and
+  // snap the viewport. A full-screen app owns its whole grid: rendering every
+  // row keeps its layout fixed instead of settling after each repaint.
+  const visibleRowCount = reading || altScreen ? visual.rows.length : Math.min(renderRowCount, visual.rows.length);
 
   // Virtualization windows over [0, visibleRowCount): the rows whose document
   // positions fall within the viewport, plus one viewport of overscan each side
@@ -1847,7 +2071,7 @@ export function MobileLiveTerminal({
             // wheel scrolls the app, the double-scroll clunk. touch-action:
             // none stops the browser from starting any pan or zoom for
             // touches on the terminal; JS still receives every touch event.
-            touchAction: forwardMode ? "none" : undefined,
+            touchAction: forwardGestures ? "none" : undefined,
             // Do NOT set `-webkit-overflow-scrolling: touch` here. It promotes
             // this opaque scroll region to a composited layer that macOS/iOS
             // Safari rasterizes at 1x, making the DOM terminal text look
@@ -1879,30 +2103,29 @@ export function MobileLiveTerminal({
             opt out (`bottomAlign=false`) so a near-empty bash prompt sits at
             the top like a normal terminal. */}
         <div className={`relative whitespace-pre ${bottomAlign ? "mt-auto" : ""}`} data-live-content>
-          {mounted.blocks.map(({ padLines, start, end }) => {
-            return (
-              <Fragment key={`${start}-${end}`}>
-                {padLines > 0 && <div style={{ height: `${padLines * lineH}px` }} aria-hidden="true" />}
-                {visual.rows.slice(start, end).map((segs, j) => {
-                  const i = start + j;
-                  // Keyed by ABSOLUTE buffer position (spacer + window row),
-                  // which is invariant as the agent appends: history grows by
-                  // k, the capture window slides by k, and a given content
-                  // line keeps spacer+index. With a viewport-relative key an
-                  // append shifted every row onto a new key and re-rendered
-                  // the entire mounted slice per streamed frame.
-                  return (
-                    <Row
-                      key={effectiveSpacerLines + i}
-                      segs={segs}
-                      cursorCol={i === cursorRow ? live.col : null}
-                      focused={i === cursorRow && focused}
-                    />
-                  );
-                })}
-              </Fragment>
-            );
-          })}
+          {mounted.blocks.flatMap(({ padLines, start, end }, block) => [
+            padLines > 0 ? (
+              <div key={`pad-${block}`} style={{ height: `${padLines * lineH}px` }} aria-hidden="true" />
+            ) : null,
+            // Rows are keyed by pane line (spacer + window line, invariant as
+            // the agent appends: history grows by k and the window slides by
+            // k) plus wrap offset, so a wrapped row keeps its identity too.
+            // The pads sit beside them in one flat list because any wrapper
+            // keyed on the mounted range would remount every row (and drop
+            // the user's selection) each time the range moved by a line.
+            ...visual.rows.slice(start, end).map((segs, j) => {
+              const i = start + j;
+              const src = visual.source[i]!;
+              return (
+                <Row
+                  key={`${effectiveSpacerLines + src.line}:${src.wrap}`}
+                  segs={segs}
+                  cursorCol={i === cursorRow ? live.col : null}
+                  focused={i === cursorRow && focused}
+                />
+              );
+            }),
+          ])}
           {bottomPadLines > 0 && <div style={{ height: `${bottomPadLines * lineH}px` }} aria-hidden="true" />}
         </div>
       </div>
@@ -1918,11 +2141,19 @@ export function MobileLiveTerminal({
             `grid=${renderCols}cols spacer=${spacerLines} lastNonBlank=${lastNonBlankRow}`,
             `cur=${frame?.cursor ? `${frame.cursor.x},${frame.cursor.y}` : "null"} -> row=${live.row} col=${live.col}`,
             `lineH=${lineH.toFixed(2)} charW=${charW.toFixed(3)}`,
+            `seq=${frame?.seq ?? "-"} alt=${altScreen ? 1 : 0} fps=${frameTiming.fps().toFixed(1)} paint=${frameTiming
+              .meanPaintMs()
+              .toFixed(1)}ms`,
+            `transport=${transport ?? "-"} frames=${liveStats?.frames ?? "-"} patches=${
+              liveStats?.patches ?? "-"
+            } resyncs=${liveStats?.resyncs ?? "-"} wire=${
+              liveStats ? `${(liveStats.wireBytes / 1024).toFixed(1)}k` : "-"
+            }`,
           ].join("\n")}
         </div>
       )}
 
-      {reading && (
+      {(reading || selectionHeld) && (
         <button
           type="button"
           onClick={jumpToLatest}
@@ -1971,6 +2202,7 @@ export function MobileLiveTerminal({
         onKeyDown={(e) => handleKeyDown(e.nativeEvent)}
         onPaste={(e) => handlePaste(e.nativeEvent)}
         onCompositionStart={() => handleCompositionStart()}
+        onCompositionUpdate={(e) => handleCompositionUpdate(e.nativeEvent)}
         onCompositionEnd={(e) => handleCompositionEnd(e.nativeEvent)}
       />
     </div>

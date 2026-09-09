@@ -240,10 +240,8 @@ pub fn delta_meets_threshold(delta_bytes: usize, new_turns: usize) -> bool {
     delta_bytes >= MIN_DELTA_BYTES || new_turns >= MIN_DELTA_TURNS
 }
 
-#[cfg(feature = "serve")]
 pub use serve::{should_trigger_summary, try_conversation_summary, SummaryTrigger};
 
-#[cfg(feature = "serve")]
 mod serve {
     use super::*;
     use crate::server::AppState;
@@ -334,7 +332,7 @@ mod serve {
             return;
         };
 
-        let resolved = crate::session::repo_config::resolve_config_with_repo_or_warn(
+        let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
             &profile,
             std::path::Path::new(&project_path),
         );

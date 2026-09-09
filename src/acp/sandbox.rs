@@ -87,7 +87,7 @@ pub async fn ensure_container_for_session_locked(
             } else {
                 None
             };
-            let env = crate::session::repo_config::lifecycle_env_vars(&instance_clone);
+            let env = crate::session::config::repo_config::lifecycle_env_vars(&instance_clone);
             Ok((instance_clone.sandbox_info.clone(), workdir, hooks, env))
         })
         .await
@@ -122,7 +122,7 @@ pub async fn ensure_container_for_session_locked(
             let workdir = container_workdir.clone();
             let sid = session_id.to_string();
             match tokio::task::spawn_blocking(move || {
-                crate::session::repo_config::execute_hooks_in_container_best_effort(
+                crate::session::config::repo_config::execute_hooks_in_container_best_effort(
                     &cmds,
                     &container_name,
                     &workdir,

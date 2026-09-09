@@ -64,7 +64,7 @@ export interface WizardData {
    *  can turn it off in AgentStep to launch a tmux/terminal session. The
    *  submit path sends `view: "structured"` only when the tool is
    *  ACP-capable and this flag is set; the server re-validates
-   *  capability (src/server/api/sessions.rs). Intentionally not
+   *  capability (src/server/api/sessions/create.rs). Intentionally not
    *  tracked in `profileDirty` (see SET_FIELD) and not persisted: a
    *  remembered opt-out would silently override the per-session default. */
   useStructuredView: boolean;

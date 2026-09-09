@@ -3,103 +3,40 @@
 use super::*;
 
 impl Instance {
-    /// Full set of session IDs capture must skip for this instance: live tmux
-    /// ownership, cascade-cleared ids, conversations same-project peers parked
-    /// while running another tool, and inactive peers that still own records
-    /// in a shared host store.
+    /// Full set of session IDs capture must skip for this instance.
     pub(super) fn retroactive_capture_exclusion_set(&self) -> HashSet<String> {
         crate::session::capture::compose_exclusion_with_persisted_peers(
             &self.id,
             &self.project_path,
-            &self.tool,
-            self.tool == "claude"
-                || (matches!(self.tool.as_str(), "codex" | "kimi") && !self.is_sandboxed()),
             &self.effective_profile(),
             &self.retroactive_capture_excludes,
         )
     }
 
-    /// Whether another AoE session shares this one's Kimi store, which makes
-    /// the session index useless for attributing a conversation to a pane.
-    /// Both own homes are supplied so a hook-minted `KIMI_CODE_HOME` still
-    /// counts static-profile siblings as sharing.
-    fn kimi_store_is_shared(&self) -> bool {
-        crate::session::capture::kimi_store_is_shared(
-            &self.id,
-            &self.project_path,
-            &self.resolved_host_environment(),
-            &self.profile_host_environment(),
-        )
-    }
-
     pub(crate) fn try_retroactive_capture(&self) -> Option<String> {
-        let result: Option<String> = match self.tool.as_str() {
-            "claude" => {
-                // Claude additionally extends the common live and parked-id
-                // exclusion with stopped, archived, or pane-less peer sids so
-                // the mtime fallback skips peers whose jsonl outlived their
-                // tmux session (#2355).
-                let exclusion = self.retroactive_capture_exclusion_set();
-                if self.is_sandboxed() {
-                    let container_name = self.sandbox_info.as_ref()?.container_name.clone();
-                    capture_claude_session_id_in_container(
-                        &container_name,
-                        &self.container_workdir(),
-                        &exclusion,
-                        None,
-                    )
-                    .ok()
-                } else {
-                    capture_claude_session_id(
-                        &self.project_path,
-                        None,
-                        &exclusion,
-                        &self.resolved_host_environment(),
-                    )
-                    .ok()
-                }
+        let (capture, context) = self.resolved_session_support()?;
+        let backend = capture.backend;
+        if matches!(
+            context,
+            crate::agents::SessionCaptureContext::Preassigned
+                | crate::agents::SessionCaptureContext::ManagedExclusiveStore
+        ) {
+            return None;
+        }
+        let exclusion = self.retroactive_capture_exclusion_set();
+        let result = match backend {
+            crate::agents::SessionCaptureBackend::Claude
+            | crate::agents::SessionCaptureBackend::HookSidecar => {
+                crate::hooks::read_hook_session_id_any_age(&self.id)
             }
-            "opencode" => {
-                let exclusion = self.retroactive_capture_exclusion_set();
-                if self.is_sandboxed() {
-                    let container_name = self.sandbox_info.as_ref()?.container_name.clone();
-                    try_capture_opencode_session_id_in_container(
-                        &container_name,
-                        &self.container_workdir(),
-                        &exclusion,
-                        None,
-                    )
-                    .ok()
-                } else {
-                    try_capture_opencode_session_id(&self.project_path, &exclusion, None).ok()
-                }
-            }
-            "vibe" => {
-                let exclusion = self.retroactive_capture_exclusion_set();
-                if self.is_sandboxed() {
-                    let container_name = self.sandbox_info.as_ref()?.container_name.clone();
-                    try_capture_vibe_session_id_in_container(
-                        &container_name,
-                        &self.container_workdir(),
-                        &exclusion,
-                    )
-                    .ok()
-                } else {
-                    capture_vibe_session_id(&self.project_path, &exclusion).ok()
-                }
-            }
-            "pi" => {
-                // Never: identity comes from the pin or the floored poller,
-                // and this path has no floor at all. Sandboxed panes share one
-                // `~/.pi/sandbox`, so they are no more attributable.
-                None
-            }
-            "omp" => {
+            crate::agents::SessionCaptureBackend::Pi => self.pi_published_session_id(true),
+            crate::agents::SessionCaptureBackend::Omp => {
                 let options = self.omp_capture_options()?;
-                let exclusion = self.retroactive_capture_exclusion_set();
-                let tmux_session_name = self
-                    .tmux_env_session_name()
-                    .or_else(|| self.tmux_session().ok().map(|s| s.name().to_string()))?;
+                let tmux_session_name = self.tmux_env_session_name().or_else(|| {
+                    self.tmux_session()
+                        .ok()
+                        .map(|session| session.name().to_string())
+                })?;
                 let metadata = self.omp_capture_metadata(&tmux_session_name, &options, None)?;
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
@@ -115,117 +52,12 @@ impl Instance {
                     capture_omp_session_id(&metadata, &exclusion, &tmux_session_name).ok()
                 }
             }
-            "codex" => {
-                if self.is_sandboxed() {
-                    // Sandboxed Codex sessions have instance-private homes, so
-                    // their transcript stores cannot contain a sibling's
-                    // rollout (#3317). The common helper therefore omits
-                    // inactive same-tool peers on this path.
-                    let exclusion = self.retroactive_capture_exclusion_set();
-                    let container_name = self.sandbox_info.as_ref()?.container_name.clone();
-                    try_capture_codex_session_id_in_container(
-                        &container_name,
-                        &self.container_workdir(),
-                        &exclusion,
-                    )
-                    .ok()
-                } else {
-                    // Host Codex sessions share `~/.codex/sessions/`. Include
-                    // stopped and pane-less same-directory peers so the mtime
-                    // scan cannot adopt a sibling's newer conversation.
-                    let exclusion = self.retroactive_capture_exclusion_set();
-                    capture_codex_session_id(&self.project_path, &exclusion).ok()
-                }
-            }
-            "gemini" => {
-                let exclusion = self.retroactive_capture_exclusion_set();
-                if self.is_sandboxed() {
-                    let container_name = self.sandbox_info.as_ref()?.container_name.clone();
-                    try_capture_gemini_session_id_in_container(
-                        &container_name,
-                        &self.container_workdir(),
-                        &exclusion,
-                    )
-                    .ok()
-                } else {
-                    capture_gemini_session_id(&self.project_path, &exclusion).ok()
-                }
-            }
-            "hermes" => {
-                let exclusion = self.retroactive_capture_exclusion_set();
-                if self.is_sandboxed() {
-                    let container_name = self.sandbox_info.as_ref()?.container_name.clone();
-                    try_capture_hermes_session_id_in_container(
-                        &container_name,
-                        &self.container_workdir(),
-                        &exclusion,
-                    )
-                    .ok()
-                } else {
-                    capture_hermes_session_id(&self.project_path, &exclusion).ok()
-                }
-            }
-            "copilot" => {
-                // Copilot stores sessions in a SQLite db. Host capture reads it
-                // directly; sandbox resume is a follow-up (the container's db is
-                // not read over `docker exec`), so a sandboxed Copilot session
-                // simply starts fresh on restart.
-                if self.is_sandboxed() {
-                    None
-                } else {
-                    let exclusion = self.retroactive_capture_exclusion_set();
-                    capture_copilot_session_id(&self.project_path, &exclusion).ok()
-                }
-            }
-            "kimi" => {
-                // Kimi records sessions in `session_index.jsonl` under the
-                // resolved `KIMI_CODE_HOME`, keyed by workDir. Host capture
-                // reads it through the launched pane's environment; sandbox
-                // resume is a follow-up (the container's index is not read
-                // over `docker exec`), so a sandboxed Kimi session starts
-                // fresh on restart, mirroring Copilot.
-                if self.is_sandboxed() {
-                    None
-                } else if self.kimi_store_is_shared() {
-                    // A shared store names no pane: its newest same-workDir
-                    // record is as likely to be a co-located peer's
-                    // conversation as this one's, so the MRU scan is refused
-                    // entirely (#3516). An anchored sid keeps its value on
-                    // the freshest path; an id-less session starts fresh
-                    // rather than adopt a peer conversation. Sole-owner
-                    // stores keep the MRU retarget, which stays the
-                    // new-conversation promotion path (#2291).
-                    None
-                } else {
-                    let exclusion = self.retroactive_capture_exclusion_set();
-                    // Retroactive recovery is unrestricted (no launch floor):
-                    // resuming an older session on restart is the goal here.
-                    capture_kimi_session_id(
-                        &self.project_path,
-                        &exclusion,
-                        None,
-                        &self.resolved_host_environment(),
-                    )
-                    .ok()
-                }
-            }
-            "prime-agent" => {
-                // Prime Agent writes one JSONL per session under
-                // `~/.prime/agent/sessions`, header line keyed by cwd. Host
-                // capture reads it directly; sandbox resume is a follow-up
-                // (the container's sessions dir is not read over `docker
-                // exec`), so a sandboxed Prime Agent session starts fresh on
-                // restart, mirroring Copilot and Kimi.
-                if self.is_sandboxed() {
-                    None
-                } else {
-                    let exclusion = self.retroactive_capture_exclusion_set();
-                    // Retroactive recovery is unrestricted (no launch floor):
-                    // resuming an older session on restart is the goal here.
-                    capture_prime_agent_session_id(&self.project_path, &exclusion, None).ok()
-                }
-            }
-            _ => None,
+            crate::agents::SessionCaptureBackend::Codex
+            | crate::agents::SessionCaptureBackend::Gemini
+            | crate::agents::SessionCaptureBackend::Hermes
+            | crate::agents::SessionCaptureBackend::Kimi
+            | crate::agents::SessionCaptureBackend::PrimeAgent
+            | crate::agents::SessionCaptureBackend::OpenCode => None,
         };
         result.and_then(validated_session_id)
     }
@@ -250,7 +82,10 @@ impl Instance {
             // owner of a freshly-observed entry. Counting it would strand the
             // live session forever behind a ghost. Mirrors the liveness gate
             // `self_heal_session_id` applies to `self`.
-            if inst.agent_session_id.is_some() || !inst.tmux_alive_cached() {
+            if inst.agent_session_id.is_some()
+                || !inst.tmux_alive_cached()
+                || inst.resolved_session_support().is_none()
+            {
                 continue;
             }
             let key = inst.contended_capture_key();
@@ -279,7 +114,7 @@ impl Instance {
     /// count as one, matching the directory match in `filter_agent_sessions`.
     pub(super) fn contended_capture_key(&self) -> (String, String) {
         (
-            self.tool.clone(),
+            self.capture_agent_name().unwrap_or(&self.tool).to_string(),
             crate::session::capture::canonicalize_or_raw(&self.project_path)
                 .to_string_lossy()
                 .into_owned(),
@@ -347,6 +182,78 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn unauthorized_alias_does_not_contend_with_a_direct_base() {
+        const PROFILE: &str = "contended-unauthorized-alias-test";
+        let _registry = crate::session::instance::test_helpers::install_aliases(
+            PROFILE,
+            &[("opencode-remote", "opencode")],
+        );
+        let cwd = std::env::current_dir().unwrap();
+        let project = cwd.to_str().unwrap();
+        let canonical = crate::session::capture::canonicalize_or_raw(project)
+            .to_string_lossy()
+            .into_owned();
+        let mut base = Instance::new("base", project);
+        base.tool = "opencode".to_string();
+        let mut remote = Instance::new("remote", project);
+        remote.source_profile = PROFILE.to_string();
+        remote.tool = "opencode-remote".to_string();
+        remote.command = "ssh host opencode".to_string();
+        assert!(base.resolved_session_support().is_some());
+        assert!(remote.resolved_session_support().is_none());
+
+        let guard = crate::tmux::SessionCacheGuard::capture();
+        guard.force_present(&[]);
+        let sessions = [&base, &remote]
+            .map(|instance| crate::tmux::Session::resolve_name(&instance.id, &instance.title));
+        let live = sessions.iter().map(String::as_str).collect::<Vec<_>>();
+        guard.force_present(&live);
+
+        assert!(
+            !Instance::contended_capture_cwds(&[base, remote])
+                .contains(&("opencode".to_string(), canonical)),
+            "an alias without capture authorization cannot veto the direct pane"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn contended_capture_cwds_spans_a_direct_alias_and_its_base() {
+        const PROFILE: &str = "contended-alias-test";
+        let _registry = crate::session::instance::test_helpers::install_aliases(
+            PROFILE,
+            &[("opencode-personal", "opencode")],
+        );
+        let cwd = std::env::current_dir().unwrap();
+        let project = cwd.to_str().unwrap();
+        let canonical = crate::session::capture::canonicalize_or_raw(project)
+            .to_string_lossy()
+            .into_owned();
+        let mut base = Instance::new("base", project);
+        base.tool = "opencode".to_string();
+        let mut alias = Instance::new("alias", project);
+        alias.source_profile = PROFILE.to_string();
+        alias.tool = "opencode-personal".to_string();
+        alias.command = "opencode".to_string();
+        assert!(base.resolved_session_support().is_some());
+        assert!(alias.resolved_session_support().is_some());
+
+        let guard = crate::tmux::SessionCacheGuard::capture();
+        guard.force_present(&[]);
+        let sessions = [&base, &alias]
+            .map(|instance| crate::tmux::Session::resolve_name(&instance.id, &instance.title));
+        let live = sessions.iter().map(String::as_str).collect::<Vec<_>>();
+        guard.force_present(&live);
+
+        assert!(
+            Instance::contended_capture_cwds(&[base, alias])
+                .contains(&("opencode".to_string(), canonical)),
+            "a direct alias and its base share one capture identity"
+        );
+    }
 
     #[test]
     #[serial_test::serial]

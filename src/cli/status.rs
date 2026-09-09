@@ -65,14 +65,14 @@ pub async fn run(profile: &str, args: StatusArgs) -> Result<()> {
     // Resolving the profile config installs the declarative status-rule
     // registry (`[[agents.<name>.status_rules]]`); the per-instance poll
     // below never loads config itself.
-    crate::session::profile_config::resolve_config_or_warn(profile);
+    crate::session::config::profile_config::resolve_config_or_warn(profile);
 
     // Refresh tmux session cache
     crate::tmux::refresh_session_cache();
 
     let contended = crate::session::Instance::contended_capture_cwds(&instances);
     for inst in &mut instances {
-        inst.update_status();
+        inst.update_status_once(None, None);
         inst.self_heal_session_id(profile, &contended);
     }
 

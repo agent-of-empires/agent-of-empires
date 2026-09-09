@@ -1113,7 +1113,7 @@ export function getProfileSettings(name: string): Promise<ProfileSettingsRespons
  *  writable; `description` is the profile-only top-level field that carries no
  *  schema descriptor. Sections absent from the schema, notably `hooks` plus the
  *  agent-command and env fields, are remote-code-execution surfaces the server
- *  rejects (`validate_patch` in src/session/settings_schema/policy.rs); we
+ *  rejects (`validate_patch` in src/session/config/settings_schema/policy.rs); we
  *  reject them client side too as defense in depth. Because both sides read the
  *  same schema, there is no hand-kept list to keep in sync. */
 export function profileWritableSections(schema: SettingsFieldDescriptor[]): Set<string> {

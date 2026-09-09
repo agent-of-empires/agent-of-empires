@@ -19,7 +19,7 @@ Mobile and touch behavior is documented inline on each page.
 
 The dashboard ships in all release binaries: [GitHub Releases](https://github.com/agent-of-empires/agent-of-empires/releases), the [quick install script](../installation.md#quick-install-recommended), and Homebrew (`brew install aoe`). Just run `aoe serve`.
 
-Building from source requires the `serve` Cargo feature and Node.js to compile the embedded frontend.
+Building from source requires the `web` Cargo feature and Node.js to compile the embedded frontend. A plain `cargo build` still ships the daemon, so `aoe serve` runs and answers the API; there is just no dashboard to open.
 
 ## Starting the server
 
@@ -41,7 +41,7 @@ aoe web dashboard running at:
 
 Open it in any browser. The token is set as a cookie on first visit, so you don't need to keep it in the URL.
 
-`--open` is suppressed with `--daemon` or `--remote`, over SSH (`SSH_CONNECTION` / `SSH_TTY` set), and on Linux/BSD with no `DISPLAY` / `WAYLAND_DISPLAY`.
+`--open` is suppressed with `--daemon` or `--remote`, and whenever no browser you could see is reachable: over SSH without a forwarded `DISPLAY`, and on Linux/BSD with no display server. Setting `BROWSER` overrides the check on platforms whose browser launcher reads it, which excludes macOS. The preview's link handling uses the same rules.
 
 ### Retrieving the live URL
 
@@ -183,6 +183,8 @@ aoe serve \
 ```
 
 The upstream must set `X-Forwarded-For` (or `cf-connecting-ip`); aoe reads the last value as the client IP. The trust check fires only when the socket peer is loopback, so a misconfigured upstream that lets requests reach aoe directly cannot spoof the IP.
+
+With `--auth=passphrase --behind-proxy` the passphrase wall applies to loopback callers too. Proxied traffic arrives on a loopback socket, so an upstream that forgets the header would otherwise hand every visitor the same-host bypass. A browser on the same host signs in with the passphrase like any other client. The TUI structured view has no passphrase exchange, so it cannot attach to a `--behind-proxy` passphrase daemon; use `--auth=token` on daemons you also drive from the local TUI.
 
 `--behind-proxy` requires at least one `--allowed-host <public-hostname>`: aoe cannot infer the hostname your proxy forwards, and the [DNS-rebinding gate](#dns-rebinding) rejects any `Host` it does not recognize. If the proxy listens on a nonstandard port, also pass the exact origin, e.g. `--allowed-origin https://aoe.example.com:8443`. The daemon refuses to start (with an explicit message) if `--behind-proxy` is set without `--allowed-host`.
 

@@ -30,7 +30,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::elicitations::ElicitationAnswer;
-use super::state::{DiffComment, Event, PromptAttachmentRef, ToolCall, ToolOutputBlock};
+use super::state::{DiffComment, Event, ToolCall, ToolOutputBlock};
+use crate::daemon::PromptAttachmentRef;
 
 /// One renderable row of the transcript. A stable superset of the web
 /// `ActivityRow` union and the TUI `ActivityRow` enum: the same shape serves
@@ -469,13 +470,14 @@ impl TranscriptModel {
                     format!("mode switch to \"{mode_id}\" failed: {reason}"),
                 ))]
             }
-            Event::RateLimitAutoResumed { resets_at } => {
+            Event::RateLimitAutoResumed { resets_at, manual } => {
                 let group_id = self.fresh_group();
+                let how = if *manual { "resumed" } else { "auto-resumed" };
                 vec![self.append(TranscriptRow::new(
                     format!("notice-{seq}"),
                     group_id,
                     TranscriptRowKind::Notice,
-                    format!("auto-resumed at {resets_at} after rate-limit park"),
+                    format!("{how} at {resets_at} after rate-limit park"),
                 ))]
             }
             Event::ConversationSummary { text, .. } => {
@@ -921,7 +923,8 @@ mod tests {
     use crate::acp::approvals::Nonce;
     use crate::acp::elicitations::Elicitation;
     use crate::acp::elicitations::ElicitationOutcome;
-    use crate::acp::state::{DiffPreview, MemoryRecall, PromptAttachmentKind};
+    use crate::acp::state::{DiffPreview, MemoryRecall};
+    use crate::daemon::PromptAttachmentKind;
     use chrono::TimeZone;
 
     fn at(secs: i64) -> DateTime<Utc> {
@@ -1005,7 +1008,9 @@ mod tests {
             "auto-resumed at {} after rate-limit park",
             resets_at_fixture()
         );
-        let cases: [(&str, Event, &str); 4] = [
+        let expected_manual_resume =
+            format!("resumed at {} after rate-limit park", resets_at_fixture());
+        let cases: [(&str, Event, &str); 5] = [
             (
                 "startup",
                 Event::AgentStartupError {
@@ -1032,8 +1037,18 @@ mod tests {
                 "rate-limit resume",
                 Event::RateLimitAutoResumed {
                     resets_at: resets_at_fixture(),
+                    manual: false,
                 },
                 expected_resume.as_str(),
+            ),
+            (
+                "manual rate-limit resume: RESUME NOW is the user's own, \
+                 so the notice must not call it automatic (#3688)",
+                Event::RateLimitAutoResumed {
+                    resets_at: resets_at_fixture(),
+                    manual: true,
+                },
+                expected_manual_resume.as_str(),
             ),
         ];
         for (label, event, expected) in cases {
@@ -1758,6 +1773,7 @@ mod tests {
                 image: false,
                 audio: false,
                 embedded_context: false,
+                load_session: None,
                 steering: true,
             },
             prompt("read src/acp"),

@@ -72,6 +72,11 @@ pub(crate) fn resolve_client_ip(
 /// the local-TUI-to-local-daemon flow; remote callers proxied via a
 /// tunnel are unaffected because [`resolve_client_ip`] resolves them
 /// to the real remote IP, not loopback. See #1168.
+///
+/// That last clause holds only while the upstream sets those headers.
+/// [`passphrase_wall_entry_action`], which grants access on loopback
+/// alone, therefore drops the carve-out behind an external ingress.
+/// See #3843.
 fn is_local_trusted(client_ip: IpAddr) -> bool {
     client_ip.is_loopback()
 }
@@ -291,13 +296,13 @@ enum PassphraseWallEntryAction {
     /// `/login`, `/api/login`, static assets, etc. stay reachable
     /// even without a session.
     BypassExempt,
-    /// Caller is on loopback. fs-perm boundary on
-    /// `~/.agent-of-empires/serve.*` already protects same-host
-    /// access, so layering the passphrase factor on top adds friction
-    /// without strengthening the trust boundary. Mirrors the token-
-    /// auth path's `is_local_trusted` carve-out from #1168 so the
-    /// local TUI works against an `--auth=passphrase` daemon. See
-    /// #1525.
+    /// Caller is on loopback and no external ingress fronts the
+    /// daemon. fs-perm boundary on `~/.agent-of-empires/serve.*`
+    /// already protects same-host access, so layering the passphrase
+    /// factor on top adds friction without strengthening the trust
+    /// boundary. Mirrors the token-auth path's `is_local_trusted`
+    /// carve-out from #1168 so the local TUI works against an
+    /// `--auth=passphrase` daemon. See #1525.
     BypassLoopback,
     /// Run the full session + device-binding + elevation flow.
     Continue,
@@ -305,12 +310,19 @@ enum PassphraseWallEntryAction {
 
 /// Resolve the entry decision for `run_passphrase_wall`. Extracted so
 /// the bypass policy is table-testable without standing up the full
-/// axum middleware. See #1525.
-fn passphrase_wall_entry_action(path: &str, client_ip: IpAddr) -> PassphraseWallEntryAction {
+/// axum middleware. `behind_ingress` is `state.behind_tunnel`;
+/// `auth_middleware` withholds `LoopbackTrusted` under the same
+/// condition so elevation does not restore what this denies. See
+/// #1525 and #3843.
+fn passphrase_wall_entry_action(
+    path: &str,
+    client_ip: IpAddr,
+    behind_ingress: bool,
+) -> PassphraseWallEntryAction {
     if is_login_session_exempt(path) {
         return PassphraseWallEntryAction::BypassExempt;
     }
-    if is_local_trusted(client_ip) {
+    if !behind_ingress && is_local_trusted(client_ip) {
         return PassphraseWallEntryAction::BypassLoopback;
     }
     PassphraseWallEntryAction::Continue
@@ -551,10 +563,10 @@ pub(crate) async fn handler_elevated(
 /// mirrors the token-auth path's #1168 carve-out so the local TUI can
 /// attach to a same-host `--auth=passphrase` daemon without going
 /// through a passphrase exchange. The fs-perm boundary on
-/// `~/.agent-of-empires/serve.*` already protects same-host access,
-/// and remote callers proxied through a tunnel come in with the real
-/// remote IP via `resolve_client_ip`, so they still hit the wall as
-/// expected. See #1525.
+/// `~/.agent-of-empires/serve.*` already protects same-host access.
+/// Behind an external ingress a loopback peer may be proxied public
+/// traffic instead, so the carve-out is off there and the passphrase
+/// holds for everyone. See #1525 and #3843.
 ///
 /// Rate-limit lockout is intentionally not consulted here: the only
 /// authentication attempt that can fail in this path is the passphrase
@@ -572,7 +584,7 @@ async fn run_passphrase_wall(
     let path = request.uri().path().to_string();
     let method = request.method().clone();
 
-    match passphrase_wall_entry_action(&path, client_ip) {
+    match passphrase_wall_entry_action(&path, client_ip, state.behind_tunnel) {
         PassphraseWallEntryAction::BypassExempt => return next.run(request).await,
         PassphraseWallEntryAction::BypassLoopback => {
             log_loopback_bypass_passphrase(client_ip, &path);
@@ -660,7 +672,14 @@ pub async fn auth_middleware(
     // elevation gates see the #1168 carve-out no matter which path
     // (token, session, passphrase wall, loopback bypass) handled the
     // request. See `LoopbackTrusted`.
-    if is_local_trusted(client_ip) {
+    //
+    // Withheld wherever the passphrase wall itself stops trusting
+    // loopback, or a caller who signed in through the wall would keep
+    // the elevation carve-out the wall just denied them. See #3843.
+    let wall_covers_loopback = state.behind_tunnel
+        && state.token_manager.is_no_auth().await
+        && state.login_manager.is_enabled();
+    if !wall_covers_loopback && is_local_trusted(client_ip) {
         request.extensions_mut().insert(LoopbackTrusted);
     }
 
@@ -1223,15 +1242,15 @@ mod tests {
         // wall entirely. This is the #1525 fix: same-host TUI attach
         // must not require a passphrase exchange.
         assert_eq!(
-            passphrase_wall_entry_action("/api/sessions", loopback),
+            passphrase_wall_entry_action("/api/sessions", loopback, false),
             PassphraseWallEntryAction::BypassLoopback
         );
         assert_eq!(
-            passphrase_wall_entry_action("/sessions/abc/acp/ws", loopback),
+            passphrase_wall_entry_action("/sessions/abc/acp/ws", loopback, false),
             PassphraseWallEntryAction::BypassLoopback
         );
         assert_eq!(
-            passphrase_wall_entry_action("/api/settings", loopback_v6),
+            passphrase_wall_entry_action("/api/settings", loopback_v6, false),
             PassphraseWallEntryAction::BypassLoopback
         );
 
@@ -1239,26 +1258,46 @@ mod tests {
         // is the case the passphrase wall was built for; the bypass
         // must not leak through here.
         assert_eq!(
-            passphrase_wall_entry_action("/api/sessions", remote),
+            passphrase_wall_entry_action("/api/sessions", remote, false),
             PassphraseWallEntryAction::Continue
         );
         assert_eq!(
-            passphrase_wall_entry_action("/sessions/abc/acp/ws", remote),
+            passphrase_wall_entry_action("/sessions/abc/acp/ws", remote, false),
             PassphraseWallEntryAction::Continue
         );
 
         // Login-bootstrap allow-list wins regardless of IP, so the
         // SPA can pull assets and POST to `/api/login` from any peer.
         assert_eq!(
-            passphrase_wall_entry_action("/login", remote),
+            passphrase_wall_entry_action("/login", remote, false),
             PassphraseWallEntryAction::BypassExempt
         );
         assert_eq!(
-            passphrase_wall_entry_action("/api/login", remote),
+            passphrase_wall_entry_action("/api/login", remote, false),
             PassphraseWallEntryAction::BypassExempt
         );
         assert_eq!(
-            passphrase_wall_entry_action("/assets/index.css", loopback),
+            passphrase_wall_entry_action("/assets/index.css", loopback, false),
+            PassphraseWallEntryAction::BypassExempt
+        );
+
+        // #3843: behind an external ingress the loopback rows run the
+        // full session check. This is the reported bypass: with
+        // `--auth=passphrase --behind-proxy` and an upstream that does
+        // not set `X-Forwarded-For`, every internet request arrived as
+        // loopback and walked straight past the only gate.
+        assert_eq!(
+            passphrase_wall_entry_action("/api/sessions", loopback, true),
+            PassphraseWallEntryAction::Continue
+        );
+        assert_eq!(
+            passphrase_wall_entry_action("/sessions/abc/acp/ws", loopback_v6, true),
+            PassphraseWallEntryAction::Continue
+        );
+        // The login surfaces stay exempt, otherwise nobody could reach
+        // the wall to get past it.
+        assert_eq!(
+            passphrase_wall_entry_action("/api/login", loopback, true),
             PassphraseWallEntryAction::BypassExempt
         );
     }

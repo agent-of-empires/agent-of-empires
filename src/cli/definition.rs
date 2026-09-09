@@ -6,7 +6,6 @@
 use clap::{Parser, Subcommand};
 use clap_complete::Shell;
 
-#[cfg(feature = "serve")]
 use super::acp::AcpCommands;
 use super::add::AddArgs;
 use super::cityhall::CityHallCommands;
@@ -15,7 +14,6 @@ use super::group::GroupCommands;
 use super::init::InitArgs;
 use super::killall::KillallArgs;
 use super::list::ListArgs;
-#[cfg(feature = "serve")]
 use super::log_level::LogLevelArgs;
 use super::logs::LogsArgs;
 use super::mcp::McpCommands;
@@ -24,8 +22,8 @@ use super::profile::ProfileCommands;
 use super::project::ProjectCommands;
 use super::ps::PsArgs;
 use super::remove::RemoveArgs;
+use super::sandbox::SandboxCommands;
 use super::send::SendArgs;
-#[cfg(feature = "serve")]
 use super::serve::ServeArgs;
 use super::session::SessionCommands;
 use super::settings::SettingsCommands;
@@ -37,7 +35,6 @@ use super::theme::ThemeCommands;
 use super::tmux::TmuxCommands;
 use super::uninstall::UninstallArgs;
 use super::update::UpdateArgs;
-#[cfg(feature = "serve")]
 use super::url::UrlArgs;
 use super::worktree::WorktreeCommands;
 
@@ -53,7 +50,11 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
     Run without arguments to launch the TUI dashboard."
 )]
 pub struct Cli {
-    /// Profile to use (separate workspace with its own sessions)
+    /// Profile to use (separate workspace with its own sessions). Commands that
+    /// consume or create profile state require an existing profile: an unknown
+    /// name is refused, not created (make one with `aoe profile create`).
+    /// Profile-independent commands such as `list --all` and `serve --stop`
+    /// ignore it
     #[arg(short = 'p', long, global = true, env = "AGENT_OF_EMPIRES_PROFILE")]
     pub profile: Option<String>,
 
@@ -95,7 +96,6 @@ pub enum Commands {
     /// Pass a bare level (debug/info/...) for the safe expansion, or
     /// `--filter <expr>` for raw EnvFilter syntax. `--get` prints the
     /// current filter. Changes are ephemeral and lost on daemon restart.
-    #[cfg(feature = "serve")]
     LogLevel(LogLevelArgs),
 
     /// Remove a session
@@ -153,6 +153,12 @@ pub enum Commands {
         command: ProjectCommands,
     },
 
+    /// Inspect and reclaim per-session sandbox agent stores
+    Sandbox {
+        #[command(subcommand)]
+        command: SandboxCommands,
+    },
+
     /// Manage git worktrees for parallel development
     Worktree {
         #[command(subcommand)]
@@ -207,16 +213,14 @@ pub enum Commands {
         command: SkillCommands,
     },
 
-    /// Start a web dashboard for remote session access
-    #[cfg(feature = "serve")]
+    /// Start the aoe daemon: REST/WebSocket API, plus the web dashboard in
+    /// builds that embed it
     Serve(ServeArgs),
 
-    /// Print the current dashboard URL of a running `aoe serve` daemon
-    #[cfg(feature = "serve")]
+    /// Print the URL of a running `aoe serve` daemon
     Url(UrlArgs),
 
     /// Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...).
-    #[cfg(feature = "serve")]
     Acp {
         #[command(subcommand)]
         command: AcpCommands,
@@ -225,7 +229,6 @@ pub enum Commands {
     /// Internal: per-acp-worker shim spawned by `aoe serve`. Owns the
     /// agent subprocess and outlives the daemon so workers survive
     /// `aoe serve --stop`. Hidden from help.
-    #[cfg(feature = "serve")]
     #[command(name = "__acp-runner", hide = true)]
     AcpRunner(Box<crate::process::runner::AcpRunnerArgs>),
 
@@ -241,6 +244,13 @@ pub enum Commands {
     /// Update aoe to the latest release
     Update(UpdateArgs),
 
+    /// Run pending data migrations now, showing progress. A sandboxed session
+    /// moves its own agent store when it starts; use this to move every
+    /// eligible store at once instead. Trashed and archived sessions are
+    /// skipped; each moves when it is started, or restore or unarchive it
+    /// and run this again.
+    Migrate,
+
     /// Generate shell completions
     Completion {
         /// Shell to generate completions for
@@ -252,12 +262,9 @@ pub enum Commands {
 /// Every command name [`command_name`] can return, used as the closed
 /// allowlist when building the `cli_usage` telemetry event: any key loaded from
 /// a hand-edited or corrupt `telemetry.json` that is not in this set is dropped
-/// before sending, so the wire payload can only ever carry these tokens. The
-/// `serve` / `url` / `acp` / `log_level` names are listed unconditionally
-/// even though their variants are `serve`-feature-gated; in a TUI-only build
-/// those commands cannot run, so the extra allowlist entries are simply never
-/// matched. Keep in sync with [`command_name`]; the unit test asserts every
-/// `command_name` output is a member.
+/// before sending, so the wire payload can only ever carry these tokens. Keep
+/// in sync with [`command_name`]; the unit test asserts every `command_name`
+/// output is a member.
 pub const CLI_COMMAND_NAMES: &[&str] = &[
     "add",
     "agents",
@@ -275,6 +282,7 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
     "plugin",
     "profile",
     "project",
+    "sandbox",
     "worktree",
     "tmux",
     "sounds",
@@ -289,6 +297,7 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
     "acp",
     "uninstall",
     "update",
+    "migrate",
     "completion",
 ];
 
@@ -310,7 +319,6 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         Commands::List(_) => "list",
         Commands::Ps(_) => "ps",
         Commands::Logs(_) => "logs",
-        #[cfg(feature = "serve")]
         Commands::LogLevel(_) => "log_level",
         Commands::Remove(_) => "remove",
         Commands::Send(_) => "send",
@@ -323,6 +331,7 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         Commands::Plugin { .. } => "plugin",
         Commands::Profile { .. } => "profile",
         Commands::Project { .. } => "project",
+        Commands::Sandbox { .. } => "sandbox",
         Commands::Worktree { .. } => "worktree",
         Commands::Tmux { .. } => "tmux",
         Commands::Sounds { .. } => "sounds",
@@ -332,18 +341,15 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         Commands::Telemetry { .. } => "telemetry",
         Commands::Mcp { .. } => "mcp",
         Commands::Skill { .. } => "skill",
-        #[cfg(feature = "serve")]
         Commands::Serve(_) => "serve",
-        #[cfg(feature = "serve")]
         Commands::Url(_) => "url",
-        #[cfg(feature = "serve")]
         Commands::Acp { .. } => "acp",
         // Internal, machine-spawned commands: never a user action, never counted.
-        #[cfg(feature = "serve")]
         Commands::AcpRunner(_) => return None,
         Commands::ExtractSessionId(_) => return None,
         Commands::Uninstall(_) => "uninstall",
         Commands::Update(_) => "update",
+        Commands::Migrate => "migrate",
         Commands::Completion { .. } => "completion",
     })
 }
@@ -397,9 +403,9 @@ mod tests {
     /// nothing forces a matching `CLI_COMMAND_NAMES` entry. Without this guard a
     /// contributor could add a counted command and silently drop it from the
     /// `cli_usage` payload (`build_cli_usage` filters unknown keys). Assert every
-    /// visible clap subcommand is in the allowlist (subset direction: the
-    /// allowlist may carry extra `serve`-only names in a TUI-only build, which is
-    /// a harmless never-matched filter key). `log-level` maps to `log_level`.
+    /// visible clap subcommand is in the allowlist (subset direction: an
+    /// extra allowlist entry is a harmless never-matched filter key).
+    /// `log-level` maps to `log_level`.
     #[test]
     fn allowlist_covers_every_visible_subcommand() {
         use clap::CommandFactory;

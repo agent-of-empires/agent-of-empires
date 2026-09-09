@@ -154,7 +154,6 @@ mod tests {
         dir: &std::path::Path,
         prompt_delay_secs: u32,
     ) -> (std::path::PathBuf, std::path::PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
         let capture = dir.join("capture.ndjson");
         let script_path = dir.join("fake-compacting-agent.sh");
         let script = r#"#!/bin/sh
@@ -184,8 +183,6 @@ done
         .replace("__CAPTURE__", capture.to_str().expect("utf8 tmp path"))
         .replace("__DELAY__", &prompt_delay_secs.to_string());
         std::fs::write(&script_path, script).expect("write fake agent script");
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod fake agent script");
         (script_path, capture)
     }
 

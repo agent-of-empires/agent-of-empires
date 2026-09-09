@@ -42,7 +42,6 @@ import {
   STATE_TTL_MS,
   clearQueueCount,
   setQueueCount,
-  setRateLimit,
   type PersistedEntry,
 } from "../lib/acpStateStorage";
 import { getToken } from "../lib/token";
@@ -223,7 +222,6 @@ function persistState(sessionId: string, state: AcpState): void {
   } satisfies PersistedEntry);
   if (safeSetItem(key, body)) {
     setQueueCount(sessionId, state.queuedPrompts.length);
-    setRateLimit(sessionId, state.rateLimit);
     return;
   }
   // Storage write failed (likely QuotaExceeded). Evict a single oldest
@@ -233,7 +231,6 @@ function persistState(sessionId: string, state: AcpState): void {
   if (!evictOldestPersistedAcpState(key)) return;
   if (safeSetItem(key, body)) {
     setQueueCount(sessionId, state.queuedPrompts.length);
-    setRateLimit(sessionId, state.rateLimit);
   }
 }
 
@@ -933,7 +930,7 @@ export function useAcpSession(
    *  When not `"running"`, the drain effect parks queued prompts so they
    *  don't dispatch into a worker that isn't online yet. Defaults to
    *  `"running"` so non-structured view / pre-#1088 call sites keep working. */
-  workerState: "absent" | "resuming" | "running" = "running",
+  workerState: "absent" | "resuming" | "running" | "stopping" = "running",
   /** RFC3339 archived-at, or null. `sendPrompt` clears this server-side
    *  (via PATCH /api/sessions/{id}/archive) before enqueueing so the
    *  reconciler stops skipping the session and respawns the worker.
@@ -1668,7 +1665,9 @@ export function useAcpSession(
   }, [sessionId, fetchReplay, clearRetryTimers]);
 
   const resolveApproval = useCallback(
-    async (nonce: string, decision: ApprovalDecision) => {
+    // `optionId` answers with the agent's own option instead of letting
+    // the daemon pick by option kind.
+    async (nonce: string, decision: ApprovalDecision, optionId?: string) => {
       if (!sessionId) return;
       try {
         const res = await fetch(
@@ -1676,7 +1675,7 @@ export function useAcpSession(
           {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ decision }),
+            body: JSON.stringify(optionId === undefined ? { decision } : { decision, option_id: optionId }),
           },
         );
         const detail = res.ok ? "" : await safeText(res);
@@ -1928,12 +1927,15 @@ export function useAcpSession(
       // A transient 503 means the daemon accepted the request but its worker
       // did not come online within `send_prompt`'s wait window (#1748 / #1833).
       // The prompt is not on the queue (the daemon decided to send it), so
-      // enqueue it here or it is lost.
-      if (result.kind === "retryable_failure" && state.workerIdleStopped) {
+      // enqueue it here or it is lost. Both daemon-side states that answer
+      // "sent" for a session with no worker need this: the idle-dormant wake
+      // and the rate-limit redelivery-cap park, whose banner tells the user a
+      // fresh prompt is the recovery (#3688).
+      if (result.kind === "retryable_failure" && (state.workerIdleStopped || state.rateLimitRetriesExhausted)) {
         enqueueServer(text, attachments);
       }
     },
-    [sessionId, state.workerIdleStopped, dispatchPromptNow, enqueueServer],
+    [sessionId, state.workerIdleStopped, state.rateLimitRetriesExhausted, dispatchPromptNow, enqueueServer],
   );
 
   // Server-queue hydration. The daemon owns the queue and drains it (even
@@ -2212,7 +2214,7 @@ export function useAcpSession(
     status === "open" &&
     !state.workerStopped &&
     !state.workerRestarting &&
-    (workerState === "running" || state.workerIdleStopped);
+    (workerState === "running" || state.workerIdleStopped || state.rateLimitRetriesExhausted);
 
   // True when pressing "Send now" would interrupt a running, non-steerable turn
   // rather than send immediately, so the affordance can warn before it cancels
