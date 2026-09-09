@@ -230,6 +230,7 @@ impl Instance {
                 if recreate {
                     container.remove(false)?;
                 } else {
+                    container_config::place_shadowed_credential_mountpoints(&config);
                     container.start()?;
                     self.identity_publisher_launched = config.identity_publisher_installed
                         && identity_publisher_mount_matches(&container, &config)?
@@ -270,8 +271,8 @@ impl Instance {
                 .and_then(|sandbox| sandbox.container_workdir.as_deref()),
         );
         container.remove_stranded_named_ignore_volumes(&self.id, &stranded);
+        container_config::place_shadowed_credential_mountpoints(&config);
         let container_id = container.create(&config)?;
-        container_config::remove_shadowed_credential_copies(&config);
         self.identity_publisher_launched = config.identity_publisher_installed
             && identity_publisher_dependencies_available(&container)
             && self.hook_session_publisher_allowed_by_argv();
