@@ -708,8 +708,8 @@ fn send_message_drains_pending_paste_for_structured_view() {
         "pending_paste must be drained when routing to structured view"
     );
     assert_eq!(
-        env.view.pending_paste_for_structured_view,
-        Some((id, "cached text".to_string())),
+        env.view.pending_paste_for_structured_view.get(&id),
+        Some(&"cached text".to_string()),
         "drained text must land in pending_paste_for_structured_view, bound to the selected session"
     );
 }
@@ -726,19 +726,19 @@ fn send_message_merges_buffered_paste_for_same_session() {
     env.view.pending_paste = Some("second".to_string());
     env.view.handle_key(key(KeyCode::Char('m')), None);
     assert_eq!(
-        env.view.pending_paste_for_structured_view,
-        Some((id, "first second".to_string())),
+        env.view.pending_paste_for_structured_view.get(&id),
+        Some(&"first second".to_string()),
         "same-target paste must merge into the buffered text"
     );
 }
 
-/// A paste captured for a different structured session takes over the
-/// buffer: the earlier target can no longer drain (its open failed), and
-/// mixing the two texts would leak one session's draft into the other.
+/// A paste captured for another structured session gets its own entry: the
+/// earlier target's unsent draft survives (returning to it still drains),
+/// and mixing the two texts would leak one session's draft into the other.
 #[test]
 #[serial]
-fn send_message_replaces_buffered_paste_for_other_session() {
-    let (mut env, _id) = structured_session_env();
+fn send_message_keeps_buffered_paste_per_session() {
+    let (mut env, id_a) = structured_session_env();
     env.view.pending_paste = Some("session a draft".to_string());
     env.view.handle_key(key(KeyCode::Char('m')), None);
     let other = add_session(&mut env.view, "acp-two");
@@ -751,8 +751,13 @@ fn send_message_replaces_buffered_paste_for_other_session() {
     env.view.select_session_by_id(&other);
     env.view.handle_key(key(KeyCode::Char('m')), None);
     assert_eq!(
-        env.view.pending_paste_for_structured_view,
-        Some((other, "session b draft".to_string())),
-        "a different target must own the buffer outright"
+        env.view.pending_paste_for_structured_view.get(&other),
+        Some(&"session b draft".to_string()),
+        "the new target owns its own draft"
+    );
+    assert_eq!(
+        env.view.pending_paste_for_structured_view.get(&id_a),
+        Some(&"session a draft".to_string()),
+        "the previous target's unsent draft must survive the switch"
     );
 }

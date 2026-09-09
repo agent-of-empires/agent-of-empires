@@ -448,7 +448,11 @@ pub struct HomeView {
     /// `(session_id, text)`. Draining only feeds a mounted view whose session
     /// id matches, so a failed open on session A can never leak its text into
     /// session B's composer.
-    pub(super) pending_paste_for_structured_view: Option<(String, String)>,
+    /// Unsent paste drafts captured on 'm', keyed by the structured session
+    /// they were captured for. Drained into that session's composer when its
+    /// view mounts; entries for other targets survive, so a failed open is
+    /// recoverable by returning to the session.
+    pub(super) pending_paste_for_structured_view: HashMap<String, String>,
     /// Session to attach after the custom instruction warning dialog is dismissed
     pub(super) pending_attach_after_warning: Option<String>,
     /// Session to stop after the confirmation dialog is accepted

@@ -3151,25 +3151,22 @@ impl App {
     }
 
     /// Drain buffered paste text into the structured composer after the view
-    /// activates. The buffer is bound to the session it was captured for:
-    /// text only drains into a mounted view of that session, and it is kept
-    /// when there is no mounted view (activation failed) or the mounted view
-    /// belongs to another session, so the next 'm' press on the captured
-    /// session can still surface it.
+    /// activates. Drafts are keyed by their captured session: the mounted
+    /// view consumes its own entry on success, and entries for other targets
+    /// stay put, so a failed activation is recoverable by returning to that
+    /// session ('m' again).
     async fn drain_pending_paste_for_structured_view(&mut self) {
-        let Some((target, buf)) = self.home.pending_paste_for_structured_view.clone() else {
-            return;
-        };
-        let matches_mounted = self
+        let Some(mounted) = self
             .home
             .structured_preview
             .as_ref()
-            .is_some_and(|v| v.session_id() == target);
-        if !matches_mounted {
-            // Activation failed or the mounted view is another session's:
-            // keep the buffer for the captured session.
+            .map(|v| v.session_id().to_string())
+        else {
             return;
-        }
+        };
+        let Some(buf) = self.home.pending_paste_for_structured_view.remove(&mounted) else {
+            return;
+        };
         if let Some(view) = self.home.structured_preview.as_mut() {
             view.paste_text_with_file_load(&buf).await;
         }
