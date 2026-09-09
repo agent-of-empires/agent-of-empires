@@ -227,6 +227,20 @@
       ]
     },
     {
+      "id": "terminal.selection-hold",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": [
+        "src/components/__tests__/MobileLiveTerminal.selectionHold.test.tsx",
+        "tests/live-selection-hold.spec.ts"
+      ],
+      "components": [
+        "web/src/components/MobileLiveTerminal.tsx",
+        "web/src/hooks/useSelectionHold.ts",
+        "web/src/hooks/useTerminalGestureBoundary.ts"
+      ]
+    },
+    {
       "id": "terminal.mobile-ime-word-commit",
       "kind": "vitest",
       "risk": "medium",
