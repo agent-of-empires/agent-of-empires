@@ -790,15 +790,17 @@ fn read_credential_candidate(dir: &Path, name: &str, follow: SymlinkPolicy) -> O
     })
 }
 
-/// Which credentials a fold may put in the shared file.
+/// Which candidates a fold may put over a credential the shared file holds.
+/// The host file and the Keychain only ever seed a file holding none: a token
+/// copied from the host is the host's own refresh token, and the first side
+/// to refresh would log the other out.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum CredentialFold {
-    /// A come-up, create or start: the freshest candidate replaces what the
-    /// file holds.
+    /// A come-up, create or start: a fresher copy left in the store by an
+    /// earlier layout, a sandbox chain of its own, replaces what the file
+    /// holds.
     Freshest,
-    /// Off a come-up: a file holding a credential is left to the containers'
-    /// own rotation, so a fresher host token never re-couples them to the host
-    /// chain mid-session. Only a file holding none is seeded.
+    /// Off a come-up: nothing replaces what the file holds.
     SeedOnly,
 }
 
@@ -815,10 +817,9 @@ fn holds_credential(content: &str) -> bool {
 /// once a container mounting the shared file exists.
 ///
 /// Candidates are the store's private copy (left by the v027 move or by a
-/// login before the file was shared), the host file and the macOS Keychain;
-/// each replaces the current content only when its `expiresAt` is newer, so a
-/// login made inside a container survives a stale host copy and a host
-/// re-login reaches every container at its next start. Only the winner's
+/// login before the file was shared), the host file and the macOS Keychain,
+/// the freshest by `expiresAt` winning among those `fold` admits; see
+/// [`CredentialFold`]. Only the winner's
 /// `claudeAiOauth` replaces the file's, so what the agent keeps beside it
 /// survives. The file is written in place: a rename would leave every running
 /// container's bind mount on the old inode. An absent file is created
@@ -838,23 +839,20 @@ fn sync_shared_credential(
     };
     std::fs::create_dir_all(root)?;
 
+    // Each candidate with whether it is a sandbox chain of its own.
     let mut candidates = Vec::new();
-    candidates.extend(read_credential_candidate(
-        sandbox_dir,
-        name,
-        SymlinkPolicy::Never,
-    ));
-    candidates.extend(read_credential_candidate(
-        host_dir,
-        name,
-        SymlinkPolicy::Follow,
-    ));
+    candidates.extend(
+        read_credential_candidate(sandbox_dir, name, SymlinkPolicy::Never).map(|c| (c, true)),
+    );
+    candidates.extend(
+        read_credential_candidate(host_dir, name, SymlinkPolicy::Follow).map(|c| (c, false)),
+    );
     if let Some((service, _)) = mount
         .keychain_credential
         .filter(|(_, filename)| *filename == name)
     {
         match read_keychain_credential(service) {
-            Ok(content) => candidates.extend(content),
+            Ok(content) => candidates.extend(content.map(|c| (c, false))),
             Err(e) => tracing::warn!(target: "session.profile",
                 "Failed to read keychain credential for {}: {}", mount.host_rel, e),
         }
@@ -865,10 +863,12 @@ fn sync_shared_credential(
     // so another come-up or a container's own refresh in between is seen.
     crate::hooks::with_config_lock_policy(&shared, "lock", SymlinkPolicy::Never, || {
         let existing = read_credential_file(root, name, SymlinkPolicy::Never)?;
-        let replaceable =
-            fold == CredentialFold::Freshest || !existing.as_deref().is_some_and(holds_credential);
+        let existing_usable = existing.as_deref().is_some_and(holds_credential);
         let mut winner: Option<&str> = None;
-        for candidate in candidates.iter().filter(|_| replaceable) {
+        for (candidate, sandbox_chain) in &candidates {
+            if existing_usable && !(*sandbox_chain && fold == CredentialFold::Freshest) {
+                continue;
+            }
             let current = winner.or(existing.as_deref());
             if current.is_none_or(|current| should_overwrite_credential(current, candidate)) {
                 winner = Some(candidate);
@@ -4566,16 +4566,17 @@ mod tests {
         assert_eq!(fs::read_to_string(&shared).unwrap(), credential(100));
         assert!(!private.exists());
 
-        // A store with prior data still picks up a fresher host login.
+        // A fresher host login is the host's own chain: seeding it again
+        // would have the first side to refresh log the other out.
         fs::create_dir_all(store.join("projects")).unwrap();
         fs::write(host.join(".credentials.json"), credential(200)).unwrap();
         prepare();
-        assert_eq!(fs::read_to_string(&shared).unwrap(), credential(200));
+        assert_eq!(fs::read_to_string(&shared).unwrap(), credential(100));
 
-        // A stale host copy does not clobber a login made in a container.
-        fs::write(host.join(".credentials.json"), credential(150)).unwrap();
+        // Nor does a stale host copy clobber a login made in a container.
+        fs::write(host.join(".credentials.json"), credential(50)).unwrap();
         prepare();
-        assert_eq!(fs::read_to_string(&shared).unwrap(), credential(200));
+        assert_eq!(fs::read_to_string(&shared).unwrap(), credential(100));
 
         // A private copy left by the v027 move is folded in and left for a
         // container that still mounts only the store.
@@ -4617,9 +4618,10 @@ mod tests {
             );
         }
 
-        // A fresher host login waits for a come-up: between starts the file
-        // holds the containers' own rotation.
-        fs::write(host.join(".credentials.json"), credential(200)).unwrap();
+        // A fresher copy in the store, a sandbox chain of its own, waits for
+        // a come-up; a fresher host login never replaces what the file holds.
+        fs::write(host.join(".credentials.json"), credential(300)).unwrap();
+        fs::write(store.join(".credentials.json"), credential(200)).unwrap();
         prepare(CredentialFold::SeedOnly);
         assert_eq!(fs::read_to_string(&shared).unwrap(), credential(100));
         prepare(CredentialFold::Freshest);
