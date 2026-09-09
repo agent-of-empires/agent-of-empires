@@ -1022,8 +1022,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn orphaned_hook_agent_requires_env_and_executable_not_captured_sid() {
-        use std::os::unix::fs::PermissionsExt;
-
         let mut inst = Instance::new("orphan-env-agent", "/tmp/test");
         inst.id = format!("orphanboth{:012}", std::process::id());
         // Model a first hook publication or a later native rotation: this id is
@@ -1036,8 +1034,14 @@ mod tests {
         // under any other name, so the stand-in would die before the scan. The
         // sleep is short because it outlives the killed shell.
         std::fs::write(&agent, "#!/bin/sh\nsleep 10\n").unwrap();
-        std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let mut child = std::process::Command::new(&agent)
+        // Hand the stub to `sh` instead of exec'ing it: a concurrent spawn in
+        // this binary can fork between the write's open and close and hold a
+        // writable copy, which fails execve with ETXTBSY (#3861). `sh` only
+        // opens it for reading. The kernel rewrites a shebang exec into this
+        // same argv, so the executable needle still matches the `claude`
+        // token and the stub needs no exec bit.
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg(&agent)
             .env(crate::tmux::env::AOE_INSTANCE_ID_KEY, &inst.id)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
