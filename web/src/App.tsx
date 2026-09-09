@@ -882,6 +882,11 @@ function AppContent({
   const transitionKeyboardProxy = useCallback((nextSessionId: string | null) => {
     if (keyboardProxySessionIdRef.current === nextSessionId) return;
     keyboardProxySessionIdRef.current = nextSessionId;
+    // The retained intermediate syllable is a shadow of the old session's
+    // PTY edit. Carrying it into the new session would let the next
+    // deleteContentBackward delete that session's text before the
+    // replacement arrives, so the shadow is dropped with the receiver.
+    if (keyboardProxyRef.current) keyboardProxyRef.current.value = "";
     clearMobileKeyboardProxyInput();
   }, []);
 

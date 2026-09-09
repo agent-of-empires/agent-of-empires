@@ -88,4 +88,43 @@ test.describe("Live terminal IME syllable rewrite", () => {
     await expect(page.locator(INPUT)).toHaveValue("");
     await expect.poll(() => textBytes(handle, start), { timeout: 5_000 }).toBe("한\r");
   });
+
+  test("switching sessions drops the retained syllable instead of replaying it", async ({ page }) => {
+    const handle = await mockTerminalApis(page, { extraSessions: [{ id: "other", title: "other" }] });
+    await openSession(page, handle);
+
+    // A syllable mid-rewrite is retained in the shadow for the deletes to
+    // stay observable.
+    await softKey(page, "insertText", "ㅎ");
+    await expect(page.locator(INPUT)).toHaveValue("ㅎ");
+
+    // Selecting another session must drop that shadow with the receiver:
+    // replaying a delete against the new PTY would delete its prompt text
+    // before the replacement syllable arrives.
+    await openMobileSidebar(page);
+    await clickSidebarSession(page, "other");
+    await page.locator("[data-live-terminal]").waitFor({ state: "visible", timeout: 10_000 });
+    await expect(page.locator(INPUT)).toHaveValue("");
+  });
+
+  test("out-of-band toolbar input drops the retained syllable before the next rewrite", async ({ page }) => {
+    const handle = await mockTerminalApis(page);
+    await openSession(page, handle);
+
+    const start = handle.liveMessages.length;
+    await softKey(page, "insertText", "한");
+    await expect(page.locator(INPUT)).toHaveValue("한");
+
+    // Tab bypasses the shadow textarea: once it reaches the PTY the retained
+    // syllable no longer mirrors the line, so the next Korean keystroke must
+    // not rewrite the stale value as DEL + 하 over the cleared prompt.
+    await page.locator('button[aria-label="Tab"]').click();
+    await expect(page.locator(INPUT)).toHaveValue("");
+
+    // The rewrite re-arms from an empty shadow, mirroring the keyboard.
+    await softKey(page, "deleteContentBackward");
+    await softKey(page, "insertText", "하");
+    await expect(page.locator(INPUT)).toHaveValue("하");
+    await expect.poll(() => textBytes(handle, start), { timeout: 5_000 }).toBe("한\t\x7f하");
+  });
 });

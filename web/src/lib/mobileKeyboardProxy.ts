@@ -37,6 +37,15 @@ export function clearMobileKeyboardProxyInput() {
   pending = [];
 }
 
+/** Out-of-band terminal input (toolbar keys, hardware navigation) reaches
+ * the PTY without a `beforeinput` on the shadow textarea, so the retained
+ * intermediate syllable no longer mirrors the PTY line. Drop it, or the
+ * next Korean keystroke rewrites the stale value as `DEL + replacement`
+ * into whatever prompt the PTY now shows. */
+export function invalidateRetainedImeContext(target: HTMLTextAreaElement | null | undefined) {
+  if (target) target.value = "";
+}
+
 /** Translate a native `beforeinput` on a hidden terminal textarea into a
  * semantic soft-keyboard edit.
  *
