@@ -2716,12 +2716,13 @@ mod tests {
         }
     }
 
-    /// Direct, timing-based proof that `wait_until_ready` with a known
-    /// marker actually blocks until that marker appears, rather than
-    /// returning early on a merely-static pane -- the gap in the generic
-    /// content-settle fallback (a short "still loading" screen can look
-    /// "settled" long before the agent is really listening).
+    /// Direct proof that `wait_until_ready` with a known marker actually
+    /// blocks until that marker appears, rather than returning early on a
+    /// merely-static pane -- the gap in the generic content-settle fallback
+    /// (a "still loading" screen can look "settled" long before the agent is
+    /// really listening).
     #[test]
+    #[serial_test::serial]
     fn wait_until_ready_blocks_until_the_marker_appears() {
         if !tmux_available() {
             eprintln!("Skipping test: tmux not available");
@@ -2729,12 +2730,21 @@ mod tests {
         }
         let guard = TmuxTestSession::new("aoe_test_ready_marker");
         let name = guard.name().to_string();
-        // A short, static "booting" line appears immediately and would
-        // satisfy the generic settle heuristic well under 700ms; the real
-        // marker text only appears after the sleep. The trailing `set-option
-        // pane-base-index 0` chain mirrors `append_pane_base_index_args` so the
-        // `^.0` capture target resolves on hosts with `pane-base-index 1` set
-        // globally (#488, #2231).
+        let temp = tempfile::tempdir().expect("release tempdir");
+        let release = temp.path().join("release");
+        let quote =
+            |p: &std::path::Path| format!("'{}'", p.to_string_lossy().replace('\'', r#"'\''"#));
+        // The pane holds a screen the generic fallback would accept (over 20
+        // characters, unchanging) and prints the marker only once this test
+        // creates the release file, so the marker's arrival is caused here
+        // rather than timed against a sleep in the pane. The trailing
+        // `set-option pane-base-index 0` chain mirrors
+        // `append_pane_base_index_args` so the `^.0` capture target resolves
+        // on hosts with `pane-base-index 1` set globally (#488, #2231).
+        let script = format!(
+            "echo 'booting, please wait ...'; until [ -f {} ]; do sleep 0.02; done; echo 'ask anything...'; sleep 30",
+            quote(&release)
+        );
         let status = crate::tmux::tmux_command()
             .args([
                 "new-session",
@@ -2747,7 +2757,7 @@ mod tests {
                 "24",
                 "sh",
                 "-c",
-                "echo booting; sleep 0.7; echo 'ask anything...'; sleep 30",
+                &script,
                 ";",
                 "set-option",
                 "-t",
@@ -2760,19 +2770,73 @@ mod tests {
         assert!(status.success());
         refresh_session_cache();
 
+        /// Releases the pane on the way out, so an unwind inside the scope
+        /// below cannot leave the waiter forking against a killed session
+        /// until its budget expires.
+        struct ReleaseOnDrop<'a>(&'a std::path::Path);
+        impl Drop for ReleaseOnDrop<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::write(self.0, b"");
+            }
+        }
+
+        let (returned_tx, returned_rx) = std::sync::mpsc::channel();
         let session = Session::from_name(&name);
-        let start = std::time::Instant::now();
-        session.wait_until_ready(std::time::Duration::from_secs(3), Some("ask anything"));
-        let elapsed = start.elapsed();
+        // Observations are collected, not asserted, inside the scope, and the
+        // release runs on every path out of it, so no failure leaves the
+        // waiter forking against a killed session and the join stays prompt.
+        let (settled, last, premature, early, released) = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                // Only a failure deadline, and it has to dominate the
+                // sample-bounded window below: a budget the window can reach
+                // on a slow host would expire mid-window and read as the
+                // early return this test exists to catch.
+                Session::from_name(&name)
+                    .wait_until_ready(std::time::Duration::from_secs(60), Some("ask anything"));
+                let _ = returned_tx.send(());
+            });
+            let _release_on_unwind = ReleaseOnDrop(&release);
+            // Negative claim, so it needs a window: hold the settled markerless
+            // screen across several of the waiter's 200ms polls, which is the
+            // state an early return would key on. Bounded by sample count, not
+            // wall time, so a slow host lengthens the window the waiter has to
+            // survive instead of starving the loop of samples.
+            let mut settled = 0;
+            let mut last: Option<String> = None;
+            let mut premature = None;
+            for _ in 0..12 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let now = session.capture_pane(5).expect("capture pane");
+                if now.to_lowercase().contains("ask anything") {
+                    premature = Some(now.clone());
+                }
+                if now.trim().len() > 20 && last.as_deref() == Some(now.as_str()) {
+                    settled += 1;
+                }
+                last = Some(now);
+            }
+            let early = returned_rx.try_recv();
+            std::fs::write(&release, b"").expect("release the pane");
+            // Far above the ~200ms poll interval the marker path returns on,
+            // far below the waiter's budget, so this separates "the marker
+            // fired" from both "it idled" and "it gave up".
+            let released = returned_rx.recv_timeout(std::time::Duration::from_secs(2));
+            (settled, last, premature, early, released)
+        });
 
         assert!(
-            elapsed >= std::time::Duration::from_millis(600),
-            "returned before the marker could plausibly have appeared: {elapsed:?}"
+            premature.is_none(),
+            "the pane printed the marker before the test released it: {premature:?}"
         );
         assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "should have returned promptly once the marker appeared, not idled toward the bound: {elapsed:?}"
+            settled >= 2,
+            "pane never held a screen the settle fallback would accept: {last:?}"
         );
+        assert!(
+            matches!(early, Err(std::sync::mpsc::TryRecvError::Empty)),
+            "returned on the static screen, before the marker appeared"
+        );
+        released.expect("did not return promptly once the marker appeared");
     }
 
     #[test]

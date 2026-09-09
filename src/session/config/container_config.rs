@@ -12,6 +12,7 @@ use crate::containers::{ContainerConfig, EnvEntry, NamedVolumeMount, RunPolicy, 
 use crate::git::GitWorktree;
 use crate::session::config::VolumeIgnoresStrategy;
 
+use crate::hooks::SymlinkPolicy;
 use crate::session::environment::collect_environment;
 use crate::session::instance::SandboxInfo;
 
@@ -51,10 +52,14 @@ struct AgentConfigMount {
     /// Each (filename, content) pair is written to the sandbox dir root and mounted as
     /// a separate file at CONTAINER_HOME/filename (write-once).
     home_seed_files: &'static [(&'static str, &'static str)],
-    /// Files that should only be copied from the host if they don't already exist in the
-    /// sandbox. Protects credentials placed by the v002 migration or by in-container
-    /// authentication from being overwritten by stale host copies.
+    /// Files copied from the host only when the sandbox lacks them, so what the
+    /// container wrote survives a refresh.
     preserve_files: &'static [&'static str],
+    /// Credential files every sandbox of this agent shares as one file at the
+    /// store root, bind-mounted over the store's own path. The agent rotates
+    /// its refresh token on every refresh, so a per-store copy that misses a
+    /// rotation is logged out. See [`sync_shared_credential`].
+    shared_credential_files: &'static [&'static str],
     /// Files to delete from the sandbox dir before each launch. Prevents stale state
     /// (e.g. leftover lock/cache files) from causing failures when the container image
     /// is updated. Do NOT use this for sandbox-owned session state (e.g. opencode's
@@ -76,8 +81,8 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         // is copied as a top-level file, so without the scripts it points at, every
         // referenced hook errors in-container ("No such file or directory"). See #3014.
         copy_dirs: &["plugins", "skills", "hooks"],
-        // On macOS, OAuth tokens live in the Keychain. Extract and write as .credentials.json
-        // so the container can authenticate without re-login.
+        // On macOS the OAuth token lives in the Keychain; it seeds the shared
+        // .credentials.json so the container authenticates without re-login.
         keychain_credential: Some(("Claude Code-credentials", ".credentials.json")),
         // Claude Code reads ~/.claude.json (home level, NOT inside ~/.claude/) for onboarding
         // state. Seeding hasCompletedOnboarding skips the first-run wizard.
@@ -92,7 +97,8 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
             (".claude.json", r#"{"hasCompletedOnboarding":true}"#),
             (".sandbox-gitconfig", SANDBOX_GITCONFIG_SEED),
         ],
-        preserve_files: &[".credentials.json", "history.jsonl"],
+        preserve_files: &["history.jsonl"],
+        shared_credential_files: &[".credentials.json"],
         clean_files: &[],
     },
     AgentConfigMount {
@@ -117,6 +123,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         keychain_credential: None,
         home_seed_files: &[],
         preserve_files: &[],
+        shared_credential_files: &[],
         clean_files: &[],
     },
     AgentConfigMount {
@@ -129,6 +136,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         keychain_credential: None,
         home_seed_files: &[],
         preserve_files: &[],
+        shared_credential_files: &[],
         clean_files: &[],
     },
     AgentConfigMount {
@@ -141,6 +149,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         keychain_credential: None,
         home_seed_files: &[],
         preserve_files: &[],
+        shared_credential_files: &[],
         clean_files: &[],
     },
     AgentConfigMount {
@@ -153,6 +162,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         keychain_credential: None,
         home_seed_files: &[],
         preserve_files: &[],
+        shared_credential_files: &[],
         clean_files: &[],
     },
     AgentConfigMount {
@@ -165,6 +175,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         keychain_credential: None,
         home_seed_files: &[],
         preserve_files: &[],
+        shared_credential_files: &[],
         clean_files: &[],
     },
     AgentConfigMount {
@@ -177,6 +188,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         keychain_credential: None,
         home_seed_files: &[],
         preserve_files: &[],
+        shared_credential_files: &[],
         clean_files: &[],
     },
     AgentConfigMount {
@@ -189,6 +201,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         keychain_credential: None,
         home_seed_files: &[],
         preserve_files: &[],
+        shared_credential_files: &[],
         clean_files: &[],
     },
     AgentConfigMount {
@@ -201,6 +214,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         keychain_credential: None,
         home_seed_files: &[],
         preserve_files: &[],
+        shared_credential_files: &[],
         clean_files: &[],
     },
     AgentConfigMount {
@@ -213,6 +227,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         keychain_credential: None,
         home_seed_files: &[],
         preserve_files: &[],
+        shared_credential_files: &[],
         clean_files: &[],
     },
     AgentConfigMount {
@@ -241,6 +256,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         // on every session, but we preserve it in case the user has
         // additional approvals beyond the AoE-managed ones.
         preserve_files: &["shell-hooks-allowlist.json"],
+        shared_credential_files: &[],
         clean_files: &[],
     },
     AgentConfigMount {
@@ -253,6 +269,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         keychain_credential: None,
         home_seed_files: &[],
         preserve_files: &[],
+        shared_credential_files: &[],
         clean_files: &[],
     },
     AgentConfigMount {
@@ -265,6 +282,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         keychain_credential: None,
         home_seed_files: &[],
         preserve_files: &[],
+        shared_credential_files: &[],
         clean_files: &[],
     },
     AgentConfigMount {
@@ -277,6 +295,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         keychain_credential: None,
         home_seed_files: &[],
         preserve_files: &[],
+        shared_credential_files: &[],
         clean_files: &[],
     },
     AgentConfigMount {
@@ -289,6 +308,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         keychain_credential: None,
         home_seed_files: &[],
         preserve_files: &["antigravity-oauth-token"],
+        shared_credential_files: &[],
         clean_files: &[],
     },
     AgentConfigMount {
@@ -303,6 +323,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         keychain_credential: None,
         home_seed_files: &[],
         preserve_files: &[],
+        shared_credential_files: &[],
         clean_files: &[],
     },
     AgentConfigMount {
@@ -320,6 +341,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         keychain_credential: None,
         home_seed_files: &[],
         preserve_files: &[],
+        shared_credential_files: &[],
         clean_files: &[],
     },
 ];
@@ -348,8 +370,8 @@ fn sync_agent_config(
 
     // If the sandbox already has a "projects/" subdirectory, a prior container
     // session ran and created state we must not overwrite (e.g. settings.json,
-    // statsig/, session metadata). Only seed files, copy_dirs, and keychain
-    // credentials are still synced; the general top-level file copy is skipped.
+    // statsig/, session metadata). Only seed files, copy_dirs and shared
+    // credential files are still synced; the general top-level file copy is skipped.
     //
     // Why "projects/"? Claude Code creates this directory on first run to store
     // per-project session data. Its presence reliably indicates the container
@@ -632,19 +654,36 @@ fn copy_dir_recursive_inner(
 
 /// Parse the `expiresAt` timestamp from a Claude Code credential JSON string.
 /// Returns `None` if the JSON is malformed or the field is missing/wrong type.
-#[cfg(any(target_os = "macos", test))]
 fn parse_credential_expires_at(content: &str) -> Option<u64> {
     let value: serde_json::Value = serde_json::from_str(content).ok()?;
     value.get("claudeAiOauth")?.get("expiresAt")?.as_u64()
 }
 
+/// The furthest `expiresAt` a real token carries. The shared file is writable
+/// from inside every sandbox, so a planted timestamp beyond this would
+/// otherwise outrank every later login for good.
+const CREDENTIAL_EXPIRY_HORIZON: std::time::Duration =
+    std::time::Duration::from_secs(400 * 24 * 60 * 60);
+
+fn plausible_credential_expires_at(content: &str, now_ms: u64) -> Option<u64> {
+    parse_credential_expires_at(content).filter(|expires_at| {
+        *expires_at <= now_ms.saturating_add(CREDENTIAL_EXPIRY_HORIZON.as_millis() as u64)
+    })
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
 /// Decide whether an incoming credential should overwrite the existing one,
 /// based on `expiresAt` timestamps. Returns `true` if the incoming credential
 /// should be written.
-#[cfg(any(target_os = "macos", test))]
 fn should_overwrite_credential(existing_content: &str, incoming_content: &str) -> bool {
-    let existing_exp = parse_credential_expires_at(existing_content);
-    let incoming_exp = parse_credential_expires_at(incoming_content);
+    let now = now_ms();
+    let existing_exp = plausible_credential_expires_at(existing_content, now);
+    let incoming_exp = plausible_credential_expires_at(incoming_content, now);
 
     match (existing_exp, incoming_exp) {
         (Some(existing), Some(incoming)) => incoming > existing,
@@ -653,10 +692,10 @@ fn should_overwrite_credential(existing_content: &str, incoming_content: &str) -
     }
 }
 
-/// Extract credentials from the macOS Keychain and write to a file.
-/// Returns Ok(true) if credentials were written, Ok(false) if not available.
+/// Read a credential from the macOS Keychain. `None` when there is no usable
+/// entry.
 #[cfg(target_os = "macos")]
-fn extract_keychain_credential(service: &str, dest: &Path) -> Result<bool> {
+fn read_keychain_credential(service: &str) -> Result<Option<String>> {
     use std::process::Command;
 
     let user = std::env::var("USER").unwrap_or_default();
@@ -695,7 +734,7 @@ fn extract_keychain_credential(service: &str, dest: &Path) -> Result<bool> {
                 stderr.trim()
             );
         }
-        return Ok(false);
+        return Ok(None);
     }
 
     let content = String::from_utf8_lossy(&output.stdout);
@@ -705,35 +744,197 @@ fn extract_keychain_credential(service: &str, dest: &Path) -> Result<bool> {
             "Keychain entry for service '{}' exists but has empty content",
             service
         );
-        return Ok(false);
+        return Ok(None);
     }
-
-    // Only overwrite if the keychain credential is fresher than what the sandbox already has.
-    if dest.exists() {
-        if let Ok(existing_content) = std::fs::read_to_string(dest) {
-            if !should_overwrite_credential(&existing_content, trimmed) {
-                tracing::debug!(target: "session.profile",
-                    "Keychain credential for '{}' is not fresher than sandbox, keeping sandbox",
-                    service,
-                );
-                return Ok(false);
-            }
-        }
-    }
-
-    std::fs::write(dest, trimmed)?;
-    tracing::debug!(target: "session.profile",
-        "Extracted keychain credential for '{}' -> {}",
-        service,
-        dest.display()
-    );
-    Ok(true)
+    Ok(Some(trimmed.to_string()))
 }
 
 #[cfg(not(target_os = "macos"))]
-fn extract_keychain_credential(_service: &str, _dest: &Path) -> Result<bool> {
-    Ok(false)
+fn read_keychain_credential(_service: &str) -> Result<Option<String>> {
+    Ok(None)
 }
+
+/// The shared credential file for the store root `sandbox_dir` sits under, or
+/// `None` for the legacy single shared store, whose parent is the host config.
+fn shared_credential_path(sandbox_dir: &Path, name: &str) -> Option<PathBuf> {
+    let root = sandbox_dir.parent()?;
+    (root.file_name()? == SANDBOX_PRIVATE_SUBDIR).then(|| root.join(name))
+}
+
+/// A file's content, or `None` when it is absent, empty (the placeholder a
+/// runtime leaves under a file mount) or not a plain file. A plain file that
+/// cannot be read is an error, never `None`: the caller would take absence as
+/// leave to write over it. The store is container-writable, so a link planted
+/// there is not followed; the host file is the user's own.
+fn read_credential_file(dir: &Path, name: &str, follow: SymlinkPolicy) -> Result<Option<String>> {
+    let path = dir.join(name);
+    if let Some(content) = follow.read(&path)? {
+        return Ok(Some(content).filter(|content| !content.trim().is_empty()));
+    }
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() => {
+            anyhow::bail!("{} exists but could not be read", path.display())
+        }
+        Ok(_) => Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("inspecting {}", path.display())),
+    }
+}
+
+/// A candidate that cannot be read is skipped; the file it would replace is
+/// still the one every sandbox mounts.
+fn read_credential_candidate(dir: &Path, name: &str, follow: SymlinkPolicy) -> Option<String> {
+    read_credential_file(dir, name, follow).unwrap_or_else(|e| {
+        tracing::warn!(target: "session.profile", "Skipping credential candidate: {}", e);
+        None
+    })
+}
+
+/// Fold the freshest credential into the file every store of this agent
+/// mounts. This is a come-up fold rather than a migration because a container
+/// built before the file was shared keeps refreshing its store copy while it
+/// runs, so which copy is freshest is only known at come-up. That copy is left
+/// for such a container; [`remove_shadowed_credential_copies`] drops it once a
+/// container mounting the shared file exists.
+///
+/// Candidates are the store's private copy (left by the v027 move or by a
+/// login before the file was shared), the host file and the macOS Keychain;
+/// each replaces the current content only when its `expiresAt` is newer, so a
+/// login made inside a container survives a stale host copy and a host
+/// re-login reaches every container at its next start. Only the winner's
+/// `claudeAiOauth` replaces the file's, so what the agent keeps beside it
+/// survives. The file is written in place: a rename would leave every running
+/// container's bind mount on the old inode. An absent file is created
+/// empty-but-valid so the mount has a source; the agent's own login fills it.
+fn sync_shared_credential(
+    mount: &AgentConfigMount,
+    host_dir: &Path,
+    sandbox_dir: &Path,
+    name: &str,
+) -> Result<Option<PathBuf>> {
+    let Some(shared) = shared_credential_path(sandbox_dir, name) else {
+        return Ok(None);
+    };
+    let Some(root) = shared.parent() else {
+        return Ok(None);
+    };
+    std::fs::create_dir_all(root)?;
+
+    let mut candidates = Vec::new();
+    candidates.extend(read_credential_candidate(
+        sandbox_dir,
+        name,
+        SymlinkPolicy::Never,
+    ));
+    candidates.extend(read_credential_candidate(
+        host_dir,
+        name,
+        SymlinkPolicy::Follow,
+    ));
+    if let Some((service, _)) = mount
+        .keychain_credential
+        .filter(|(_, filename)| *filename == name)
+    {
+        match read_keychain_credential(service) {
+            Ok(content) => candidates.extend(content),
+            Err(e) => tracing::warn!(target: "session.profile",
+                "Failed to read keychain credential for {}: {}", mount.host_rel, e),
+        }
+    }
+
+    // The candidates are gathered outside the lock (the Keychain read is a
+    // subprocess); the file is read again under it, right before the write,
+    // so another come-up or a container's own refresh in between is seen.
+    crate::hooks::with_config_lock_policy(&shared, "lock", SymlinkPolicy::Never, || {
+        let existing = read_credential_file(root, name, SymlinkPolicy::Never)?;
+        let mut winner: Option<&str> = None;
+        for candidate in &candidates {
+            let current = winner.or(existing.as_deref());
+            if current.is_none_or(|current| should_overwrite_credential(current, candidate)) {
+                winner = Some(candidate);
+            }
+        }
+        match (existing.as_deref(), winner) {
+            (None, None) => write_credential_in_place(&shared, "{}"),
+            (_, None) => Ok(()),
+            (existing, Some(winner)) => {
+                write_credential_in_place(&shared, &merge_credential(existing, winner))
+            }
+        }
+    })?;
+    Ok(Some(shared))
+}
+
+/// `winner` with everything `existing` held beside `claudeAiOauth` kept, so a
+/// host copy that wins on expiry does not drop what the agent stored in the
+/// file inside a container. Anything that is not two JSON objects is replaced
+/// whole.
+fn merge_credential(existing: Option<&str>, winner: &str) -> String {
+    let parsed = |content: &str| {
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(content).ok()
+    };
+    let merged = existing.and_then(parsed).and_then(|mut merged| {
+        let oauth = parsed(winner)?.remove("claudeAiOauth")?;
+        merged.insert("claudeAiOauth".to_string(), oauth);
+        serde_json::to_string(&merged).ok()
+    });
+    merged.unwrap_or_else(|| winner.to_string())
+}
+
+/// Drop each store's own copy of a credential the container mounts the shared
+/// file over. Runs once the container exists: one built before the file was
+/// shared reads that copy instead, and is recreated rather than stripped.
+pub(crate) fn remove_shadowed_credential_copies(config: &ContainerConfig) {
+    let volume_at = |target: &Path| {
+        config
+            .volumes
+            .iter()
+            .find(|volume| Path::new(&volume.container_path) == target)
+    };
+    for container_path in &config.shared_credential_mounts {
+        let path = Path::new(container_path);
+        let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+            continue;
+        };
+        let (Some(shared), Some(store)) = (volume_at(path), volume_at(dir)) else {
+            continue;
+        };
+        // Only a store beside the shared file holds a shadowed copy. A user
+        // extra_volumes entry at the config path replaces the store mount, and
+        // the credential under it is the user's own login.
+        if Path::new(&store.host_path).parent() != Path::new(&shared.host_path).parent() {
+            continue;
+        }
+        let copy = Path::new(&store.host_path).join(name);
+        match std::fs::remove_file(&copy) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(target: "session.profile",
+                "Failed to remove shadowed credential copy {}: {}", copy.display(), e),
+        }
+    }
+}
+
+/// Write in place, never rename: containers bind-mount this inode. The new
+/// content lands before the old tail is cut, so a concurrent reader never
+/// sees an empty file.
+fn write_credential_in_place(path: &Path, content: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("opening shared credential {}", path.display()))?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(content.as_bytes())
+        .and_then(|()| file.set_len(content.len() as u64))
+        .with_context(|| format!("writing shared credential {}", path.display()))
+}
+
 /// Return a sandbox config path. A supplied instance ID creates the physically
 /// isolated store mounted into that pane; no live conversation store is shared.
 fn sandbox_dir_for(
@@ -949,10 +1150,16 @@ fn prepare_sandbox_dir_from(
             None
         };
 
+        let skip_entries: Vec<&str> = mount
+            .skip_entries
+            .iter()
+            .chain(mount.shared_credential_files)
+            .copied()
+            .collect();
         sync_agent_config(
             &host_dir,
             &sandbox_dir,
-            mount.skip_entries,
+            &skip_entries,
             mount.seed_files,
             mount.copy_dirs,
             mount.preserve_files,
@@ -987,18 +1194,15 @@ fn prepare_sandbox_dir_from(
                 );
             }
         }
-
-        if let Some((service, filename)) = mount.keychain_credential {
-            if let Err(e) = extract_keychain_credential(service, &sandbox_dir.join(filename)) {
-                tracing::warn!(target: "session.profile",
-                    "Failed to extract keychain credential for {}: {}",
-                    mount.host_rel,
-                    e
-                );
-            }
-        }
     } else {
         std::fs::create_dir_all(&sandbox_dir)?;
+    }
+
+    for &name in mount.shared_credential_files {
+        if let Err(e) = sync_shared_credential(mount, &host_dir, &sandbox_dir, name) {
+            tracing::warn!(target: "session.profile",
+                "Failed to sync shared credential {} for {}: {}", name, mount.host_rel, e);
+        }
     }
 
     for &(filename, content) in mount.home_seed_files {
@@ -2021,6 +2225,7 @@ pub(crate) fn build_container_config(
         profile_session_config.agent_config_dir_for(agent_selection.tool, &home);
     // Agent definitions are in AGENT_CONFIG_MOUNTS. Add new agents there.
     let mut active_sandbox_config: Option<(&AgentConfigMount, PathBuf)> = None;
+    let mut shared_credential_mounts = Vec::new();
     let mut identity_publisher_installed = false;
     let mut identity_publisher_path: Option<(PathBuf, String)> = None;
     let mut identity_output_path: Option<(PathBuf, String)> = None;
@@ -2058,6 +2263,20 @@ pub(crate) fn build_container_config(
             sandbox_dir.display(),
             container_path
         );
+        for &name in mount.shared_credential_files {
+            let Some(shared) = shared_credential_path(&sandbox_dir, name) else {
+                continue;
+            };
+            if shared.is_file() {
+                let container_path = format!("{container_path}/{name}");
+                shared_credential_mounts.push(container_path.clone());
+                volumes.push(VolumeMount {
+                    host_path: shared.to_string_lossy().to_string(),
+                    container_path,
+                    read_only: false,
+                });
+            }
+        }
         volumes.push(VolumeMount {
             host_path: sandbox_dir.to_string_lossy().to_string(),
             container_path,
@@ -2419,6 +2638,7 @@ pub(crate) fn build_container_config(
         network: sanitize_network(sandbox_config.network.as_deref()),
         selinux_relabel: sandbox_config.selinux_relabel,
         identity_publisher_installed,
+        shared_credential_mounts,
         run_policy: RunPolicy {
             privileged: sandbox_config.privileged,
             cap_add: sandbox_config.cap_add.clone(),
@@ -4110,6 +4330,224 @@ mod tests {
     fn test_should_overwrite_when_only_keychain_parseable() {
         let keychain = r#"{"claudeAiOauth":{"expiresAt":1000}}"#;
         assert!(should_overwrite_credential("not-json", keychain));
+    }
+
+    fn credential(expires_at: u64) -> String {
+        format!(r#"{{"claudeAiOauth":{{"expiresAt":{expires_at}}}}}"#)
+    }
+
+    #[test]
+    fn an_unreadable_shared_file_is_never_overwritten() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = TempDir::new().unwrap();
+        let host = home.path().join(".claude");
+        let mount = claude_mount_without_keychain();
+        let store = host.join(SANDBOX_PRIVATE_SUBDIR).join("aaaaaaaaaaaaaaaa");
+        let shared = host.join(SANDBOX_PRIVATE_SUBDIR).join(".credentials.json");
+        fs::create_dir_all(&store).unwrap();
+        // A failed sync is logged and the launch goes on; the file must be
+        // left exactly as it was.
+        let prepare =
+            || prepare_sandbox_dir_from(&mount, host.clone(), store.clone(), home.path()).unwrap();
+
+        // Root reads a write-only file regardless, so the case cannot fail there.
+        if !nix::unistd::geteuid().is_root() {
+            fs::write(&shared, credential(5)).unwrap();
+            fs::set_permissions(&shared, fs::Permissions::from_mode(0o200)).unwrap();
+            prepare();
+            fs::set_permissions(&shared, fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(fs::read_to_string(&shared).unwrap(), credential(5));
+            fs::remove_file(&shared).unwrap();
+        }
+
+        // A path that is not a plain file is not seeded over either.
+        fs::create_dir(&shared).unwrap();
+        prepare();
+        assert!(shared.is_dir());
+    }
+
+    #[test]
+    fn an_implausible_expiry_never_outranks_a_real_one() {
+        let far = credential(now_ms() + 2 * CREDENTIAL_EXPIRY_HORIZON.as_millis() as u64);
+        let real = credential(now_ms());
+        assert!(!should_overwrite_credential(&real, &far));
+        assert!(should_overwrite_credential(&far, &real));
+    }
+
+    #[test]
+    fn merge_keeps_what_the_file_held_beside_the_oauth_token() {
+        let existing = r#"{"claudeAiOauth":{"expiresAt":1},"designOauth":{"k":"v"}}"#;
+        let winner = r#"{"claudeAiOauth":{"expiresAt":2}}"#;
+        let merged: serde_json::Value =
+            serde_json::from_str(&merge_credential(Some(existing), winner)).unwrap();
+        assert_eq!(merged["claudeAiOauth"]["expiresAt"], 2);
+        assert_eq!(merged["designOauth"]["k"], "v");
+        assert_eq!(merge_credential(Some("{}"), winner), winner);
+        assert_eq!(merge_credential(Some("not json"), winner), winner);
+        assert_eq!(merge_credential(None, winner), winner);
+    }
+
+    /// The Claude mount without its Keychain source, so a developer's own
+    /// login never reaches the assertions on macOS.
+    fn claude_mount_without_keychain() -> AgentConfigMount {
+        AgentConfigMount {
+            tool_name: "claude",
+            host_rel: ".claude",
+            container_suffix: ".claude",
+            skip_entries: &["sandbox", "projects"],
+            seed_files: &[],
+            copy_dirs: &[],
+            keychain_credential: None,
+            home_seed_files: &[],
+            preserve_files: &["history.jsonl"],
+            shared_credential_files: &[".credentials.json"],
+            clean_files: &[],
+        }
+    }
+
+    #[test]
+    fn shared_credential_follows_the_freshest_copy_across_starts() {
+        let home = TempDir::new().unwrap();
+        let host = home.path().join(".claude");
+        fs::create_dir_all(&host).unwrap();
+        let mount = claude_mount_without_keychain();
+        let root = host.join(SANDBOX_PRIVATE_SUBDIR);
+        let store = root.join("aaaaaaaaaaaaaaaa");
+        let shared = root.join(".credentials.json");
+        let private = store.join(".credentials.json");
+        let prepare =
+            || prepare_sandbox_dir_from(&mount, host.clone(), store.clone(), home.path()).unwrap();
+
+        // Nothing to seed: the mount source still has to exist.
+        prepare();
+        assert_eq!(fs::read_to_string(&shared).unwrap(), "{}");
+        assert!(!private.exists());
+
+        // A host login reaches the shared file and never the store.
+        fs::write(host.join(".credentials.json"), credential(100)).unwrap();
+        prepare();
+        assert_eq!(fs::read_to_string(&shared).unwrap(), credential(100));
+        assert!(!private.exists());
+
+        // A store with prior data still picks up a fresher host login.
+        fs::create_dir_all(store.join("projects")).unwrap();
+        fs::write(host.join(".credentials.json"), credential(200)).unwrap();
+        prepare();
+        assert_eq!(fs::read_to_string(&shared).unwrap(), credential(200));
+
+        // A stale host copy does not clobber a login made in a container.
+        fs::write(host.join(".credentials.json"), credential(150)).unwrap();
+        prepare();
+        assert_eq!(fs::read_to_string(&shared).unwrap(), credential(200));
+
+        // A private copy left by the v027 move is folded in and left for a
+        // container that still mounts only the store.
+        fs::write(&private, credential(300)).unwrap();
+        prepare();
+        assert_eq!(fs::read_to_string(&shared).unwrap(), credential(300));
+        assert_eq!(fs::read_to_string(&private).unwrap(), credential(300));
+
+        // The empty placeholder a runtime creates for the file mount is ignored.
+        fs::write(&private, "").unwrap();
+        prepare();
+        assert_eq!(fs::read_to_string(&shared).unwrap(), credential(300));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn claude_sandboxes_share_one_credential_mount() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let host = temp_home.path().join(".claude");
+        fs::create_dir_all(&host).unwrap();
+        // Beats any real credential the macOS Keychain contributes while
+        // staying inside the horizon a real token can carry.
+        let cred = credential(now_ms() + 300 * 24 * 60 * 60 * 1000);
+        fs::write(host.join(".credentials.json"), &cred).unwrap();
+
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+        let sandbox_info = crate::session::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
+        let shared = host.join(SANDBOX_PRIVATE_SUBDIR).join(".credentials.json");
+        for instance_id in ["shared-cred-a", "shared-cred-b"] {
+            let store = host.join(SANDBOX_PRIVATE_SUBDIR).join(instance_id);
+            // A copy the v027 move left behind, folded in and shadowed.
+            fs::create_dir_all(&store).unwrap();
+            fs::write(store.join(".credentials.json"), credential(1)).unwrap();
+            let config = build_container_config(
+                project_dir.path().to_str().unwrap(),
+                &sandbox_info,
+                ContainerAgentSelection::new("claude", None),
+                false,
+                instance_id,
+                None,
+                "",
+            )
+            .unwrap();
+            let mount = config
+                .volumes
+                .iter()
+                .find(|v| v.container_path == "/root/.claude/.credentials.json")
+                .expect("credential file mount");
+            assert_eq!(mount.host_path, shared.to_string_lossy());
+            assert!(!mount.read_only);
+            assert_eq!(
+                config.shared_credential_mounts,
+                vec!["/root/.claude/.credentials.json".to_string()]
+            );
+            assert!(store.join(".credentials.json").exists());
+            remove_shadowed_credential_copies(&config);
+            assert!(!store.join(".credentials.json").exists());
+            crate::hooks::cleanup_hook_status_dir(instance_id);
+        }
+        assert_eq!(fs::read_to_string(&shared).unwrap(), cred);
+    }
+
+    #[test]
+    fn shadowed_credential_copy_is_removed_only_from_a_store() {
+        let home = TempDir::new().unwrap();
+        let host = home.path().join(".claude");
+        let root = host.join(SANDBOX_PRIVATE_SUBDIR);
+        let store = root.join("aaaaaaaaaaaaaaaa");
+        let shared = root.join(".credentials.json");
+        fs::create_dir_all(&store).unwrap();
+        fs::write(&shared, "{}").unwrap();
+        let config_for = |dir: &Path| ContainerConfig {
+            shared_credential_mounts: vec!["/root/.claude/.credentials.json".to_string()],
+            volumes: vec![
+                VolumeMount {
+                    host_path: shared.to_string_lossy().to_string(),
+                    container_path: "/root/.claude/.credentials.json".to_string(),
+                    read_only: false,
+                },
+                VolumeMount {
+                    host_path: dir.to_string_lossy().to_string(),
+                    container_path: "/root/.claude".to_string(),
+                    read_only: false,
+                },
+            ],
+            ..Default::default()
+        };
+        // A user extra_volumes entry at the config path replaces the store
+        // mount; its host copy is the user's own login, not a shadowed one.
+        for (dir, removed) in [(&store, true), (&host, false)] {
+            let copy = dir.join(".credentials.json");
+            fs::write(&copy, "token").unwrap();
+            remove_shadowed_credential_copies(&config_for(dir));
+            assert_eq!(!copy.exists(), removed, "{}", dir.display());
+        }
     }
 
     /// End-to-end test: repo-level sandbox config (environment, volume_ignores,
@@ -6624,6 +7062,7 @@ volume_ignores = ["target"]
             keychain_credential: None,
             home_seed_files: &[],
             preserve_files: &[],
+            shared_credential_files: &[],
             clean_files: &["opencode.db", "opencode.db-wal", "opencode.db-shm"],
         };
 
@@ -6661,6 +7100,7 @@ volume_ignores = ["target"]
             keychain_credential: None,
             home_seed_files: &[],
             preserve_files: &[],
+            shared_credential_files: &[],
             clean_files: &[],
         };
 
@@ -6692,6 +7132,7 @@ volume_ignores = ["target"]
             keychain_credential: None,
             home_seed_files: &[],
             preserve_files: &[],
+            shared_credential_files: &[],
             clean_files: &["opencode.db", "opencode.db-wal", "opencode.db-shm"],
         };
 

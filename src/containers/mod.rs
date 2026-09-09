@@ -191,6 +191,11 @@ impl DockerContainer {
         self.runtime.sandbox_store_generation_matches(&self.name)
     }
 
+    pub fn shared_credential_mounts_match(&self, config: &ContainerConfig) -> Result<Option<bool>> {
+        self.runtime
+            .shared_credential_mounts_match(&self.name, config)
+    }
+
     pub fn mount_fingerprint_matches(&self, config: &ContainerConfig) -> Result<Option<bool>> {
         self.runtime
             .mount_fingerprint_matches(&self.name, &config.mount_fingerprint())

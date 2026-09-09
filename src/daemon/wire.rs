@@ -93,10 +93,11 @@ pub struct QueuedPromptEntry {
 /// or mid-attach. Deliberately not persisted to the structured view event log:
 /// daemon lifecycle is ephemeral, transcript replay should not carry
 /// it. See #1088.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AcpWorkerState {
     /// No worker for this session and no resume in flight.
+    #[default]
     Absent,
     /// A spawn or attach is in progress; the UI shows the "Resuming…"
     /// banner + sidebar chip.
@@ -142,25 +143,41 @@ pub enum ContextResumeAvailability {
     },
 }
 
+/// One session as `GET /api/sessions` reports it.
+///
+/// Decoding requires only `id`: every other field defaults when absent, so an
+/// older daemon that predates a field cannot fail the whole parse and blank a
+/// client's list. `id` identifies the row, so a row without one is unusable
+/// rather than degraded, and no daemon version omits it. Serialization is
+/// unaffected; the JSON the daemon emits is unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionResponse {
     pub id: String,
+    #[serde(default)]
     pub title: String,
+    #[serde(default)]
     pub project_path: String,
     /// Absolute host path of the session's managed artifact directory. The
     /// web transcript maps agent-emitted artifact paths under this root (or
     /// the fixed sandbox mount) to the authenticated artifact route. See #2587.
+    #[serde(default)]
     pub artifact_dir: String,
+    #[serde(default)]
     pub group_path: String,
+    #[serde(default)]
     pub tool: String,
+    #[serde(default)]
     pub status: String,
     /// True when the session's structured-view worker was auto-stopped for
     /// inactivity (resumable/dormant), as opposed to a deliberate Stop. Lets
     /// the dashboard render a distinct dormant dot instead of a live-idle one.
     /// A deliberate Stop keeps `status: "Stopped"` and reports `false` here.
     /// See #2250.
+    #[serde(default)]
     pub dormant: bool,
+    #[serde(default)]
     pub yolo_mode: bool,
+    #[serde(default)]
     pub created_at: String,
     pub last_accessed_at: Option<String>,
     /// Wall-clock time of the most recent transition into Idle. Used by the
@@ -182,16 +199,19 @@ pub struct SessionResponse {
     /// default, and auto-detection. See #970.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_branch_override: Option<String>,
+    #[serde(default)]
     pub is_sandboxed: bool,
     /// True when the session was created with `--scratch`; the
     /// `project_path` points at an auto-provisioned directory under
     /// `<app_dir>/scratch/<id>/` that the deletion path removes. The web
     /// wizard filters these out of the Recent-projects list.
+    #[serde(default)]
     pub scratch: bool,
     /// True when the session is marked as a user favorite. Mirrors
     /// `Instance::is_favorited()`; surfaced so the web sidebar can pin
     /// favorited rows and render the `*` marker without re-implementing
     /// the predicate. Cross-feature parity with the TUI's `f`/`F` keybind.
+    #[serde(default)]
     pub favorited: bool,
     /// Per-session color label (`red` / `amber` / `green`), or omitted when
     /// unset. Rendered as a colored status dot in the web sidebar; set via the
@@ -205,6 +225,7 @@ pub struct SessionResponse {
     /// matching the TUI's `attention_session_key` urgent-bias. `is_urgent()`
     /// returns false for archived/snoozed sessions, so a sunk row never
     /// claws back to the top. See #1640.
+    #[serde(default)]
     pub urgent: bool,
     /// RFC3339 timestamp at which the session was web-pinned, or omitted
     /// when not pinned. Distinct from `favorited`: favorite is the TUI
@@ -249,12 +270,14 @@ pub struct SessionResponse {
     /// neither of which applies to multi-repo workspace sessions. For
     /// "is there worktree state to clean up on delete", use
     /// `has_cleanable_worktree` instead.
+    #[serde(default)]
     pub has_managed_worktree: bool,
     /// Whether deleting this session has aoe-managed worktree state to remove,
     /// covering single-repo worktrees AND multi-repo workspaces. Only the
     /// delete dialog's worktree/branch checkboxes consume this; keeping it
     /// separate from `has_managed_worktree` avoids lighting up worktree-only
     /// actions (Edit workdir) for workspace sessions (#2363).
+    #[serde(default)]
     pub has_cleanable_worktree: bool,
     /// Whether renaming this session also moves its worktree directory (the
     /// resolved `session.tie_workdir_to_name` for an aoe-managed worktree).
@@ -278,8 +301,11 @@ pub struct SessionResponse {
     /// single-session responses leave it `false`.
     #[serde(default)]
     pub default_name: bool,
+    #[serde(default)]
     pub has_terminal: bool,
+    #[serde(default)]
     pub profile: String,
+    #[serde(default)]
     pub cleanup_defaults: CleanupDefaults,
     pub remote_owner: Option<String>,
     /// Host-scoped identity for `remote_owner` ("owner@host"), so the web
@@ -311,6 +337,7 @@ pub struct SessionResponse {
     /// `running` once the supervisor holds a live worker. Drives the
     /// sidebar `Resuming…` chip and the per-session banner in the
     /// structured view. See #1088.
+    #[serde(default)]
     pub acp_worker_state: AcpWorkerState,
     /// The provider rate limit this session is parked on, read from the
     /// daemon's durable park rather than a browser-side mirror, so the
@@ -328,6 +355,7 @@ pub struct SessionResponse {
     /// declares a valid `agent_acp_cmd`. The web terminal view reads
     /// this to decide whether the "switch to structured view" affordance is
     /// available, replacing the hardcoded client-side tool list.
+    #[serde(default)]
     pub acp_capable: bool,
     /// The session's server-owned prompt queue (follow-ups the user lined up
     /// while a turn was busy), ordered by `seq`. The daemon owns it, so it is
@@ -378,10 +406,12 @@ pub struct SessionResponse {
     /// enabled Claude's fullscreen renderer (`tui: "fullscreen"` in
     /// `~/.claude/settings.json`). The web client uses this to skip
     /// scrollback-tracking workarounds that target tmux copy-mode.
+    #[serde(default)]
     pub claude_fullscreen: bool,
     /// Repos in the multi-repo workspace (empty for single-repo sessions).
     /// Each entry mirrors `WorkspaceRepo` minus paths the dashboard does
     /// not need to display.
+    #[serde(default)]
     pub workspace_repos: Vec<WorkspaceRepoSummary>,
     /// Non-fatal warnings surfaced by a mutation response. On create these are
     /// worktree-creation warnings (e.g. post-checkout hook failures where the
@@ -442,7 +472,7 @@ pub struct WorkspaceRepoSummary {
     pub branch: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CleanupDefaults {
     pub delete_worktree: bool,
     pub delete_branch: bool,
@@ -461,6 +491,7 @@ pub struct CleanupDefaults {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionsEnvelope {
     pub sessions: Vec<SessionResponse>,
+    #[serde(default)]
     pub workspace_ordering: Vec<String>,
 }
 
@@ -471,4 +502,33 @@ pub struct SessionsEnvelope {
 pub struct ListSessionsQuery {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<SessionScope>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_response_decodes_with_only_an_id() {
+        // An older daemon that predates a field must not fail the parse and
+        // blank a client's whole list; only `id` is load-bearing.
+        let row: SessionResponse = serde_json::from_str(r#"{"id":"a"}"#).unwrap();
+        assert_eq!(row.id, "a");
+        assert_eq!(row.status, "");
+        assert_eq!(row.view, crate::session::View::Terminal);
+        assert_eq!(row.acp_worker_state, AcpWorkerState::Absent);
+        assert!(!row.cleanup_defaults.delete_to_trash);
+        assert!(row.workspace_repos.is_empty());
+        assert_eq!(row.context_resume, None);
+
+        assert!(serde_json::from_str::<SessionResponse>(r#"{"title":"no id"}"#).is_err());
+    }
+
+    #[test]
+    fn sessions_envelope_decodes_without_workspace_ordering() {
+        let envelope: SessionsEnvelope =
+            serde_json::from_str(r#"{"sessions":[{"id":"a"}]}"#).unwrap();
+        assert_eq!(envelope.sessions.len(), 1);
+        assert!(envelope.workspace_ordering.is_empty());
+    }
 }

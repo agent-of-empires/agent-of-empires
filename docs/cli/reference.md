@@ -1117,13 +1117,13 @@ Inspect and reclaim per-session sandbox agent stores
 
 ###### **Subcommands:**
 
-* `reclaim` — Report per-session agent stores whose session no longer exists in any profile, and how much disk they hold. Reports only unless `--delete` is given: each store holds a copy of that agent's credentials
+* `reclaim` — Report per-session agent stores whose session no longer exists in any profile, and how much disk they hold. Reports only unless `--delete` is given: a store can hold a copy of that agent's credentials
 
 
 
 ## `aoe sandbox reclaim`
 
-Report per-session agent stores whose session no longer exists in any profile, and how much disk they hold. Reports only unless `--delete` is given: each store holds a copy of that agent's credentials
+Report per-session agent stores whose session no longer exists in any profile, and how much disk they hold. Reports only unless `--delete` is given: a store can hold a copy of that agent's credentials
 
 **Usage:** `aoe sandbox reclaim [OPTIONS]`
 

@@ -81,9 +81,17 @@ State lives in `sessions.json` in your AoE config directory:
 - **Linux**: `$XDG_CONFIG_HOME/agent-of-empires/profiles/<profile>/sessions.json`
 - **macOS/Windows**: `~/.agent-of-empires/profiles/<profile>/sessions.json`
 
-Three relevant fields:
+Four relevant fields:
 
 - `agent_session_id`: the observed conversation ID. Auto-managed; do not edit.
 - `resume_intent`: your intent (`Default`, `Use(id)`, `Cleared`). Set via the CLI above. Absent when `Default`.
 - `resume_probe_failed_sid`: the last pinned ID whose resume probe failed ambiguously.
   This loop-breaker prevents startup recovery from retrying that same ID automatically until user action changes the resume state.
+- `pi_session_path`: for Pi sessions, the transcript path the pane published.
+  Pi indexes conversations by the directory they started in, so this is what
+  resumes one whose worktree has since moved. Pi writes a transcript lazily, so
+  this can name a file that does not exist yet. A launch that would otherwise
+  pass that conversation to `pi --session`, which fails outright on an ID it
+  cannot resolve, starts fresh instead and lets the pane's next conversation
+  take over. Launches that pin with `--session-id` are unaffected, since that
+  flag creates the conversation rather than failing. Auto-managed; do not edit.

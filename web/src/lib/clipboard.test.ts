@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { armClipboardWrite } from "./clipboard";
+import { armClipboardWrite, readClipboardText } from "./clipboard";
 
 class FakeClipboardItem {
   constructor(public readonly data: Record<string, Promise<Blob>>) {}
@@ -67,5 +67,42 @@ describe("armClipboardWrite", () => {
     const armed = armClipboardWrite();
     expect(armed.resolve("fallback")).toBe(true);
     await vi.waitFor(() => expect(writeText).toHaveBeenCalledWith("fallback"));
+  });
+});
+
+describe("readClipboardText", () => {
+  afterEach(() => {
+    delete (navigator as { clipboard?: unknown }).clipboard;
+  });
+
+  it("normalises whichever text type the source app wrote", async () => {
+    Object.defineProperty(window, "isSecureContext", { configurable: true, value: true });
+    const cases: Array<[string, string, string]> = [
+      ["text/plain", "plain\ntext", "plain\ntext"],
+      [
+        "text/uri-list",
+        "# comment\r\nhttps://a.example\r\nhttps://b.example\r\n",
+        "https://a.example\nhttps://b.example",
+      ],
+      ["text/html", '<p><a href="https://x.example/pr/1">PR</a></p>', "https://x.example/pr/1"],
+      ["text/html", '<a href="">click here</a>', "click here"],
+      ["text/html", "<p> just text </p>", "just text"],
+    ];
+    for (const [type, raw, expected] of cases) {
+      const item = { types: [type], getType: async () => new Blob([raw], { type }) };
+      Object.defineProperty(navigator, "clipboard", { configurable: true, value: { read: async () => [item] } });
+      expect(await readClipboardText(), `${type}: ${raw}`).toBe(expected);
+    }
+  });
+
+  it("returns empty text outside a secure context or when the read is refused", async () => {
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { read: async () => Promise.reject(new Error("denied")) },
+    });
+    Object.defineProperty(window, "isSecureContext", { configurable: true, value: true });
+    expect(await readClipboardText()).toBe("");
+    Object.defineProperty(window, "isSecureContext", { configurable: true, value: false });
+    expect(await readClipboardText()).toBe("");
   });
 });

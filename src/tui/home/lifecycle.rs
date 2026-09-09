@@ -326,8 +326,10 @@ impl HomeView {
             system_health_discovered: user_config
                 .as_ref()
                 .is_some_and(|config| config.app_state.used_system_health),
-            daemon_status_poller: crate::tui::daemon_status_poller::DaemonStatusPoller::new(),
-            pending_daemon_status_refresh: false,
+            session_feed: crate::tui::session_feed::SessionFeed::new(),
+            pending_session_feed: false,
+            daemon_sidebar: resolved.session.daemon_sidebar,
+            sidebar_source: crate::tui::session_feed::SidebarSource::Storage,
             deletion_poller: DeletionPoller::new(),
             stop_poller: StopPoller::new(),
             trash_poller: crate::tui::trash_poller::TrashPoller::new(),

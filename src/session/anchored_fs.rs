@@ -178,13 +178,28 @@ impl AnchoredDir {
         self.modified(relative, true)
     }
 
+    /// What `relative` names: `Some(true)` a regular file, `Some(false)`
+    /// something that is not one, `None` nothing at all. `Err` when the
+    /// lookup itself could not be made, which callers that treat absence as
+    /// evidence must keep distinct from `None`.
+    ///
+    /// Inspects with `fstatat` rather than opening, so an entry this process
+    /// may stat but not read still answers `Some(true)`. A sandbox writes its
+    /// files as the container's user, and the host side only needs to know
+    /// they are there.
+    pub(crate) fn regular_lookup(&self, relative: &Path) -> Result<Option<bool>> {
+        let (parent, leaf) = self.open_parent(relative)?;
+        match fstatat(&parent, leaf.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Ok(stat) => Ok(Some(
+                (stat.st_mode & nix::libc::S_IFMT) == nix::libc::S_IFREG,
+            )),
+            Err(Errno::ENOENT) => Ok(None),
+            Err(error) => Err(error).context("inspecting anchored file"),
+        }
+    }
+
     pub(crate) fn regular_exists(&self, relative: &Path) -> bool {
-        self.open_parent(relative)
-            .ok()
-            .and_then(|(parent, leaf)| {
-                fstatat(&parent, leaf.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW).ok()
-            })
-            .is_some_and(|stat| (stat.st_mode & nix::libc::S_IFMT) == nix::libc::S_IFREG)
+        matches!(self.regular_lookup(relative), Ok(Some(true)))
     }
 
     pub(crate) fn remove_file(&self, relative: &Path) -> Result<()> {

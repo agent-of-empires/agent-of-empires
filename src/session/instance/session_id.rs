@@ -4,6 +4,37 @@ use super::*;
 
 const PI_SIDECAR_MAX_BYTES: usize = 4096;
 
+/// What a recorded Pi transcript path resolves to. `Unreadable` means the
+/// store could not be inspected, which is a statement about our view rather
+/// than about the conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PiTranscriptState {
+    Present,
+    Absent,
+    Unreadable,
+}
+
+/// Classify a transcript path the host filesystem can be asked about
+/// directly.
+///
+/// Only a miss under a directory that reads back is `Absent`. `Path::is_file`
+/// folds a denied or failing lookup into `false`, and the launch gate reads
+/// `Absent` as proof about the conversation, so an error must never arrive
+/// there.
+fn host_transcript_state(host_path: &Path) -> PiTranscriptState {
+    match std::fs::metadata(host_path) {
+        Ok(metadata) if metadata.is_file() => PiTranscriptState::Present,
+        Ok(_) => PiTranscriptState::Unreadable,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match host_path.parent().map(std::fs::metadata) {
+                Some(Ok(parent)) if parent.is_dir() => PiTranscriptState::Absent,
+                _ => PiTranscriptState::Unreadable,
+            }
+        }
+        Err(_) => PiTranscriptState::Unreadable,
+    }
+}
+
 impl Instance {
     /// Acquire a pre-launch session ID for the agent.
     ///
@@ -467,30 +498,114 @@ impl Instance {
         Some(self.pi_config_bind_dir()?.join(rest))
     }
 
-    fn pi_resumable_transcript(&self) -> Option<String> {
+    /// What this row's recorded transcript path resolves to on disk.
+    ///
+    /// `Unreadable` is the answer whenever the store directory that would
+    /// hold the file could not itself be listed: a bind that no longer
+    /// resolves, a moved store, a namespace the path does not belong to. It
+    /// is deliberately distinct from `Absent`, because only `Absent` is
+    /// evidence about the conversation rather than about our own view.
+    fn pi_recorded_transcript_state(&self, path: &str) -> PiTranscriptState {
+        let relative = if self.is_sandboxed() {
+            match path.strip_prefix("/root/.pi/") {
+                Some(relative) => Path::new(relative),
+                None => return PiTranscriptState::Unreadable,
+            }
+        } else {
+            let Some(host_path) = self.pi_host_view_of(path) else {
+                return PiTranscriptState::Unreadable;
+            };
+            return host_transcript_state(&host_path);
+        };
+        let Some(parent) = relative.parent() else {
+            return PiTranscriptState::Unreadable;
+        };
+        let Some(root) = self
+            .pi_config_bind_dir()
+            .and_then(|root| crate::session::AnchoredDir::open(&root).ok())
+        else {
+            return PiTranscriptState::Unreadable;
+        };
+        if !matches!(root.directory_modified(parent), Ok(Some(_))) {
+            return PiTranscriptState::Unreadable;
+        }
+        match root.regular_lookup(relative) {
+            Ok(Some(true)) => PiTranscriptState::Present,
+            Ok(None) => PiTranscriptState::Absent,
+            Ok(Some(false)) | Err(_) => PiTranscriptState::Unreadable,
+        }
+    }
+
+    /// The recorded transcript path when it belongs to the conversation this
+    /// row currently owns, paired with what that path resolves to.
+    fn pi_recorded_transcript(&self) -> Option<(&str, PiTranscriptState)> {
         let path = self.pi_session_path.as_deref()?;
         let id = self.agent_session_id.as_deref()?;
         let name = std::path::Path::new(path).file_name()?.to_str()?;
-        let names_this_conversation = name
-            .rsplit_once('_')
+        name.rsplit_once('_')
             .and_then(|(_, tail)| tail.strip_suffix(".jsonl"))
-            .is_some_and(|uuid| uuid == id);
-        let exists = if self.is_sandboxed() {
-            path.strip_prefix("/root/.pi/")
-                .is_some_and(|relative| self.pi_sandbox_regular_exists(Path::new(relative)))
-        } else {
-            self.pi_host_view_of(path)
-                .is_some_and(|host_path| host_path.is_file())
-        };
-        (names_this_conversation && exists).then(|| path.to_string())
+            .filter(|uuid| *uuid == id)?;
+        Some((path, self.pi_recorded_transcript_state(path)))
     }
 
-    pub(super) fn absorb_published_pi_session(&mut self) {
+    fn pi_resumable_transcript(&self) -> Option<String> {
+        let (path, state) = self.pi_recorded_transcript()?;
+        (state == PiTranscriptState::Present).then(|| path.to_string())
+    }
+
+    /// Whether the conversation this row owns is known to have no transcript.
+    ///
+    /// Positive evidence only, and only from what the pane itself published:
+    /// a recorded path for exactly this conversation, in a store directory we
+    /// can read, with no file at it. Pi writes a transcript lazily, so a
+    /// conversation that was never prompted has none. A store we cannot read
+    /// says nothing, and pi's layout is never reconstructed to guess.
+    fn pi_recorded_transcript_missing(&self) -> bool {
+        matches!(
+            self.pi_recorded_transcript(),
+            Some((_, PiTranscriptState::Absent))
+        )
+    }
+
+    pub(crate) fn absorb_published_pi_session(&mut self) {
         if self.resolved_capture_backend() != Some(crate::agents::SessionCaptureBackend::Pi) {
             return;
         }
-        if let Some(path) = self.pi_published_session_path() {
-            self.pi_session_path = Some(path);
+        let Some(path) = self.pi_published_session_path() else {
+            return;
+        };
+        if self.pi_session_path.as_deref() == Some(path.as_str()) {
+            return;
+        }
+        self.pi_session_path = Some(path.clone());
+        // The sidecar this came from lives in the host temp directory, which a
+        // reboot clears. Only the durable copy survives to tell the next launch
+        // which conversation the pane was on and whether it has a transcript.
+        if let Ok(storage) = crate::session::storage::Storage::new(
+            &self.effective_profile(),
+            self.resolve_file_watch(),
+        ) {
+            self.store_pi_session_path(&storage, &path);
+        }
+    }
+
+    /// Record a published transcript path on this row's durable state.
+    pub(super) fn store_pi_session_path(
+        &self,
+        storage: &crate::session::storage::Storage,
+        path: &str,
+    ) {
+        if let Err(error) = storage.update(|instances, _| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == self.id) {
+                inst.pi_session_path = Some(path.to_string());
+            }
+            Ok(())
+        }) {
+            tracing::warn!(
+                target: "session.store",
+                instance = %self.id,
+                "could not persist the Pi transcript path the pane published: {error}",
+            );
         }
     }
 
@@ -807,6 +922,33 @@ impl Instance {
                 return Ok(true);
             }
         }
+        // Pi's `--session` arm exits 1 when its argument resolves to nothing,
+        // and `remain-on-exit` then leaves a dead pane that the resume probe
+        // reads as a failed resume, so the next launch discards the
+        // conversation. Pi writes a transcript lazily, so an id AoE holds for
+        // a conversation that was never prompted resolves to nothing. Start
+        // fresh instead: the pane comes up on a new conversation and the
+        // poller adopts it, which is what the old id would have named anyway
+        // once pi had written to it. The `--session-id` arm creates the
+        // conversation rather than failing, which is why it is exempt. An
+        // explicit pin is left to fail: the user named that conversation and
+        // pi's own message in the pane is the answer they asked for.
+        if flag_arm_is_existing
+            && !explicitly_pinned
+            && session_id.is_some()
+            && self.resolved_capture_backend() == Some(crate::agents::SessionCaptureBackend::Pi)
+            && self.pi_recorded_transcript_missing()
+        {
+            tracing::info!(
+                target: "session.store",
+                instance = %self.id,
+                sid = ?session_id,
+                "the conversation this Pi session owns has no transcript; \
+                 starting fresh rather than failing the launch on `--session`. \
+                 The pane's next conversation replaces it",
+            );
+            session_id = None;
+        }
         let resume_tool = self
             .resolved_agent()
             .map_or(self.tool.as_str(), |agent| agent.name);
@@ -895,6 +1037,7 @@ mod tests {
     use crate::session::instance::test_helpers::*;
     use crate::session::test_support::EnvGuard;
     use serial_test::serial;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn self_heal_eligibility_rejects_owned_and_inactive_rows() {
@@ -1499,6 +1642,167 @@ pi = "~/.pi-personal"
             host_inst.pi_host_view_of("/home/u/.pi/x.jsonl"),
             Some(std::path::PathBuf::from("/home/u/.pi/x.jsonl"))
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pi_only_calls_a_transcript_missing_when_its_store_was_readable() {
+        // The gate destroys a conversation, so it must fire on evidence about
+        // the conversation and never on a store AoE could not inspect. This
+        // covers the sandboxed shape, which is the one that can lose its
+        // store dir under a live row (a moved or reclaimed bind).
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let id = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+        let leaf = format!("2026-01-01T00-00-00-000Z_{id}.jsonl");
+
+        let mut inst = Instance::new("pi-store", "/tmp/pi-store");
+        inst.tool = "pi".to_string();
+        inst.agent_session_id = Some(id.to_string());
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "aoe-pi-store".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: None,
+            before_start_env: Vec::new(),
+        });
+        inst.pi_session_path = Some(format!("/root/.pi/agent/sessions/--proj--/{leaf}"));
+
+        // No store dir on the host side of the bind yet: unreadable, so the
+        // launch keeps whatever it would have done without this gate.
+        assert!(
+            !inst.pi_recorded_transcript_missing(),
+            "an uninspectable store is not evidence the conversation is gone"
+        );
+        assert_eq!(inst.pi_resumable_transcript(), None);
+
+        let store = inst.sandbox_capture_store_dir().expect("bind dir");
+        let sessions = store.join("agent").join("sessions").join("--proj--");
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        // The store now reads, and the conversation has no file in it.
+        assert!(
+            inst.pi_recorded_transcript_missing(),
+            "a readable store with no file is the pane's own answer"
+        );
+
+        std::fs::write(sessions.join(&leaf), "{}\n").unwrap();
+        assert!(!inst.pi_recorded_transcript_missing());
+        assert_eq!(
+            inst.pi_resumable_transcript(),
+            Some(format!("/root/.pi/agent/sessions/--proj--/{leaf}")),
+            "the pane resumes its own transcript by the path it published"
+        );
+
+        // A recorded host path on a row that has since been sandboxed names
+        // nothing inside the container, so it stays evidence-free.
+        inst.pi_session_path = Some(format!("/home/u/.pi/agent/sessions/--proj--/{leaf}"));
+        assert!(!inst.pi_recorded_transcript_missing());
+    }
+
+    #[test]
+    fn pi_never_calls_a_transcript_missing_on_a_store_it_could_not_ask_about() {
+        // The host side answers from the filesystem directly, where every
+        // failed lookup looks like `false`. Only a miss under a directory
+        // that reads back is evidence about the conversation.
+        let temp = tempfile::tempdir().unwrap();
+        let id = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+        let leaf = format!("2026-01-01T00-00-00-000Z_{id}.jsonl");
+        let store = temp.path().join("sessions");
+
+        let mut inst = Instance::new("pi-host-store", "/tmp/pi-host-store");
+        inst.tool = "pi".to_string();
+        inst.agent_session_id = Some(id.to_string());
+        inst.pi_session_path = Some(store.join(&leaf).to_string_lossy().into_owned());
+
+        assert!(
+            !inst.pi_recorded_transcript_missing(),
+            "a store directory that is not there says nothing about the conversation"
+        );
+
+        std::fs::create_dir_all(&store).unwrap();
+        assert!(
+            inst.pi_recorded_transcript_missing(),
+            "a readable store with no file is the pane's own answer"
+        );
+
+        std::fs::write(store.join(&leaf), "{}\n").unwrap();
+        assert!(!inst.pi_recorded_transcript_missing());
+
+        // A lookup that fails for any reason other than a miss is not
+        // evidence. A regular file standing in for the store directory is the
+        // one shape every uid sees the same way; root bypasses mode bits.
+        let not_a_dir = temp.path().join("occupied");
+        std::fs::write(&not_a_dir, "").unwrap();
+        inst.pi_session_path = Some(not_a_dir.join(&leaf).to_string_lossy().into_owned());
+        assert!(
+            !inst.pi_recorded_transcript_missing(),
+            "a store path that is not a directory says nothing about the conversation"
+        );
+        inst.pi_session_path = Some(store.join(&leaf).to_string_lossy().into_owned());
+
+        if !nix::unistd::Uid::effective().is_root() {
+            std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let denied = !inst.pi_recorded_transcript_missing();
+            std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(
+                denied,
+                "a transcript AoE is not allowed to stat must not read as gone"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pi_launch_drops_the_failing_session_selector_when_the_transcript_is_gone() {
+        // `--session <sid>` exits 1 on an id that resolves to nothing, which
+        // kills the pane and costs the row its conversation on the retry. Pi
+        // writes a transcript lazily, so a conversation that was never
+        // prompted has none. The launch must start fresh and keep the id.
+        let (_hooks, _base, _hooks_tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+
+        // A profile `PATH` assignment means AoE cannot vouch for which `pi`
+        // the pane runs, so the launch takes the `--session` arm rather than
+        // the `--session-id` arm that would create the conversation.
+        let profile = "pi-missing-transcript";
+        let profile_dir = crate::session::get_profile_dir(profile).unwrap();
+        std::fs::write(
+            profile_dir.join("config.toml"),
+            "environment = [\"PATH=/usr/bin\"]\n",
+        )
+        .unwrap();
+
+        let id = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+        let transcript = temp
+            .path()
+            .join(format!("2026-01-01T00-00-00-000Z_{id}.jsonl"));
+
+        let mut inst = Instance::new("pi-gone", "/tmp/pi-gone");
+        inst.tool = "pi".to_string();
+        inst.command = "pi".to_string();
+        inst.source_profile = profile.to_string();
+        inst.agent_session_id = Some(id.to_string());
+        inst.pi_session_path = Some(transcript.to_string_lossy().into_owned());
+
+        let mut cmd = "pi".to_string();
+        let resumed = inst.apply_session_flags(&mut cmd, "test").unwrap();
+        assert_eq!(cmd, "pi", "no selector may be handed to a doomed resume");
+        assert!(!resumed, "nothing was resumed");
+        assert_eq!(
+            inst.agent_session_id.as_deref(),
+            Some(id),
+            "acquisition leaves the row's id alone; only the selector is dropped"
+        );
+
+        // The same row resumes by path once the transcript is there.
+        std::fs::write(&transcript, "{}\n").unwrap();
+        let mut cmd = "pi".to_string();
+        assert!(inst.apply_session_flags(&mut cmd, "test").unwrap());
+        assert_eq!(cmd, format!("pi --session '{}'", transcript.display()));
     }
 
     #[test]

@@ -850,7 +850,7 @@ impl App {
         const REFRESH_COOLDOWN: Duration = Duration::from_millis(15);
         let mut last_status_refresh = std::time::Instant::now();
         let mut last_metrics_sample = std::time::Instant::now();
-        let mut last_daemon_status_refresh = std::time::Instant::now();
+        let mut last_session_feed_refresh = std::time::Instant::now();
         let mut last_disk_refresh = std::time::Instant::now();
         let mut full_heartbeat_deferred = false;
         let mut last_spinner_redraw = std::time::Instant::now();
@@ -867,7 +867,7 @@ impl App {
         // than from a local tmux scrape, and `/api/sessions` costs the daemon
         // a few SQLite lookups per structured row. Half the tmux cadence
         // keeps a status dot feeling live while halving that request rate.
-        const DAEMON_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+        const SESSION_FEED_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
         const DISK_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
         // Diagnostics-strip sampling. 1s keeps the sparkline responsive to a
         // fast memory climb; request_metrics_refresh is a no-op unless the strip
@@ -1859,11 +1859,11 @@ impl App {
                 refresh_needed = true;
             }
 
-            if last_daemon_status_refresh.elapsed() >= DAEMON_STATUS_REFRESH_INTERVAL {
-                self.home.request_daemon_status_refresh();
-                last_daemon_status_refresh = std::time::Instant::now();
+            if last_session_feed_refresh.elapsed() >= SESSION_FEED_REFRESH_INTERVAL {
+                self.home.request_session_feed_refresh();
+                last_session_feed_refresh = std::time::Instant::now();
             }
-            if self.home.apply_daemon_status_updates() {
+            if self.home.apply_session_feed() {
                 refresh_needed = true;
                 needs_full_refresh = true;
             }
