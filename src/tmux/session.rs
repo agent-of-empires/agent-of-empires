@@ -2588,6 +2588,134 @@ mod tests {
         }
     }
 
+    /// Block until `pane_id` reports `#{pane_dead}`, so a caller never races
+    /// the pane's own process exit with a fixed sleep.
+    fn wait_for_pane_dead(pane_id: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let out = crate::tmux::tmux_command()
+                .args(["display-message", "-t", pane_id, "-p", "#{pane_dead}"])
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            if out == "1" {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pane {pane_id} never reported dead, last read {out:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Move `session_name`'s only window to index 1 under `base-index 1`, so
+    /// window 0 genuinely does not exist.
+    ///
+    /// Setting `base-index 1` on a live session does not renumber the window it
+    /// was created with, and a `:0.0` target against a session that still has a
+    /// window 0 resolves fine, so the option on its own leaves the base-index
+    /// half of #435 / #488 untested (#3368). Moving the window afterwards
+    /// reproduces what a user with `base-index 1` in their `tmux.conf` has,
+    /// without touching the server-global option every other tmux test shares.
+    ///
+    /// tmux resolves a window index that does not exist to the session's
+    /// current window, so with a second window active a `:0.0` target then
+    /// reads the active window rather than failing loudly. That is the
+    /// regression these callers exist to catch.
+    fn rebase_first_window_to_index_one(session_name: &str) {
+        let set = crate::tmux::tmux_command()
+            .args(["set-option", "-t", session_name, "base-index", "1"])
+            .output()
+            .expect("tmux set-option base-index");
+        assert!(set.status.success(), "failed to set base-index 1");
+
+        let moved = crate::tmux::tmux_command()
+            .args([
+                "move-window",
+                "-d",
+                "-s",
+                &format!("{session_name}:0"),
+                "-t",
+                &format!("{session_name}:1"),
+            ])
+            .output()
+            .expect("tmux move-window");
+        assert!(
+            moved.status.success(),
+            "failed to move the first window off index 0: {}",
+            String::from_utf8_lossy(&moved.stderr)
+        );
+
+        let listed = crate::tmux::tmux_command()
+            .args(["list-windows", "-t", session_name, "-F", "#{window_index}"])
+            .output()
+            .expect("tmux list-windows");
+        let indices = String::from_utf8_lossy(&listed.stdout);
+        assert!(
+            !indices.lines().any(|line| line.trim() == "0"),
+            "window 0 must not exist, or a `:0.0` target still resolves: {indices:?}"
+        );
+    }
+
+    /// Set the server-global `pane-base-index` for the rest of the scope and
+    /// restore the previous value on drop, including on unwind.
+    ///
+    /// Modelling a user who sets `pane-base-index 1` needs the global option:
+    /// aoe pins the session-level one, and a window-level value would take
+    /// precedence over that pin rather than losing to it. Every test in this
+    /// binary that forks `tmux new-session` carries the default
+    /// `#[serial_test::serial]` key, so the global is exclusive for the
+    /// guard's lifetime. Construct it only once a session exists: both
+    /// `set-option -g` and `show-options -g` fail against a stopped server.
+    struct GlobalPaneBaseIndex(String);
+
+    impl GlobalPaneBaseIndex {
+        fn set(value: &str) -> Self {
+            // A failed read would restore an empty string, and
+            // `set-option -g pane-base-index ""` leaves the global at `value`
+            // for the rest of the binary's run: every later unpinned session
+            // then numbers panes from 1 and the `.0` targets fall through to
+            // the active pane.
+            let read = crate::tmux::tmux_command()
+                .args(["show-options", "-g", "-v", "pane-base-index"])
+                .output()
+                .expect("tmux show-options -g pane-base-index");
+            assert!(
+                read.status.success(),
+                "failed to read the global pane-base-index: {}",
+                String::from_utf8_lossy(&read.stderr)
+            );
+            let previous = String::from_utf8_lossy(&read.stdout).trim().to_string();
+            // tmux prints the default rather than nothing, so an empty read
+            // means the option is not what this guard thinks it is; restoring
+            // `""` would leave the global at `value` for the rest of the run.
+            assert!(
+                !previous.is_empty(),
+                "tmux reported no global pane-base-index to restore"
+            );
+            let applied = crate::tmux::tmux_command()
+                .args(["set-option", "-g", "pane-base-index", value])
+                .output()
+                .expect("tmux set-option -g pane-base-index");
+            assert!(
+                applied.status.success(),
+                "failed to set a global pane-base-index of {value}"
+            );
+            Self(previous)
+        }
+    }
+
+    impl Drop for GlobalPaneBaseIndex {
+        fn drop(&mut self) {
+            let _ = crate::tmux::tmux_command()
+                .args(["set-option", "-g", "pane-base-index", &self.0])
+                .output();
+        }
+    }
+
     /// Create a detached session for the composite tests, applying the guards
     /// the rest of this module treats as mandatory:
     ///
@@ -4001,8 +4129,13 @@ mod tests {
     }
 
     /// Regression test for #435: with multiple tmux windows, pane health
-    /// checks must target window 0 pane 0 explicitly so that a dead pane in
-    /// a second window does not cause the agent pane to be killed.
+    /// checks must target the first window's pane explicitly so that a dead
+    /// pane in a second window does not cause the agent pane to be killed.
+    ///
+    /// The dead pane has to outlive its process for the active window to stay
+    /// the wrong answer. `remain-on-exit` is a window/pane option, so it is
+    /// set on the second window's pane while that pane still blocks on a
+    /// release file, rather than raced against a command that exits at once.
     #[test]
     #[serial_test::serial]
     fn test_is_pane_dead_targets_window_zero_with_multiple_windows() {
@@ -4038,35 +4171,44 @@ mod tests {
             .expect("tmux new-session");
         assert!(output.status.success());
 
-        // Force base-index 1 and pane-base-index 1 to simulate users who
-        // have both set in their tmux.conf.
-        let output = crate::tmux::tmux_command()
-            .args(["set-option", "-t", &session_name, "base-index", "1"])
-            .output()
-            .expect("tmux set-option base-index");
-        assert!(output.status.success());
-        let output = crate::tmux::tmux_command()
-            .args(["set-option", "-t", &session_name, "pane-base-index", "1"])
-            .output()
-            .expect("tmux set-option pane-base-index");
-        assert!(output.status.success());
+        rebase_first_window_to_index_one(&session_name);
 
-        // Create a second window with a command that exits immediately
+        // A second window that blocks until this test releases it, so
+        // `remain-on-exit` lands on its pane before the pane can die.
+        let temp = tempfile::tempdir().unwrap();
+        let release = temp.path().join("release");
         let output = crate::tmux::tmux_command()
             .args([
                 "new-window",
                 "-t",
                 &session_name,
-                "true", // exits immediately
+                "-P",
+                "-F",
+                "#{pane_id}",
+                &format!("until [ -e '{}' ]; do sleep 0.02; done", release.display()),
+                ";",
+                "set-option",
+                "-p",
+                "-t",
+                &session_name,
+                "remain-on-exit",
+                "on",
             ])
             .output()
             .expect("tmux new-window");
         assert!(output.status.success());
-
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        let dead_pane = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        assert!(
+            dead_pane.starts_with('%'),
+            "expected a pane id from new-window -P, got {dead_pane:?}"
+        );
+        std::fs::write(&release, b"go").unwrap();
+        wait_for_pane_dead(&dead_pane);
 
         // The agent pane (first window) is still alive, so is_pane_dead should
-        // return false even though the second window's pane has exited.
+        // return false even though the second window's pane has exited. With
+        // no window 0 a `:0.0` target resolves to the active window, which is
+        // that dead second window.
         assert!(
             !is_pane_dead(&session_name),
             "is_pane_dead should check the first window's pane, not the active window"
@@ -4076,6 +4218,11 @@ mod tests {
     /// Regression test: capture_pane must target the first window's pane
     /// regardless of which window is currently active, and regardless of
     /// the user's tmux base-index setting.
+    ///
+    /// The pane prints a marker before exec'ing `sleep`, so the capture has
+    /// something to assert on: `capture_pane` swallows a failed tmux call into
+    /// `Ok(String::new())`, and the `:0.0` regression this guards is exactly
+    /// that silent empty read (#3368).
     #[test]
     #[serial_test::serial]
     fn test_capture_pane_targets_first_window_with_multiple_windows() {
@@ -4098,21 +4245,14 @@ mod tests {
                 "80",
                 "-y",
                 "24",
-                "sleep 30",
+                "sh -c 'echo AOE_FIRST_WINDOW; exec sleep 30'",
             ])
             .output()
             .expect("tmux new-session");
         assert!(output.status.success());
         let agent_pane = only_pane_id(&session_name);
 
-        // Force base-index 1 to simulate users who have set base-index 1 in
-        // their tmux.conf. With base-index 1, window 0 does not exist, so any
-        // target using :0.0 silently fails.
-        let output = crate::tmux::tmux_command()
-            .args(["set-option", "-t", &session_name, "base-index", "1"])
-            .output()
-            .expect("tmux set-option base-index");
-        assert!(output.status.success());
+        rebase_first_window_to_index_one(&session_name);
 
         // Open a second window running a shell, and make it the active window
         let output = crate::tmux::tmux_command()
@@ -4127,11 +4267,17 @@ mod tests {
             name: session_name.clone(),
         };
 
-        // capture_pane must succeed -- with base-index 1, a :0.0 target does
-        // not exist and the tmux command fails silently returning empty content.
-        let _content = session
+        // With no window 0, a `:0.0` target resolves to the active window --
+        // the shell opened above -- so `capture_pane` reads the wrong pane or,
+        // when tmux does reject the target, returns `Ok("")`. Asserting the
+        // first window's own marker rejects both.
+        let content = session
             .capture_pane(10)
             .expect("capture_pane should not return an error for a valid session");
+        assert!(
+            content.contains("AOE_FIRST_WINDOW"),
+            "capture_pane must read the first window's pane: {content:?}"
+        );
 
         // The command in the first window is 'sleep', not a shell.
         // is_pane_running_shell must return false even though the active
@@ -4721,14 +4867,7 @@ mod tests {
         assert!(output.status.success());
         let agent_pane = only_pane_id(&session_name);
 
-        // Force base-index 1 to simulate users who have set base-index 1 in
-        // their tmux.conf. With base-index 1, window 0 does not exist, so any
-        // target using :0.0 silently fails.
-        let output = crate::tmux::tmux_command()
-            .args(["set-option", "-t", &session_name, "base-index", "1"])
-            .output()
-            .expect("tmux set-option base-index");
-        assert!(output.status.success());
+        rebase_first_window_to_index_one(&session_name);
 
         // Open a second window running a shell and make it active
         let output = crate::tmux::tmux_command()
@@ -4739,10 +4878,9 @@ mod tests {
 
         wait_for_pane_command(&agent_pane, "sleep");
 
-        // Should be false: first window runs 'sleep', not a shell.
-        // Would incorrectly return true if the active second window (sh) were checked.
-        // With base-index 1 and a :0.0 target the call silently fails and
-        // returns false for the wrong reason; ^ correctly reads the first pane.
+        // Should be false: first window runs 'sleep', not a shell. With no
+        // window 0 a `:0.0` target resolves to the active window, so the
+        // reverted targeting reads the second window's `sh` and returns true.
         assert!(
             !is_pane_running_shell(&session_name),
             "is_pane_running_shell should target first window (sleep), not active window (sh)"
@@ -4817,8 +4955,15 @@ mod tests {
         );
     }
 
-    /// Regression test for #488: ensure status checks work correctly when both
-    /// pane-base-index 1 and split panes are in play.
+    /// Regression test for #488: on a host whose global `pane-base-index` is 1,
+    /// the `.0` half of the `^.0` status targets only resolves because
+    /// [`append_pane_base_index_args`] pins `pane-base-index 0` onto every
+    /// session aoe creates. Without that pin the panes number from 1 and `.0`
+    /// falls back to the active pane, which is the split the user just made.
+    ///
+    /// The global option is what a user actually sets: aoe's own pin is
+    /// session-level, and a window-level value would win over it rather than
+    /// lose to it.
     #[test]
     #[serial_test::serial]
     fn test_status_checks_with_split_panes_and_pane_base_index_1() {
@@ -4830,43 +4975,46 @@ mod tests {
         let guard = TmuxTestSession::new("aoe_test_splitpbi");
         let session_name = guard.name().to_string();
 
-        // Create session with pane-base-index 0 pinned (as aoe does)
+        // Built with the production helpers rather than a hand-written copy of
+        // their arguments, so emptying either one fails here.
+        let mut args: Vec<String> = [
+            "new-session",
+            "-d",
+            "-s",
+            &session_name,
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "sleep 30",
+        ]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+        append_remain_on_exit_args(&mut args, &session_name);
+        append_pane_base_index_args(&mut args, &session_name);
         let output = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &session_name,
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sleep 30",
-                ";",
-                "set-option",
-                "-p",
-                "-t",
-                &session_name,
-                "remain-on-exit",
-                "on",
-                ";",
-                "set-option",
-                "-t",
-                &session_name,
-                "pane-base-index",
-                "0",
-            ])
+            .args(&args)
             .output()
             .expect("tmux new-session");
         assert!(output.status.success());
         let agent_pane = only_pane_id(&session_name);
 
-        // Simulate a user with pane-base-index 1 globally by setting it on the
-        // window -- but aoe has already pinned pane-base-index 0 on the session,
-        // so pane 0 should still be valid.
-        // Note: we set it on the session to verify our pinning takes precedence.
-        // Actually, set pane-base-index 1 globally to simulate user config, then
-        // verify our session-level override keeps pane 0 valid.
+        // After the create: `set-option -g` needs a running server, and pane
+        // indices are computed from the option on every read, so applying it
+        // to a live session is the same state as a host that had it all along.
+        let _global_pane_base_index = GlobalPaneBaseIndex::set("1");
+
+        let listed = crate::tmux::tmux_command()
+            .args(["list-panes", "-t", &session_name, "-F", "#{pane_index}"])
+            .output()
+            .expect("tmux list-panes");
+        let indices = String::from_utf8_lossy(&listed.stdout);
+        assert!(
+            indices.lines().any(|line| line.trim() == "0"),
+            "the session pin must keep pane 0 addressable under a global \
+             pane-base-index of 1: {indices:?}"
+        );
 
         // Split the window and make the new pane active
         let output = crate::tmux::tmux_command()
@@ -5028,14 +5176,10 @@ mod tests {
         file.disarm();
     }
 
-    /// `#[serial]` because the assertion reads the inherited PATH, and every
-    /// test that scrubs PATH process-globally carries that same default-key
-    /// annotation: `crate::acp::node`, `crate::acp::acp_client`, and
-    /// `crate::update::install`. Not an `EnvGuard` lock: none of them takes
-    /// `test_support::ENV_LOCK`.
+    /// Holds `ENV_LOCK` across the `PATH` read it hands to a child.
     #[test]
-    #[serial_test::serial]
     fn test_container_env_file_does_not_mutate_host_process_environment() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         let temp = tempfile::tempdir().unwrap();
         let host_output = temp.path().join("host-env");
         let payload_output = temp.path().join("container-env");

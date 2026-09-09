@@ -440,10 +440,9 @@ mod tests {
             eprintln!("skipping: node not on PATH");
             return;
         };
-        std::env::set_var("AOE_ACP_NODE", &p);
+        let _env = crate::session::test_support::EnvGuard::set(&[("AOE_ACP_NODE", &p)]);
         let temp = tempfile::tempdir().unwrap();
         let resolved = resolve("", temp.path()).expect("env var resolves");
-        std::env::remove_var("AOE_ACP_NODE");
         assert!(matches!(resolved.source, NodeSource::Env));
     }
 
@@ -452,17 +451,8 @@ mod tests {
     fn resolve_returns_no_node_with_unmatchable_settings() {
         // No PATH-side node, no env, no settings → NoNode.
         let temp = tempfile::tempdir().unwrap();
-        let saved_path = std::env::var_os("PATH");
-        let saved_env = std::env::var_os("AOE_ACP_NODE");
-        std::env::remove_var("PATH");
-        std::env::remove_var("AOE_ACP_NODE");
+        let _env = crate::session::test_support::EnvGuard::unset(&["PATH", "AOE_ACP_NODE"]);
         let result = resolve("", temp.path());
-        if let Some(p) = saved_path {
-            std::env::set_var("PATH", p);
-        }
-        if let Some(v) = saved_env {
-            std::env::set_var("AOE_ACP_NODE", v);
-        }
         assert!(matches!(result, Err(NodeError::NoNode(_))));
     }
 }
