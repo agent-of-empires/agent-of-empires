@@ -367,6 +367,18 @@ at that session's next start when it is fresher. To seed the sandboxes from a
 new host login instead, stop them, delete `sandbox-v2/.credentials.json` and
 start one.
 
+Claude Code writes the file itself, and empties `accessToken` and
+`refreshToken` in place when the credential it holds fails to authenticate.
+That reaches every sandbox at once, through the mount they share. A file whose
+tokens are both empty holds no credential, whatever expiry is left beside
+them, so it is seeded like any other at the next start or TUI refresh and the
+container that emptied it costs the rest of them nothing more than a seed.
+
+Two containers that refresh at the same moment off one token stay a hazard the
+shared file cannot remove: one refresh wins, the other is refused, and the
+container that lost empties the file. The token the winner obtained goes with
+it, and the sandboxes are seeded from the host at the next start or refresh.
+
 A container created before this layout mounts only its store, so a stopped
 one is recreated at its next start, as it was for the store move, and a
 running one refuses to relaunch until it is stopped. Running `/logout` inside

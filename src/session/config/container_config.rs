@@ -652,21 +652,33 @@ fn copy_dir_recursive_inner(
     Ok(())
 }
 
-/// Parse the `expiresAt` timestamp from a Claude Code credential JSON string.
-/// Returns `None` if the JSON is malformed or the field is missing/wrong type.
-fn parse_credential_expires_at(content: &str) -> Option<u64> {
-    let value: serde_json::Value = serde_json::from_str(content).ok()?;
-    value.get("claudeAiOauth")?.get("expiresAt")?.as_u64()
-}
-
 /// The furthest `expiresAt` a real token carries. The shared file is writable
 /// from inside every sandbox, so a planted timestamp beyond this would
 /// otherwise outrank every later login for good.
 const CREDENTIAL_EXPIRY_HORIZON: std::time::Duration =
     std::time::Duration::from_secs(400 * 24 * 60 * 60);
 
+/// The `expiresAt` of a credential a container could use, or `None` when the
+/// content is not one.
+///
+/// A blanked token block is not one. Claude Code empties `accessToken` and
+/// `refreshToken` in place when its credential fails to authenticate and
+/// keeps the rest of the block, so what it leaves still parses and can still
+/// carry an expiry (#3860). Read as a credential, that shell mounts dead into
+/// every later container and blocks the seed that would repair it.
 fn plausible_credential_expires_at(content: &str, now_ms: u64) -> Option<u64> {
-    parse_credential_expires_at(content).filter(|expires_at| {
+    let value: serde_json::Value = serde_json::from_str(content).ok()?;
+    let oauth = value.get("claudeAiOauth")?;
+    let filled = |field| {
+        oauth
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|token| !token.trim().is_empty())
+    };
+    if !filled("accessToken") && !filled("refreshToken") {
+        return None;
+    }
+    oauth.get("expiresAt")?.as_u64().filter(|expires_at| {
         *expires_at <= now_ms.saturating_add(CREDENTIAL_EXPIRY_HORIZON.as_millis() as u64)
     })
 }
@@ -4386,75 +4398,83 @@ mod tests {
 
     // --- credential freshness tests ---
 
-    #[test]
-    fn test_parse_credential_expires_at_valid() {
-        let json = r#"{"claudeAiOauth":{"expiresAt":1700000000}}"#;
-        assert_eq!(parse_credential_expires_at(json), Some(1700000000));
-    }
-
-    #[test]
-    fn test_parse_credential_expires_at_missing_key() {
-        // Missing claudeAiOauth entirely.
-        assert_eq!(parse_credential_expires_at(r#"{"other":"data"}"#), None);
-        // Missing expiresAt inside claudeAiOauth.
-        assert_eq!(
-            parse_credential_expires_at(r#"{"claudeAiOauth":{"token":"abc"}}"#),
-            None
-        );
-    }
-
-    #[test]
-    fn test_parse_credential_expires_at_invalid_json() {
-        assert_eq!(parse_credential_expires_at("not json at all"), None);
-        assert_eq!(parse_credential_expires_at(""), None);
-    }
-
-    #[test]
-    fn test_parse_credential_expires_at_wrong_type() {
-        // expiresAt is a string instead of a number.
-        let json = r#"{"claudeAiOauth":{"expiresAt":"1700000000"}}"#;
-        assert_eq!(parse_credential_expires_at(json), None);
-    }
-
-    #[test]
-    fn test_should_not_overwrite_with_stale_keychain() {
-        let sandbox = r#"{"claudeAiOauth":{"expiresAt":2000}}"#;
-        let keychain = r#"{"claudeAiOauth":{"expiresAt":1000}}"#;
-        assert!(!should_overwrite_credential(sandbox, keychain));
-    }
-
-    #[test]
-    fn test_should_overwrite_with_fresh_keychain() {
-        let sandbox = r#"{"claudeAiOauth":{"expiresAt":1000}}"#;
-        let keychain = r#"{"claudeAiOauth":{"expiresAt":2000}}"#;
-        assert!(should_overwrite_credential(sandbox, keychain));
-    }
-
-    #[test]
-    fn test_should_not_overwrite_equal_timestamps() {
-        let cred = r#"{"claudeAiOauth":{"expiresAt":1000}}"#;
-        assert!(!should_overwrite_credential(cred, cred));
-    }
-
-    #[test]
-    fn test_should_not_overwrite_when_keychain_unparseable() {
-        let sandbox = r#"{"claudeAiOauth":{"expiresAt":1000}}"#;
-        assert!(!should_overwrite_credential(sandbox, "not-json"));
-    }
-
-    #[test]
-    fn test_should_overwrite_when_both_unparseable() {
-        assert!(should_overwrite_credential("bad", "also-bad"));
-    }
-
-    #[test]
-    fn test_should_overwrite_when_only_keychain_parseable() {
-        let keychain = r#"{"claudeAiOauth":{"expiresAt":1000}}"#;
-        assert!(should_overwrite_credential("not-json", keychain));
-    }
-
+    /// Fields in the order `serde_json` writes them back, so a fold that
+    /// re-serializes a credential produces this string again.
     fn credential(expires_at: u64) -> String {
-        format!(r#"{{"claudeAiOauth":{{"expiresAt":{expires_at}}}}}"#)
+        format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"access-{expires_at}","expiresAt":{expires_at},"refreshToken":"refresh-{expires_at}"}}}}"#
+        )
+    }
+
+    /// What Claude Code leaves behind when its credential fails to
+    /// authenticate: both tokens emptied in place, the rest of the block kept.
+    fn blanked_credential(expires_at: u64) -> String {
+        format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"","expiresAt":{expires_at},"refreshToken":"","scopes":["user:inference"],"subscriptionType":"max"}}}}"#
+        )
+    }
+
+    #[test]
+    fn only_a_usable_credential_carries_an_expiry() {
+        let now = now_ms();
+        let horizon = CREDENTIAL_EXPIRY_HORIZON.as_millis() as u64;
+        let cases = [
+            (credential(1700000000), Some(1700000000)),
+            // Emptied tokens are not a credential, whatever expiry is left
+            // beside them (#3860).
+            (blanked_credential(1700000000), None),
+            (blanked_credential(0), None),
+            // Either token alone keeps a container going: an access token
+            // until it expires, a refresh token to get another.
+            (
+                r#"{"claudeAiOauth":{"accessToken":"a","expiresAt":10}}"#.into(),
+                Some(10),
+            ),
+            (
+                r#"{"claudeAiOauth":{"refreshToken":"r","expiresAt":10}}"#.into(),
+                Some(10),
+            ),
+            (r#"{"other":"data"}"#.into(), None),
+            (r#"{"claudeAiOauth":{"accessToken":"a"}}"#.into(), None),
+            (
+                r#"{"claudeAiOauth":{"accessToken":"a","expiresAt":"10"}}"#.into(),
+                None,
+            ),
+            ("not json at all".into(), None),
+            (String::new(), None),
+            // Planted from inside a sandbox to outrank every later login.
+            (credential(now + horizon + 1), None),
+        ];
+        for (content, expires_at) in cases {
+            assert_eq!(
+                plausible_credential_expires_at(&content, now),
+                expires_at,
+                "{content}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_freshest_credential_wins_an_overwrite() {
+        let cases = [
+            (credential(2000), credential(1000), false),
+            (credential(1000), credential(2000), true),
+            (credential(1000), credential(1000), false),
+            (credential(1000), "not-json".into(), false),
+            ("bad".into(), "also-bad".into(), true),
+            ("not-json".into(), credential(1000), true),
+            // A blanked file never outranks a credential however far its
+            // leftover expiry reaches, and a credential always replaces it.
+            (credential(1000), blanked_credential(9000), false),
+            (blanked_credential(9000), credential(1000), true),
+        ];
+        for (existing, incoming, overwrite) in cases {
+            assert_eq!(
+                should_overwrite_credential(&existing, &incoming),
+                overwrite,
+                "{existing} -> {incoming}"
+            );
+        }
     }
 
     #[test]
@@ -4629,6 +4649,50 @@ mod tests {
     }
 
     #[test]
+    fn an_emptied_shared_file_is_seeded_for_the_next_container() {
+        let home = TempDir::new().unwrap();
+        let host = home.path().join(".claude");
+        fs::create_dir_all(&host).unwrap();
+        let mount = claude_mount_without_keychain();
+        let root = host.join(SANDBOX_PRIVATE_SUBDIR);
+        let store = root.join("aaaaaaaaaaaaaaaa");
+        let shared = root.join(".credentials.json");
+        fs::create_dir_all(&store).unwrap();
+        let prepare = |fold| {
+            prepare_sandbox_dir_from(&mount, host.clone(), store.clone(), home.path(), fold)
+                .unwrap()
+        };
+
+        // A container whose credential fails to authenticate empties both
+        // tokens in place, through the mount every sandbox shares. The file
+        // it leaves keeps its expiry, and used to read as a credential no
+        // seed would replace: every container created afterwards came up on
+        // it and only deleting the file by hand got out (#3860). The next
+        // come-up seeds it now, and so does the poll, for the containers
+        // already running.
+        fs::write(host.join(".credentials.json"), credential(100)).unwrap();
+        for fold in [CredentialFold::SeedOnly, CredentialFold::Freshest] {
+            fs::write(&shared, blanked_credential(900)).unwrap();
+            prepare(fold);
+            let seeded = fs::read_to_string(&shared).unwrap();
+            assert!(holds_credential(&seeded), "{fold:?}");
+            assert_eq!(seeded, credential(100), "{fold:?}");
+        }
+
+        // The emptied file the container left is not a fresher credential
+        // than the one seeded over it, however far its leftover expiry
+        // reaches, so a second come-up does not put it back.
+        prepare(CredentialFold::Freshest);
+        assert_eq!(fs::read_to_string(&shared).unwrap(), credential(100));
+
+        // A copy a container emptied in a store is not a candidate either: it
+        // would otherwise outrank the login it is folded against.
+        fs::write(store.join(".credentials.json"), blanked_credential(900)).unwrap();
+        prepare(CredentialFold::Freshest);
+        assert_eq!(fs::read_to_string(&shared).unwrap(), credential(100));
+    }
+
+    #[test]
     #[serial_test::serial]
     fn claude_sandboxes_share_one_credential_mount() {
         let (_hg, _, _tmp_base) = BaseGuard::ready();
@@ -4739,6 +4803,9 @@ mod tests {
             ("", credential(1)),
             ("{}", credential(1)),
             (&credential(2), credential(3)),
+            // Blanked in place by a container that failed to authenticate:
+            // the copy is the only chain left, so it stays (#3860).
+            (&blanked_credential(9), credential(1)),
         ] {
             fs::write(&shared, unfolded).unwrap();
             fs::write(&copy, &copy_content).unwrap();
