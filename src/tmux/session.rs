@@ -2670,7 +2670,7 @@ mod tests {
     /// `#[serial_test::serial]` key, so the global is exclusive for the
     /// guard's lifetime. Construct it only once a session exists: both
     /// `set-option -g` and `show-options -g` fail against a stopped server.
-    struct GlobalPaneBaseIndex(Option<String>);
+    struct GlobalPaneBaseIndex(String);
 
     impl GlobalPaneBaseIndex {
         fn set(value: &str) -> Self {
@@ -2689,6 +2689,13 @@ mod tests {
                 String::from_utf8_lossy(&read.stderr)
             );
             let previous = String::from_utf8_lossy(&read.stdout).trim().to_string();
+            // tmux prints the default rather than nothing, so an empty read
+            // means the option is not what this guard thinks it is; restoring
+            // `""` would leave the global at `value` for the rest of the run.
+            assert!(
+                !previous.is_empty(),
+                "tmux reported no global pane-base-index to restore"
+            );
             let applied = crate::tmux::tmux_command()
                 .args(["set-option", "-g", "pane-base-index", value])
                 .output()
@@ -2697,19 +2704,15 @@ mod tests {
                 applied.status.success(),
                 "failed to set a global pane-base-index of {value}"
             );
-            Self(Some(previous).filter(|previous| !previous.is_empty()))
+            Self(previous)
         }
     }
 
     impl Drop for GlobalPaneBaseIndex {
         fn drop(&mut self) {
-            // `-u` where the option had no value, so the restore never writes
-            // an empty string tmux would reject.
-            let restore = match &self.0 {
-                Some(previous) => vec!["set-option", "-g", "pane-base-index", previous],
-                None => vec!["set-option", "-gu", "pane-base-index"],
-            };
-            let _ = crate::tmux::tmux_command().args(restore).output();
+            let _ = crate::tmux::tmux_command()
+                .args(["set-option", "-g", "pane-base-index", &self.0])
+                .output();
         }
     }
 
@@ -5173,10 +5176,7 @@ mod tests {
         file.disarm();
     }
 
-    /// The assertion reads the inherited PATH and hands it to a child, so it
-    /// holds `ENV_LOCK` for that window. Since #3469 every process-global PATH
-    /// scrub goes through `EnvGuard`, so the lock excludes all of them;
-    /// `#[serial]` only ever excluded the ones sharing its key.
+    /// Holds `ENV_LOCK` across the `PATH` read it hands to a child.
     #[test]
     fn test_container_env_file_does_not_mutate_host_process_environment() {
         let _env = crate::session::test_support::EnvGuard::read_lock();

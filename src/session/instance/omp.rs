@@ -789,10 +789,7 @@ mod tests {
         std::env::join_paths(entries).expect("PATH entries contain no separator")
     }
 
-    /// Reads the inherited `PATH` to build the child's, so it holds
-    /// `ENV_LOCK` across that read. Since #3469 every process-global `PATH`
-    /// scrub takes the same lock, which is the exclusion `#[serial]` could not
-    /// give: it covered only the scrubbers sharing its key.
+    /// Holds `ENV_LOCK` across the `PATH` read that builds the child's.
     #[cfg(unix)]
     #[test]
     fn omp_capture_gate_executes_nested_stdin_scripts() {

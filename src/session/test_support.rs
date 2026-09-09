@@ -240,7 +240,6 @@ pub(crate) fn path_prepended(dir: &Path) -> EnvGuard {
 /// Install a PATH command that remains first after the test pane starts its
 /// login shell.
 pub(crate) fn install_login_shell_path_command(root: &Path, name: &str, script: &str) -> EnvGuard {
-    let guard = EnvGuard::read_lock();
     let bin = root.join("bin");
     std::fs::create_dir_all(&bin).expect("create test bin directory");
     let executable = bin.join(name);
@@ -261,17 +260,7 @@ pub(crate) fn install_login_shell_path_command(root: &Path, name: &str, script: 
         ),
     )
     .expect("write test login profile");
-    let path = std::env::join_paths(
-        std::iter::once(bin).chain(
-            std::env::var_os("PATH")
-                .iter()
-                .flat_map(|value| std::env::split_paths(value)),
-        ),
-    )
-    .expect("join test PATH");
-    guard
-        .and_set("PATH", path)
-        .and_set("SHELL", OsString::from("/bin/sh"))
+    path_prepended(&bin).and_set("SHELL", OsString::from("/bin/sh"))
 }
 
 /// Restores the process-global tied-worktree setting even when a test panics.

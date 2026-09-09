@@ -918,10 +918,8 @@ mod tests {
     /// `working_dir` inside the login shell's own script, after profile
     /// sourcing, so it wins regardless of what those files did.
     ///
-    /// No `#[serial]` key: since #3469 every process-global `PATH` mutation in
-    /// the crate goes through `EnvGuard`, so `ENV_LOCK` excludes them all for
-    /// this test's whole body. The lock is taken before the `which` so the
-    /// resolution is inside that window too.
+    /// Holds `ENV_LOCK` across the `PATH` read, which is why the lock is taken
+    /// before the `which` rather than after it.
     #[test]
     fn test_wrap_command_reasserts_working_dir_after_login_shell() {
         let _lock = EnvGuard::read_lock();

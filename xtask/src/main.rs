@@ -395,11 +395,20 @@ struct CliTree {
 impl CliTree {
     fn from_command(cmd: &clap::Command) -> Self {
         let mut tree = Self::default();
-        tree.walk(cmd, "");
+        tree.walk(cmd, "", false);
         tree
     }
 
-    fn walk(&mut self, cmd: &clap::Command, prefix: &str) {
+    /// Walks each spelling of each command, so a subcommand is recorded under
+    /// its parent's aliases as well as its parent's name. Recursing only under
+    /// the canonical name leaves `<alias> <sub>` in no set at all, and a parent
+    /// path followed by an unknown word reports as nonexistent: a red check on
+    /// correct documentation.
+    ///
+    /// `aliased` tracks whether any segment so far was an alias. One anywhere
+    /// in the path keeps the whole path out of the advisory, since `aoe grp
+    /// create` is not a documentation gap for `aoe group create`.
+    fn walk(&mut self, cmd: &clap::Command, prefix: &str, aliased: bool) {
         for sub in cmd.get_subcommands() {
             if sub.get_name() == "help" {
                 continue;
@@ -411,19 +420,21 @@ impl CliTree {
                     format!("{prefix} {name}")
                 }
             };
-            let path = join(sub.get_name());
-            if sub.has_subcommands() {
-                self.parents.insert(path.clone());
-            }
-            for alias in sub.get_all_aliases() {
-                let alias_path = join(alias);
+            let spellings = std::iter::once((sub.get_name(), false))
+                .chain(sub.get_all_aliases().map(|alias| (alias, true)));
+            for (name, is_alias) in spellings {
+                let path = join(name);
+                let aliased = aliased || is_alias;
                 if sub.has_subcommands() {
-                    self.parents.insert(alias_path.clone());
+                    self.parents.insert(path.clone());
                 }
-                self.aliases.insert(alias_path);
+                if aliased {
+                    self.aliases.insert(path.clone());
+                } else {
+                    self.commands.insert(path.clone());
+                }
+                self.walk(sub, &path, aliased);
             }
-            self.commands.insert(path.clone());
-            self.walk(sub, &path);
         }
     }
 
@@ -440,14 +451,32 @@ impl CliTree {
 /// `name: aoe` from reading as an invocation of whatever the next line
 /// starts with.
 fn code_spans(content: &str) -> Vec<&str> {
+    // Only a shell fence holds commands. A `json` or `text` fence is data, and
+    // the `#` truncation below would read a payload as a shell comment.
+    fn is_shell_fence(info: &str) -> bool {
+        matches!(
+            info.trim(),
+            "" | "sh" | "bash" | "shell" | "zsh" | "console" | "shell-session"
+        )
+    }
+
     let mut spans = Vec::new();
-    let mut in_fence = false;
+    // `Some(is_shell)` while inside a fence. Tracking "inside" separately from
+    // "is shell" is what keeps a `json` fence's closing marker from reading as
+    // the opening of a shell one and inverting every fence after it.
+    let mut fence: Option<bool> = None;
     for line in content.lines() {
-        if line.trim_start().starts_with("```") {
-            in_fence = !in_fence;
+        if let Some(info) = line.trim_start().strip_prefix("```") {
+            fence = match fence {
+                Some(_) => None,
+                None => Some(is_shell_fence(info)),
+            };
             continue;
         }
-        if in_fence {
+        if let Some(is_shell) = fence {
+            if !is_shell {
+                continue;
+            }
             // Truncated at `#`, which is a comment in every shell fence these
             // files use. Prose naming a command is common there and is not an
             // invocation; dropping the tail can only under-check, never
@@ -700,6 +729,17 @@ mod skill_check_tests {
             // Neither tilde fences nor indented blocks are code context here.
             ("~~~\naoe list\n~~~", &[]),
             ("    aoe list", &[]),
+            // A non-shell fence is data. Reading it as commands turned a
+            // sample payload or a prose block into a red check.
+            ("```json\n\"note\": \"aoe manages sessions\"\n```", &[]),
+            ("```text\naoe makes it easy to run agents\n```", &[]),
+            // Its closing marker must not open a shell fence: that inverts
+            // every fence after it, which silently drops real coverage.
+            (
+                "```json\n{}\n```\nprose aoe here\n```sh\naoe list\n```",
+                &["aoe list"],
+            ),
+            ("```json\n{}\n```\nRun `aoe list`.", &["aoe list"]),
         ];
         for (content, expected) in cases {
             assert_eq!(&code_spans(content), expected, "spans of {content:?}");
@@ -746,6 +786,35 @@ mod skill_check_tests {
             assert_eq!(referenced, set(credited), "credited for {content:?}");
             assert_eq!(reported, set(unknown), "reported for {content:?}");
         }
+    }
+
+    /// A parent reached through an alias still has subcommands. Before this,
+    /// `walk` recursed only under the canonical name, so `grp create` was in
+    /// neither `commands` nor `aliases`, `grp` resolved as a parent, and the
+    /// trailing word reported as a command that does not exist.
+    #[test]
+    fn aliases_expand_into_their_subcommand_paths() {
+        let cmd = clap::Command::new("aoe").subcommand(
+            clap::Command::new("group")
+                .alias("grp")
+                .subcommand(clap::Command::new("create").alias("new")),
+        );
+        let cli = CliTree::from_command(&cmd);
+        for path in ["group", "grp", "group create", "grp create", "grp new"] {
+            assert!(cli.is_known(path), "{path} must resolve");
+        }
+        assert_eq!(
+            cli.commands,
+            set(&["group", "group create"]),
+            "only the fully canonical paths belong in the advisory"
+        );
+        // The parent rule still has to catch a bad subcommand under the alias.
+        let (credited, unknown) = check_invocations("`aoe grp bogusverb`", &cli);
+        assert!(credited.is_empty());
+        assert_eq!(unknown, set(&["grp bogusverb"]));
+        // And a real one through the alias must stay silent.
+        let (credited, unknown) = check_invocations("`aoe grp create mygroup`", &cli);
+        assert!(credited.is_empty() && unknown.is_empty());
     }
 
     #[test]
