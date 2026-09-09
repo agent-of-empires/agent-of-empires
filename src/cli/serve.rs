@@ -26,7 +26,7 @@ impl AuthMode {
     /// match arms are kept in lockstep with clap's `value(rename_all =
     /// "lowercase")` derive by the `auth_mode_cli_str_matches_clap`
     /// unit test, which round-trips each string through `ValueEnum`.
-    fn as_cli_str(self) -> &'static str {
+    pub(crate) fn as_cli_str(self) -> &'static str {
         match self {
             AuthMode::Token => "token",
             AuthMode::Passphrase => "passphrase",
@@ -1096,7 +1096,7 @@ pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
         profile,
         host: &host,
         port: args.resolved_port(),
-        no_auth: matches!(auth_mode, AuthMode::Passphrase | AuthMode::None),
+        auth_mode,
         read_only: args.read_only,
         remote: args.remote,
         tunnel_name: args.tunnel_name.as_deref(),

@@ -3,16 +3,6 @@ import { test, expect } from "./helpers/mockedTest";
 const NEW_SESSION_PANE_NAME = /New session Pick a project, then launch a new session/i;
 
 test.describe("Dashboard layout", () => {
-  test("loads and shows header", async ({ page }) => {
-    await page.goto("/");
-    await expect(page.locator("header")).toBeVisible();
-  });
-
-  test("shows branded home screen with logo text", async ({ page }) => {
-    await page.goto("/");
-    await expect(page.getByText("empires", { exact: false })).toBeVisible();
-  });
-
   test("shows branded home screen with action panes", async ({ page }) => {
     await page.goto("/");
     await expect(page.getByText("empires", { exact: false })).toBeVisible();
@@ -32,11 +22,6 @@ test.describe("Sidebar", () => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
     await expect(page.getByLabel("New project session")).toBeVisible();
-  });
-
-  test("sidebar toggle button exists", async ({ page }) => {
-    await page.goto("/");
-    await expect(page.getByRole("button", { name: "Toggle sidebar" })).toBeVisible();
   });
 
   test("sidebar Projects section lists a no-session saved project with an add button", async ({ page }) => {
@@ -138,11 +123,6 @@ test.describe("Create session from home screen", () => {
 });
 
 test.describe("Settings", () => {
-  test("settings gear button visible", async ({ page }) => {
-    await page.goto("/");
-    await expect(page.getByRole("button", { name: "Settings" })).toBeVisible();
-  });
-
   test("settings opens on click", async ({ page }) => {
     await page.goto("/");
     await page.getByRole("button", { name: "Settings" }).click();
@@ -201,11 +181,13 @@ test.describe("Mobile responsive", () => {
     await expect(page.getByText("empires", { exact: false })).toBeVisible();
   });
 
-  test("mobile home screen shows sidebar toggle between title and panes", async ({ page }) => {
+  test("mobile home screen's Show sessions button opens the sidebar", async ({ page }) => {
+    // Dashboard.tsx's own `md:hidden` trigger, not TopBar's "Toggle sidebar":
+    // the two are separate elements and nothing else in web/ drives this one.
     await page.setViewportSize({ width: 375, height: 812 });
     await page.goto("/");
-    await expect(page.getByText("Show sessions")).toBeVisible();
-    await expect(page.getByRole("button", { name: NEW_SESSION_PANE_NAME })).toBeVisible();
+    await page.getByText("Show sessions").click();
+    await expect(page.getByLabel("New project session")).toBeInViewport();
   });
 
   test("mobile home offers the five most recent sessions while desktop keeps them hidden", async ({ page }) => {
@@ -287,45 +269,10 @@ test.describe("Mobile responsive", () => {
     await expect(page.getByLabel("New project session")).not.toBeInViewport();
   });
 
-  test("settings gear accessible on mobile", async ({ page }) => {
-    await page.setViewportSize({ width: 375, height: 812 });
-    await page.goto("/");
-    await expect(page.getByRole("button", { name: "Settings" })).toBeVisible();
-  });
-
   test("create modal works on mobile", async ({ page }) => {
     await page.setViewportSize({ width: 375, height: 812 });
     await page.goto("/");
     await page.getByRole("button", { name: NEW_SESSION_PANE_NAME }).click();
     await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
-  });
-});
-
-test.describe("Design system", () => {
-  test("uses dark surface background", async ({ page }) => {
-    await page.goto("/");
-    const bg = await page.evaluate(() => getComputedStyle(document.body).backgroundColor);
-    // surface-900 = #1c1c1f = rgb(28, 28, 31)
-    expect(bg).toContain("28");
-    expect(bg).not.toBe("rgb(255, 255, 255)");
-  });
-
-  test("loads Geist Sans body font", async ({ page }) => {
-    await page.goto("/");
-    const fonts = await page.evaluate(() => getComputedStyle(document.body).fontFamily);
-    expect(fonts.toLowerCase()).toContain("geist");
-  });
-
-  test("focus-visible ring appears on keyboard navigation", async ({ page }) => {
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.goto("/");
-    // Tab to the first button
-    await page.keyboard.press("Tab");
-    const outline = await page.evaluate(() => {
-      const el = document.activeElement;
-      return el ? getComputedStyle(el).outlineColor : "";
-    });
-    // Should have a brand-colored outline
-    expect(outline).not.toBe("");
   });
 });

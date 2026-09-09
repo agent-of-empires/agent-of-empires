@@ -1,7 +1,7 @@
 use super::*;
+use crate::daemon::PendingApproval;
 use crate::session::Status;
 use crate::tui::approval_poller::{ApprovalResolution, ApprovalResult};
-use crate::tui::daemon_status_poller::PendingApproval;
 use crate::tui::home::PermissionResponseTarget;
 
 fn add_session_with_tool(view: &mut HomeView, title: &str, tool: &str) -> String {

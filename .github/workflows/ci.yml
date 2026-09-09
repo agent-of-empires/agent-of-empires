@@ -146,6 +146,11 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check skill file references valid CLI commands
         run: cargo xtask check-skill
+      # The workspace declares no `default-members`, so every other `cargo
+      # test` in these workflows is scoped to the root package and these two
+      # members' tests ran nowhere (#3479). This job already builds xtask.
+      - name: Cargo test (non-default workspace members)
+        run: cargo test -p xtask -p aoe-plugin-api
 
   build-cache-selftest:
     name: Build Cache Self-Test

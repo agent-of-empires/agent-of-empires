@@ -570,22 +570,24 @@ async fn sessions_turn_send(
         // it cannot answer `agent_busy` for a session the caller may not see
         // (#3685).
         // Ownership is checked before the wake so a foreign session is never
-        // touched. The wake clears an idle-dormant (or manually stopped)
-        // park the same way a user prompt does: a turn is intent to continue,
-        // so the host resumes rather than refusing (#3686).
-        deps.session_service
-            .admits_turn(&caller, &req.session_id)
+        // touched, and the guard is claimed before it too, as the user prompt
+        // handlers do, so a Stop cannot overtake a turn the host just started
+        // (see `acp_cancel`). The wake clears an idle-dormant (or manually
+        // stopped) park the same way a user prompt does: a turn is intent to
+        // continue, so the host resumes rather than refusing (#3686).
+        let _submission = deps
+            .session_service
+            .admit_prompt_submission(&caller, &req.session_id)
             .await
             .map_err(|e| map_send_error(e.into()))?;
         let woke_idle_dormant = deps
             .session_service
             .touch_and_wake_on_prompt(&req.session_id)
             .await;
-        let (_submission, dispatch) = deps
+        let dispatch = deps
             .session_service
-            .begin_prompt_submission(&caller, &req.session_id, woke_idle_dormant)
-            .await
-            .map_err(|e| map_send_error(e.into()))?;
+            .prompt_dispatch_under_submission(&req.session_id, woke_idle_dormant)
+            .await;
         // A cold worker is not a refusal on this path: `send_turn` resumes it
         // and waits, which is how a scheduler wakes a session it created. The
         // turn gates are, because a second prompt at a busy non-steerable

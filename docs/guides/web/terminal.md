@@ -19,6 +19,8 @@ The terminal uses tmux for scrollback and selection, so copy and scroll work wit
 - **Scroll** with the mouse wheel (or a one-finger swipe on touch) through tmux scrollback. Touch scrolling follows the finger like any native list: drag down to look back through history, drag up to head back toward the live tail.
 - **Select** by click-dragging across the text. Dragging upward past the top edge scrolls into scrollback and extends the selection. Releasing the drag copies to your system clipboard automatically; no Ctrl/Cmd+C needed.
 
+While a selection touches the terminal the pane stops repainting, so the agent cannot rewrite the text under it mid-gesture. Dragging upward still reaches older scrollback: newly captured history loads in above the held rows. The agent keeps running; the **Back to live** button appears for as long as the view is held, and clearing the selection (or clicking that button) catches it back up. A full-screen mouse agent also gives up its grip on touch gestures while a selection is live, so the selection handles can be dragged.
+
 Mouse-enabled full-screen agents copy through OSC 52 instead: AoE forwards the agent's clipboard event through the live connection to the same browser clipboard path.
 
 Copy relies on the browser Clipboard API, which only works in a secure context: HTTPS (the remote-access tunnel modes) or `http://localhost`. On a plain-HTTP LAN/VPN origin the browser blocks clipboard writes, so the selection stays visible but is not copied. Firefox is best-effort (it lacks the async clipboard write); Chromium and Safari copy reliably.

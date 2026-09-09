@@ -536,13 +536,17 @@ pub struct HomeView {
     pub(super) system_health_tip_earned: bool,
     pub(super) system_health_discovered: bool,
 
-    // Structured (ACP) rows: the tmux poller above bails on them, so their
-    // status and pending approval nonces come from the daemon instead. See
-    // `daemon_status_poller`.
-    pub(super) daemon_status_poller: super::daemon_status_poller::DaemonStatusPoller,
-    pub(super) pending_daemon_status_refresh: bool,
-    pub(super) structured_pending_approvals:
-        HashMap<String, Vec<super::daemon_status_poller::PendingApproval>>,
+    // The sidebar's subscription to the daemon's session list. Structured
+    // (ACP) rows take their status from it; see `session_feed`.
+    pub(super) session_feed: super::session_feed::SessionFeed,
+    pub(super) pending_session_feed: bool,
+    /// `session.daemon_sidebar`: whether the feed runs at all.
+    pub(super) daemon_sidebar: bool,
+    pub(super) sidebar_source: super::session_feed::SidebarSource,
+    // Structured (ACP) rows also surface their pending approval nonces from
+    // the daemon; the home permission dialog resolves them. See
+    // `structured_approval_poller`.
+    pub(super) structured_pending_approvals: HashMap<String, Vec<crate::daemon::PendingApproval>>,
     pub(super) structured_approval_poller: super::approval_poller::StructuredApprovalPoller,
 
     // Performance: background deletion

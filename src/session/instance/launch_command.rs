@@ -918,17 +918,11 @@ mod tests {
     /// `working_dir` inside the login shell's own script, after profile
     /// sourcing, so it wins regardless of what those files did.
     ///
-    /// `#[serial]` on the default key, not `shell_env`: this resolves `bash`
-    /// through the inherited `PATH`, and every test that mutates `PATH`
-    /// process-globally (`update::install`, `acp::node`, `acp::acp_client`)
-    /// carries the default key, so `shell_env` bought no exclusion against
-    /// them. Since #3421 a scrub racing the `which` is a silent skip rather
-    /// than a failure. The `shell_env` holder this stops excluding touches
-    /// only `TERM`/`COLORTERM`/`FORCE_COLOR`/`NO_COLOR`, and `Command`
-    /// snapshots the environment at spawn, so the exposure is that instant.
+    /// Holds `ENV_LOCK` across the `PATH` read, which is why the lock is taken
+    /// before the `which` rather than after it.
     #[test]
-    #[serial_test::serial]
     fn test_wrap_command_reasserts_working_dir_after_login_shell() {
+        let _lock = EnvGuard::read_lock();
         // The wrapper execs `$SHELL`, so it has to be a shell that exists here.
         let Ok(bash) = which::which("bash") else {
             eprintln!("skipping: bash not found on PATH");
