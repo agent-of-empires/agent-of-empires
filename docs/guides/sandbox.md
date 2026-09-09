@@ -16,7 +16,8 @@ Docker sandboxing runs your AI coding agents (Claude Code, OpenCode, Mistral Vib
 
 Agent credentials are seeded from the host config into a private per-session
 sandbox directory, so agents authenticate without re-login. Containers do not
-share a writable agent store.
+share a writable agent store; Claude Code's credential file is the one
+exception, see [Shared credentials](#shared-credentials).
 
 ## CLI vs TUI Behavior
 
@@ -150,6 +151,8 @@ volume_ignores_strategy = "named"
 | `~/.gitconfig` | `/root/.gitconfig` | RO | Git config |
 | `~/.ssh/` | `/root/.ssh/` | RO | SSH keys |
 | `~/.config/opencode/` | `/root/.config/opencode/` | RO | OpenCode config |
+| `<agent config>/sandbox-v2/<instance-id>/` | the agent's config path, e.g. `/root/.claude/` | RW | [Per-session agent store](#per-session-agent-stores) |
+| `~/.claude/sandbox-v2/.credentials.json` | `/root/.claude/.credentials.json` | RW | [Shared Claude Code credential](#shared-credentials) |
 
 ## Environment Variables
 
@@ -311,9 +314,17 @@ example `~/.claude/sandbox`). Each one moves when you start it: AoE copies the
 shared store into that session's private directory, removes its stopped
 container so the next launch mounts the copy, and deletes the shared store once
 every session that used it has moved (the private copies are the data from then
-on). A large store takes a while, so the first start of a session is slower
-than usual; the TUI shows the copy's progress on its status line and opens the
-session once it is done, and a plain `aoe` start says how many sessions still
+on). For an agent whose sessions already had a private store of their own, the
+copy takes the shared store's top-level files, its credentials, config and
+state, and not its directories: caches, logs, plugin trees and conversation
+history belonging to no one session. Those stay where they are rather than
+being replicated into every session, so if any are left the shared store is
+kept rather than deleted and AoE names it when the move finishes; remove it
+yourself once you no longer want it. A store with nothing left in it is
+deleted as before. A large store takes a while, so the first start of a
+session is slower than usual; the TUI shows the copy's progress on its status
+line and opens the session once it is done, and a plain `aoe` start says how
+many sessions still
 have the move ahead of them. A session whose container is still running is
 skipped and moved on a later start, after it stops. Trashed and archived sessions stay on the shared
 store. Starting one moves it; restoring or unarchiving alone does not, so run
@@ -333,6 +344,55 @@ one of them is started or brought back.
 container is still running carries on unaffected, on the shared store. One
 whose container is stopped cannot start until its store has moved, so drop the
 variable or run `aoe migrate` before launching it.
+
+### Shared credentials
+
+Claude Code rotates its refresh token every time it refreshes, and the old
+token stops working. A per-session copy of `.credentials.json` therefore logs
+out as soon as any other copy refreshes, and logging in inside one container
+would fix only that container. So every Claude Code session mounts the one
+`sandbox-v2/.credentials.json` at its config path instead of keeping a copy in
+its store, and a refresh or login in any container is seen by the rest.
+
+Each start folds the freshest credential into that file: the Keychain entry on
+macOS, `~/.claude/.credentials.json` elsewhere, and any copy left in the
+session's store by an earlier layout, each taken only when its expiry is later
+than what the file holds. Logging in on the host and starting or restarting
+one sandboxed session re-authenticates all of them; a login made inside a
+container is never overwritten by a staler host copy. The host itself stays a
+separate chain: a refresh inside a sandbox still rotates the token the host
+holds, as it did before. A container created before this layout mounts only
+its store, so a stopped one is recreated at its next start, as it was for the
+store move, and a running one refuses to relaunch until it is stopped. Running
+`/logout` inside a sandbox revokes the token for every sandbox but cannot
+remove the mounted file, so the revoked token stays there until the next
+login.
+
+### Reclaiming stores
+
+Permanently deleting a sandboxed session removes its store along with its
+container. Stores stranded before that, by a delete that kept the container, or
+by a delete that failed part-way and kept the session, are found by their
+instance id resolving in no profile:
+
+```bash
+aoe sandbox reclaim            # report what would go, and how much it frees
+aoe sandbox reclaim --delete   # remove it
+```
+
+The report is the default because a store holds a copy of the agent's
+credentials. A store is removed only when no container for it exists under any
+installed runtime: a stopped container can be started again, and nothing a
+reclaim can hold would stop it. A store is also kept when a runtime cannot be
+asked, and when it was written to in the last fifteen minutes, since a store is
+seeded before the session that owns it is recorded. The pass refuses to run
+while a store move is in flight.
+
+A session still on the shared legacy store has no private store of its own, so
+deleting it removes its container but leaves that shared store to the
+migration. The Claude Code credential file at `sandbox-v2/.credentials.json`
+belongs to no session and is not reclaimed; remove it yourself once the last
+Claude Code sandbox is gone.
 
 ## Worktrees and Sandboxing
 

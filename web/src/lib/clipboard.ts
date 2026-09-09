@@ -1,10 +1,64 @@
+/** Wrap pasted text in bracketed-paste markers so an agent treats embedded
+ *  newlines as part of one paste rather than per-line submits.
+ *
+ *  The web input path cannot see whether the pane enabled DECSET 2004, so a
+ *  raw shell or simple REPL receives the markers as text and shows `00~` /
+ *  `01~` around the paste. The TUI avoids this by pasting through tmux
+ *  (`Session::paste_text`); routing web pastes the same way is the fix. */
+export function bracketedPaste(text: string): string {
+  return `\x1b[200~${text}\x1b[201~`;
+}
+
+const CLIPBOARD_TEXT_TYPES = ["text/plain", "text/uri-list", "text/html"] as const;
+
+// GitHub's "Copy link" buttons (and many Mac copy-link UIs) write
+// text/uri-list only, no text/plain, so a text/plain-only reader sees an
+// empty clipboard.
+function normalizeClipboardData(type: string, raw: string): string {
+  if (type === "text/uri-list") {
+    // CRLF-separated URLs with `#` comment lines.
+    return raw
+      .split(/\r?\n/)
+      .filter((l) => l && !l.startsWith("#"))
+      .join("\n");
+  }
+  if (type === "text/html") {
+    const doc = new DOMParser().parseFromString(raw, "text/html");
+    const href = doc.querySelector("a[href]")?.getAttribute("href");
+    return href || (doc.body?.textContent?.trim() ?? "");
+  }
+  return raw;
+}
+
+/** Read the clipboard as plain text from a user gesture, or "" when the
+ *  browser refuses or it is empty. The async Clipboard API exists only in
+ *  secure contexts; iOS shows its own Paste confirmation and rejects if the
+ *  user dismisses it. */
+export async function readClipboardText(): Promise<string> {
+  if (!window.isSecureContext) return "";
+  try {
+    if (navigator.clipboard?.read) {
+      for (const item of await navigator.clipboard.read()) {
+        for (const type of CLIPBOARD_TEXT_TYPES) {
+          if (!item.types.includes(type)) continue;
+          const text = normalizeClipboardData(type, await (await item.getType(type)).text());
+          if (text) return text;
+        }
+      }
+      return "";
+    }
+    return (await navigator.clipboard?.readText?.()) ?? "";
+  } catch {
+    return "";
+  }
+}
+
 /** Write `text` to the clipboard, returning whether it succeeded.
  *
  *  Prefers the async Clipboard API, but that is only defined in secure
  *  contexts (HTTPS or `localhost`). `aoe serve` is frequently reached
  *  over plain HTTP on a LAN or Tailscale IP, where `navigator.clipboard`
- *  is `undefined`, so fall back to a hidden-textarea `execCommand("copy")`
- *  (same approach the mobile terminal toolbar uses for its paste path). */
+ *  is `undefined`, so fall back to a hidden-textarea `execCommand("copy")`. */
 export async function writeClipboard(text: string): Promise<boolean> {
   if (window.isSecureContext && navigator.clipboard?.writeText) {
     try {

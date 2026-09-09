@@ -22,6 +22,7 @@ use super::profile::ProfileCommands;
 use super::project::ProjectCommands;
 use super::ps::PsArgs;
 use super::remove::RemoveArgs;
+use super::sandbox::SandboxCommands;
 use super::send::SendArgs;
 use super::serve::ServeArgs;
 use super::session::SessionCommands;
@@ -152,6 +153,12 @@ pub enum Commands {
         command: ProjectCommands,
     },
 
+    /// Inspect and reclaim per-session sandbox agent stores
+    Sandbox {
+        #[command(subcommand)]
+        command: SandboxCommands,
+    },
+
     /// Manage git worktrees for parallel development
     Worktree {
         #[command(subcommand)]
@@ -275,6 +282,7 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
     "plugin",
     "profile",
     "project",
+    "sandbox",
     "worktree",
     "tmux",
     "sounds",
@@ -323,6 +331,7 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         Commands::Plugin { .. } => "plugin",
         Commands::Profile { .. } => "profile",
         Commands::Project { .. } => "project",
+        Commands::Sandbox { .. } => "sandbox",
         Commands::Worktree { .. } => "worktree",
         Commands::Tmux { .. } => "tmux",
         Commands::Sounds { .. } => "sounds",

@@ -22,7 +22,6 @@ use crate::acp::protocol::{
     FilesResponse, PromptAttachmentUpload, PromptRequest, ReplayQuery, ReplayResponse,
     ResolveApprovalRequest, SwitchAgentRequest, SwitchAgentResponse,
 };
-use crate::acp::state::{Event, RateLimitInfo};
 use crate::acp::supervisor::SupervisorError;
 use crate::daemon::PromptAttachmentKind;
 use crate::server::session_service::{SendTurnError, SessionCaller};
@@ -34,6 +33,12 @@ const MAX_ATTACHMENTS: usize = 8;
 const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
 /// Maximum decoded size of all attachments on one prompt (20 MiB).
 const MAX_TOTAL_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+
+/// How long `acp_cancel` may wait on the session's prompt submission before it
+/// says so. Well over the sub-millisecond claim on an idle daemon and over a
+/// same-gesture prompt's own handler on a loaded one, so this fires for a Stop
+/// queued behind something else. See `acp_cancel`.
+const CANCEL_SUBMISSION_WAIT_WARN: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Startup-error banner text for a failed detached structured-view spawn,
 /// shared by the create-path (`create_session`) and enable-path
@@ -222,28 +227,25 @@ pub(crate) fn validate_attachments(
     Ok(blobs)
 }
 
+/// The resume-at instant a manual RESUME NOW breadcrumb carries, from the
+/// session's durable park (#3514: a failed auto-resume's startup error must
+/// not hide it). #3688: an exhausted-retries park also continues the
+/// interrupted turn on manual resume; no schedule applies, so the marker is
+/// only the resume-at instant.
 fn rate_limit_resume_marker_resets_at(
-    latest_status: Option<&Event>,
-    latest_rate_limit: Option<&RateLimitInfo>,
+    park: Option<&crate::acp::event_store::RateLimitPark>,
     fallback_resets_at: DateTime<Utc>,
 ) -> Option<DateTime<Utc>> {
-    // #3688: an exhausted-retries park also continues the interrupted turn
-    // on manual resume. No schedule applies (the reconciler already gave
-    // up), so the marker's timestamp is only the resume-at instant the
-    // breadcrumb reports.
-    match latest_status {
-        Some(Event::Stopped { reason }) if reason == "rate_limited" => Some(
-            latest_rate_limit
-                .and_then(|info| info.resets_at)
-                .unwrap_or(fallback_resets_at),
-        ),
-        Some(Event::Stopped { reason })
-            if reason == crate::server::acp_reconciler::RATE_LIMIT_EXHAUSTED_RETRIES_REASON =>
-        {
-            Some(fallback_resets_at)
-        }
-        _ => None,
+    let park = park?;
+    if park.cap_reached {
+        return Some(fallback_resets_at);
     }
+    Some(
+        park.info
+            .as_ref()
+            .and_then(|info| info.resets_at)
+            .unwrap_or(fallback_resets_at),
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -314,7 +316,7 @@ fn supervisor_error_response(context: &str, err: &SupervisorError) -> axum::resp
             "structured view worker already running for session",
         )
             .into_response(),
-        SupervisorError::CapacityFull { .. } => {
+        SupervisorError::CapacityFull { .. } | SupervisorError::TeardownPending(_) => {
             (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response()
         }
         // 503, not 500: the worker's connection task has ended but its
@@ -332,9 +334,21 @@ fn supervisor_error_response(context: &str, err: &SupervisorError) -> axum::resp
             format!("worker_not_ready: {context}: {err}"),
         )
             .into_response(),
-        SupervisorError::Acp(_)
-        | SupervisorError::InvalidAgentCommand(_)
-        | SupervisorError::SpawnCancelled(_) => (
+        // The handshake itself hit the provider limit; the session is parked
+        // on it, which is the outcome the caller sees in the payload.
+        SupervisorError::Acp(AcpError::RateLimited(_)) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("rate_limited: {context}: {err}"),
+        )
+            .into_response(),
+        // A stop landed while the worker was coming up; the caller's spawn
+        // did not fail, it was superseded, and the session is stopped.
+        SupervisorError::SpawnCancelled(_) => (
+            StatusCode::CONFLICT,
+            format!("spawn_cancelled: {context}: {err}"),
+        )
+            .into_response(),
+        SupervisorError::Acp(_) | SupervisorError::InvalidAgentCommand(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("{context}: {err}"),
         )
@@ -448,15 +462,8 @@ pub async fn spawn_acp(
         let store = Arc::clone(&state.acp_event_store);
         let id_for_probe = id.clone();
         tokio::task::spawn_blocking(move || {
-            let latest_status = store.latest_status_event(&id_for_probe);
-            let latest_rate_limit = store
-                .latest_rate_limit_event(&id_for_probe)
-                .map(|(info, _created_at)| info);
-            rate_limit_resume_marker_resets_at(
-                latest_status.as_ref(),
-                latest_rate_limit.as_ref(),
-                Utc::now(),
-            )
+            let park = store.rate_limit_park(&id_for_probe);
+            rate_limit_resume_marker_resets_at(park.as_ref(), Utc::now())
         })
         .await
         .unwrap_or_else(|e| {
@@ -465,6 +472,9 @@ pub async fn spawn_acp(
         })
     };
 
+    // An explicit resume overrides a stop kept from a resume that failed
+    // before it installed; only the reconciler's fallback must honor it.
+    state.acp_supervisor.forget_stale_cancel(&id);
     let spawn_result = state
         .acp_supervisor
         .spawn(crate::acp::supervisor::SpawnRequest {
@@ -1086,6 +1096,9 @@ pub async fn switch_acp_agent(
     let source_profile = Some(instance.source_profile.clone());
 
     let model = req.model.clone().or(instance.agent_model.clone());
+    // An explicit resume overrides a stop kept from a resume that failed
+    // before it installed; only the reconciler's fallback must honor it.
+    state.acp_supervisor.forget_stale_cancel(&id);
     let spawn_result = state
         .acp_supervisor
         .spawn(crate::acp::supervisor::SpawnRequest {
@@ -1207,122 +1220,6 @@ pub async fn switch_acp_agent(
     .into_response()
 }
 
-/// Touches the row's `last_accessed_at` on every prompt (a prompt is a
-/// user gesture, and structured rows have no other per-prompt recency
-/// writer since the intent stamp was dropped for #3465), then wakes a
-/// sunk row: archived_at/snoozed_until are cleared and an idle-dormant
-/// worker respawns; the frontend's queue drains as soon as the fresh
-/// `AcpSessionAssigned` lands. The idle_dormant clear is the wake path for
-/// auto-stopped idle workers (#1689); a worker reaped for inactivity
-/// respawns on the next prompt. See #1581.
-///
-/// The in-memory mutation and the disk persistence are both held under
-/// `state.instance_lock(&id)` so they serialize against other
-/// session-mutating endpoints (archive / snooze / pin / rename) on the
-/// same id. Without this guard, a concurrent archive PATCH could
-/// interleave with the touch and produce a lost write (archive sets
-/// archived_at = Some, touch clears it, archive's persist lands first,
-/// touch's persist lands second and overwrites the archive). The lock is
-/// dropped before the caller reaches the supervisor: publish/send take
-/// their own locks downstream and holding ours across the agent forward
-/// would serialize prompts unnecessarily and stall siblings.
-/// Returns whether the wake cleared an idle-dormant marker, so the caller
-/// can synchronously kick a background respawn (the reconciler's ~2s tick
-/// is too slow for the prompt that triggered the wake; see #1748).
-async fn touch_on_prompt_and_wake_if_sunk(state: &Arc<AppState>, id: &str) -> bool {
-    let inst_lock = state.instance_lock(id).await;
-    let _guard = inst_lock.lock().await;
-    let (found, wake, woke_idle_dormant) = {
-        let mut instances = state.instances.write().await;
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-            let was_idle_dormant = inst.is_idle_dormant();
-            let wake = inst.is_archived() || inst.is_snoozed() || was_idle_dormant;
-            // Memory side: a prompt is a user gesture, so refresh recency
-            // and lift sinks unconditionally.
-            inst.touch_last_accessed();
-            if was_idle_dormant {
-                // Pairs with the "auto-stopped idle structured view worker"
-                // info log in the reconciler's reap pass (#1689) so the
-                // stop/resume cycle is traceable in the daemon log.
-                tracing::info!(
-                    target: "acp.supervisor",
-                    session = %id,
-                    "waking idle-dormant structured view session on prompt; spawning a fresh worker"
-                );
-            }
-            (true, wake, was_idle_dormant)
-        } else {
-            (false, false, false)
-        }
-    };
-    if found {
-        let profile = {
-            let instances = state.instances.read().await;
-            instances
-                .iter()
-                .find(|i| i.id == id)
-                .map(|i| i.source_profile.clone())
-                .unwrap_or_default()
-        };
-        if let Ok(storage) = crate::session::Storage::new(&profile, state.file_watch.clone()) {
-            let id_clone = id.to_string();
-            let session_id_for_log = id.to_string();
-            match tokio::task::spawn_blocking(move || {
-                storage.update(|instances, _groups| {
-                    if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
-                        apply_prompt_persist_to_disk(inst, wake);
-                    }
-                    Ok(())
-                })
-            })
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::warn!(
-                    target: "http.api.acp",
-                    session = %session_id_for_log,
-                    "failed to save after prompt touch and wake: {e}"
-                ),
-                Err(join_err) => tracing::warn!(
-                    target: "http.api.acp",
-                    session = %session_id_for_log,
-                    "spawn_blocking join error during prompt touch save: {join_err}"
-                ),
-            }
-        }
-    }
-    woke_idle_dormant
-}
-
-/// Disk-side half of [`touch_on_prompt_and_wake_if_sunk`], mirroring onto disk
-/// whatever the memory side actually did. A waking prompt keeps touch semantics
-/// and lifts the sink; any other prompt advances recency monotonically and
-/// leaves sink state alone.
-///
-/// What the second tier buys, precisely: `wake` is computed from
-/// `state.instances`, so a daemon whose memory predates a peer's archive would
-/// otherwise clear a sink it has never observed. Tier 2 stops that, and only
-/// that.
-///
-/// It does NOT make this save path safe against #3465's wipe, and it was a
-/// mistake to claim otherwise. Advancing `last_accessed_at` on disk arms the
-/// very signal the wipe keys on: `merge_user_action_diff` computes
-/// `touched = self.last_accessed_at > pre.last_accessed_at`
-/// (`session/instance/merge.rs`) and clears `archived_at` / `snoozed_until` /
-/// `idle_dormant_since` when it holds, so a writer whose `pre` snapshot
-/// predates this advance still loses its archive one hop later. That is the
-/// documented invariant rather than a bug (a prompt is a real user gesture, and
-/// a real touch is meant to dethrone a concurrent archive); what #3465 was
-/// about is a *passive* stamp reaching the same arm with no gesture behind it.
-fn apply_prompt_persist_to_disk(disk: &mut crate::session::Instance, wake: bool) {
-    if wake {
-        disk.touch_last_accessed();
-    } else {
-        let now = chrono::Utc::now();
-        disk.last_accessed_at = disk.last_accessed_at.max(Some(now));
-    }
-}
-
 /// `POST /api/sessions/{id}/acp/prompt` success body.
 ///
 /// **Breaking**: this endpoint used to answer a bare 202 with no body. It now
@@ -1352,13 +1249,18 @@ pub async fn acp_prompt(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
-    let woke_idle_dormant = touch_on_prompt_and_wake_if_sunk(&state, &id).await;
-    {
-        let instances = state.instances.read().await;
-        if !instances.iter().any(|i| i.id == id) {
-            return (StatusCode::NOT_FOUND, "session not found").into_response();
-        }
-    }
+    // Claimed before the wake, not after it: everything below is window a
+    // concurrent `/acp/cancel` could pass through, and the wake takes
+    // `instance_lock`, which `prompt_submission` orders under this guard. See
+    // `acp_cancel`.
+    let Some(_submission) = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await
+    else {
+        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    };
+    let woke_idle_dormant = state.session_service.touch_and_wake_on_prompt(&id).await;
     // Decode + validate + capability-gate attachments BEFORE publishing
     // so a rejected prompt never leaves a half-rendered attachment in
     // the transcript (the publish path is otherwise authoritative). See
@@ -1368,21 +1270,18 @@ pub async fn acp_prompt(
         Ok(a) => a,
         Err((code, msg)) => return (code, msg).into_response(),
     };
-    // Claim the session's prompt-submission authority and decide under it, so
-    // every client follows the same send, steer, or queue rules and the
-    // decision and the dispatch it picks are one atomic step. Releasing
-    // between them let a queue drain read a fold this prompt had not published
-    // into yet, so both delivered and whichever lost the agent's race came
-    // back `agent_busy` after its queue row was already retired (#3621).
-    // `woke_idle_dormant` is passed rather than re-read: the wake above
-    // already cleared the marker, so the instance now says "awake".
-    let Ok((_submission, dispatch)) = state
+    // Decide the disposition under the guard we already hold, so every client
+    // follows the same send, steer, or queue rules and the decision and the
+    // dispatch it picks are one atomic step. Releasing between them let a
+    // queue drain read a fold this prompt had not published into yet, so both
+    // delivered and whichever lost the agent's race came back `agent_busy`
+    // after its queue row was already retired (#3621). `woke_idle_dormant` is
+    // passed rather than re-read: the wake above already cleared the marker,
+    // so the instance now says "awake".
+    let dispatch = state
         .session_service
-        .begin_prompt_submission(&SessionCaller::User, &id, woke_idle_dormant)
-        .await
-    else {
-        return (StatusCode::NOT_FOUND, "session not found").into_response();
-    };
+        .prompt_dispatch_under_submission(&id, woke_idle_dormant)
+        .await;
     // A fresh user prompt supersedes any queued rate-limit resume
     // continuation, so drop it before sending: otherwise the reconciler could
     // later replay the older interrupted prompt after this newer one (#3028).
@@ -1530,17 +1429,22 @@ pub async fn acp_prompt_diff_comments(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
-    let woke_idle_dormant = touch_on_prompt_and_wake_if_sunk(&state, &id).await;
     // This opens a turn (`UserDiffCommentsPrompt` folds to `turn_active`) just
     // as an ordinary prompt does, so it takes the same submission authority
-    // and settles the same disposition under it (#3621, #3649).
-    let Ok((_submission, dispatch)) = state
+    // and settles the same disposition under it (#3621, #3649), claimed before
+    // the wake for the reasons `acp_cancel` gives.
+    let Some(_submission) = state
         .session_service
-        .begin_prompt_submission(&SessionCaller::User, &id, woke_idle_dormant)
+        .prompt_submission_for_session(&id)
         .await
     else {
         return (StatusCode::NOT_FOUND, "session not found").into_response();
     };
+    let woke_idle_dormant = state.session_service.touch_and_wake_on_prompt(&id).await;
+    let dispatch = state
+        .session_service
+        .prompt_dispatch_under_submission(&id, woke_idle_dormant)
+        .await;
     // A typed diff-comments prompt has no queue row to park on, so anything
     // but send-or-steer is refused here rather than published and then
     // rejected asynchronously as `agent_busy`, which would strand the card in
@@ -1646,12 +1550,60 @@ pub async fn acp_attachment(
     }
 }
 
+/// Cancel the session's in-flight turn.
+///
+/// Ordered behind any prompt submission still in flight for this session.
+/// `/acp/prompt` and `/acp/cancel` are separate requests served on separate
+/// tasks, and they reach the agent by very different routes: the prompt path
+/// resumes the worker, awaits readiness and publishes `UserPromptSent` before
+/// it hands `ClientCmd::Prompt` to the connection task, while cancel goes
+/// almost straight to the command channel. A Stop pressed shortly after Enter
+/// therefore overtook its own prompt, and the agent saw `session/cancel` with
+/// nothing in flight followed by the `session/prompt` it was meant to stop:
+/// per ACP a cancel names no prompt, so the turn then ran to completion with
+/// the UI still showing Stop. The gap is the prompt handler's own duration,
+/// so a loaded host widens it from ~1ms to hundreds.
+///
+/// `prompt_submission_for_session` is the same guard every prompt-submitting
+/// surface claims, which `prompt_submission` documents as the session's
+/// ordering primitive. Taking it here restores the user's gesture order for every
+/// cancel client (the web composer, and `acp::client::http` for the TUI) at
+/// once, and the prompt handlers claim it before their wake so the whole
+/// submission sits inside the hold. It costs nothing on the common path, where
+/// no submission is in flight.
+///
+/// The guard is not only held by the user's own prompt, though: a queue drain
+/// can park on `WORKER_READY_TIMEOUT`, and a rename holds it across a worktree
+/// move. A cancel queued behind one of those publishes nothing while it waits,
+/// so the composer shows an unchanged spinner and no Force stop hatch (that
+/// needs `CancelRequested`, which only the connection task emits). Hence the
+/// warn below: a Stop that stalls should be legible in the log rather than
+/// arrive as a bug report. Dropping the guard early would shave the stall but
+/// reopen a window for a drain's prompt to slip in and be cancelled instead.
+///
+/// `force_end_turn` deliberately stays unguarded: it is the escape hatch for a
+/// wedged UI and must never queue.
 pub async fn acp_cancel(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     if let Some(resp) = read_only_block(&state) {
         return resp;
+    }
+    let waited_from = std::time::Instant::now();
+    let _submission = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await;
+    let waited = waited_from.elapsed();
+    if waited >= CANCEL_SUBMISSION_WAIT_WARN {
+        tracing::warn!(
+            target: "http.api.acp",
+            session = %id,
+            waited_ms = waited.as_millis(),
+            "cancel waited on the session's prompt submission; the UI showed no \
+             progress for that long"
+        );
     }
     match state.acp_supervisor.cancel_prompt(&id).await {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
@@ -3048,6 +3000,7 @@ pub async fn list_claude_sessions(State(state): State<Arc<AppState>>) -> impl In
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::state::{Event, RateLimitInfo};
     use std::io::Write;
 
     fn utc_ts(raw: &str) -> DateTime<Utc> {
@@ -3542,7 +3495,7 @@ mod tests {
 
         // The 2s budget is far under the 10s `WORKER_READY_TIMEOUT` the
         // pre-fix handler holds the lock for, and far over the microseconds
-        // `touch_on_prompt_and_wake_if_sunk` holds it now.
+        // `SessionService::touch_and_wake_on_prompt` holds it now.
         let inst_lock = state.instance_lock(&id).await;
         let acquired = tokio::time::timeout(Duration::from_secs(2), inst_lock.lock()).await;
         assert!(
@@ -3568,6 +3521,90 @@ mod tests {
         );
     }
 
+    /// A Stop pressed right after Enter must not overtake its own prompt.
+    ///
+    /// `/acp/prompt` and `/acp/cancel` are concurrent requests that reach the
+    /// agent by very different routes: the prompt path wakes, folds, publishes
+    /// and awaits worker readiness before it hands `ClientCmd::Prompt` to the
+    /// connection task, while cancel goes almost straight to the command
+    /// channel. Whenever cancel passed it, the agent saw `session/cancel` with
+    /// nothing in flight and then the very prompt it named; per ACP a cancel
+    /// names no prompt, so the turn ran to completion with the UI still on
+    /// Stop. The window is the prompt handler's own duration, so a loaded host
+    /// stretched it from ~1ms to hundreds and the live `composer-stop` spec
+    /// failed on whichever case clicked Stop without waiting for output first.
+    ///
+    /// Both halves of the ordering are pinned here, against a held guard
+    /// rather than a live agent: cancel must wait for it, and the prompt
+    /// handler must claim it before its first side effect (the wake, which is
+    /// what `last_accessed_at` records). A handler that claims later leaves
+    /// exactly that much window for a cancel to pass through.
+    #[tokio::test]
+    async fn cancel_and_prompt_serialize_on_the_submission_guard() {
+        use std::time::Duration;
+
+        let mut inst = crate::session::Instance::new("stop-order", "/tmp/aoe-stop-order");
+        inst.id = "sess-stop-order".to_string();
+        inst.view = crate::session::View::Structured;
+        assert!(
+            inst.last_accessed_at.is_none(),
+            "fresh instance is untouched"
+        );
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        // Stand in for a submission already in flight. There is no worker, so
+        // every path below fails fast once it gets past the guard.
+        let submission = state
+            .session_service
+            .prompt_submission_for_session(&id)
+            .await
+            .expect("seeded session must admit a submission");
+
+        let cancel = tokio::spawn({
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            async move { acp_cancel(State(state), Path(id)).await.into_response() }
+        });
+        let prompt = tokio::spawn({
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            async move {
+                acp_prompt(
+                    State(state),
+                    Path(id),
+                    Ok(Json(PromptRequest {
+                        text: "think about this".to_string(),
+                        attachments: Vec::new(),
+                        prompt_id: None,
+                    })),
+                )
+                .await
+                .into_response()
+            }
+        });
+
+        // 500ms is orders of magnitude over the microseconds either handler
+        // needs to reach the agent-facing work once it is past the guard.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !cancel.is_finished(),
+            "acp_cancel must wait for the in-flight submission instead of racing ahead of it"
+        );
+        assert!(
+            state.instances.read().await[0].last_accessed_at.is_none(),
+            "acp_prompt must claim the submission guard before it wakes the session"
+        );
+
+        drop(submission);
+        for handler in [cancel, prompt] {
+            tokio::time::timeout(Duration::from_secs(10), handler)
+                .await
+                .expect("both handlers must finish once the guard drops")
+                .expect("handler task must not panic");
+        }
+    }
+
     /// #3688: the recovery lives in `dispatch::decide`, not in one handler,
     /// so every admission site inherits it. Pinning it here rather than
     /// through a handler keeps the contract on the shared decision point:
@@ -3581,11 +3618,15 @@ mod tests {
         let state = crate::server::test_support::build_test_app_state(vec![inst]);
 
         // A worker-less session with no park parks the prompt, as ever.
-        let (guard, dispatch) = state
+        let guard = state
             .session_service
-            .begin_prompt_submission(&SessionCaller::User, &id, false)
+            .admit_prompt_submission(&SessionCaller::User, &id)
             .await
             .expect("session exists");
+        let dispatch = state
+            .session_service
+            .prompt_dispatch_under_submission(&id, false)
+            .await;
         assert_eq!(
             dispatch,
             crate::acp::dispatch::PromptDispatch::Queued {
@@ -3599,11 +3640,15 @@ mod tests {
             crate::server::acp_reconciler::RATE_LIMIT_EXHAUSTED_RETRIES_REASON,
             0,
         ));
-        let (_guard, dispatch) = state
+        let _guard = state
             .session_service
-            .begin_prompt_submission(&SessionCaller::User, &id, false)
+            .admit_prompt_submission(&SessionCaller::User, &id)
             .await
             .expect("session exists");
+        let dispatch = state
+            .session_service
+            .prompt_dispatch_under_submission(&id, false)
+            .await;
         assert_eq!(
             dispatch,
             crate::acp::dispatch::PromptDispatch::Sent,
@@ -4097,90 +4142,52 @@ mod tests {
         assert_eq!(rows_resp.lost, frames_resp.lost);
     }
 
+    /// The marker follows the durable park: none without one; the reported
+    /// reset when there is one; the fallback when the agent reported none
+    /// (#3152) or the cap parked the session terminally (#3688), where a
+    /// manual resume must still continue the interrupted turn.
     #[test]
-    fn rate_limit_resume_marker_requires_latest_rate_limit_park() {
+    fn rate_limit_resume_marker_follows_the_durable_park() {
+        use crate::acp::event_store::RateLimitPark;
         let fallback = utc_ts("2099-01-01T00:00:00Z");
-        assert_eq!(
-            rate_limit_resume_marker_resets_at(None, None, fallback),
-            None
-        );
-
-        let stopped = Event::Stopped {
-            reason: "user_stopped".to_string(),
-        };
-        assert_eq!(
-            rate_limit_resume_marker_resets_at(Some(&stopped), None, fallback),
-            None
-        );
-    }
-
-    #[test]
-    fn rate_limit_resume_marker_uses_latest_rate_limit_reset() {
-        let stopped = Event::Stopped {
-            reason: "rate_limited".to_string(),
-        };
         let resets_at = utc_ts("2099-02-03T04:05:06Z");
-        let fallback = utc_ts("2099-01-01T00:00:00Z");
-        let info = RateLimitInfo {
+        let info = |resets_at| RateLimitInfo {
             status: "limited".to_string(),
-            resets_at: Some(resets_at),
+            resets_at,
             kind: "rate_limit".to_string(),
         };
-
-        assert_eq!(
-            rate_limit_resume_marker_resets_at(Some(&stopped), Some(&info), fallback),
-            Some(resets_at)
-        );
-    }
-
-    #[test]
-    fn rate_limit_resume_marker_falls_back_when_rate_limit_event_missing() {
-        let stopped = Event::Stopped {
-            reason: "rate_limited".to_string(),
+        let park = |info, cap_reached| RateLimitPark {
+            info,
+            recorded_at_ms: 0,
+            cap_reached,
+            last_resume_attempt_ms: None,
         };
-        let fallback = utc_ts("2099-01-01T00:00:00Z");
-
-        assert_eq!(
-            rate_limit_resume_marker_resets_at(Some(&stopped), None, fallback),
-            Some(fallback)
-        );
-    }
-
-    /// #3688: an exhausted-retries park still resumes manually. The marker
-    /// gates whether the spawn path queues the interrupted prompt, so a
-    /// None here would leave RESUME NOW spawning an idle worker.
-    #[test]
-    fn rate_limit_resume_marker_covers_exhausted_retries_park() {
-        let stopped = Event::Stopped {
-            reason: "rate_limit_exhausted_retries".to_string(),
-        };
-        let fallback = utc_ts("2099-01-01T00:00:00Z");
-
-        assert_eq!(
-            rate_limit_resume_marker_resets_at(Some(&stopped), None, fallback),
-            Some(fallback)
-        );
-    }
-
-    /// The park exists but the agent reported no reset: the marker has to
-    /// fall through to the caller's fallback, or auto-resume loses its
-    /// schedule for exactly the sessions #3152 is about.
-    #[test]
-    fn rate_limit_resume_marker_falls_back_when_reset_unknown() {
-        let stopped = Event::Stopped {
-            reason: "rate_limited".to_string(),
-        };
-        let fallback = utc_ts("2099-01-01T00:00:00Z");
-        let info = RateLimitInfo {
-            status: "limited".to_string(),
-            resets_at: None,
-            kind: "rate_limit".to_string(),
-        };
-
-        assert_eq!(
-            rate_limit_resume_marker_resets_at(Some(&stopped), Some(&info), fallback),
-            Some(fallback)
-        );
+        let cases = [
+            ("no park", None, None),
+            (
+                "reported reset",
+                Some(park(Some(info(Some(resets_at))), false)),
+                Some(resets_at),
+            ),
+            (
+                "reset unknown",
+                Some(park(Some(info(None)), false)),
+                Some(fallback),
+            ),
+            ("limit row pruned", Some(park(None, false)), Some(fallback)),
+            (
+                "cap park",
+                Some(park(Some(info(Some(resets_at))), true)),
+                Some(fallback),
+            ),
+        ];
+        for (label, park, expected) in cases {
+            assert_eq!(
+                rate_limit_resume_marker_resets_at(park.as_ref(), fallback),
+                expected,
+                "{label}"
+            );
+        }
     }
 
     #[test]
@@ -4339,7 +4346,7 @@ mod tests {
         disk.last_accessed_at = Some(chrono::Utc::now() - chrono::Duration::seconds(60));
         disk.archived_at = Some(chrono::Utc::now() - chrono::Duration::seconds(30));
 
-        apply_prompt_persist_to_disk(&mut disk, false);
+        crate::server::session_service::apply_prompt_persist_to_disk(&mut disk, false);
 
         assert!(
             disk.archived_at.is_some(),
@@ -4354,7 +4361,7 @@ mod tests {
         disk.view = crate::session::View::Structured;
         disk.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::minutes(10));
 
-        apply_prompt_persist_to_disk(&mut disk, true);
+        crate::server::session_service::apply_prompt_persist_to_disk(&mut disk, true);
 
         assert!(
             disk.snoozed_until.is_none(),

@@ -25,21 +25,41 @@ async function openLiveView(page: Page, baseUrl: string) {
   await expect.poll(() => page.locator("[data-live-content]").innerText(), { timeout: 15_000 }).toContain(PROMPT);
 }
 
-/** Vertical distance (px) between the cursor overlay and the top of the
- *  rendered row containing the prompt. 0 means perfectly aligned. */
-async function cursorToPromptDelta(page: Page): Promise<number> {
+/** How many rendered rows carry the prompt, and where the cursor overlay sits
+ *  relative to the first of them, as a phrase rather than a boolean: an
+ *  asserted-equal object reports its mismatched value, so the offset that
+ *  identifies the fault survives into the failure message.
+ *
+ *  The count is asserted, not navigated around. The fixture's WINCH handler
+ *  redraws with a bare carriage return and never a newline, so the pane cannot
+ *  hold two prompt rows; a second one means the grid put the cursor on a row the
+ *  pane never had and the redraw landed there (#3824).
+ *
+ *  This supersedes #3826, which read that second row as a pre-resize prompt left
+ *  behind in the scrollback and measured against the last match instead. It is
+ *  not scrollback: at the failing checkpoint tmux reports history_size=0 and a
+ *  single prompt row while the grid shows two. Measuring against the last match
+ *  made this spec pass with the grid-side duplicate still live. */
+async function promptAlignment(page: Page): Promise<{ promptRows: number; cursor: string }> {
   return page.evaluate((prompt) => {
     const content = document.querySelector("[data-live-content]");
     const cursor = document.querySelector("[data-live-cursor]");
-    if (!content || !cursor) return Number.NaN;
+    if (!content || !cursor) return { promptRows: -1, cursor: "no live content" };
     const rows = Array.from(content.children).filter((el) => !el.hasAttribute("data-live-cursor"));
-    const promptRow = rows.find((el) => (el.textContent ?? "").includes(prompt));
-    if (!promptRow) return Number.NaN;
-    const c = cursor.getBoundingClientRect();
-    const r = promptRow.getBoundingClientRect();
-    return c.top - r.top;
+    const promptRows = rows.filter((el) => (el.textContent ?? "").includes(prompt));
+    const promptRow = promptRows[0];
+    if (!promptRow) return { promptRows: 0, cursor: "no prompt row" };
+    const rect = promptRow.getBoundingClientRect();
+    const delta = cursor.getBoundingClientRect().top - rect.top;
+    const offBy = rect.height > 0 ? Math.round(delta / rect.height) : Number.NaN;
+    return {
+      promptRows: promptRows.length,
+      cursor: Math.abs(delta) < 2 ? "on the prompt row" : `${offBy} rows off (${delta.toFixed(1)}px)`,
+    };
   }, PROMPT);
 }
+
+const ON_PROMPT = { promptRows: 1, cursor: "on the prompt row" };
 
 async function takeOver(page: Page) {
   const banner = page.locator("[data-live-takeover]");
@@ -98,25 +118,25 @@ test("ownership ping-pong keeps the cursor on the prompt row", async ({ browser 
     await openLiveView(a, serve.baseUrl);
     // First client owns; no banner.
     await expect(a.locator("[data-live-takeover]")).toHaveCount(0);
-    await expect.poll(async () => Math.abs(await cursorToPromptDelta(a)), { timeout: 10_000 }).toBeLessThan(2);
+    await expect.poll(() => promptAlignment(a), { timeout: 10_000 }).toEqual(ON_PROMPT);
 
     await openLiveView(b, serve.baseUrl);
 
     // B takes over; A is demoted (banner) and B aligns.
     await takeOver(b);
     await a.locator("[data-live-takeover]").waitFor({ state: "visible", timeout: 10_000 });
-    await expect.poll(async () => Math.abs(await cursorToPromptDelta(b)), { timeout: 10_000 }).toBeLessThan(2);
+    await expect.poll(() => promptAlignment(b), { timeout: 10_000 }).toEqual(ON_PROMPT);
 
     // Two full take-back cycles: the reported bug was the cursor drifting
     // one row below the prompt on every take-back.
     for (let cycle = 0; cycle < 2; cycle++) {
       await takeOver(a);
       await b.locator("[data-live-takeover]").waitFor({ state: "visible", timeout: 10_000 });
-      await expect.poll(async () => Math.abs(await cursorToPromptDelta(a)), { timeout: 10_000 }).toBeLessThan(2);
+      await expect.poll(() => promptAlignment(a), { timeout: 10_000 }).toEqual(ON_PROMPT);
 
       await takeOver(b);
       await a.locator("[data-live-takeover]").waitFor({ state: "visible", timeout: 10_000 });
-      await expect.poll(async () => Math.abs(await cursorToPromptDelta(b)), { timeout: 10_000 }).toBeLessThan(2);
+      await expect.poll(() => promptAlignment(b), { timeout: 10_000 }).toEqual(ON_PROMPT);
     }
 
     await ctxA.close();
@@ -158,7 +178,7 @@ test("released lock auto-reclaims without another take-over tap", async ({ brows
     // NO tap; the cursor re-aligns once A's grid is re-asserted.
     await ctxB.close();
     await a.locator("[data-live-takeover]").waitFor({ state: "detached", timeout: 15_000 });
-    await expect.poll(async () => Math.abs(await cursorToPromptDelta(a)), { timeout: 10_000 }).toBeLessThan(2);
+    await expect.poll(() => promptAlignment(a), { timeout: 10_000 }).toEqual(ON_PROMPT);
 
     await ctxA.close();
   } finally {
