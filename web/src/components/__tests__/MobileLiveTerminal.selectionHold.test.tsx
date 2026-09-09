@@ -1,10 +1,7 @@
 // @vitest-environment jsdom
 //
-// A repainting agent rewrites a mounted row's text node in place, and the
-// DOM collapses any range whose endpoints sit inside it. Keeping the row
-// nodes mounted (#3830) does not help; the paint has to stop for the length
-// of the gesture. A full-screen agent repaints every row of every frame, so
-// without the hold a selection there never survives long enough to copy.
+// Select-to-copy over a full-screen agent, which repaints every row of every
+// frame. See useSelectionHold for why the paint has to stop.
 
 import { createRef } from "react";
 import { afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
@@ -45,7 +42,11 @@ beforeEach(() => {
 afterEach(() => {
   vi.useRealTimers();
   document.getSelection()?.removeAllRanges();
+  outside?.remove();
+  outside = null;
 });
+
+let outside: HTMLElement | null = null;
 
 // A full-screen agent: no scrollback, and the transcript slides up through a
 // fixed grid, so every screen row holds new text on the next frame.
@@ -131,7 +132,7 @@ it("holds the painted frame while a selection is live, then catches up", () => {
 });
 
 it("keeps painting when the selection is outside the terminal", () => {
-  const outside = document.createElement("p");
+  outside = document.createElement("p");
   outside.textContent = "elsewhere";
   document.body.append(outside);
   const { container, rerender } = mount(altFrame(1));
@@ -143,5 +144,19 @@ it("keeps painting when the selection is outside the terminal", () => {
   rerender(terminal(altFrame(2)));
 
   expect(container.querySelector("[data-live-content]")?.textContent).toContain("line 4");
-  outside.remove();
+});
+
+it("offers the back-to-live control while a frame is held, and releasing catches up", () => {
+  const { container, rerender } = mount(altFrame(1));
+  expect(screen.queryByLabelText("Back to live")).toBeNull();
+
+  selectRowText("line 2");
+  rerender(terminal(altFrame(2)));
+  const backToLive = screen.getByLabelText("Back to live");
+
+  act(() => backToLive.click());
+  rerender(terminal(altFrame(3)));
+
+  expect(document.getSelection()?.isCollapsed ?? true).toBe(true);
+  expect(container.querySelector("[data-live-content]")?.textContent).toContain("line 5");
 });

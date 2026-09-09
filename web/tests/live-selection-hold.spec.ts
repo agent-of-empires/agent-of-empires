@@ -1,13 +1,15 @@
 import { test, expect } from "./helpers/mockedTest";
 import { devices, type Page } from "@playwright/test";
 import { clickSidebarSession, openMobileSidebar } from "./helpers/sidebar";
-import { mockTerminalApis, installTerminalSpies, seedSettings, type MockHandle } from "./helpers/terminal-mocks";
+import { mockTerminalApis, installTerminalSpies, seedSettings } from "./helpers/terminal-mocks";
 
-// Select-to-copy over a full-screen agent. jsdom covers the hold itself
-// (MobileLiveTerminal.selectionHold.test.tsx); this is the real engine
-// agreeing that a range anchored inside a row's text node survives the
-// frames that land during the gesture. On iOS a collapsed range takes the
-// Copy callout down with it, so the selection surviving IS the feature.
+// Select-to-copy over a full-screen agent, driven end to end: a real
+// Selection over the production bundle, fed by frames off the live-ws route.
+// jsdom covers the hold's logic (MobileLiveTerminal.selectionHold.test.tsx)
+// and models the range collapse faithfully, so this is not the cheapest test
+// that catches the bug; it is here because the bug is Selection semantics and
+// jsdom only simulates those. The mocked suite is Chromium, so it says
+// nothing about the WebKit callout this ultimately exists for.
 test.use({ ...devices["iPhone 13"] });
 
 // A full-screen agent: no scrollback, and the transcript slides up through
@@ -39,7 +41,7 @@ test("a selection over a full-screen agent survives its repaints", async ({ page
   await page.locator("[data-live-terminal]").waitFor({ state: "visible", timeout: 10_000 });
   await expect.poll(() => handle.liveMessages.length, { timeout: 5_000 }).toBeGreaterThan(0);
 
-  handle.pushLiveFrame(altFrame(1) as Parameters<MockHandle["pushLiveFrame"]>[0]);
+  handle.pushLiveFrame(altFrame(1));
   await expect.poll(() => content(page).textContent()).toContain("line 1");
 
   // Both endpoints inside the row's text node, the way a long-press word
@@ -60,14 +62,14 @@ test("a selection over a full-screen agent survives its repaints", async ({ page
   });
   expect(await selection(page)).toBe("line 2");
 
-  handle.pushLiveFrame(altFrame(2) as Parameters<MockHandle["pushLiveFrame"]>[0]);
-  handle.pushLiveFrame(altFrame(3) as Parameters<MockHandle["pushLiveFrame"]>[0]);
+  handle.pushLiveFrame(altFrame(2));
+  handle.pushLiveFrame(altFrame(3));
   await page.waitForTimeout(300);
   expect(await selection(page)).toBe("line 2");
   await expect(content(page)).toContainText("line 1");
 
   // Letting go releases the hold and the view catches up to the live edge.
   await page.evaluate(() => window.getSelection()?.removeAllRanges());
-  handle.pushLiveFrame(altFrame(4) as Parameters<MockHandle["pushLiveFrame"]>[0]);
+  handle.pushLiveFrame(altFrame(4));
   await expect.poll(() => content(page).textContent()).toContain("line 6");
 });

@@ -645,11 +645,11 @@ export function MobileLiveTerminal({
     setFontSize(configuredFontSize);
   }
   const scrollerRef = useRef<HTMLDivElement>(null);
-  // A selection anywhere in the grid pins the painted frame until the user
-  // lets go, so no row is rewritten out from under the range. Everything
-  // below renders that held frame; only the stream acknowledgements read
-  // `streamFrame`.
-  const frame = useSelectionHold(streamFrame, scrollerRef);
+  // A selection touching the grid pins the painted frame until the user lets
+  // go, so no row is rewritten out from under the range (see the hook).
+  // Everything below renders that held frame; only the stream
+  // acknowledgements read `streamFrame`.
+  const { value: frame, held: selectionHeld } = useSelectionHold(streamFrame, scrollerRef);
   const measureRef = useRef<HTMLSpanElement>(null);
   const keyboardLayoutRef = useRef<KeyboardLayoutReader | null>(null);
   useEffect(() => {
@@ -703,8 +703,8 @@ export function MobileLiveTerminal({
   }, [remeasure]);
 
   // --- frame geometry -------------------------------------------------------
-  // `frame` always tracks the live stream; reading scrollback just widens
-  // the capture window (the hook owns that). Nothing is frozen.
+  // `frame` tracks the live stream except while a selection holds it; reading
+  // scrollback just widens the capture window (the hook owns that).
   const rowsRef = useRef(0);
   const readingRef = useRef(reading);
   useEffect(() => {
@@ -1078,6 +1078,9 @@ export function MobileLiveTerminal({
     const el = scrollerRef.current;
     if (el) el.scrollTop = liveScrollTarget(el);
     liveDetachedRef.current = false;
+    // Dropping the selection is what releases a held frame; a selection the
+    // user has stopped caring about would otherwise pin the view silently.
+    document.getSelection()?.removeAllRanges();
     returnToLive(rowsRef.current * LIVE_WINDOW_SCREENS);
   }, [returnToLive, liveScrollTarget]);
 
@@ -2098,7 +2101,7 @@ export function MobileLiveTerminal({
         </div>
       )}
 
-      {reading && (
+      {(reading || selectionHeld) && (
         <button
           type="button"
           onClick={jumpToLatest}

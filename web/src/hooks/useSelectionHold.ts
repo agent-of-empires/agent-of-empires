@@ -1,50 +1,59 @@
-import { useCallback, useState, useSyncExternalStore } from "react";
+import { useCallback, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
 import type { RefObject } from "react";
 
 /** Holds the rendered value still while the user holds a text selection
- *  inside `containerRef`, returning the value that was on screen when the
- *  selection began.
+ *  touching `containerRef`, returning the value that was on screen when the
+ *  selection began and whether the hold is in effect.
  *
- *  React updates a row whose text changed by rewriting its existing text
+ *  React updates an element whose text changed by rewriting its existing text
  *  node in place, and the DOM's replace-data steps collapse any range whose
- *  endpoints sit inside that node. Keeping row nodes mounted (#3830) is
- *  therefore not enough: an agent that repaints the row under the finger
- *  still destroys the selection, and on iOS that dismisses the Copy callout
- *  mid-gesture. A full-screen agent repaints every row of every frame, so
- *  there a selection never survives long enough to copy.
- *
- *  Freezing the paint for the length of the gesture is the terminal
- *  convention (tmux copy-mode does the same). The stream itself is
- *  untouched: the agent keeps running and the view catches up on release.
+ *  endpoints sit inside that node. Node identity never enters into it, so
+ *  keeping nodes mounted across a frame (#3830) is not enough on its own:
+ *  repainting the text under the finger destroys the selection, and on iOS
+ *  that dismisses the Copy callout mid-gesture. Freezing the paint for the
+ *  length of the gesture is the terminal convention, tmux copy-mode included.
  */
-export function useSelectionHold<T>(value: T, containerRef: RefObject<HTMLElement | null>): T {
+export function useSelectionHold<T>(
+  value: T,
+  containerRef: RefObject<HTMLElement | null>,
+): { value: T; held: boolean } {
   const subscribe = useCallback((onChange: () => void) => {
     document.addEventListener("selectionchange", onChange);
     return () => document.removeEventListener("selectionchange", onChange);
   }, []);
   // Read through useSyncExternalStore rather than from a selectionchange
-  // handler so the answer is re-derived during the render an arriving frame
+  // handler so the answer is re-derived during the render an arriving value
   // triggers. A handler's state update could still be queued at that point,
-  // and the frame would repaint over a selection made moments earlier.
+  // and that render would repaint over a selection made moments earlier.
+  // Either endpoint inside the container counts, so a drag that ends outside
+  // it is held too.
   const getSnapshot = useCallback(() => {
     const container = containerRef.current;
     const selection = document.getSelection();
     if (!container || !selection || selection.isCollapsed || selection.rangeCount === 0) return false;
-    return container.contains(selection.anchorNode) && container.contains(selection.focusNode);
+    return container.contains(selection.anchorNode) || container.contains(selection.focusNode);
   }, [containerRef]);
   const selecting = useSyncExternalStore(subscribe, getSnapshot, () => false);
 
-  // Adjust-state-during-render, as elsewhere in this tree. `painted` trails
-  // the last value rendered without a selection, so it is the frame the user
-  // selected against even when the selection and a new frame land together.
-  // The wrapper object distinguishes holding a null frame from not holding.
-  const [painted, setPainted] = useState(value);
+  // The last committed value. Trails `shown`, so at the render that first
+  // sees a selection it is the value the user selected against, even when
+  // the selection and a new value land in the same render.
+  const painted = useRef(value);
   const [held, setHeld] = useState<{ value: T } | null>(null);
   if (selecting) {
-    if (held === null) setHeld({ value: painted });
-  } else {
-    if (held !== null) setHeld(null);
-    if (painted !== value) setPainted(value);
+    // Adjust-state-during-render, as elsewhere in this tree. Reading the ref
+    // here is safe and deliberate: it is written only in the layout effect
+    // below, so it holds the same committed value for every pass of a render.
+    // Mirroring it in state instead costs a second render pass per streamed
+    // value, on the path this component is built to keep cheap.
+    // eslint-disable-next-line react-hooks/refs
+    if (held === null) setHeld({ value: painted.current });
+  } else if (held !== null) {
+    setHeld(null);
   }
-  return selecting && held ? held.value : value;
+  const shown = selecting && held ? held.value : value;
+  useLayoutEffect(() => {
+    painted.current = shown;
+  });
+  return { value: shown, held: selecting && held !== null };
 }
