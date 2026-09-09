@@ -3122,14 +3122,14 @@ impl App {
             .is_some_and(|v| v.session_id() == session_id)
         {
             self.activate_embedded();
-            self.drain_pending_paste_for_structured_view();
+            self.drain_pending_paste_for_structured_view().await;
             return Ok(());
         }
         match require_daemon().await {
             Ok(endpoint) => {
                 self.connect_embedded_structured(endpoint, session_id).await;
                 self.activate_embedded();
-                self.drain_pending_paste_for_structured_view();
+                self.drain_pending_paste_for_structured_view().await;
             }
             Err(ManagerError::NoDaemonRunning(_)) => {
                 self.home.prompt_start_daemon_for_structured(session_id);
@@ -3151,18 +3151,27 @@ impl App {
     }
 
     /// Drain buffered paste text into the structured composer after the view
-    /// activates.  Leaves the text in `pending_paste_for_structured_view`
-    /// when there is no mounted view (activation failed), so the next 'm'
-    /// press can still surface it.
-    fn drain_pending_paste_for_structured_view(&mut self) {
-        if let Some(buf) = self.home.pending_paste_for_structured_view.take() {
-            if let Some(view) = self.home.structured_preview.as_mut() {
-                view.paste_text(&buf);
-            } else {
-                // No mounted view: activation failed or was interrupted.
-                // Put the text back so the next 'm' press can drain it.
-                self.home.pending_paste_for_structured_view = Some(buf);
-            }
+    /// activates. The buffer is bound to the session it was captured for:
+    /// text only drains into a mounted view of that session, and it is kept
+    /// when there is no mounted view (activation failed) or the mounted view
+    /// belongs to another session, so the next 'm' press on the captured
+    /// session can still surface it.
+    async fn drain_pending_paste_for_structured_view(&mut self) {
+        let Some((target, buf)) = self.home.pending_paste_for_structured_view.clone() else {
+            return;
+        };
+        let matches_mounted = self
+            .home
+            .structured_preview
+            .as_ref()
+            .is_some_and(|v| v.session_id() == target);
+        if !matches_mounted {
+            // Activation failed or the mounted view is another session's:
+            // keep the buffer for the captured session.
+            return;
+        }
+        if let Some(view) = self.home.structured_preview.as_mut() {
+            view.paste_text_with_file_load(&buf).await;
         }
     }
 

@@ -227,9 +227,13 @@ impl EmbeddedView {
         render::wrapped_transcript(&self.state, &crate::tui::styles::Theme::default(), width)
     }
 
-    /// Paste text into the composer, focusing it if needed.
-    /// Used to forward buffered paste into the structured composer.
-    pub fn paste_text(&mut self, text: &str) {
+    /// Paste text into the composer, focusing it if needed, then load the
+    /// file index when the paste leaves an open `@`-mention. Mirrors the
+    /// interactive paste path (`CrosstermEvent::Paste`) so buffered paste
+    /// forwarded from the home view opens the mention picker in the same
+    /// state a direct paste would.
+    pub async fn paste_text_with_file_load(&mut self, text: &str) {
         super::paste_into_composer(&mut self.state, text);
+        super::ensure_files_loaded(&mut self.state, &mut self.toast_deadline).await;
     }
 }

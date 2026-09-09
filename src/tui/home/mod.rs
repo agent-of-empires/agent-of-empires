@@ -444,7 +444,11 @@ pub struct HomeView {
     /// route into the structured composer. Drained by
     /// `open_structured_view` after the view activates, preserving the
     /// text if activation fails so the next 'm' press can still drain it.
-    pub(super) pending_paste_for_structured_view: Option<String>,
+    /// Buffered paste bound to the structured session it was captured for:
+    /// `(session_id, text)`. Draining only feeds a mounted view whose session
+    /// id matches, so a failed open on session A can never leak its text into
+    /// session B's composer.
+    pub(super) pending_paste_for_structured_view: Option<(String, String)>,
     /// Session to attach after the custom instruction warning dialog is dismissed
     pub(super) pending_attach_after_warning: Option<String>,
     /// Session to stop after the confirmation dialog is accepted

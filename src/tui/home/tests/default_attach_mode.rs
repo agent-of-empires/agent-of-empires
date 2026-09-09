@@ -700,7 +700,7 @@ fn send_message_opens_structured_view() {
 #[test]
 #[serial]
 fn send_message_drains_pending_paste_for_structured_view() {
-    let (mut env, _id) = structured_session_env();
+    let (mut env, id) = structured_session_env();
     env.view.pending_paste = Some("cached text".to_string());
     env.view.handle_key(key(KeyCode::Char('m')), None);
     assert_eq!(
@@ -709,7 +709,50 @@ fn send_message_drains_pending_paste_for_structured_view() {
     );
     assert_eq!(
         env.view.pending_paste_for_structured_view,
-        Some("cached text".to_string()),
-        "drained text must land in pending_paste_for_structured_view"
+        Some((id, "cached text".to_string())),
+        "drained text must land in pending_paste_for_structured_view, bound to the selected session"
+    );
+}
+
+/// A second buffered paste captured for the same structured session must
+/// append to the earlier buffered text instead of silently replacing it:
+/// the earlier paste belongs to a failed activation still waiting to drain.
+#[test]
+#[serial]
+fn send_message_merges_buffered_paste_for_same_session() {
+    let (mut env, id) = structured_session_env();
+    env.view.pending_paste = Some("first ".to_string());
+    env.view.handle_key(key(KeyCode::Char('m')), None);
+    env.view.pending_paste = Some("second".to_string());
+    env.view.handle_key(key(KeyCode::Char('m')), None);
+    assert_eq!(
+        env.view.pending_paste_for_structured_view,
+        Some((id, "first second".to_string())),
+        "same-target paste must merge into the buffered text"
+    );
+}
+
+/// A paste captured for a different structured session takes over the
+/// buffer: the earlier target can no longer drain (its open failed), and
+/// mixing the two texts would leak one session's draft into the other.
+#[test]
+#[serial]
+fn send_message_replaces_buffered_paste_for_other_session() {
+    let (mut env, _id) = structured_session_env();
+    env.view.pending_paste = Some("session a draft".to_string());
+    env.view.handle_key(key(KeyCode::Char('m')), None);
+    let other = add_session(&mut env.view, "acp-two");
+    env.view.mutate_instance(&other, |inst| {
+        inst.view = crate::session::View::Structured;
+    });
+    env.view.flat_items = env.view.build_flat_items();
+    env.view.pending_paste = Some("session b draft".to_string());
+    // Select the other structured session and press 'm' again.
+    env.view.select_session_by_id(&other);
+    env.view.handle_key(key(KeyCode::Char('m')), None);
+    assert_eq!(
+        env.view.pending_paste_for_structured_view,
+        Some((other, "session b draft".to_string())),
+        "a different target must own the buffer outright"
     );
 }
