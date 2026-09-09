@@ -281,11 +281,11 @@ impl SyncHoldPlan {
     }
 
     /// Applied before the chunk reaches the parser.
-    fn begin(&self, signals: &ViewerSignals) {
+    fn begin(&self, signals: &ViewerSignals, now: impl FnOnce() -> u64) {
         if self.restart {
-            signals.restart_hold();
+            signals.restart_hold(now());
         } else if self.open {
-            signals.begin_hold();
+            signals.begin_hold(now());
         }
     }
 
@@ -342,8 +342,8 @@ impl ViewerSignals {
         self.clipboard_seq.fetch_add(1, Ordering::Release);
     }
 
-    fn begin_hold(&self) {
-        let now = chunk_now_ms().max(1);
+    fn begin_hold(&self, now: u64) {
+        let now = now.max(1);
         if self.sync_hold_since_ms.load(Ordering::Relaxed) == 0 {
             self.sync_hold_since_ms.store(now, Ordering::Relaxed);
         }
@@ -369,8 +369,8 @@ impl ViewerSignals {
     /// shown would let a continuously repainting app hold the view forever. A
     /// read that opens, closes and reopens over a settled grid starts one,
     /// because it too leaves a repaint half applied.
-    fn restart_hold(&self) {
-        let now = chunk_now_ms().max(1);
+    fn restart_hold(&self, now: u64) {
+        let now = now.max(1);
         self.sync_hold_since_ms.store(now, Ordering::Relaxed);
         if self.incomplete_since_ms.load(Ordering::Relaxed) == 0 {
             self.incomplete_since_ms.store(now, Ordering::Relaxed);
@@ -382,7 +382,10 @@ impl ViewerSignals {
     /// [`Self::frame_incomplete`]: once the grid is publishable there is
     /// nothing left to suppress wakeups for.
     pub(crate) fn hold_active(&self) -> bool {
-        let now = chunk_now_ms();
+        self.hold_active_at(chunk_now_ms())
+    }
+
+    fn hold_active_at(&self, now: u64) -> bool {
         open_within(
             self.sync_hold_since_ms.load(Ordering::Relaxed),
             now,
@@ -611,10 +614,36 @@ fn pump_pane_output_with_hook<F: FnMut()>(
     }
 }
 
+#[cfg(test)]
+struct TestRendezvous {
+    entered: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+impl TestRendezvous {
+    fn new() -> (
+        Self,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (entered, observed) = std::sync::mpsc::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        (Self { entered, resume }, observed, release)
+    }
+
+    // Dropping either test endpoint cancels the held operation on unwind.
+    fn hold(self) -> bool {
+        self.entered.send(()).is_ok() && self.resume.recv().is_ok()
+    }
+}
+
 #[derive(Default)]
 struct DrainControl {
     stream: Option<UnixStream>,
     next_generation: u64,
+    #[cfg(test)]
+    before_deadline: Option<TestRendezvous>,
 }
 
 /// Ask the forwarder to put every byte it already read from `pipe-pane` onto
@@ -626,11 +655,17 @@ fn drain_forwarder(control: &Mutex<DrainControl>) -> bool {
     let Ok(mut control) = control.lock() else {
         return false;
     };
+    #[cfg(test)]
+    let before_deadline = control.before_deadline.take();
     let generation = control.next_generation;
     control.next_generation = control.next_generation.wrapping_add(1);
     let Some(stream) = control.stream.as_mut() else {
         return false;
     };
+    #[cfg(test)]
+    if before_deadline.is_some_and(|boundary| !boundary.hold()) {
+        return false;
+    }
     let deadline = Instant::now() + Duration::from_millis(100);
     if stream
         .write_all(&drain_frame(DRAIN_PROBE, generation))
@@ -1809,6 +1844,8 @@ fn grid_content(
 /// function tests can drive against a raw socket without arming a real
 /// `pipe-pane`.
 struct ReaderCtx {
+    #[cfg(test)]
+    idle_poll_returned: Option<TestRendezvous>,
     parser: Arc<Mutex<vt100::Parser>>,
     stop: Arc<AtomicBool>,
     seeded: Arc<AtomicBool>,
@@ -1991,7 +2028,10 @@ fn stop_and_wake_reader(stop: &AtomicBool, sock_path: &std::path::Path) {
 /// writable half for input dispatch, then pump pane output into the vt100
 /// grid, waking viewers on every change. Runs on its own thread; exits on
 /// pipe EOF, socket error, or `stop`.
-fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
+fn run_reader(listener: UnixListener, ctx: ReaderCtx, clock: impl Fn() -> u64) {
+    #[cfg(test)]
+    let mut ctx = ctx;
+
     let Ok((conn, _)) = listener.accept() else {
         VtLifecycle::fail(&ctx.lifecycle);
         return;
@@ -2021,7 +2061,18 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
             }
             break;
         }
-        if ready == 0 || fd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) == 0 {
+        if ready == 0 {
+            #[cfg(test)]
+            if ctx
+                .idle_poll_returned
+                .take()
+                .is_some_and(|boundary| !boundary.hold())
+            {
+                break;
+            }
+            continue;
+        }
+        if fd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) == 0 {
             continue;
         }
         // A snapshot holds this same mutex from its forwarder drain through
@@ -2048,7 +2099,7 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
                 sync_events.clear();
                 sync.feed(&buf[..n], &mut sync_events);
                 let sync_plan = SyncHoldPlan::from_events(&sync_events);
-                sync_plan.begin(&ctx.signals);
+                sync_plan.begin(&ctx.signals, &clock);
                 // The vt100 parser below silently drops OSC 52, and in
                 // live-send no tmux client is attached for `set-clipboard`
                 // to forward to, so this tap is the ONLY path an agent's
@@ -2099,7 +2150,7 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
                     ctx.grid_gen.fetch_add(1, Ordering::Relaxed);
                     // Stamp this chunk's arrival so the capture worker can tell a
                     // lone chunk from a back-to-back stream and wait for settling.
-                    let now = chunk_now_ms();
+                    let now = clock();
                     let prev = ctx.last_chunk_ms.swap(now, Ordering::Relaxed);
                     ctx.prev_gap_ms.store(
                         if seq == 0 {
@@ -2117,7 +2168,7 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
                     ctx.settled_chunk_seq.store(seq + 1, Ordering::Release);
                     // Inside a synchronized-output bracket the grid is a
                     // half-drawn frame; viewers wake when it closes.
-                    if sync_plan.close || !ctx.signals.hold_active() {
+                    if sync_plan.close || !ctx.signals.hold_active_at(clock()) {
                         ctx.notify_viewers();
                     }
                 }
@@ -2471,6 +2522,8 @@ impl VtChannel {
         let signals = Arc::new(ViewerSignals::new());
         let reader = {
             let ctx = ReaderCtx {
+                #[cfg(test)]
+                idle_poll_returned: None,
                 parser: parser.clone(),
                 stop: stop.clone(),
                 seeded: seeded.clone(),
@@ -2488,7 +2541,7 @@ impl VtChannel {
                 grid_gen: grid_gen.clone(),
                 signals: signals.clone(),
             };
-            std::thread::spawn(move || run_reader(listener, ctx))
+            std::thread::spawn(move || run_reader(listener, ctx, chunk_now_ms))
         };
 
         let pipe_cmd = format!(
@@ -4283,7 +4336,7 @@ mod tests {
         // Mid-bracket the rows are a half-drawn repaint. A composite splices
         // them into the window next to panes captured whole, so the sample says
         // so and the preview keeps the frame it has.
-        ch.signals.begin_hold();
+        ch.signals.begin_hold(chunk_now_ms());
         let held = ch.sample_rows_padded(20, 4).expect("sample");
         assert!(held.incomplete, "mid-bracket rows are not publishable");
         ch.signals.end_hold();
@@ -4433,6 +4486,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let grid_gen = Arc::new(AtomicU64::new(0));
         let ctx = ReaderCtx {
+            idle_poll_returned: None,
             parser: Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0))),
             stop: stop.clone(),
             seeded: Arc::new(AtomicBool::new(true)),
@@ -4450,7 +4504,7 @@ mod tests {
             grid_gen: grid_gen.clone(),
             signals: Arc::new(ViewerSignals::new()),
         };
-        let reader = std::thread::spawn(move || run_reader(listener, ctx));
+        let reader = std::thread::spawn(move || run_reader(listener, ctx, chunk_now_ms));
         let mut conn = UnixStream::connect(&sock).expect("connect");
         conn.write_all(b"first-chunk").expect("write");
 
@@ -4466,22 +4520,22 @@ mod tests {
     }
 
     #[test]
-    fn idle_reader_does_not_hold_snapshot_fence() {
+    fn completed_idle_poll_leaves_snapshot_fence_available() {
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("s.sock");
         let listener = UnixListener::bind(&sock).expect("bind");
         let stop = Arc::new(AtomicBool::new(false));
-        let lifecycle = Arc::new(AtomicU8::new(VtLifecycle::Starting as u8));
         let snapshot = Arc::new(Mutex::new(()));
-        let snapshot_guard = snapshot.lock().expect("hold snapshot before reader starts");
+        let (idle_poll_returned, idle_rx, resume_tx) = TestRendezvous::new();
         let ctx = ReaderCtx {
+            idle_poll_returned: Some(idle_poll_returned),
             parser: Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0))),
             stop: stop.clone(),
             seeded: Arc::new(AtomicBool::new(true)),
             snapshot: snapshot.clone(),
             stream: Arc::new(Mutex::new(None)),
             app_cursor: Arc::new(AtomicBool::new(false)),
-            lifecycle: lifecycle.clone(),
+            lifecycle: Arc::new(AtomicU8::new(VtLifecycle::Starting as u8)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
             links: Arc::new(LinkTable::default()),
@@ -4492,24 +4546,22 @@ mod tests {
             grid_gen: Arc::new(AtomicU64::new(0)),
             signals: Arc::new(ViewerSignals::new()),
         };
-        let reader = std::thread::spawn(move || run_reader(listener, ctx));
         let conn = UnixStream::connect(&sock).expect("connect");
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while VtLifecycle::load(&lifecycle) != VtLifecycle::Live {
-            assert!(Instant::now() < deadline, "reader never connected");
-            std::thread::sleep(Duration::from_millis(2));
-        }
-
-        drop(snapshot_guard);
-        std::thread::sleep(Duration::from_millis(20));
-        assert!(
-            snapshot.try_lock().is_ok(),
-            "an idle reader must not hold the snapshot fence while it waits for input"
-        );
+        let reader = std::thread::spawn(move || run_reader(listener, ctx, chunk_now_ms));
+        let reached_idle = idle_rx.recv_timeout(Duration::from_secs(5));
+        let available = snapshot.try_lock().is_ok();
 
         stop.store(true, Ordering::Relaxed);
         drop(conn);
-        reader.join().expect("reader exits");
+        drop(resume_tx);
+        let joined = reader.join();
+
+        reached_idle.expect("reader completed an idle poll and is held before continuing");
+        joined.expect("reader exits");
+        assert!(
+            available,
+            "the completed idle poll must leave snapshot available"
+        );
     }
 
     #[test]
@@ -4523,6 +4575,7 @@ mod tests {
         let lifecycle = Arc::new(AtomicU8::new(VtLifecycle::Starting as u8));
         let stream = Arc::new(Mutex::new(None));
         let ctx = ReaderCtx {
+            idle_poll_returned: None,
             parser: Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0))),
             stop: stop.clone(),
             seeded: Arc::new(AtomicBool::new(true)),
@@ -4540,7 +4593,7 @@ mod tests {
             grid_gen: Arc::new(AtomicU64::new(0)),
             signals: Arc::new(ViewerSignals::new()),
         };
-        let reader = std::thread::spawn(move || run_reader(listener, ctx));
+        let reader = std::thread::spawn(move || run_reader(listener, ctx, chunk_now_ms));
         let mut peer = UnixStream::connect(&sock).expect("connect");
         let deadline = Instant::now() + Duration::from_secs(1);
         while VtLifecycle::load(&lifecycle) != VtLifecycle::Live {
@@ -4607,6 +4660,7 @@ mod tests {
         let chunk_seq = Arc::new(AtomicU64::new(0));
         let settled_chunk_seq = Arc::new(AtomicU64::new(0));
         let ctx = ReaderCtx {
+            idle_poll_returned: None,
             parser: parser.clone(),
             stop: stop.clone(),
             seeded: Arc::new(AtomicBool::new(true)),
@@ -4624,7 +4678,7 @@ mod tests {
             grid_gen: grid_gen.clone(),
             signals: Arc::new(ViewerSignals::new()),
         };
-        let reader = std::thread::spawn(move || run_reader(listener, ctx));
+        let reader = std::thread::spawn(move || run_reader(listener, ctx, chunk_now_ms));
         let mut conn = UnixStream::connect(&sock).expect("connect");
 
         // The generation a snapshot swap reads before forking its capture.
@@ -4804,6 +4858,7 @@ mod tests {
         let control = Mutex::new(DrainControl {
             stream: Some(parent_control),
             next_generation: 0,
+            before_deadline: None,
         });
         assert_eq!(
             swap_drained_seeded_parser(
@@ -4836,35 +4891,22 @@ mod tests {
         forwarder_thread.join().expect("forwarder exits");
     }
 
-    /// A reseed waits on the forwarder's ACK, and `write_input` needs the
-    /// same socket mutex the seed reads the pipe through. Holding it across
-    /// that wait stalls a keystroke for the whole ACK deadline, once per
-    /// retry. `seed_parser` clones the descriptor and drops the guard before
-    /// draining, so input keeps flowing while a slow forwarder is answering.
+    /// Input remains usable while drain owns control, before its native deadline.
     #[test]
-    fn a_pending_drain_does_not_hold_the_input_socket_mutex() {
-        use std::io::Write;
-        use std::sync::mpsc;
+    fn entered_drain_leaves_input_socket_available() {
+        use std::io::{Read, Write};
 
-        let (_data_reader, data_forwarder) = UnixStream::pair().expect("data pair");
+        let (mut data_reader, data_forwarder) = UnixStream::pair().expect("data pair");
         let (parent_control, mut forwarder_control) = UnixStream::pair().expect("control pair");
-        let (probed_tx, probed_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel::<()>();
-        // Answers only once released, so the seed is parked on the deadline
-        // for as long as the test needs.
-        let forwarder = std::thread::spawn(move || {
-            let (kind, generation) =
-                read_drain_frame(&mut forwarder_control).expect("receive drain probe");
-            assert_eq!(kind, DRAIN_PROBE);
-            probed_tx.send(()).expect("signal the probe arrived");
-            let _ = release_rx.recv_timeout(Duration::from_secs(5));
-            let _ = forwarder_control.write_all(&drain_frame(DRAIN_ACK, generation));
-        });
-
+        forwarder_control
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("bound probe wait");
+        let (before_deadline, entered_rx, resume_tx) = TestRendezvous::new();
         let socket = Arc::new(Mutex::new(Some(data_forwarder)));
         let control = Mutex::new(DrainControl {
             stream: Some(parent_control),
             next_generation: 0,
+            before_deadline: Some(before_deadline),
         });
         let parser = Mutex::new(vt100::Parser::new(6, 40, 0));
         let app_cursor = AtomicBool::new(false);
@@ -4894,26 +4936,39 @@ mod tests {
             )
         });
 
-        probed_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("seed sent its drain probe");
-        // The seed is now waiting on the ACK. Input must not be queued behind it.
-        let acquired = socket
+        let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+        let wrote_input = socket
             .try_lock()
             .map(|mut guard| {
                 guard
                     .as_mut()
-                    .map(|stream| stream.write_all(b"x").is_ok())
-                    .unwrap_or(false)
+                    .is_some_and(|stream| stream.write_all(b"x").is_ok())
             })
             .unwrap_or(false);
-        release_tx.send(()).ok();
-        let _ = seed.join();
-        forwarder.join().expect("forwarder thread");
+        let mut input = [0; 1];
+        let received_input = wrote_input && data_reader.read_exact(&mut input).is_ok();
+
+        let resumed = resume_tx.send(());
+        drop(resume_tx);
+        let probe = read_drain_frame(&mut forwarder_control);
+        if let Ok((DRAIN_PROBE, generation)) = probe {
+            let _ = forwarder_control.write_all(&drain_frame(DRAIN_ACK, generation));
+        }
+        let result = seed.join();
+
+        entered.expect("drain is held after acquiring control and before its deadline");
+        resumed.expect("resume drain");
         assert!(
-            acquired,
-            "a keystroke must reach the pane while a reseed waits for its drain ACK"
+            received_input,
+            "input must traverse the socket while drain is held"
         );
+        assert_eq!(&input, b"x");
+        assert!(matches!(probe, Ok((DRAIN_PROBE, _))), "receive drain probe");
+        // The native deadline can expire after release; drain protocol has separate tests.
+        assert!(matches!(
+            result.expect("seed exits"),
+            VtRefreshResult::Busy | VtRefreshResult::Refreshed
+        ));
     }
 
     #[test]
@@ -4953,6 +5008,7 @@ mod tests {
         let control = Mutex::new(DrainControl {
             stream: Some(parent_control),
             next_generation: 0,
+            before_deadline: None,
         });
         let parser = Mutex::new(vt100::Parser::new(6, 40, 0));
         let app_cursor = AtomicBool::new(false);
@@ -5078,6 +5134,7 @@ mod tests {
         let lifecycle = Arc::new(AtomicU8::new(VtLifecycle::Starting as u8));
         let wakeup_slot: Arc<Mutex<Option<ChangeWakeup>>> = Arc::new(Mutex::new(None));
         let ctx = ReaderCtx {
+            idle_poll_returned: None,
             parser: parser.clone(),
             stop: stop.clone(),
             // Seeded upfront: this test has no capture-pane seed to wait for.
@@ -5096,7 +5153,7 @@ mod tests {
             grid_gen: Arc::new(AtomicU64::new(0)),
             signals: Arc::new(ViewerSignals::new()),
         };
-        let reader = std::thread::spawn(move || run_reader(listener, ctx));
+        let reader = std::thread::spawn(move || run_reader(listener, ctx, chunk_now_ms));
         let mut conn = UnixStream::connect(&sock).expect("connect");
 
         let pair: ChangeWakeup = Arc::new((Mutex::new(0), Condvar::new()));
@@ -5240,6 +5297,7 @@ mod tests {
         let lifecycle = Arc::new(AtomicU8::new(VtLifecycle::Starting as u8));
         let clipboard: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let ctx = ReaderCtx {
+            idle_poll_returned: None,
             parser: parser.clone(),
             stop: stop.clone(),
             seeded: Arc::new(AtomicBool::new(true)),
@@ -5257,7 +5315,8 @@ mod tests {
             grid_gen: Arc::new(AtomicU64::new(0)),
             signals: Arc::new(ViewerSignals::new()),
         };
-        let reader = std::thread::spawn(move || run_reader(listener, ctx));
+        let settled = ctx.settled_chunk_seq.clone();
+        let reader = std::thread::spawn(move || run_reader(listener, ctx, chunk_now_ms));
         let mut conn = UnixStream::connect(&sock).expect("connect");
         conn.write_all(b"visible\x1b]52;c;aGVsbG8=\x07")
             .expect("write pane output");
@@ -5273,6 +5332,13 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         };
         assert_eq!(copied.as_deref(), Some("hello"));
+        while settled.load(Ordering::Acquire) < 1 {
+            assert!(
+                Instant::now() < deadline,
+                "reader never settled copied chunk"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert!(
             parser
                 .lock()
@@ -5302,6 +5368,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let links: Arc<LinkTable> = Arc::new(LinkTable::default());
         let ctx = ReaderCtx {
+            idle_poll_returned: None,
             parser: parser.clone(),
             stop: stop.clone(),
             seeded: Arc::new(AtomicBool::new(true)),
@@ -5319,7 +5386,7 @@ mod tests {
             grid_gen: Arc::new(AtomicU64::new(0)),
             signals: Arc::new(ViewerSignals::new()),
         };
-        let reader = std::thread::spawn(move || run_reader(listener, ctx));
+        let reader = std::thread::spawn(move || run_reader(listener, ctx, chunk_now_ms));
         let mut conn = UnixStream::connect(&sock).expect("connect");
         conn.write_all(b"see \x1b]8;;https://example.com/repo\x1b\\the repo\x1b]8;;\x1b\\ now")
             .expect("write pane output");
@@ -5415,7 +5482,7 @@ mod tests {
             .output()
             .expect("tmux new-session");
         assert!(out.status.success());
-        let target = format!("{}:^.0", guard.name());
+        let target = crate::tmux::test_helpers::only_pane_id(guard.name());
         let deadline = crate::tmux::TmuxCommandDeadline::new();
 
         // Wait for the prompt to be painted before seeding.
@@ -5495,7 +5562,7 @@ mod tests {
             .expect("tmux new-session");
         assert!(out.status.success());
         // Let the pane paint before capturing it.
-        let target = format!("{}:^.0", guard.name());
+        let target = crate::tmux::test_helpers::only_pane_id(guard.name());
         let deadline = crate::tmux::TmuxCommandDeadline::new();
         let mut stream = Vec::new();
         for _ in 0..50 {
@@ -5737,13 +5804,7 @@ mod tests {
     fn reader_chunk_timing_distinguishes_stream_from_lone_chunk() {
         use std::io::Write;
 
-        // Drive run_reader against a raw socket (posing as the pipe-pane
-        // forwarder), no tmux needed. The reader stamps each chunk's arrival;
-        // `chunk_timing` feeds the capture worker's repaint-quiescence debounce,
-        // which must tell a lone chunk (a keystroke echo, wide inter-chunk gap)
-        // from a back-to-back stream (a multi-chunk repaint, small gap). Without
-        // that distinction the worker samples half-repainted grids and the
-        // paired terminal flashes (#2903).
+        // Socket reads remain separate; arrival times are local test input.
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("s.sock");
         let listener = UnixListener::bind(&sock).expect("bind");
@@ -5754,7 +5815,8 @@ mod tests {
         let last_chunk_ms = Arc::new(AtomicU64::new(0));
         let prev_gap_ms = Arc::new(AtomicU64::new(u64::MAX));
         let ctx = ReaderCtx {
-            parser,
+            idle_poll_returned: None,
+            parser: parser.clone(),
             stop: stop.clone(),
             // Seeded upfront: this test has no capture-pane seed to wait for.
             seeded: Arc::new(AtomicBool::new(true)),
@@ -5772,7 +5834,11 @@ mod tests {
             grid_gen: Arc::new(AtomicU64::new(0)),
             signals: Arc::new(ViewerSignals::new()),
         };
-        let reader = std::thread::spawn(move || run_reader(listener, ctx));
+        let now = Arc::new(AtomicU64::new(100));
+        let reader_now = now.clone();
+        let reader = std::thread::spawn(move || {
+            run_reader(listener, ctx, || reader_now.load(Ordering::Acquire))
+        });
         let mut conn = UnixStream::connect(&sock).expect("connect");
 
         // Wait for the reader to publish the nth chunk's complete parser
@@ -5790,36 +5856,24 @@ mod tests {
             }
         };
 
-        // First chunk (the repaint's clear): no prior chunk, so the gap is
-        // "infinite" and it classifies as lone, never streaming.
-        conn.write_all(b"\x1b[2J").expect("write clear");
-        wait_seq(1);
+        for (index, (at, bytes, gap)) in [
+            (100, &b"\x1b[2J"[..], u64::MAX),
+            (104, &b"partial"[..], 4),
+            (109, &b" repaint"[..], 5),
+            (149, &b"!"[..], 40),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            now.store(at, Ordering::Release);
+            conn.write_all(bytes).expect("write chunk");
+            wait_seq(index as u64 + 1);
+            assert_eq!(last_chunk_ms.load(Ordering::Relaxed), at);
+            assert_eq!(prev_gap_ms.load(Ordering::Relaxed), gap);
+        }
         assert_eq!(
-            prev_gap_ms.load(Ordering::Relaxed),
-            u64::MAX,
-            "the first chunk after arming is lone, not streaming"
-        );
-
-        // Two back-to-back reprint chunks: the reader records a real, small gap.
-        conn.write_all(b"partial").expect("write partial");
-        wait_seq(2);
-        conn.write_all(b" repaint").expect("write rest");
-        wait_seq(3);
-        let stream_gap = prev_gap_ms.load(Ordering::Relaxed);
-        assert!(
-            stream_gap < 20,
-            "back-to-back chunks record a small gap, got {stream_gap}"
-        );
-
-        // A chunk after a quiet pause records a much wider gap, so it reads as a
-        // lone chunk and samples immediately rather than debouncing.
-        std::thread::sleep(Duration::from_millis(40));
-        conn.write_all(b"!").expect("write lone");
-        wait_seq(4);
-        let quiet_gap = prev_gap_ms.load(Ordering::Relaxed);
-        assert!(
-            quiet_gap >= 20 && quiet_gap > stream_gap,
-            "a chunk after a 40ms pause is lone (gap {quiet_gap}) vs streamed (gap {stream_gap})"
+            parser.lock().unwrap().screen().contents(),
+            "partial repaint!"
         );
 
         stop.store(true, Ordering::Relaxed);
@@ -5881,6 +5935,7 @@ mod tests {
         let chunk_seq = Arc::new(AtomicU64::new(0));
         let settled_chunk_seq = Arc::new(AtomicU64::new(0));
         let ctx = ReaderCtx {
+            idle_poll_returned: None,
             parser: parser.clone(),
             stop: stop.clone(),
             seeded: seeded.clone(),
@@ -5898,17 +5953,17 @@ mod tests {
             grid_gen: grid_gen.clone(),
             signals: Arc::new(ViewerSignals::new()),
         };
-        let reader = std::thread::spawn(move || run_reader(listener, ctx));
+        let reader = std::thread::spawn(move || run_reader(listener, ctx, chunk_now_ms));
         let mut conn = UnixStream::connect(&sock).expect("connect");
 
         // Pre-seed: pane output plus an OSC 52 copy, all while `seeded == false`.
         conn.write_all(b"PRE-SEED-OUTPUT\x1b]52;c;aGVsbG8=\x07")
             .expect("write pre-seed");
         let deadline = Instant::now() + Duration::from_secs(5);
-        while clipboard.lock().unwrap().is_none() {
+        while settled_chunk_seq.load(Ordering::Acquire) < 1 {
             assert!(
                 Instant::now() < deadline,
-                "reader never tapped the pre-seed OSC 52"
+                "reader never settled the pre-seed chunk"
             );
             std::thread::sleep(Duration::from_millis(2));
         }
@@ -6260,9 +6315,9 @@ mod tests {
         let signals = ViewerSignals::new();
         let stale = u64::MAX;
         signals.sync_hold_since_ms.store(stale, Ordering::Relaxed);
-        SyncHoldPlan::from_events(&[true]).begin(&signals);
+        SyncHoldPlan::from_events(&[true]).begin(&signals, || 100);
         assert_eq!(signals.sync_hold_since_ms.load(Ordering::Relaxed), stale);
-        SyncHoldPlan::from_events(&[false, true]).begin(&signals);
+        SyncHoldPlan::from_events(&[false, true]).begin(&signals, || 100);
         let fresh = signals.sync_hold_since_ms.load(Ordering::Relaxed);
         assert_ne!(fresh, stale, "a new bracket gets a new timestamp");
         // The restart is one store: the previous repaint's tail bytes have not
@@ -6274,21 +6329,21 @@ mod tests {
     #[test]
     fn viewer_signals_hold_opens_and_closes() {
         let signals = ViewerSignals::new();
-        assert!(!signals.hold_active());
-        signals.begin_hold();
-        assert!(signals.hold_active());
+        assert!(!signals.hold_active_at(100));
+        signals.begin_hold(100);
+        assert!(signals.hold_active_at(100));
         // Re-opening does not restart the clock.
         let since = signals.sync_hold_since_ms.load(Ordering::Relaxed);
-        signals.begin_hold();
+        signals.begin_hold(101);
         assert_eq!(signals.sync_hold_since_ms.load(Ordering::Relaxed), since);
         signals.end_hold();
-        assert!(!signals.hold_active());
-        assert!(!signals.frame_incomplete());
+        assert!(!signals.hold_active_at(100));
+        assert!(!signals.incomplete_within(100));
 
         // A repaint slower than the wakeup hold stops suppressing publication
         // but must still read as incomplete, or the sampler would serve the
         // half-drawn grid instead of the last whole frame it already has.
-        signals.begin_hold();
+        signals.begin_hold(100);
         let since = signals.sync_hold_since_ms.load(Ordering::Relaxed);
         for (elapsed, hold, incomplete) in [
             (0, true, true),
@@ -6299,11 +6354,7 @@ mod tests {
             (SYNC_BRACKET_ABANDON_MS, false, false),
         ] {
             let now = since + elapsed;
-            assert_eq!(
-                open_within(since, now, SYNC_HOLD_MAX_MS) && signals.incomplete_within(now),
-                hold,
-                "hold at {elapsed}ms"
-            );
+            assert_eq!(signals.hold_active_at(now), hold, "hold at {elapsed}ms");
             assert_eq!(
                 signals.incomplete_within(now),
                 incomplete,
@@ -6322,11 +6373,11 @@ mod tests {
         // therefore stamped once and left alone, so the abandon window still
         // expires and publication resumes (torn at worst, never frozen).
         let signals = ViewerSignals::new();
-        signals.begin_hold();
+        signals.begin_hold(100);
         let run_started = signals.incomplete_since_ms.load(Ordering::Relaxed);
         let mut bracket = signals.sync_hold_since_ms.load(Ordering::Relaxed);
         for read in 1..=50 {
-            SyncHoldPlan::from_events(&[false, true]).begin(&signals);
+            SyncHoldPlan::from_events(&[false, true]).begin(&signals, || 100 + read);
             let next = signals.sync_hold_since_ms.load(Ordering::Relaxed);
             assert!(next >= bracket, "read {read}: bracket hold moves forward");
             bracket = next;
@@ -6345,10 +6396,10 @@ mod tests {
         // it ends the run, and the next repaint gets a whole fresh hold.
         SyncHoldPlan::from_events(&[false]).end(&signals);
         assert_eq!(signals.incomplete_since_ms.load(Ordering::Relaxed), 0);
-        assert!(!signals.frame_incomplete());
-        signals.begin_hold();
-        assert!(signals.frame_incomplete());
-        assert!(signals.hold_active());
+        assert!(!signals.incomplete_within(100));
+        signals.begin_hold(100);
+        assert!(signals.incomplete_within(100));
+        assert!(signals.hold_active_at(100));
     }
 
     #[test]
@@ -6363,12 +6414,12 @@ mod tests {
         let plan = SyncHoldPlan::from_events(&[true, false, true]);
         assert!(plan.restart, "the last opener follows a close");
         assert!(!plan.close, "and the read ends inside the new bracket");
-        plan.begin(&signals);
+        plan.begin(&signals, || 100);
         assert!(
-            signals.frame_incomplete(),
+            signals.incomplete_within(100),
             "the half-applied repaint is held"
         );
-        assert!(signals.hold_active());
+        assert!(signals.hold_active_at(100));
         assert_ne!(signals.incomplete_since_ms.load(Ordering::Relaxed), 0);
     }
 
@@ -6387,6 +6438,7 @@ mod tests {
         let signals = Arc::new(ViewerSignals::new());
         let wakeup: ChangeWakeup = Arc::new((Mutex::new(0u64), Condvar::new()));
         let ctx = ReaderCtx {
+            idle_poll_returned: None,
             parser: Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0))),
             stop: stop.clone(),
             seeded: Arc::new(AtomicBool::new(true)),
@@ -6405,17 +6457,24 @@ mod tests {
             signals: signals.clone(),
         };
         let rx = signals.changed_tx.subscribe();
-        let reader = std::thread::spawn(move || run_reader(listener, ctx));
+        let parser = ctx.parser.clone();
+        let settled = ctx.settled_chunk_seq.clone();
+        let reader = std::thread::spawn(move || run_reader(listener, ctx, || 100));
         let mut conn = UnixStream::connect(&sock).expect("connect");
 
         conn.write_all(b"\x1b[?2026h\x1b[2J\x1b[HPART-A")
             .expect("write");
         let deadline = Instant::now() + Duration::from_secs(5);
-        while grid_gen.load(Ordering::Relaxed) < 1 {
+        while settled.load(Ordering::Acquire) < 1 {
             assert!(Instant::now() < deadline, "reader never parsed the chunk");
             std::thread::sleep(Duration::from_millis(2));
         }
-        assert!(signals.hold_active(), "bracket opened: hold must be active");
+        // Settlement precedes notification; the parser lock closes that window.
+        drop(parser.lock().unwrap());
+        assert!(
+            signals.hold_active_at(100),
+            "bracket opened: hold must be active"
+        );
         assert!(
             !rx.has_changed().unwrap(),
             "no viewer wake inside the bracket"
@@ -6428,11 +6487,15 @@ mod tests {
 
         conn.write_all(b"\x1b[5;1HPART-B\x1b[?2026l")
             .expect("write");
-        while grid_gen.load(Ordering::Relaxed) < 2 {
+        while settled.load(Ordering::Acquire) < 2 {
             assert!(Instant::now() < deadline, "reader never parsed the close");
             std::thread::sleep(Duration::from_millis(2));
         }
-        assert!(!signals.hold_active(), "bracket closed: hold released");
+        drop(parser.lock().unwrap());
+        assert!(
+            !signals.hold_active_at(100),
+            "bracket closed: hold released"
+        );
         assert!(
             rx.has_changed().unwrap(),
             "viewers wake when the frame completes"
@@ -6459,6 +6522,7 @@ mod tests {
         let settled = Arc::new(AtomicU64::new(0));
         let signals = Arc::new(ViewerSignals::new());
         let ctx = ReaderCtx {
+            idle_poll_returned: None,
             parser: Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0))),
             stop: stop.clone(),
             seeded: Arc::new(AtomicBool::new(false)),
@@ -6476,7 +6540,7 @@ mod tests {
             grid_gen: Arc::new(AtomicU64::new(0)),
             signals: signals.clone(),
         };
-        let reader = std::thread::spawn(move || run_reader(listener, ctx));
+        let reader = std::thread::spawn(move || run_reader(listener, ctx, || 100));
         let mut conn = UnixStream::connect(&sock).expect("connect");
         let deadline = Instant::now() + Duration::from_secs(5);
         let await_chunk = |seq: u64| {
@@ -6491,12 +6555,15 @@ mod tests {
 
         conn.write_all(b"\x1b[?2026h\x1b[2JPART-A").expect("write");
         await_chunk(1);
-        assert!(signals.hold_active(), "pre-seed opener still holds");
+        assert!(signals.hold_active_at(100), "pre-seed opener still holds");
 
         conn.write_all(b"PART-B\x1b[?2026l").expect("write");
         await_chunk(2);
-        assert!(!signals.hold_active(), "pre-seed close releases the hold");
-        assert!(!signals.frame_incomplete());
+        assert!(
+            !signals.hold_active_at(100),
+            "pre-seed close releases the hold"
+        );
+        assert!(!signals.incomplete_within(100));
 
         stop.store(true, Ordering::Relaxed);
         drop(conn);
@@ -6514,7 +6581,7 @@ mod tests {
         assert!(first.contains("before"));
 
         // Output lands inside a bracket: the sample must not follow it yet.
-        ch.signals.begin_hold();
+        ch.signals.begin_hold(chunk_now_ms());
         ch.parser.lock().unwrap().process(b"\r\x1b[Kafter");
         ch.grid_gen.fetch_add(1, Ordering::Relaxed);
         let held = ch.sample_with_deadline(4, &deadline).content;
@@ -6671,7 +6738,7 @@ mod tests {
         assert!(!cached.incomplete);
 
         // A repaint opens a bracket and only its first half has been applied.
-        ch.signals.begin_hold();
+        ch.signals.begin_hold(chunk_now_ms());
         ch.parser.lock().unwrap().process(b"\r\x1b[Kpart");
         ch.grid_gen.fetch_add(1, Ordering::Relaxed);
 
