@@ -794,8 +794,8 @@ fn read_credential_candidate(dir: &Path, name: &str, follow: SymlinkPolicy) -> O
 /// mounts. This is a come-up fold rather than a migration because a container
 /// built before the file was shared keeps refreshing its store copy while it
 /// runs, so which copy is freshest is only known at come-up. That copy is left
-/// for such a container; [`remove_shadowed_credential_copies`] drops it once a
-/// container mounting the shared file exists.
+/// for such a container; [`place_shadowed_credential_mountpoints`] empties it
+/// once a container mounting the shared file exists.
 ///
 /// Candidates are the store's private copy (left by the v027 move or by a
 /// login before the file was shared), the host file and the macOS Keychain;
@@ -881,10 +881,25 @@ fn merge_credential(existing: Option<&str>, winner: &str) -> String {
     merged.unwrap_or_else(|| winner.to_string())
 }
 
-/// Drop each store's own copy of a credential the container mounts the shared
-/// file over. Runs once the container exists: one built before the file was
-/// shared reads that copy instead, and is recreated rather than stripped.
-pub(crate) fn remove_shadowed_credential_copies(config: &ContainerConfig) {
+/// Place the mountpoint each store needs for the shared credential file
+/// mounted over it, and empty the store's own copy once the shared file holds
+/// it.
+///
+/// The mount is a file nested inside the store's directory mount, so a runtime
+/// asked to create the mountpoint resolves it through that mount and lands on
+/// the host store, outside the container's rootfs. Docker Desktop refuses it
+/// there with `create mountpoint for ... is outside of rootfs` yet leaves the
+/// file behind, which is why a store without it failed every first create and
+/// worked on the retry (#3845, upstream docker/for-mac#7853). Placing the
+/// file ourselves is what makes the first create work, and keeps the runtime
+/// from having to create a mountpoint through a bind mount at all.
+///
+/// Empty rather than carrying the copy's old content: [`read_credential_file`]
+/// reads an empty file as no credential, so a copy [`sync_shared_credential`]
+/// already folded in cannot come back as a candidate. Runs before every create
+/// and start, since the runtime needs the mountpoint each time it applies the
+/// mounts.
+pub(crate) fn place_shadowed_credential_mountpoints(config: &ContainerConfig) {
     let volume_at = |target: &Path| {
         config
             .volumes
@@ -906,13 +921,46 @@ pub(crate) fn remove_shadowed_credential_copies(config: &ContainerConfig) {
             continue;
         }
         let copy = Path::new(&store.host_path).join(name);
-        match std::fs::remove_file(&copy) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => tracing::warn!(target: "session.profile",
-                "Failed to remove shadowed credential copy {}: {}", copy.display(), e),
+        // Emptying the copy is only safe once the fold has landed a credential
+        // in the shared file; short of that (a failed fold, or the empty seed
+        // `sync_shared_credential` writes when it found none) the copy may be
+        // the only one left, and it already serves as the mountpoint.
+        let folded = std::fs::read_to_string(&shared.host_path)
+            .is_ok_and(|content| !matches!(content.trim(), "" | "{}"));
+        if let Err(e) = place_credential_mountpoint(&copy, folded) {
+            tracing::warn!(target: "session.profile",
+                "Failed to place credential mountpoint {}: {}", copy.display(), e);
         }
     }
+}
+
+/// A plain file at `path` for the runtime to mount over, emptied when
+/// `replace` and left as it is otherwise. The store is container-writable and
+/// a runtime that got as far as making a directory there leaves one, so
+/// anything but a plain file is replaced rather than mounted through.
+fn place_credential_mountpoint(path: &Path, replace: bool) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && (!replace || metadata.len() == 0) => return Ok(()),
+        Ok(metadata) => {
+            if metadata.is_dir() {
+                std::fs::remove_dir_all(path)
+            } else {
+                std::fs::remove_file(path)
+            }
+            .with_context(|| format!("removing {}", path.display()))?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("inspecting {}", path.display())),
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map(|_| ())
+        .with_context(|| format!("creating {}", path.display()))
 }
 
 /// Write in place, never rename: containers bind-mount this inode. The new
@@ -4481,11 +4529,14 @@ mod tests {
             container_workdir: None,
         };
         let shared = host.join(SANDBOX_PRIVATE_SUBDIR).join(".credentials.json");
-        for instance_id in ["shared-cred-a", "shared-cred-b"] {
+        // A store the v027 move left a copy in, and a fresh one with none: both
+        // end up with the empty mountpoint the nested file mount needs (#3845).
+        for (instance_id, stale_copy) in [("shared-cred-a", true), ("shared-cred-b", false)] {
             let store = host.join(SANDBOX_PRIVATE_SUBDIR).join(instance_id);
-            // A copy the v027 move left behind, folded in and shadowed.
             fs::create_dir_all(&store).unwrap();
-            fs::write(store.join(".credentials.json"), credential(1)).unwrap();
+            if stale_copy {
+                fs::write(store.join(".credentials.json"), credential(1)).unwrap();
+            }
             let config = build_container_config(
                 project_dir.path().to_str().unwrap(),
                 &sandbox_info,
@@ -4507,23 +4558,26 @@ mod tests {
                 config.shared_credential_mounts,
                 vec!["/root/.claude/.credentials.json".to_string()]
             );
-            assert!(store.join(".credentials.json").exists());
-            remove_shadowed_credential_copies(&config);
-            assert!(!store.join(".credentials.json").exists());
+            assert_eq!(store.join(".credentials.json").exists(), stale_copy);
+            place_shadowed_credential_mountpoints(&config);
+            assert_eq!(
+                fs::read_to_string(store.join(".credentials.json")).unwrap(),
+                ""
+            );
             crate::hooks::cleanup_hook_status_dir(instance_id);
         }
         assert_eq!(fs::read_to_string(&shared).unwrap(), cred);
     }
 
     #[test]
-    fn shadowed_credential_copy_is_removed_only_from_a_store() {
+    fn shadowed_credential_copy_is_emptied_only_in_a_store() {
         let home = TempDir::new().unwrap();
         let host = home.path().join(".claude");
         let root = host.join(SANDBOX_PRIVATE_SUBDIR);
         let store = root.join("aaaaaaaaaaaaaaaa");
         let shared = root.join(".credentials.json");
         fs::create_dir_all(&store).unwrap();
-        fs::write(&shared, "{}").unwrap();
+        fs::write(&shared, "shared").unwrap();
         let config_for = |dir: &Path| ContainerConfig {
             shared_credential_mounts: vec!["/root/.claude/.credentials.json".to_string()],
             volumes: vec![
@@ -4542,12 +4596,40 @@ mod tests {
         };
         // A user extra_volumes entry at the config path replaces the store
         // mount; its host copy is the user's own login, not a shadowed one.
-        for (dir, removed) in [(&store, true), (&host, false)] {
+        for (dir, emptied) in [(&store, true), (&host, false)] {
             let copy = dir.join(".credentials.json");
             fs::write(&copy, "token").unwrap();
-            remove_shadowed_credential_copies(&config_for(dir));
-            assert_eq!(!copy.exists(), removed, "{}", dir.display());
+            place_shadowed_credential_mountpoints(&config_for(dir));
+            let kept = fs::read_to_string(&copy).unwrap() == "token";
+            assert_eq!(!kept, emptied, "{}", dir.display());
         }
+
+        // A shared file the fold landed no credential in leaves the copy alone:
+        // it is still the only one, and already the mountpoint the mount needs.
+        let copy = store.join(".credentials.json");
+        for unfolded in ["", "{}"] {
+            fs::write(&shared, unfolded).unwrap();
+            fs::write(&copy, "token").unwrap();
+            place_shadowed_credential_mountpoints(&config_for(&store));
+            assert_eq!(fs::read_to_string(&copy).unwrap(), "token", "{unfolded:?}");
+        }
+        fs::write(&shared, "shared").unwrap();
+
+        // The store is container-writable, so a link planted at the mountpoint
+        // is replaced rather than followed.
+        let outside = home.path().join("outside");
+        fs::write(&outside, "token").unwrap();
+        fs::remove_file(&copy).unwrap();
+        std::os::unix::fs::symlink(&outside, &copy).unwrap();
+        place_shadowed_credential_mountpoints(&config_for(&store));
+        assert!(fs::symlink_metadata(&copy).unwrap().is_file());
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "token");
+
+        // As is a directory left by a runtime that got that far.
+        fs::remove_file(&copy).unwrap();
+        fs::create_dir(&copy).unwrap();
+        place_shadowed_credential_mountpoints(&config_for(&store));
+        assert!(fs::symlink_metadata(&copy).unwrap().is_file());
     }
 
     /// End-to-end test: repo-level sandbox config (environment, volume_ignores,

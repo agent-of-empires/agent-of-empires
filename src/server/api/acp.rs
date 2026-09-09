@@ -34,6 +34,12 @@ const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
 /// Maximum decoded size of all attachments on one prompt (20 MiB).
 const MAX_TOTAL_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
 
+/// How long `acp_cancel` may wait on the session's prompt submission before it
+/// says so. Well over the sub-millisecond claim on an idle daemon and over a
+/// same-gesture prompt's own handler on a loaded one, so this fires for a Stop
+/// queued behind something else. See `acp_cancel`.
+const CANCEL_SUBMISSION_WAIT_WARN: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Startup-error banner text for a failed detached structured-view spawn,
 /// shared by the create-path (`create_session`) and enable-path
 /// (`acp_enable`). `CapacityFull` is transient and user-actionable, so its
@@ -1243,13 +1249,18 @@ pub async fn acp_prompt(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
+    // Claimed before the wake, not after it: everything below is window a
+    // concurrent `/acp/cancel` could pass through, and the wake takes
+    // `instance_lock`, which `prompt_submission` orders under this guard. See
+    // `acp_cancel`.
+    let Some(_submission) = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await
+    else {
+        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    };
     let woke_idle_dormant = state.session_service.touch_and_wake_on_prompt(&id).await;
-    {
-        let instances = state.instances.read().await;
-        if !instances.iter().any(|i| i.id == id) {
-            return (StatusCode::NOT_FOUND, "session not found").into_response();
-        }
-    }
     // Decode + validate + capability-gate attachments BEFORE publishing
     // so a rejected prompt never leaves a half-rendered attachment in
     // the transcript (the publish path is otherwise authoritative). See
@@ -1259,21 +1270,18 @@ pub async fn acp_prompt(
         Ok(a) => a,
         Err((code, msg)) => return (code, msg).into_response(),
     };
-    // Claim the session's prompt-submission authority and decide under it, so
-    // every client follows the same send, steer, or queue rules and the
-    // decision and the dispatch it picks are one atomic step. Releasing
-    // between them let a queue drain read a fold this prompt had not published
-    // into yet, so both delivered and whichever lost the agent's race came
-    // back `agent_busy` after its queue row was already retired (#3621).
-    // `woke_idle_dormant` is passed rather than re-read: the wake above
-    // already cleared the marker, so the instance now says "awake".
-    let Ok((_submission, dispatch)) = state
+    // Decide the disposition under the guard we already hold, so every client
+    // follows the same send, steer, or queue rules and the decision and the
+    // dispatch it picks are one atomic step. Releasing between them let a
+    // queue drain read a fold this prompt had not published into yet, so both
+    // delivered and whichever lost the agent's race came back `agent_busy`
+    // after its queue row was already retired (#3621). `woke_idle_dormant` is
+    // passed rather than re-read: the wake above already cleared the marker,
+    // so the instance now says "awake".
+    let dispatch = state
         .session_service
-        .begin_prompt_submission(&SessionCaller::User, &id, woke_idle_dormant)
-        .await
-    else {
-        return (StatusCode::NOT_FOUND, "session not found").into_response();
-    };
+        .prompt_dispatch_under_submission(&id, woke_idle_dormant)
+        .await;
     // A fresh user prompt supersedes any queued rate-limit resume
     // continuation, so drop it before sending: otherwise the reconciler could
     // later replay the older interrupted prompt after this newer one (#3028).
@@ -1421,17 +1429,22 @@ pub async fn acp_prompt_diff_comments(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
-    let woke_idle_dormant = state.session_service.touch_and_wake_on_prompt(&id).await;
     // This opens a turn (`UserDiffCommentsPrompt` folds to `turn_active`) just
     // as an ordinary prompt does, so it takes the same submission authority
-    // and settles the same disposition under it (#3621, #3649).
-    let Ok((_submission, dispatch)) = state
+    // and settles the same disposition under it (#3621, #3649), claimed before
+    // the wake for the reasons `acp_cancel` gives.
+    let Some(_submission) = state
         .session_service
-        .begin_prompt_submission(&SessionCaller::User, &id, woke_idle_dormant)
+        .prompt_submission_for_session(&id)
         .await
     else {
         return (StatusCode::NOT_FOUND, "session not found").into_response();
     };
+    let woke_idle_dormant = state.session_service.touch_and_wake_on_prompt(&id).await;
+    let dispatch = state
+        .session_service
+        .prompt_dispatch_under_submission(&id, woke_idle_dormant)
+        .await;
     // A typed diff-comments prompt has no queue row to park on, so anything
     // but send-or-steer is refused here rather than published and then
     // rejected asynchronously as `agent_busy`, which would strand the card in
@@ -1537,12 +1550,60 @@ pub async fn acp_attachment(
     }
 }
 
+/// Cancel the session's in-flight turn.
+///
+/// Ordered behind any prompt submission still in flight for this session.
+/// `/acp/prompt` and `/acp/cancel` are separate requests served on separate
+/// tasks, and they reach the agent by very different routes: the prompt path
+/// resumes the worker, awaits readiness and publishes `UserPromptSent` before
+/// it hands `ClientCmd::Prompt` to the connection task, while cancel goes
+/// almost straight to the command channel. A Stop pressed shortly after Enter
+/// therefore overtook its own prompt, and the agent saw `session/cancel` with
+/// nothing in flight followed by the `session/prompt` it was meant to stop:
+/// per ACP a cancel names no prompt, so the turn then ran to completion with
+/// the UI still showing Stop. The gap is the prompt handler's own duration,
+/// so a loaded host widens it from ~1ms to hundreds.
+///
+/// `prompt_submission_for_session` is the same guard every prompt-submitting
+/// surface claims, which `prompt_submission` documents as the session's
+/// ordering primitive. Taking it here restores the user's gesture order for every
+/// cancel client (the web composer, and `acp::client::http` for the TUI) at
+/// once, and the prompt handlers claim it before their wake so the whole
+/// submission sits inside the hold. It costs nothing on the common path, where
+/// no submission is in flight.
+///
+/// The guard is not only held by the user's own prompt, though: a queue drain
+/// can park on `WORKER_READY_TIMEOUT`, and a rename holds it across a worktree
+/// move. A cancel queued behind one of those publishes nothing while it waits,
+/// so the composer shows an unchanged spinner and no Force stop hatch (that
+/// needs `CancelRequested`, which only the connection task emits). Hence the
+/// warn below: a Stop that stalls should be legible in the log rather than
+/// arrive as a bug report. Dropping the guard early would shave the stall but
+/// reopen a window for a drain's prompt to slip in and be cancelled instead.
+///
+/// `force_end_turn` deliberately stays unguarded: it is the escape hatch for a
+/// wedged UI and must never queue.
 pub async fn acp_cancel(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     if let Some(resp) = read_only_block(&state) {
         return resp;
+    }
+    let waited_from = std::time::Instant::now();
+    let _submission = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await;
+    let waited = waited_from.elapsed();
+    if waited >= CANCEL_SUBMISSION_WAIT_WARN {
+        tracing::warn!(
+            target: "http.api.acp",
+            session = %id,
+            waited_ms = waited.as_millis(),
+            "cancel waited on the session's prompt submission; the UI showed no \
+             progress for that long"
+        );
     }
     match state.acp_supervisor.cancel_prompt(&id).await {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
@@ -3460,6 +3521,90 @@ mod tests {
         );
     }
 
+    /// A Stop pressed right after Enter must not overtake its own prompt.
+    ///
+    /// `/acp/prompt` and `/acp/cancel` are concurrent requests that reach the
+    /// agent by very different routes: the prompt path wakes, folds, publishes
+    /// and awaits worker readiness before it hands `ClientCmd::Prompt` to the
+    /// connection task, while cancel goes almost straight to the command
+    /// channel. Whenever cancel passed it, the agent saw `session/cancel` with
+    /// nothing in flight and then the very prompt it named; per ACP a cancel
+    /// names no prompt, so the turn ran to completion with the UI still on
+    /// Stop. The window is the prompt handler's own duration, so a loaded host
+    /// stretched it from ~1ms to hundreds and the live `composer-stop` spec
+    /// failed on whichever case clicked Stop without waiting for output first.
+    ///
+    /// Both halves of the ordering are pinned here, against a held guard
+    /// rather than a live agent: cancel must wait for it, and the prompt
+    /// handler must claim it before its first side effect (the wake, which is
+    /// what `last_accessed_at` records). A handler that claims later leaves
+    /// exactly that much window for a cancel to pass through.
+    #[tokio::test]
+    async fn cancel_and_prompt_serialize_on_the_submission_guard() {
+        use std::time::Duration;
+
+        let mut inst = crate::session::Instance::new("stop-order", "/tmp/aoe-stop-order");
+        inst.id = "sess-stop-order".to_string();
+        inst.view = crate::session::View::Structured;
+        assert!(
+            inst.last_accessed_at.is_none(),
+            "fresh instance is untouched"
+        );
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        // Stand in for a submission already in flight. There is no worker, so
+        // every path below fails fast once it gets past the guard.
+        let submission = state
+            .session_service
+            .prompt_submission_for_session(&id)
+            .await
+            .expect("seeded session must admit a submission");
+
+        let cancel = tokio::spawn({
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            async move { acp_cancel(State(state), Path(id)).await.into_response() }
+        });
+        let prompt = tokio::spawn({
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            async move {
+                acp_prompt(
+                    State(state),
+                    Path(id),
+                    Ok(Json(PromptRequest {
+                        text: "think about this".to_string(),
+                        attachments: Vec::new(),
+                        prompt_id: None,
+                    })),
+                )
+                .await
+                .into_response()
+            }
+        });
+
+        // 500ms is orders of magnitude over the microseconds either handler
+        // needs to reach the agent-facing work once it is past the guard.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !cancel.is_finished(),
+            "acp_cancel must wait for the in-flight submission instead of racing ahead of it"
+        );
+        assert!(
+            state.instances.read().await[0].last_accessed_at.is_none(),
+            "acp_prompt must claim the submission guard before it wakes the session"
+        );
+
+        drop(submission);
+        for handler in [cancel, prompt] {
+            tokio::time::timeout(Duration::from_secs(10), handler)
+                .await
+                .expect("both handlers must finish once the guard drops")
+                .expect("handler task must not panic");
+        }
+    }
+
     /// #3688: the recovery lives in `dispatch::decide`, not in one handler,
     /// so every admission site inherits it. Pinning it here rather than
     /// through a handler keeps the contract on the shared decision point:
@@ -3473,11 +3618,15 @@ mod tests {
         let state = crate::server::test_support::build_test_app_state(vec![inst]);
 
         // A worker-less session with no park parks the prompt, as ever.
-        let (guard, dispatch) = state
+        let guard = state
             .session_service
-            .begin_prompt_submission(&SessionCaller::User, &id, false)
+            .admit_prompt_submission(&SessionCaller::User, &id)
             .await
             .expect("session exists");
+        let dispatch = state
+            .session_service
+            .prompt_dispatch_under_submission(&id, false)
+            .await;
         assert_eq!(
             dispatch,
             crate::acp::dispatch::PromptDispatch::Queued {
@@ -3491,11 +3640,15 @@ mod tests {
             crate::server::acp_reconciler::RATE_LIMIT_EXHAUSTED_RETRIES_REASON,
             0,
         ));
-        let (_guard, dispatch) = state
+        let _guard = state
             .session_service
-            .begin_prompt_submission(&SessionCaller::User, &id, false)
+            .admit_prompt_submission(&SessionCaller::User, &id)
             .await
             .expect("session exists");
+        let dispatch = state
+            .session_service
+            .prompt_dispatch_under_submission(&id, false)
+            .await;
         assert_eq!(
             dispatch,
             crate::acp::dispatch::PromptDispatch::Sent,

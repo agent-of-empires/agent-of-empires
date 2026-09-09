@@ -31,6 +31,10 @@ pub(super) fn apply_drained_identity_if_unchanged(
     {
         live.agent_session_id = drained.agent_session_id.clone();
         live.omp_capture_generation = drained.omp_capture_generation.clone();
+        // The drain also records the transcript path a Pi pane published.
+        // Guarded by the same sid baseline: the path names a conversation, so
+        // carrying it onto a row whose sid moved would pair two conversations.
+        live.pi_session_path = drained.pi_session_path.clone();
         if live.resume_probe_failed_sid == *baseline_marker {
             live.resume_probe_failed_sid = drained.resume_probe_failed_sid.clone();
         }

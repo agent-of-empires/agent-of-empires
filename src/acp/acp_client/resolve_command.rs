@@ -267,9 +267,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn resolve_agent_command_falls_back_to_bundled_when_not_on_path() {
-        // Tagged `#[serial]` and PATH-scrubbed because the adapter names are
-        // real: a dev machine with a global `claude-agent-acp` would
-        // (correctly) resolve that copy instead of the bundled one.
+        // PATH-scrubbed because the adapter names are real: a dev machine
+        // with a global `claude-agent-acp` would (correctly) resolve that
+        // copy instead of the bundled one.
         let app = tempfile::TempDir::new().unwrap();
         let name = "claude-agent-acp";
         let bin_dir = app
@@ -280,20 +280,9 @@ mod tests {
         std::fs::write(&bin, "#!/usr/bin/env node\n").unwrap();
 
         let empty = tempfile::TempDir::new().unwrap();
-        let prev = std::env::var_os("PATH");
-        // SAFETY: mutates the process-wide PATH; `#[serial]` keeps other
-        // PATH readers out of the way.
-        unsafe {
-            std::env::set_var("PATH", empty.path());
-        }
-        let resolved = resolve_agent_command(name, Some(app.path()));
-        if let Some(prev) = prev {
-            unsafe {
-                std::env::set_var("PATH", prev);
-            }
-        }
-
-        let resolved = resolved.expect("should resolve from the bundled adapter dir");
+        let _path = crate::session::test_support::EnvGuard::set(&[("PATH", empty.path())]);
+        let resolved = resolve_agent_command(name, Some(app.path()))
+            .expect("should resolve from the bundled adapter dir");
         assert_eq!(resolved.path, bin);
         assert_eq!(resolved.prepend_paths.first(), Some(&bin_dir));
     }
@@ -349,9 +338,6 @@ mod tests {
     #[serial_test::serial]
     fn resolve_agent_command_finds_binary_in_path_env() {
         // Build a temp dir with a fake binary, point PATH at it.
-        // Tagged `#[serial]` because the test mutates the process-wide
-        // PATH; any concurrent test that reads PATH (e.g. resolves a
-        // real binary) would race.
         let dir = tempfile::TempDir::new().unwrap();
         let bin = dir.path().join("aoe-test-resolver-fake");
         std::fs::write(&bin, "#!/bin/sh\n").unwrap();
@@ -360,27 +346,9 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let prev = std::env::var_os("PATH");
-        let new_path = format!(
-            "{}:{}",
-            dir.path().display(),
-            prev.as_ref()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        );
-        // SAFETY: this test mutates the process-wide PATH. Other PATH
-        // readers in the same test binary would race; `#[serial]` keeps
-        // them apart.
-        unsafe {
-            std::env::set_var("PATH", &new_path);
-        }
-        let resolved = resolve_agent_command("aoe-test-resolver-fake", None);
-        if let Some(prev) = prev {
-            unsafe {
-                std::env::set_var("PATH", prev);
-            }
-        }
-        let resolved = resolved.expect("binary should resolve from PATH");
+        let _path = crate::session::test_support::path_prepended(dir.path());
+        let resolved = resolve_agent_command("aoe-test-resolver-fake", None)
+            .expect("binary should resolve from PATH");
         assert_eq!(resolved.path, bin);
         assert_eq!(resolved.prepend_paths, vec![dir.path().to_path_buf()]);
     }

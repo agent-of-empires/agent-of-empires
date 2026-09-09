@@ -896,19 +896,6 @@ mod tests {
             std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
 
-        fn with_path_prepended<F: FnOnce()>(prefix: &Path, f: F) {
-            let prev = std::env::var("PATH").unwrap_or_default();
-            let new_path = format!("{}:{}", prefix.display(), prev);
-            // SAFETY: serial_test ensures no concurrent env mutation.
-            unsafe {
-                std::env::set_var("PATH", &new_path);
-            }
-            f();
-            unsafe {
-                std::env::set_var("PATH", &prev);
-            }
-        }
-
         #[test]
         #[serial]
         fn sudo_replace_moves_then_chmods() {
@@ -922,9 +909,8 @@ mod tests {
             #[cfg(unix)]
             std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-            with_path_prepended(dir.path(), || {
-                sudo_replace(&source, &target).expect("sudo_replace should succeed");
-            });
+            let _path = crate::session::test_support::path_prepended(dir.path());
+            sudo_replace(&source, &target).expect("sudo_replace should succeed");
 
             assert!(!source.exists(), "source should be moved");
             assert_eq!(std::fs::read(&target).unwrap(), b"new");
@@ -945,15 +931,13 @@ mod tests {
             std::fs::write(&source, b"new").unwrap();
             let target = dir.path().join("target");
 
-            with_path_prepended(dir.path(), || {
-                let err =
-                    sudo_replace(&source, &target).expect_err("failing sudo should propagate");
-                let s = err.to_string();
-                assert!(
-                    s.contains("sudo mv failed"),
-                    "expected mv-failed error, got: {s}"
-                );
-            });
+            let _path = crate::session::test_support::path_prepended(dir.path());
+            let err = sudo_replace(&source, &target).expect_err("failing sudo should propagate");
+            let s = err.to_string();
+            assert!(
+                s.contains("sudo mv failed"),
+                "expected mv-failed error, got: {s}"
+            );
         }
     }
 
@@ -1031,26 +1015,14 @@ mod tests {
             log
         }
 
-        fn with_path_prepended<F: FnOnce()>(prefix: &Path, f: F) {
-            let prev = std::env::var("PATH").unwrap_or_default();
-            unsafe {
-                std::env::set_var("PATH", format!("{}:{}", prefix.display(), prev));
-            }
-            f();
-            unsafe {
-                std::env::set_var("PATH", &prev);
-            }
-        }
-
         #[test]
         #[serial]
         fn runs_update_info_then_upgrade_aoe() {
             let dir = TempDir::new().unwrap();
             let log = write_recording_brew_shim(dir.path(), "1.5.2", None);
 
-            with_path_prepended(dir.path(), || {
-                update_via_brew("1.5.2").expect("brew upgrade should succeed");
-            });
+            let _path = crate::session::test_support::path_prepended(dir.path());
+            update_via_brew("1.5.2").expect("brew upgrade should succeed");
 
             let invocations = std::fs::read_to_string(&log).unwrap();
             let lines: Vec<_> = invocations.lines().collect();
@@ -1066,7 +1038,8 @@ mod tests {
             let dir = TempDir::new().unwrap();
             let log = write_recording_brew_shim(dir.path(), "1.5.2", Some("update"));
 
-            let err = with_path_prepended_returning(dir.path(), || update_via_brew("1.5.2"));
+            let _path = crate::session::test_support::path_prepended(dir.path());
+            let err = update_via_brew("1.5.2");
             let err = err.expect_err("brew update failure should propagate");
             assert!(
                 err.to_string().contains("brew update"),
@@ -1088,7 +1061,8 @@ mod tests {
             let dir = TempDir::new().unwrap();
             let log = write_recording_brew_shim(dir.path(), "1.5.2", Some("upgrade"));
 
-            let err = with_path_prepended_returning(dir.path(), || update_via_brew("1.5.2"));
+            let _path = crate::session::test_support::path_prepended(dir.path());
+            let err = update_via_brew("1.5.2");
             let err = err.expect_err("brew upgrade failure should propagate");
             assert!(
                 err.to_string().contains("brew upgrade aoe"),
@@ -1112,7 +1086,8 @@ mod tests {
             // brew has 1.5.1 but we're trying to install 1.5.2
             let log = write_recording_brew_shim(dir.path(), "1.5.1", None);
 
-            let err = with_path_prepended_returning(dir.path(), || update_via_brew("1.5.2"));
+            let _path = crate::session::test_support::path_prepended(dir.path());
+            let err = update_via_brew("1.5.2");
             let err = err.expect_err("formula lag should fail loudly");
             let msg = err.to_string();
             assert!(
@@ -1145,29 +1120,13 @@ mod tests {
             #[cfg(unix)]
             std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-            with_path_prepended(dir.path(), || {
-                update_via_brew("1.5.2").expect("missing JSON should not block upgrade");
-            });
+            let _path = crate::session::test_support::path_prepended(dir.path());
+            update_via_brew("1.5.2").expect("missing JSON should not block upgrade");
 
             let invocations = std::fs::read_to_string(&log).unwrap();
             let lines: Vec<_> = invocations.lines().collect();
             assert_eq!(lines.len(), 3, "upgrade should still run; got {lines:?}");
             assert_eq!(lines[2], "upgrade aoe");
-        }
-
-        // PATH-prepended runner that returns a value (Result, in this case).
-        // The plain `with_path_prepended` upstream is FnOnce() -> () which
-        // is fine for assert! but loses the Result.
-        fn with_path_prepended_returning<R, F: FnOnce() -> R>(prefix: &Path, f: F) -> R {
-            let prev = std::env::var("PATH").unwrap_or_default();
-            unsafe {
-                std::env::set_var("PATH", format!("{}:{}", prefix.display(), prev));
-            }
-            let result = f();
-            unsafe {
-                std::env::set_var("PATH", &prev);
-            }
-            result
         }
     }
 
@@ -1191,19 +1150,11 @@ mod tests {
             #[cfg(unix)]
             std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-            let prev = std::env::var("PATH").unwrap_or_default();
-            let new_path = format!("{}:{}", dir.path().display(), prev);
-            unsafe {
-                std::env::set_var("PATH", &new_path);
-            }
+            let _path = crate::session::test_support::path_prepended(dir.path());
 
             let started = Instant::now();
             let result = probe_brew_aoe_path_with_timeout(Duration::from_millis(300));
             let elapsed = started.elapsed();
-
-            unsafe {
-                std::env::set_var("PATH", &prev);
-            }
 
             assert!(result.is_none(), "hanging brew should return None");
             assert!(

@@ -1,6 +1,7 @@
 //! Bringing the server up: auth mode, fd limits, the listener, and the
 //! background loops it owns.
 
+use crate::cli::serve::AuthMode;
 use crate::file_watch::FileWatchService;
 use crate::server::push::{PushState, STATUS_CHANNEL_CAPACITY};
 use crate::server::rate_limit::RateLimiter;
@@ -144,7 +145,12 @@ pub struct ServerConfig<'a> {
     pub profile: &'a str,
     pub host: &'a str,
     pub port: u16,
-    pub no_auth: bool,
+    /// Auth mode the operator asked for. Carried whole rather than
+    /// flattened to a "no token" bool so `start_server` can tell
+    /// `--auth=passphrase` (token off, passphrase wall on) apart from
+    /// `--auth=none` (no gate) and refuse to bind when the requested
+    /// mode's gate is missing. See #3843.
+    pub auth_mode: AuthMode,
     pub read_only: bool,
     pub remote: bool,
     pub tunnel_name: Option<&'a str>,
@@ -182,12 +188,40 @@ pub(crate) async fn resolve_auth_mode(
     }
 }
 
+/// Refuse to bind when the requested [`AuthMode`] has no live gate.
+///
+/// Each mode names one thing that must exist: `token` a URL token,
+/// `passphrase` the login wall. `none` is the only mode allowed to have
+/// neither, and the CLI already confines it to a loopback bind or an
+/// explicit `--behind-proxy`. Asking for a stronger mode must never
+/// resolve to a weaker one than the default, so an unwired gate is a
+/// startup failure rather than a warning over an open port. See #3843.
+fn check_auth_gate(
+    auth_mode: AuthMode,
+    token_gate: bool,
+    passphrase_wall: bool,
+) -> anyhow::Result<()> {
+    let installed = match auth_mode {
+        AuthMode::Token => token_gate,
+        AuthMode::Passphrase => passphrase_wall,
+        AuthMode::None => true,
+    };
+    if installed {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "--auth={} was requested but its gate did not come up; refusing to serve \
+         unauthenticated. Use --auth=none if an unauthenticated port is intended.",
+        auth_mode.as_cli_str()
+    )
+}
+
 pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     let ServerConfig {
         profile,
         host,
         port,
-        no_auth,
+        auth_mode,
         read_only,
         remote,
         tunnel_name,
@@ -218,16 +252,18 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
 
     let instances = load_all_instances(&file_watch)?;
 
-    // Load or generate auth token
-    let auth_token = if no_auth {
+    // Only `--auth=token` issues a URL token. The other two modes are
+    // separated below, once the login wall they depend on exists.
+    let auth_token = match auth_mode {
+        AuthMode::Token => Some(load_or_generate_token().await?),
+        AuthMode::Passphrase | AuthMode::None => None,
+    };
+    if matches!(auth_mode, AuthMode::None) {
         eprintln!(
             "WARNING: Running without authentication. \
              Anyone with network access to this port can control your agent sessions."
         );
-        None
-    } else {
-        Some(load_or_generate_token().await?)
-    };
+    }
 
     let token_lifetime = test_token_lifetime_override().unwrap_or_else(|| {
         if remote {
@@ -272,6 +308,17 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         login::LoginManager::new(passphrase)
     });
     let rate_limiter = Arc::new(RateLimiter::new());
+
+    // Fail closed before anything binds: check the gates that actually
+    // came up against the mode that was asked for. See #3843.
+    check_auth_gate(auth_mode, auth_token.is_some(), login_manager.is_enabled())?;
+
+    if matches!(auth_mode, AuthMode::Passphrase) {
+        eprintln!(
+            "Passphrase authentication: no URL token is issued. Callers reaching \
+             this port sign in with the passphrase."
+        );
+    }
 
     if login_manager.is_enabled() {
         info!("Passphrase login enabled (second-factor authentication)");
@@ -1147,6 +1194,32 @@ async fn remote_rotation_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Every arm of the mode -> gate mapping, including the two that
+    // were never the reported bug: a mode may only start when the gate
+    // it names is live. #3843 was `passphrase` resolving to an open
+    // port, so the passphrase row is the load-bearing one, but the
+    // token row guards the same class of mistake.
+    #[test]
+    fn check_auth_gate_requires_the_gate_each_mode_names() {
+        let cases = [
+            (AuthMode::Token, true, false, true),
+            (AuthMode::Token, true, true, true),
+            (AuthMode::Token, false, true, false),
+            (AuthMode::Passphrase, false, true, true),
+            (AuthMode::Passphrase, false, false, false),
+            (AuthMode::Passphrase, true, false, false),
+            (AuthMode::None, false, false, true),
+        ];
+        for (mode, token_gate, wall, expected_ok) in cases {
+            let got = check_auth_gate(mode, token_gate, wall);
+            assert_eq!(
+                got.is_ok(),
+                expected_ok,
+                "mode={mode:?} token_gate={token_gate} wall={wall} gave {got:?}"
+            );
+        }
+    }
 
     #[test]
     fn remote_serve_url_contents_keeps_public_primary_and_loopback_alternate() {
