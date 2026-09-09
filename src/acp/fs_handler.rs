@@ -293,8 +293,11 @@ mod tests {
     fn rejects_symlink_leaf_pointing_outside_root() {
         let temp = tempfile::tempdir().unwrap();
         let policy = FsPolicy::new(vec![temp.path().to_path_buf()]);
-        let outside = std::env::temp_dir().join("aoe-fs-handler-symlink-target");
-        let _ = std::fs::remove_file(&outside);
+        // Its own tempdir, not a fixed name under `$TMPDIR`: a second test
+        // binary running on this machine would otherwise share the path and
+        // could unlink the file between this write and the read below.
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside = outside_dir.path().join("symlink-target");
         std::fs::write(&outside, "secret").unwrap();
         let symlink_in_root = temp.path().join("escape");
         std::os::unix::fs::symlink(&outside, &symlink_in_root).unwrap();
@@ -307,7 +310,6 @@ mod tests {
 
         let target_after = std::fs::read_to_string(&outside).unwrap();
         assert_eq!(target_after, "secret", "outside file must remain untouched");
-        let _ = std::fs::remove_file(outside);
     }
 
     /// Dangling symlink (target does not exist) inside the allowed root.
