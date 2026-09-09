@@ -310,7 +310,10 @@ enum PassphraseWallEntryAction {
 
 /// Resolve the entry decision for `run_passphrase_wall`. Extracted so
 /// the bypass policy is table-testable without standing up the full
-/// axum middleware. See #1525.
+/// axum middleware. `behind_ingress` is `state.behind_tunnel`;
+/// `auth_middleware` withholds `LoopbackTrusted` under the same
+/// condition so elevation does not restore what this denies. See
+/// #1525 and #3843.
 fn passphrase_wall_entry_action(
     path: &str,
     client_ip: IpAddr,
@@ -669,7 +672,14 @@ pub async fn auth_middleware(
     // elevation gates see the #1168 carve-out no matter which path
     // (token, session, passphrase wall, loopback bypass) handled the
     // request. See `LoopbackTrusted`.
-    if is_local_trusted(client_ip) {
+    //
+    // Withheld wherever the passphrase wall itself stops trusting
+    // loopback, or a caller who signed in through the wall would keep
+    // the elevation carve-out the wall just denied them. See #3843.
+    let wall_covers_loopback = state.behind_tunnel
+        && state.token_manager.is_no_auth().await
+        && state.login_manager.is_enabled();
+    if !wall_covers_loopback && is_local_trusted(client_ip) {
         request.extensions_mut().insert(LoopbackTrusted);
     }
 

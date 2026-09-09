@@ -556,6 +556,12 @@ fn cli_serve_auth_passphrase_loopback_bypass() {
 /// what such a proxy sends: loopback socket, the public `Host`, no
 /// forwarding header, no credential. `/api/sessions` must 401. Before
 /// the fix it returned 200 with the session list.
+///
+/// Then sign in over that same unforwarded shape and confirm a
+/// step-up-gated route still demands elevation: the request used to
+/// carry `LoopbackTrusted`, which would have handed a proxied visitor
+/// who knew the passphrase the skill and plugin mutation routes with
+/// no re-prompt.
 #[test]
 #[parallel]
 fn cli_serve_auth_passphrase_behind_proxy_gates_unforwarded_requests() {
@@ -624,6 +630,73 @@ fn cli_serve_auth_passphrase_behind_proxy_gates_unforwarded_requests() {
         if !login_page.status().is_success() {
             let s = login_page.status();
             return Err(format!("/api/login/status must stay reachable, got {s}"));
+        }
+
+        // Signing in must not restore through elevation what the wall
+        // denied. The same unforwarded request used to be stamped
+        // `LoopbackTrusted`, which `handler_elevated` reads as an
+        // elevated session, so a proxied visitor who knew the
+        // passphrase reached the step-up-gated routes (plugin and
+        // skill mutation: arbitrary code on the host) with no
+        // re-prompt. `SkillMutationGuard` runs before the handler, so
+        // the directory below is never touched.
+        let binding_raw: [u8; 32] = [0x5Au8; 32];
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let binding_b64 = URL_SAFE_NO_PAD.encode(binding_raw);
+
+        let login = client
+            .post(format!("{base}/api/login"))
+            .header("host", "aoe.example.test")
+            .json(&serde_json::json!({
+                "passphrase": "e2e-pass",
+                "device_binding_secret": binding_b64,
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("POST /api/login: {e}"))?;
+        if !login.status().is_success() {
+            let s = login.status();
+            let b = login.text().await.unwrap_or_default();
+            return Err(format!("login failed: status={s} body={b}"));
+        }
+        let session_cookie = login
+            .headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .find_map(|v| {
+                let s = v.to_str().ok()?;
+                let first = s.split(';').next()?.trim();
+                if first.starts_with("aoe_session=") {
+                    Some(first.to_string())
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| "login response missing aoe_session Set-Cookie".to_string())?;
+
+        let mutation = client
+            .delete(format!("{base}/api/skills/e2e-nonexistent"))
+            .header("host", "aoe.example.test")
+            .header("cookie", &session_cookie)
+            .header("x-aoe-device-binding", &binding_b64)
+            .send()
+            .await
+            .map_err(|e| format!("DELETE /api/skills: {e}"))?;
+        if mutation.status() != reqwest::StatusCode::FORBIDDEN {
+            let s = mutation.status();
+            let b = mutation.text().await.unwrap_or_default();
+            return Err(format!(
+                "a signed-in proxied caller must still step up for a skill \
+                 mutation, got status={s} body={b}"
+            ));
+        }
+        let body: serde_json::Value = mutation
+            .json()
+            .await
+            .map_err(|e| format!("decode mutation body: {e}"))?;
+        if body.get("error").and_then(|v| v.as_str()) != Some("elevation_required") {
+            return Err(format!("expected elevation_required, got {body}"));
         }
 
         Ok(())

@@ -37,7 +37,11 @@ stay in sync.
 - **`--auth=passphrase` daemons**: the local TUI attaches to a same-host
   daemon without the passphrase exchange (loopback callers are protected
   by the 0600 serve files on disk). Remote callers proxied through a
-  tunnel still hit the passphrase wall.
+  tunnel still hit the passphrase wall. Adding `--behind-proxy` withdraws
+  the same-host carve-out (see
+  [Behind a reverse proxy](../guides/web-dashboard.md#behind-a-reverse-proxy)),
+  and the TUI has no passphrase exchange to fall back on, so it cannot
+  attach to that daemon.
 
 ### TUI structured view keybinds
 
