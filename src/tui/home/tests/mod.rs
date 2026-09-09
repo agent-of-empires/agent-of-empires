@@ -21,7 +21,6 @@ fn key(code: KeyCode) -> KeyEvent {
 mod apply_session_id_updates;
 mod archive_restart_grouping;
 mod click_to_select;
-mod daemon_status_apply_tests;
 mod default_attach_mode;
 mod divider_drag;
 mod footer_toolbar;
@@ -40,6 +39,7 @@ mod right_click_context_menu;
 mod save_field_merge;
 mod scroll_pane_isolation;
 mod search;
+mod session_feed_tests;
 mod settings_scroll_wiring;
 mod stacked_single_seam;
 mod status_rows_menu;

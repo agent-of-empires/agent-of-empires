@@ -122,6 +122,8 @@ impl SessionResponse {
                 q
             },
             acp_worker_state,
+            rate_limit: None,
+            rate_limit_auto_resume: None,
             // Built-in ACP capability is resolved here from a process-wide
             // registry (cheap, no IO). Custom agents depend on profile
             // config; the list and create handlers overlay that without a

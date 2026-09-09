@@ -21,6 +21,7 @@ pub mod profile;
 pub mod project;
 pub mod ps;
 pub mod remove;
+pub mod sandbox;
 pub mod send;
 pub mod serve;
 pub mod session;

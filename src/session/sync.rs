@@ -95,6 +95,7 @@ fn drain_and_persist_session_ids_inner(
 ) -> SessionIdSyncOutcome {
     let mut updates: Vec<Update> = Vec::with_capacity(instances.len());
     let mut filtered_ids: HashSet<String> = HashSet::with_capacity(instances.len());
+    let mut already_current: Vec<String> = Vec::new();
 
     // Frozen pre-update ownership snapshot. Collision checks must read this,
     // never a map mutated mid-loop: with two pollers that transiently cross
@@ -190,6 +191,12 @@ fn drain_and_persist_session_ids_inner(
         }
         if inst.agent_session_id.as_deref() == Some(sid.as_str()) && !confirms_omp_pin {
             acknowledge_poller_observation(inst, &observation);
+            // The pane published the id this row already holds, so there is no
+            // sid to write. Its transcript path may still be new: a launch
+            // that pre-minted its id never sees one of these observations
+            // reach the write below, and that path is the only durable record
+            // of which file the conversation lives in.
+            already_current.push(inst.id.clone());
             continue;
         }
         updates.push(Update {
@@ -229,6 +236,12 @@ fn drain_and_persist_session_ids_inner(
             true
         }
     });
+
+    for id in &already_current {
+        if let Some(inst) = instances.iter_mut().find(|i| i.id == *id) {
+            inst.absorb_published_pi_session();
+        }
+    }
 
     if updates.is_empty() && filtered_ids.is_empty() {
         return SessionIdSyncOutcome::default();
@@ -400,6 +413,11 @@ fn drain_and_persist_session_ids_inner(
             } else {
                 inst.resume_probe_failed_sid = None;
             }
+            // The transcript path belongs with the id it names. Recording it
+            // here is what makes it durable while the pane is still running:
+            // the sidecar it comes from lives in the host temp directory, and
+            // the only other writer is teardown, which a reboot never reaches.
+            inst.absorb_published_pi_session();
         }
     }
     for rb in &to_rollback {
@@ -1339,6 +1357,53 @@ mod tests {
         assert!(
             instances[0].session_id_poller.is_some(),
             "a sidecar poller keeps watching for the next switch"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn pi_records_its_transcript_path_when_the_observation_repeats_its_own_id() {
+        // A host Pi launch that pre-mints its id sees every poller
+        // observation match the row, so nothing is ever written through the
+        // sid path. The transcript path still has to land: it is the only
+        // durable record of which file the conversation lives in, and the
+        // sidecar it comes from does not survive a reboot.
+        let (_hooks, _base, _hooks_tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let temp = tempdir().unwrap();
+        let _guard = storage_home_guard(&temp);
+
+        let profile = "sync-pi-same-sid";
+        let sid = "01a05234-8889-72e2-a7c9-7ebc27b25b78";
+        let mut inst = Instance::new("pi-same-sid-title", "/tmp/pi-same-sid");
+        inst.source_profile = profile.to_string();
+        inst.tool = "pi".to_string();
+        inst.agent_session_id = Some(sid.to_string());
+        inst.mark_pi_extension_launched_for_test();
+        seed_instance_on_disk(profile, &inst);
+
+        let published = "/home/u/.pi/agent/sessions/--proj--/2026-01-01T00-00-00-000Z_01a05234-8889-72e2-a7c9-7ebc27b25b78.jsonl";
+        crate::hooks::write_session_id_via_guard(&inst.id, sid).unwrap();
+        let dir = crate::hooks::ensure_instance_dir_path(&inst.id).unwrap();
+        std::fs::write(dir.join("session_path"), format!("{published}\n")).unwrap();
+
+        let poller = SessionPoller::new(format!("test-tmux-{}", inst.id));
+        poller.inject_test_sidecar_update(&inst.id, sid);
+        inst.session_id_poller = Some(Arc::new(Mutex::new(poller)));
+
+        let file_watch = FileWatchService::noop();
+        let mut instances = [inst];
+        drain_and_persist_session_ids(&mut instances, &file_watch);
+
+        assert_eq!(
+            instances[0].agent_session_id.as_deref(),
+            Some(sid),
+            "an observation that repeats the row's own id changes no sid"
+        );
+        let stored = Storage::new_unwatched(profile).unwrap().load().unwrap();
+        assert_eq!(
+            stored[0].pi_session_path.as_deref(),
+            Some(published),
+            "the transcript path must be durable before any teardown runs"
         );
     }
 

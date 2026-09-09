@@ -208,7 +208,7 @@ pub(super) fn poll_statuses_once(
             // container is owned by the worker rather than by a tmux pane, so
             // neither probe below can say anything true about them. The
             // `aoe serve` daemon derives their status from ACP events
-            // (`derive_acp_status`) and `DaemonStatusPoller` is the only
+            // (`derive_acp_status`) and `SessionFeed` is the only
             // producer that carries it into the TUI; emitting anything here
             // would fight that overlay on alternating cycles.
             //

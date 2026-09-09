@@ -771,6 +771,9 @@ mod tests {
     /// wins over any real one; inherited, so a host whose coreutils sit
     /// outside the FHS layout still resolves them. `OsString` throughout: a
     /// `PATH` entry need not be UTF-8.
+    ///
+    /// Child-scoped on purpose. Putting the shim on the process `PATH` would
+    /// hand the fake `tmux` to every test resolving a real one concurrently.
     #[cfg(unix)]
     fn test_path_with_shim(bin: &std::path::Path) -> std::ffi::OsString {
         // An unset or empty PATH is handled separately: `split_paths("")`
@@ -786,19 +789,13 @@ mod tests {
         std::env::join_paths(entries).expect("PATH entries contain no separator")
     }
 
-    /// `#[serial]` because this reads the inherited PATH, and every test that
-    /// scrubs PATH process-globally carries that same default-key annotation:
-    /// `crate::acp::node`, `crate::acp::acp_client`, and
-    /// `crate::update::install`.
-    /// Not an `EnvGuard` lock: none of them takes `test_support::ENV_LOCK`, so
-    /// a guard would exclude unrelated guard users and leave this window open.
-    /// A future PATH mutator outside the default serial group would reopen it.
+    /// Holds `ENV_LOCK` across the `PATH` read that builds the child's.
     #[cfg(unix)]
     #[test]
-    #[serial_test::serial]
     fn omp_capture_gate_executes_nested_stdin_scripts() {
         use std::os::unix::fs::PermissionsExt;
 
+        let _env = crate::session::test_support::EnvGuard::read_lock();
         let temp = tempfile::tempdir().unwrap();
         let bin = temp.path().join("bin");
         std::fs::create_dir(&bin).unwrap();

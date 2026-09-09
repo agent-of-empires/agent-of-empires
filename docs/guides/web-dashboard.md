@@ -184,6 +184,8 @@ aoe serve \
 
 The upstream must set `X-Forwarded-For` (or `cf-connecting-ip`); aoe reads the last value as the client IP. The trust check fires only when the socket peer is loopback, so a misconfigured upstream that lets requests reach aoe directly cannot spoof the IP.
 
+With `--auth=passphrase --behind-proxy` the passphrase wall applies to loopback callers too. Proxied traffic arrives on a loopback socket, so an upstream that forgets the header would otherwise hand every visitor the same-host bypass. A browser on the same host signs in with the passphrase like any other client. The TUI structured view has no passphrase exchange, so it cannot attach to a `--behind-proxy` passphrase daemon; use `--auth=token` on daemons you also drive from the local TUI.
+
 `--behind-proxy` requires at least one `--allowed-host <public-hostname>`: aoe cannot infer the hostname your proxy forwards, and the [DNS-rebinding gate](#dns-rebinding) rejects any `Host` it does not recognize. If the proxy listens on a nonstandard port, also pass the exact origin, e.g. `--allowed-origin https://aoe.example.com:8443`. The daemon refuses to start (with an explicit message) if `--behind-proxy` is set without `--allowed-host`.
 
 ## Security

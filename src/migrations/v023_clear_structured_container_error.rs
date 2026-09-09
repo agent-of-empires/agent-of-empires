@@ -13,7 +13,7 @@
 //! `status = "error"` alone.
 //!
 //! The poller now returns `None` for structured rows and the daemon overlay
-//! (`DaemonStatusPoller`) is their only status producer, so no new rows can be
+//! (`SessionFeed`) is their only status producer, so no new rows can be
 //! poisoned. This one-shot demotes the existing ones back to Idle. Any
 //! persisted Error on a structured row can only be that spurious transition:
 //! the daemon never persisted structured status at all in those builds (see

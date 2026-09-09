@@ -33,6 +33,25 @@ function mount(overrides?: Partial<React.ComponentProps<typeof SystemNotices>>) 
   return { manualReconnect, ...render(<SystemNotices {...props} />) };
 }
 
+describe("SystemNotices auto-resume status (#3514)", () => {
+  const rateLimit = { status: "limited", resets_at: "2099-01-01T00:00:00Z", kind: "rate_limit" };
+
+  it("says the park ends by itself when auto-resume is armed", () => {
+    const { getByText } = mount({ rateLimit, rateLimitAutoResume: true });
+    expect(getByText(/Auto-resume is armed/)).toBeDefined();
+  });
+
+  it("says auto-resume is off and how to recover when it is not", () => {
+    const { getByText } = mount({ rateLimit, rateLimitAutoResume: false });
+    expect(getByText(/Auto-resume is off for this profile/)).toBeDefined();
+  });
+
+  it("claims nothing about auto-resume when the caller does not know", () => {
+    const { queryByText } = mount({ rateLimit });
+    expect(queryByText(/Auto-resume/)).toBeNull();
+  });
+});
+
 describe("SystemNotices rate-limit handoff", () => {
   it("renders the switch-agent button only when rateLimit + handler are set", () => {
     const onSwitchAgent = vi.fn();
