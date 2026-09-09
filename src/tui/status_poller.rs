@@ -192,14 +192,17 @@ pub(super) fn poll_statuses_once(
             // file is still rotating the copy in its store; folding that in
             // would log every sandbox on the shared file out.
             let container = crate::containers::DockerContainer::from_session_id(&instance.id);
-            let running = state
+            // An absent name is unknown, not stopped: the map is empty for a
+            // runtime that cannot list states and for a failed list. Only a
+            // container known to be stopped skips the check.
+            let stopped = state
                 .container_states
                 .get(&crate::containers::DockerContainer::generate_name(
                     &instance.id,
                 ))
                 .copied()
-                .unwrap_or(false);
-            if running {
+                == Some(false);
+            if !stopped {
                 match instance.predates_shared_credential(&container, &instance.detect_as) {
                     Ok(false) => {}
                     Ok(true) => continue,
