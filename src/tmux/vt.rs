@@ -5591,8 +5591,8 @@ mod tests {
             return false;
         }
         // Its own threshold, not `parse_tmux_pipe_support`'s: that encodes when
-        // `pipe-pane -IO` became usable, and the two matching today is a
-        // coincidence a future tmux requirement would silently break.
+        // `pipe-pane` became usable for the VT channel, and the two matching
+        // today is a coincidence a future tmux requirement would silently break.
         const TMUX_OSC8_MIN: (u32, u32) = (3, 4);
         tmux_version(&String::from_utf8_lossy(out.stdout.as_slice())) >= TMUX_OSC8_MIN
     }

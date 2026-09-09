@@ -5,7 +5,8 @@
 //! bytes stream through `pipe-pane` into an in-process grid, frames publish
 //! the moment the grid changes (held while the app is inside a DEC 2026
 //! synchronized-output bracket, so a half-drawn repaint is never shipped),
-//! and keystrokes go back over the same socket. The paired host and
+//! and on tmux 3.8 or newer keystrokes go back over the same socket
+//! (older tmux delivers them with `send-keys`). The paired host and
 //! container shells, and every fallback, poll `tmux capture-pane` snapshots
 //! on a cadence and deliver input with `tmux send-keys -H`. Either way there
 //! is no PTY and no `tmux attach`: scrollback is just a bigger window the
