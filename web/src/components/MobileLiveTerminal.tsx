@@ -5,6 +5,7 @@ import {
   LineParseCache,
   clusterSpanAt,
   findCursorCharIndex,
+  isHttpUrl,
   splitCellRuns,
   splitUrls,
   textWidth,
@@ -487,7 +488,10 @@ export const Row = memo(function Row({
     return (
       <div>
         {segs.map((seg, i) =>
-          splitUrls(seg.text).map((part, j) => {
+          // An OSC 8 hyperlink's displayed text need not be its URL (a PR
+          // title over a PR link), so a segment carrying one anchors as a
+          // whole instead of being re-scanned by the bare-URL regex.
+          (seg.url && isHttpUrl(seg.url) ? [{ text: seg.text, url: seg.url }] : splitUrls(seg.text)).map((part, j) => {
             const runs = splitCellRuns(part.text).map((run, k) => cellRunSpan(run, seg.style, `${i}-${j}-${k}`));
             // Whole-part anchors: a URL that runs into glued non-ASCII
             // keeps those glyphs in its href and inside the clickable

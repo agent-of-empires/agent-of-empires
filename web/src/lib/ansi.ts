@@ -1,28 +1,34 @@
 /* eslint-disable no-control-regex -- this file's whole job is to match ESC sequences */
-// ANSI SGR parser for Bash tool output.
+// ANSI SGR parser for Bash tool output and the live terminal view.
 //
 // claude-agent-acp forwards `\x1b[...m` color escapes from commands
 // like `git status --color=always` and `gls --color=always`. Shiki's
 // bash grammar treats them as raw text, so the user sees literal
-// `[01;34m` noise unless we render them ourselves.
+// `[01;34m` noise unless we render them ourselves. Agents also emit
+// `\x1b]8;;URL\x1b\TEXT\x1b]8;;\x1b\` OSC 8 hyperlinks (e.g. `gh pr
+// create` output); there is no xterm here to interpret those, so
+// without this parser they show up as literal escape bytes (#3519).
 //
-// We:
-//   1. Collapse `\r` (carriage-return repaints) so progress bars don't
-//      flatten into one concatenated line.
-//   2. Strip non-SGR CSI sequences (cursor movement, line erase, etc.)
-//      that would otherwise leak through as garbage characters.
-//   3. Walk the remaining SGR sequences (`\x1b[<n;n;…>m`) and emit
-//      typed segments the React layer can style.
+// One pass walks every escape sequence in order, carrying the SGR style
+// and the open hyperlink target as a single state. Text between sequences
+// becomes a segment stamped with that state, so there are no string
+// coordinates for two passes to disagree about.
+//
+// Carriage-return repaints are collapsed first, because that is a
+// line-oriented rewrite that needs no coordinate agreement.
 
 // Any CSI sequence: ESC [ params final-byte (any letter).
 const ANY_CSI = /\[[\d;?]*[a-zA-Z]/g;
-// SGR specifically: same shape, terminated by `m`.
-const SGR = /\[([\d;]*)m/g;
-// CSI sequences other than SGR — anything ending in a letter that
-// isn't `m`. We match the full sequence so ANY_CSI followed by a
-// negative-set replace would risk eating SGR; instead use a
-// non-`m`-terminator pattern.
-const NON_SGR_CSI = /\[[\d;?]*[a-ln-zA-LN-Z]/g;
+
+// Every escape sequence this parser understands, in one alternation so a
+// single walk sees them in the order they appear:
+//   1-2: CSI params + final byte. `m` is SGR; every other final byte is
+//        cursor movement, line erase and the like, dropped.
+//   3-4: OSC code + payload, terminated by BEL or ST (`ESC \`). Code 8
+//        carries `params;URI` and opens or closes a hyperlink; every other
+//        code (title sets, OSC 52 clipboard) is dropped whole, payload
+//        included, because none of it is meant to render.
+const TOKEN = /\[([\d;?]*)([a-zA-Z])|\]([0-9]+)(?:;([^\x07]*))?(?:\\|\x07)/g;
 
 export interface AnsiStyle {
   fg?: string;
@@ -37,14 +43,26 @@ export interface AnsiStyle {
 export interface AnsiSegment {
   text: string;
   style: AnsiStyle;
+  /** Hyperlink target when this span fell inside an OSC 8 sequence. */
+  url?: string;
 }
 
-// Match a real CSI sequence (`ESC [ params final-byte`), not just the
-// `ESC [` prefix. A markdown blob that quotes the literal characters
-// "\x1b[" — e.g. agent docs about color output — would otherwise trip
-// the ANSI fast path, find no SGR, and render as a plain `<pre>`
-// instead of going through Shiki for highlighting.
-const HAS_ANSI = /\x1b\[[\d;?]*[a-zA-Z]/;
+/** Everything an escape sequence can leave in effect past the end of a
+ *  line: tmux emits a reset only when the style changes, and a hyperlink
+ *  legitimately spans lines, so a per-line parse must thread both. */
+export interface AnsiState {
+  style: AnsiStyle;
+  /** Target of a hyperlink still open at this point, if any. */
+  url?: string;
+}
+
+// Match a real escape sequence, not just an `ESC [` or `ESC ]` prefix. A
+// markdown blob that quotes the literal characters "[" — e.g. agent
+// docs about color output — would otherwise trip the ANSI fast path, find
+// nothing to style, and render as a plain `<pre>` instead of going through
+// Shiki for highlighting. Output whose only sequence is a hyperlink counts:
+// it has no color code, and skipping it here leaks the escape bytes.
+const HAS_ANSI = /\[[\d;?]*[a-zA-Z]|\][0-9]+(?:;[^\x07]*)?(?:\\|\x07)/;
 
 export function hasAnsi(text: string): boolean {
   return HAS_ANSI.test(text);
@@ -223,35 +241,57 @@ function applySgr(style: AnsiStyle, params: number[]): AnsiStyle {
   return next;
 }
 
-/** Parse a string with ANSI SGR codes into styled segments, starting from
- *  `initial` SGR state and reporting the state left in effect at the end.
- *  This is the resumable core behind [`parseAnsi`]: tmux emits a reset only
- *  when the style changes, so SGR state legitimately spans lines, and a
- *  per-line parse cache must thread the carried style through explicitly.
- *  Non-SGR CSI sequences and `\r` repaints are stripped/collapsed first. */
-export function parseAnsiFrom(text: string, initial: AnsiStyle): { segs: AnsiSegment[]; exit: AnsiStyle } {
-  const cleaned = collapseCarriageReturns(text).replace(NON_SGR_CSI, "");
+/** Parse `text` into styled segments, starting from the escape state
+ *  `initial` leaves in effect and reporting the state left at the end.
+ *  This is the resumable core behind [`parseAnsi`]: a color or an open
+ *  hyperlink legitimately spans lines, so a per-line parse cache must
+ *  thread both through explicitly. */
+export function parseAnsiFrom(text: string, initial: AnsiState): { segs: AnsiSegment[]; exit: AnsiState } {
+  const clean = collapseCarriageReturns(text);
   const segs: AnsiSegment[] = [];
   let last = 0;
-  let cur: AnsiStyle = { ...initial };
-  for (const m of cleaned.matchAll(SGR)) {
-    const idx = m.index ?? 0;
-    if (idx > last) {
-      segs.push({ text: cleaned.slice(last, idx), style: { ...cur } });
+  let style: AnsiStyle = { ...initial.style };
+  let url = initial.url;
+  // A dropped sequence (cursor movement, a title set) leaves the state
+  // untouched, so the text on either side of it is one span rather than two.
+  let restyled = true;
+  const emit = (chunk: string) => {
+    if (chunk.length === 0) return;
+    const prev = segs[segs.length - 1];
+    if (!restyled && prev) {
+      prev.text += chunk;
+      return;
     }
-    const raw = m[1] ?? "";
-    const params = raw === "" ? [] : raw.split(";").map((s) => Number(s));
-    cur = applySgr(cur, params);
+    segs.push({ text: chunk, style: { ...style }, url });
+    restyled = false;
+  };
+  for (const m of clean.matchAll(TOKEN)) {
+    const idx = m.index ?? 0;
+    emit(clean.slice(last, idx));
     last = idx + m[0].length;
+    if (m[2] !== undefined) {
+      // CSI: SGR restyles, every other final byte is dropped.
+      if (m[2] !== "m") continue;
+      const raw = m[1] ?? "";
+      style = applySgr(style, raw === "" ? [] : raw.split(";").map((n) => Number(n)));
+      restyled = true;
+      continue;
+    }
+    if (m[3] !== "8") continue;
+    const payload = m[4] ?? "";
+    const sep = payload.indexOf(";");
+    // OSC 8 carries `params;URI`. An empty URI closes the link; a second
+    // open before a close (malformed input) retargets rather than nests.
+    // An open with no close runs to the end of the parsed text, so a frame
+    // cut mid-link still shows its visible text.
+    url = (sep >= 0 ? payload.slice(sep + 1) : "") || undefined;
+    restyled = true;
   }
-  if (last < cleaned.length) {
-    segs.push({ text: cleaned.slice(last), style: { ...cur } });
-  }
-  return { segs: segs.filter((s) => s.text.length > 0), exit: cur };
+  emit(clean.slice(last));
+  return { segs, exit: { style, url } };
 }
 
-/** Parse a string with ANSI SGR codes into styled segments. Non-SGR
- *  CSI sequences and `\r` repaints are stripped/collapsed first. */
+/** Parse a string with ANSI escape sequences into styled segments. */
 export function parseAnsi(text: string): AnsiSegment[] {
-  return parseAnsiFrom(text, {}).segs;
+  return parseAnsiFrom(text, { style: {} }).segs;
 }

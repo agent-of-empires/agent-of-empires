@@ -3537,27 +3537,23 @@ mod tests {
     /// stretched it from ~1ms to hundreds and the live `composer-stop` spec
     /// failed on whichever case clicked Stop without waiting for output first.
     ///
-    /// Both halves of the ordering are pinned here, against a held guard
-    /// rather than a live agent: cancel must wait for it, and the prompt
-    /// handler must claim it before its first side effect (the wake, which is
-    /// what `last_accessed_at` records). A handler that claims later leaves
-    /// exactly that much window for a cancel to pass through.
+    /// This pins the cancel half of the ordering, against a held guard rather
+    /// than a live agent: a Stop must wait the submission out instead of
+    /// racing ahead of it. The producer half, that a prompt handler claims the
+    /// guard before its first side effect and so leaves no window to race at
+    /// all, is `prompt_handlers_claim_the_submission_guard_before_they_wake`.
     #[tokio::test]
-    async fn cancel_and_prompt_serialize_on_the_submission_guard() {
+    async fn cancel_waits_for_an_in_flight_prompt_submission() {
         use std::time::Duration;
 
         let mut inst = crate::session::Instance::new("stop-order", "/tmp/aoe-stop-order");
         inst.id = "sess-stop-order".to_string();
         inst.view = crate::session::View::Structured;
-        assert!(
-            inst.last_accessed_at.is_none(),
-            "fresh instance is untouched"
-        );
         let id = inst.id.clone();
         let state = crate::server::test_support::build_test_app_state(vec![inst]);
 
         // Stand in for a submission already in flight. There is no worker, so
-        // every path below fails fast once it gets past the guard.
+        // cancel fails fast once it gets past the guard.
         let submission = state
             .session_service
             .prompt_submission_for_session(&id)
@@ -3569,42 +3565,129 @@ mod tests {
             let id = id.clone();
             async move { acp_cancel(State(state), Path(id)).await.into_response() }
         });
-        let prompt = tokio::spawn({
-            let state = Arc::clone(&state);
-            let id = id.clone();
-            async move {
-                acp_prompt(
-                    State(state),
-                    Path(id),
-                    Ok(Json(PromptRequest {
-                        text: "think about this".to_string(),
-                        attachments: Vec::new(),
-                        prompt_id: None,
-                    })),
-                )
-                .await
-                .into_response()
-            }
-        });
 
-        // 500ms is orders of magnitude over the microseconds either handler
-        // needs to reach the agent-facing work once it is past the guard.
+        // 500ms is orders of magnitude over the microseconds cancel needs to
+        // reach the agent-facing work once it is past the guard.
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(
             !cancel.is_finished(),
             "acp_cancel must wait for the in-flight submission instead of racing ahead of it"
         );
-        assert!(
-            state.instances.read().await[0].last_accessed_at.is_none(),
-            "acp_prompt must claim the submission guard before it wakes the session"
-        );
 
         drop(submission);
-        for handler in [cancel, prompt] {
-            tokio::time::timeout(Duration::from_secs(10), handler)
+        tokio::time::timeout(Duration::from_secs(10), cancel)
+            .await
+            .expect("cancel must finish once the guard drops")
+            .expect("handler task must not panic");
+    }
+
+    /// #3859: a Stop landing while a prompt handler wakes or resumes the
+    /// session must still queue behind the prompt it names. That holds only
+    /// because the handler claims the submission guard before its first side
+    /// effect, so the whole wake-resume-send sequence sits inside the hold and
+    /// `acp_cancel`'s own claim has to wait it out. A handler that woke first
+    /// would leave that window open again, and a sunk session widens it from
+    /// milliseconds to a whole resume. Both turn-starting endpoints are here:
+    /// the ordering is a property of the guard, not of one handler.
+    ///
+    /// The claim tap is what makes this deterministic instead of a sleep. It
+    /// fires after the guard's pre-acquisition existence check and before
+    /// `prompt_locks` is read, so a handler that reaches it has run nothing
+    /// else, and the guard held here parks it there. `last_accessed_at` is
+    /// what the wake stamps, so reading it at that checkpoint reads the
+    /// ordering directly: `None` means the claim came first, `Some` means the
+    /// wake ran outside the guard. Releasing and letting the handler finish is
+    /// the other half, without which a handler that never woke at all would
+    /// pass the same assertion.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn prompt_handlers_claim_the_submission_guard_before_they_wake() {
+        use crate::session::test_support::isolate_app_dir;
+        use std::time::Duration;
+
+        enum Endpoint {
+            Prompt,
+            DiffComments,
+        }
+
+        for (endpoint_name, endpoint) in [
+            ("acp_prompt", Endpoint::Prompt),
+            ("acp_prompt_diff_comments", Endpoint::DiffComments),
+        ] {
+            let _app_dir = isolate_app_dir();
+            let mut inst = crate::session::Instance::new("wake-order", "/tmp/aoe-3859-project");
+            inst.id = "sess-3859".to_string();
+            inst.view = crate::session::View::Structured;
+            assert!(
+                inst.last_accessed_at.is_none(),
+                "fresh instance is untouched"
+            );
+            let id = inst.id.clone();
+            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+            // Stand in for whatever else the session's guard can be busy with.
+            // Claimed before the watcher is installed, so the tap only ever
+            // reports the handler's claim.
+            let held = state
+                .session_service
+                .prompt_submission_for_session(&id)
                 .await
-                .expect("both handlers must finish once the guard drops")
+                .expect("seeded session must admit a submission");
+            let mut claims = state.session_service.watch_submission_claims();
+
+            let handler = tokio::spawn({
+                let state = Arc::clone(&state);
+                let id = id.clone();
+                async move {
+                    match endpoint {
+                        Endpoint::Prompt => acp_prompt(
+                            State(state),
+                            Path(id),
+                            Ok(Json(PromptRequest {
+                                text: "think about this".to_string(),
+                                attachments: Vec::new(),
+                                prompt_id: None,
+                            })),
+                        )
+                        .await
+                        .into_response(),
+                        Endpoint::DiffComments => acp_prompt_diff_comments(
+                            State(state),
+                            Path(id),
+                            Ok(Json(DiffCommentsPromptRequest {
+                                intro: String::new(),
+                                outro: String::new(),
+                                is_multi_repo: false,
+                                comments: Vec::new(),
+                                assembled_markdown: "review this".to_string(),
+                            })),
+                        )
+                        .await
+                        .into_response(),
+                    }
+                }
+            });
+
+            let claimed = tokio::time::timeout(Duration::from_secs(10), claims.recv())
+                .await
+                .unwrap_or_else(|_| panic!("{endpoint_name} must reach its submission claim"))
+                .expect("the tap outlives the handler");
+            assert_eq!(claimed, id, "{endpoint_name} claimed another session");
+            assert!(
+                state.instances.read().await[0].last_accessed_at.is_none(),
+                "{endpoint_name} must claim the submission guard before it wakes the session"
+            );
+
+            drop(held);
+            tokio::time::timeout(Duration::from_secs(30), handler)
+                .await
+                .expect("the handler must finish once the guard drops")
                 .expect("handler task must not panic");
+            assert!(
+                state.instances.read().await[0].last_accessed_at.is_some(),
+                "{endpoint_name} must wake the session under the guard, or the \
+                 assertion above passes for a handler that never woke at all"
+            );
         }
     }
 

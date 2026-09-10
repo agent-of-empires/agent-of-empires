@@ -1059,3 +1059,33 @@ describe("clickable file path (#3088)", () => {
     expect(container.querySelector('[title="/tmp/main.rs"]')).not.toBeNull();
   });
 });
+
+describe("hyperlinks in tool output", () => {
+  // The card header is a toggle; output is collapsed until it is clicked.
+  const outputWith = (text: string) => {
+    const rendered = render(
+      <Wrap>
+        <ToolCard tool={fixtures.bash} result={makeCompletion({ toolCallId: "bash-1", text })} />
+      </Wrap>,
+    );
+    const header = rendered.container.querySelector("button");
+    if (header) fireEvent.click(header);
+    return rendered;
+  };
+
+  it("links output whose only escape sequence is a hyperlink", () => {
+    // No color code anywhere: this output used to miss the ANSI path
+    // entirely and render its escape bytes as text.
+    const { container } = outputWith("See \x1b]8;;https://example.com/pr/8\x1b\\the PR\x1b]8;;\x1b\\ now");
+    const link = container.querySelector('a[href="https://example.com/pr/8"]');
+    expect(link?.textContent).toBe("the PR");
+    expect(container.textContent).toContain("See the PR now");
+    expect(container.textContent).not.toContain("]8;;");
+  });
+
+  it("renders a target outside the scheme allowlist as plain text", () => {
+    const { container } = outputWith("run \x1b]8;;javascript:alert(1)\x1b\\this\x1b]8;;\x1b\\ now");
+    expect(container.querySelector("a")).toBeNull();
+    expect(container.textContent).toContain("run this now");
+  });
+});

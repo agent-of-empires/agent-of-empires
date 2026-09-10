@@ -34,9 +34,7 @@ use super::config_options::{
 };
 use super::control::{establish_session_v3, prompt_outcome_to_response, DaemonControlClient};
 use super::delete::handle_delete_session_cmd;
-use super::errors::{
-    acp_internal_error, is_unsupported_session_error, AcpError, IncompatibleAgentError,
-};
+use super::errors::{acp_internal_error, AcpError, IncompatibleAgentError};
 use super::fs_handlers::{handle_read_text_file, handle_write_text_file};
 use super::handshake::{build_initialize_request, should_fork};
 use super::lifecycle::{
@@ -48,7 +46,7 @@ use super::pending::PendingResponders;
 use super::permission_handlers::{handle_elicitation_request, handle_permission_request};
 use super::rate_limit::{
     captured_rate_limit_resets_at, classify_rate_limit_error, classify_rate_limit_from_message,
-    rate_limit_rejection_from_meta,
+    is_unsupported_session_error, rate_limit_rejection_from_meta,
 };
 use super::reset::{
     await_reset_request, ResetRequestError, ResetSessionOutcome, SESSION_RESET_IN_TASK_TIMEOUT,
@@ -1983,20 +1981,22 @@ pub(super) async fn run_connection_task<W, R>(
                                                 break;
                                             }
                                             // A resumed worker reuses the stored
-                                            // acp_session_id without session/load; an
-                                            // agent that dropped that session rejects
-                                            // the first prompt. Reset the context so
-                                            // the respawn opens a fresh session/new
-                                            // (the transcript is preserved for replay)
-                                            // instead of terminating the runner (#3560).
-                                            if this_prompt_epoch == 1
-                                                && session_from_storage
+                                            // acp_session_id without session/load;
+                                            // an agent that dropped that session
+                                            // rejects the prompt, on the first or
+                                            // any later one. Reset the context so
+                                            // the respawn opens a fresh
+                                            // session/new (the transcript is
+                                            // preserved for replay) instead of
+                                            // terminating the runner (#3560).
+                                            if session_from_storage
                                                 && is_unsupported_session_error(&e)
                                             {
                                                 warn!(
                                                     target: "acp.protocol",
                                                     session = %session_label,
-                                                    "resumed ACP session rejected; resetting context so the respawn starts fresh: {e}"
+                                                    acp_session_id = %acp_session_id.0,
+                                                    "resumed ACP session rejected as unsupported; resetting context so the respawn starts fresh: {e}"
                                                 );
                                                 let _ = event_tx_for_block
                                                     .send(Event::SessionContextReset {
@@ -2732,6 +2732,10 @@ pub(super) async fn run_connection_task<W, R>(
                                 // client and the runner cannot disagree
                                 // about which session owns later prompts.
                                 acp_session_id = new_id.clone();
+                                // The id in use is now agent-created, not
+                                // the stored one, so a later prompt
+                                // rejection is not a stale resume.
+                                session_from_storage = false;
                                 available_mode_ids =
                                     new_session.modes.as_ref().map(|modes| {
                                         modes
