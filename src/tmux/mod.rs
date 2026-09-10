@@ -561,23 +561,50 @@ pub(crate) fn marked_names(
         .map(|(name, session)| (name.as_str(), session.kind.map(SessionKind::as_marker)))
 }
 
-/// The one scan every kind-aware lookup reads: the global `@aoe_kind` (see
-/// [`parse_session_scan`]) followed by one line per live session.
+/// The one scan every kind-aware lookup reads: the inheritable `@aoe_kind`
+/// scopes (see [`parse_session_scan`]) followed by one line per live session.
 fn session_scan_command() -> Command {
     let mut command = tmux_query_command();
-    command.args([
-        "show-options",
-        "-gqv",
-        session_kind::KIND_OPTION,
-        ";",
-        "list-sessions",
-        "-F",
-        SESSION_SCAN_FORMAT,
-    ]);
+    for flags in INHERITABLE_KIND_SCOPES {
+        command.args(["show-options", flags, session_kind::KIND_OPTION, ";"]);
+    }
+    command.args(["list-sessions", "-F", SESSION_SCAN_FORMAT]);
     command
 }
 
+/// The server-wide option scopes a `list-sessions` `#{@aoe_kind}` reads, as
+/// `show-options` flag sets, each read back so [`parse_session_scan`] can
+/// subtract it.
+///
+/// Measured on tmux 3.6, highest first: `-s` > `-gw` > `-w` > a session's own
+/// value > `-g`. Only `-g` is a fall-through; the rest OVERRIDE the mark aoe
+/// wrote, so a user who sets one does not shadow aoe's answer selectively,
+/// they hide every mark on the server and put the whole fleet back on the
+/// name-shape guess. Subtracting them is therefore never able to discard a
+/// legitimate mark: when they are set, no legitimate mark is visible anyway.
+///
+/// `-w` and `-p` reach the format too but are per-window and per-pane, so a
+/// single subtracted value cannot cover them. Setting `@aoe_kind` yourself
+/// stays unsupported (`docs/guides/tmux-status-bar.md`).
+const INHERITABLE_KIND_SCOPES: [&str; 3] = ["-gqv", "-sqv", "-gwqv"];
+
 const SESSION_SCAN_FORMAT: &str = "#{session_name}|#{session_activity}|#{@aoe_kind}";
+
+/// Whether a scan line is a session rather than one of the leading
+/// [`INHERITABLE_KIND_SCOPES`] values.
+///
+/// A session line is `<name>|<activity>|<marker>`, so its second field is
+/// always `#{session_activity}`'s integer. Testing that rather than the mere
+/// presence of a [`FIELD_SEP`] keeps a scope value that happens to contain one
+/// from ending the scope block early, which would leave every later scope
+/// unsubtracted and hand a paired terminal the agent's kind.
+fn is_session_line(line: &str) -> bool {
+    let mut fields = line.split(FIELD_SEP);
+    fields.next();
+    fields
+        .next()
+        .is_some_and(|activity| activity.parse::<i64>().is_ok())
+}
 
 /// Parse the [`session_scan_command`] output.
 ///
@@ -585,13 +612,13 @@ const SESSION_SCAN_FORMAT: &str = "#{session_name}|#{session_activity}|#{@aoe_ki
 /// session with no mark, so a line that is short or empty there is an unmarked
 /// session and not a parse failure.
 ///
-/// The first line is the GLOBAL `@aoe_kind`, printed only when the user set
-/// one, and recognized by carrying no [`FIELD_SEP`] where a session line
-/// always has two. It has to be subtracted: `#{@aoe_kind}` falls through to
-/// the global value for every session that does not set its own, so a user who
-/// sets one would otherwise mark their whole server as agents. A session whose
-/// value merely equals the global is treated as unmarked, which is the
-/// name-shape fallback rather than a wrong answer.
+/// The leading lines are the [`INHERITABLE_KIND_SCOPES`] values, printed only
+/// for a scope the user set one in and told apart by [`is_session_line`].
+/// They have to be subtracted: a session that sets none of its own reads the
+/// broadest scope that is set, so a user who sets one would otherwise mark
+/// their whole server as agents and a paired terminal would pass as an agent
+/// pane. A session whose value merely equals one of them is treated as
+/// unmarked, which is the name-shape fallback rather than a wrong answer.
 ///
 /// aoe-created names are sanitized to `[A-Za-z0-9_-]`, but the shared server
 /// also carries foreign sessions, whose names tmux does allow `|` in. Such a
@@ -599,9 +626,12 @@ const SESSION_SCAN_FORMAT: &str = "#{session_name}|#{session_activity}|#{@aoe_ki
 /// the same outcome it had before the kind field existed.
 fn parse_session_scan(stdout: &str) -> HashMap<String, LiveSession> {
     let mut lines = stdout.lines().peekable();
-    let global = lines
-        .next_if(|line| !line.contains(FIELD_SEP))
-        .filter(|line| !line.is_empty());
+    let mut inherited: Vec<&str> = Vec::new();
+    while let Some(line) = lines.next_if(|line| !is_session_line(line)) {
+        if !line.is_empty() {
+            inherited.push(line);
+        }
+    }
 
     let mut map = HashMap::new();
     for line in lines {
@@ -617,7 +647,7 @@ fn parse_session_scan(stdout: &str) -> HashMap<String, LiveSession> {
             LiveSession {
                 activity: activity.parse().unwrap_or(0),
                 kind: marker
-                    .filter(|marker| Some(*marker) != global)
+                    .filter(|marker| !inherited.contains(marker))
                     .and_then(SessionKind::from_marker),
             },
         );
@@ -872,6 +902,10 @@ pub fn agent_session_belongs_to(tmux_name: &str, session_id: &str) -> bool {
     NameShape::agent(&id_suffix(session_id)).matches(tmux_name)
 }
 
+/// A live session's name paired with the kind marker the scan read for it,
+/// absent for a session created before the marker existed.
+pub(crate) type MarkedSessionName = (String, Option<SessionKind>);
+
 /// One tmux observation shared by a batch of per-instance liveness lookups.
 ///
 /// A pass that asks "is this instance's pane live?" once per stored session
@@ -894,13 +928,9 @@ pub fn agent_session_belongs_to(tmux_name: &str, session_id: &str) -> bool {
 /// that only needs session names never forks `list-panes`.
 ///
 /// An unreachable server is preserved rather than collapsed into "absent":
-/// [`Self::names`] returns `None`, so a one-shot caller that cannot retry can
-/// tell Unknown from Absent and probe per row instead (see
+/// [`LiveSessionSnapshot::sessions`] returns `None`, so a one-shot caller that
+/// cannot retry can tell Unknown from Absent and probe per row instead (see
 /// `Instance::tmux_env_session_name_in_or_probe`).
-/// A live session's name paired with the kind marker the scan read for it,
-/// absent for a session created before the marker existed.
-pub(crate) type MarkedSessionName = (String, Option<SessionKind>);
-
 #[derive(Default)]
 pub(crate) struct LiveSessionSnapshot {
     sessions: OnceLock<Option<Vec<MarkedSessionName>>>,
@@ -940,11 +970,10 @@ impl LiveSessionSnapshot {
         snapshot
     }
 
-    /// Live session names, or None when the tmux server could not be reached.
-    /// The fresh observation also warms the display cache, so TUI startup can
-    /// reuse this pass instead of issuing another list-sessions command.
     /// Live session names paired with the kind each was stamped with, or
-    /// `None` when the tmux server could not be reached.
+    /// `None` when the tmux server could not be reached. The fresh
+    /// observation also warms the display cache, so TUI startup can reuse
+    /// this pass instead of issuing another list-sessions command.
     pub(crate) fn sessions(&self) -> Option<&[MarkedSessionName]> {
         self.sessions
             .get_or_init(|| {
@@ -3706,12 +3735,13 @@ mod tests {
         assert!(!parsed.contains_key("garbage-with-no-separator"));
     }
 
-    /// `#{@aoe_kind}` falls through to the global option, so a user who sets
-    /// one would otherwise have every unmarked session on their server claim
-    /// that kind, which is how a paired terminal would pass as an agent pane
-    /// again. The scan prints the global first so it can be subtracted.
+    /// `#{@aoe_kind}` falls through to the server, global-window and
+    /// global-session options, so a user who sets one would otherwise have
+    /// every unmarked session on their server claim that kind, which is how a
+    /// paired terminal would pass as an agent pane again. The scan prints
+    /// those scopes first so they can be subtracted.
     #[test]
-    fn a_global_kind_option_marks_nothing() {
+    fn an_inherited_kind_option_marks_nothing() {
         let agent = format!("{P}Vikings{ID8}");
         let terminal = format!("{TERMINAL_PREFIX}Vikings{ID8}");
         let scan = format!(
@@ -3745,6 +3775,40 @@ mod tests {
             parsed.get(&terminal).unwrap().kind,
             Some(SessionKind::Agent)
         );
+
+        // `#{@aoe_kind}` inherits from the server and global-window scopes as
+        // well, so the scan reads back one line per scope and every value has
+        // to be subtracted, not just the first.
+        let parsed = parse_session_scan(&format!(
+            "term\n\
+             agent\n\
+             {agent}|1789065184|agent\n\
+             {terminal}|1789065184|term\n\
+             {terminal}_t1|1789065184|tool"
+        ));
+        assert_eq!(parsed.get(&agent).unwrap().kind, None);
+        assert_eq!(parsed.get(&terminal).unwrap().kind, None);
+        assert_eq!(
+            parsed.get(&format!("{terminal}_t1")).unwrap().kind,
+            Some(SessionKind::Tool),
+            "a value no scope could have produced is still a mark"
+        );
+
+        // A separator inside one scope's value must not end the scope block:
+        // the scopes are printed in a fixed order, so a `|` in the first one
+        // would otherwise leave the rest unsubtracted and hand this terminal
+        // the agent kind.
+        let parsed = parse_session_scan(&format!(
+            "a|b\n\
+             agent\n\
+             {terminal}|1789065184|agent"
+        ));
+        assert_eq!(
+            parsed.get(&terminal).unwrap().kind,
+            None,
+            "a later scope is still subtracted when an earlier one holds a separator"
+        );
+        assert!(!parsed.contains_key("a"), "a scope value is not a session");
     }
 
     /// The kind marker is what name shape cannot say, in both directions: an
