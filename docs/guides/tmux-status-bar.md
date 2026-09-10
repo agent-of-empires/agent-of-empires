@@ -118,10 +118,22 @@ set -g status-right "#{?#{==:#(aoe tmux status),},,%#(aoe tmux status) | }%H:%M"
 
 ## tmux User Options
 
-aoe sets `@aoe_title`, `@aoe_branch` (worktree sessions), and `@aoe_sandbox` (sandboxed sessions) on each session, which you can reference in your own config:
+aoe sets `@aoe_title`, `@aoe_branch` (worktree sessions), `@aoe_sandbox` (sandboxed sessions), and `@aoe_kind` on each session, which you can reference in your own config:
 
 ```tmux
 set -g status-right "#{@aoe_title} #{@aoe_branch} #{@aoe_sandbox} | %H:%M"
+```
+
+`@aoe_kind` is what kind of session it is: `agent`, `term` (paired terminal),
+`cterm` (container terminal), or `tool`. It is written when the session is
+created and survives renames, so it stays accurate where the session name
+cannot: a title such as `term notes` gives an agent session a name shaped like
+a paired terminal's. A session started by an earlier aoe carries no
+value until it is restarted.
+
+```tmux
+# Only decorate the agent pane
+set -g status-right "#{?#{==:#{@aoe_kind},agent},#{@aoe_title},} | %H:%M"
 ```
 
 ## Troubleshooting

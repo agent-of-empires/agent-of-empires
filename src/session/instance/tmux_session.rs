@@ -2,16 +2,41 @@
 
 use super::*;
 
-pub(super) fn tmux_env_session_name_for_instance_id(instance_id: &str) -> Option<String> {
+/// One authoritative `list-sessions`, each line `<name>|<kind marker>`.
+fn live_sessions_probe() -> Option<String> {
     let output = crate::tmux::tmux_query_command()
-        .args(["list-sessions", "-F", "#{session_name}"])
+        .args(["list-sessions", "-F", "#{session_name}|#{@aoe_kind}"])
         .output()
         .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    crate::tmux::live_any_kind_name_for_id(stdout.lines(), instance_id)
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+pub(super) fn tmux_env_session_name_for_instance_id(instance_id: &str) -> Option<String> {
+    let stdout = live_sessions_probe()?;
+    crate::tmux::live_any_kind_name_for_id(
+        stdout.lines().map(crate::tmux::split_kind_marker),
+        instance_id,
+        crate::tmux::utils::is_pane_dead,
+    )
+}
+
+/// The live AGENT session for `instance_id`, ignoring its paired terminals,
+/// container terminals and tool sub-sessions.
+///
+/// [`tmux_env_session_name_for_instance_id`] answers "does this row have any
+/// live pane", which a terminal outliving its agent satisfies. A session-id
+/// poller needs the agent pane specifically: seeded with a terminal it would
+/// probe that pane as alive forever (#3880).
+pub(super) fn live_agent_name_for_instance_id(instance_id: &str) -> Option<String> {
+    let stdout = live_sessions_probe()?;
+    crate::tmux::live_agent_name_for_id(
+        stdout.lines().map(crate::tmux::split_kind_marker),
+        instance_id,
+        crate::tmux::utils::is_pane_dead,
+    )
 }
 
 /// Find another session that owns the exact title and normalized path.
@@ -55,6 +80,12 @@ impl Instance {
 
     pub(crate) fn tmux_env_session_name(&self) -> Option<String> {
         tmux_env_session_name_for_instance_id(&self.id)
+    }
+
+    /// [`Self::has_live_agent_pane_in`] as a fresh probe, answering with the
+    /// agent session's name.
+    pub(crate) fn live_agent_tmux_name(&self) -> Option<String> {
+        live_agent_name_for_instance_id(&self.id)
     }
 
     /// [`Self::tmux_env_session_name`] answered from a snapshot the caller

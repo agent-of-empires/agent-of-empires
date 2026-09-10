@@ -531,6 +531,11 @@ impl Session {
         append_pane_base_index_args(&mut args, &self.name);
         append_window_size_args(&mut args, &self.name);
         append_tmux_setting_args(&mut args, &self.name, &config);
+        crate::tmux::append_session_kind_args(
+            &mut args,
+            &self.name,
+            crate::tmux::SessionKind::Agent,
+        );
 
         let output = crate::tmux::tmux_command().args(&args).output()?;
 
@@ -3155,6 +3160,45 @@ mod tests {
         let created_at_ms = Session::from_name(guard.name()).created_at_ms().unwrap();
         assert!(created_at_ms > 0);
         assert_eq!(created_at_ms % 1000, 999);
+    }
+
+    /// The marker has to survive the wiring, not just tmux: the option is
+    /// chained onto `new-session`, and a scan reads it back through the same
+    /// `-F` the session cache uses. A rename must not lose it, since that is
+    /// the case the marker exists for (smart rename is on by default).
+    #[test]
+    #[serial_test::serial]
+    fn create_marks_the_agent_session_and_a_rename_keeps_the_mark() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let guard = TmuxTestSession::new("aoe_test_kind_marker");
+        let session = Session::from_name(guard.name());
+        session
+            .create(&temp.path().to_string_lossy(), Some("sleep 30"), "default")
+            .expect("create the agent session");
+
+        let read_marker = |name: &str| -> String {
+            let out = crate::tmux::tmux_command()
+                .args(["display-message", "-p", "-t", name, "#{@aoe_kind}"])
+                .output()
+                .expect("tmux display-message");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(read_marker(guard.name()), "agent");
+
+        let renamed = TmuxTestSession::new("aoe_test_kind_renamed");
+        crate::tmux::tmux_command()
+            .args(["rename-session", "-t", guard.name(), renamed.name()])
+            .output()
+            .expect("tmux rename-session");
+        assert_eq!(
+            read_marker(renamed.name()),
+            "agent",
+            "the mark travels with the session, unlike its name"
+        );
     }
 
     #[test]
