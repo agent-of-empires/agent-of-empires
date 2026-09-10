@@ -77,73 +77,29 @@ pub(super) const RESUME_IDLE_GRACE_DEFAULT: std::time::Duration =
 /// normally resolve cancellation promptly.
 pub(crate) const CANCEL_ESCALATION_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Test observation of the in-flight-prompt select's first winner when the
-/// command channel and the lifecycle channel are both ready: `2` means the
-/// command arm (`Cancel`) was polled first, `1` the lifecycle arm. `biased;`
-/// makes `2` deterministic; its removal lets Tokio randomize, which the
-/// fairness test asserts against.
-///
-/// Armed only while the observing test's connection runs
-/// (`SELECT_OBSERVER_ARMED`): other tests spawn their own connections whose
-/// select loops must not write here, or a concurrent test's lifecycle arm
-/// could record `1` after this test's reset and break correct code.
-/// Contested-poll tally, armed only while the observing test's connection
-/// runs (`SELECT_OBSERVER_ARMED`): other tests spawn their own connections
-/// whose select loops must not write here. `biased;` makes the command arm
-/// win every contested poll, so the tally ends all-command; its removal
-/// randomizes the winner and the all-command assertion fails.
 #[cfg(test)]
-pub(super) static SELECT_CMD_WINS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-#[cfg(test)]
-pub(super) static SELECT_LIFECYCLE_WINS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-#[cfg(test)]
-static SELECT_OBSERVER_ARMED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Open only across the contested window: reset (just before the test sends
-/// Cancel) until the command arm dispatches that Cancel. Outside it the
-/// select polls unrelated iterations (a plain lifecycle drain with an empty
-/// command channel) that prove nothing about ordering.
-#[cfg(test)]
-static SELECT_CONTESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Arm the tally for the connection this test is about to drive and open the
-/// contested window. Test-only; production code never reads these.
-#[cfg(test)]
-pub(super) fn reset_select_first_winner() {
-    use std::sync::atomic::Ordering;
-    SELECT_CMD_WINS.store(0, Ordering::SeqCst);
-    SELECT_LIFECYCLE_WINS.store(0, Ordering::SeqCst);
-    SELECT_OBSERVER_ARMED.store(true, Ordering::SeqCst);
-    SELECT_CONTESTED.store(true, Ordering::SeqCst);
-}
-
-/// Disarm after the observed connection's test finished.
-#[cfg(test)]
-pub(super) fn disarm_select_first_winner() {
-    SELECT_OBSERVER_ARMED.store(false, std::sync::atomic::Ordering::SeqCst);
-    SELECT_CONTESTED.store(false, std::sync::atomic::Ordering::SeqCst);
+struct SelectProbe {
+    gate: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+    armed: bool,
+    winner: Option<oneshot::Sender<bool>>,
 }
 
 #[cfg(test)]
-fn observe_select_win(winner: usize) {
-    use std::sync::atomic::Ordering;
-    if !SELECT_OBSERVER_ARMED.load(Ordering::SeqCst) || !SELECT_CONTESTED.load(Ordering::SeqCst) {
-        return;
-    }
-    let counter = if winner == 2 {
-        &SELECT_CMD_WINS
-    } else {
-        &SELECT_LIFECYCLE_WINS
-    };
-    counter.fetch_add(1, Ordering::SeqCst);
-    if winner == 2 {
-        // The Cancel dispatched: the contested window closes.
-        SELECT_CONTESTED.store(false, Ordering::SeqCst);
-    }
+tokio::task_local! {
+    // Scoped to this connection future, not inherited by spawned tasks.
+    static SELECT_PROBE: std::cell::RefCell<SelectProbe>;
+}
+
+#[cfg(test)]
+fn observe_select_win(command: bool) {
+    let _ = SELECT_PROBE.try_with(|probe| {
+        let mut probe = probe.borrow_mut();
+        if probe.armed {
+            if let Some(winner) = probe.winner.take() {
+                let _ = winner.send(command);
+            }
+        }
+    });
 }
 
 /// Read the resume-idle grace. In debug builds, honors
@@ -1982,19 +1938,20 @@ pub(super) async fn run_connection_task<W, R>(
                         }
 
                         loop {
+                            #[cfg(test)]
+                            if !lifecycle_signal_rx.is_empty() {
+                                let gate = SELECT_PROBE.try_with(|probe| probe.borrow_mut().gate.take()).ok().flatten();
+                                if let Some((ready, resume)) = gate {
+                                    ready.send(()).expect("test receives readiness");
+                                    resume.await.expect("test queues Cancel before resuming");
+                                    assert!(!cmd_rx.is_empty());
+                                    assert!(!lifecycle_signal_rx.is_empty());
+                                    SELECT_PROBE.with(|probe| probe.borrow_mut().armed = true);
+                                }
+                            }
                             tokio::select! {
-                                // Send the prompt before a queued Cancel. A
-                                // notification delivered first is ignored by agents
-                                // that have not yet started the prompt it should stop.
-                                // Biased poll order: the prompt result
-                                // first (dispatch ordering), then user
-                                // cancellation and its escalation deadline
-                                // ahead of the lifecycle notifications, so a
-                                // sustained notification stream cannot delay a
-                                // Cancel/ForceStop past its poll iteration
-                                // (tokio's documented biased-fairness caveat).
-                                // The orphan timer and steering follow,
-                                // notifications last.
+                                // Dispatch the prompt before Cancel, then prioritize
+                                // commands and their deadline over lifecycle traffic.
                                 biased;
                                 res = &mut prompt_fut, if !simulate_orphan => {
                                     match res {
@@ -2084,7 +2041,7 @@ pub(super) async fn run_connection_task<W, R>(
                                 }
                                 cmd = cmd_rx.recv() => {
                                     #[cfg(test)]
-                                    observe_select_win(2);
+                                    observe_select_win(true);
                                     match cmd {
                                         Some(ClientCmd::Cancel) => {
                                             info!(
@@ -2308,7 +2265,7 @@ pub(super) async fn run_connection_task<W, R>(
                                 }
                                 env = lifecycle_signal_rx.recv() => {
                                     #[cfg(test)]
-                                    observe_select_win(1);
+                                    observe_select_win(false);
                                     if let Some(env) = env {
                                         if env.epoch != this_prompt_epoch {
                                             // Stale envelope from a prior
@@ -3172,6 +3129,14 @@ mod cancel_fairness_tests {
 
     #[tokio::test]
     async fn cancel_reaches_the_agent_while_notifications_remain_queued() {
+        // Repeated contested polls make unbiased selection observable; this is
+        // probabilistic mutation coverage, not a guarantee about Tokio's RNG.
+        for _ in 0..32 {
+            tokio::join!(cancel_under_flood(), cancel_under_flood());
+        }
+    }
+
+    async fn cancel_under_flood() {
         let (daemon_write, agent_read) = tokio::io::duplex(1024 * 1024);
         let (agent_write, daemon_read) = tokio::io::duplex(1024 * 1024);
         let agent_write: SharedWrite = Arc::new(Mutex::new(agent_write));
@@ -3183,8 +3148,8 @@ mod cancel_fairness_tests {
         let (cmd_tx, cmd_rx) = mpsc::channel::<ClientCmd>(16);
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), AcpError>>();
 
-        let cwd = std::env::temp_dir().join(format!("aoe-cancel-fair-{}", std::process::id()));
-        std::fs::create_dir_all(&cwd).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().to_path_buf();
 
         let transport = ByteStreams::new(daemon_write.compat_write(), daemon_read.compat());
         let resources = SessionResources {
@@ -3194,31 +3159,42 @@ mod cancel_fairness_tests {
             label: "s-fair".to_string(),
             sandbox: None,
         };
-        tokio::spawn(run_connection_task(
-            transport,
-            event_tx,
-            cmd_rx,
-            cwd.clone(),
-            "s-fair".to_string(),
-            None,
-            Arc::new(Mutex::new(HashMap::new())),
-            resources,
-            None,
-            ConnectMode::Fresh {
-                stored_acp_session_id: None,
-                seed_history_replay: false,
-                fork_from: None,
-            },
-            Some(ready_tx),
-            &crate::acp::agent_profiles::GEMINI,
-            ExpectedAgent::Gemini,
-            None,
-            None,
-            None,
-            Vec::new(),
-            None,
-            None,
-            None,
+        let (paused_tx, mut paused_rx) = oneshot::channel();
+        let (resume_tx, resume_rx) = oneshot::channel();
+        let (winner_tx, winner_rx) = oneshot::channel();
+        let probe = std::cell::RefCell::new(SelectProbe {
+            gate: Some((paused_tx, resume_rx)),
+            armed: false,
+            winner: Some(winner_tx),
+        });
+        let connection = tokio::spawn(SELECT_PROBE.scope(
+            probe,
+            run_connection_task(
+                transport,
+                event_tx,
+                cmd_rx,
+                cwd.clone(),
+                "s-fair".to_string(),
+                None,
+                Arc::new(Mutex::new(HashMap::new())),
+                resources,
+                None,
+                ConnectMode::Fresh {
+                    stored_acp_session_id: None,
+                    seed_history_replay: false,
+                    fork_from: None,
+                },
+                Some(ready_tx),
+                &crate::acp::agent_profiles::GEMINI,
+                ExpectedAgent::Gemini,
+                None,
+                None,
+                None,
+                Vec::new(),
+                None,
+                None,
+                None,
+            ),
         ));
 
         // Fake agent: handshake, then flood updates for as long as the turn
@@ -3307,26 +3283,20 @@ mod cancel_fairness_tests {
             .await
             .unwrap();
 
-        // Wait until the agent is actually flooding before cancelling.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        while !flooded.load(Ordering::SeqCst) {
-            tokio::time::timeout_at(deadline, tokio::time::sleep(Duration::from_millis(5)))
-                .await
-                .expect("flood never started");
-        }
-
-        // Deterministic selection-order assertion: with the flood keeping
-        // the lifecycle arm permanently ready, the command channel and the
-        // lifecycle channel are simultaneously ready the moment Cancel is
-        // sent. `biased;` must make the command arm win that poll; without
-        // it Tokio randomizes and this assertion fails intermittently.
-        //
-        // The reset happens while the lifecycle channel is FULL (128-slot
-        // capacity, saturated by the flood): its handler task is blocked on
-        // `send_lifecycle_signal`, so no new envelope can land between this
-        // reset and the select's first poll of the queued Cancel.
-        reset_select_first_winner();
+        // Pause with a real notification queued, then enqueue Cancel before
+        // allowing this connection's next select to poll either receiver.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                tokio::select! {
+                    ready = &mut paused_rx => { ready.unwrap(); break; }
+                    event = event_rx.recv() => { event.expect("connection remains open"); }
+                }
+            }
+        })
+        .await
+        .expect("connection reaches the selection barrier");
         cmd_tx.send(ClientCmd::Cancel).await.unwrap();
+        resume_tx.send(()).unwrap();
 
         // The turn must end while the flood is still running: the Stopped
         // event proves the prompt loop processed the cancel, and the
@@ -3346,27 +3316,14 @@ mod cancel_fairness_tests {
             cancelled.load(Ordering::SeqCst),
             "session/cancel must reach the agent while notifications are queued: {stopped:?}"
         );
-        // Selection order: the command arm must have won the first poll
-        // where both channels were ready (observer written before the arm
-        // body dispatches). `biased;` or the arm order being removed
-        // randomizes this and fails the test.
-        // Every contested poll must go to the command arm. `biased;` makes
-        // that deterministic; removing it or reordering the arms randomizes
-        // the winner, and the lifecycle tally then shows wins of its own.
-        disarm_select_first_winner();
         assert!(
-            SELECT_CMD_WINS.load(Ordering::SeqCst) > 0,
-            "the command arm must win at least the Cancel poll"
-        );
-        assert_eq!(
-            SELECT_LIFECYCLE_WINS.load(Ordering::SeqCst),
-            0,
-            "the lifecycle arm must never win a contested poll while biased; \
-             orders the command arm first"
+            winner_rx.await.unwrap(),
+            "Cancel must beat the queued lifecycle notification"
         );
 
         flood.abort();
         agent.abort();
-        let _ = std::fs::remove_dir_all(&cwd);
+        connection.abort();
+        let _ = tokio::join!(flood, agent, connection);
     }
 }
