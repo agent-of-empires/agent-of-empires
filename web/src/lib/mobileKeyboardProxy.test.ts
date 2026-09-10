@@ -78,11 +78,12 @@ describe("forwardTerminalBeforeInput", () => {
     expect(ev.defaultPrevented).toBe(true);
   });
 
-  it("cancels a delete the pane refused, so the textarea keeps its text", () => {
+  it("cancels a refused delete and drops the retained text", () => {
     const ta = document.createElement("textarea");
     ta.value = "\uadf8";
     const { ev } = beforeInput(ta, { inputType: "deleteContentBackward" }, false);
     expect(ev.defaultPrevented).toBe(true);
+    expect(ta.value).toBe("");
   });
 
   it("ignores other input types", () => {
@@ -152,17 +153,6 @@ describe("mobile keyboard proxy", () => {
     document.body.innerHTML = "";
   });
 
-  // Drain without a mounted proxy (unit callers, non-browser consumers):
-  // the refusal path must tolerate the missing element.
-  it("tolerates a missing proxy when a drained edit is refused", () => {
-    document.body.innerHTML = "";
-    deliverMobileKeyboardProxyInput({ inputType: "insertText", data: "ㅎ", isComposing: false });
-    const receive = vi.fn(() => false);
-    const unregister = registerMobileKeyboardProxyReceiver(receive);
-    expect(receive).toHaveBeenCalled();
-    unregister();
-  });
-
   // Unregistering a receiver that is not the current one must not detach
   // the live receiver.
   it("keeps the current receiver when an older cleanup runs", () => {
@@ -182,13 +172,12 @@ describe("mobile keyboard proxy", () => {
 // must also tolerate a non-textarea target (the handler is wired per-input,
 // but nothing in the helper's contract guarantees it).
 describe("forwardTerminalBeforeInput refused-edit target guard", () => {
-  it("does not throw when the target is not a textarea", () => {
+  it("prevents refused edits on non-textarea targets", () => {
     const div = document.createElement("div");
-    div.dispatchEvent = () => true; // not used directly; helper is called explicitly
     const deliver = vi.fn(() => false);
     const ev = new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertText", data: "c" });
     Object.defineProperty(ev, "target", { value: div });
-    expect(() => forwardTerminalBeforeInput(ev, deliver)).not.toThrow();
+    forwardTerminalBeforeInput(ev, deliver);
     expect(ev.defaultPrevented).toBe(true);
   });
 

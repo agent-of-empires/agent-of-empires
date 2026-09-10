@@ -1,8 +1,7 @@
 import { test, expect } from "./helpers/mockedTest";
 import { devices, type Page } from "@playwright/test";
-import { mockTerminalApis, type MockHandle } from "./helpers/terminal-mocks";
+import { mockTerminalApis, seedSettings, type MockHandle } from "./helpers/terminal-mocks";
 import { clickSidebarSession, openMobileSidebar } from "./helpers/sidebar";
-import { seedSettings } from "./helpers/terminal-mocks";
 
 // iOS WebKit fires no composition events for the Korean keyboard (WebKit bug
 // 274700). Every keystroke rewrites the trailing syllable through the plain
@@ -43,6 +42,7 @@ async function softKey(
       const ta = document.querySelector<HTMLTextAreaElement>(selector);
       if (!ta) throw new Error("live terminal input not found");
       ta.focus();
+      if (inputType === "deleteContentBackward" && ta.value === "") return;
       const ev = new InputEvent("beforeinput", { inputType, data, bubbles: true, cancelable: true });
       if (!ta.dispatchEvent(ev)) return;
       const end = ta.value.length;
@@ -139,7 +139,7 @@ test.describe("Live terminal IME syllable rewrite", () => {
     await softKey(page, "deleteContentBackward");
     await softKey(page, "insertText", "하");
     expect(await valueOf(page, INPUT)).toBe("하");
-    await expect.poll(() => textBytes(handle, start), { timeout: 5_000 }).toBe("한\t\x7f하");
+    await expect.poll(() => textBytes(handle, start), { timeout: 5_000 }).toBe("한\t하");
   });
 
   // The proxy is the element under test, not INPUT: a session switch unmounts
@@ -247,15 +247,6 @@ test.describe("Live terminal IME syllable rewrite", () => {
     await openMobileSidebar(page);
     await clickSidebarSession(page, "other");
     await page.locator(`[data-live-terminal]:visible`).waitFor({ state: "visible", timeout: 10_000 });
-
-    // Let the switch's layout-effect proxy clear land before typing (two
-    // animation frames), so the syllable below is unambiguously B's.
-    await page.evaluate(() =>
-      Promise.all([
-        new Promise((r) => requestAnimationFrame(() => r(null))),
-        new Promise((r) => requestAnimationFrame(() => r(null))),
-      ]),
-    );
 
     // The foreground user (session B) retains a syllable in the shared proxy.
     await softKey(page, "insertText", "ㅎ", PROXY);

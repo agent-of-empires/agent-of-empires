@@ -1720,12 +1720,10 @@ export function MobileLiveTerminal({
     [sendData, ctrlActiveRef, clearCtrl],
   );
 
-  // Mirrors `active` for async continuations: a paste's upload completion
-  // must observe whether this session still owns the foreground AT THAT
-  // TIME, not at paste time (the handler's closure captures the paste-time
-  // value). See #3885 review.
   const activeRef = useRef(active);
-  activeRef.current = active;
+  useLayoutEffect(() => {
+    activeRef.current = active;
+  }, [active]);
 
   // Native (not React-synthetic) beforeinput: React's onBeforeInput is
   // backed by keypress in Chromium and carries no inputType, so the
@@ -1865,23 +1863,17 @@ export function MobileLiveTerminal({
         );
         const parts = [text.trim(), ...paths.map(escapePastePath)].filter((s) => s.length > 0);
         if (parts.length === 0) return;
-        // Leading and trailing spaces keep the path from gluing onto queued
-        // text or the user's next keystroke. No newline: never auto-submit.
-        // Re-invalidated here too: the upload's await leaves room for the
-        // user to type a syllable this insert would then displace. The
-        // live terminal's own textarea must be named: with no target the
-        // helper clears only the proxy, and the local shadow would keep
-        // the syllable the pasted path displaces. The shared proxy is only
-        // cleared while this session still owns the foreground NOW (ref,
-        // not the paste-time closure): a late upload from a backgrounded
-        // session must not wipe the syllable the foreground session's
-        // proxy retained. See #3885.
-        if (activeRef.current) invalidateRetainedImeContext(inputRef.current);
-        else if (inputRef.current) inputRef.current.value = "";
+        const target = inputRef.current;
+        if (!target) return;
+        // An unmounted session cannot send; a background session may finish
+        // its own paste but must not invalidate the foreground proxy.
+        if (activeRef.current) invalidateRetainedImeContext(target);
+        else target.value = "";
+        // Pad the path without submitting the command.
         sendData(bracketedPaste(` ${parts.join(" ")} `));
       })();
     },
-    [active, inputRef, sendData, uploadPastedImage],
+    [inputRef, sendData, uploadPastedImage],
   );
 
   const handleCompositionStart = useCallback(() => {

@@ -11,9 +11,14 @@
 
 import { createRef } from "react";
 import { describe, expect, it, vi, beforeAll } from "vitest";
-import { fireEvent, render, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, waitFor } from "@testing-library/react";
 import { MobileLiveTerminal } from "../MobileLiveTerminal";
 import type { LiveFrame } from "../../hooks/useLiveTerminal";
+import {
+  clearMobileKeyboardProxyInput,
+  deliverMobileKeyboardProxyInput,
+  forwardTerminalBeforeInput,
+} from "../../lib/mobileKeyboardProxy";
 
 vi.mock("../../hooks/useWebSettings", () => ({
   useWebSettings: () => ({ settings: { mobileFontSize: 14, desktopFontSize: 14 }, update: vi.fn() }),
@@ -43,10 +48,11 @@ const frame: LiveFrame = {
   mouseSgr: false,
 };
 
-function renderTerm(uploadPastedImage = vi.fn().mockResolvedValue(null)) {
+function renderTerm(uploadPastedImage = vi.fn().mockResolvedValue(null), ctrlActive = false) {
   const inputRef = createRef<HTMLTextAreaElement>();
-  const sendData = vi.fn();
-  render(
+  const ctrlActiveRef = { current: ctrlActive };
+  const sendData = vi.fn<(data: string) => boolean>(() => true);
+  const view = render(
     <MobileLiveTerminal
       frame={frame}
       connected
@@ -62,15 +68,17 @@ function renderTerm(uploadPastedImage = vi.fn().mockResolvedValue(null)) {
       uploadPastedImage={uploadPastedImage}
       forwardWheel={vi.fn()}
       forwardButton={vi.fn()}
-      ctrlActiveRef={createRef<boolean>() as React.RefObject<boolean>}
-      clearCtrl={vi.fn()}
+      ctrlActiveRef={ctrlActiveRef}
+      clearCtrl={() => {
+        ctrlActiveRef.current = false;
+      }}
       inputRef={inputRef}
       onInputFocusChange={vi.fn()}
       bottomAlign
       keyboardOpen={false}
     />,
   );
-  return { input: inputRef.current!, sendData, uploadPastedImage };
+  return { input: inputRef.current!, sendData, uploadPastedImage, unmount: view.unmount };
 }
 
 // A clipboard item wrapping a File, as clipboardData.items exposes it.
@@ -102,6 +110,65 @@ function stubKeyboardLayout(entries: [string, string][]) {
 }
 
 describe("MobileLiveTerminal paste", () => {
+  it("retains accepted replay after a Ctrl chord for the next Korean rewrite", () => {
+    clearMobileKeyboardProxyInput();
+    const proxy = document.createElement("textarea");
+    proxy.dataset.keyboardProxy = "";
+    proxy.value = "cㅎ";
+    document.body.append(proxy);
+    try {
+      deliverMobileKeyboardProxyInput({ inputType: "insertText", data: "c", isComposing: false });
+      deliverMobileKeyboardProxyInput({ inputType: "insertText", data: "ㅎ", isComposing: false });
+      const { sendData } = renderTerm(undefined, true);
+      expect(sendData.mock.calls.map(([data]) => data).join("")).toBe("\x03ㅎ");
+      expect(proxy.value).toBe("ㅎ");
+      proxy.addEventListener("beforeinput", (event) =>
+        forwardTerminalBeforeInput(event as InputEvent, deliverMobileKeyboardProxyInput),
+      );
+      expect(
+        proxy.dispatchEvent(
+          new InputEvent("beforeinput", { inputType: "deleteContentBackward", bubbles: true, cancelable: true }),
+        ),
+      ).toBe(true);
+      proxy.value = "";
+      expect(
+        proxy.dispatchEvent(
+          new InputEvent("beforeinput", { inputType: "insertText", data: "하", bubbles: true, cancelable: true }),
+        ),
+      ).toBe(true);
+      proxy.value = "하";
+      expect(sendData.mock.calls.map(([data]) => data).join("")).toBe("\x03ㅎ\x7f하");
+    } finally {
+      proxy.remove();
+      clearMobileKeyboardProxyInput();
+    }
+  });
+
+  it("does not invalidate another session's proxy after the uploading terminal unmounts", async () => {
+    let finish!: (path: string) => void;
+    const pending = new Promise<string>((resolve) => {
+      finish = resolve;
+    });
+    const { input, sendData, unmount } = renderTerm(vi.fn(() => pending));
+    fireEvent.paste(input, {
+      clipboardData: { getData: () => "", items: [imageItem(new File(["x"], "shot.png", { type: "image/png" }))] },
+    });
+    unmount();
+    const proxy = document.createElement("textarea");
+    proxy.dataset.keyboardProxy = "";
+    proxy.value = "ㅎ";
+    document.body.append(proxy);
+    try {
+      await act(async () => {
+        finish("/tmp/paste.png");
+        await pending;
+      });
+      expect(proxy.value).toBe("ㅎ");
+      expect(sendData).not.toHaveBeenCalled();
+    } finally {
+      proxy.remove();
+    }
+  });
   it("does not swallow Ctrl+V into a literal ^V, and the paste event sends a bracketed paste", () => {
     const { input, sendData } = renderTerm();
 

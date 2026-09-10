@@ -26,21 +26,26 @@ export function registerMobileKeyboardProxyReceiver(next: Receiver) {
   receiver = next;
   const queued = pending;
   pending = [];
-  let refused = false;
+  let retained: string | null = null;
   for (const input of queued) {
-    if (!next(input)) {
-      refused = true;
-      continue;
+    const accepted = next(input);
+    if (
+      !accepted ||
+      input.inputType === "insertLineBreak" ||
+      input.inputType === "insertParagraph" ||
+      input.inputType === "insertFromPaste"
+    ) {
+      retained = "";
+    } else if (retained !== null) {
+      if (input.inputType === "insertText") retained += input.data ?? "";
+      else if (input.inputType === "deleteContentBackward") retained = Array.from(retained).slice(0, -1).join("");
     }
   }
-  if (refused) {
-    // A refused edit must not survive in the shadow: the pane does not hold
-    // it, so the next rewrite would open with a delete against text the user
-    // did not type. Later queued edits stay deliverable — `false` can mean
-    // one edit was transformed (a Ctrl chord sent its control code) rather
-    // than that the receiver is wedged.
+  // Browser edits were already applied while buffered. Rebuild only the
+  // accepted suffix after an invalidation, without discarding later input.
+  if (retained !== null) {
     const proxy = document.querySelector<HTMLTextAreaElement>("[data-keyboard-proxy]");
-    if (proxy) proxy.value = "";
+    if (proxy) proxy.value = retained;
   }
   return () => {
     if (receiver === next) receiver = null;
@@ -93,12 +98,6 @@ export function forwardTerminalBeforeInput(ev: InputEvent, deliver: Receiver) {
     case "insertText":
     case "deleteContentBackward":
       if (!deliver({ inputType: ev.inputType, data: ev.data, isComposing: ev.isComposing })) {
-        // The pane refused the edit (a Ctrl chord turned it into a control
-        // code; a read-only viewer dropped it), yet the shadow still holds
-        // the syllable it was mirroring. The chord consumed that shadow's
-        // job, so whatever it holds now no longer mirrors the line; keep
-        // it and the next rewrite opens with a delete against text the
-        // user did not type. See #3885.
         if (ev.target instanceof HTMLTextAreaElement) ev.target.value = "";
         ev.preventDefault();
       }
