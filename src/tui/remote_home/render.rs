@@ -553,6 +553,10 @@ mod tests {
         assert_eq!(width, PLUGIN_REGION_MAX_WIDTH);
     }
 
+    /// Path prefix with all four fixed columns: 24+2 title, 10+2 status,
+    /// 11+2 context resume. `no_plugin_entries_reserve_no_width` pins it.
+    const PATH_COLUMN_PREFIX: usize = 54;
+
     #[test]
     fn row_shows_the_plugin_row_badge_text_before_the_column() {
         let state = state_with(
@@ -581,12 +585,12 @@ mod tests {
         );
         let painted = rows(&state);
         assert!(painted.iter().any(|l| l.contains("draft")), "{painted:?}");
-        // The 41-cell prefix, the whole region, and the gap before the path:
+        // The 54-cell prefix, the whole region, and the gap before the path:
         // the badge took its cells from the column, not from the path, which
         // starts exactly where a badge-free capped column leaves it.
         assert_eq!(
             column_of(&painted, "/tmp/s1"),
-            41 + PLUGIN_REGION_MAX_WIDTH + 2
+            PATH_COLUMN_PREFIX + PLUGIN_REGION_MAX_WIDTH + 2
         );
     }
 
@@ -615,7 +619,7 @@ mod tests {
     #[test]
     fn cleared_badges_reserve_no_width() {
         let state = state_with(&["s1"], json!([row_badge("s1", json!({"items": []}))]));
-        assert_eq!(column_of(&rows(&state), "/tmp/s1"), 41);
+        assert_eq!(column_of(&rows(&state), "/tmp/s1"), PATH_COLUMN_PREFIX);
     }
 
     #[test]
@@ -633,7 +637,7 @@ mod tests {
             )]),
         );
         let painted = rows(&state);
-        assert_eq!(column_of(&painted, "/tmp/s1"), 44);
+        assert_eq!(column_of(&painted, "/tmp/s1"), PATH_COLUMN_PREFIX + 3);
         assert!(
             painted.iter().any(|row| row.contains('\u{25CF}')),
             "the compact marker must be painted"
