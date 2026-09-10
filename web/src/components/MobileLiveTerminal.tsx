@@ -14,6 +14,7 @@ import {
 import { cursorLineIndex, pointerPaneCell, wheelNotches } from "../lib/liveMouse";
 import {
   forwardTerminalBeforeInput,
+  invalidateRetainedImeContext,
   registerMobileKeyboardProxyReceiver,
   type MobileKeyboardProxyInput,
 } from "../lib/mobileKeyboardProxy";
@@ -1723,33 +1724,38 @@ export function MobileLiveTerminal({
   // backed by keypress in Chromium and carries no inputType, so the
   // soft-keyboard input types below would never match through it.
   const handleMobileKeyboardProxyInput = useCallback(
-    (input: MobileKeyboardProxyInput) => {
-      if (composingRef.current || input.isComposing) return;
+    // The return value tells `forwardTerminalBeforeInput` whether the shadow
+    // textarea may keep this edit: false means the pane never got it.
+    (input: MobileKeyboardProxyInput): boolean => {
+      // The IME owns the textarea mid-composition; never cancel its edits.
+      if (composingRef.current || input.isComposing) return true;
       const run = typedWordRef.current;
       typedWordRef.current = "";
       switch (input.inputType) {
         case "insertText": {
           const data = input.data ?? "";
-          if (data && !sendKeys(data)) break;
+          if (data && !sendKeys(data)) return false;
           typedWordRef.current = plainRunAfter(run, data);
-          break;
+          return true;
         }
         case "insertLineBreak":
         case "insertParagraph":
-          sendKeys("\r");
-          break;
+          return sendKeys("\r");
         case "deleteContentBackward":
           // One character, so the IME's word loses its last one too;
           // `deleteWordBackward` is a separate input type and not forwarded.
-          if (!sendKeys("\x7f")) break;
+          if (!sendKeys("\x7f")) return false;
           typedWordRef.current = dropLastCodePoint(run);
-          break;
+          return true;
         case "insertFromPaste": {
+          // The paste lands on the line without passing through the
+          // textarea, so the retained syllable stops mirroring it.
+          invalidateRetainedImeContext();
           if (input.data) sendData(bracketedPaste(input.data));
-          break;
+          return true;
         }
         default:
-          break;
+          return true;
       }
     },
     [sendKeys, sendData, typedWordRef],
@@ -1771,10 +1777,11 @@ export function MobileLiveTerminal({
       const seq = specialKeySequence(e);
       if (seq) {
         e.preventDefault();
-        sendData(seq);
         // Typed text accumulates in the hidden textarea as IME context (see
-        // forwardTerminalBeforeInput); Enter is the safe point to drop it.
-        if (e.key === "Enter" && e.target instanceof HTMLTextAreaElement) e.target.value = "";
+        // forwardTerminalBeforeInput). Enter submits the line and every other
+        // special key rewrites it, so neither leaves the shadow still valid.
+        invalidateRetainedImeContext(e.target instanceof HTMLTextAreaElement ? e.target : null);
+        sendData(seq);
         return;
       }
       // Ctrl+Shift+C copies the current terminal selection (the terminal-
@@ -1798,6 +1805,7 @@ export function MobileLiveTerminal({
         const code = e.key.toUpperCase().charCodeAt(0);
         if (code >= 65 && code <= 90) {
           e.preventDefault();
+          invalidateRetainedImeContext(e.target instanceof HTMLTextAreaElement ? e.target : null);
           sendData(String.fromCharCode(code - 64));
         }
       }
@@ -1816,6 +1824,7 @@ export function MobileLiveTerminal({
       if (!metaKey) return;
       e.preventDefault();
       e.stopPropagation();
+      invalidateRetainedImeContext(e.target instanceof HTMLTextAreaElement ? e.target : null);
       sendData(`\x1b${metaKey}`);
     },
     [sendData],
@@ -1832,6 +1841,8 @@ export function MobileLiveTerminal({
         .filter((f): f is File => f != null && f.type.startsWith("image/"));
 
       e.preventDefault();
+      // Pasted text lands on the line without passing through the textarea.
+      invalidateRetainedImeContext(e.target instanceof HTMLTextAreaElement ? e.target : null);
 
       if (imageFiles.length === 0) {
         if (text) sendData(bracketedPaste(text));
@@ -1849,6 +1860,9 @@ export function MobileLiveTerminal({
         if (parts.length === 0) return;
         // Leading and trailing spaces keep the path from gluing onto queued
         // text or the user's next keystroke. No newline: never auto-submit.
+        // Re-invalidated here too: the upload's await leaves room for the
+        // user to type a syllable this insert would then displace.
+        invalidateRetainedImeContext();
         sendData(bracketedPaste(` ${parts.join(" ")} `));
       })();
     },

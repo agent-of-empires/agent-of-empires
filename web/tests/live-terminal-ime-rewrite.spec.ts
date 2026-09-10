@@ -101,6 +101,46 @@ test.describe("Live terminal IME syllable rewrite", () => {
     await expect.poll(() => textBytes(handle, start), { timeout: 5_000 }).toBe("한\r");
   });
 
+  // #3877's repro. The Ctrl latch turns the next letter into a control code,
+  // so `sendKeys` returns false and the pane never receives "c". If the
+  // textarea kept it anyway, the following Korean rewrite would open with a
+  // delete and eat a character of the post-SIGINT prompt.
+  test("a letter the Ctrl latch turned into a control code is not retained", async ({ page }) => {
+    const handle = await mockTerminalApis(page);
+    await openSession(page, handle);
+
+    const start = handle.liveMessages.length;
+    await page.locator('button[aria-label="Ctrl"]').click();
+    await softKey(page, "insertText", "c");
+
+    expect(await valueOf(page, INPUT)).toBe("");
+    await expect.poll(() => textBytes(handle, start), { timeout: 5_000 }).toBe("\x03");
+
+    // The next rewrite therefore re-arms from an empty line: no leading DEL.
+    await softKey(page, "insertText", "ㅎ");
+    await expect.poll(() => textBytes(handle, start), { timeout: 5_000 }).toBe("\x03ㅎ");
+  });
+
+  test("out-of-band toolbar input drops the retained syllable before the next rewrite", async ({ page }) => {
+    const handle = await mockTerminalApis(page);
+    await openSession(page, handle);
+
+    const start = handle.liveMessages.length;
+    await softKey(page, "insertText", "한");
+    expect(await valueOf(page, INPUT)).toBe("한");
+
+    // Tab bypasses the textarea: once it reaches the PTY the retained
+    // syllable no longer mirrors the line.
+    await page.locator('button[aria-label="Tab"]').click();
+    expect(await valueOf(page, INPUT)).toBe("");
+
+    // So the rewrite re-arms from an empty shadow, mirroring the keyboard.
+    await softKey(page, "deleteContentBackward");
+    await softKey(page, "insertText", "하");
+    expect(await valueOf(page, INPUT)).toBe("하");
+    await expect.poll(() => textBytes(handle, start), { timeout: 5_000 }).toBe("한\t\x7f하");
+  });
+
   // The proxy is the element under test, not INPUT: a session switch unmounts
   // and remounts the live terminal, so INPUT is empty afterwards either way.
   // The proxy persists across the switch, so only clearing it on the session

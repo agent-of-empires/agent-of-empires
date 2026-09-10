@@ -99,6 +99,7 @@
       "components": [
         "web/src/App.tsx",
         "web/src/components/MobileLiveTerminal.tsx",
+        "web/src/components/MobileTerminalToolbar.tsx",
         "web/src/lib/mobileKeyboardProxy.ts"
       ]
     },
