@@ -2732,6 +2732,10 @@ pub(super) async fn run_connection_task<W, R>(
                                 // client and the runner cannot disagree
                                 // about which session owns later prompts.
                                 acp_session_id = new_id.clone();
+                                // The id in use is now agent-created, not
+                                // the stored one, so a later prompt
+                                // rejection is not a stale resume.
+                                session_from_storage = false;
                                 available_mode_ids =
                                     new_session.modes.as_ref().map(|modes| {
                                         modes
