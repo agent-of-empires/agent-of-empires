@@ -596,9 +596,21 @@ impl RowTag {
     /// (`界`, two cells) or a combining mark (zero cells) in the content still
     /// yields a bracket span of exactly `max_width + 2` cells.
     pub fn rendered(&self) -> String {
-        let used = unicode_width::UnicodeWidthStr::width(self.content.as_str());
+        // Cap the content to `max_width` of the renderer's cells first, then
+        // pad by the same metric: `UnicodeWidthStr` resolves halfwidth
+        // katakana dakuten/handakuten to zero cells while the renderer paints
+        // one cell each, so a `UnicodeWidthStr`-measured pad would overflow
+        // the tag's fixed-width contract. Grapheme-aligned measurement keeps
+        // combined sequences (emoji + VS16, skin-tone modifiers) whole.
+        use ratatui::buffer::CellWidth;
+        use unicode_segmentation::UnicodeSegmentation;
+        let content = crate::tui::components::prefix_within_width(&self.content, self.max_width);
+        let used: usize = content
+            .graphemes(true)
+            .map(|g| g.cell_width() as usize)
+            .sum();
         let pad = self.max_width.saturating_sub(used);
-        format!("[{}{}]", self.content, " ".repeat(pad))
+        format!("[{content}{}]", " ".repeat(pad))
     }
 }
 
@@ -715,6 +727,44 @@ fn branch_tag_content(branch: &str, max_width: usize) -> Option<String> {
 /// [`RowTag::max_width`]. The mapping is per-name and deterministic, so two
 /// profiles that collapse to the same code render identically; the full name
 /// still shows in a filtered view's list title and in the New/Restart dialogs.
+#[cfg(test)]
+mod row_tag_render_tests {
+    use super::RowTag;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::text::Line;
+
+    /// The bracketed tag must occupy exactly `max_width + 2` cells **as the
+    /// renderer paints it**: locked `ratatui-core` paints halfwidth katakana
+    /// dakuten/handakuten (U+FF9E/U+FF9F) one cell each, while
+    /// `UnicodeWidthStr` resolves them to zero, so a string-width metric
+    /// produces a nine-cell tag for `ｶﾞｻﾞﾊﾟ` where the renderer sees six
+    /// content cells. Asserting through a `Buffer` reads back what the
+    /// renderer actually paints.
+    #[test]
+    fn row_tag_rendered_fits_the_fixed_width_contract_in_a_buffer() {
+        let cases: [(&str, usize); 4] = [("ｶﾞｻﾞﾊﾟ", 4), ("main", 4), ("界界界", 4), ("♥️", 4)];
+        for (content, max_width) in cases {
+            let rendered = RowTag {
+                content: content.into(),
+                max_width,
+            }
+            .rendered();
+            let total = (max_width + 8) as u16;
+            let area = Rect::new(0, 0, total, 1);
+            let mut buffer = Buffer::empty(area);
+            // `set_line` returns the column after the last painted cell, so
+            // this reads back exactly what the renderer would paint.
+            let (x, _) = buffer.set_line(0, 0, &Line::raw(rendered.clone()), total);
+            assert_eq!(
+                x as usize,
+                max_width + 2,
+                "{content}: the rendered tag must paint exactly max_width + 2 cells"
+            );
+        }
+    }
+}
+
 pub(crate) fn profile_short_code(profile: &str) -> String {
     use unicode_segmentation::UnicodeSegmentation;
     const MAX_CELLS: usize = 4;
@@ -4507,6 +4557,51 @@ impl HomeView {
             .style(Style::default().bg(theme.selection));
         frame.render_widget(bar, area);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn row_tag_rendered_caps_wide_content_to_max_width() {
+    let tag = RowTag {
+        content: "界".repeat(12),
+        max_width: BRANCH_TAG_WIDTH,
+    };
+    let rendered = tag.rendered();
+    let width = unicode_width::UnicodeWidthStr::width(rendered.as_str());
+    assert_eq!(
+        width,
+        BRANCH_TAG_WIDTH + 2,
+        "a wide branch name must cap at the tag contract, got {rendered:?}"
+    );
+}
+
+#[test]
+fn row_tag_rendered_keeps_grapheme_sequences_whole() {
+    // VS16 sequence plus a wide glyph: the VS16 adds no cells and the
+    // prefix measurement must not split the cluster or over-count it.
+    let tag = RowTag {
+        content: "\u{2665}\u{fe0f}界-a".to_string(),
+        max_width: BRANCH_TAG_WIDTH,
+    };
+    let rendered = tag.rendered();
+    assert!(
+        rendered.contains('\u{2665}'),
+        "the heart must survive grapheme-aligned truncation, got {rendered:?}"
+    );
+    let width = unicode_width::UnicodeWidthStr::width(rendered.as_str());
+    assert_eq!(width, BRANCH_TAG_WIDTH + 2, "got {rendered:?}");
+
+    // Skin-tone modifier: chars sum to 4 but the cluster is 2 cells, so
+    // a per-char budget would drop the trailing "m" that actually fits.
+    let tag = RowTag {
+        content: "\u{1f91d}\u{1f3fd}m".to_string(),
+        max_width: BRANCH_TAG_WIDTH,
+    };
+    let rendered = tag.rendered();
+    assert!(
+        rendered.contains('m'),
+        "the m fits in cells and must not be dropped, got {rendered:?}"
+    );
 }
 
 #[cfg(test)]

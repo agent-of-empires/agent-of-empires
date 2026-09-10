@@ -129,11 +129,18 @@ pub fn truncate_to_width(text: &str, max_width: usize) -> String {
 /// any caller that subtracts the result from a remaining budget) and
 /// under-admits the second.
 pub fn prefix_within_width(text: &str, max_width: usize) -> &str {
+    use ratatui::buffer::CellWidth;
     use unicode_segmentation::UnicodeSegmentation;
-    use unicode_width::UnicodeWidthStr;
+    let mut cells = 0usize;
     let mut end = 0;
     for (start, g) in text.grapheme_indices(true) {
-        if UnicodeWidthStr::width(&text[..start + g.len()]) > max_width {
+        // The renderer's own per-grapheme metric (`CellWidth`, the same rule
+        // `Span::styled_graphemes` + `Buffer::set_stringn` apply), not
+        // `UnicodeWidthStr`: the latter resolves halfwidth katakana
+        // dakuten/handakuten to zero cells, while the renderer paints each of
+        // them into a cell, so a string-width budget would over-admit them.
+        cells += g.cell_width() as usize;
+        if cells > max_width {
             break;
         }
         end = start + g.len();
