@@ -1315,38 +1315,43 @@ mod tests {
 
     #[test]
     fn test_poller_cleanup_decrements_counter() {
-        let budget =
-            test_support::IsolatedBudget::with_ceiling(DEFAULT_SESSION_ID_POLLER_MAX_THREADS);
-        let poll_count = Arc::new(Mutex::new(0u32));
-        let poll_count_clone = poll_count.clone();
-
+        let budget = test_support::IsolatedBudget::with_ceiling(1);
+        let sid = Arc::new(Mutex::new("initial-id".to_string()));
+        let observed_sid = sid.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
         let mut poller = SessionPoller::new("test-session".to_string());
-        poller.start(
-            "test-cleanup".to_string(),
-            Box::new(move || {
-                *lock_unpoisoned(&poll_count_clone) += 1;
-                Some("id".to_string())
-            }),
-            Box::new(|_| {}),
-            None,
+        // Stop is already queued, so no periodic tick can publish the final ID.
+        poller.cmd_tx.send(PollCommand::Stop).expect("queue stop");
+        assert_eq!(
+            poller.start(
+                "test-cleanup".to_string(),
+                Box::new(move || Some(lock_unpoisoned(&observed_sid).clone())),
+                Box::new(move |value| {
+                    if value == "initial-id" {
+                        started_tx.send(()).expect("report initial observation");
+                        let _ = release_rx.recv();
+                    }
+                }),
+                None,
+            ),
+            PollerSpawn::Spawned
         );
-
-        // Wait for the immediate first poll to run
-        std::thread::sleep(Duration::from_millis(100));
-
-        let count_before_stop = budget.active();
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("initial observation");
+        let active_before_stop = budget.active();
+        *lock_unpoisoned(&sid) = "final-id".to_string();
+        drop(release_tx);
         poller.stop();
-        let count_after_stop = budget.active();
-
-        assert!(
-            count_after_stop < count_before_stop,
-            "counter should decrement after stop (before_stop={}, after_stop={})",
-            count_before_stop,
-            count_after_stop
-        );
-        assert!(
-            *lock_unpoisoned(&poll_count) >= 2,
-            "stop must perform a final poll after the immediate first poll"
+        assert_eq!(active_before_stop, 1);
+        assert_eq!(budget.active(), 0);
+        assert_eq!(
+            poller.latest_observation(),
+            Some((
+                "test-cleanup".to_string(),
+                SessionIdObservation::unguarded("final-id".to_string()),
+            ))
         );
     }
 

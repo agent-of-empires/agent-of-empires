@@ -782,24 +782,21 @@ async fn wait_until_left_starting_resolves_on_broadcast() {
     assert_eq!(result.map(|i| i.status), Some(Status::Waiting));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn wait_until_left_starting_times_out_with_current_status() {
     let mut inst = Instance::new("stuck", "/tmp/wait-c");
     inst.id = "wait-timeout".to_string();
     inst.status = Status::Starting;
     let state = crate::server::test_support::build_test_app_state(vec![inst]);
 
-    let result = wait_until_left_starting(
-        &state,
-        "wait-timeout",
-        std::time::Duration::from_millis(150),
-    )
-    .await;
-    assert_eq!(
-        result.map(|i| i.status),
-        Some(Status::Starting),
-        "timeout must still return the freshest known status, not lie about readiness"
-    );
+    let timeout = std::time::Duration::from_millis(150);
+    let waiter = wait_until_left_starting(&state, "wait-timeout", timeout);
+    tokio::pin!(waiter);
+    assert!(futures_util::poll!(waiter.as_mut()).is_pending());
+    state.instances.write().await[0].status = Status::Waiting;
+    assert!(futures_util::poll!(waiter.as_mut()).is_pending());
+    tokio::time::advance(timeout).await;
+    assert_eq!(waiter.await.map(|i| i.status), Some(Status::Waiting));
 }
 
 #[tokio::test]

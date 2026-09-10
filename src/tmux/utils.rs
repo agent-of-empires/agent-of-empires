@@ -973,22 +973,25 @@ mod tests {
         if !tmux_available() {
             return;
         }
-        let name = "aoe_test_pane_title";
-        let _ = crate::tmux::tmux_command()
-            .args(["kill-session", "-t", name])
-            .output();
-        let spawn = crate::tmux::tmux_command()
-            .args(["new-session", "-d", "-s", name, "sleep", "30"])
-            .status();
-        if !spawn.map(|s| s.success()).unwrap_or(false) {
-            return;
-        }
-        let target = format!("{name}:^.0");
-        let _ = crate::tmux::tmux_command()
+        let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_pane_title");
+        let name = guard.name();
+        let mut args: Vec<String> = ["new-session", "-d", "-s", name, "sleep 30"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+        append_pane_base_index_args(&mut args, name);
+        assert!(crate::tmux::tmux_command()
+            .args(&args)
+            .status()
+            .expect("create title fixture")
+            .success());
+        let target = crate::tmux::test_helpers::only_pane_id(name);
+        assert!(crate::tmux::tmux_command()
             .args(["select-pane", "-t", &target, "-T", "aoe-title-probe"])
-            .output();
+            .status()
+            .expect("set pane title")
+            .success());
         let title = pane_title(name);
-        let _ = kill_session_if_present(name);
         assert_eq!(title.as_deref(), Some("aoe-title-probe"));
     }
 

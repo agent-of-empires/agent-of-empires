@@ -1,3 +1,4 @@
+import { makePatch } from "./helpers/patch";
 import { test, expect } from "./helpers/mockedTest";
 import type { Page } from "@playwright/test";
 import { clickSidebarSession } from "./helpers/sidebar";
@@ -168,24 +169,23 @@ test.describe("Cmd/Ctrl+` desktop", () => {
 
   test("with diff viewer open, Cmd+` to agent closes the diff", async ({ page }, _testInfo) => {
     await mockTerminalApis(page);
-    // Provide one file in the diff list. Don't mock the file content
-    // endpoint — DiffFileViewer can render an error state and the test
-    // only cares about selectedFilePath being set (which hides the agent
-    // wrapper).
-    await page.route("**/api/sessions/*/diff/files", (r) =>
-      r.fulfill({
+    const file = { path: "src/foo.ts", old_path: null, status: "modified", additions: 1, deletions: 1 };
+    const oldContent = "export const value = 1;\n";
+    const newContent = "export const value = 2;\n";
+    await page.route("**/api/sessions/*/diff/files", (route) =>
+      route.fulfill({
+        json: { files: [file], per_repo_bases: [{ base_branch: "main" }], warning: null },
+      }),
+    );
+    await page.route(/\/api\/sessions\/[^/]+\/diff\/file\?/, (route) =>
+      route.fulfill({
         json: {
-          files: [
-            {
-              path: "src/foo.ts",
-              old_path: null,
-              status: "modified",
-              additions: 3,
-              deletions: 1,
-            },
-          ],
-          per_repo_bases: [{ base_branch: "main" }],
-          warning: null,
+          file,
+          old_content: oldContent,
+          new_content: newContent,
+          is_binary: false,
+          truncated: false,
+          patch: makePatch(file.path, oldContent, newContent),
         },
       }),
     );
@@ -195,16 +195,23 @@ test.describe("Cmd/Ctrl+` desktop", () => {
 
     // Click the file in the diff list.
     await page.locator('button:has-text("foo.ts")').first().click();
-    // The agent terminal wrapper is now className="hidden". The
-    // [data-term="agent"] node still exists but inside a hidden parent.
+    const agent = page.locator('[data-term="agent"]');
+    const backToTerminal = page.getByRole("button", { name: "Back to terminal" });
+    await expect(backToTerminal).toBeVisible();
+    await expect(agent).toHaveCount(1);
+    await expect(agent).toBeHidden();
     await shot(page, "06-diff-open.png");
 
     await focusKind(page, "paired");
     await expect.poll(() => focusedKind(page)).toBe("paired");
+    await expect(backToTerminal).toBeVisible();
+    await expect(agent).toBeHidden();
 
     // Press Cmd+` → handler clears selectedFilePath, then rAF-dispatches.
     await page.keyboard.press("ControlOrMeta+`");
     await expect.poll(() => focusedKind(page)).toBe("agent");
+    await expect(agent).toBeVisible();
+    await expect(backToTerminal).toBeHidden();
     await shot(page, "07-after-toggle-agent.png");
   });
 

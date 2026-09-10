@@ -1,14 +1,5 @@
-// The agent surface's live view against a real `aoe serve`: frames come from
-// the in-process VT grid, so a full-screen app that brackets its repaints in
-// DEC 2026 synchronized output is never shown half-drawn, and once the client
-// advertises `caps.patch` the stream carries row patches instead of whole
-// windows.
-//
-// Only the first of those is grid-only. Row patches are planned in the shared
-// publish path and arrive on the snapshot fallback too, so neither assertion
-// proves which transport is live. The server says so directly instead, and
-// both cases check it: a run that quietly fell back to snapshots would
-// otherwise read as a tearing bug in the grid rather than as an absent grid.
+// Real live-grid delivery: synchronized frames, resize/OSC 52, and row patches.
+// Assert the announced transport so a snapshot fallback cannot satisfy the oracle.
 import { devices, type Page } from "@playwright/test";
 import { join } from "node:path";
 import { writeFileSync, chmodSync, mkdirSync } from "node:fs";
@@ -23,6 +14,8 @@ import {
   type SpawnOptions,
 } from "../helpers/aoeServe";
 import { clickSidebarSession, openMobileSidebar } from "../helpers/sidebar";
+
+test.use({ ...devices["iPhone 13"] });
 
 /** The server announces its transport on the first frame. Fail here rather
  *  than letting a snapshot fallback masquerade as a grid that tears: the
@@ -134,7 +127,8 @@ function seedTool(title: string, script: string): SpawnOptions["seedFn"] {
     chmodSync(tool, 0o755);
     const pd = join(e.home, "project");
     mkdirSync(pd, { recursive: true });
-    spawnSync("git", ["init", "-q"], { cwd: pd });
+    const initialized = spawnSync("git", ["init", "-q"], { cwd: pd, env: e.env });
+    if (initialized.status !== 0) throw new Error(String(initialized.stderr));
     const r = spawnSync(resolveAoeBinary(), ["add", pd, "-t", title, "-c", "claude", "--cmd-override", tool], {
       env: e.env,
     });
@@ -171,7 +165,7 @@ printf '\\e]52;c;YWZ0ZXItcmVzaXpl\\a'
 while true; do sleep 1; done
 `;
 
-test("synchronized-output brackets publish whole frames only", async ({ browser }, testInfo) => {
+test("synchronized-output brackets publish whole frames only", async ({ page }, testInfo) => {
   test.setTimeout(90_000);
   const serve = await spawnAoeServe({
     authMode: "none",
@@ -180,17 +174,25 @@ test("synchronized-output brackets publish whole frames only", async ({ browser 
     seedFn: seedTool("sync-app", SYNC_APP),
   });
   try {
-    const ctx = await browser.newContext({ ...devices["iPhone 13"] });
-    const page = await ctx.newPage();
     await page.goto(`${serve.baseUrl}/?livedebug=1`);
     await openMobileSidebar(page);
     await clickSidebarSession(page, "sync-app");
     await page.locator("[data-live-terminal]").waitFor({ state: "visible", timeout: 15_000 });
     await expectGridTransport(page);
-    await page
-      .locator("[data-live-content]")
-      .filter({ hasText: /FRAME-B \d+/ })
-      .waitFor({ state: "attached", timeout: 30_000 });
+    await expect
+      .poll(
+        () =>
+          page
+            .locator('[data-term="agent"] [data-live-content]')
+            .textContent()
+            .then((text) => {
+              const a = /FRAME-A (\d+)/.exec(text ?? "");
+              const b = /FRAME-B (\d+)/.exec(text ?? "");
+              return Boolean(a && b && a[1] === b[1]);
+            }),
+        { timeout: 30_000 },
+      )
+      .toBe(true);
 
     // Sample the rendered grid far more often than the app repaints. A torn
     // frame shows part A of one repaint with part B of the previous one (or
@@ -202,13 +204,12 @@ test("synchronized-output brackets publish whole frames only", async ({ browser 
           const seen = new Set<string>();
           let samples = 0;
           const timer = setInterval(() => {
-            const text = document.querySelector("[data-live-content]")?.textContent ?? "";
+            const text = document.querySelector('[data-term="agent"] [data-live-content]')?.textContent ?? "";
             const a = /FRAME-A (\d+)/.exec(text);
             const b = /FRAME-B (\d+)/.exec(text);
-            if (!a) return;
             samples += 1;
-            seen.add(a[1]!);
-            if (!b || a[1] !== b[1]) torn.push(text.replace(/\s+/g, " ").trim().slice(0, 60));
+            if (!a || !b || a[1] !== b[1]) torn.push(text.replace(/\s+/g, " ").trim().slice(0, 60));
+            else seen.add(a[1]!);
             if (samples >= 150) {
               clearInterval(timer);
               resolve({ samples, torn, frames: seen.size });
@@ -224,7 +225,7 @@ test("synchronized-output brackets publish whole frames only", async ({ browser 
   }
 });
 
-test("a resize keeps the live grid and its OSC 52 forwarding", async ({ browser }, testInfo) => {
+test("a resize keeps the live grid and its OSC 52 forwarding", async ({ page, context }, testInfo) => {
   test.setTimeout(90_000);
   const marker = `POST_RESEED_${randomUUID().slice(0, 8)}`;
   const serve = await spawnAoeServe({
@@ -237,9 +238,7 @@ test("a resize keeps the live grid and its OSC 52 forwarding", async ({ browser 
     const sessions = await waitForSessions(serve.baseUrl);
     const session = sessions.find((session) => session.title === "clipboard-fallback");
     if (!session) throw new Error("clipboard fixture session was not seeded");
-    const ctx = await browser.newContext({ ...devices["iPhone 13"] });
-    await ctx.grantPermissions(["clipboard-read", "clipboard-write"]);
-    const page = await ctx.newPage();
+    await context.grantPermissions(["clipboard-read", "clipboard-write"]);
     const socketUrl = new URL(`/sessions/${session.id}/live-ws`, serve.baseUrl);
     socketUrl.protocol = socketUrl.protocol === "https:" ? "wss:" : "ws:";
     await holdClientResize(page, socketUrl.href);
@@ -300,7 +299,7 @@ test("a resize keeps the live grid and its OSC 52 forwarding", async ({ browser 
   }
 });
 
-test("a streaming agent is delivered as row patches after the first frame", async ({ browser }, testInfo) => {
+test("a streaming agent is delivered as row patches after the first frame", async ({ page }, testInfo) => {
   test.setTimeout(90_000);
   const serve = await spawnAoeServe({
     authMode: "none",
@@ -309,8 +308,6 @@ test("a streaming agent is delivered as row patches after the first frame", asyn
     seedFn: seedTool("patch-stream", STREAMER),
   });
   try {
-    const ctx = await browser.newContext({ ...devices["iPhone 13"] });
-    const page = await ctx.newPage();
     await page.goto(`${serve.baseUrl}/?livedebug=1`);
     await openMobileSidebar(page);
     await clickSidebarSession(page, "patch-stream");

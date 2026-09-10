@@ -8,8 +8,8 @@
 //
 // Worker isolation: callers pass `workerIndex` and `parallelIndex` (from
 // Playwright's `testInfo`). Port and TMUX_TMPDIR are derived deterministically
-// so parallel workers never collide. tmux is contained inside the test's
-// HOME tree, so cleanup is a simple `rm -rf home`.
+// so parallel workers never collide. Cleanup stops workers and the isolated
+// tmux server before removing their HOME, including when seeding fails.
 
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync, mkdtempSync, writeFileSync, chmodSync, mkdirSync, realpathSync, rmSync } from "node:fs";
@@ -669,10 +669,6 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
     }
   }
 
-  if (opts.seedFn) {
-    await opts.seedFn({ home, shimBin, xdg, tmp, tmuxTmp, env: seedEnv });
-  }
-
   const passphrase = authMode === "passphrase" ? (opts.passphrase ?? DEFAULT_PASSPHRASE) : undefined;
 
   const spawnTimeoutMs = opts.spawnTimeoutMs ?? 10_000;
@@ -740,33 +736,6 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
   let port = 0;
   let baseUrl = "";
 
-  for (let attempt = 0; attempt < 5; attempt++) {
-    port = portFor(opts.workerIndex, opts.parallelIndex, attempt);
-    baseUrl = `http://127.0.0.1:${port}`;
-    try {
-      proc = await spawnOnce(buildArgs(port), baseUrl);
-      break;
-    } catch (err) {
-      if (attempt === 4) {
-        rmSync(home, { recursive: true, force: true });
-        throw err;
-      }
-      // try next port
-    }
-  }
-
-  if (!proc) {
-    rmSync(home, { recursive: true, force: true });
-    throw new Error("aoe serve failed to bind on every attempted port");
-  }
-
-  let authToken: string | undefined;
-  let tokenFile: string | undefined;
-  if (authMode === "token") {
-    tokenFile = join(appDirFor(home, xdg, aoeBinary), "serve.token");
-    authToken = await readTokenFile(tokenFile, spawnTimeoutMs);
-  }
-
   async function killProc(child: ChildProcess): Promise<void> {
     if (child.exitCode !== null || child.signalCode !== null) return;
     child.kill("SIGTERM");
@@ -798,88 +767,81 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
     });
   }
 
-  const handle: ServeHandle = {
-    baseUrl,
-    port,
-    home,
-    shimBin,
-    env: seedEnv,
-    proc,
-    authMode,
-    passphrase,
-    authToken,
-    tokenFile,
-    tmuxPrefix: tmuxPrefixFor(aoeBinary),
-    tmuxSocket: tmuxSocketPath(home),
-    async restart() {
+  async function cleanup(): Promise<void> {
+    try {
+      // Stop ACP before removing the daemon or its registry.
+      spawnSync(aoeBinary, ["acp", "stop", "--all"], { env: seedEnv, stdio: "ignore", timeout: 10_000 });
       if (proc) await killProc(proc);
-      const next = await spawnOnce(buildArgs(port), baseUrl);
-      proc = next;
-      handle.proc = next;
-      if (authMode === "token" && tokenFile) {
-        const refreshed = await readTokenFile(tokenFile, spawnTimeoutMs);
-        handle.authToken = refreshed;
-      }
-    },
-    async stop() {
+    } finally {
+      await killOrphanRunners(appDirFor(home, xdg, aoeBinary));
       try {
-        // Terminate acp workers BEFORE killing the daemon and deleting
-        // the temp HOME. `acp stop --all` makes the still-live daemon
-        // group-kill every per-session `aoe __acp-runner` (and its node
-        // + claude descendants). Without it they outlive the daemon, the
-        // HOME is then wiped, and the orphaned tree leaks forever. See
-        // #1921.
-        spawnSync(aoeBinary, ["acp", "stop", "--all"], {
-          env: seedEnv,
-          stdio: "ignore",
-          timeout: 10_000,
-        });
-        if (proc) await killProc(proc);
-      } finally {
-        // Direct fallback for a daemon that was already dead/wedged (so the
-        // RPC above was a no-op): group-kill any runner still recorded in
-        // the registry, reading its pid off disk. Runs before rmSync so we
-        // never orphan a tree by deleting its HOME out from under it.
-        await killOrphanRunners(appDirFor(home, xdg, aoeBinary));
-        // Best-effort: kill any tmux server bound to the isolated socket
-        // before deleting the dir. Structured view specs leave tmux child
-        // processes around that hold open file descriptors and trip
-        // ENOTEMPTY on rmSync if not cleaned up first.
-        try {
-          // aoe binds its own `-S <socket>` (#2608), not the default socket
-          // under TMUX_TMPDIR, so kill the server on that explicit socket.
-          spawnSync("tmux", ["-S", tmuxSocketPath(home), "kill-server"], {
-            env: seedEnv,
-            stdio: "ignore",
-          });
-        } catch {
-          // tmux not installed or no server running; either way we don't
-          // care.
-        }
-        // Removing the home dir wipes the isolated TMUX_TMPDIR socket too.
-        // Wrap in try/catch: stale fds, slow umount, or AFS-style retry
-        // semantics can leave non-empty dirs that don't matter for the
-        // test result.
-        try {
-          rmSync(home, { recursive: true, force: true });
-        } catch {
-          // best effort
-        }
+        spawnSync("tmux", ["-S", tmuxSocketPath(home), "kill-server"], { env: seedEnv, stdio: "ignore" });
+      } catch {
+        // No tmux installation or no remaining server.
       }
-    },
-  };
-
-  if (authMode === "passphrase" && passphrase && opts.preloginViaHarness) {
-    const deviceBindingSecret = randomBytes(32).toString("base64url");
-    const { cookie } = await loginWithPassphrase(baseUrl, passphrase, deviceBindingSecret);
-    handle.sessionCookie = cookie;
-    handle.deviceBindingSecret = deviceBindingSecret;
+      try {
+        rmSync(home, { recursive: true, force: true });
+      } catch {
+        // Best effort for stale descriptors and slow filesystems.
+      }
+    }
   }
 
-  // The structured view is the default for ACP-capable agents now (the master
-  // switch was removed), so the harness no longer enables anything here.
-  // `opts.structured view` is accepted for source compatibility and ignored.
-  void opts.acp;
+  try {
+    if (opts.seedFn) await opts.seedFn({ home, shimBin, xdg, tmp, tmuxTmp, env: seedEnv });
+    for (let attempt = 0; attempt < 5; attempt++) {
+      port = portFor(opts.workerIndex, opts.parallelIndex, attempt);
+      baseUrl = `http://127.0.0.1:${port}`;
+      try {
+        proc = await spawnOnce(buildArgs(port), baseUrl);
+        break;
+      } catch (error) {
+        if (attempt === 4) throw error;
+      }
+    }
+    if (!proc) throw new Error("aoe serve failed to bind on every attempted port");
+    let authToken: string | undefined;
+    let tokenFile: string | undefined;
+    if (authMode === "token") {
+      tokenFile = join(appDirFor(home, xdg, aoeBinary), "serve.token");
+      authToken = await readTokenFile(tokenFile, spawnTimeoutMs);
+    }
+    const handle: ServeHandle = {
+      baseUrl,
+      port,
+      home,
+      shimBin,
+      env: seedEnv,
+      proc,
+      authMode,
+      passphrase,
+      authToken,
+      tokenFile,
+      tmuxPrefix: tmuxPrefixFor(aoeBinary),
+      tmuxSocket: tmuxSocketPath(home),
+      async restart() {
+        if (proc) await killProc(proc);
+        const next = await spawnOnce(buildArgs(port), baseUrl);
+        proc = next;
+        handle.proc = next;
+        if (authMode === "token" && tokenFile) {
+          const refreshed = await readTokenFile(tokenFile, spawnTimeoutMs);
+          handle.authToken = refreshed;
+        }
+      },
+      stop: cleanup,
+    };
 
-  return handle;
+    if (authMode === "passphrase" && passphrase && opts.preloginViaHarness) {
+      const deviceBindingSecret = randomBytes(32).toString("base64url");
+      const { cookie } = await loginWithPassphrase(baseUrl, passphrase, deviceBindingSecret);
+      handle.sessionCookie = cookie;
+      handle.deviceBindingSecret = deviceBindingSecret;
+    }
+
+    return handle;
+  } catch (error) {
+    await cleanup().catch(() => {});
+    throw error;
+  }
 }

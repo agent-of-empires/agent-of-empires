@@ -822,28 +822,8 @@ impl Session {
         }
     }
 
-    /// Wait for the pane to become ready for input, or `max_wait` to elapse.
-    /// Failsafe: always returns by `max_wait`, so a caller's next action
-    /// (e.g. `send-keys`) still runs even if the pane never becomes ready,
-    /// such as an agent that is genuinely still streaming output.
-    ///
-    /// When `ready_marker` is `Some` (see `AgentDef::ready_marker`), polls
-    /// for that substring actually appearing in the captured pane content
-    /// (matched case-insensitively) -- a real, agent-specific readiness
-    /// signal.
-    ///
-    /// When `ready_marker` is `None` (no such signal is known for this
-    /// agent yet), falls back to a generic heuristic: content stops
-    /// changing across two consecutive samples. This is weaker -- a short,
-    /// static "still loading" screen can satisfy it before the agent is
-    /// actually listening -- but it is strictly better than sending
-    /// immediately, and is the same heuristic `aoe session restart`'s
-    /// wake-message send already relied on before per-agent markers
-    /// existed.
-    ///
-    /// Shared by `aoe session restart`'s post-restart wake message and `aoe
-    /// send`'s pre-send wait: both need to avoid typing into a pane whose
-    /// agent has not finished rendering yet.
+    /// Wait for a known marker, or for two stable captures when no marker exists.
+    /// The polling budget bounds readiness checks, not each native subprocess.
     pub fn wait_until_ready(&self, max_wait: std::time::Duration, ready_marker: Option<&str>) {
         let poll_interval = std::time::Duration::from_millis(200);
         let deadline = std::time::Instant::now() + max_wait;
@@ -854,6 +834,8 @@ impl Session {
             let Ok(now) = self.capture_pane(5) else {
                 continue;
             };
+            #[cfg(test)]
+            tests::observe_ready_capture(&now);
             if let Some(marker) = ready_marker.as_deref() {
                 if now.to_lowercase().contains(marker) {
                     return;
@@ -2520,9 +2502,41 @@ pub(crate) fn build_create_args(
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::{
-        only_pane_id, wait_for_pane_command, wait_for_pane_dead, TmuxTestSession,
+        only_pane_id, pane_field, wait_for_pane_command, wait_for_pane_dead, TmuxTestSession,
     };
     use super::*;
+    struct ReadyCaptureProbe {
+        captured: std::sync::mpsc::Sender<String>,
+        resume: std::sync::mpsc::Receiver<()>,
+    }
+
+    thread_local! {
+        static READY_CAPTURE: std::cell::RefCell<Option<ReadyCaptureProbe>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn observe_ready_capture(content: &str) {
+        READY_CAPTURE.with(|slot| {
+            if let Some(probe) = slot.borrow().as_ref() {
+                if probe.captured.send(content.to_owned()).is_ok() {
+                    let _ = probe.resume.recv();
+                }
+            }
+        });
+    }
+
+    struct ReadyCaptureGuard(Option<ReadyCaptureProbe>);
+
+    impl ReadyCaptureGuard {
+        fn install(probe: ReadyCaptureProbe) -> Self {
+            Self(READY_CAPTURE.with(|slot| slot.replace(Some(probe))))
+        }
+    }
+
+    impl Drop for ReadyCaptureGuard {
+        fn drop(&mut self) {
+            READY_CAPTURE.with(|slot| slot.replace(self.0.take()));
+        }
+    }
 
     /// Helper: check if tmux is available for tests that need it
     fn tmux_available() -> bool {
@@ -2533,53 +2547,39 @@ mod tests {
             .unwrap_or(false)
     }
 
-    /// Move `session_name`'s only window to index 1 under `base-index 1`, so
-    /// window 0 genuinely does not exist.
-    ///
-    /// Setting `base-index 1` on a live session does not renumber the window it
-    /// was created with, and a `:0.0` target against a session that still has a
-    /// window 0 resolves fine, so the option on its own leaves the base-index
-    /// half of #435 / #488 untested (#3368). Moving the window afterwards
-    /// reproduces what a user with `base-index 1` in their `tmux.conf` has,
-    /// without touching the server-global option every other tmux test shares.
-    ///
-    /// tmux resolves a window index that does not exist to the session's
-    /// current window, so with a second window active a `:0.0` target then
-    /// reads the active window rather than failing loudly. That is the
-    /// regression these callers exist to catch.
+    /// Leave one window at index 1, regardless of the server configuration.
     fn rebase_first_window_to_index_one(session_name: &str) {
+        let window = pane_field(session_name, "#{window_id}");
+        let index = pane_field(session_name, "#{window_index}");
         let set = crate::tmux::tmux_command()
             .args(["set-option", "-t", session_name, "base-index", "1"])
             .output()
-            .expect("tmux set-option base-index");
-        assert!(set.status.success(), "failed to set base-index 1");
-
-        let moved = crate::tmux::tmux_command()
-            .args([
-                "move-window",
-                "-d",
-                "-s",
-                &format!("{session_name}:0"),
-                "-t",
-                &format!("{session_name}:1"),
-            ])
-            .output()
-            .expect("tmux move-window");
-        assert!(
-            moved.status.success(),
-            "failed to move the first window off index 0: {}",
-            String::from_utf8_lossy(&moved.stderr)
-        );
-
+            .expect("set base-index");
+        assert!(set.status.success());
+        if index != "1" {
+            let moved = crate::tmux::tmux_command()
+                .args([
+                    "move-window",
+                    "-d",
+                    "-s",
+                    &window,
+                    "-t",
+                    &format!("{session_name}:1"),
+                ])
+                .output()
+                .expect("move window");
+            assert!(
+                moved.status.success(),
+                "move window: {}",
+                String::from_utf8_lossy(&moved.stderr)
+            );
+        }
         let listed = crate::tmux::tmux_command()
             .args(["list-windows", "-t", session_name, "-F", "#{window_index}"])
             .output()
-            .expect("tmux list-windows");
-        let indices = String::from_utf8_lossy(&listed.stdout);
-        assert!(
-            !indices.lines().any(|line| line.trim() == "0"),
-            "window 0 must not exist, or a `:0.0` target still resolves: {indices:?}"
-        );
+            .expect("list windows");
+        assert!(listed.status.success());
+        assert_eq!(String::from_utf8_lossy(&listed.stdout).trim(), "1");
     }
 
     /// Set the server-global `pane-base-index` for the rest of the scope and
@@ -2766,11 +2766,7 @@ mod tests {
         }
     }
 
-    /// Direct proof that `wait_until_ready` with a known marker actually
-    /// blocks until that marker appears, rather than returning early on a
-    /// merely-static pane -- the gap in the generic content-settle fallback
-    /// (a "still loading" screen can look "settled" long before the agent is
-    /// really listening).
+    /// A known marker must take precedence over stable loading content.
     #[test]
     #[serial_test::serial]
     fn wait_until_ready_blocks_until_the_marker_appears() {
@@ -2784,13 +2780,7 @@ mod tests {
         let release = temp.path().join("release");
         let quote =
             |p: &std::path::Path| format!("'{}'", p.to_string_lossy().replace('\'', r#"'\''"#));
-        // The pane holds a screen the generic fallback would accept (over 20
-        // characters, unchanging) and prints the marker only once this test
-        // creates the release file, so the marker's arrival is caused here
-        // rather than timed against a sleep in the pane. The trailing
-        // `set-option pane-base-index 0` chain mirrors
-        // `append_pane_base_index_args` so the `^.0` capture target resolves
-        // on hosts with `pane-base-index 1` set globally (#488, #2231).
+        // Hold a stable loading screen until the waiter has rejected it.
         let script = format!(
             "echo 'booting, please wait ...'; until [ -f {} ]; do sleep 0.02; done; echo 'ask anything...'; sleep 30",
             quote(&release)
@@ -2820,73 +2810,94 @@ mod tests {
         assert!(status.success());
         refresh_session_cache();
 
-        /// Releases the pane on the way out, so an unwind inside the scope
-        /// below cannot leave the waiter forking against a killed session
-        /// until its budget expires.
         struct ReleaseOnDrop<'a>(&'a std::path::Path);
         impl Drop for ReleaseOnDrop<'_> {
             fn drop(&mut self) {
                 let _ = std::fs::write(self.0, b"");
             }
         }
-
-        let (returned_tx, returned_rx) = std::sync::mpsc::channel();
-        let session = Session::from_name(&name);
-        // Observations are collected, not asserted, inside the scope, and the
-        // release runs on every path out of it, so no failure leaves the
-        // waiter forking against a killed session and the join stays prompt.
-        let (settled, last, premature, early, released) = std::thread::scope(|scope| {
-            scope.spawn(|| {
-                // Only a failure deadline, and it has to dominate the
-                // sample-bounded window below: a budget the window can reach
-                // on a slow host would expire mid-window and read as the
-                // early return this test exists to catch.
-                Session::from_name(&name)
-                    .wait_until_ready(std::time::Duration::from_secs(60), Some("ask anything"));
-                let _ = returned_tx.send(());
+        let (captured_tx, captured_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (stable, last, premature, returned_on_marker, released, joined) =
+            std::thread::scope(|scope| {
+                let name = &name;
+                let waiter = scope.spawn(move || {
+                    let _probe = ReadyCaptureGuard::install(ReadyCaptureProbe {
+                        captured: captured_tx,
+                        resume: resume_rx,
+                    });
+                    Session::from_name(name)
+                        .wait_until_ready(std::time::Duration::from_secs(60), Some("ask anything"));
+                });
+                let _release_on_unwind = ReleaseOnDrop(&release);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut stable = 0;
+                let mut last: Option<String> = None;
+                let mut premature = false;
+                while let Some(remaining) =
+                    deadline.checked_duration_since(std::time::Instant::now())
+                {
+                    let Ok(now) = captured_rx.recv_timeout(remaining) else {
+                        break;
+                    };
+                    premature |= now.to_lowercase().contains("ask anything");
+                    stable = if now.trim().len() <= 20 {
+                        0
+                    } else if last.as_deref() == Some(now.as_str()) {
+                        stable + 1
+                    } else {
+                        1
+                    };
+                    last = Some(now);
+                    // The third capture proves the first two decisions did not accept the static screen.
+                    if stable >= 3 || premature {
+                        break;
+                    }
+                    let _ = resume_tx.send(());
+                }
+                let released = std::fs::write(&release, b"");
+                let _ = resume_tx.send(());
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut marker_seen = false;
+                while let Some(remaining) =
+                    deadline.checked_duration_since(std::time::Instant::now())
+                {
+                    let Ok(now) = captured_rx.recv_timeout(remaining) else {
+                        break;
+                    };
+                    marker_seen = now.to_lowercase().contains("ask anything");
+                    let _ = resume_tx.send(());
+                    if marker_seen {
+                        break;
+                    }
+                }
+                let returned = captured_rx.recv_timeout(std::time::Duration::from_secs(2));
+                drop(resume_tx);
+                drop(captured_rx);
+                (
+                    stable,
+                    last,
+                    premature,
+                    marker_seen
+                        && matches!(
+                            returned,
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+                        ),
+                    released,
+                    waiter.join(),
+                )
             });
-            let _release_on_unwind = ReleaseOnDrop(&release);
-            // Negative claim, so it needs a window: hold the settled markerless
-            // screen across several of the waiter's 200ms polls, which is the
-            // state an early return would key on. Bounded by sample count, not
-            // wall time, so a slow host lengthens the window the waiter has to
-            // survive instead of starving the loop of samples.
-            let mut settled = 0;
-            let mut last: Option<String> = None;
-            let mut premature = None;
-            for _ in 0..12 {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                let now = session.capture_pane(5).expect("capture pane");
-                if now.to_lowercase().contains("ask anything") {
-                    premature = Some(now.clone());
-                }
-                if now.trim().len() > 20 && last.as_deref() == Some(now.as_str()) {
-                    settled += 1;
-                }
-                last = Some(now);
-            }
-            let early = returned_rx.try_recv();
-            std::fs::write(&release, b"").expect("release the pane");
-            // Far above the ~200ms poll interval the marker path returns on,
-            // far below the waiter's budget, so this separates "the marker
-            // fired" from both "it idled" and "it gave up".
-            let released = returned_rx.recv_timeout(std::time::Duration::from_secs(2));
-            (settled, last, premature, early, released)
-        });
-
+        joined.expect("readiness waiter exits");
+        released.expect("release the pane");
+        assert!(!premature, "the marker appeared before release");
         assert!(
-            premature.is_none(),
-            "the pane printed the marker before the test released it: {premature:?}"
+            stable >= 3,
+            "waiter did not reject consecutive stable captures: {last:?}"
         );
         assert!(
-            settled >= 2,
-            "pane never held a screen the settle fallback would accept: {last:?}"
+            returned_on_marker,
+            "the waiter must return upon observing the released marker"
         );
-        assert!(
-            matches!(early, Err(std::sync::mpsc::TryRecvError::Empty)),
-            "returned on the static screen, before the marker appeared"
-        );
-        released.expect("did not return promptly once the marker appeared");
     }
 
     #[test]
@@ -3645,8 +3656,7 @@ mod tests {
 
         let guard = TmuxTestSession::new("aoe_test_tokens_no_enter");
         let name = guard.name().to_string();
-        // `read -r` blocks on a full line: it only prints once Enter arrives.
-        // A bare literal with no Enter token must leave it blocked.
+        // A later suffix and Enter must complete the same first read.
         let status = crate::tmux::tmux_command()
             .args([
                 "new-session",
@@ -3657,7 +3667,7 @@ mod tests {
                 "40",
                 "-y",
                 "10",
-                "sh -c 'read -r line; printf \"got:%s\" \"$line\"; sleep 60'",
+                r#"sh -c 'read -r line; printf "got:<%s>" "$line"; sleep 60'"#,
                 ";",
                 "set-option",
                 "-t",
@@ -3678,12 +3688,22 @@ mod tests {
             .send_key_tokens(&[crate::agents::KeyToken::Literal("hi")])
             .expect("send_key_tokens");
 
-        // Give the shell a beat to react if it were (incorrectly) going to.
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        let content = session.capture_pane(20).expect("capture_pane");
-        assert!(
-            !content.contains("got:"),
-            "no trailing Enter should have been sent, but read() completed: {content:?}"
+        let pane = only_pane_id(&name);
+        for args in [
+            vec!["send-keys", "-t", &pane, "-l", "--", "-tail"],
+            vec!["send-keys", "-t", &pane, "Enter"],
+        ] {
+            assert!(crate::tmux::tmux_command()
+                .args(args)
+                .status()
+                .expect("complete input line")
+                .success());
+        }
+        wait_for_text(
+            &session,
+            "got:<hi-tail>",
+            "one complete input line",
+            |session| session.capture_pane(20),
         );
     }
 
@@ -4065,26 +4085,24 @@ mod tests {
         let guard = TmuxTestSession::new("aoe_test_multiwin");
         let session_name = guard.name().to_string();
 
-        // Create session with a long-running command in window 0
+        let mut args: Vec<String> = [
+            "new-session",
+            "-d",
+            "-s",
+            &session_name,
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "sleep 30",
+        ]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+        append_remain_on_exit_args(&mut args, &session_name);
+        append_pane_base_index_args(&mut args, &session_name);
         let output = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &session_name,
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sleep 30",
-                ";",
-                "set-option",
-                "-p",
-                "-t",
-                &session_name,
-                "remain-on-exit",
-                "on",
-            ])
+            .args(&args)
             .output()
             .expect("tmux new-session");
         assert!(output.status.success());
@@ -4154,19 +4172,23 @@ mod tests {
         let guard = TmuxTestSession::new("aoe_test_capture_multiwin");
         let session_name = guard.name().to_string();
 
-        // Create session running sleep in the first window
+        let mut args: Vec<String> = [
+            "new-session",
+            "-d",
+            "-s",
+            &session_name,
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "sh -c 'echo AOE_FIRST_WINDOW; exec sleep 30'",
+        ]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+        append_pane_base_index_args(&mut args, &session_name);
         let output = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &session_name,
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sh -c 'echo AOE_FIRST_WINDOW; exec sleep 30'",
-            ])
+            .args(&args)
             .output()
             .expect("tmux new-session");
         assert!(output.status.success());
@@ -4769,19 +4791,23 @@ mod tests {
         let guard = TmuxTestSession::new("aoe_test_shell_multiwin");
         let session_name = guard.name().to_string();
 
-        // Create session running sleep (not a shell) in the first window
+        let mut args: Vec<String> = [
+            "new-session",
+            "-d",
+            "-s",
+            &session_name,
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "sleep 30",
+        ]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+        append_pane_base_index_args(&mut args, &session_name);
         let output = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &session_name,
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sleep 30",
-            ])
+            .args(&args)
             .output()
             .expect("tmux new-session");
         assert!(output.status.success());
@@ -4821,57 +4847,81 @@ mod tests {
         let guard = TmuxTestSession::new("aoe_test_splitpane");
         let session_name = guard.name().to_string();
 
-        // Create session with a long-running command (the "agent")
+        let mut args: Vec<String> = [
+            "new-session",
+            "-d",
+            "-s",
+            &session_name,
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "sleep 30",
+        ]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+        append_remain_on_exit_args(&mut args, &session_name);
+        append_pane_base_index_args(&mut args, &session_name);
         let output = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &session_name,
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sleep 30",
-                ";",
-                "set-option",
-                "-p",
-                "-t",
-                &session_name,
-                "remain-on-exit",
-                "on",
-            ])
+            .args(&args)
             .output()
             .expect("tmux new-session");
         assert!(output.status.success());
         let agent_pane = only_pane_id(&session_name);
 
-        // Split the window -- this creates a new pane running a shell
         let output = crate::tmux::tmux_command()
-            .args(["split-window", "-t", &session_name])
+            .args([
+                "split-window",
+                "-t",
+                &session_name,
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "sh -c 'read -r line'",
+            ])
             .output()
             .expect("tmux split-window");
         assert!(output.status.success());
-
-        // The split pane is now active. Select it explicitly to be sure.
-        let output = crate::tmux::tmux_command()
-            .args(["select-pane", "-t", &format!("{session_name}:.1")])
-            .output()
-            .expect("tmux select-pane");
-        assert!(output.status.success());
-
+        let split = String::from_utf8(output.stdout)
+            .expect("pane ID")
+            .trim()
+            .to_string();
+        assert!(split.starts_with('%'));
+        assert!(crate::tmux::tmux_command()
+            .args([
+                "set-option",
+                "-p",
+                "-t",
+                &split,
+                "remain-on-exit",
+                "on",
+                ";",
+                "select-pane",
+                "-t",
+                &split
+            ])
+            .status()
+            .expect("retain and select split")
+            .success());
+        assert_eq!(pane_field(&session_name, "#{pane_id}"), split);
         wait_for_pane_command(&agent_pane, "sleep");
-
-        // The agent pane (pane 0) is still alive
-        assert!(
-            !is_pane_dead(&session_name),
-            "is_pane_dead should check pane 0 (sleep), not the active split pane"
-        );
-
-        // The agent pane runs 'sleep', not a shell
+        wait_for_pane_command(&split, "sh");
         assert!(
             !is_pane_running_shell(&session_name),
-            "is_pane_running_shell should check pane 0 (sleep), not the active split pane (shell)"
+            "status must target the agent, not the active shell"
+        );
+        assert!(crate::tmux::tmux_command()
+            .args(["send-keys", "-t", &split, "Enter"])
+            .status()
+            .expect("release split shell")
+            .success());
+        wait_for_pane_dead(&split);
+        assert_eq!(pane_field(&agent_pane, "#{pane_dead}"), "0");
+        assert_eq!(pane_field(&session_name, "#{pane_id}"), split);
+        assert!(
+            !is_pane_dead(&session_name),
+            "status must target the live agent, not the dead active split"
         );
     }
 

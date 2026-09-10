@@ -152,12 +152,16 @@ test.describe("Structured-view composer keyboard reservation (#2011)", () => {
     await setup(page);
     await openStructuredSession(page);
 
-    expect(await rootPaddingBottom(page)).toBe(0);
-
-    // innerHeight shrinks with the keyboard: keyboardHeight is 0, dvh handles it.
+    const root = await page.getByTestId("structured-view-root").elementHandle();
+    expect(root).not.toBeNull();
+    const reservation = () =>
+      root!.evaluate((element) => ({
+        connected: element.isConnected,
+        padding: parseInt(element.style.paddingBottom || "0") || 0,
+      }));
+    await simulateKeyboardOpen(page, 300);
+    await expect.poll(async () => (await reservation()).padding).toBeGreaterThanOrEqual(250);
     await simulateKeyboardOpen(page, 300, { innerHeightShrinks: true });
-    await page.waitForTimeout(400);
-
-    expect(await rootPaddingBottom(page)).toBe(0);
+    await expect.poll(reservation).toEqual({ connected: true, padding: 0 });
   });
 });

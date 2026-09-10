@@ -67,11 +67,7 @@ test.describe("URL routing", () => {
   });
 
   test("refresh on /session/<id> for a known session keeps the user on that session", async ({ page }) => {
-    // Stub the sessions list with a single known session, then visit
-    // /session/<id>, reload, and assert the dashboard fallback never
-    // shows. This pins #1351: before the fix the dashboard would flash
-    // on every refresh during the brief window where `useSessions` had
-    // not yet resolved its first fetch.
+    // The known session must resolve to its terminal on both navigations.
     await page.route("**/api/sessions", (r) => {
       if (r.request().method() === "POST") return r.fulfill({ status: 400 });
       return r.fulfill({
@@ -110,13 +106,17 @@ test.describe("URL routing", () => {
     });
     await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
     await page.route("**/api/sessions/*/terminal", (r) => r.fulfill({ status: 200, body: "" }));
-    await page.routeWebSocket(/\/sessions\/.*\/(ws|acp-ws)$/, () => {});
+    await page.routeWebSocket(/\/sessions\/.*\/(?:live-ws|ws|acp-ws)(?:\?.*)?$/, () => {});
 
     await page.goto("/session/known-session");
+    await expect(page.locator('[data-term="agent"] [data-live-terminal]')).toBeVisible();
+    await expect(page.locator('[data-term="agent"] textarea')).toHaveCount(1);
     await expect(page).toHaveURL("/session/known-session");
     await expect(page.getByRole("button", { name: NEW_SESSION_PANE_NAME })).not.toBeVisible();
 
     await page.reload();
+    await expect(page.locator('[data-term="agent"] [data-live-terminal]')).toBeVisible();
+    await expect(page.locator('[data-term="agent"] textarea')).toHaveCount(1);
     await expect(page).toHaveURL("/session/known-session");
     await expect(page.getByRole("button", { name: NEW_SESSION_PANE_NAME })).not.toBeVisible();
   });
