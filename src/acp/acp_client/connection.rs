@@ -84,16 +84,68 @@ pub(crate) const CANCEL_ESCALATION_GRACE: std::time::Duration = std::time::Durat
 /// command arm (`Cancel`) was polled first, `1` the lifecycle arm. `biased;`
 /// makes `2` deterministic; its removal lets Tokio randomize, which the
 /// fairness test asserts against.
+///
+/// Armed only while the observing test's connection runs
+/// (`SELECT_OBSERVER_ARMED`): other tests spawn their own connections whose
+/// select loops must not write here, or a concurrent test's lifecycle arm
+/// could record `1` after this test's reset and break correct code.
+/// Contested-poll tally, armed only while the observing test's connection
+/// runs (`SELECT_OBSERVER_ARMED`): other tests spawn their own connections
+/// whose select loops must not write here. `biased;` makes the command arm
+/// win every contested poll, so the tally ends all-command; its removal
+/// randomizes the winner and the all-command assertion fails.
 #[cfg(test)]
-pub(super) static SELECT_FIRST_WINNER: std::sync::atomic::AtomicUsize =
+pub(super) static SELECT_CMD_WINS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(super) static SELECT_LIFECYCLE_WINS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// Reset the select-order observation. Test-only; production code never
-/// reads the counter.
+#[cfg(test)]
+static SELECT_OBSERVER_ARMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Open only across the contested window: reset (just before the test sends
+/// Cancel) until the command arm dispatches that Cancel. Outside it the
+/// select polls unrelated iterations (a plain lifecycle drain with an empty
+/// command channel) that prove nothing about ordering.
+#[cfg(test)]
+static SELECT_CONTESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Arm the tally for the connection this test is about to drive and open the
+/// contested window. Test-only; production code never reads these.
 #[cfg(test)]
 pub(super) fn reset_select_first_winner() {
     use std::sync::atomic::Ordering;
-    SELECT_FIRST_WINNER.store(0, Ordering::SeqCst);
+    SELECT_CMD_WINS.store(0, Ordering::SeqCst);
+    SELECT_LIFECYCLE_WINS.store(0, Ordering::SeqCst);
+    SELECT_OBSERVER_ARMED.store(true, Ordering::SeqCst);
+    SELECT_CONTESTED.store(true, Ordering::SeqCst);
+}
+
+/// Disarm after the observed connection's test finished.
+#[cfg(test)]
+pub(super) fn disarm_select_first_winner() {
+    SELECT_OBSERVER_ARMED.store(false, std::sync::atomic::Ordering::SeqCst);
+    SELECT_CONTESTED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn observe_select_win(winner: usize) {
+    use std::sync::atomic::Ordering;
+    if !SELECT_OBSERVER_ARMED.load(Ordering::SeqCst) || !SELECT_CONTESTED.load(Ordering::SeqCst) {
+        return;
+    }
+    let counter = if winner == 2 {
+        &SELECT_CMD_WINS
+    } else {
+        &SELECT_LIFECYCLE_WINS
+    };
+    counter.fetch_add(1, Ordering::SeqCst);
+    if winner == 2 {
+        // The Cancel dispatched: the contested window closes.
+        SELECT_CONTESTED.store(false, Ordering::SeqCst);
+    }
 }
 
 /// Read the resume-idle grace. In debug builds, honors
@@ -2032,12 +2084,7 @@ pub(super) async fn run_connection_task<W, R>(
                                 }
                                 cmd = cmd_rx.recv() => {
                                     #[cfg(test)]
-                                    {
-                                        use std::sync::atomic::Ordering;
-                                        SELECT_FIRST_WINNER
-                                            .compare_exchange(0, 2, Ordering::SeqCst, Ordering::SeqCst)
-                                            .ok();
-                                    }
+                                    observe_select_win(2);
                                     match cmd {
                                         Some(ClientCmd::Cancel) => {
                                             info!(
@@ -2261,12 +2308,7 @@ pub(super) async fn run_connection_task<W, R>(
                                 }
                                 env = lifecycle_signal_rx.recv() => {
                                     #[cfg(test)]
-                                    {
-                                        use std::sync::atomic::Ordering;
-                                        SELECT_FIRST_WINNER
-                                            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
-                                            .ok();
-                                    }
+                                    observe_select_win(1);
                                     if let Some(env) = env {
                                         if env.epoch != this_prompt_epoch {
                                             // Stale envelope from a prior
@@ -3274,6 +3316,11 @@ mod cancel_fairness_tests {
         // lifecycle channel are simultaneously ready the moment Cancel is
         // sent. `biased;` must make the command arm win that poll; without
         // it Tokio randomizes and this assertion fails intermittently.
+        //
+        // The reset happens while the lifecycle channel is FULL (128-slot
+        // capacity, saturated by the flood): its handler task is blocked on
+        // `send_lifecycle_signal`, so no new envelope can land between this
+        // reset and the select's first poll of the queued Cancel.
         reset_select_first_winner();
         cmd_tx.send(ClientCmd::Cancel).await.unwrap();
 
@@ -3299,11 +3346,19 @@ mod cancel_fairness_tests {
         // where both channels were ready (observer written before the arm
         // body dispatches). `biased;` or the arm order being removed
         // randomizes this and fails the test.
+        // Every contested poll must go to the command arm. `biased;` makes
+        // that deterministic; removing it or reordering the arms randomizes
+        // the winner, and the lifecycle tally then shows wins of its own.
+        disarm_select_first_winner();
+        assert!(
+            SELECT_CMD_WINS.load(Ordering::SeqCst) > 0,
+            "the command arm must win at least the Cancel poll"
+        );
         assert_eq!(
-            SELECT_FIRST_WINNER.load(Ordering::SeqCst),
-            2,
-            "the command arm must be polled first when both channels are ready; \
-             lifecycle notifications must not overtake a queued Cancel"
+            SELECT_LIFECYCLE_WINS.load(Ordering::SeqCst),
+            0,
+            "the lifecycle arm must never win a contested poll while biased; \
+             orders the command arm first"
         );
 
         flood.abort();
