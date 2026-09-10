@@ -1987,6 +1987,15 @@ impl<S: BroadcastSink> Supervisor<S> {
             drop(client);
             return Err(self.retire_refused_install(&lease, identity, refusal).await);
         }
+        // Reconcile the durable log against reality before the drain starts.
+        // A fresh or respawned Runner has an empty `pending_responders`, so an
+        // `ApprovalRequested` with no matching `ApprovalResolved` is orphaned
+        // by the worker it replaced and would resurface as a dead 404 card.
+        // Sweeping after the drain would instead race a startup approval from
+        // the new worker, cancelling it while its live responder is still
+        // parked. See #1099.
+        self.cancel_orphaned_approvals(&session_id);
+        self.cancel_orphaned_elicitations(&session_id);
         let drain_task = self.start_drain_task(session_id.clone(), lease.clone(), inbound);
         let client_for_mode = (acp_mode_id.is_some() || yolo_mode).then(|| Arc::clone(&client));
         workers.insert(
@@ -2006,18 +2015,6 @@ impl<S: BroadcastSink> Supervisor<S> {
         drop(workers);
         drop(reservation);
         self.worker_notify.notify_waiters();
-
-        // Reconcile the durable log against reality, exactly as `attach` does
-        // (see its call site below the `workers.insert`). A fresh or respawned
-        // Runner starts with an empty `pending_responders`, so any
-        // `ApprovalRequested` in the log with no matching `ApprovalResolved`
-        // is orphaned: its responder oneshot died with the previous daemon or
-        // worker. Publish the synthetic `ApprovalResolved { Cancelled }` now so
-        // it never resurfaces as a dead 404 card, and so the home TUI's
-        // `running`-gated pending-approval projection only ever sees approvals
-        // this live worker can actually resolve. See #1099.
-        self.cancel_orphaned_approvals(&session_id);
-        self.cancel_orphaned_elicitations(&session_id);
 
         // Honor the wizard's "Auto-approve" / profile `yolo_mode_default`
         // by switching the ACP session to the adapter's bypass mode. The
@@ -3401,6 +3398,11 @@ impl<S: BroadcastSink> Supervisor<S> {
                 .retire_refused_install(&lease, Some(identity), refusal)
                 .await);
         }
+        // Same pre-drain sweep as `spawn`, for entries the previous daemon
+        // orphaned: after the drain starts, this worker's own approvals are
+        // in the log and the sweep can no longer tell them apart.
+        self.cancel_orphaned_approvals(&session_id);
+        self.cancel_orphaned_elicitations(&session_id);
         let drain_task = self.start_drain_task(session_id.clone(), lease.clone(), inbound);
         workers.insert(
             session_id.clone(),
@@ -3426,9 +3428,6 @@ impl<S: BroadcastSink> Supervisor<S> {
         drop(workers);
         drop(reservation);
         self.worker_notify.notify_waiters();
-
-        self.cancel_orphaned_approvals(&session_id);
-        self.cancel_orphaned_elicitations(&session_id);
         Ok(())
     }
 
@@ -3955,12 +3954,6 @@ async fn restart_decision(
     }
 }
 
-/// Increment and return the per-session seq counter. Lives at the
-/// supervisor level so the no-worker `publish_startup_error` path
-/// and the drain task share a single source of truth — otherwise
-/// both used to start at seq=1 and collide in the replay buffer
-/// after a retry, which the client-side dedupe then rendered as a
-/// silently-lost first message.
 /// Cancel approvals left unresolved in the durable log by a dead worker:
 /// its replacement starts with an empty `pending_responders`, so the
 /// parked responders are gone and the cards would 404 on submit. Shared
@@ -4030,6 +4023,12 @@ fn cancel_orphaned_elicitations_on<S: BroadcastSink>(
     }
 }
 
+/// Increment and return the per-session seq counter. Lives at the
+/// supervisor level so the no-worker `publish_startup_error` path
+/// and the drain task share a single source of truth — otherwise
+/// both used to start at seq=1 and collide in the replay buffer
+/// after a retry, which the client-side dedupe then rendered as a
+/// silently-lost first message.
 fn next_seq(next_seqs: &SeqMap, session_id: &str) -> u64 {
     let mut guard = match next_seqs.lock() {
         Ok(g) => g,

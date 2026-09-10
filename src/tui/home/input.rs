@@ -6544,7 +6544,7 @@ impl HomeView {
             if approval.choice {
                 self.info_dialog = Some(InfoDialog::new(
                     "Answer in the Structured View",
-                    "This request offers several answers, not allow/deny.                      Open the structured view to pick one.",
+                    "This request offers several answers, not allow/deny. Open the structured view to pick one.",
                 ));
                 return;
             }

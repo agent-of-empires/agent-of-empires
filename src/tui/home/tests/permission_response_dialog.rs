@@ -11,9 +11,9 @@ fn add_session_with_tool(view: &mut HomeView, title: &str, tool: &str) -> String
     view.add_instance(inst);
     id
 }
-/// Nonce de fixture généré à l'exécution : un littéral qui flue vers un
-/// champ `nonce` déclenche CodeQL rust/hard-coded-cryptographic-value
-/// (alertes 179-181), même en code de test.
+/// Fixture nonce derived at runtime: a literal flowing into a `nonce`
+/// field trips CodeQL rust/hard-coded-cryptographic-value (alerts
+/// 179-181), test code included.
 fn test_nonce() -> String {
     uuid::Uuid::new_v4().to_string()
 }
@@ -121,9 +121,9 @@ fn choice_list_approval_is_routed_to_the_structured_view() {
     env.view
         .structured_pending_approvals
         .insert(id.clone(), pending(&nonce));
-    // Marquer l'entree comme liste de reponses (pi ask_user_question) : le
-    // dialog generique n'a pas les labels et Allow repondrait la premiere
-    // option de l'agent.
+    // Mark the entry as a choice list (pi's ask_user_question): the generic
+    // dialog has no labels to show and its Allow would answer the agent's
+    // first option.
     env.view.structured_pending_approvals.get_mut(&id).unwrap()[0].choice = true;
     env.view.selected_session = Some(id.clone());
 

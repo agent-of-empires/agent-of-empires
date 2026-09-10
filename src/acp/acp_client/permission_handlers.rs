@@ -532,14 +532,14 @@ mod tests {
             profile,
             cache,
         ));
-        // Le nonce arrive avec l'event ApprovalRequested.
+        // The nonce arrives with the ApprovalRequested event.
         let nonce = loop {
             match event_rx.recv().await.expect("events") {
                 Event::ApprovalRequested { approval } => break approval.nonce,
                 _ => continue,
             }
         };
-        // Reponse generique : Allow sans option id, comme le dialog home.
+        // Generic answer: Allow with no option id, as the home dialog sends.
         let PendingResponder { resolver } = pending.lock().await.remove(&nonce).expect("parked");
         let PendingResolver::Approval(tx) = resolver else {
             panic!("approval resolver expected");
@@ -555,7 +555,7 @@ mod tests {
             matches!(response.outcome, RequestPermissionOutcome::Cancelled),
             "a choice list must not be answered by kind: {response:?}"
         );
-        // La carte est fermee avec un Cancelled, jamais un Allow.
+        // The card closes on Cancelled, never on an Allow.
         loop {
             match event_rx.recv().await.expect("resolution event") {
                 Event::ApprovalResolved { decision, .. } => {
