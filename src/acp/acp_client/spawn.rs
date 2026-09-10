@@ -928,6 +928,7 @@ mod tests {
             assert_eq!(scrub_stderr_secrets(line), line);
         }
     }
+
     /// Scripted stdio agent: completes `initialize` and `session/load`, then
     /// rejects every `session/prompt` the way OMP rejects a stored session
     /// id it no longer holds.

@@ -53,10 +53,6 @@ pub(crate) fn classify_rate_limit_from_message(
 /// unrelated prompt failure still ends the turn as an ordinary error instead
 /// of being silently swallowed into a context reset.
 pub(crate) fn is_unsupported_session_error(err: &agent_client_protocol::Error) -> bool {
-    // Whole phrases, never independent words: "Unsupported content block in
-    // session/prompt" and "Method not found: session/prompt" are ordinary
-    // prompt failures, and word-matching would rewrite them into context
-    // resets that discard the agent's context.
     const PHRASES: &[&str] = &[
         "unsupported acp session",
         "unsupported session",
@@ -325,12 +321,6 @@ mod tests {
         assert_eq!(captured_rate_limit_resets_at(&all_past, now), None);
     }
 
-    /// The resume-rejection recovery hinges on recognizing the agent's
-    /// "stored session is gone" rejection (OMP: `Unsupported ACP session`)
-    /// and nothing else: a false positive would silently rewrite an
-    /// unrelated prompt failure into a context reset, and a false negative
-    /// would leave the resumed session terminating the runner with no
-    /// recovery. Table pins both edges.
     #[test]
     fn is_unsupported_session_error_matches_only_stale_session_rejections() {
         let classify = |m: &str| {
@@ -339,17 +329,13 @@ mod tests {
             is_unsupported_session_error(&err)
         };
         let cases = [
-            // The observed OMP rejection of a resumed stored id, plus the
-            // common phrasings other adapters use for the same condition.
             ("Unsupported ACP session", true),
             ("Unknown session 01a040bb-...", true),
             ("session not found", true),
             ("no such session: abc", true),
             ("Session does not exist", true),
-            // Unrelated failures must stay ordinary errors. The last two
-            // contain a phrase word ("unsupported", "not found") next to
-            // "session", which independent-word matching turned into
-            // context resets discarding the agent's context.
+            // Unrelated failures, including two that contain a phrase
+            // word next to "session", must stay ordinary errors.
             ("You've hit your limit", false),
             ("transport closed", false),
             ("permission denied", false),
