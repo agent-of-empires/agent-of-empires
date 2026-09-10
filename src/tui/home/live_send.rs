@@ -2,11 +2,26 @@
 //!
 //! When a user presses `Tab` on a runnable session, the home view installs
 //! a `LiveSendState` and routes every subsequent key event through this
-//! module's translator. Each translation produces a `tmux send-keys` call
-//! against the target pane: plain characters go literally, every other
-//! key (arrows, Esc, Tab, modifier combos) goes by tmux key name with
-//! `C-` / `M-` prefixes. The user exits with one of the configured
-//! exit chords (default: `Ctrl+q`).
+//! module's translator. Each translation produces a `TmuxAction`, delivered
+//! by whichever transport the pane has armed.
+//!
+//! While a VT channel carries input (`[tmux] vt_live`, tmux 3.8 or newer,
+//! unix) the action is encoded to raw terminal bytes and written into the
+//! pane socket, bypassing tmux's own key translation, so the encoder honors
+//! the pane's DECCKM state itself. That is the default. Presence of a live
+//! input channel is a single-writer signal: every keystroke then goes over
+//! the socket and none through `send-keys`, since the two writers would
+//! interleave on one pty input stream.
+//!
+//! Otherwise each action forks `tmux send-keys`: plain characters go
+//! literally, every other key (arrows, Esc, Tab, modifier combos) by tmux
+//! key name with `C-` / `M-` prefixes. This is the path for tmux older than
+//! 3.8 (through 3.7a, writing to a dead pane's input takes the whole tmux
+//! server down), a pane whose forwarder has not connected or has died, and
+//! `vt_live` turned off.
+//!
+//! The user exits with one of the configured exit chords (default:
+//! `Ctrl+q`).
 //!
 //! Exit chord configuration: the user picks a comma-separated list
 //! of chord specs (`C-q`, `M-x`, `F12`, …) via settings. Default is
@@ -21,15 +36,16 @@
 //! - No echo, no inline editing, no review step. The preview pane is the
 //!   only feedback channel; users who need multi-line composition or want
 //!   to proofread voice/dictation should use the compose dialog on `M`.
-//! - Each coalesced keystroke run becomes one `tmux send-keys`
-//!   subprocess. A long-lived `tmux -C` control-mode connection was
+//! - On the `send-keys` fallback, each coalesced keystroke run becomes
+//!   one subprocess. A long-lived `tmux -C` control-mode connection was
 //!   tried (#1485) to avoid that fork cost on mobile, but the
 //!   connection turned out to be unreliable on macOS tmux 3.x: it
 //!   EOF'd within milliseconds of spawn, leaving us paying the spawn
 //!   cost while never benefiting from the connection. Forking per
 //!   batch is the simpler, more portable model; the per-batch fork
 //!   cost is bounded by user typing speed (held keys / pastes
-//!   coalesce into one fork) and is invisible on a laptop.
+//!   coalesce into one fork) and is invisible on a laptop. The socket
+//!   path forks nothing per keystroke.
 //!
 //! Reserved (non-forwarded) chords:
 //! - The configured exit chord list — exits live mode (see above).
