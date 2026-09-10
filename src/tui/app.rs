@@ -3216,14 +3216,16 @@ impl App {
             .is_some_and(|v| v.session_id() == session_id)
         {
             self.activate_embedded();
-            self.drain_pending_paste_for_structured_view().await;
+            self.drain_pending_paste_for_structured_view(session_id)
+                .await;
             return Ok(());
         }
         match require_daemon().await {
             Ok(endpoint) => {
                 self.connect_embedded_structured(endpoint, session_id).await;
                 self.activate_embedded();
-                self.drain_pending_paste_for_structured_view().await;
+                self.drain_pending_paste_for_structured_view(session_id)
+                    .await;
             }
             Err(ManagerError::NoDaemonRunning(_)) => {
                 self.home.prompt_start_daemon_for_structured(session_id);
@@ -3244,24 +3246,21 @@ impl App {
         }
     }
 
-    /// Drain buffered paste text into the structured composer after the view
-    /// activates. Drafts are keyed by their captured session: the mounted
-    /// view consumes its own entry on success, and entries for other targets
-    /// stay put, so a failed activation is recoverable by returning to that
-    /// session ('m' again).
-    async fn drain_pending_paste_for_structured_view(&mut self) {
-        let Some(mounted) = self
+    /// Consume the requested session's draft only if that session mounted.
+    async fn drain_pending_paste_for_structured_view(&mut self, session_id: &str) {
+        let Some(view) = self
             .home
             .structured_preview
-            .as_ref()
-            .map(|v| v.session_id().to_string())
+            .as_mut()
+            .filter(|view| view.session_id() == session_id)
         else {
             return;
         };
-        let Some(buf) = self.home.pending_paste_for_structured_view.remove(&mounted) else {
-            return;
-        };
-        if let Some(view) = self.home.structured_preview.as_mut() {
+        if let Some(buf) = self
+            .home
+            .pending_paste_for_structured_view
+            .remove(session_id)
+        {
             view.paste_text_with_file_load(&buf).await;
         }
     }
@@ -3315,11 +3314,9 @@ impl App {
                 self.update_status = None;
                 self.connect_embedded_structured(endpoint, session_id).await;
                 self.activate_embedded();
-                // Same target-checked handoff as the reachable-daemon
-                // activations: a paste captured before accepting the
-                // daemon startup must reach the composer now that the
-                // view is mounted.
-                self.drain_pending_paste_for_structured_view().await;
+                // Preserve the captured draft until its requested view mounts.
+                self.drain_pending_paste_for_structured_view(session_id)
+                    .await;
             }
             Err(e) => {
                 let first = e.lines().next().unwrap_or("unknown error");
@@ -4361,11 +4358,7 @@ mod tests {
         }
     }
 
-    /// App-level consumption of the structured paste handoff: a mounted view
-    /// of the captured session takes the buffer into its composer and the
-    /// entry is consumed, while another target's draft stays put. The
-    /// daemon-start continuation and the reachable-daemon activations share
-    /// this same drain call, so the App-level behavior is defined once.
+    /// A failed replacement must not consume the previous view's draft.
     #[tokio::test]
     #[serial_test::serial]
     async fn drain_paste_forwards_to_the_mounted_view_and_keeps_other_targets() {
@@ -4388,7 +4381,26 @@ mod tests {
         app.home.structured_preview =
             Some(crate::tui::structured_view::embedded::EmbeddedView::for_test("s-1"));
 
-        app.drain_pending_paste_for_structured_view().await;
+        // A failed attempt to mount s-2 can leave s-1 mounted.
+        app.drain_pending_paste_for_structured_view("s-2").await;
+        assert_eq!(
+            app.home
+                .structured_preview
+                .as_ref()
+                .unwrap()
+                .composer_text(),
+            ""
+        );
+        assert_eq!(
+            app.home
+                .pending_paste_for_structured_view
+                .get("s-1")
+                .map(String::as_str),
+            Some("buffered draft"),
+        );
+
+        app.drain_pending_paste_for_structured_view("s-1").await;
+        app.drain_pending_paste_for_structured_view("s-1").await;
 
         let preview = app.home.structured_preview.as_ref().expect("mounted");
         assert_eq!(
