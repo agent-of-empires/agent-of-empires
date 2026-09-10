@@ -79,6 +79,23 @@ pub(super) const RESUME_IDLE_GRACE_DEFAULT: std::time::Duration =
 /// normally resolve cancellation promptly.
 pub(crate) const CANCEL_ESCALATION_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Test observation of the in-flight-prompt select's first winner when the
+/// command channel and the lifecycle channel are both ready: `2` means the
+/// command arm (`Cancel`) was polled first, `1` the lifecycle arm. `biased;`
+/// makes `2` deterministic; its removal lets Tokio randomize, which the
+/// fairness test asserts against.
+#[cfg(test)]
+pub(super) static SELECT_FIRST_WINNER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Reset the select-order observation. Test-only; production code never
+/// reads the counter.
+#[cfg(test)]
+pub(super) fn reset_select_first_winner() {
+    use std::sync::atomic::Ordering;
+    SELECT_FIRST_WINNER.store(0, Ordering::SeqCst);
+}
+
 /// Read the resume-idle grace. In debug builds, honors
 /// `AOE_RESUME_IDLE_GRACE_MS` so integration tests can short-circuit
 /// the default 10s without making real failures racy. Values below
@@ -2014,6 +2031,13 @@ pub(super) async fn run_connection_task<W, R>(
                                     break;
                                 }
                                 cmd = cmd_rx.recv() => {
+                                    #[cfg(test)]
+                                    {
+                                        use std::sync::atomic::Ordering;
+                                        SELECT_FIRST_WINNER
+                                            .compare_exchange(0, 2, Ordering::SeqCst, Ordering::SeqCst)
+                                            .ok();
+                                    }
                                     match cmd {
                                         Some(ClientCmd::Cancel) => {
                                             info!(
@@ -2236,6 +2260,13 @@ pub(super) async fn run_connection_task<W, R>(
                                     break;
                                 }
                                 env = lifecycle_signal_rx.recv() => {
+                                    #[cfg(test)]
+                                    {
+                                        use std::sync::atomic::Ordering;
+                                        SELECT_FIRST_WINNER
+                                            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+                                            .ok();
+                                    }
                                     if let Some(env) = env {
                                         if env.epoch != this_prompt_epoch {
                                             // Stale envelope from a prior
@@ -3238,6 +3269,12 @@ mod cancel_fairness_tests {
                 .expect("flood never started");
         }
 
+        // Deterministic selection-order assertion: with the flood keeping
+        // the lifecycle arm permanently ready, the command channel and the
+        // lifecycle channel are simultaneously ready the moment Cancel is
+        // sent. `biased;` must make the command arm win that poll; without
+        // it Tokio randomizes and this assertion fails intermittently.
+        reset_select_first_winner();
         cmd_tx.send(ClientCmd::Cancel).await.unwrap();
 
         // The turn must end while the flood is still running: the Stopped
@@ -3257,6 +3294,16 @@ mod cancel_fairness_tests {
         assert!(
             cancelled.load(Ordering::SeqCst),
             "session/cancel must reach the agent while notifications are queued: {stopped:?}"
+        );
+        // Selection order: the command arm must have won the first poll
+        // where both channels were ready (observer written before the arm
+        // body dispatches). `biased;` or the arm order being removed
+        // randomizes this and fails the test.
+        assert_eq!(
+            SELECT_FIRST_WINNER.load(Ordering::SeqCst),
+            2,
+            "the command arm must be polled first when both channels are ready; \
+             lifecycle notifications must not overtake a queued Cancel"
         );
 
         flood.abort();
