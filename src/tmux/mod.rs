@@ -5,6 +5,7 @@ pub(crate) mod detect;
 pub(crate) mod env;
 pub(crate) mod osc8;
 mod session;
+mod session_kind;
 pub mod status_bar;
 pub(crate) mod status_detection;
 pub(crate) mod status_rules;
@@ -26,6 +27,8 @@ pub use status_detection::{
 pub use terminal_session::{kill_all_terminals_for_id, ContainerTerminalSession, TerminalSession};
 pub use tool_session::{kill_all_tool_sessions_for_id, ToolSession};
 pub use utils::{attach_return_hint, tmux_prefix_display};
+
+pub(crate) use session_kind::{append_session_kind_args, SessionKind};
 
 /// OSC 8 hyperlinks the live VT channel for `session` has seen, oldest first.
 /// Always empty off unix, where there is no channel and the capture fallback
@@ -324,8 +327,30 @@ static SESSION_CACHE: RwLock<SessionCache> = RwLock::new(SessionCache {
     outcome: SessionCacheRefresh::Unknown,
 });
 
+/// One live tmux session, as the shared `list-sessions` scan sees it.
+#[derive(Debug, Clone)]
+pub(crate) struct LiveSession {
+    /// tmux's `#{session_activity}` epoch seconds.
+    activity: i64,
+    /// The kind this session was stamped with at creation, absent for a
+    /// session created before [`session_kind::KIND_OPTION`] existed.
+    kind: Option<SessionKind>,
+}
+
+#[cfg(test)]
+impl LiveSession {
+    /// A session as an older build (or a tmux that never answered the option)
+    /// leaves it: present, with nothing recorded about its kind.
+    fn unmarked() -> Self {
+        Self {
+            activity: 0,
+            kind: None,
+        }
+    }
+}
+
 struct SessionCache {
-    data: Option<HashMap<String, i64>>,
+    data: Option<HashMap<String, LiveSession>>,
     time: Option<Instant>,
     refresh_id: u64,
     outcome: SessionCacheRefresh,
@@ -489,7 +514,7 @@ fn next_refresh_id(counter: &std::sync::atomic::AtomicU64) -> u64 {
 
 fn publish_session_cache(
     refresh_id: u64,
-    data: Option<HashMap<String, i64>>,
+    data: Option<HashMap<String, LiveSession>>,
     outcome: SessionCacheRefresh,
     respect_forced_guard: bool,
 ) -> SessionCacheRefresh {
@@ -514,23 +539,134 @@ fn publish_session_cache(
     cache.outcome = outcome;
     outcome
 }
+/// One authoritative scan, parsed: the same command and parser the shared
+/// cache uses, for a caller that needs a fresh answer rather than the cache's.
+/// `None` when the tmux server could not be reached, which is not evidence
+/// that anything is absent.
+pub(crate) fn probe_live_sessions() -> Option<HashMap<String, LiveSession>> {
+    let output = run_tmux_command_with_timeout(&mut session_scan_command()).ok()?;
+    output
+        .status
+        .success()
+        .then(|| parse_session_scan(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// Every live session as `(name, kind marker)` pairs, the shape the id
+/// lookups take.
+pub(crate) fn marked_names(
+    sessions: &HashMap<String, LiveSession>,
+) -> impl Iterator<Item = (&str, Option<&str>)> {
+    sessions
+        .iter()
+        .map(|(name, session)| (name.as_str(), session.kind.map(SessionKind::as_marker)))
+}
+
+/// The one scan every kind-aware lookup reads: the inheritable `@aoe_kind`
+/// scopes (see [`parse_session_scan`]) followed by one line per live session.
+fn session_scan_command() -> Command {
+    let mut command = tmux_query_command();
+    for flags in INHERITABLE_KIND_SCOPES {
+        command.args(["show-options", flags, session_kind::KIND_OPTION, ";"]);
+    }
+    command.args(["list-sessions", "-F", SESSION_SCAN_FORMAT]);
+    command
+}
+
+/// The server-wide option scopes a `list-sessions` `#{@aoe_kind}` reads, as
+/// `show-options` flag sets, each read back so [`parse_session_scan`] can
+/// subtract it.
+///
+/// Measured on tmux 3.6, highest first: `-s` > `-gw` > `-w` > a session's own
+/// value > `-g`. Only `-g` is a fall-through; the rest OVERRIDE the mark aoe
+/// wrote, so a user who sets one does not shadow aoe's answer selectively,
+/// they hide every mark on the server and put the whole fleet back on the
+/// name-shape guess. Subtracting them is therefore never able to discard a
+/// legitimate mark: when they are set, no legitimate mark is visible anyway.
+///
+/// `-w` and `-p` reach the format too but are per-window and per-pane, so a
+/// single subtracted value cannot cover them. Setting `@aoe_kind` yourself
+/// stays unsupported (`docs/guides/tmux-status-bar.md`).
+const INHERITABLE_KIND_SCOPES: [&str; 3] = ["-gqv", "-sqv", "-gwqv"];
+
+const SESSION_SCAN_FORMAT: &str = "#{session_name}|#{session_activity}|#{@aoe_kind}";
+
+/// Whether a scan line is a session rather than one of the leading
+/// [`INHERITABLE_KIND_SCOPES`] values.
+///
+/// A session line is `<name>|<activity>|<marker>`, so its second field is
+/// always `#{session_activity}`'s integer. Testing that rather than the mere
+/// presence of a [`FIELD_SEP`] keeps a scope value that happens to contain one
+/// from ending the scope block early, which would leave every later scope
+/// unsubtracted and hand a paired terminal the agent's kind.
+fn is_session_line(line: &str) -> bool {
+    let mut fields = line.split(FIELD_SEP);
+    fields.next();
+    fields
+        .next()
+        .is_some_and(|activity| activity.parse::<i64>().is_ok())
+}
+
+/// Parse the [`session_scan_command`] output.
+///
+/// A session line is `<name>|<activity>|<kind marker>`, the marker empty for a
+/// session with no mark, so a line that is short or empty there is an unmarked
+/// session and not a parse failure.
+///
+/// The leading lines are the [`INHERITABLE_KIND_SCOPES`] values, printed only
+/// for a scope the user set one in and told apart by [`is_session_line`].
+/// They have to be subtracted: a session that sets none of its own reads the
+/// broadest scope that is set, so a user who sets one would otherwise mark
+/// their whole server as agents and a paired terminal would pass as an agent
+/// pane. A session whose value merely equals one of them is treated as
+/// unmarked, which is the name-shape fallback rather than a wrong answer.
+///
+/// aoe-created names are sanitized to `[A-Za-z0-9_-]`, but the shared server
+/// also carries foreign sessions, whose names tmux does allow `|` in. Such a
+/// name splits into a nonsense key that no `_<id8>` lookup can match, which is
+/// the same outcome it had before the kind field existed.
+fn parse_session_scan(stdout: &str) -> HashMap<String, LiveSession> {
+    let mut lines = stdout.lines().peekable();
+    let mut inherited: Vec<&str> = Vec::new();
+    while let Some(line) = lines.next_if(|line| !is_session_line(line)) {
+        if !line.is_empty() {
+            inherited.push(line);
+        }
+    }
+
+    let mut map = HashMap::new();
+    for line in lines {
+        let Some((name, rest)) = line.split_once(FIELD_SEP) else {
+            continue;
+        };
+        let (activity, marker) = match rest.split_once(FIELD_SEP) {
+            Some((activity, marker)) => (activity, Some(marker)),
+            None => (rest, None),
+        };
+        map.insert(
+            name.to_string(),
+            LiveSession {
+                activity: activity.parse().unwrap_or(0),
+                kind: marker
+                    .filter(|marker| !inherited.contains(marker))
+                    .and_then(SessionKind::from_marker),
+            },
+        );
+    }
+    map
+}
+
 pub fn refresh_session_cache() -> SessionCacheRefresh {
     let refresh_id = next_refresh_id(&SESSION_REFRESH_ID);
     let start = Instant::now();
-    let mut command = tmux_query_command();
-    command.args(["list-sessions", "-F", "#{session_name}|#{session_activity}"]);
+    let mut command = session_scan_command();
     let output = run_tmux_command_with_timeout(&mut command);
     let (new_data, outcome) = match output {
         Ok(out) if out.status.success() => {
             let stdout = String::from_utf8_lossy(&out.stdout);
-            let mut map = HashMap::new();
-            for line in stdout.lines() {
-                if let Some((name, activity)) = line.split_once(FIELD_SEP) {
-                    let activity: i64 = activity.parse().unwrap_or(0);
-                    map.insert(name.to_string(), activity);
-                }
-            }
-            (Some(map), SessionCacheRefresh::Populated)
+            (
+                Some(parse_session_scan(&stdout)),
+                SessionCacheRefresh::Populated,
+            )
         }
         Ok(out) if tmux_no_server_running(&out.stderr) => {
             tracing::trace!(target: "tmux.cache", "no tmux server running; cache cleared");
@@ -690,10 +826,6 @@ fn id_suffix(session_id: &str) -> String {
     format!("_{}", crate::cli::truncate_id(session_id, 8))
 }
 
-/// Auxiliary kinds whose prefixes nest under `SESSION_PREFIX`, so the agent
-/// shape has to exclude them explicitly.
-const AGENT_EXCLUDED_PREFIXES: &[&str] = &[TERMINAL_PREFIX, CONTAINER_TERMINAL_PREFIX, TOOL_PREFIX];
-
 /// How one kind of aoe tmux session's name is shaped for one session id, so a
 /// live session can still be found after the title embedded in the name has
 /// gone stale. Every name of a given kind is
@@ -706,9 +838,12 @@ const AGENT_EXCLUDED_PREFIXES: &[&str] = &[TERMINAL_PREFIX, CONTAINER_TERMINAL_P
 pub(crate) struct NameShape<'a> {
     pub prefix: &'a str,
     pub suffix: &'a str,
-    /// Prefixes nesting under `prefix` that must never be adopted. Empty for
-    /// every kind but the agent, whose `aoe_` prefixes all the others.
-    pub excluded_prefixes: &'a [&'a str],
+    /// The kind a name of this shape belongs to. A live session is matched
+    /// against this rather than against the prefix alone: the auxiliary
+    /// prefixes nest under `SESSION_PREFIX`, and a sanitized title can carry
+    /// a name into another kind's shape, so only [`SessionKind`] separates
+    /// them (see [`session_kind`]).
+    pub kind: SessionKind,
 }
 
 impl NameShape<'_> {
@@ -718,38 +853,42 @@ impl NameShape<'_> {
         NameShape {
             prefix: SESSION_PREFIX,
             suffix,
-            excluded_prefixes: AGENT_EXCLUDED_PREFIXES,
+            kind: SessionKind::Agent,
         }
     }
 
-    /// The paired-terminal shape for a session id. `TERMINAL_PREFIX` does not
-    /// nest under any other kind's prefix, so nothing is excluded.
+    /// The paired-terminal shape for a session id.
     pub(crate) fn terminal<'a>(suffix: &'a str) -> NameShape<'a> {
         NameShape {
             prefix: TERMINAL_PREFIX,
             suffix,
-            excluded_prefixes: &[],
+            kind: SessionKind::Terminal,
         }
     }
 
-    /// The container-terminal shape for a session id. `CONTAINER_TERMINAL_PREFIX`
-    /// does not nest under any other kind's prefix, so nothing is excluded.
+    /// The container-terminal shape for a session id.
     pub(crate) fn container<'a>(suffix: &'a str) -> NameShape<'a> {
         NameShape {
             prefix: CONTAINER_TERMINAL_PREFIX,
             suffix,
-            excluded_prefixes: &[],
+            kind: SessionKind::ContainerTerminal,
         }
     }
 
-    /// True when `name` has this shape. A name whose sanitized title pushes it
-    /// under an excluded prefix fails here, so it never resolves and callers
-    /// keep their title-derived name: mistaking a paired terminal for the agent
-    /// pane would be worse than not resolving at all.
-    fn matches(&self, name: &str) -> bool {
+    /// True when the live session `name`, stamped with kind marker `marker`,
+    /// is this shape's session for this id. `marker` is `None` for a session
+    /// created before [`session_kind::KIND_OPTION`] existed, which classifies
+    /// by name shape and so cannot tell an agent titled `term Foo` from the
+    /// paired terminal of a row titled `Foo`.
+    fn matches_marked(&self, name: &str, marker: Option<&str>) -> bool {
         name.starts_with(self.prefix)
             && name.ends_with(self.suffix)
-            && !self.excluded_prefixes.iter().any(|p| name.starts_with(p))
+            && SessionKind::of(name, marker) == Some(self.kind)
+    }
+
+    /// [`Self::matches_marked`] for a caller holding only the name.
+    fn matches(&self, name: &str) -> bool {
+        self.matches_marked(name, None)
     }
 }
 
@@ -762,6 +901,10 @@ impl NameShape<'_> {
 pub fn agent_session_belongs_to(tmux_name: &str, session_id: &str) -> bool {
     NameShape::agent(&id_suffix(session_id)).matches(tmux_name)
 }
+
+/// A live session's name paired with the kind marker the scan read for it,
+/// absent for a session created before the marker existed.
+pub(crate) type MarkedSessionName = (String, Option<SessionKind>);
 
 /// One tmux observation shared by a batch of per-instance liveness lookups.
 ///
@@ -785,12 +928,12 @@ pub fn agent_session_belongs_to(tmux_name: &str, session_id: &str) -> bool {
 /// that only needs session names never forks `list-panes`.
 ///
 /// An unreachable server is preserved rather than collapsed into "absent":
-/// [`Self::names`] returns `None`, so a one-shot caller that cannot retry can
-/// tell Unknown from Absent and probe per row instead (see
+/// [`LiveSessionSnapshot::sessions`] returns `None`, so a one-shot caller that
+/// cannot retry can tell Unknown from Absent and probe per row instead (see
 /// `Instance::tmux_env_session_name_in_or_probe`).
 #[derive(Default)]
 pub(crate) struct LiveSessionSnapshot {
-    names: OnceLock<Option<Vec<String>>>,
+    sessions: OnceLock<Option<Vec<MarkedSessionName>>>,
     panes: OnceLock<Option<HashMap<String, PaneMetadata>>>,
 }
 
@@ -808,29 +951,50 @@ impl LiveSessionSnapshot {
         names: Option<Vec<String>>,
         panes: Option<HashMap<String, PaneMetadata>>,
     ) -> Self {
+        Self::from_marked_parts(
+            names.map(|names| names.into_iter().map(|name| (name, None)).collect()),
+            panes,
+        )
+    }
+
+    /// [`Self::from_parts`] for a test that needs the sessions stamped with
+    /// the kind marker a live scan would have read.
+    #[cfg(test)]
+    pub(crate) fn from_marked_parts(
+        names: Option<Vec<MarkedSessionName>>,
+        panes: Option<HashMap<String, PaneMetadata>>,
+    ) -> Self {
         let snapshot = Self::new();
-        let _ = snapshot.names.set(names);
+        let _ = snapshot.sessions.set(names);
         let _ = snapshot.panes.set(panes);
         snapshot
     }
 
-    /// Live session names, or None when the tmux server could not be reached.
-    /// The fresh observation also warms the display cache, so TUI startup can
-    /// reuse this pass instead of issuing another list-sessions command.
-    pub(crate) fn names(&self) -> Option<&[String]> {
-        self.names
+    /// Live session names paired with the kind each was stamped with, or
+    /// `None` when the tmux server could not be reached. The fresh
+    /// observation also warms the display cache, so TUI startup can reuse
+    /// this pass instead of issuing another list-sessions command.
+    pub(crate) fn sessions(&self) -> Option<&[MarkedSessionName]> {
+        self.sessions
             .get_or_init(|| {
                 if refresh_session_cache() != SessionCacheRefresh::Populated {
                     return None;
                 }
                 SESSION_CACHE.read().ok().and_then(|cache| {
-                    cache
-                        .data
-                        .as_ref()
-                        .map(|sessions| sessions.keys().cloned().collect())
+                    cache.data.as_ref().map(|sessions| {
+                        sessions
+                            .iter()
+                            .map(|(name, session)| (name.clone(), session.kind))
+                            .collect()
+                    })
                 })
             })
             .as_deref()
+    }
+
+    /// [`Self::sessions`] for a caller that only needs the names.
+    pub(crate) fn names(&self) -> Option<impl Iterator<Item = &str>> {
+        Some(self.sessions()?.iter().map(|(name, _)| name.as_str()))
     }
 
     /// Whether `name`'s first pane is dead, mirroring `utils::is_pane_dead`
@@ -866,14 +1030,30 @@ pub(crate) fn live_agent_name_for_id_in(
     snapshot: &LiveSessionSnapshot,
     session_id: &str,
 ) -> Option<String> {
-    let names = snapshot.names()?;
+    let sessions = snapshot.sessions()?;
     let suffix = id_suffix(session_id);
     let agent = NameShape::agent(&suffix);
-    names
+    sessions
         .iter()
-        .map(String::as_str)
-        .find(|name| agent.matches(name) && !snapshot.pane_dead(name))
-        .map(str::to_string)
+        .find(|(name, kind)| {
+            agent.matches_marked(name, kind.map(SessionKind::as_marker))
+                && !snapshot.pane_dead(name)
+        })
+        .map(|(name, _)| name.clone())
+}
+
+/// [`live_agent_name_for_id_in`] against a scan the caller has just taken,
+/// as `(name, kind marker)` pairs.
+pub(crate) fn live_agent_name_for_id<'a>(
+    live: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+    session_id: &str,
+    pane_dead: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let suffix = id_suffix(session_id);
+    let agent = NameShape::agent(&suffix);
+    live.into_iter()
+        .find(|(name, marker)| agent.matches_marked(name, *marker) && !pane_dead(name))
+        .map(|(name, _)| name.to_string())
 }
 
 /// [`live_any_kind_name_for_id`] against an already-taken snapshot, so a batch
@@ -882,28 +1062,14 @@ pub(crate) fn live_any_kind_name_for_id_in(
     snapshot: &LiveSessionSnapshot,
     session_id: &str,
 ) -> Option<String> {
-    let names = snapshot.names()?;
-    let suffix = id_suffix(session_id);
-    let agent = NameShape::agent(&suffix);
-    let terminal = NameShape::terminal(&suffix);
-    let container = NameShape::container(&suffix);
-    let (mut agent_hit, mut terminal_hit, mut container_hit) = (None, None, None);
-    for name in names {
-        let name = name.as_str();
-        let bucket = if agent.matches(name) {
-            &mut agent_hit
-        } else if terminal.matches(name) {
-            &mut terminal_hit
-        } else if container.matches(name) {
-            &mut container_hit
-        } else {
-            continue;
-        };
-        if bucket.is_none() && !snapshot.pane_dead(name) {
-            *bucket = Some(name.to_string());
-        }
-    }
-    agent_hit.or(terminal_hit).or(container_hit)
+    let sessions = snapshot.sessions()?;
+    live_any_kind_name_for_id(
+        sessions
+            .iter()
+            .map(|(name, kind)| (name.as_str(), kind.map(SessionKind::as_marker))),
+        session_id,
+        |name| snapshot.pane_dead(name),
+    )
 }
 
 /// The live tmux session name carrying `session_id`'s `_<id8>` tail, preferring
@@ -914,29 +1080,38 @@ pub(crate) fn live_any_kind_name_for_id_in(
 /// where any live pane for the id is evidence the session exists. Matching runs
 /// through [`NameShape`] so the name shapes stay the single source of truth.
 pub(crate) fn live_any_kind_name_for_id<'a>(
-    live_names: impl IntoIterator<Item = &'a str>,
+    live: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
     session_id: &str,
+    pane_dead: impl Fn(&str) -> bool,
 ) -> Option<String> {
     let suffix = id_suffix(session_id);
     let agent = NameShape::agent(&suffix);
     let terminal = NameShape::terminal(&suffix);
     let container = NameShape::container(&suffix);
     let (mut agent_hit, mut terminal_hit, mut container_hit) = (None, None, None);
-    for name in live_names {
-        let bucket = if agent.matches(name) {
+    for (name, marker) in live {
+        let bucket = if agent.matches_marked(name, marker) {
             &mut agent_hit
-        } else if terminal.matches(name) {
+        } else if terminal.matches_marked(name, marker) {
             &mut terminal_hit
-        } else if container.matches(name) {
+        } else if container.matches_marked(name, marker) {
             &mut container_hit
         } else {
             continue;
         };
-        if bucket.is_none() && !utils::is_pane_dead(name) {
+        if bucket.is_none() && !pane_dead(name) {
             *bucket = Some(name.to_string());
         }
     }
     agent_hit.or(terminal_hit).or(container_hit)
+}
+
+/// Name-only pairs for a caller with no kind markers to offer.
+#[cfg(test)]
+fn unmarked<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+) -> impl Iterator<Item = (&'a str, Option<&'a str>)> {
+    names.into_iter().map(|name| (name, None))
 }
 
 /// The tmux session name to act on for one of a session's panes, resolved
@@ -950,23 +1125,28 @@ pub(crate) fn live_any_kind_name_for_id<'a>(
 /// and keeps `create` from spawning a second pane beside it. Two candidates are
 /// ambiguous, so `derived` wins there as well.
 pub(crate) fn resolve_session_name<'a>(
-    live_names: impl IntoIterator<Item = &'a str>,
+    live: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
     derived: &str,
     shape: &NameShape,
 ) -> String {
     let mut adopted: Option<&str> = None;
     let mut ambiguous = false;
     let mut derived_is_live = false;
-    for name in live_names {
-        // Test `derived` on its own rather than through the shape: a title that
-        // sanitizes under an excluded prefix makes the derived name fail
-        // `matches`, and a live derived name must still win over an older
-        // session rather than be filtered out of its own match.
+    for (name, marker) in live {
+        // Test `derived` on its own rather than through the shape: an
+        // unmarked session whose sanitized title lands under another kind's
+        // prefix fails the shape, and a live derived name must still win over
+        // an older session rather than be filtered out of its own match. A
+        // session that SAYS it is another kind is the exception: a title moved
+        // across an auxiliary prefix leaves a paired terminal holding what is
+        // now the agent's derived name, and adopting it points the operation
+        // at the wrong pane.
         if name == derived {
-            derived_is_live = true;
+            derived_is_live = SessionKind::from_marker(marker.unwrap_or_default())
+                .is_none_or(|kind| kind == shape.kind);
             continue;
         }
-        if !shape.matches(name) {
+        if !shape.matches_marked(name, marker) {
             continue;
         }
         if adopted.replace(name).is_some() {
@@ -979,14 +1159,21 @@ pub(crate) fn resolve_session_name<'a>(
     }
 }
 
-/// `resolve_session_name` for the agent pane, against `live_names`.
+/// `resolve_session_name` for the agent pane, against names alone: with no
+/// kind marker every name falls back to its shape, which cannot separate an
+/// agent titled `term Foo` from a paired terminal. Callers reading the shared
+/// scan resolve through `live_session_name`, which does have the markers.
 pub fn resolve_agent_session_name<'a>(
     live_names: impl IntoIterator<Item = &'a str>,
     session_id: &str,
     derived: &str,
 ) -> String {
     let suffix = id_suffix(session_id);
-    resolve_session_name(live_names, derived, &NameShape::agent(&suffix))
+    resolve_session_name(
+        live_names.into_iter().map(|name| (name, None)),
+        derived,
+        &NameShape::agent(&suffix),
+    )
 }
 
 /// [`resolve_agent_session_name`] against a [`batch_pane_metadata`] snapshot
@@ -1049,17 +1236,29 @@ pub fn live_agent_session_name(session_id: &str, derived: &str) -> String {
 }
 
 fn resolve_session_name_from_snapshot(
-    names: Option<&HashMap<String, i64>>,
+    sessions: Option<&HashMap<String, LiveSession>>,
     derived: &str,
     shape: &NameShape,
 ) -> String {
-    let Some(names) = names else {
+    let Some(sessions) = sessions else {
         return derived.to_string();
     };
-    if names.contains_key(derived) {
+    // Fast path only when the live derived name is also this kind: a session
+    // marked as another kind has to go through the scan, which looks for the
+    // one this shape is actually asking for.
+    if sessions
+        .get(derived)
+        .is_some_and(|session| session.kind.is_none_or(|kind| kind == shape.kind))
+    {
         return derived.to_string();
     }
-    resolve_session_name(names.keys().map(String::as_str), derived, shape)
+    resolve_session_name(
+        sessions
+            .iter()
+            .map(|(name, session)| (name.as_str(), session.kind.map(SessionKind::as_marker))),
+        derived,
+        shape,
+    )
 }
 
 /// Resolve from the current authoritative cache snapshot without spawning.
@@ -1402,7 +1601,7 @@ pub(crate) fn observed_window_size_from_cache(session_name: &str) -> Option<((u1
 pub fn test_inject_session_into_cache(name: &str) {
     if let Ok(mut cache) = SESSION_CACHE.write() {
         let map = cache.data.get_or_insert_with(HashMap::new);
-        map.insert(name.to_string(), 0);
+        map.insert(name.to_string(), LiveSession::unmarked());
         cache.time = Some(Instant::now());
     }
 }
@@ -1500,7 +1699,7 @@ pub(crate) mod fork_probe {
 /// cache is process-global.
 #[cfg(test)]
 pub(crate) struct SessionCacheGuard {
-    prev_data: Option<HashMap<String, i64>>,
+    prev_data: Option<HashMap<String, LiveSession>>,
     prev_time: Option<Instant>,
     prev_refresh_id: u64,
     prev_outcome: SessionCacheRefresh,
@@ -1547,7 +1746,12 @@ impl SessionCacheGuard {
     /// Force a fresh "server reachable" snapshot containing exactly `names`.
     pub(crate) fn force_present(&self, names: &[&str]) {
         if let Ok(mut cache) = SESSION_CACHE.write() {
-            cache.data = Some(names.iter().map(|n| (n.to_string(), 0)).collect());
+            cache.data = Some(
+                names
+                    .iter()
+                    .map(|n| (n.to_string(), LiveSession::unmarked()))
+                    .collect(),
+            );
             cache.time = Some(Instant::now());
             cache.outcome = SessionCacheRefresh::Populated;
         }
@@ -1764,7 +1968,11 @@ pub fn session_exists_from_cache(name: &str) -> Option<bool> {
 /// `aoe ps`, not a liveness decision.
 pub fn session_activity(name: &str) -> Option<i64> {
     let cache = SESSION_CACHE.read().ok()?;
-    cache.data.as_ref()?.get(name).copied()
+    cache
+        .data
+        .as_ref()?
+        .get(name)
+        .map(|session| session.activity)
 }
 
 /// Tri-state result of probing whether an aoe tmux session exists, per
@@ -2973,7 +3181,10 @@ mod tests {
         assert_eq!(
             publish_session_cache(
                 session_newer,
-                Some(HashMap::from([("new-session".to_string(), 0)])),
+                Some(HashMap::from([(
+                    "new-session".to_string(),
+                    LiveSession::unmarked(),
+                )])),
                 SessionCacheRefresh::Populated,
                 false,
             ),
@@ -3416,17 +3627,23 @@ mod tests {
 
         let all = [agent.as_str(), terminal.as_str(), container.as_str()];
         assert_eq!(
-            live_any_kind_name_for_id(all, ID).as_deref(),
+            live_any_kind_name_for_id(unmarked(all), ID, utils::is_pane_dead).as_deref(),
             Some(agent.as_str()),
             "the agent pane wins when present"
         );
         assert_eq!(
-            live_any_kind_name_for_id([terminal.as_str(), container.as_str()], ID).as_deref(),
+            live_any_kind_name_for_id(
+                unmarked([terminal.as_str(), container.as_str()]),
+                ID,
+                utils::is_pane_dead
+            )
+            .as_deref(),
             Some(terminal.as_str()),
             "the paired terminal is preferred over the container terminal"
         );
         assert_eq!(
-            live_any_kind_name_for_id([container.as_str()], ID).as_deref(),
+            live_any_kind_name_for_id(unmarked([container.as_str()]), ID, utils::is_pane_dead)
+                .as_deref(),
             Some(container.as_str()),
         );
     }
@@ -3462,7 +3679,12 @@ mod tests {
         // And the any-kind lookup still answers it, since peer exclusion and
         // the TUI reload legitimately want any live pane for the id.
         assert_eq!(
-            live_any_kind_name_for_id([terminal.as_str(), container.as_str()], ID).as_deref(),
+            live_any_kind_name_for_id(
+                unmarked([terminal.as_str(), container.as_str()]),
+                ID,
+                utils::is_pane_dead
+            )
+            .as_deref(),
             Some(terminal.as_str()),
         );
 
@@ -3476,6 +3698,204 @@ mod tests {
         assert_eq!(live_agent_name_for_id_in(&snapshot, ID), None);
     }
 
+    /// The scan is where a marker becomes usable at all: a wrong split
+    /// silently unmarks every session and puts the whole fleet back on the
+    /// ambiguous name-shape guess.
+    #[test]
+    fn session_scan_reads_the_kind_field_and_tolerates_its_absence() {
+        let parsed = parse_session_scan(
+            "aoe_Vikings_abcd1234|1789065184|agent\n\
+             aoe_term_Vikings_abcd1234|1789065184|term\n\
+             unmarked_session|1789065184|\n\
+             short_line|1789065184\n\
+             aoe_Weird_abcd1234|1789065184|from-a-newer-build\n\
+             garbage-with-no-separator",
+        );
+
+        assert_eq!(
+            parsed.get("aoe_Vikings_abcd1234").unwrap().kind,
+            Some(SessionKind::Agent)
+        );
+        assert_eq!(
+            parsed.get("aoe_term_Vikings_abcd1234").unwrap().kind,
+            Some(SessionKind::Terminal)
+        );
+        assert_eq!(
+            parsed.get("unmarked_session").unwrap().activity,
+            1789065184,
+            "an empty kind field still carries the session and its activity"
+        );
+        assert_eq!(parsed.get("unmarked_session").unwrap().kind, None);
+        assert_eq!(parsed.get("short_line").unwrap().kind, None);
+        assert_eq!(
+            parsed.get("aoe_Weird_abcd1234").unwrap().kind,
+            None,
+            "a marker this build does not know is not evidence of a kind"
+        );
+        assert!(!parsed.contains_key("garbage-with-no-separator"));
+    }
+
+    /// `#{@aoe_kind}` falls through to the server, global-window and
+    /// global-session options, so a user who sets one would otherwise have
+    /// every unmarked session on their server claim that kind, which is how a
+    /// paired terminal would pass as an agent pane again. The scan prints
+    /// those scopes first so they can be subtracted.
+    #[test]
+    fn an_inherited_kind_option_marks_nothing() {
+        let agent = format!("{P}Vikings{ID8}");
+        let terminal = format!("{TERMINAL_PREFIX}Vikings{ID8}");
+        let scan = format!(
+            "agent\n\
+             {agent}|1789065184|agent\n\
+             {terminal}|1789065184|agent\n\
+             {terminal}_t1|1789065184|term"
+        );
+
+        let parsed = parse_session_scan(&scan);
+        assert_eq!(
+            parsed.get(&terminal).unwrap().kind,
+            None,
+            "a value the global could have produced is not a mark"
+        );
+        assert_eq!(
+            parsed.get(&agent).unwrap().kind,
+            None,
+            "including on a session that really is an agent: unmarked falls \
+             back to the name shape, which is right for it"
+        );
+        assert_eq!(
+            parsed.get(&format!("{terminal}_t1")).unwrap().kind,
+            Some(SessionKind::Terminal),
+            "a value the global cannot explain is still a mark"
+        );
+
+        // Without a global line every mark stands.
+        let parsed = parse_session_scan(&format!("{terminal}|1789065184|agent"));
+        assert_eq!(
+            parsed.get(&terminal).unwrap().kind,
+            Some(SessionKind::Agent)
+        );
+
+        // `#{@aoe_kind}` inherits from the server and global-window scopes as
+        // well, so the scan reads back one line per scope and every value has
+        // to be subtracted, not just the first.
+        let parsed = parse_session_scan(&format!(
+            "term\n\
+             agent\n\
+             {agent}|1789065184|agent\n\
+             {terminal}|1789065184|term\n\
+             {terminal}_t1|1789065184|tool"
+        ));
+        assert_eq!(parsed.get(&agent).unwrap().kind, None);
+        assert_eq!(parsed.get(&terminal).unwrap().kind, None);
+        assert_eq!(
+            parsed.get(&format!("{terminal}_t1")).unwrap().kind,
+            Some(SessionKind::Tool),
+            "a value no scope could have produced is still a mark"
+        );
+
+        // A separator inside one scope's value must not end the scope block:
+        // the scopes are printed in a fixed order, so a `|` in the first one
+        // would otherwise leave the rest unsubtracted and hand this terminal
+        // the agent kind.
+        let parsed = parse_session_scan(&format!(
+            "a|b\n\
+             agent\n\
+             {terminal}|1789065184|agent"
+        ));
+        assert_eq!(
+            parsed.get(&terminal).unwrap().kind,
+            None,
+            "a later scope is still subtracted when an earlier one holds a separator"
+        );
+        assert!(!parsed.contains_key("a"), "a scope value is not a session");
+    }
+
+    /// The kind marker is what name shape cannot say, in both directions: an
+    /// agent whose title sanitizes into a terminal's shape is still the agent
+    /// pane (#3888), and a paired terminal is never one however its name
+    /// reads (#3880).
+    #[test]
+    #[serial_test::serial]
+    fn live_agent_lookup_follows_the_marker_over_the_name_shape() {
+        // `aoe_term_rewriting_<id8>`: the agent name for title `term
+        // rewriting`, and the paired-terminal name for title `rewriting`.
+        let ambiguous = format!("{TERMINAL_PREFIX}rewriting_{ID8}");
+
+        let as_agent = LiveSessionSnapshot::from_marked_parts(
+            Some(vec![(ambiguous.clone(), Some(SessionKind::Agent))]),
+            Some(HashMap::new()),
+        );
+        assert_eq!(
+            live_agent_name_for_id_in(&as_agent, ID).as_deref(),
+            Some(ambiguous.as_str()),
+            "a marked agent is the row's agent pane whatever its title sanitized to"
+        );
+
+        let as_terminal = LiveSessionSnapshot::from_marked_parts(
+            Some(vec![(ambiguous.clone(), Some(SessionKind::Terminal))]),
+            Some(HashMap::new()),
+        );
+        assert_eq!(
+            live_agent_name_for_id_in(&as_terminal, ID),
+            None,
+            "a marked terminal never passes as the agent pane"
+        );
+
+        let unmarked_snapshot =
+            LiveSessionSnapshot::from_parts(Some(vec![ambiguous.clone()]), Some(HashMap::new()));
+        assert_eq!(
+            live_agent_name_for_id_in(&unmarked_snapshot, ID),
+            None,
+            "a session created before the marker keeps the old, ambiguous guess"
+        );
+
+        // The any-kind lookup buckets by the same classifier, so the marked
+        // agent is preferred over a terminal rather than mistaken for one.
+        let terminal = format!("{TERMINAL_PREFIX}other_{ID8}");
+        assert_eq!(
+            live_any_kind_name_for_id(
+                [
+                    (terminal.as_str(), Some("term")),
+                    (ambiguous.as_str(), Some("agent")),
+                ],
+                ID,
+                |_| false
+            )
+            .as_deref(),
+            Some(ambiguous.as_str()),
+        );
+    }
+
+    /// The collision a smart rename creates: a row titled `Foo` gets the
+    /// paired terminal `aoe_term_Foo_<id8>`, is retitled to `term Foo`, and
+    /// that terminal now holds the agent's derived name. Adopting it would
+    /// point every lifecycle operation, and the session-id poller, at the
+    /// wrong pane.
+    #[test]
+    fn a_session_marked_another_kind_is_not_the_live_derived_name() {
+        let derived = format!("{TERMINAL_PREFIX}Foo_{ID8}");
+        let agent = format!("{P}Foo_{ID8}");
+
+        assert_eq!(
+            resolve_session_name(
+                [
+                    (derived.as_str(), Some("term")),
+                    (agent.as_str(), Some("agent")),
+                ],
+                &derived,
+                &NameShape::agent(&id_suffix(ID))
+            ),
+            agent,
+            "the marked agent wins over a terminal wearing the derived name"
+        );
+        assert_eq!(
+            resolve_agent_session_name([derived.as_str(), agent.as_str()], ID, &derived),
+            derived,
+            "unmarked keeps the pre-marker answer: a live derived name wins"
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn live_any_kind_name_for_id_excludes_tool_subsessions_and_other_ids() {
@@ -3486,7 +3906,11 @@ mod tests {
             "vim".to_string(),
         ];
         assert_eq!(
-            live_any_kind_name_for_id(names.iter().map(String::as_str), ID),
+            live_any_kind_name_for_id(
+                unmarked(names.iter().map(String::as_str)),
+                ID,
+                utils::is_pane_dead
+            ),
             None,
             "a tool sub-session and other ids are never this session's pane"
         );

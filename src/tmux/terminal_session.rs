@@ -31,6 +31,13 @@ impl TerminalKind {
         }
     }
 
+    fn session_kind(self) -> crate::tmux::SessionKind {
+        match self {
+            TerminalKind::Host => crate::tmux::SessionKind::Terminal,
+            TerminalKind::Container => crate::tmux::SessionKind::ContainerTerminal,
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             TerminalKind::Host => "terminal session",
@@ -157,7 +164,7 @@ impl PairedTerminal {
         let shape = crate::tmux::NameShape {
             prefix: kind.prefix(),
             suffix: &suffix,
-            excluded_prefixes: &[],
+            kind: kind.session_kind(),
         };
         if display_only {
             crate::tmux::session_name_for_display(&derived, &shape)
@@ -250,6 +257,7 @@ impl PairedTerminal {
             append_default_shell_args(&mut args, &self.name, shell);
         }
         append_tmux_setting_args(&mut args, &self.name, &config);
+        crate::tmux::append_session_kind_args(&mut args, &self.name, self.kind.session_kind());
 
         let output = crate::tmux::tmux_command().args(&args).output()?;
 

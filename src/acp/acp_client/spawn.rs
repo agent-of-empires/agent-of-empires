@@ -969,6 +969,74 @@ done
         script_path
     }
 
+    /// #3560: a prompt rejected because the agent no longer holds the
+    /// resumed session emits `SessionContextReset` before the connection
+    /// ends on the error, so the respawn opens a fresh `session/new`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unsupported_session_prompt_rejection_emits_context_reset_before_error() {
+        use crate::acp::acp_client::test_helpers::reset_fake_spawn_config;
+        use crate::acp::Event;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let script = write_unsupported_session_fake_agent(dir.path());
+        let mut config = reset_fake_spawn_config(&script, cwd.path());
+        config.stored_acp_session_id = Some("sid-stored".into());
+        let mut client = AcpClient::spawn(config, AcpSessionId("resume-reject".into()))
+            .await
+            .expect("spawn fake agent");
+        client
+            .send_prompt("continue", &[])
+            .await
+            .expect("queue prompt");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut saw_reset = false;
+        let mut terminal = None;
+        loop {
+            let ev = tokio::time::timeout_at(deadline, client.next_event())
+                .await
+                .expect("timed out waiting for the recovery reset");
+            match ev {
+                Some(Event::SessionContextReset { reason }) => {
+                    assert!(
+                        reason.contains("resumed session no longer available"),
+                        "reset reason should name the rejected resume, got {reason:?}"
+                    );
+                    saw_reset = true;
+                }
+                Some(Event::Stopped { reason }) => {
+                    // The reset must precede the terminal event: a terminal
+                    // first would mean the connection died before the
+                    // recovery signal the supervisor keys on.
+                    assert!(
+                        saw_reset,
+                        "terminal event must arrive after the SessionContextReset, got stopped={reason:?} first"
+                    );
+                    terminal = Some(reason);
+                }
+                Some(Event::AgentStartupError { message }) => {
+                    panic!("a recoverable reset must not surface a startup error: {message}")
+                }
+                // The channel closes once the connection task takes the
+                // error path: reaching it after the reset pins the order.
+                None => break,
+                _ => {}
+            }
+        }
+        assert!(
+            saw_reset,
+            "the rejection must emit SessionContextReset before ending"
+        );
+        assert_eq!(
+            terminal.as_deref(),
+            Some("stored_session_rejected"),
+            "the connection ends on a soft stop the respawn recovers from"
+        );
+        let _ = client.shutdown().await;
+    }
+
     /// Scripted stdio agent: completes `initialize`, then rejects
     /// `session/new` with the adapter's rate-limit fingerprint.
     #[cfg(unix)]
@@ -1028,65 +1096,6 @@ done
             }
         }
         assert_eq!(kinds, vec!["rate_limit:rate_limit", "stopped:rate_limited"]);
-        let _ = client.shutdown().await;
-    }
-
-    /// #3560: a prompt rejected because the agent no longer holds the
-    /// resumed session emits `SessionContextReset` before the connection
-    /// ends on the error, so the respawn opens a fresh `session/new`.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn unsupported_session_prompt_rejection_emits_context_reset_before_error() {
-        use crate::acp::acp_client::test_helpers::reset_fake_spawn_config;
-        use crate::acp::Event;
-
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = tempfile::tempdir().unwrap();
-        let script = write_unsupported_session_fake_agent(dir.path());
-        let mut config = reset_fake_spawn_config(&script, cwd.path());
-        config.stored_acp_session_id = Some("sid-stored".into());
-        let mut client = AcpClient::spawn(config, AcpSessionId("resume-reject".into()))
-            .await
-            .expect("spawn fake agent");
-        client
-            .send_prompt("continue", &[])
-            .await
-            .expect("queue prompt");
-
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut saw_reset = false;
-        let mut terminal = None;
-        loop {
-            let ev = tokio::time::timeout_at(deadline, client.next_event())
-                .await
-                .expect("timed out waiting for the recovery reset");
-            match ev {
-                Some(Event::SessionContextReset { reason }) => {
-                    assert!(
-                        reason.contains("resumed session no longer available"),
-                        "reset reason should name the rejected resume, got {reason:?}"
-                    );
-                    saw_reset = true;
-                }
-                Some(Event::Stopped { reason }) => terminal = Some(reason),
-                Some(Event::AgentStartupError { message }) => {
-                    panic!("a recoverable reset must not surface a startup error: {message}")
-                }
-                // The channel closes once the connection task takes the
-                // error path: reaching it after the reset pins the order.
-                None => break,
-                _ => {}
-            }
-        }
-        assert!(
-            saw_reset,
-            "the rejection must emit SessionContextReset before ending"
-        );
-        assert_eq!(
-            terminal.as_deref(),
-            Some("stored_session_rejected"),
-            "the connection ends on a soft stop the respawn recovers from"
-        );
         let _ = client.shutdown().await;
     }
 }

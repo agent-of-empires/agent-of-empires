@@ -4259,6 +4259,142 @@ Final prose line.\n";
     }
 
     #[test]
+    fn test_detect_omp_status_multiline_task_composer() {
+        let band = "╭── ⠏ 1h > ◒ GPT-5.6-Sol > branch ⚙ 1 < Corriger tous les fin… ──╮";
+        for (name, interrupt, header, body) in [
+            (
+                "localized task",
+                "  ⎋ Poursuivre suite contrainte",
+                band.to_string(),
+                "│ draft first line │\n".to_string(),
+            ),
+            (
+                "without task segment",
+                "  ⎋ Poursuivre suite contrainte",
+                band.replace(" ⚙ 1 < Corriger tous les fin…", ""),
+                "│ draft first line │\n".to_string(),
+            ),
+            (
+                "canonical interrupt",
+                "  ⎋ Working…",
+                band.to_string(),
+                "│ draft first line │\n".to_string(),
+            ),
+            (
+                "wrapped interrupt",
+                "  ⎋ Searching the parent tree\n continuation",
+                band.to_string(),
+                "│ draft first line │\n".to_string(),
+            ),
+            (
+                "composer at capture boundary",
+                "  ⎋ Poursuivre suite contrainte",
+                band.to_string(),
+                "│ draft │\n".repeat(27),
+            ),
+            (
+                "draft resembles activity",
+                "  ⎋ Poursuivre suite contrainte",
+                band.to_string(),
+                "│ Working… │\n│ 1s > fake timer │\n│ ╭── fake header │\n".to_string(),
+            ),
+        ] {
+            let pane = format!("{interrupt}\n{header}\n{body}╰─ draft last line ─╯");
+            assert_eq!(detect_omp_status(&pane), Status::Running, "case: {name}");
+        }
+    }
+
+    #[test]
+    fn test_detect_omp_status_multiline_composer_rejects_stale_activity() {
+        let active = "  ⎋ Poursuivre suite contrainte\n╭── ⠏ 1h > model status ──╮\n│ draft │\n╰─ continued draft ─╯";
+        let approval = "│ ❯ Approve │\n│ Deny │\n│ up/down navigate  enter select  esc cancel │";
+        let idle = "╭── π > model status ──╮\n│ draft │\n╰─ continued draft ─╯";
+        for (name, pane, expected) in [
+            (
+                "no interrupt",
+                active.replace("  ⎋ Poursuivre suite contrainte\n", ""),
+                Status::Idle,
+            ),
+            ("elapsed clock", active.replace("⠏", "⏱"), Status::Idle),
+            (
+                "duration prose",
+                active.replace("⠏ 1h > model status", "x 1h saved per run"),
+                Status::Idle,
+            ),
+            (
+                "new idle composer",
+                format!("{active}\n{idle}"),
+                Status::Idle,
+            ),
+            (
+                "fake timer inside idle draft",
+                idle.replace("│ draft │", "│ 1s > fake timer │"),
+                Status::Idle,
+            ),
+            // A frame the bottom-line window still reaches keeps its status
+            // row: a turn timer under a live interrupt row is activity
+            // whether or not the frame below it finished painting.
+            (
+                "frame without its bottom border",
+                active.replace("╰─ continued draft ─╯", "│ continued draft │"),
+                Status::Running,
+            ),
+            (
+                "output painted over the composer body",
+                active.replace("│ draft │", "Completed response."),
+                Status::Running,
+            ),
+            (
+                "interrupt outside capture window",
+                active.replace("│ draft │\n", &"│ draft │\n".repeat(28)),
+                Status::Idle,
+            ),
+            (
+                "lower terminal error",
+                format!("{active}\nError: Retry budget exhausted after 10 retries"),
+                Status::Error,
+            ),
+            (
+                "lower approval",
+                format!("{active}\n{approval}"),
+                Status::Waiting,
+            ),
+            (
+                "lower active composer",
+                format!("{approval}\n{active}"),
+                Status::Running,
+            ),
+        ] {
+            assert_eq!(detect_omp_status(&pane), expected, "case: {name}");
+        }
+    }
+
+    /// The bottom status row reaches further up for its activity hint than
+    /// either the compact band rule or the multiline composer rule does, and
+    /// it serves ascii and Unicode frames alike. Rows between the interrupt
+    /// and the frame must not read as idle.
+    #[test]
+    fn test_detect_omp_status_band_hint_above_the_narrow_windows() {
+        let filler = " context 40%\n tokens 1000\n cost 0.42\n branch main";
+        for (name, pane) in [
+            (
+                "Unicode band, hint above the compact window",
+                format!("  \u{238B} Working\u{2026}\n{filler}\n\u{256D}\u{2500}\u{2500} \u{2839} 4m > model status \u{2500}\u{2500}\u{256E}\n\u{2570}\u{2500} draft \u{2500}\u{256F}"),
+            ),
+            (
+                "ascii band, hint above the compact window",
+                format!("  \u{238B} Working\u{2026}\n{filler}\n+== \u{2839} 4m == model status\n+-- draft --"),
+            ),
+            (
+                "Unicode composer, hint above the composer window",
+                "  \u{238B} Working\u{2026}\n context 40%\n tokens 1000\n\u{256D}\u{2500}\u{2500} \u{2839} 4m > model status \u{2500}\u{2500}\u{256E}\n\u{2502} draft \u{2502}\n\u{2570}\u{2500} continued draft \u{2500}\u{256F}".to_string(),
+            ),
+        ] {
+            assert_eq!(detect_omp_status(&pane), Status::Running, "case: {name}");
+        }
+    }
+
+    #[test]
     fn test_detect_omp_status_running_on_active_brand() {
         let cases = [
             (
@@ -4344,6 +4480,19 @@ Final prose line.\n";
                  ❯\n\
                  ───────────────────────────────────\n\
                   ⠼ 16m · 🖥 host",
+            ),
+            (
+                "compaction on compact Unicode band",
+                " ⠧ Auto server compaction… (esc to cancel)\n\
+                 ╭── ⠼ 16m > model status ──╮\n\
+                 ╰─ draft ─╯",
+            ),
+            (
+                "compaction on multiline Unicode composer",
+                " ⠧ Auto server compaction… (esc to cancel)\n\
+                 ╭── ⠼ 16m > model status ──╮\n\
+                 │ draft │\n\
+                 ╰─ continued draft ─╯",
             ),
             (
                 "rule shape",
