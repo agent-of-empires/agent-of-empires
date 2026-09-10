@@ -49,6 +49,11 @@ impl Instance {
         disk.last_start_time = self.last_start_time;
         disk.session_id_poller = self.session_id_poller.take();
         disk.session_id_poller_retry_after = self.session_id_poller_retry_after;
+        // `poller_repair` is `#[serde(skip)]`, so the disk snapshot's default
+        // state would reset the backoff schedule to "due now" and let
+        // `repair_session_id_poller_if_needed` retry ahead of its 5-60s
+        // escalation. Carry the live schedule across the reload.
+        disk.poller_repair = self.poller_repair.clone();
         disk.retroactive_capture_excludes = std::mem::take(&mut self.retroactive_capture_excludes);
         disk.pane_dead_observed = self.pane_dead_observed;
         disk.force_fresh_next_launch = self.force_fresh_next_launch;
@@ -166,6 +171,48 @@ mod tests {
         assert_eq!(inst.agent_session_id.as_deref(), Some("old-sid"));
         inst.reconcile_from_disk();
         assert_eq!(inst.agent_session_id.as_deref(), Some("new-sid"));
+    }
+
+    // #3776 review finding: `poller_repair` is `#[serde(skip)]`, so an
+    // unscheduled reload would otherwise reset the backoff to "due now" and
+    // let the repair retry ahead of its 5-60s escalation.
+    #[test]
+    #[serial]
+    fn reconcile_from_disk_carries_poller_repair_backoff() {
+        let temp = tempdir().unwrap();
+        std::env::set_var("HOME", temp.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+
+        let storage = crate::session::storage::Storage::new_unwatched("reconcile-test").unwrap();
+        let mut inst = Instance::new("title", "/tmp/x");
+        inst.source_profile = "reconcile-test".to_string();
+        storage
+            .update(|i, g| {
+                *i = vec![inst.clone()];
+                *g = crate::session::GroupTree::new_with_groups(std::slice::from_ref(&inst), &[])
+                    .get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+
+        // A deferred repair in flight: not due for another minute, two
+        // deferrals recorded. `defer_poller_repair` is private to the
+        // polling module, so the schedule is built through the backoff's
+        // own `defer`.
+        let now = std::time::Instant::now();
+        inst.poller_repair.defer(now);
+        inst.poller_repair.defer(now);
+        let deferrals = inst.poller_repair.deferrals();
+        assert!(deferrals >= 2);
+        assert!(!inst.poller_repair.due(now));
+
+        inst.reconcile_from_disk();
+
+        // The reload must not reset the schedule: the next repair stays
+        // deferred, not immediately due.
+        assert_eq!(inst.poller_repair.deferrals(), deferrals);
+        assert!(!inst.poller_repair.due(now));
     }
 
     #[test]
