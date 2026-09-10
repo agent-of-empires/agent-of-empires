@@ -605,7 +605,6 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::PollerStart;
-    use crate::session::instance::test_helpers::install_aliases;
     use crate::session::{Instance, SandboxInfo, Status};
 
     /// The 2026-09-04 fleet shape: two sessions past the poller budget were

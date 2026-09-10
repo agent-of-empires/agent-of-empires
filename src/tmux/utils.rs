@@ -225,6 +225,8 @@ pub fn append_window_size_args(args: &mut Vec<String>, target: &str) {
 /// empty stdout, and nothing on stderr, so "the pane is alive and not dead"
 /// and "there is no such session" are only separable by looking at whether
 /// the format expanded to anything at all.
+use super::tmux_no_server_running;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PaneProbe {
     /// `#{pane_dead}` expanded to `0`.
@@ -236,24 +238,26 @@ pub(crate) enum PaneProbe {
     /// "not dead", while a caller holding a long-lived handle to the session
     /// wants it to read as "stop".
     ///
-    /// Both empty-stdout shapes land here, deliberately, and the exit status
-    /// is not consulted to split them:
+    /// `Missing` is the precise "tmux resolved the target to nothing" signal,
+    /// and only that: exit 0 with empty stdout (the name did not resolve), or
+    /// a non-zero exit carrying the recognized no-server / dead-socket
+    /// (ENOENT) markers on stderr — there is no tmux server, so every session
+    /// on it is gone too. Classifying those as `Unknown` would be worse, not
+    /// safer: nothing ever terminates on `Unknown`, so a vanished server would
+    /// leave every poller running against sessions that cannot come back
+    /// under that server, which is the leak this variant exists to close.
     ///
-    /// - exit 0, empty stdout: the session name did not resolve.
-    /// - exit 1, `no server running on <socket>` on stderr: there is no tmux
-    ///   server, so every session on it is gone too.
+    /// Every other empty-stdout failure (EACCES, ENOTSOCK, malformed stderr)
+    /// is `Unknown`: folding it into `Missing` stops a poller that has seen
+    /// the target alive after two such probes. So does stdout that is neither
+    /// `0`, `1`, nor empty.
     ///
-    /// Classifying the second as `Unknown` would be worse, not safer: nothing
-    /// ever terminates on `Unknown`, so a vanished server would leave every
-    /// poller running against sessions that cannot come back under that
-    /// server, which is the leak this variant exists to close.
-    ///
-    /// `Missing` is a precise signal rather than a catch-all, because any
-    /// target tmux can resolve *to a session* expands the format to a digit,
-    /// including out-of-range window and pane indices (`:99.0`, `:^.99`),
-    /// which it falls back from. Only an unresolvable session name yields
-    /// empty stdout, so a user's `pane-base-index` setting cannot make a live
-    /// pane read as `Missing`. (Measured against tmux 3.7c.)
+    /// `Missing` stays precise because any target tmux can resolve *to a
+    /// session* expands the format to a digit, including out-of-range window
+    /// and pane indices (`:99.0`, `:^.99`), which it falls back from. Only an
+    /// unresolvable session name yields empty stdout, so a user's
+    /// `pane-base-index` setting cannot make a live pane read as `Missing`.
+    /// (Measured against tmux 3.7c.)
     Missing,
     /// tmux itself could not be run, so the probe says nothing about the pane.
     Unknown,
@@ -272,13 +276,24 @@ pub(crate) fn probe_pane(session_name: &str) -> PaneProbe {
     else {
         return PaneProbe::Unknown;
     };
-    let Ok(stdout) = String::from_utf8(output.stdout) else {
-        return PaneProbe::Unknown;
-    };
-    match stdout.trim() {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    classify_pane_probe(output.status.success(), stdout.trim(), &output.stderr)
+}
+
+/// Pure classification of one `#{pane_dead}` probe, split out from the real
+/// tmux call so the failure taxonomy is unit-testable without a socket.
+pub(crate) fn classify_pane_probe(succeeded: bool, stdout: &str, stderr: &[u8]) -> PaneProbe {
+    match stdout {
         "1" => PaneProbe::Dead,
         "0" => PaneProbe::Alive,
-        _ => PaneProbe::Missing,
+        "" => {
+            if succeeded || tmux_no_server_running(stderr) {
+                PaneProbe::Missing
+            } else {
+                PaneProbe::Unknown
+            }
+        }
+        _ => PaneProbe::Unknown,
     }
 }
 
@@ -1066,5 +1081,58 @@ mod tests {
             "title\n",
             "a newline the title itself carried must survive"
         );
+    }
+}
+
+#[cfg(test)]
+mod pane_probe_tests {
+    use super::*;
+
+    /// The failure taxonomy the session-id poller depends on: a recognized
+    /// "gone" stays Missing, an unrecognized failure never folds into it, so
+    /// a poller that has seen the target alive is not stopped by two
+    /// unexpected probes.
+    #[test]
+    fn classify_pane_probe_splits_missing_from_unknown() {
+        use std::str::from_utf8;
+
+        assert_eq!(classify_pane_probe(true, "0", &[]), PaneProbe::Alive);
+        assert_eq!(classify_pane_probe(true, "1", &[]), PaneProbe::Dead);
+
+        // Precise "gone": the name did not resolve (exit 0, empty stdout),
+        // or tmux reported no server / a dead socket file.
+        assert_eq!(classify_pane_probe(true, "", &[]), PaneProbe::Missing);
+        let no_server = b"no server running on /tmp/tmux-501/default\n";
+        assert_eq!(
+            classify_pane_probe(false, "", no_server),
+            PaneProbe::Missing
+        );
+        let enoent = b"error connecting to /tmp/tmux-501/default (No such file or directory)\n";
+        assert_eq!(classify_pane_probe(false, "", enoent), PaneProbe::Missing);
+
+        // Unexpected failures stay Unknown: the poller's alive-seen guard
+        // only stops on two Missing probes.
+        let eacces = b"error connecting to /tmp/tmux-501/default (Permission denied)\n";
+        assert_eq!(classify_pane_probe(false, "", eacces), PaneProbe::Unknown);
+        let enotsock =
+            b"error connecting to /tmp/tmux-501/default (Socket operation on non-socket)\n";
+        assert_eq!(classify_pane_probe(false, "", enotsock), PaneProbe::Unknown);
+        assert_eq!(
+            classify_pane_probe(false, "", b"garbage\n"),
+            PaneProbe::Unknown
+        );
+
+        // Malformed stdout is not a resolvable shape either.
+        assert_eq!(
+            classify_pane_probe(true, "garbage", &[]),
+            PaneProbe::Unknown
+        );
+        assert_eq!(classify_pane_probe(false, "0", &[]), PaneProbe::Alive);
+        assert_eq!(classify_pane_probe(false, "1", &[]), PaneProbe::Dead);
+
+        // The bytes really are valid UTF-8 in the shapes above, matching the
+        // lossy conversion probe_pane performs.
+        assert!(from_utf8(no_server).is_ok());
+        assert!(from_utf8(enoent).is_ok());
     }
 }

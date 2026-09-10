@@ -469,7 +469,7 @@ const ESCAPED_TAIL_SEP: &str = r"\037";
 /// so a socket path that happens to contain either phrase cannot fake the
 /// empty case on a different errno. Callers MUST use [`tmux_query_command`] so
 /// the `strerror` text is stable English (see #3327/#3328).
-fn tmux_no_server_running(stderr: &[u8]) -> bool {
+pub(super) fn tmux_no_server_running(stderr: &[u8]) -> bool {
     let s = String::from_utf8_lossy(stderr);
     // tmux (`client.c`) prints both markers at the start of their own line
     // (`no server running on <socket>` / `error connecting to <socket>
