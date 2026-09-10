@@ -87,6 +87,39 @@ impl EmbeddedView {
     }
 
     /// The session this view is streaming.
+    /// Test constructor: a mounted, non-activated view over a state that
+    /// never talks to a daemon. Lets App-level tests drive the paste-drain
+    /// handoff without a live connection.
+    #[cfg(test)]
+    pub(crate) fn for_test(session_id: &str) -> Self {
+        let endpoint = crate::acp::client::DaemonEndpoint::new(
+            "http://127.0.0.1:8080".into(),
+            None,
+            crate::acp::client::discovery::Source::Env,
+        );
+        let http =
+            crate::acp::client::HttpClient::new(endpoint.clone()).expect("fake endpoint client");
+        Self {
+            state: crate::tui::structured_view::StructuredViewState::new(
+                session_id.into(),
+                endpoint,
+                http,
+                None,
+            ),
+            toast_deadline: None,
+            plugin_rx: tokio::sync::mpsc::channel(1).1,
+            session_info_rx: tokio::sync::mpsc::channel(1).1,
+            active: false,
+        }
+    }
+
+    /// Composer content, joined on newlines: test read for the paste-drain
+    /// handoff.
+    #[cfg(test)]
+    pub(crate) fn composer_text(&self) -> String {
+        self.state.composer.lines().join("\n")
+    }
+
     pub fn session_id(&self) -> &str {
         &self.state.session_id
     }
