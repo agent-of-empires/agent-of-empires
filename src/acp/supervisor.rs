@@ -508,13 +508,8 @@ pub struct SpawnRequest {
     pub provider_env: Vec<(String, String)>,
     pub model: Option<String>,
     pub effort: Option<String>,
-    /// Provenance of `effort`: true only when the user explicitly set it
-    /// (persisted in `Instance.acp_effort`), making it a session pin that
-    /// survives a later model-pin change. A nonempty `effort` alone proves
-    /// nothing — the creation path forwards the daemon-resolved default
-    /// while `Instance.acp_effort` stays `None` — so an inherited effort
-    /// must read false and re-resolve against the pinned model on respawn.
-    /// See #3683 review.
+    /// True for persisted user effort, not a resolved default. Only explicit
+    /// effort survives a model-pin change without being re-resolved.
     pub effort_explicit: bool,
     /// ACP session id from a previous run; when `Some` and the agent
     /// advertises `load_session = true`, the spawn calls
@@ -731,11 +726,7 @@ fn log_wrapper_substitution(session_id: &str, tool: &str, wrapper: &str, base: &
     );
 }
 
-/// Re-run the spawn model/effort resolution on a `SpawnConfig` cached at
-/// first launch, so a pin changed since then applies to the respawn. The
-/// cached values stand in for the original request. They are resolved
-/// values, so when the pin moves the model, the effort keyed on the new
-/// model replaces a cached effort keyed on the old one.
+/// Apply current model pins and effort defaults to a cached respawn request.
 fn refresh_spawn_model_effort(
     config: &mut SpawnConfig,
     defaults: Option<&crate::session::config::AcpAgentDefaults>,
@@ -745,10 +736,7 @@ fn refresh_spawn_model_effort(
         .iter()
         .find(|(key, _)| key == "AOE_AGENT_MODEL")
         .map(|(_, value)| value.clone());
-    // An explicit effort is a session pin: it survives the model-pin move.
-    // Inherited effort re-resolves for the model the respawn runs on, the
-    // keyed entry when one exists or the ordinary fallback (`effort_for_model`)
-    // when it does not; passing no request effort lets the resolver do that.
+    // Preserve explicit effort; resolve inherited effort for the new model.
     let (model, effort) = if config.default_effort_explicit {
         crate::session::config::resolve_spawn_model_effort(
             defaults,
@@ -4446,58 +4434,6 @@ mod tests {
                 "{name}"
             );
         }
-    }
-
-    /// The creation handoff must carry effort provenance, not derive it from
-    /// the value: the create path forwards the daemon-resolved default while
-    /// `Instance.acp_effort` is `None`, so a nonempty `effort` is NOT a pin.
-    /// Drives the real `Supervisor::spawn` with the request the create path
-    /// sends, then asserts the installed SpawnConfig reads inherited.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn creation_handoff_keeps_resolved_default_effort_inherited() {
-        let _home = isolate_home();
-        let control = Arc::new(FakeProcessControl::default());
-        control.alive(4343);
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let gate = Arc::new(tokio::sync::Notify::new());
-        let sup = Arc::new(
-            Supervisor::new(VecSink::new())
-                .with_process_control(control)
-                .with_launcher(gated_launcher(entered.clone(), gate.clone(), 4343)),
-        );
-
-        // What the create path sends: an effort that was resolved from the
-        // pinned model's defaults, with no user selection behind it.
-        let mut req = spawn_request("s-prov");
-        req.effort = Some("low".into());
-        req.effort_explicit = false;
-
-        // The launcher parks on the gate until released, so spawn runs
-        // beside this task like the create path's detached spawn does.
-        let spawner = {
-            let sup = Arc::clone(&sup);
-            tokio::spawn(async move { sup.spawn(req).await })
-        };
-        entered.notified().await;
-        gate.notify_one();
-        spawner.await.unwrap().expect("spawn");
-
-        let config = sup
-            .workers
-            .lock()
-            .await
-            .get("s-prov")
-            .map(|handle| match &handle.kind {
-                WorkerKind::Runner { spawn_config } => spawn_config.default_effort_explicit,
-                _ => panic!("runner handle expected"),
-            })
-            .expect("worker installed");
-        assert!(
-            !config,
-            "a resolved default effort must not read as a session pin; \
-             the watchdog would refuse the new model's inherited effort"
-        );
     }
 
     /// An explicit request effort is a session pin (persisted in

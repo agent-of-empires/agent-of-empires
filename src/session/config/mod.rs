@@ -1554,10 +1554,12 @@ impl AcpAgentDefaults {
             && self.effort_by_model.is_empty()
     }
 
-    /// Default model, with empty strings treated as unset (mirrors `mode`) so a
-    /// blank value never overrides the agent's own default at spawn.
+    /// Configured model, excluding empty or whitespace-only values.
     pub fn model(&self) -> Option<String> {
-        self.model.clone().filter(|value| !value.is_empty())
+        self.model
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+            .cloned()
     }
 
     /// The pinned model: `model` when `pin_model` is on and the value is
@@ -4966,6 +4968,24 @@ mod tests {
         let (model, effort) = resolve_spawn_model_effort(None, None, None);
         assert_eq!(model, None);
         assert_eq!(effort, None);
+    }
+
+    #[test]
+    fn resolve_spawn_model_effort_ignores_blank_configured_pin() {
+        let defaults = AcpAgentDefaults {
+            model: Some(" \t\n".into()),
+            pin_model: true,
+            effort_by_model: HashMap::from([("requested".into(), "high".into())]),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_spawn_model_effort(Some(&defaults), Some("requested".into()), None),
+            (Some("requested".into()), Some("high".into()))
+        );
+        assert_eq!(
+            resolve_spawn_model_effort(Some(&defaults), None, None),
+            (None, None)
+        );
     }
 
     #[test]

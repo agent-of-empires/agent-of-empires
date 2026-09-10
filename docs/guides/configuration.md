@@ -110,6 +110,7 @@ prevent_sleep_idle_grace_minutes = 15  # release once every session has been idl
 [acp.acp_defaults.opencode]
 model = "openai/gpt-5.5"
 # pin_model = true        # make `model` a pin: creation refuses any other model
+# Empty or whitespace-only model values are unset, including with pin_model.
 effort = "high"           # default thinking level
 mode = "plan"             # default mode, applied when the agent advertises one
 
