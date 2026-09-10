@@ -90,6 +90,16 @@ describe("mobile keyboard proxy", () => {
     expect(receive).toHaveBeenCalledWith({ inputType: "insertText", data: "first", isComposing: false });
   });
 
+  // The overflow guard: a bound queue rejects further edits instead of
+  // growing without limit while no terminal is mounted.
+  it("rejects input past the queue bound", () => {
+    for (let i = 0; i < 128; i++) {
+      const ok = deliverMobileKeyboardProxyInput({ inputType: "insertText", data: `x${i}`, isComposing: false });
+      expect(ok).toBe(true);
+    }
+    expect(deliverMobileKeyboardProxyInput({ inputType: "insertText", data: "over", isComposing: false })).toBe(false);
+  });
+
   it("drops queued input at a session boundary", () => {
     deliverMobileKeyboardProxyInput({ inputType: "insertText", data: "old", isComposing: false });
     clearMobileKeyboardProxyInput();
