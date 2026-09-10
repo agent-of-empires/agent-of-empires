@@ -461,6 +461,14 @@ impl RuntimeBase {
                 "com.agent-of-empires.mount-fingerprint={}",
                 config.mount_fingerprint()
             ));
+            if !config.shared_credential_mounts.is_empty() {
+                args.push("--label".to_string());
+                args.push(format!(
+                    "{}={}",
+                    crate::containers::container_interface::SHARED_CREDENTIAL_MOUNTS_LABEL,
+                    config.shared_credential_label()
+                ));
+            }
         }
 
         for vol in &config.volumes {
@@ -1803,6 +1811,14 @@ mod tests {
     #[test]
     fn store_generation_label_is_emitted_by_supported_runtimes() {
         let config = ContainerConfig::default();
+        let shared = ContainerConfig {
+            shared_credential_mounts: vec!["/root/.claude/.credentials.json".to_string()],
+            ..Default::default()
+        };
+        let credential_label = [
+            "--label",
+            "com.agent-of-empires.shared-credential-mounts=/root/.claude/.credentials.json",
+        ];
         for base in [
             RuntimeBase::DOCKER,
             RuntimeBase::PODMAN,
@@ -1812,6 +1828,9 @@ mod tests {
             assert!(args.windows(2).any(|pair| {
                 pair == ["--label", "com.agent-of-empires.sandbox-store-generation=2"]
             }));
+            assert!(!args.windows(2).any(|pair| pair == credential_label));
+            let args = base.build_create_args("c", "image", &shared);
+            assert!(args.windows(2).any(|pair| pair == credential_label));
         }
     }
 

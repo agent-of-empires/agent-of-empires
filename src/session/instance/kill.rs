@@ -18,12 +18,7 @@ impl Instance {
         if self.pi_session_path.as_deref() == Some(path.as_str()) {
             return;
         }
-        let _ = storage.update(|instances, _| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == self.id) {
-                inst.pi_session_path = Some(path.clone());
-            }
-            Ok(())
-        });
+        self.store_pi_session_path(storage, &path);
     }
 
     /// [`flush_pi_sidecar_conversation`] against this session's own storage,

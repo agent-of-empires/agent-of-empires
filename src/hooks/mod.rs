@@ -928,7 +928,7 @@ fn with_config_lock<T>(
 /// planted at the lock path by a process in the container fails the open and
 /// the write it guards never runs, rather than the lock landing on a host file
 /// outside the bind.
-fn with_config_lock_policy<T>(
+pub(crate) fn with_config_lock_policy<T>(
     path: &Path,
     lock_extension: &str,
     policy: SymlinkPolicy,
@@ -987,7 +987,7 @@ impl SymlinkPolicy {
     /// link would pull an arbitrary host file into a config the container
     /// reads. The type check and the read share one `O_NOFOLLOW` descriptor,
     /// so a link swapped in after the check cannot be the thing read.
-    fn read(self, path: &Path) -> Result<Option<String>> {
+    pub(crate) fn read(self, path: &Path) -> Result<Option<String>> {
         match self {
             Self::Follow => match std::fs::read_to_string(path) {
                 Ok(content) => Ok(Some(content)),

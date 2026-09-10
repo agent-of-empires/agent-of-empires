@@ -20,6 +20,7 @@ use std::sync::{Arc, RwLock};
 use thiserror::Error;
 
 use crate::cli::serve::{daemon_pid, read_serve_urls, ServeUrl};
+use crate::daemon::{DaemonClient, DaemonClientError};
 
 /// A located daemon endpoint. `base_url` carries no query string so it
 /// is safe to log; the auth token (if any) travels separately and is
@@ -60,6 +61,13 @@ impl DaemonEndpoint {
     /// caller can hand it to `tokio_tungstenite::connect_async`.
     pub fn ws_base_url(&self) -> String {
         http_to_ws(&self.base_url)
+    }
+
+    /// Session-list client for this endpoint, carrying the credential as
+    /// resolved now (see `resolved_token`).
+    pub fn daemon_client(&self) -> Result<DaemonClient, DaemonClientError> {
+        let token = self.resolved_token();
+        DaemonClient::new(&self.base_url, token.as_deref())
     }
 
     /// Resolve the credential to send now rather than relying forever on the

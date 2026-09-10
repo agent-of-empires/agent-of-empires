@@ -170,13 +170,26 @@ impl Instance {
                 self.backfill_container_workdir(&container);
                 return Ok(container);
             }
+            // Still rotating the copy in its store. The refresh below would
+            // fold that copy into the shared file and log every sandbox on
+            // it out at the copy's next rotation, so refuse first.
+            if self.predates_shared_credential(&container, &detect_as)? {
+                anyhow::bail!(
+                    "running sandbox {} predates the shared credential file; stop it, then relaunch to rebuild it",
+                    self.id
+                );
+            }
+            // Not a come-up: the credential file stays with the containers'
+            // own rotation, and is only seeded when it holds none.
+            let fold = container_config::CredentialFold::SeedOnly;
             container_config::refresh_agent_configs_for_instance(
                 &self.effective_profile(),
                 &self.id,
                 &self.tool,
                 Some(detect_as.as_str()),
+                fold,
             );
-            let config = self.build_container_config()?;
+            let config = self.build_container_config_with(fold)?;
             self.identity_publisher_launched = config.identity_publisher_installed
                 && identity_publisher_mount_matches(&container, &config)?
                 && identity_publisher_dependencies_available(&container)
@@ -200,6 +213,7 @@ impl Instance {
             );
         }
 
+        let mut recreate = false;
         if container.exists()? {
             if container.sandbox_store_generation_matches()? == Some(false) {
                 container.remove(false)?;
@@ -212,23 +226,33 @@ impl Instance {
                     &self.id,
                     &self.tool,
                     Some(detect_as.as_str()),
+                    container_config::CredentialFold::Freshest,
                 );
                 let config = self.build_container_config()?;
-                container.start()?;
-                self.identity_publisher_launched = config.identity_publisher_installed
-                    && identity_publisher_mount_matches(&container, &config)?
-                    && identity_publisher_dependencies_available(&container)
-                    && self.hook_session_publisher_allowed_by_argv();
-                self.backfill_container_workdir(&container);
-                container_config::ensure_folder_trust_config_for_active_agent(
-                    &self.tool,
-                    Some(detect_as.as_str()),
-                    &self.source_profile,
-                    &self.id,
-                    &self.container_workdir(),
-                    self.is_yolo_mode(),
-                );
-                return Ok(container);
+                // Built before its agent shared a credential file, so it
+                // mounts only the store, whose copy the come-up no longer
+                // refreshes.
+                recreate = container.shared_credential_mounts_match(&config)? == Some(false);
+                if recreate {
+                    container.remove(false)?;
+                } else {
+                    container_config::place_shadowed_credential_mountpoints(&config);
+                    container.start()?;
+                    self.identity_publisher_launched = config.identity_publisher_installed
+                        && identity_publisher_mount_matches(&container, &config)?
+                        && identity_publisher_dependencies_available(&container)
+                        && self.hook_session_publisher_allowed_by_argv();
+                    self.backfill_container_workdir(&container);
+                    container_config::ensure_folder_trust_config_for_active_agent(
+                        &self.tool,
+                        Some(detect_as.as_str()),
+                        &self.source_profile,
+                        &self.id,
+                        &self.container_workdir(),
+                        self.is_yolo_mode(),
+                    );
+                    return Ok(container);
+                }
             }
         }
 
@@ -238,7 +262,10 @@ impl Instance {
 
         // Mint before building the container config so the docker-run env also
         // carries the values (leak-safe via the inherit path in run_create).
-        self.ensure_before_start_env(true)?;
+        // A container just removed for its credential mount was minted above.
+        if !recreate {
+            self.ensure_before_start_env(true)?;
+        }
         let config = self.build_container_config()?;
         // Still the workdir the *previous* container was created with; the pin below
         // is what moves it forward.
@@ -250,6 +277,7 @@ impl Instance {
                 .and_then(|sandbox| sandbox.container_workdir.as_deref()),
         );
         container.remove_stranded_named_ignore_volumes(&self.id, &stranded);
+        container_config::place_shadowed_credential_mountpoints(&config);
         let container_id = container.create(&config)?;
         self.identity_publisher_launched = config.identity_publisher_installed
             && identity_publisher_dependencies_available(&container)
@@ -263,6 +291,25 @@ impl Instance {
         }
 
         Ok(container)
+    }
+
+    /// Whether the session's container was created before its agent shared a
+    /// credential file, so the copy in its store is a token chain the
+    /// container is still rotating. Read from the create-time label rather
+    /// than from the config, since building the config folds that copy in.
+    pub(crate) fn predates_shared_credential(
+        &self,
+        container: &DockerContainer,
+        detect_as: &str,
+    ) -> Result<bool> {
+        if !container_config::agent_shares_credential_file(
+            &self.effective_profile(),
+            &self.tool,
+            Some(detect_as),
+        ) {
+            return Ok(false);
+        }
+        Ok(container.carries_shared_credential_label()? == Some(false))
     }
 
     fn ensure_container_hook_mount_source(&self) {
@@ -359,6 +406,15 @@ impl Instance {
     }
 
     pub(super) fn build_container_config(&self) -> Result<crate::containers::ContainerConfig> {
+        self.build_container_config_with(container_config::CredentialFold::Freshest)
+    }
+
+    /// [`Self::build_container_config`] with `fold` deciding what the build
+    /// may put in the credential file the agent's sandboxes share.
+    fn build_container_config_with(
+        &self,
+        fold: container_config::CredentialFold,
+    ) -> Result<crate::containers::ContainerConfig> {
         self.ensure_container_hook_mount_source();
         let detect_as = self.effective_detect_as();
         let sandbox = self
@@ -391,7 +447,8 @@ impl Instance {
             &self.project_path,
             sandbox,
             container_config::ContainerAgentSelection::new(&self.tool, Some(&detect_as))
-                .with_selected_agent(selected_agent.as_deref()),
+                .with_selected_agent(selected_agent.as_deref())
+                .with_credential_fold(fold),
             self.is_yolo_mode(),
             &self.id,
             self.workspace_info.as_ref(),

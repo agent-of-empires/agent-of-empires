@@ -531,10 +531,13 @@ pub struct HomeView {
     pub(super) system_health_tip_earned: bool,
     pub(super) system_health_discovered: bool,
 
-    // Structured (ACP) rows: the tmux poller above bails on them, so their
-    // status comes from the daemon instead. See `daemon_status_poller`.
-    pub(super) daemon_status_poller: super::daemon_status_poller::DaemonStatusPoller,
-    pub(super) pending_daemon_status_refresh: bool,
+    // The sidebar's subscription to the daemon's session list. Structured
+    // (ACP) rows take their status from it; see `session_feed`.
+    pub(super) session_feed: super::session_feed::SessionFeed,
+    pub(super) pending_session_feed: bool,
+    /// `session.daemon_sidebar`: whether the feed runs at all.
+    pub(super) daemon_sidebar: bool,
+    pub(super) sidebar_source: super::session_feed::SidebarSource,
 
     // Performance: background deletion
     pub(super) deletion_poller: DeletionPoller,

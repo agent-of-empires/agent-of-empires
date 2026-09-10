@@ -669,7 +669,7 @@ pub struct Instance {
     /// whose managed worktree has since moved; the id alone would resolve to
     /// nothing there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pi_session_path: Option<String>,
+    pub(crate) pi_session_path: Option<String>,
 
     #[serde(skip)]
     pub last_error: Option<String>,

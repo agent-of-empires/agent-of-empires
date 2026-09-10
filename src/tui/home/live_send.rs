@@ -1337,8 +1337,8 @@ impl LiveCaptureWorker {
             // whenever a cycle ends with nothing deferred.
             let mut pending_since: Option<std::time::Instant> = None;
             // Render the live preview from an in-process vt100 grid fed by
-            // `tmux pipe-pane -IO` (and route input back through the same
-            // socket), instead of scraping `capture-pane` and forking
+            // `tmux pipe-pane` (and, on tmux 3.8+, route input back through
+            // the same socket), instead of scraping `capture-pane` and forking
             // `send-keys` per keystroke. This is the default; the
             // `[tmux] vt_live` setting turns it off (`vt_enabled_cell`,
             // re-read every cycle so a settings change applies in place).
@@ -1568,7 +1568,7 @@ impl LiveCaptureWorker {
                     #[cfg(not(unix))]
                     let clipboard_now: Option<String> = None;
                     // Acquire one frame + cursor. Default: sample the in-process
-                    // vt100 grid, arming a `pipe-pane -IO` channel once the
+                    // vt100 grid, arming a `pipe-pane` channel once the
                     // selection rests on this target (cursor and alt/mouse
                     // flags come authoritatively from the grid). Until it is
                     // armed, or if arming fails (tmux too old, stopped pane),

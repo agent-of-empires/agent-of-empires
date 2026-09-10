@@ -193,18 +193,47 @@ impl HomeView {
         }
     }
 
-    /// Request the daemon's view of every structured row's status
-    /// (non-blocking). Skipped entirely when no structured session is
-    /// loaded, so a terminal-only home view never talks to the daemon.
-    pub fn request_daemon_status_refresh(&mut self) {
-        if self.pending_daemon_status_refresh {
+    /// Request the daemon's session list (non-blocking). Skipped when
+    /// `session.daemon_sidebar` is off, and when no structured session is
+    /// loaded: the daemon owns nothing on a terminal-only sidebar yet, so
+    /// that view never talks to it.
+    pub fn request_session_feed_refresh(&mut self) {
+        if !self.daemon_sidebar || self.pending_session_feed {
             return;
         }
         if !self.instances.values().any(|i| i.is_structured()) {
             return;
         }
-        self.daemon_status_poller.request_refresh();
-        self.pending_daemon_status_refresh = true;
+        self.session_feed.request_refresh();
+        self.pending_session_feed = true;
+    }
+
+    /// Record where daemon-owned sidebar state comes from, logging the
+    /// transition so a sidebar stuck on stale structured status is
+    /// diagnosable from the log alone. `reason` says why the daemon is not
+    /// the source and is ignored for `Daemon`.
+    pub(super) fn set_sidebar_source(
+        &mut self,
+        source: crate::tui::session_feed::SidebarSource,
+        reason: Option<&str>,
+    ) {
+        use crate::tui::session_feed::SidebarSource;
+
+        if self.sidebar_source == source {
+            return;
+        }
+        self.sidebar_source = source;
+        match source {
+            SidebarSource::Daemon => tracing::info!(
+                target: "tui.home",
+                "sidebar: daemon reachable; structured rows follow /api/sessions",
+            ),
+            SidebarSource::Storage => tracing::info!(
+                target: "tui.home",
+                reason = reason.unwrap_or(""),
+                "sidebar: local store only; daemon-owned state keeps its last value",
+            ),
+        }
     }
 
     /// Whether a daemon-sourced status may be applied to `id`, mirroring the
@@ -241,19 +270,35 @@ impl HomeView {
             && !inst.is_trashed()
     }
 
-    /// Apply any pending daemon-sourced statuses. Returns true if the
-    /// caller should redraw.
-    pub fn apply_daemon_status_updates(&mut self) -> bool {
+    /// Apply a pending session-list result from the daemon. Returns true if
+    /// the caller should redraw.
+    pub fn apply_session_feed(&mut self) -> bool {
+        use crate::tui::session_feed::{self, SessionFeedResult, SidebarSource};
         use std::sync::mpsc::TryRecvError;
 
-        match self.daemon_status_poller.try_recv_updates() {
-            Ok(updates) => {
-                let applied = !updates.is_empty();
-                for update in updates {
-                    self.apply_daemon_status_update(update);
+        match self.session_feed.try_recv() {
+            Ok(result) => {
+                self.pending_session_feed = false;
+                // A result that was in flight when the setting flipped off is
+                // dropped, so "off" means the daemon never drives a row.
+                if !self.daemon_sidebar {
+                    return false;
                 }
-                self.pending_daemon_status_refresh = false;
-                applied
+                match result {
+                    SessionFeedResult::Snapshot(rows) => {
+                        self.set_sidebar_source(SidebarSource::Daemon, None);
+                        let updates = session_feed::structured_updates(&rows);
+                        let applied = !updates.is_empty();
+                        for update in updates {
+                            self.apply_daemon_status_update(update);
+                        }
+                        applied
+                    }
+                    SessionFeedResult::Unavailable(reason) => {
+                        self.set_sidebar_source(SidebarSource::Storage, Some(&reason));
+                        false
+                    }
+                }
             }
             Err(TryRecvError::Empty) => false,
             Err(TryRecvError::Disconnected) => {
@@ -262,11 +307,10 @@ impl HomeView {
                 // freezes for the rest of the process.
                 tracing::error!(
                     target: "tui.home",
-                    "daemon status poller worker gone; respawning a fresh poller",
+                    "session feed worker gone; respawning a fresh feed",
                 );
-                self.daemon_status_poller =
-                    crate::tui::daemon_status_poller::DaemonStatusPoller::new();
-                self.pending_daemon_status_refresh = false;
+                self.session_feed = crate::tui::session_feed::SessionFeed::new();
+                self.pending_session_feed = false;
                 true
             }
         }
@@ -287,7 +331,7 @@ impl HomeView {
     /// terminal rows. Dropping the mismatch keeps one producer per row.
     pub(in crate::tui) fn apply_daemon_status_update(
         &mut self,
-        update: crate::tui::daemon_status_poller::DaemonStatusUpdate,
+        update: crate::tui::session_feed::DaemonStatusUpdate,
     ) {
         use crate::session::Status;
         use crate::tui::status_poller::IdleIntent;

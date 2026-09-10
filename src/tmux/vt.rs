@@ -1,10 +1,11 @@
 //! Shared in-process VT channel.
 //!
-//! A `tmux pipe-pane -IO` stream feeds a pane's raw output into an in-process
+//! A `tmux pipe-pane` stream feeds a pane's raw output into an in-process
 //! [`vt100::Parser`] (a real grid: alt-screen buffer, cursor, mouse/DEC modes),
-//! and the same full-duplex unix socket carries keystroke bytes back to the
-//! pane. tmux still owns the pane (process, persistence, kill-tree); only the
-//! live render/input transport lives here.
+//! and, where tmux can take it safely (`tmux_supports_pipe_pane_input`), the
+//! same full-duplex unix socket carries keystroke bytes back to the pane. tmux
+//! still owns the pane (process, persistence, kill-tree); only the live
+//! render/input transport lives here.
 //!
 //! One [`VtChannel`] per tmux session, shared and refcounted by native live
 //! previews. The channel tears down (disables the pipe, stops the forwarder)
@@ -414,9 +415,9 @@ fn open_within(since: u64, now_ms: u64, window_ms: u64) -> bool {
     since != 0 && now_ms.saturating_sub(since) < window_ms
 }
 
-/// `aoe __vt-pipe <socket>`: the bidirectional `pipe-pane -IO` forwarder. tmux
-/// connects the pane's OUTPUT to this process's stdin and the pane's INPUT to
-/// its stdout, so:
+/// `aoe __vt-pipe <socket>`: the `pipe-pane` forwarder. tmux connects the
+/// pane's OUTPUT to this process's stdin and, when armed `-IO`, the pane's
+/// INPUT to its stdout (`-O` only leaves stdout on /dev/null), so:
 ///   - stdin (pane output) -> socket  (a viewer reads it into a vt100 grid)
 ///   - socket -> stdout (pane input)  (a viewer writes keystrokes, no fork)
 ///
@@ -745,16 +746,27 @@ fn lookup_osc52(session: &str) -> Option<Arc<Osc52Channel>> {
         .and_then(Weak::upgrade)
 }
 
-/// If `session` has a *live* armed channel, return its current cursor-key mode
-/// (DECCKM): `Some(true)` = application cursor keys (`ESC O A`), `Some(false)` =
-/// normal (`ESC [ A`). `None` means no channel is armed, or its forwarder has
-/// disconnected. Presence of `Some` is the single-writer signal: while live,
-/// ALL pane input must go through [`try_send_input`] (never `send-keys`), so
-/// the two writers don't interleave. Gating on liveness means a dead channel
-/// reports `None` and input falls back to `send-keys` rather than vanishing.
-pub(crate) fn input_mode(session: &str) -> Option<bool> {
+/// DECCKM state of `session`'s pane as its *live* grid last saw it, readable
+/// whether or not the channel accepts socket input: `send-keys -H` is as
+/// literal as the socket, so the web terminal re-encodes cursor keys either
+/// way. `None` when no live channel exists.
+pub(crate) fn cursor_mode(session: &str) -> Option<bool> {
     lookup(session)
         .filter(|c| c.is_alive())
+        .map(|c| c.app_cursor.load(Ordering::Relaxed))
+}
+
+/// If `session` has a *live* armed channel, return its current cursor-key mode
+/// (DECCKM): `Some(true)` = application cursor keys (`ESC O A`), `Some(false)` =
+/// normal (`ESC [ A`). `None` means no channel is armed, it is output-only, or
+/// its forwarder has disconnected. Presence of `Some` is the single-writer
+/// signal: while live, ALL pane input must go through [`try_send_input`]
+/// (never `send-keys`), so the two writers don't interleave. Gating on
+/// liveness means a dead channel reports `None` and input falls back to
+/// `send-keys` rather than vanishing.
+pub(crate) fn input_mode(session: &str) -> Option<bool> {
+    lookup(session)
+        .filter(|c| c.input && c.is_alive())
         .map(|c| c.app_cursor.load(Ordering::Relaxed))
 }
 
@@ -773,7 +785,9 @@ fn sh_quote(s: &str) -> String {
 
 /// The pane's geometry AND cursor in one `display-message` fork:
 /// `(pane_width, pane_height, cursor_x, cursor_y)`, the cursor 0-based in
-/// visible-screen coordinates (the space `assemble_seed_stream`'s CUP uses).
+/// visible-screen coordinates, the space [`reconcile_step`] compares the grid's
+/// cursor in once the two agree on geometry. [`seeded_cursor_row`] is what maps
+/// it onto a grid whose height differs.
 ///
 /// Folded into the geometry probe rather than run as a second fork because
 /// [`VtChannel::reconcile_grid`] needs both on the same once-a-second budget:
@@ -890,8 +904,9 @@ fn reconcile_step(
 /// state before and after the `capture-pane` fork and retries while the two
 /// disagree, so a pane that scrolled, moved its cursor, or flipped screens
 /// mid-seed can't stamp a stale position into the fresh grid. `history_size`
-/// and `pane_height` exist for that comparison alone, mirroring the drift
-/// fields `merge_cursor_probes` trusts on the legacy capture path.
+/// exists for that comparison alone, mirroring the drift fields
+/// `merge_cursor_probes` trusts on the legacy capture path; `pane_height` also
+/// anchors [`seeded_cursor_row`].
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct PaneSeedState {
     alt: bool,
@@ -916,7 +931,8 @@ struct PaneSeedState {
     /// pane that scrolled between the probes grew its history, even when the
     /// cursor stayed pinned to the same bottom row.
     history_size: u32,
-    /// `#{pane_height}`: resize detector for the same check; a resize mid-seed
+    /// `#{pane_height}`: resize detector for the same check, and the height
+    /// [`seeded_cursor_row`] counts `cursor_y` back from; a resize mid-seed
     /// invalidates the coordinate space `cursor_y` was reported in.
     pane_height: u16,
     /// `#{pane_width}`: the other resize axis. A width-only resize rewraps the
@@ -1095,8 +1111,7 @@ fn seed_parser(
     guard: SeedGuard<'_>,
     fence: SeedInstallFence<'_>,
 ) -> VtRefreshResult {
-    let (_, rows) = size;
-    let Some(stream) = capture_seed_stream(target, rows, deadline) else {
+    let Some(stream) = capture_seed_stream(target, size, deadline) else {
         return VtRefreshResult::Failed;
     };
     install_seeded_parser(sink, since, &stream, size, guard, fence)
@@ -1154,10 +1169,11 @@ fn install_seeded_parser(
 /// generation check `swap_seeded_parser` needs.
 fn capture_seed_stream(
     target: &str,
-    rows: u16,
+    size: (u16, u16),
     deadline: &crate::tmux::TmuxCommandDeadline,
 ) -> Option<Vec<u8>> {
-    let (body, state) = capture_seed_snapshot(target, deadline)?;
+    let (cols, rows) = size;
+    let (body, state) = capture_seed_snapshot(target, (cols, rows), deadline)?;
     Some(assemble_seed_stream(&body, &state, rows))
 }
 
@@ -1236,10 +1252,11 @@ fn swap_drained_seeded_parser(
     swap_seeded_parser(sink, since, stream, size, drained_guard.guard)
 }
 /// How many times [`capture_seed_snapshot`] re-runs the probe/capture/probe
-/// round before settling for its last (possibly raced) snapshot. Each retry
-/// costs two forks plus a short settle sleep, and only fires while the pane is
-/// actively changing under the seed, so the bound is about capping seed latency
-/// on a pane that streams continuously, not about a steady state.
+/// round before settling for its last (possibly raced or off-geometry)
+/// snapshot. Each retry costs two forks plus a short settle sleep, and only
+/// fires while the pane is changing or is not yet at the size being seeded, so
+/// the bound is about capping seed latency on a pane that streams continuously
+/// or is mid-resize, not about a steady state.
 const SEED_PROBE_ATTEMPTS: usize = 3;
 
 /// Pause between disagreeing seed attempts, letting a mid-flight burst (a
@@ -1273,6 +1290,7 @@ const SEED_INSTALL_RETRY: Duration = Duration::from_millis(20);
 /// residue).
 fn capture_seed_snapshot(
     target: &str,
+    want: (u16, u16),
     deadline: &crate::tmux::TmuxCommandDeadline,
 ) -> Option<(Vec<u8>, PaneSeedState)> {
     let seed_start = format!("-{SCROLLBACK_LINES}");
@@ -1324,16 +1342,24 @@ fn capture_seed_snapshot(
         }
         let post = parse_seed_state(probe_line);
         let agreed = pre == post;
+        // A capture taken at the geometry we are seeding at needs no mapping and
+        // lays its cells out for the grid that will hold them, so it is worth
+        // one more probe. Bounded by the same attempt budget and only ever
+        // entered while the pane disagrees, so the settled case still returns on
+        // the first pass.
+        let at_want = (post.pane_width, post.pane_height) == want;
         last = Some((body.to_vec(), post));
-        if agreed {
+        if agreed && at_want {
             return last;
         }
     }
-    if last.is_some() {
+    if let Some((_, state)) = last.as_ref() {
         tracing::debug!(
             %target,
             attempts = SEED_PROBE_ATTEMPTS,
-            "vt seed: bracketing probes never agreed; seeding from last snapshot"
+            probe = ?(state.pane_width, state.pane_height),
+            want = ?want,
+            "vt seed: no settled snapshot at the target geometry; seeding from last"
         );
     }
     last
@@ -1384,16 +1410,16 @@ fn split_seed_capture(raw: &[u8]) -> (&[u8], &str) {
 /// absolute CUP and the DECTCEM show/hide.
 ///
 /// The body is fed faithfully, including the blank rows capture-pane pads out to
-/// the full pane height, so the parser's visible screen is a pixel-for-pixel
-/// replica of the pane. Only the single trailing line terminator is dropped:
+/// the full pane height, so the parser's visible screen replicates the pane
+/// whenever the two are the same height. When they are not, the surplus rows
+/// scroll into the grid's history and [`seeded_cursor_row`] carries the cursor
+/// with them; the cells stay offset until a reseed at matching geometry. Only the single trailing line terminator is dropped:
 /// with it, the final `\n` would push the whole screen up one row (the top row
-/// scrolls into history) and misplace every cell. Because the visible screen is
-/// faithful, the CUP is a plain 1-based `#{cursor_y}` / `#{cursor_x}`, which
-/// addresses the visible screen regardless of how much scrollback sits behind
-/// it (that is the coordinate space tmux reports the cursor in). Without this,
-/// the parser's cursor lands after the last replayed glyph, bottom-right for a
-/// full-screen app, until the first live chunk carries the app's own escapes
-/// (issue #2902).
+/// scrolls into history) and misplace every cell. The CUP that follows carries
+/// `#{cursor_x}` and the row [`seeded_cursor_row`] maps `#{cursor_y}` onto.
+/// Without it the parser's cursor lands after the last replayed glyph,
+/// bottom-right for a full-screen app, until the first live chunk carries the
+/// app's own escapes (issue #2902).
 fn assemble_seed_stream(body: &[u8], state: &PaneSeedState, rows: u16) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::with_capacity(body.len() + 32);
     if state.alt {
@@ -1418,10 +1444,9 @@ fn assemble_seed_stream(body: &[u8], state: &PaneSeedState, rows: u16) -> Vec<u8
         out.extend_from_slice(b"\x1b[?1h");
     }
     out.extend_from_slice(&lf_to_crlf(strip_trailing_row_terminator(body)));
-    // 1-based CUP in visible-screen coordinates, clamped to the grid so a stale
-    // query (the pane moved between the state read and this seed) can't push the
-    // cursor off-screen; the first live chunk re-syncs it either way.
-    let cy = state.cursor_y.min(rows.saturating_sub(1)) + 1;
+    // 1-based CUP, clamped to the grid so a state read this far off can't push
+    // the cursor off-screen; the first live chunk re-syncs it either way.
+    let cy = seeded_cursor_row(body, state, rows).min(rows.saturating_sub(1)) + 1;
     let cx = state.cursor_x + 1;
     out.extend_from_slice(format!("\x1b[{cy};{cx}H").as_bytes());
     out.extend_from_slice(if state.cursor_visible {
@@ -1430,6 +1455,40 @@ fn assemble_seed_stream(body: &[u8], state: &PaneSeedState, rows: u16) -> Vec<u8
         b"\x1b[?25l"
     });
     out
+}
+
+/// The seeded grid's own row for the pane cursor tmux reported at
+/// `state.cursor_y`.
+///
+/// tmux counts `cursor_y` from the top of the pane's visible screen, so that is
+/// the grid's row only while the grid is exactly as tall as the pane the body
+/// came from. A reseed racing a `resize-window` breaks that: the capture reads
+/// the pane at its old, taller height, the surplus rows scroll off the top of
+/// the shorter grid and carry the pane's content up with them, and a bare
+/// `cursor_y` leaves the cursor parked that many rows BELOW the content. The
+/// app's next redraw prints its prompt there, so the grid ends up holding two
+/// prompt rows where the pane has one, and no reconcile can see it: grid and
+/// pane still agree on geometry and on the cursor, only the cells differ.
+///
+/// Bottom-anchoring the row survives a mismatch either way, and reduces to
+/// `cursor_y` whenever the two heights agree. A `pane_height` of 0 means the
+/// probe carried no geometry, so keep the plain mapping there.
+///
+/// `tui::home::render::map_live_preview_cursor` bottom-anchors the same pane
+/// cursor onto the TUI preview rect (#2742, #3515); keep the two in step.
+fn seeded_cursor_row(body: &[u8], state: &PaneSeedState, rows: u16) -> u16 {
+    if state.pane_height == 0 {
+        return state.cursor_y;
+    }
+    let fed = strip_trailing_row_terminator(body);
+    let body_rows = if fed.is_empty() {
+        0
+    } else {
+        u16::try_from(fed.iter().filter(|&&b| b == b'\n').count() + 1).unwrap_or(u16::MAX)
+    };
+    // Rows of the body the grid still shows; the rest scrolled into history.
+    let visible = body_rows.min(rows);
+    visible.saturating_sub(state.pane_height.saturating_sub(state.cursor_y))
 }
 
 /// Drop the single trailing line terminator (`\n` or `\r\n`) from a
@@ -1448,21 +1507,36 @@ fn strip_trailing_row_terminator(raw: &[u8]) -> &[u8] {
     }
 }
 
-/// `pipe-pane -I` (input injection) landed in tmux 2.8, and a dead-pane write
-/// crash was fixed in 3.4, so we require >= 3.4 before arming a channel. Older
-/// tmux (or a `tmux -V` we can't parse) falls back to the capture path. Cached:
-/// the server version doesn't change under a running aoe.
+/// `pipe-pane -O` landed in tmux 2.8; 3.4 is the floor for arming a channel at
+/// all. Older tmux (or a `tmux -V` we can't parse) falls back to the capture
+/// path. Cached: the server version doesn't change under a running aoe.
 fn tmux_supports_pipe_pane_io(deadline: &crate::tmux::TmuxCommandDeadline) -> bool {
     static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     cached_tmux_support(&SUPPORTED, || {
-        let mut command = crate::tmux::tmux_command();
-        command.arg("-V");
-        let out = deadline.run(&mut command).ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        parse_tmux_pipe_support(&String::from_utf8_lossy(&out.stdout))
+        parse_tmux_pipe_support(&tmux_version(deadline)?)
     })
+}
+
+/// Whether keystrokes may ride the pipe's `-I` side. Through 3.7a, a pane that
+/// exits under `remain-on-exit` frees its pty event but keeps its pipe, so the
+/// next byte the pipe process writes is a NULL `bufferevent_write` that kills
+/// the whole tmux server and every session on it (upstream fix f751d3f, after
+/// 3.7a). Below that, channels arm `-O` only and input stays on `send-keys`.
+fn tmux_supports_pipe_pane_input(deadline: &crate::tmux::TmuxCommandDeadline) -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cached_tmux_support(&SUPPORTED, || {
+        parse_tmux_pipe_input_support(&tmux_version(deadline)?)
+    })
+}
+
+fn tmux_version(deadline: &crate::tmux::TmuxCommandDeadline) -> Option<String> {
+    let mut command = crate::tmux::tmux_command();
+    command.arg("-V");
+    let out = deadline.run(&mut command).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 fn cached_tmux_support(
@@ -1480,6 +1554,14 @@ fn cached_tmux_support(
 }
 
 fn parse_tmux_pipe_support(version: &str) -> Option<bool> {
+    parse_tmux_version(version).map(|v| v >= (3, 4))
+}
+
+fn parse_tmux_pipe_input_support(version: &str) -> Option<bool> {
+    parse_tmux_version(version).map(|v| v >= (3, 8))
+}
+
+fn parse_tmux_version(version: &str) -> Option<(u32, u32)> {
     let digits: String = version
         .trim()
         .trim_start_matches(|c: char| !c.is_ascii_digit())
@@ -1489,7 +1571,7 @@ fn parse_tmux_pipe_support(version: &str) -> Option<bool> {
     let mut parts = digits.split('.');
     let major: u32 = parts.next()?.parse().ok()?;
     let minor: u32 = parts.next()?.parse().ok()?;
-    Some((major, minor) >= (3, 4))
+    Some((major, minor))
 }
 fn cursor_from_screen(screen: &vt100::Screen, rows: u16, cols: u16) -> PaneCursor {
     let (y, x) = screen.cursor_position();
@@ -1837,10 +1919,19 @@ fn record_links(slot: &LinkTable, found: Vec<PaneLink>) {
 /// Replace a channel's table with the links an accepted snapshot advertises.
 ///
 /// A seed covers the whole scrollback the grid keeps, so it is the complete set
-/// of what the pane is currently offering. Merging into the table instead would
-/// leave a target behind for a label the pane has since reprinted as plain
-/// text, and the text matcher would keep that label actionable against an
-/// obsolete URI.
+/// of what the pane is currently offering, including links the reader never saw
+/// (seed bytes are replayed into a fresh parser, not fed through `run_reader`).
+/// Merging into the table instead would leave a target behind for a label the
+/// pane has since reprinted as plain text, and the text matcher would keep that
+/// label actionable against an obsolete URI.
+///
+/// Only an ACCEPTED seed reaches here, under the parser lock beside the grid it
+/// describes, so the table and the frame it speaks for are installed together.
+/// The install holds the snapshot fence across all of that, and `run_reader`
+/// holds the same fence from before `recv` through its own parse, which is what
+/// stops a replacement landing between a target being recorded and the label
+/// that needs it reaching the grid (#3818). The parser lock pairs the table
+/// with its frame; the fence is what orders the two writers.
 fn reconcile_links(slot: &LinkTable, found: Vec<PaneLink>) {
     let Ok(mut table) = slot.table.lock() else {
         return;
@@ -1858,19 +1949,6 @@ fn reconcile_links(slot: &LinkTable, found: Vec<PaneLink>) {
         *table = next;
         slot.generation.fetch_add(1, Ordering::Release);
     }
-}
-
-/// Fold a `capture-pane -e` seed's hyperlinks into a channel's table.
-///
-/// The seed bytes are replayed into a fresh parser rather than passing through
-/// `run_reader`, so without this a link already on screen when the channel arms
-/// would lose its target until the pane reprinted it. Reseeds run this too,
-/// which keeps a link that is still on screen recorded no matter how long ago
-/// its sequence left the stream. Recorded even when the swap loses its race:
-/// the pane advertised the link either way.
-#[cfg(test)]
-fn record_seed_links(slot: &LinkTable, stream: &[u8]) {
-    reconcile_links(slot, crate::tmux::osc8::extract_links(stream));
 }
 
 /// A channel's link table plus a counter that moves whenever it does.
@@ -2040,7 +2118,9 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
                 // Below the seed gate on purpose, unlike the OSC 52 tap above:
                 // a dropped pre-seed chunk never reaches the grid, and the seed
                 // snapshot carries its links instead, so recording here would
-                // leave targets for text that was never accepted.
+                // leave targets for text that was never accepted. Inside the
+                // fence with the parse below it, so a seed replacing the table
+                // cannot land between this chunk's targets and its bytes.
                 record_links(&ctx.links, osc8.feed(&buf[..n]));
                 if let Ok(mut p) = ctx.parser.lock() {
                     p.process(&buf[..n]);
@@ -2091,12 +2171,15 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
     ctx.notify_viewers();
 }
 
-/// One shared pane channel: a vt100 grid fed by a `pipe-pane -IO` byte stream,
+/// One shared pane channel: a vt100 grid fed by a `pipe-pane` byte stream,
 /// plus the writable half of the same socket for keystroke injection. Methods
 /// take `&self` (interior mutability) so many viewers share one `Arc`.
 pub(crate) struct VtChannel {
     /// tmux session name; the registry key.
     name: String,
+    /// Armed `-IO` (keystrokes ride the socket) rather than `-O` only (input
+    /// stays on `send-keys`); see `tmux_supports_pipe_pane_input`.
+    input: bool,
     /// Fencing token for this exact pipe generation.
     owner_id: String,
     /// `name:^.0`, the pane target for tmux commands.
@@ -2181,19 +2264,86 @@ pub(crate) struct VtChannel {
     /// so `sample` refreshes at a fraction of `VT_OWNER_TTL` instead of
     /// forking `set-option` every call.
     last_owner_hb: Mutex<Instant>,
-    /// Geometry the parser still has to be rebuilt at, packed by [`pack_size`];
-    /// 0 when its grid describes the pane. tmux reflows on resize while
+    /// The pane's resize bookkeeping; see [`ResizeState`].
+    resize: Mutex<ResizeState>,
+}
+
+/// What the parser still owes the pane after a resize, plus enough about the
+/// resizes themselves to say who owes it and whether anyone is still working.
+///
+/// One lock over the three concerns #3817 named, because every viewer of the
+/// channel shares this gate and any of them may declare a resize: split across
+/// atomics, a declaration's identity, the resizes still running, and the
+/// retirement of an expectation can be read apart, and one viewer then retires
+/// another's outstanding work.
+#[derive(Default)]
+struct ResizeState {
+    /// Geometry the parser has to be rebuilt at, packed by [`pack_size`]; 0
+    /// when its grid describes the pane. tmux reflows on resize while
     /// `pipe-pane` carries no reflow redraw, so between the pane changing size
-    /// and the reseed landing the grid renders a layout the pane no longer has.
-    /// A reseed that comes back `Busy` or `Failed` leaves it that way, and the
-    /// channel is shared: this belongs here, not in one viewer's state, or the
-    /// viewers that did not drive the resize keep publishing the stale grid.
-    resync_target: AtomicU64,
-    /// Seqlock over pane resizes: odd while one is in flight, and bumped again
-    /// when it finishes. A geometry probe that straddles a resize describes
-    /// either side of it, so it cannot be trusted to retire the expectation
-    /// that resize declared (see [`VtChannel::observe_pane_geometry`]).
-    resize_seq: AtomicU64,
+    /// and the reseed landing the grid renders a layout the pane no longer
+    /// has. A reseed that comes back `Busy` or `Failed` leaves it that way.
+    /// Not `target`, which on [`VtChannel`] is the tmux pane this all describes.
+    owed: u64,
+    /// Which declaration installed `owed`. Monotonic and never reused, so a
+    /// withdrawal names its own declaration: two viewers resizing to the same
+    /// geometry are two declarations, and the geometry cannot tell them apart.
+    token: u64,
+    /// Resizes still running. A count, not a parity: two overlapping
+    /// declarations must not read as none in flight.
+    in_flight: usize,
+    /// Bumped by every declaration and every resize that finishes, so a probe
+    /// can tell whether any of it moved while the probe was in flight.
+    epoch: u64,
+}
+
+impl ResizeState {
+    /// Owe `geometry` under a fresh identity, and return that identity.
+    fn declare(&mut self, geometry: u64) -> u64 {
+        self.epoch += 1;
+        self.token += 1;
+        self.owed = geometry;
+        self.token
+    }
+
+    /// Declare `geometry` and open a resize window over it, which stays open
+    /// until the matching [`Self::finish`].
+    fn begin(&mut self, geometry: u64) -> u64 {
+        self.in_flight += 1;
+        self.declare(geometry)
+    }
+
+    /// Close a resize's window, and withdraw the declaration it opened when
+    /// `withdrawn` names it: one caller's resize never ran, so its expectation
+    /// goes with it.
+    ///
+    /// Only the last resize standing may withdraw. Naming the declaration is
+    /// enough to protect a NEWER one, which has replaced this token, but not an
+    /// older one still running behind it: two viewers declare before either
+    /// learns who owns the pane size, so the one that declared second can be
+    /// the one that turns out not to own it. Leaving the expectation up is the
+    /// safe direction either way, and a probe retires it a pass later if
+    /// nothing owed it after all.
+    fn finish(&mut self, withdrawn: Option<u64>) {
+        if withdrawn == Some(self.token) && self.in_flight == 1 {
+            self.owed = 0;
+        }
+        self.epoch += 1;
+        self.in_flight -= 1;
+    }
+
+    /// Whether nothing about the resize state moved since `probe` and nothing
+    /// is moving now, i.e. whatever that probe read still describes the pane.
+    fn settled_since(&self, probe: ResizeObservation) -> bool {
+        self.in_flight == 0 && self.epoch == probe.epoch
+    }
+}
+
+/// The resize state as it stood before a geometry probe, handed back to
+/// [`VtChannel::observe_pane_geometry`] with what the probe read.
+#[derive(Clone, Copy)]
+struct ResizeObservation {
+    epoch: u64,
 }
 
 fn pack_size(cols: u16, rows: u16) -> u64 {
@@ -2234,25 +2384,33 @@ impl VtSample {
     }
 }
 
-/// A pane resize in progress. Holding one marks [`VtChannel::resize_seq`] odd,
-/// so a geometry probe overlapping it knows not to retire the expectation the
-/// resize declared; dropping it closes the window.
+/// A pane resize in progress. Holding one keeps the channel counting a resize
+/// in flight, so a geometry probe overlapping it knows not to retire the
+/// expectation the resize declared; dropping it closes the window.
 pub(crate) struct ResizeInFlight<'a> {
     channel: &'a VtChannel,
+    /// The declaration this resize opened, so a withdrawal names that one and
+    /// not whatever has since replaced it.
     token: u64,
+    withdrawn: bool,
 }
 
 impl ResizeInFlight<'_> {
     /// The resize never ran (this caller turned out not to own the pane size):
-    /// withdraw its expectation, unless a newer one has replaced it.
-    pub(crate) fn abandon(self) {
-        self.channel.abandon_expected_grid(self.token);
+    /// withdraw its expectation, unless a newer declaration has replaced it or
+    /// another resize is still in flight behind it (see [`ResizeState::finish`]
+    /// for why both). Marks rather than acts, so closing the window and
+    /// withdrawing the declaration are the one locked step below.
+    pub(crate) fn abandon(mut self) {
+        self.withdrawn = true;
     }
 }
 
 impl Drop for ResizeInFlight<'_> {
     fn drop(&mut self) {
-        self.channel.resize_seq.fetch_add(1, Ordering::Release);
+        self.channel
+            .resize_state()
+            .finish(self.withdrawn.then_some(self.token));
     }
 }
 
@@ -2449,7 +2607,9 @@ impl VtChannel {
             sh_quote(&exe.to_string_lossy()),
             sh_quote(&sock_path.to_string_lossy())
         );
-        let armed = session.arm_vt_pipe_if_owner_with_deadline(&owner, "-IO", &pipe_cmd, deadline);
+        let input = tmux_supports_pipe_pane_input(deadline);
+        let flags = if input { "-IO" } else { "-O" };
+        let armed = session.arm_vt_pipe_if_owner_with_deadline(&owner, flags, &pipe_cmd, deadline);
         if !armed {
             tracing::warn!(%target, "vt: tmux pipe-pane failed; falling back to capture");
             stop_and_wake_reader(&stop, &sock_path);
@@ -2550,12 +2710,14 @@ impl VtChannel {
             %target,
             cols,
             rows,
+            flags,
             pid = std::process::id(),
-            "vt channel armed (pipe-pane -IO <-> vt100 grid)"
+            "vt channel armed (pipe-pane <-> vt100 grid)"
         );
 
         Some(Self {
             name: name.to_string(),
+            input,
             owner_id: owner,
             target,
             parser,
@@ -2584,8 +2746,7 @@ impl VtChannel {
             last_size_check: Mutex::new(Instant::now()),
             pending_drift: Mutex::new(None),
             last_owner_hb: Mutex::new(Instant::now()),
-            resync_target: AtomicU64::new(0),
-            resize_seq: AtomicU64::new(0),
+            resize: Mutex::new(ResizeState::default()),
         })
     }
 
@@ -2633,7 +2794,7 @@ impl VtChannel {
         drop(guard);
         // Before the probe: a resize that starts or finishes while it is in
         // flight makes what it read obsolete.
-        let probe_seq = self.resize_seq();
+        let probe = self.resize_observation();
         let Some((c, r, cx, cy)) = pane_size_cursor(&self.target, deadline) else {
             return;
         };
@@ -2656,7 +2817,7 @@ impl VtChannel {
         drop(p);
         // tmux has just told us the pane's real size, which is what any
         // outstanding resize expectation was a guess at.
-        self.observe_pane_geometry((c, r), probe_seq);
+        self.observe_pane_geometry((c, r), probe);
         let pending = self.pending_drift.lock().ok().and_then(|guard| *guard);
         match reconcile_step((c, r, cx, cy), (gc, gr, gcx, gcy), pending, grid_gen) {
             GridReconcile::InSync => self.clear_drift(),
@@ -2955,14 +3116,19 @@ impl VtChannel {
         result
     }
 
+    /// The channel's resize bookkeeping. Recovers a poisoned lock rather than
+    /// propagating the panic: every field is a counter this module maintains,
+    /// and the gate it drives is display-only.
+    fn resize_state(&self) -> std::sync::MutexGuard<'_, ResizeState> {
+        self.resize.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Declare the geometry the pane is being resized to, before the resize
     /// runs. [`Self::grid_resync_pending`] holds every viewer off the grid from
     /// this moment until the parser is rebuilt at it, so no one can publish a
     /// frame laid out for the size the pane just left.
-    fn expect_grid_size(&self, cols: u16, rows: u16) -> u64 {
-        let target = pack_size(cols, rows);
-        self.resync_target.store(target, Ordering::Relaxed);
-        target
+    fn expect_grid_size(&self, cols: u16, rows: u16) {
+        self.resize_state().declare(pack_size(cols, rows));
     }
 
     /// Open the window in which the pane's size is changing: declare the
@@ -2971,18 +3137,20 @@ impl VtChannel {
     /// concurrent geometry probe can tell that what it read may already be
     /// obsolete.
     pub(crate) fn begin_resize(&self, cols: u16, rows: u16) -> ResizeInFlight<'_> {
-        self.resize_seq.fetch_add(1, Ordering::Release);
-        let token = self.expect_grid_size(cols, rows);
+        let token = self.resize_state().begin(pack_size(cols, rows));
         ResizeInFlight {
             channel: self,
             token,
+            withdrawn: false,
         }
     }
 
-    /// The resize seqlock, for a caller that is about to read the pane's
-    /// geometry and will hand the value back to [`Self::observe_pane_geometry`].
-    pub(crate) fn resize_seq(&self) -> u64 {
-        self.resize_seq.load(Ordering::Acquire)
+    /// The resize state, for a caller that is about to read the pane's geometry
+    /// and will hand the value back to [`Self::observe_pane_geometry`].
+    fn resize_observation(&self) -> ResizeObservation {
+        ResizeObservation {
+            epoch: self.resize_state().epoch,
+        }
     }
 
     /// Resolve any outstanding expectation against the geometry tmux just
@@ -3002,14 +3170,16 @@ impl VtChannel {
     /// and gating the grid on it would put the channel into a retry loop over
     /// something the same reconcile pass is already fixing.
     ///
-    /// `probe_seq` is [`Self::resize_seq`] read BEFORE the probe. Matching
-    /// dimensions only retire an expectation when no resize overlapped it: one
-    /// viewer's probe can read the pane before another viewer's resize lands
-    /// and come back to a grid that still agrees with it, which says nothing
-    /// about the resize now in flight. Re-aiming is left unguarded because it
-    /// keeps the gate up, which is the safe direction for a stale read.
-    fn observe_pane_geometry(&self, pane: (u16, u16), probe_seq: u64) {
-        if self.resync_target.load(Ordering::Relaxed) == 0 {
+    /// `probe` is [`Self::resize_observation`] read BEFORE the probe. Matching
+    /// dimensions only retire an expectation when nothing about the resize
+    /// state moved across it: one viewer's probe can read the pane before
+    /// another viewer's resize lands and come back to a grid that still agrees
+    /// with it, which says nothing about the resize now in flight. Re-aiming is
+    /// left unguarded because it keeps the gate up, which is the safe direction
+    /// for a stale read.
+    fn observe_pane_geometry(&self, pane: (u16, u16), probe: ResizeObservation) {
+        let mut state = self.resize_state();
+        if state.owed == 0 {
             return;
         }
         if pane
@@ -3018,25 +3188,12 @@ impl VtChannel {
                 self.rows.load(Ordering::Relaxed),
             )
         {
-            self.expect_grid_size(pane.0, pane.1);
+            state.declare(pack_size(pane.0, pane.1));
             return;
         }
-        if probe_seq % 2 == 0 && probe_seq == self.resize_seq() {
-            self.clear_resync_target();
+        if state.settled_since(probe) {
+            state.owed = 0;
         }
-    }
-
-    /// Drop an expectation whose resize never happened (the caller turned out
-    /// not to own the pane size). Conditional, so a resize that another viewer
-    /// declared in the meantime is left standing.
-    fn abandon_expected_grid(&self, token: u64) {
-        let _ = self
-            .resync_target
-            .compare_exchange(token, 0, Ordering::Relaxed, Ordering::Relaxed);
-    }
-
-    fn clear_resync_target(&self) {
-        self.resync_target.store(0, Ordering::Relaxed);
     }
 
     /// True while the parser has not been rebuilt at the geometry the pane was
@@ -3050,22 +3207,24 @@ impl VtChannel {
     /// The geometry still owed, for a caller that wants to drive the reseed
     /// rather than wait for the periodic reconcile.
     pub(crate) fn pending_resync_target(&self) -> Option<(u16, u16)> {
-        let target = self.resync_target.load(Ordering::Relaxed);
-        if target == 0 {
+        let mut state = self.resize_state();
+        if state.owed == 0 {
             return None;
         }
-        if target
+        if state.owed
             == pack_size(
                 self.cols.load(Ordering::Relaxed),
                 self.rows.load(Ordering::Relaxed),
             )
         {
             // Reached, by whichever path got there: reconcile, another viewer's
-            // resize, or this channel rearming.
-            self.clear_resync_target();
+            // resize, or this channel rearming. Read and cleared under the one
+            // lock, so a declaration landing between the two is not retired by
+            // a decision taken before it existed.
+            state.owed = 0;
             return None;
         }
-        Some(((target >> 16) as u16, target as u16))
+        Some(((state.owed >> 16) as u16, state.owed as u16))
     }
 
     /// Re-read the pane and reconcile the grid with it from a caller that is
@@ -3141,6 +3300,9 @@ impl VtChannel {
 
     fn write_input(&self, bytes: &[u8]) -> bool {
         use std::io::Write;
+        if !self.input {
+            return false;
+        }
         let mut guard = self.stream.lock().unwrap();
         match guard.as_mut() {
             Some(stream) => stream.write_all(bytes).is_ok(),
@@ -3449,6 +3611,75 @@ impl Drop for Osc52Channel {
     }
 }
 
+/// Test double for a channel that never armed a pipe: no reader thread, no
+/// socket, flags set by the caller. Shared with consumer tests in other modules.
+#[cfg(test)]
+pub(crate) fn dummy_channel_with_input(
+    name: &str,
+    dir: &std::path::Path,
+    input: bool,
+) -> (Arc<VtChannel>, Arc<AtomicU8>) {
+    let lifecycle = Arc::new(AtomicU8::new(VtLifecycle::Starting as u8));
+    let ch = Arc::new(VtChannel {
+        name: name.to_string(),
+        input,
+        owner_id: new_pipe_owner_id(),
+        target: format!("{name}:^.0"),
+        parser: Arc::new(Mutex::new(vt100::Parser::new(4, 20, SCROLLBACK_LINES))),
+        stream: Arc::new(Mutex::new(None)),
+        app_cursor: Arc::new(AtomicBool::new(false)),
+        lifecycle: lifecycle.clone(),
+        wakeup: Arc::new(Mutex::new(None)),
+        clipboard: Arc::new(Mutex::new(None)),
+        links: Arc::new(LinkTable::default()),
+        chunk_seq: Arc::new(AtomicU64::new(0)),
+        settled_chunk_seq: Arc::new(AtomicU64::new(0)),
+        snapshot: Arc::new(Mutex::new(())),
+        drain: Arc::new(Mutex::new(DrainControl::default())),
+        last_chunk_ms: Arc::new(AtomicU64::new(0)),
+        prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
+        grid_gen: Arc::new(AtomicU64::new(0)),
+        signals: Arc::new(ViewerSignals::new()),
+        armed_at: Instant::now(),
+        sample_cache: Mutex::new(None),
+        sock_dir: dir.to_path_buf(),
+        sock_path: dir.join("s.sock"),
+        stop: Arc::new(AtomicBool::new(false)),
+        reader: Mutex::new(None),
+        cols: AtomicU16::new(20),
+        rows: AtomicU16::new(4),
+        last_size_check: Mutex::new(Instant::now()),
+        pending_drift: Mutex::new(None),
+        last_owner_hb: Mutex::new(Instant::now()),
+        resize: Mutex::new(ResizeState::default()),
+    });
+    (ch, lifecycle)
+}
+
+/// Publish a live test double for `name` with the given input capability and
+/// DECCKM state, as `acquire` would. The returned `Arc` keeps it registered.
+#[cfg(test)]
+pub(crate) fn register_live_for_test(
+    name: &str,
+    dir: &std::path::Path,
+    input: bool,
+    app_cursor: bool,
+) -> Arc<VtChannel> {
+    let (channel, lifecycle) = dummy_channel_with_input(name, dir, input);
+    channel.app_cursor.store(app_cursor, Ordering::Relaxed);
+    VtLifecycle::Live.store(&lifecycle);
+    REGISTRY
+        .lock()
+        .unwrap()
+        .insert(name.to_string(), Arc::downgrade(&channel));
+    channel
+}
+
+#[cfg(test)]
+pub(crate) fn unregister_for_test(name: &str) {
+    REGISTRY.lock().unwrap().remove(name);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3478,6 +3709,30 @@ mod tests {
         ];
         for (version, expected) in cases {
             assert_eq!(parse_tmux_pipe_support(version), expected, "{version}");
+        }
+    }
+
+    #[test]
+    fn pipe_input_requires_a_tmux_that_survives_a_dead_pane_write() {
+        // Through 3.7a, tmux keeps the pipe-pane bufferevent after a pane's
+        // process exits under remain-on-exit, so the next byte written to the
+        // dead pane's input is a NULL bufferevent_write that takes the whole
+        // server (every session) down. Output streaming is unaffected.
+        let cases = [
+            ("tmux 3.4", Some(false)),
+            ("tmux 3.5a", Some(false)),
+            ("tmux 3.7a", Some(false)),
+            ("tmux 3.8", Some(true)),
+            ("tmux next-3.8", Some(true)),
+            ("tmux 4.0", Some(true)),
+            ("bad", None),
+        ];
+        for (version, expected) in cases {
+            assert_eq!(
+                parse_tmux_pipe_input_support(version),
+                expected,
+                "{version}"
+            );
         }
     }
 
@@ -3749,6 +4004,7 @@ mod tests {
             cursor_x: 3,
             cursor_y: 1,
             cursor_visible: true,
+            pane_height: rows,
             ..Default::default()
         };
         let mut p = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
@@ -3809,6 +4065,7 @@ mod tests {
             cursor_x: 2,
             cursor_y: 1,
             cursor_visible: true,
+            pane_height: rows,
             ..Default::default()
         };
         let mut p = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
@@ -3825,6 +4082,90 @@ mod tests {
             "newest row must be on the visible screen:\n{}",
             p.screen().contents()
         );
+    }
+
+    #[test]
+    fn seed_keeps_cursor_on_the_prompt_when_the_pane_outgrows_the_grid() {
+        // #3824. A reseed that runs before `resize-window` lands captures the
+        // pane at its OLD height, so the body is taller than the grid being
+        // built and its top rows scroll into history, carrying the content up.
+        // The cursor has to travel with them; left at a bare `#{cursor_y}` it
+        // parks below the prompt, and the app's next SIGWINCH redraw prints a
+        // second prompt row there that no reconcile can see (grid and pane
+        // agree on geometry and cursor, only the cells differ).
+        let rows: u16 = 6;
+        let cols: u16 = 20;
+        // Pane is two rows taller than the grid: three content rows, a prompt,
+        // and the blank rows capture-pane pads to the pane height.
+        let pane_height: u16 = 8;
+        let mut body = Vec::new();
+        for i in 0..3 {
+            body.extend_from_slice(format!("line-{i}\n").as_bytes());
+        }
+        body.extend_from_slice(b"READY> \n");
+        for _ in 4..pane_height {
+            body.extend_from_slice(b"\n");
+        }
+        let state = PaneSeedState {
+            cursor_x: 7,
+            cursor_y: 3,
+            cursor_visible: true,
+            pane_height,
+            ..Default::default()
+        };
+        let mut p = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
+        p.process(&assemble_seed_stream(&body, &state, rows));
+
+        // Two body rows scrolled off, so the prompt sits on row 1 and the
+        // cursor must be on it, not two rows below on row 3.
+        assert_eq!(
+            p.screen().cursor_position(),
+            (1, 7),
+            "cursor must follow the prompt row the taller body pushed up:\n{}",
+            p.screen().contents()
+        );
+        assert!(
+            p.screen().contents().contains("READY>"),
+            "prompt must be on the visible screen:\n{}",
+            p.screen().contents()
+        );
+    }
+
+    #[test]
+    fn seeded_cursor_row_reduces_to_cursor_y_when_heights_agree() {
+        // The mapping must be the identity on the normal path (any scrollback
+        // depth, grid as tall as the pane) and fall back to it when the probe
+        // reported no geometry at all.
+        let body = |rows: usize| -> Vec<u8> {
+            let mut out = Vec::new();
+            for i in 0..rows {
+                out.extend_from_slice(format!("r{i}\n").as_bytes());
+            }
+            out
+        };
+        // (body rows, pane_height, cursor_y, grid rows, expected row)
+        let cases: [(usize, u16, u16, u16, u16); 4] = [
+            (4, 4, 2, 4, 2),
+            // Six rows of scrollback ahead of a 4-row pane.
+            (10, 4, 2, 4, 2),
+            // No geometry in the probe: keep the plain mapping.
+            (4, 0, 2, 4, 2),
+            // Grid taller than the pane, so nothing scrolled off: the body's
+            // own history still offsets the cursor by its depth.
+            (4, 2, 1, 6, 3),
+        ];
+        for (body_rows, pane_height, cursor_y, rows, want) in cases {
+            let state = PaneSeedState {
+                cursor_y,
+                pane_height,
+                ..Default::default()
+            };
+            assert_eq!(
+                seeded_cursor_row(&body(body_rows), &state, rows),
+                want,
+                "body_rows={body_rows} pane_height={pane_height} cursor_y={cursor_y} rows={rows}"
+            );
+        }
     }
 
     #[test]
@@ -3919,41 +4260,58 @@ mod tests {
 
     /// A hand-built channel (no tmux, no forwarder) for registry / sample tests.
     fn dummy_channel(name: &str, dir: &std::path::Path) -> (Arc<VtChannel>, Arc<AtomicU8>) {
-        let lifecycle = Arc::new(AtomicU8::new(VtLifecycle::Starting as u8));
-        let ch = Arc::new(VtChannel {
-            name: name.to_string(),
-            owner_id: new_pipe_owner_id(),
-            target: format!("{name}:^.0"),
-            parser: Arc::new(Mutex::new(vt100::Parser::new(4, 20, SCROLLBACK_LINES))),
-            stream: Arc::new(Mutex::new(None)),
-            app_cursor: Arc::new(AtomicBool::new(false)),
-            lifecycle: lifecycle.clone(),
-            wakeup: Arc::new(Mutex::new(None)),
-            clipboard: Arc::new(Mutex::new(None)),
-            links: Arc::new(LinkTable::default()),
-            chunk_seq: Arc::new(AtomicU64::new(0)),
-            settled_chunk_seq: Arc::new(AtomicU64::new(0)),
-            snapshot: Arc::new(Mutex::new(())),
-            drain: Arc::new(Mutex::new(DrainControl::default())),
-            last_chunk_ms: Arc::new(AtomicU64::new(0)),
-            prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
-            grid_gen: Arc::new(AtomicU64::new(0)),
-            signals: Arc::new(ViewerSignals::new()),
-            armed_at: Instant::now(),
-            sample_cache: Mutex::new(None),
-            sock_dir: dir.to_path_buf(),
-            sock_path: dir.join("s.sock"),
-            stop: Arc::new(AtomicBool::new(false)),
-            reader: Mutex::new(None),
-            cols: AtomicU16::new(20),
-            rows: AtomicU16::new(4),
-            last_size_check: Mutex::new(Instant::now()),
-            pending_drift: Mutex::new(None),
-            last_owner_hb: Mutex::new(Instant::now()),
-            resync_target: AtomicU64::new(0),
-            resize_seq: AtomicU64::new(0),
-        });
-        (ch, lifecycle)
+        dummy_channel_with_input(name, dir, true)
+    }
+
+    #[test]
+    fn output_only_channel_never_writes_to_the_pane() {
+        // An output-only channel (tmux without the dead-pane pipe fix) must
+        // steer every keystroke to the send-keys fallback and never touch the
+        // socket, even when a forwarder is connected; a full channel delivers.
+        for (input, delivered) in [(false, false), (true, true)] {
+            let name = format!("aoe_test_vt_input_{input}_{}", std::process::id());
+            let dir = tempfile::tempdir().expect("tempdir");
+            let listener = UnixListener::bind(dir.path().join("s.sock")).expect("bind");
+            let writer = UnixStream::connect(dir.path().join("s.sock")).expect("connect");
+            let (mut pane_side, _) = listener.accept().expect("accept");
+            pane_side
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .expect("read timeout");
+            let (channel, lifecycle) = dummy_channel_with_input(&name, dir.path(), input);
+            *channel.stream.lock().unwrap() = Some(writer);
+            VtLifecycle::Live.store(&lifecycle);
+            REGISTRY
+                .lock()
+                .unwrap()
+                .insert(name.clone(), Arc::downgrade(&channel));
+
+            assert_eq!(input_mode(&name).is_some(), delivered, "input={input}");
+            assert_eq!(try_send_input(&name, b"x"), delivered, "input={input}");
+            let mut buf = [0u8; 8];
+            let got = pane_side.read(&mut buf).unwrap_or(0);
+            let want: &[u8] = if delivered { b"x" } else { b"" };
+            assert_eq!(&buf[..got], want, "input={input}");
+
+            REGISTRY.lock().unwrap().remove(&name);
+        }
+    }
+
+    #[test]
+    fn output_only_channel_still_reports_the_pane_cursor_mode() {
+        // The web terminal re-encodes the browser's normal-mode cursor keys for
+        // a DECCKM app before `send-keys -H` delivers them literally, so the
+        // grid's cursor mode must stay readable while socket input is off.
+        let name = format!("aoe_test_vt_cursor_mode_{}", std::process::id());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let channel = register_live_for_test(&name, dir.path(), false, true);
+
+        assert_eq!(cursor_mode(&name), Some(true));
+        assert_eq!(input_mode(&name), None);
+
+        VtLifecycle::fail(&channel.lifecycle);
+        assert_eq!(cursor_mode(&name), None, "a dead grid's mode is stale");
+
+        unregister_for_test(&name);
     }
 
     /// An authoritative refresh reinstalls the grid rather than standing the
@@ -5233,8 +5591,8 @@ mod tests {
             return false;
         }
         // Its own threshold, not `parse_tmux_pipe_support`'s: that encodes when
-        // `pipe-pane -IO` became usable, and the two matching today is a
-        // coincidence a future tmux requirement would silently break.
+        // `pipe-pane` became usable for the VT channel, and the two matching
+        // today is a coincidence a future tmux requirement would silently break.
         const TMUX_OSC8_MIN: (u32, u32) = (3, 4);
         tmux_version(&String::from_utf8_lossy(out.stdout.as_slice())) >= TMUX_OSC8_MIN
     }
@@ -5251,6 +5609,83 @@ mod tests {
             parts.next().and_then(|p| p.parse().ok()).unwrap_or(0),
             parts.next().and_then(|p| p.parse().ok()).unwrap_or(0),
         )
+    }
+
+    /// What an accepted seed swap does to the table, without the swap.
+    fn record_seed_links(slot: &LinkTable, stream: &[u8]) {
+        reconcile_links(slot, crate::tmux::osc8::extract_links(stream));
+    }
+    /// The unit tests hand-build a `PaneSeedState`; this drives the real
+    /// probe/capture/seed path against a live pane whose height differs from
+    /// the grid being seeded, which is the shape #3824 turned on. Skips when
+    /// tmux is unavailable, like the OSC 8 test below.
+    #[test]
+    #[serial_test::serial]
+    fn real_tmux_seed_lands_the_cursor_on_the_prompt_at_a_shorter_grid() {
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
+            eprintln!("Skipping test: tmux unavailable");
+            return;
+        }
+        let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_seed_geom");
+        // The live spec's fixture: scrollback, then a prompt the cursor parks on.
+        let script = "for i in $(seq 1 20); do echo \"line-$i\"; done; printf 'READY> '; sleep 30";
+        let out = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                guard.name(),
+                "-x",
+                "80",
+                "-y",
+                "40",
+                script,
+            ])
+            .output()
+            .expect("tmux new-session");
+        assert!(out.status.success());
+        let target = format!("{}:^.0", guard.name());
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+
+        // Wait for the prompt to be painted before seeding.
+        let mut probe = PaneSeedState::default();
+        for _ in 0..50 {
+            probe = pane_seed_state(&target, &deadline).unwrap_or_default();
+            if probe.cursor_y == 20 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(
+            (probe.pane_height, probe.cursor_y),
+            (40, 20),
+            "fixture must park the cursor on the prompt row of a 40-row pane"
+        );
+
+        // Seed a grid SHORTER than the pane, the racing shape: the body's top
+        // rows scroll into history and take the prompt with them.
+        let rows: u16 = 24;
+        let stream =
+            capture_seed_stream(&target, (80, rows), &deadline).expect("capture seed stream");
+        let mut p = vt100::Parser::new(rows, 80, SCROLLBACK_LINES);
+        p.process(&stream);
+
+        let (cy, cx) = p.screen().cursor_position();
+        let contents = p.screen().contents();
+        let prompt_row = contents
+            .lines()
+            .position(|l| l.contains("READY>"))
+            .expect("prompt must be on the visible screen");
+        assert_eq!(
+            (cy as usize, cx),
+            (prompt_row, 7),
+            "cursor must sit on the prompt row the shorter grid pushed up:\n{contents}"
+        );
+        assert_eq!(
+            contents.lines().filter(|l| l.contains("READY>")).count(),
+            1,
+            "one prompt row only:\n{contents}"
+        );
     }
 
     /// The seed and the capture fallback both read `capture-pane -e`, and the
@@ -5293,7 +5728,7 @@ mod tests {
         let deadline = crate::tmux::TmuxCommandDeadline::new();
         let mut stream = Vec::new();
         for _ in 0..50 {
-            stream = capture_seed_stream(&target, 24, &deadline).unwrap_or_default();
+            stream = capture_seed_stream(&target, (80, 24), &deadline).unwrap_or_default();
             if !crate::tmux::osc8::extract_links(&stream).is_empty() {
                 break;
             }
@@ -5422,6 +5857,292 @@ mod tests {
         let held: Vec<PaneLink> = slot.table.lock().unwrap().iter().cloned().collect();
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].uri, "https://example.com/live");
+    }
+
+    /// The install's half of #3818's ordering: it takes the snapshot fence
+    /// before its drain and still holds it inside the swap, where it replaces
+    /// the link table. The reader cannot show this, and the seed's chunk guard
+    /// would keep catching the erase on its own, so a fence narrowed to either
+    /// side would leave `reconcile_links` racing the reader again with nothing
+    /// red.
+    ///
+    /// Probed at both ends, because one end does not imply the other. The
+    /// forwarder probes during the drain, which cannot complete until it
+    /// answers. The link table is then held so the install parks inside the
+    /// swap, and the parser lock going away is the install arriving there.
+    #[test]
+    fn an_install_holds_the_snapshot_fence_across_its_swap() {
+        use std::io::Write;
+
+        let (_data_reader, data_forwarder) = UnixStream::pair().expect("data pair");
+        let (parent_control, mut forwarder_control) = UnixStream::pair().expect("control pair");
+        let snapshot = Arc::new(Mutex::new(()));
+        let probed_fence = snapshot.clone();
+        let forwarder = std::thread::spawn(move || {
+            let (kind, generation) =
+                read_drain_frame(&mut forwarder_control).expect("receive drain probe");
+            assert_eq!(kind, DRAIN_PROBE);
+            let fenced = probed_fence.try_lock().is_err();
+            let _ = forwarder_control.write_all(&drain_frame(DRAIN_ACK, generation));
+            fenced
+        });
+
+        let socket = Arc::new(Mutex::new(Some(data_forwarder)));
+        let control = Mutex::new(DrainControl {
+            stream: Some(parent_control),
+            next_generation: 0,
+        });
+        let parser = Mutex::new(vt100::Parser::new(6, 40, 0));
+        let app_cursor = AtomicBool::new(false);
+        let grid_gen = AtomicU64::new(0);
+        let links = LinkTable::default();
+
+        // Park the install inside the swap: `reconcile_links` waits on this.
+        let in_swap = links.table.lock().expect("hold the link table");
+        let (result, fenced_in_swap) = std::thread::scope(|scope| {
+            let install = scope.spawn(|| {
+                install_seeded_parser(
+                    SeedSink {
+                        parser: &parser,
+                        app_cursor: &app_cursor,
+                        grid_gen: &grid_gen,
+                        links: &links,
+                    },
+                    None,
+                    b"\x1b]8;;https://example.com/seeded\x1b\\docs\x1b]8;;\x1b\\\r\n",
+                    (40, 6),
+                    SeedGuard {
+                        chunk: None,
+                        pipe: None,
+                    },
+                    SeedInstallFence {
+                        snapshot: Some(&snapshot),
+                        socket: Some(&socket),
+                        control: Some(&control),
+                    },
+                )
+            });
+            // The install takes the parser lock only inside the swap, so losing
+            // it here is the install past its drain and into the replacement.
+            let arrival = Instant::now() + Duration::from_secs(5);
+            while parser.try_lock().is_ok() {
+                assert!(
+                    Instant::now() < arrival,
+                    "the install never reached the swap"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let fenced = snapshot.try_lock().is_err();
+            drop(in_swap);
+            (install.join().expect("install thread"), fenced)
+        });
+
+        assert_eq!(result, VtRefreshResult::Refreshed);
+        assert!(
+            forwarder.join().expect("forwarder thread"),
+            "the install must hold the fence across its drain"
+        );
+        assert!(
+            fenced_in_swap,
+            "and still hold it inside the swap, where the link table is replaced"
+        );
+        // The accepted snapshot's targets landed with the grid they describe.
+        assert_eq!(
+            links
+                .table
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![PaneLink {
+                text: "docs".to_string(),
+                uri: "https://example.com/seeded".to_string(),
+            }]
+        );
+    }
+
+    /// #3818: a reseed replaces the link table wholesale from its snapshot, so
+    /// a target the reader recorded after that snapshot was captured must not
+    /// be dropped between being recorded and its label reaching the grid.
+    ///
+    /// Both halves run behind one mutex: `run_reader` holds `snapshot` from
+    /// before `recv` through the parse, and `install_seeded_parser` holds it
+    /// from before its drain through the table replacement. Park a real
+    /// install on its drain ACK to hold that window open, and deliver the
+    /// sequence into it.
+    #[test]
+    fn a_reseed_cannot_erase_a_link_recorded_inside_its_fence() {
+        use std::io::Write;
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("s.sock");
+        let listener = UnixListener::bind(&sock).expect("bind");
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        let app_cursor = Arc::new(AtomicBool::new(false));
+        let grid_gen = Arc::new(AtomicU64::new(0));
+        let links: Arc<LinkTable> = Arc::new(LinkTable::default());
+        let chunk_seq = Arc::new(AtomicU64::new(0));
+        let settled_chunk_seq = Arc::new(AtomicU64::new(0));
+        let snapshot = Arc::new(Mutex::new(()));
+        let stream: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
+        let stop = Arc::new(AtomicBool::new(false));
+        let ctx = ReaderCtx {
+            parser: parser.clone(),
+            stop: stop.clone(),
+            seeded: Arc::new(AtomicBool::new(true)),
+            snapshot: snapshot.clone(),
+            stream: stream.clone(),
+            app_cursor: app_cursor.clone(),
+            lifecycle: Arc::new(AtomicU8::new(VtLifecycle::Starting as u8)),
+            wakeup: Arc::new(Mutex::new(None)),
+            clipboard: Arc::new(Mutex::new(None)),
+            links: links.clone(),
+            chunk_seq: chunk_seq.clone(),
+            settled_chunk_seq: settled_chunk_seq.clone(),
+            last_chunk_ms: Arc::new(AtomicU64::new(0)),
+            prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
+            grid_gen: grid_gen.clone(),
+            signals: Arc::new(ViewerSignals::new()),
+        };
+        let reader = std::thread::spawn(move || run_reader(listener, ctx));
+        let mut conn = UnixStream::connect(&sock).expect("connect");
+
+        // The screen the reseed's snapshot was taken from. Waiting for it also
+        // proves the reader is in its loop with its socket published, which is
+        // what the install reads the pending queue through.
+        conn.write_all(b"see docs now").expect("write pane output");
+        let ready = Instant::now() + Duration::from_secs(5);
+        while settled_chunk_seq.load(Ordering::Acquire) == 0 {
+            assert!(
+                Instant::now() < ready,
+                "reader never applied the first chunk"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        // A forwarder that answers the install's drain as a live one would.
+        let (parent_control, mut forwarder_control) = UnixStream::pair().expect("control pair");
+        let (probed_tx, probed_rx) = mpsc::channel();
+        let forwarder = std::thread::spawn(move || {
+            let (kind, generation) =
+                read_drain_frame(&mut forwarder_control).expect("receive drain probe");
+            assert_eq!(kind, DRAIN_PROBE);
+            probed_tx.send(()).expect("signal the probe arrived");
+            let _ = forwarder_control.write_all(&drain_frame(DRAIN_ACK, generation));
+        });
+        let control = Arc::new(Mutex::new(DrainControl {
+            stream: Some(parent_control),
+            next_generation: 0,
+        }));
+
+        let expected_chunk_seq = chunk_seq.load(Ordering::Acquire);
+        // The snapshot: the same screen, advertising nothing. Accepting it
+        // after the reader has recorded the sequence below is the erase.
+        let seed = assemble_seed_stream(b"see docs now\n", &PaneSeedState::default(), 24);
+
+        // Stand in for the install's own hold on the fence, so the window it
+        // occupies from before its drain through the table replacement is open
+        // for as long as this test needs (its drain deadline is 100 ms).
+        let fence = snapshot.lock().expect("hold the fence");
+        // The pane advertises a new target into that window.
+        conn.write_all(b"\r\n\x1b]8;;https://example.com/new\x1b\\docs\x1b]8;;\x1b\\ added")
+            .expect("write pane output");
+        let install = {
+            let (parser, app_cursor, grid_gen, links) = (
+                parser.clone(),
+                app_cursor.clone(),
+                grid_gen.clone(),
+                links.clone(),
+            );
+            let (chunk_seq, settled_chunk_seq) = (chunk_seq.clone(), settled_chunk_seq.clone());
+            let (snapshot, stream, control) = (snapshot.clone(), stream.clone(), control.clone());
+            std::thread::spawn(move || {
+                install_seeded_parser(
+                    SeedSink {
+                        parser: &parser,
+                        app_cursor: &app_cursor,
+                        grid_gen: &grid_gen,
+                        links: &links,
+                    },
+                    None,
+                    &seed,
+                    (80, 24),
+                    SeedGuard {
+                        chunk: Some((&chunk_seq, &settled_chunk_seq, expected_chunk_seq)),
+                        pipe: None,
+                    },
+                    SeedInstallFence {
+                        snapshot: Some(&snapshot),
+                        socket: Some(&stream),
+                        control: Some(&control),
+                    },
+                )
+            })
+        };
+
+        // Neither side may enter. The install takes the fence before anything
+        // else, so it never reaches its drain; and the reader takes it before
+        // `recv`, so the chunk is not claimed, let alone recorded. This is the
+        // interleaving #3818 describes, and there is no state in which the
+        // target is recorded and its bytes are not yet applied.
+        assert!(
+            matches!(
+                probed_rx.recv_timeout(Duration::from_millis(200)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "the install must not run its drain inside another holder's fence"
+        );
+        assert_eq!(
+            chunk_seq.load(Ordering::Acquire),
+            expected_chunk_seq,
+            "the fence holds the reader off the chunk, sequence and bytes together"
+        );
+        assert!(links.table.lock().unwrap().is_empty());
+
+        drop(fence);
+        probed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the install proceeds once the fence clears");
+        assert_eq!(
+            install.join().expect("install thread"),
+            VtRefreshResult::Busy,
+            "whichever side wins the released fence, the snapshot is stale: the chunk is either unread on the socket or already past the baseline it captured at"
+        );
+
+        // The reader applies what it was holding: label and target arrive
+        // together, and the stale snapshot took neither.
+        let landed = Instant::now() + Duration::from_secs(5);
+        let recorded = loop {
+            let held: Vec<PaneLink> = links.table.lock().unwrap().iter().cloned().collect();
+            if !held.is_empty() || Instant::now() >= landed {
+                break held;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(
+            recorded,
+            vec![PaneLink {
+                text: "docs".to_string(),
+                uri: "https://example.com/new".to_string(),
+            }],
+            "the newly advertised target must survive the reseed"
+        );
+        assert!(
+            parser
+                .lock()
+                .unwrap()
+                .screen()
+                .contents()
+                .contains("docs added"),
+            "and the label it describes must be on the grid"
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        drop(conn);
+        let _ = reader.join();
+        forwarder.join().expect("forwarder thread");
     }
 
     #[test]
@@ -6365,6 +7086,44 @@ mod tests {
         );
         drop(theirs);
 
+        // Same again with both viewers asking for the SAME geometry (#3817).
+        // An ownership handover is exactly that shape, and the geometry cannot
+        // tell the two declarations apart: the loser's withdrawal must not take
+        // the winner's still-pending resize with it.
+        let mine = ch.begin_resize(100, 30);
+        let theirs = ch.begin_resize(100, 30);
+        mine.abandon();
+        assert_eq!(
+            ch.pending_resync_target(),
+            Some((100, 30)),
+            "an identical declaration is still someone else's"
+        );
+        drop(theirs);
+        assert!(
+            ch.grid_resync_pending(),
+            "and it outlives the resize window"
+        );
+
+        // The mirror of it: naming the declaration protects a NEWER one, which
+        // has replaced this token, but not an older resize still running behind
+        // it. Both viewers declare before either learns who owns the pane size,
+        // so the one that declared second is as likely to be the one that turns
+        // out not to own it.
+        ch.cols.store(100, Ordering::Relaxed);
+        ch.rows.store(30, Ordering::Relaxed);
+        let owner = ch.begin_resize(132, 43);
+        let follower = ch.begin_resize(132, 43);
+        follower.abandon();
+        assert_eq!(
+            ch.pending_resync_target(),
+            Some((132, 43)),
+            "a live resize still owes its geometry after a later one withdraws"
+        );
+        drop(owner);
+        ch.cols.store(40, Ordering::Relaxed);
+        ch.rows.store(10, Ordering::Relaxed);
+        ch.expect_grid_size(100, 30);
+
         // tmux is the authority on whether the grid is behind, and reconcile
         // hands its answer here. A pane that already matches the grid owes
         // nothing: this expectation described a resize tmux refused or clamped,
@@ -6375,19 +7134,19 @@ mod tests {
             ch.cols.load(Ordering::Relaxed),
             ch.rows.load(Ordering::Relaxed),
         );
-        ch.observe_pane_geometry(grid, ch.resize_seq());
+        ch.observe_pane_geometry(grid, ch.resize_observation());
         assert!(!ch.grid_resync_pending(), "an unmet request is dropped");
 
         // With nothing outstanding, a probe opens no gate of its own: ordinary
         // drift is the reseed's job, not this one's.
-        ch.observe_pane_geometry((132, 43), ch.resize_seq());
+        ch.observe_pane_geometry((132, 43), ch.resize_observation());
         assert!(!ch.grid_resync_pending(), "reconcile opens no expectation");
 
         // A pane that disagrees while one IS outstanding is a real divergence:
         // it is re-aimed at tmux's own geometry and holds for as long as the
         // reseed takes, however many attempts that is.
         drop(ch.begin_resize(1, 1));
-        ch.observe_pane_geometry((132, 43), ch.resize_seq());
+        ch.observe_pane_geometry((132, 43), ch.resize_observation());
         assert_eq!(ch.pending_resync_target(), Some((132, 43)));
         for _ in 0..10 {
             // Every failed reseed re-declares the same target; none of them
@@ -6419,11 +7178,11 @@ mod tests {
         // Owner: resize to 100x30 declared, tmux has not applied it yet.
         let in_flight = ch.begin_resize(100, 30);
         // Follower: probe starts here and reads the pane's pre-resize size.
-        let probe_seq = ch.resize_seq();
+        let probe = ch.resize_observation();
         // Owner: tmux applies the resize, the reseed fails, the window closes.
         drop(in_flight);
 
-        ch.observe_pane_geometry(settled, probe_seq);
+        ch.observe_pane_geometry(settled, probe);
         assert_eq!(
             ch.pending_resync_target(),
             Some((100, 30)),
@@ -6432,15 +7191,51 @@ mod tests {
 
         // A probe taken wholly inside the window is no better.
         let in_flight = ch.begin_resize(100, 30);
-        let probe_seq = ch.resize_seq();
-        ch.observe_pane_geometry(settled, probe_seq);
+        let probe = ch.resize_observation();
+        ch.observe_pane_geometry(settled, probe);
         assert!(ch.grid_resync_pending(), "nor one taken mid-resize");
         drop(in_flight);
 
+        // Nor one taken while TWO viewers are resizing (#3817). An ownership
+        // handover leaves the old caller's declaration open while the new
+        // owner opens its own, and counting resizes by parity reads that pair
+        // as quiescent: the follower would retire an expectation with both
+        // resizes still running and go straight back to the old layout.
+        let old_owner = ch.begin_resize(100, 30);
+        let new_owner = ch.begin_resize(100, 30);
+        let probe = ch.resize_observation();
+        ch.observe_pane_geometry(settled, probe);
+        assert!(
+            ch.grid_resync_pending(),
+            "overlapping resizes must not read as none in flight"
+        );
+        // The new owner's resize lands, its reseed comes back Busy, and the old
+        // caller then loses the ownership check and withdraws. Both resize
+        // windows are closed now, but the grid is still laid out for the size
+        // the pane left, so every follower stays gated: the withdrawal names
+        // the old caller's own declaration, not the identical live one.
+        drop(new_owner);
+        old_owner.abandon();
+        let probe = ch.resize_observation();
+        ch.observe_pane_geometry((100, 30), probe);
+        assert_eq!(
+            ch.pending_resync_target(),
+            Some((100, 30)),
+            "a follower stays gated while the reseed still owes the geometry"
+        );
+        // The retry lands and the gate opens for every viewer.
+        ch.cols.store(100, Ordering::Relaxed);
+        ch.rows.store(30, Ordering::Relaxed);
+        assert!(
+            !ch.grid_resync_pending(),
+            "a landed reseed resumes the grid"
+        );
+
         // A probe with no resize anywhere near it is the case that may retire
         // an expectation, and still does.
-        let probe_seq = ch.resize_seq();
-        ch.observe_pane_geometry(settled, probe_seq);
+        ch.expect_grid_size(80, 24);
+        let probe = ch.resize_observation();
+        ch.observe_pane_geometry((100, 30), probe);
         assert!(
             !ch.grid_resync_pending(),
             "a quiescent probe still resolves a request the pane never took"

@@ -99,6 +99,13 @@ impl HomeView {
         // Keep the strip in sync when the Settings UI or a config-file edit
         // flips the toggle from any settings surface.
         self.show_diagnostics = config.session.show_diagnostics_pane;
+        self.daemon_sidebar = config.session.daemon_sidebar;
+        if !self.daemon_sidebar {
+            self.set_sidebar_source(
+                crate::tui::session_feed::SidebarSource::Storage,
+                Some("session.daemon_sidebar is off"),
+            );
+        }
         self.agent_clipboard_forward =
             config.tmux.clipboard != crate::session::config::TmuxSettingMode::Disabled;
         self.vt_live_enabled = config.tmux.vt_live;
