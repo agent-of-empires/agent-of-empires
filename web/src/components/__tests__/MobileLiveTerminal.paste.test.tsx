@@ -102,6 +102,39 @@ function stubKeyboardLayout(entries: [string, string][]) {
 }
 
 describe("MobileLiveTerminal paste", () => {
+  // The paste is swallowed by forwardTerminalBeforeInput and never enters the
+  // textarea, so a syllable typed before it stays retained while the line now
+  // shows the pasted text. The next Korean rewrite would then open with a
+  // delete against text the user did not type. The async image-upload path had
+  // the same gap (#3885); this is its synchronous sibling.
+  it("drops a retained syllable when a paste bypasses the textarea", () => {
+    const proxy = document.createElement("textarea");
+    proxy.setAttribute("data-keyboard-proxy", "");
+    proxy.value = "\ud55c";
+    document.body.append(proxy);
+    try {
+      const { input, sendData } = renderTerm();
+      input.value = "\ud55c";
+
+      fireEvent(
+        input,
+        new InputEvent("beforeinput", {
+          bubbles: true,
+          cancelable: true,
+          inputType: "insertFromPaste",
+          data: "ls -al",
+        }),
+      );
+
+      expect(sendData).toHaveBeenCalledWith(expect.stringContaining("ls -al"));
+      // Either hidden input can hold focus, so both shadows must drop it.
+      expect(input.value).toBe("");
+      expect(proxy.value).toBe("");
+    } finally {
+      proxy.remove();
+    }
+  });
+
   it("does not swallow Ctrl+V into a literal ^V, and the paste event sends a bracketed paste", () => {
     const { input, sendData } = renderTerm();
 

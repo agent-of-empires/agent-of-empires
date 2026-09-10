@@ -1749,8 +1749,9 @@ export function MobileLiveTerminal({
           return true;
         case "insertFromPaste": {
           // The paste lands on the line without passing through the
-          // textarea, so the retained syllable stops mirroring it.
-          invalidateRetainedImeContext();
+          // textarea, so the retained syllable stops mirroring it. Name the
+          // local input: with no target the helper clears only the proxy.
+          invalidateRetainedImeContext(inputRef.current);
           if (input.data) sendData(bracketedPaste(input.data));
           return true;
         }
@@ -1758,7 +1759,7 @@ export function MobileLiveTerminal({
           return true;
       }
     },
-    [sendKeys, sendData, typedWordRef],
+    [sendKeys, sendData, typedWordRef, inputRef],
   );
   const handleBeforeInput = useCallback(
     (ev: InputEvent) => forwardTerminalBeforeInput(ev, handleMobileKeyboardProxyInput),
