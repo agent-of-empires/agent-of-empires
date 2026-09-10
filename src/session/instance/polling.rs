@@ -102,6 +102,35 @@ fn try_acquire_managed_capture_lease(
     Ok(ManagedCaptureLease(lease))
 }
 
+/// The tmux session name to seed a session-id poller with, or `None` when
+/// this instance has no agent pane for one to follow.
+///
+/// `live_any_kind` is the live name of any kind carrying the id (agent, else a
+/// paired terminal, else a container terminal); `derived` is the title-derived
+/// name, asked only when nothing is live yet so a poller started alongside its
+/// tmux session still gets a target. Both are filtered to the agent shape: a
+/// poller seeded with a terminal name re-resolves to that same live name every
+/// tick, probes `Alive`, and so never terminates, holding a budget slot for an
+/// agent that is gone while reading session-id state off the wrong pane.
+///
+/// A live terminal is a decisive answer rather than a reason to fall back: it
+/// is only reached when the agent pane is absent or dead, and the derived name
+/// would then name a session that is not running.
+///
+/// This fails closed for a title sanitizing under the agent shape's excluded
+/// prefixes, whose own agent name is unrecognizable as one; see
+/// `tmux::live_agent_name_for_id_in`, which already gates poller repair the
+/// same way.
+fn poller_seed_name(
+    live_any_kind: Option<String>,
+    derived: impl FnOnce() -> Option<String>,
+    session_id: &str,
+) -> Option<String> {
+    live_any_kind
+        .or_else(derived)
+        .filter(|name| crate::tmux::agent_session_belongs_to(name, session_id))
+}
+
 impl Instance {
     /// Whether this session should run a session-id poller: the agent has a
     /// resume strategy to capture for, and its conversation is not already
@@ -306,15 +335,16 @@ impl Instance {
         };
         self.session_id_poller_retry_after = None;
 
-        let tmux_session_name = self
-            .tmux_env_session_name()
-            .or_else(|| {
-                self.tmux_session()
-                    .ok()
-                    .map(|session| session.name().to_string())
-                    .filter(|name| crate::tmux::agent_session_belongs_to(name, &self.id))
-            })
-            .unwrap_or_default();
+        let Some(tmux_session_name) = poller_seed_name(
+            self.tmux_env_session_name(),
+            || self.tmux_session().ok().map(|s| s.name().to_string()),
+            &self.id,
+        ) else {
+            tracing::debug!(target: "session.create",
+                "No agent tmux session resolves for {}; session-id poller not started",
+                self.id);
+            return PollerStart::NotApplicable;
+        };
         let omp_metadata = if backend == crate::agents::SessionCaptureBackend::Omp {
             let Some(options) = self.omp_capture_options() else {
                 return PollerStart::NotApplicable;
@@ -1011,6 +1041,106 @@ mod tests {
         assert!(
             inst.session_id_poller.is_some(),
             "decline must happen before the handle is cleared"
+        );
+    }
+
+    /// The seed must name the AGENT pane whichever arm answers. A paired or
+    /// container terminal outliving its agent still answers the live lookup,
+    /// and a poller seeded with that name re-resolves to it forever.
+    #[test]
+    fn poller_seed_name_accepts_only_an_agent_name() {
+        const ID: &str = "9f2c41d6-0000-4000-8000-000000000001";
+        let agent = crate::tmux::Session::generate_name(ID, "Vikings");
+        let terminal = crate::tmux::TerminalSession::generate_name(ID, "Vikings");
+        let container = crate::tmux::ContainerTerminalSession::generate_name(ID, "Vikings");
+        // A title sanitizing under TERMINAL_PREFIX makes even the agent's own
+        // name unrecognizable as one.
+        let aux_shaped = crate::tmux::Session::generate_name(ID, "term rewriting");
+
+        // (case, live name of any kind, derived name, expected seed)
+        type Case<'a> = (&'a str, Option<&'a str>, Option<&'a str>, Option<&'a str>);
+        let cases: &[Case] = &[
+            ("agent pane live", Some(&agent), Some(&agent), Some(&agent)),
+            (
+                "only a paired terminal live",
+                Some(&terminal),
+                Some(&agent),
+                None,
+            ),
+            (
+                "only a container terminal live",
+                Some(&container),
+                Some(&agent),
+                None,
+            ),
+            ("nothing live yet", None, Some(&agent), Some(&agent)),
+            ("nothing live and no derived name", None, None, None),
+            (
+                "aux-shaped title",
+                Some(&aux_shaped),
+                Some(&aux_shaped),
+                None,
+            ),
+        ];
+
+        for (case, live, derived, expected) in cases {
+            assert_eq!(
+                super::poller_seed_name(
+                    live.map(str::to_string),
+                    || derived.map(str::to_string),
+                    ID,
+                )
+                .as_deref(),
+                *expected,
+                "{case}"
+            );
+        }
+    }
+
+    /// The race #3880 describes: repair sees a live agent pane in its
+    /// snapshot, the agent dies before `maybe_start_poller` re-queries tmux,
+    /// and only the paired terminal answers. The start declines instead of
+    /// seeding a poller that would never terminate, keeping the budget slot
+    /// and leaving the next tick free to try again.
+    ///
+    /// The re-query is driven off a title whose own agent name is aux-shaped,
+    /// which is the same "no agent name resolves" answer a surviving terminal
+    /// produces, without a live tmux server.
+    #[test]
+    fn repair_declines_when_the_agent_pane_dies_under_the_snapshot() {
+        let budget = crate::session::poller::test_support::IsolatedBudget::with_ceiling(1);
+        let mut inst = Instance::new("term rewriting", "/tmp/agent-died-under-snapshot");
+        inst.tool = "claude".to_string();
+        let snapshot = crate::tmux::LiveSessionSnapshot::from_parts(
+            Some(vec![crate::tmux::Session::generate_name(
+                &inst.id, "Vikings",
+            )]),
+            Some(std::collections::HashMap::new()),
+        );
+        assert!(
+            inst.has_live_agent_pane_in(&snapshot),
+            "fixture: the snapshot repair gates on still shows an agent pane"
+        );
+        assert!(
+            !crate::tmux::agent_session_belongs_to(
+                &crate::tmux::Session::generate_name(&inst.id, &inst.title),
+                &inst.id
+            ),
+            "fixture: this title's own agent name is aux-shaped, so the live \
+             re-query resolves no agent name"
+        );
+
+        assert!(!inst.repair_session_id_poller_if_needed(&snapshot));
+
+        assert!(
+            inst.session_id_poller.is_none(),
+            "no poller on the wrong pane"
+        );
+        assert_eq!(budget.active(), 0, "a declined start takes no budget slot");
+        assert_eq!(
+            inst.poller_repair,
+            Default::default(),
+            "nothing to poll is not a failed repair: the next tick looks again"
         );
     }
 }
