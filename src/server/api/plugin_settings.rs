@@ -282,16 +282,16 @@ mod tests {
     use crate::session::Instance;
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn resolves_agents_models_and_groups() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
         let mut a = Instance::new("one", "/tmp/p");
         a.group_path = "work/backend".to_string();
         let mut b = Instance::new("two", "/tmp/q");
         b.group_path = "work/backend".to_string();
         let state = crate::server::test_support::build_test_app_state(vec![a, b]);
 
-        // Agents: filtered to adapters present on this host, so the exact set
-        // is environment-dependent; just assert the resolver succeeds and only
-        // ever returns known registry ids (no custom agents in this profile).
+        // An isolated profile adds no custom ids to the installed registry agents.
         let agents = resolve_option_source(&state, OptionSource::AcpAgents, &[])
             .await
             .expect("agents");

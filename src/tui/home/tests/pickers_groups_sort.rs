@@ -23,6 +23,7 @@ fn test_uppercase_p_picker_switch_profile() {
 
     crate::session::create_profile("first").unwrap();
     crate::session::create_profile("second").unwrap();
+    crate::session::create_profile("third").unwrap();
 
     let _storage = Storage::new_unwatched("first").unwrap();
     let tools = AvailableTools::with_tools(&["claude"]);
@@ -36,17 +37,12 @@ fn test_uppercase_p_picker_switch_profile() {
     view.flat_items = view.build_flat_items();
     view.update_selected();
 
-    // Open picker
     view.handle_key(key(KeyCode::Char('P')), None);
     assert!(view.profile_picker_dialog.is_some());
 
-    // In filtered mode, "all" is at top, then "first", "second", "test"
-    // Navigate down to reach "second" and select it
-    view.handle_key(key(KeyCode::Down), None);
-    view.handle_key(key(KeyCode::Down), None);
+    // The active profile is selected; a trailing entry prevents end-of-list clamping.
     view.handle_key(key(KeyCode::Down), None);
     let action = view.handle_key(key(KeyCode::Enter), None);
-    // Profile switch is handled internally, no Action returned
     assert_eq!(action, None);
     assert_eq!(view.active_profile, Some("second".to_string()));
     assert!(view.profile_picker_dialog.is_none());
