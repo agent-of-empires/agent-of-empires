@@ -117,10 +117,11 @@ fn try_acquire_managed_capture_lease(
 /// is only reached when the agent pane is absent or dead, and the derived name
 /// would then name a session that is not running.
 ///
-/// This fails closed for a title sanitizing under the agent shape's excluded
-/// prefixes, whose own agent name is unrecognizable as one; see
-/// `tmux::live_agent_name_for_id_in`, which already gates poller repair the
-/// same way.
+/// Fails closed for a title sanitizing under the agent shape's excluded
+/// prefixes: its own agent name reads as a paired terminal's, so such a
+/// session runs no session-id poller at all. See
+/// `tmux::live_agent_name_for_id_in` for why that ambiguity has no cheaper
+/// answer.
 fn poller_seed_name(
     live_any_kind: Option<String>,
     derived: impl FnOnce() -> Option<String>,
@@ -335,6 +336,12 @@ impl Instance {
         };
         self.session_id_poller_retry_after = None;
 
+        // Unlike the eligibility checks above, this forks `tmux list-sessions`,
+        // so it stays behind the budget gate rather than joining them: an
+        // over-budget process would otherwise pay a fork per deferred repair.
+        // A session that is both over budget and without an agent pane is
+        // reported as over budget, and the next repair tick stops looking once
+        // its own snapshot agrees the agent pane is gone.
         let Some(tmux_session_name) = poller_seed_name(
             self.tmux_env_session_name(),
             || self.tmux_session().ok().map(|s| s.name().to_string()),
