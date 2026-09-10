@@ -4331,15 +4331,18 @@ Final prose line.\n";
                 idle.replace("│ draft │", "│ 1s > fake timer │"),
                 Status::Idle,
             ),
+            // A frame the bottom-line window still reaches keeps its status
+            // row: a turn timer under a live interrupt row is activity
+            // whether or not the frame below it finished painting.
             (
-                "unfinished composer",
+                "frame without its bottom border",
                 active.replace("╰─ continued draft ─╯", "│ continued draft │"),
-                Status::Idle,
+                Status::Running,
             ),
             (
-                "unbordered output",
+                "output painted over the composer body",
                 active.replace("│ draft │", "Completed response."),
-                Status::Idle,
+                Status::Running,
             ),
             (
                 "interrupt outside capture window",
@@ -4363,6 +4366,31 @@ Final prose line.\n";
             ),
         ] {
             assert_eq!(detect_omp_status(&pane), expected, "case: {name}");
+        }
+    }
+
+    /// The bottom status row reaches further up for its activity hint than
+    /// either the compact band rule or the multiline composer rule does, and
+    /// it serves ascii and Unicode frames alike. Rows between the interrupt
+    /// and the frame must not read as idle.
+    #[test]
+    fn test_detect_omp_status_band_hint_above_the_narrow_windows() {
+        let filler = " context 40%\n tokens 1000\n cost 0.42\n branch main";
+        for (name, pane) in [
+            (
+                "Unicode band, hint above the compact window",
+                format!("  \u{238B} Working\u{2026}\n{filler}\n\u{256D}\u{2500}\u{2500} \u{2839} 4m > model status \u{2500}\u{2500}\u{256E}\n\u{2570}\u{2500} draft \u{2500}\u{256F}"),
+            ),
+            (
+                "ascii band, hint above the compact window",
+                format!("  \u{238B} Working\u{2026}\n{filler}\n+== \u{2839} 4m == model status\n+-- draft --"),
+            ),
+            (
+                "Unicode composer, hint above the composer window",
+                "  \u{238B} Working\u{2026}\n context 40%\n tokens 1000\n\u{256D}\u{2500}\u{2500} \u{2839} 4m > model status \u{2500}\u{2500}\u{256E}\n\u{2502} draft \u{2502}\n\u{2570}\u{2500} continued draft \u{2500}\u{256F}".to_string(),
+            ),
+        ] {
+            assert_eq!(detect_omp_status(&pane), Status::Running, "case: {name}");
         }
     }
 
