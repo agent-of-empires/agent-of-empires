@@ -1472,6 +1472,33 @@ pub const AGENTS: &[AgentDef] = &[
         permission_response: None,
         lifecycle: AgentLifecycle::Active,
     },
+    AgentDef {
+        name: "junie",
+        oneshot_flag: None,
+        binary: "junie",
+        launch_subcommand: None,
+        aliases: &[],
+        detection: DetectionMethod::Which("junie"),
+        // Junie's "brave mode" auto-approves actions; `--brave` enables it so
+        // the agent runs unattended without stopping on each approval prompt.
+        yolo: Some(YoloMode::CliFlag("--brave")),
+        instruction_flag: None,
+        set_default_command: false,
+        detect_status: status_detection::detect_junie_status,
+        container_env: &[],
+        hook_config: None,
+        sidecar_hooks: None,
+        // Junie's interactive TUI exposes no documented native resume argv, so
+        // session resume/fork stay Unsupported (Levels 4/5 not wired here).
+        session_support: None,
+        fork_strategy: ForkStrategy::Unsupported,
+        host_only: false,
+        send_keys_enter_delay_ms: 0,
+        ready_marker: None,
+        install_hint: "curl -fsSL https://junie.jetbrains.com/install.sh | bash",
+        permission_response: None,
+        lifecycle: AgentLifecycle::Active,
+    },
 ];
 
 /// Look up an agent by canonical name.
@@ -2488,7 +2515,8 @@ mod tests {
                 "antigravity",
                 "kimi",
                 "omp",
-                "prime-agent"
+                "prime-agent",
+                "junie"
             ]
         );
     }
@@ -2546,6 +2574,7 @@ mod tests {
         assert_eq!(settings_index_from_name(Some("kimi")), 15);
         assert_eq!(settings_index_from_name(Some("omp")), 16);
         assert_eq!(settings_index_from_name(Some("prime-agent")), 17);
+        assert_eq!(settings_index_from_name(Some("junie")), 18);
 
         assert_eq!(name_from_settings_index(0), None);
         assert_eq!(name_from_settings_index(1), Some("claude"));
@@ -2562,6 +2591,7 @@ mod tests {
         assert_eq!(name_from_settings_index(15), Some("kimi"));
         assert_eq!(name_from_settings_index(16), Some("omp"));
         assert_eq!(name_from_settings_index(17), Some("prime-agent"));
+        assert_eq!(name_from_settings_index(18), Some("junie"));
         assert_eq!(name_from_settings_index(99), None);
     }
 

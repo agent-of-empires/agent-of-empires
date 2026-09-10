@@ -37,6 +37,7 @@ const MANIFEST_SOURCES: &[(&str, &str)] = &[
     ("pi", include_str!("manifests/pi.toml")),
     ("codex", include_str!("manifests/codex.toml")),
     ("omp", include_str!("manifests/omp.toml")),
+    ("junie", include_str!("manifests/junie.toml")),
 ];
 
 /// What one capture says about a session.

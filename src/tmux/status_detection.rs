@@ -190,6 +190,14 @@ pub fn detect_antigravity_status(raw_content: &str) -> Status {
     detect_via_manifest("antigravity", raw_content, "", None)
 }
 
+/// Junie (JetBrains) status detection via tmux pane parsing.
+/// Junie shows a "Working…" status line while a turn runs and an
+/// "Always allow" choice on its tool-approval prompt; an empty composer
+/// prompt reads as Idle. See `detect/manifests/junie.toml`.
+pub fn detect_junie_status(raw_content: &str) -> Status {
+    detect_via_manifest("junie", raw_content, "", None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,0 +1,19 @@
+id = "junie"
+
+# Junie (JetBrains) shows a "Working…" status line while a turn runs, and its
+# tool-approval prompt offers an "Always allow" choice. An empty composer (a
+# bare "> " prompt) carries no marker, so it falls through to Idle.
+
+[[rules]]
+id = "working"
+state = "running"
+priority = 965
+region = "whole_recent"
+visible = true
+contains_any = ["working…", "working..."]
+
+[[rules]]
+extends = "approval_prompt"
+id = "approval_prompt"
+priority = 950
+contains_any = ["always allow"]
