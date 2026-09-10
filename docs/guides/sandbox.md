@@ -321,11 +321,9 @@ history belonging to no one session. Those stay where they are rather than
 being replicated into every session, so if any are left the shared store is
 kept rather than deleted and AoE names it when the move finishes; remove it
 yourself once you no longer want it. A store with nothing left in it is
-deleted as before. A large store takes a while, so the first start of a
-session is slower than usual; the TUI shows the copy's progress on its status
-line and opens the session once it is done, and a plain `aoe` start says how
-many sessions still
-have the move ahead of them. A session whose container is still running is
+deleted as before. The TUI shows the copy's progress on its status line and opens the session once
+it is done, and a plain `aoe` start says how many sessions still have the move
+ahead of them. A session whose container is still running is
 skipped and moved on a later start, after it stops. Trashed and archived sessions stay on the shared
 store. Starting one moves it; restoring or unarchiving alone does not, so run
 `aoe migrate` afterwards if you want it moved before its next start.
@@ -344,6 +342,35 @@ one of them is started or brought back.
 container is still running carries on unaffected, on the shared store. One
 whose container is stopped cannot start until its store has moved, so drop the
 variable or run `aoe migrate` before launching it.
+
+### What the move costs
+
+Where the filesystem can clone a file, the copy shares blocks instead of
+duplicating them. That covers APFS on macOS, and btrfs and XFS on Linux. The
+move then takes seconds and adds close to nothing to disk however large the
+store is, and reclaiming the shared store afterwards can leave more space free
+than you started with. Apparent size stops being the bill: several private
+stores that each report the shared store's size can together occupy about as
+much as the one they came from.
+
+Everywhere else, ext4 included, and for any move that crosses a filesystem
+boundary, the bytes are copied. Budget one full copy of the shared store for
+each sandboxed session that has to move, in disk and in time, and check that
+much is free before you begin.
+
+Stop your sandboxed sessions before upgrading so the move finishes in one pass.
+A session whose container is still running is skipped and keeps using the
+shared store, and the reminder returns on every launch until that session is
+stopped and started again.
+
+### Finishing the move
+
+The shared store is deleted, and the reminder stops, once every session that
+used it has moved. Trashed and archived sessions hold it indefinitely, since
+neither is started in the normal course of things. To release one, start it, or
+restore or unarchive it and then run `aoe migrate`, or purge it if you no longer
+want it. Until the last holder is dealt with, the shared store stays on disk at
+its full size and AoE keeps asking.
 
 ### Shared credentials
 
