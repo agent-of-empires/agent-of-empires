@@ -117,9 +117,10 @@ fn choice_list_approval_is_routed_to_the_structured_view() {
     let id = add_session_with_tool(&mut env.view, "session-one", "claude");
     env.view
         .mutate_instance(&id, |inst| inst.view = crate::session::View::Structured);
+    let nonce = test_nonce();
     env.view
         .structured_pending_approvals
-        .insert(id.clone(), pending("approval-1"));
+        .insert(id.clone(), pending(&nonce));
     // Marquer l'entree comme liste de reponses (pi ask_user_question) : le
     // dialog generique n'a pas les labels et Allow repondrait la premiere
     // option de l'agent.
