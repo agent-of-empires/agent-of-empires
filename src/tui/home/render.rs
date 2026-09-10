@@ -674,10 +674,10 @@ fn branch_row_tag(inst: &crate::session::Instance) -> Option<RowTag> {
 
 fn workspace_branch_row_tag(branch: &str, repo_count: usize) -> Option<RowTag> {
     let suffix = format!("+{repo_count}");
-    let suffix_width = suffix.chars().count();
+    let suffix_width = rendered_width(&suffix);
     if suffix_width >= BRANCH_TAG_WIDTH {
         return Some(RowTag {
-            content: suffix.chars().take(BRANCH_TAG_WIDTH).collect(),
+            content: prefix_within_width(&suffix, BRANCH_TAG_WIDTH).to_string(),
             max_width: BRANCH_TAG_WIDTH,
         });
     }
@@ -694,11 +694,14 @@ fn workspace_branch_row_tag(branch: &str, repo_count: usize) -> Option<RowTag> {
 
 fn branch_tag_content(branch: &str, max_width: usize) -> Option<String> {
     let last = branch.rsplit('/').next().unwrap_or("");
-    let trimmed: String = last.chars().take(max_width).collect();
+    // Cut in cells, not characters: `RowTag::rendered` caps the whole tag in
+    // cells, so a character-sized cut lets a wide branch fill that cap and
+    // push the workspace repository count off the end.
+    let trimmed = prefix_within_width(last, max_width);
     if trimmed.is_empty() {
         None
     } else {
-        Some(trimmed)
+        Some(trimmed.to_string())
     }
 }
 
@@ -5303,6 +5306,18 @@ mod tests {
             BRANCH_TAG_WIDTH + 2,
             "a wide branch name must cap at the tag contract, got {rendered:?}"
         );
+    }
+
+    /// The repository count is what the workspace tag exists to carry, so the
+    /// branch must be cut in cells to leave room for it rather than filling
+    /// the cap and pushing it off the end.
+    #[test]
+    fn workspace_branch_row_tag_keeps_the_repository_count() {
+        let rendered = workspace_branch_row_tag(&"界".repeat(10), 2)
+            .expect("a wide branch still yields a tag")
+            .rendered();
+        assert_eq!(rendered, "[界界界界界+2]");
+        assert_eq!(rendered_width(&rendered), BRANCH_TAG_WIDTH + 2);
     }
 
     #[test]
