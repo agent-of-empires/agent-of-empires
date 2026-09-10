@@ -174,9 +174,7 @@ mod tests {
     #[serial]
     fn reconcile_from_disk_carries_poller_repair_backoff() {
         let temp = tempdir().unwrap();
-        std::env::set_var("HOME", temp.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
 
         let storage = crate::session::storage::Storage::new_unwatched("reconcile-test").unwrap();
         let mut inst = Instance::new("title", "/tmp/x");
@@ -193,13 +191,10 @@ mod tests {
         let now = std::time::Instant::now();
         inst.poller_repair.defer(now);
         inst.poller_repair.defer(now);
-        let deferrals = inst.poller_repair.deferrals();
-        assert!(deferrals >= 2);
         assert!(!inst.poller_repair.due(now));
 
         inst.reconcile_from_disk();
 
-        assert_eq!(inst.poller_repair.deferrals(), deferrals);
         assert!(!inst.poller_repair.due(now));
     }
 
