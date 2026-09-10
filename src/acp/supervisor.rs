@@ -2040,13 +2040,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             drop(client);
             return Err(self.retire_refused_install(&lease, identity, refusal).await);
         }
-        // Reconcile the durable log against reality before the drain starts.
-        // A fresh or respawned Runner has an empty `pending_responders`, so an
-        // `ApprovalRequested` with no matching `ApprovalResolved` is orphaned
-        // by the worker it replaced and would resurface as a dead 404 card.
-        // Sweeping after the drain would instead race a startup approval from
-        // the new worker, cancelling it while its live responder is still
-        // parked. See #1099.
+        // Retire the previous worker's requests before publishing this worker's events.
         self.cancel_orphaned_approvals(&session_id);
         self.cancel_orphaned_elicitations(&session_id);
         let drain_task = self.start_drain_task(session_id.clone(), lease.clone(), inbound);
@@ -8029,6 +8023,101 @@ cursor-acp-bridge = "agent acp"
             ),
             "an attach in flight must not count toward spawn capacity"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn spawn_retires_old_approval_before_publishing_queued_request() {
+        use crate::acp::approvals::Approval;
+        use crate::acp::event_store::EventStore;
+        use crate::acp::state::ToolCall;
+
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::session::test_support::isolate_app_dir_at(home.path());
+        let store = Arc::new(EventStore::open(&home.path().join("acp.db"), 1000).unwrap());
+        let (tx, mut rx) = broadcast::channel(16);
+        let sink = Arc::new(ChannelSink {
+            tx,
+            event_store: store.clone(),
+            control_cache: Arc::new(crate::acp::control_cache::ControlStateCache::new()),
+        });
+        let approval = |nonce: &str| Approval {
+            nonce: Nonce(nonce.into()),
+            tool_call: ToolCall {
+                id: nonce.into(),
+                name: "Bash".into(),
+                kind: "execute".into(),
+                args_preview: r#"{"command":"pwd"}"#.into(),
+                started_at: chrono::Utc::now(),
+                parent_tool_call_id: None,
+                memory_recall: None,
+                diffs: Vec::new(),
+            },
+            destructive: false,
+            options: Vec::new(),
+            choice: false,
+            requested_at: chrono::Utc::now(),
+            resolved: None,
+        };
+        sink.publish(
+            "s-startup",
+            1,
+            &Event::ApprovalRequested {
+                approval: approval("old"),
+            },
+        );
+        let fresh = approval("live");
+        let senders: Arc<std::sync::Mutex<Vec<mpsc::Sender<Event>>>> = Default::default();
+        let launcher: Launcher = Arc::new(move |config, session_id| {
+            let fresh = fresh.clone();
+            let senders = senders.clone();
+            Box::pin(async move {
+                save_record(&session_id.0, 4345, config.generation);
+                let (client, tx) = AcpClient::fake_for_test(session_id);
+                tx.send(Event::ApprovalRequested { approval: fresh })
+                    .await
+                    .unwrap();
+                senders.lock().unwrap().push(tx);
+                Ok(client.with_runner_pid(4345))
+            })
+        });
+        let control = Arc::new(FakeProcessControl::default());
+        control.alive(4345);
+        let sup = Supervisor::new(sink)
+            .with_process_control(control)
+            .with_launcher(launcher);
+        sup.hydrate_seqs(store.all_session_seqs());
+        sup.spawn(spawn_request("s-startup")).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !store
+                .unresolved_approval_nonces("s-startup")
+                .contains(&Nonce("live".into()))
+            {
+                rx.recv().await.unwrap();
+            }
+        })
+        .await
+        .expect("queued approval must reach the durable log");
+        assert_eq!(
+            store.unresolved_approval_nonces("s-startup"),
+            vec![Nonce("live".into())]
+        );
+        let events: Vec<_> = store
+            .replay_from("s-startup", 0)
+            .into_iter()
+            .filter_map(|(_, event)| match event {
+                Event::ApprovalRequested { approval } => {
+                    Some(format!("requested:{}", approval.nonce.0))
+                }
+                Event::ApprovalResolved { nonce, decision } => {
+                    assert_eq!(decision, ApprovalDecision::Cancelled);
+                    Some(format!("cancelled:{}", nonce.0))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(events, ["requested:old", "cancelled:old", "requested:live"]);
+        sup.shutdown("s-startup").await.unwrap();
     }
 
     #[tokio::test]

@@ -165,32 +165,37 @@ pub fn is_destructive(tool_name: &str, args_preview: &str) -> bool {
     }
 }
 
-/// One-line "what is being approved" summary for an approval's
-/// `tool_call.args_preview`, keyed off the ACP `tool_call.kind`
-/// (`read`/`edit`/`write`/`delete`/`move` -> path, `execute` -> first
-/// command line). Mirrors the structured view's approval shelf
-/// (`structured_view/render.rs::approval_target`) minus the session
-/// path-root relativization the in-view shelf applies; the home permission
-/// dialog has no path roots, so it shows the raw path. Empty when the kind
-/// carries no obvious target or `args_preview` is not a JSON object.
-pub fn summarize_target(kind: &str, args_preview: &str) -> String {
-    const PATH_KEYS: &[&str] = &["path", "file_path", "filePath", "filename"];
-    const CMD_KEYS: &[&str] = &["command", "cmd", "args"];
-    let obj = match serde_json::from_str::<serde_json::Value>(args_preview) {
-        Ok(serde_json::Value::Object(map)) => map,
-        _ => return String::new(),
-    };
-    let pick = |keys: &[&str]| -> Option<String> {
-        keys.iter()
-            .find_map(|k| obj.get(*k).and_then(|v| v.as_str()))
-            .map(str::to_string)
-    };
+pub(crate) const PATH_KEYS: &[&str] = &["path", "file_path", "filePath", "filename"];
+pub(crate) const CMD_KEYS: &[&str] = &["command", "cmd", "args"];
+
+pub(crate) enum ToolTarget<'a> {
+    Path(&'a str),
+    Command(&'a str),
+}
+
+/// Primary target shared by approval and tool summaries. Formatting stays local.
+pub(crate) fn tool_target<'a>(
+    kind: &str,
+    args: &'a serde_json::Map<String, serde_json::Value>,
+) -> Option<ToolTarget<'a>> {
+    let pick = |keys: &[&str]| keys.iter().find_map(|key| args.get(*key)?.as_str());
     match kind {
-        "edit" | "write" | "read" | "delete" | "move" => pick(PATH_KEYS).unwrap_or_default(),
+        "edit" | "write" | "read" | "delete" | "move" => pick(PATH_KEYS).map(ToolTarget::Path),
         "execute" => pick(CMD_KEYS)
-            .and_then(|command| command.lines().next().map(str::to_string))
-            .unwrap_or_default(),
-        _ => String::new(),
+            .and_then(|command| command.lines().next())
+            .map(ToolTarget::Command),
+        _ => None,
+    }
+}
+
+/// Raw path or first command line for the home approval projection.
+pub fn summarize_target(kind: &str, args_preview: &str) -> String {
+    let Ok(serde_json::Value::Object(args)) = serde_json::from_str(args_preview) else {
+        return String::new();
+    };
+    match tool_target(kind, &args) {
+        Some(ToolTarget::Path(value) | ToolTarget::Command(value)) => value.to_owned(),
+        None => String::new(),
     }
 }
 
