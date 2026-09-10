@@ -49,10 +49,7 @@ impl Instance {
         disk.last_start_time = self.last_start_time;
         disk.session_id_poller = self.session_id_poller.take();
         disk.session_id_poller_retry_after = self.session_id_poller_retry_after;
-        // `poller_repair` is `#[serde(skip)]`, so the disk snapshot's default
-        // state would reset the backoff schedule to "due now" and let
-        // `repair_session_id_poller_if_needed` retry ahead of its 5-60s
-        // escalation. Carry the live schedule across the reload.
+        // Preserve the serde-skipped backoff so reloads cannot trigger an early retry.
         disk.poller_repair = self.poller_repair.clone();
         disk.retroactive_capture_excludes = std::mem::take(&mut self.retroactive_capture_excludes);
         disk.pane_dead_observed = self.pane_dead_observed;
@@ -173,9 +170,6 @@ mod tests {
         assert_eq!(inst.agent_session_id.as_deref(), Some("new-sid"));
     }
 
-    // #3776 review finding: `poller_repair` is `#[serde(skip)]`, so an
-    // unscheduled reload would otherwise reset the backoff to "due now" and
-    // let the repair retry ahead of its 5-60s escalation.
     #[test]
     #[serial]
     fn reconcile_from_disk_carries_poller_repair_backoff() {
@@ -196,10 +190,6 @@ mod tests {
             })
             .unwrap();
 
-        // A deferred repair in flight: not due for another minute, two
-        // deferrals recorded. `defer_poller_repair` is private to the
-        // polling module, so the schedule is built through the backoff's
-        // own `defer`.
         let now = std::time::Instant::now();
         inst.poller_repair.defer(now);
         inst.poller_repair.defer(now);
@@ -209,8 +199,6 @@ mod tests {
 
         inst.reconcile_from_disk();
 
-        // The reload must not reset the schedule: the next repair stays
-        // deferred, not immediately due.
         assert_eq!(inst.poller_repair.deferrals(), deferrals);
         assert!(!inst.poller_repair.due(now));
     }
