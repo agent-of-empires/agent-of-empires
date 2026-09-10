@@ -120,10 +120,17 @@ pub fn truncate_to_width(text: &str, max_width: usize) -> String {
 /// dakuten/handakuten (U+FF9E, U+FF9F) to zero cells where the renderer
 /// spends one on each, so a string-width budget admits twice the text that
 /// fits for that script.
+///
+/// Clusters holding a control character are dropped first, as both renderer
+/// paths do: they paint nothing, and `CellWidth` debug-asserts when handed a
+/// lone ASCII control.
 pub fn rendered_width(text: &str) -> usize {
     use ratatui::buffer::CellWidth;
     use unicode_segmentation::UnicodeSegmentation;
-    text.graphemes(true).map(|g| g.cell_width() as usize).sum()
+    text.graphemes(true)
+        .filter(|g| !g.contains(char::is_control))
+        .map(|g| g.cell_width() as usize)
+        .sum()
 }
 
 /// The longest prefix of `text` that fits in `max_width` display cells, with
@@ -135,16 +142,19 @@ pub fn rendered_width(text: &str) -> usize {
 /// from [`rendered_width`], so a cluster whose scalars do not sum to what it
 /// paints ("\u{26a0}\u{fe0f}" is 2 cells where its chars sum to 1,
 /// "\u{1f91d}\u{1f3fd}" is 2 where they sum to 4) neither over- nor
-/// under-fills the budget.
+/// under-fills the budget. A cluster holding a control character costs
+/// nothing yet stays in the slice, so the result is still a borrowed prefix.
 pub fn prefix_within_width(text: &str, max_width: usize) -> &str {
     use ratatui::buffer::CellWidth;
     use unicode_segmentation::UnicodeSegmentation;
     let mut cells = 0usize;
     let mut end = 0;
     for (start, g) in text.grapheme_indices(true) {
-        cells += g.cell_width() as usize;
-        if cells > max_width {
-            break;
+        if !g.contains(char::is_control) {
+            cells += g.cell_width() as usize;
+            if cells > max_width {
+                break;
+            }
         }
         end = start + g.len();
     }
@@ -216,6 +226,30 @@ mod tests {
         let out = truncate_to_width(&halfwidth, 24);
         assert!(rendered_width(&out) <= 24, "{out:?}");
         assert!(out.ends_with('\u{2026}'));
+    }
+
+    /// Control characters paint nothing, so charging cells for them ellipsizes
+    /// text that fits, and `CellWidth` debug-asserts when a lone ASCII control
+    /// reaches it. Plugin row-column text can carry internal tabs.
+    #[test]
+    fn control_characters_cost_no_cells() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::text::Line;
+
+        assert_eq!(rendered_width("a\tb"), 2);
+        assert_eq!(rendered_width("a\r\nb"), 2);
+        assert_eq!(prefix_within_width("a\tb", 2), "a\tb");
+        assert_eq!(truncate_to_width("a\tb", 2), "a\tb");
+        // Still budgeted correctly once the visible text does overflow.
+        assert_eq!(truncate_to_width("a\tbcdef", 3), "a\tb\u{2026}");
+
+        // The two cells ratatui actually paints for the passthrough case.
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 1));
+        let (x, _) = buffer.set_line(0, 0, &Line::raw(truncate_to_width("a\tb", 2)), 4);
+        assert_eq!(x, 2, "{buffer:?}");
+        assert_eq!(buffer[(0, 0)].symbol(), "a");
+        assert_eq!(buffer[(1, 0)].symbol(), "b");
     }
 
     #[test]
