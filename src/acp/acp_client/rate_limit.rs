@@ -41,6 +41,30 @@ pub(crate) fn classify_rate_limit_from_message(
     })
 }
 
+/// Recognize the agent's rejection of a stored/resumed ACP session id it no
+/// longer holds (e.g. OMP replying `Unsupported ACP session`). A resumed
+/// worker reuses the persisted `acp_session_id` without re-issuing
+/// `session/load`, so if the agent dropped that session across the
+/// interruption the first `session/prompt` fails with this class of error
+/// rather than a rate limit or a transport drop. The caller recovers via the
+/// established `SessionContextReset` path: the supervisor clears the stored
+/// id so the respawn opens a fresh `session/new`, while the SQLite transcript
+/// is preserved for replay. Deliberately narrow, a message fingerprint, so an
+/// unrelated prompt failure still ends the turn as an ordinary error instead
+/// of being silently swallowed into a context reset.
+pub(crate) fn is_unsupported_session_error(err: &agent_client_protocol::Error) -> bool {
+    const PHRASES: &[&str] = &[
+        "unsupported acp session",
+        "unsupported session",
+        "unknown session",
+        "session not found",
+        "no such session",
+        "session does not exist",
+    ];
+    let msg = err.message.to_ascii_lowercase();
+    PHRASES.iter().any(|phrase| msg.contains(phrase))
+}
+
 /// One observation of the SDK's rate-limit state, as forwarded by
 /// claude-agent-acp under a `usage_update`'s
 /// `_meta["_claude/rateLimit"]` (an `SDKRateLimitInfo`).
@@ -295,5 +319,33 @@ mod tests {
             (now - chrono::Duration::minutes(1)).timestamp(),
         )]));
         assert_eq!(captured_rate_limit_resets_at(&all_past, now), None);
+    }
+
+    #[test]
+    fn is_unsupported_session_error_matches_only_stale_session_rejections() {
+        let classify = |m: &str| {
+            let mut err = agent_client_protocol::Error::internal_error();
+            err.message = m.into();
+            is_unsupported_session_error(&err)
+        };
+        let cases = [
+            ("Unsupported ACP session", true),
+            ("Unknown session 01a040bb-...", true),
+            ("session not found", true),
+            ("no such session: abc", true),
+            ("Session does not exist", true),
+            // Unrelated failures, including two that contain a phrase
+            // word next to "session", must stay ordinary errors.
+            ("You've hit your limit", false),
+            ("transport closed", false),
+            ("permission denied", false),
+            ("unsupported model", false),
+            ("unknown tool", false),
+            ("Unsupported content block in session/prompt", false),
+            ("Method not found: session/prompt", false),
+        ];
+        for (msg, expected) in cases {
+            assert_eq!(classify(msg), expected, "{msg:?}");
+        }
     }
 }

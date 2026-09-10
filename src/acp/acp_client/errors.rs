@@ -133,54 +133,9 @@ pub(super) fn acp_error_from_value(error: serde_json::Value) -> agent_client_pro
         .unwrap_or_else(|_| acp_internal_error(format!("runner handshake failed: {error}")))
 }
 
-/// Whether a `session/prompt` rejection means the agent no longer holds
-/// the stored ACP session a resumed worker reused without `session/load`
-/// (OMP replies `Unsupported ACP session`). Deliberately a narrow message
-/// fingerprint: a false positive would turn an unrelated prompt failure
-/// into a context reset, a false negative leaves the runner terminating
-/// with no recovery (#3560).
-pub(crate) fn is_unsupported_session_error(err: &agent_client_protocol::Error) -> bool {
-    const PHRASES: &[&str] = &[
-        "unsupported acp session",
-        "unsupported session",
-        "unknown session",
-        "session not found",
-        "no such session",
-        "session does not exist",
-    ];
-    let msg = err.message.to_ascii_lowercase();
-    PHRASES.iter().any(|phrase| msg.contains(phrase))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn unsupported_session_matches_only_stale_session_rejections() {
-        let classify = |m: &str| {
-            let mut err = agent_client_protocol::Error::internal_error();
-            err.message = m.into();
-            is_unsupported_session_error(&err)
-        };
-        let cases = [
-            ("Unsupported ACP session", true),
-            ("Unknown session 01a040bb", true),
-            ("session not found", true),
-            ("no such session: abc", true),
-            ("Session does not exist", true),
-            ("You've hit your limit", false),
-            ("transport closed", false),
-            ("unsupported model", false),
-            ("unknown tool", false),
-            ("Unsupported content block in session/prompt", false),
-            ("Method not found: session/prompt", false),
-        ];
-        for (msg, expected) in cases {
-            assert_eq!(classify(msg), expected, "{msg:?}");
-        }
-    }
-
     /// Belt-and-suspenders: even if the pre-flight raced (cwd vanishes
     /// between `cwd.exists()` and `Command::spawn`), the classifier turns
     /// the raw ENOENT into `ProjectPathMissing` rather than the generic

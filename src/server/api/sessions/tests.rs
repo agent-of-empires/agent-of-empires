@@ -639,19 +639,19 @@ async fn list_sessions_shares_config_resolution_across_overlays() {
     let a2 = mk("default", "/tmp/repo-a-2603");
     let b = mk("default", "/tmp/repo-b-2603");
 
+    // The counter lives on this state, so no concurrent test can bump it.
     let state = crate::server::test_support::build_test_app_state(vec![a, a2, b]);
 
-    LIST_SESSIONS_RESOLVER_MISSES.store(0, Ordering::Relaxed);
     let _envelope = list_sessions(
         axum::extract::State(state.clone()),
         axum::extract::Query(ListSessionsQuery { state: None }),
     )
     .await;
-    let misses = LIST_SESSIONS_RESOLVER_MISSES.load(Ordering::Relaxed);
+    let misses = state.list_sessions_resolver_misses.load(Ordering::Relaxed);
 
     assert_eq!(
         misses, 2,
-        "shared cache must resolve exactly once per unique (profile, project_path) across both overlays; got {misses}",
+        "shared cache must resolve once per unique (profile, project_path) across both overlays; got {misses}",
     );
 }
 

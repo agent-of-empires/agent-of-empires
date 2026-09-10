@@ -380,8 +380,6 @@ fn build_exclusion_set(
     };
 
     let aoe_sessions: Vec<&str> = names
-        .iter()
-        .map(String::as_str)
         .filter(|name| {
             name.starts_with(crate::tmux::SESSION_PREFIX)
                 && !name.starts_with(crate::tmux::TOOL_PREFIX)
