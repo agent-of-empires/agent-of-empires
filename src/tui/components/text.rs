@@ -161,9 +161,32 @@ pub fn prefix_within_width(text: &str, max_width: usize) -> &str {
     &text[..end]
 }
 
+/// `text` fitted to a `max_width` column of a multi-span [`ratatui::text::Line`].
+///
+/// Cut and padded by different metrics, because ratatui lays a `Line` out with
+/// two that disagree: `Span::render` advances a cell per `CellWidth`, while
+/// `render_spans` starts the next span at `Span::width`, which is
+/// `UnicodeWidthStr`. They part only on halfwidth katakana
+/// dakuten/handakuten (U+FF9E, U+FF9F), where `CellWidth` charges the cell the
+/// terminal spends and `UnicodeWidthStr` scores zero.
+///
+/// So the cut uses [`truncate_to_width`], keeping painted glyphs inside the
+/// column, and the pad uses `UnicodeWidthStr`, landing the next span on the
+/// column boundary. Padding to `CellWidth` instead would start the next column
+/// one cell short per mark; a `{:<max_width$}` pad counts chars and leaves it
+/// short by one per wide glyph.
+pub fn fixed_width(text: &str, max_width: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let text = truncate_to_width(text, max_width);
+    let pad = max_width.saturating_sub(UnicodeWidthStr::width(text.as_str()));
+    format!("{text}{}", " ".repeat(pad))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{line_columns, prefix_within_width, rendered_width, truncate_to_width};
+    use super::{
+        fixed_width, line_columns, prefix_within_width, rendered_width, truncate_to_width,
+    };
 
     /// A wide grapheme occupies two columns and its continuation cell is reset
     /// by the renderer. Reading that back out of a buffer yields a phantom
@@ -250,6 +273,38 @@ mod tests {
         assert_eq!(x, 2, "{buffer:?}");
         assert_eq!(buffer[(0, 0)].symbol(), "a");
         assert_eq!(buffer[(1, 0)].symbol(), "b");
+    }
+
+    /// Both halves of the column contract: the next span starts exactly
+    /// `max_width` on, and the painted glyphs stay inside that. A `{:<width$}`
+    /// pad breaks the first for wide glyphs; a `CellWidth` pad breaks it for
+    /// halfwidth katakana.
+    #[test]
+    fn fixed_width_fits_a_line_column() {
+        use unicode_width::UnicodeWidthStr;
+        let wide = "\u{754c}".repeat(40);
+        for (text, width) in [
+            ("agent", 8),
+            ("\u{65e5}\u{672c}\u{8a9e}", 8),
+            ("\u{ff8a}\u{ff9e}\u{ff8a}\u{ff9e}\u{ff8a}\u{ff9e}", 8),
+            ("a much longer title than fits", 8),
+            (wide.as_str(), 24),
+            ("a\tb", 4),
+            ("", 3),
+        ] {
+            let out = fixed_width(text, width);
+            assert_eq!(
+                UnicodeWidthStr::width(out.as_str()),
+                width,
+                "{text:?} at {width}: next span must start on the boundary"
+            );
+            assert!(
+                rendered_width(out.trim_end()) <= width,
+                "{text:?} at {width}: painted glyphs must stay inside the column"
+            );
+        }
+        assert_eq!(fixed_width("ab", 5), "ab   ");
+        assert_eq!(fixed_width("abcdef", 0), "");
     }
 
     #[test]
