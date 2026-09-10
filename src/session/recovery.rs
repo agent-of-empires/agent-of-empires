@@ -912,7 +912,7 @@ mod tests {
         // Stand in for the orphaned `<agent> --resume <sid>` child: the sid
         // rides as `$0` of a compound-list `sh` so it stays alive with the id
         // in argv.
-        let mut child = std::process::Command::new("sh")
+        let mut child = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg("sleep 30; true")
             .arg(&sid)
@@ -1034,12 +1034,12 @@ mod tests {
         // under any other name, so the stand-in would die before the scan. The
         // sleep is short because it outlives the killed shell.
         std::fs::write(&agent, "#!/bin/sh\nsleep 10\n").unwrap();
-        // Hand the stub to `sh` instead of exec'ing it: a concurrent spawn in
-        // this binary can fork between the write's open and close and hold a
-        // writable copy, which fails execve with ETXTBSY (#3861). `sh` only
-        // opens it for reading. The kernel rewrites a shebang exec into this
-        // same argv, so the executable needle still matches the `claude`
-        // token and the stub needs no exec bit.
+        // The stub runs under `sh` so nothing execs it directly: a concurrent
+        // spawn in this binary can fork between the write's open and close and
+        // hold a writable copy, which fails execve with ETXTBSY (#3861). `sh`
+        // opens it for reading only. A shebang exec is rewritten by the kernel
+        // into this same argv, so the executable needle still matches the
+        // `claude` token and the stub needs no exec bit.
         let mut child = std::process::Command::new("/bin/sh")
             .arg(&agent)
             .env(crate::tmux::env::AOE_INSTANCE_ID_KEY, &inst.id)
