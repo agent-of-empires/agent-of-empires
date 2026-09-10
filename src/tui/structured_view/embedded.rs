@@ -86,7 +86,6 @@ impl EmbeddedView {
         Ok(view)
     }
 
-    /// The session this view is streaming.
     /// Test constructor: a mounted, non-activated view over a state that
     /// never talks to a daemon. Lets App-level tests drive the paste-drain
     /// handoff without a live connection.
@@ -120,6 +119,7 @@ impl EmbeddedView {
         self.state.composer.lines().join("\n")
     }
 
+    /// The session this view is streaming.
     pub fn session_id(&self) -> &str {
         &self.state.session_id
     }

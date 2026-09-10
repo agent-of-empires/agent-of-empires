@@ -440,14 +440,6 @@ pub struct HomeView {
     /// into the next compose dialog the user opens, so voice/dictation never
     /// gets thrown on the floor with a scolding info dialog.
     pub(super) pending_paste: Option<String>,
-    /// Pasted text captured at the home view that we couldn't immediately
-    /// route into the structured composer. Drained by
-    /// `open_structured_view` after the view activates, preserving the
-    /// text if activation fails so the next 'm' press can still drain it.
-    /// Buffered paste bound to the structured session it was captured for:
-    /// `(session_id, text)`. Draining only feeds a mounted view whose session
-    /// id matches, so a failed open on session A can never leak its text into
-    /// session B's composer.
     /// Unsent paste drafts captured on 'm', keyed by the structured session
     /// they were captured for. Drained into that session's composer when its
     /// view mounts; entries for other targets survive, so a failed open is
