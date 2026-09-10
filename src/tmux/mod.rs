@@ -1013,33 +1013,21 @@ impl LiveSessionSnapshot {
     }
 }
 
-/// The live AGENT session name for `session_id`, ignoring a paired terminal or
-/// container pane. The session-id poller needs this rather than
-/// [`live_any_kind_name_for_id_in`]: seeded with a terminal name, it probes
-/// that pane as alive and holds a budget slot for an agent that is gone.
-///
-/// Fails closed on one case, deliberately. A title sanitizing under
-/// [`AGENT_EXCLUDED_PREFIXES`] gives an agent name `NameShape::agent` refuses,
-/// so that session gets no poller repair. Accepting the instance's own derived
-/// name instead would reopen the leak: `aoe_term_Foo_<id>` is both the agent
-/// name for title `term_Foo` and the paired-terminal name for title `Foo`, so a
-/// smart rename across that boundary makes the surviving terminal
-/// indistinguishable from the agent by name alone, and nothing durable on the
-/// pane records which kind it is.
+/// The unique live agent pane for a poller seed. Marked panes use their durable
+/// kind; legacy unmarked panes retain name-shape filtering. Multiple live
+/// matches are ambiguous and cannot safely seed a poller.
 pub(crate) fn live_agent_name_for_id_in(
     snapshot: &LiveSessionSnapshot,
     session_id: &str,
 ) -> Option<String> {
-    let sessions = snapshot.sessions()?;
-    let suffix = id_suffix(session_id);
-    let agent = NameShape::agent(&suffix);
-    sessions
-        .iter()
-        .find(|(name, kind)| {
-            agent.matches_marked(name, kind.map(SessionKind::as_marker))
-                && !snapshot.pane_dead(name)
-        })
-        .map(|(name, _)| name.clone())
+    live_agent_name_for_id(
+        snapshot
+            .sessions()?
+            .iter()
+            .map(|(name, kind)| (name.as_str(), kind.map(SessionKind::as_marker))),
+        session_id,
+        |name| snapshot.pane_dead(name),
+    )
 }
 
 /// [`live_agent_name_for_id_in`] against a scan the caller has just taken,
@@ -1051,9 +1039,11 @@ pub(crate) fn live_agent_name_for_id<'a>(
 ) -> Option<String> {
     let suffix = id_suffix(session_id);
     let agent = NameShape::agent(&suffix);
-    live.into_iter()
-        .find(|(name, marker)| agent.matches_marked(name, *marker) && !pane_dead(name))
-        .map(|(name, _)| name.to_string())
+    let mut matches = live
+        .into_iter()
+        .filter(|(name, marker)| agent.matches_marked(name, *marker) && !pane_dead(name));
+    let (name, _) = matches.next()?;
+    matches.next().is_none().then(|| name.to_owned())
 }
 
 /// [`live_any_kind_name_for_id`] against an already-taken snapshot, so a batch
@@ -3809,6 +3799,31 @@ mod tests {
             "a later scope is still subtracted when an earlier one holds a separator"
         );
         assert!(!parsed.contains_key("a"), "a scope value is not a session");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn live_agent_lookup_rejects_multiple_live_matches() {
+        let first = format!("{P}first_{ID8}");
+        let second = format!("{TERMINAL_PREFIX}second_{ID8}");
+        let names = vec![
+            (first.clone(), Some(SessionKind::Agent)),
+            (second.clone(), Some(SessionKind::Agent)),
+        ];
+        let snapshot =
+            LiveSessionSnapshot::from_marked_parts(Some(names.clone()), Some(HashMap::new()));
+        assert_eq!(live_agent_name_for_id_in(&snapshot, ID), None);
+        assert_eq!(
+            live_agent_name_for_id(
+                names
+                    .iter()
+                    .map(|(name, kind)| (name.as_str(), kind.map(SessionKind::as_marker))),
+                ID,
+                |name| name == second,
+            ),
+            Some(first),
+            "a dead duplicate must not disqualify the only live agent",
+        );
     }
 
     /// The kind marker is what name shape cannot say, in both directions: an
