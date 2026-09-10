@@ -2,41 +2,54 @@
 
 use super::*;
 
-/// One authoritative `list-sessions`, each line `<name>|<kind marker>`.
-fn live_sessions_probe() -> Option<String> {
-    let output = crate::tmux::tmux_query_command()
-        .args(["list-sessions", "-F", "#{session_name}|#{@aoe_kind}"])
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
 pub(super) fn tmux_env_session_name_for_instance_id(instance_id: &str) -> Option<String> {
-    let stdout = live_sessions_probe()?;
+    let live = crate::tmux::probe_live_sessions()?;
     crate::tmux::live_any_kind_name_for_id(
-        stdout.lines().map(crate::tmux::split_kind_marker),
+        crate::tmux::marked_names(&live),
         instance_id,
         crate::tmux::utils::is_pane_dead,
     )
 }
 
-/// The live AGENT session for `instance_id`, ignoring its paired terminals,
-/// container terminals and tool sub-sessions.
+/// What one live scan says about `instance_id`'s panes, for seeding a
+/// session-id poller.
 ///
 /// [`tmux_env_session_name_for_instance_id`] answers "does this row have any
-/// live pane", which a terminal outliving its agent satisfies. A session-id
-/// poller needs the agent pane specifically: seeded with a terminal it would
-/// probe that pane as alive forever (#3880).
-pub(super) fn live_agent_name_for_instance_id(instance_id: &str) -> Option<String> {
-    let stdout = live_sessions_probe()?;
-    crate::tmux::live_agent_name_for_id(
-        stdout.lines().map(crate::tmux::split_kind_marker),
+/// live pane", which a terminal outliving its agent satisfies. A poller needs
+/// the agent pane specifically: seeded with a terminal it would probe that
+/// pane as alive forever (#3880). It also needs to tell "no agent yet" from
+/// "no agent any more", since only the first is a reason to fall back to the
+/// title-derived name.
+pub(crate) enum AgentSeed {
+    /// The live agent session for the id.
+    Agent(String),
+    /// Panes are live for the id, none of them the agent.
+    OtherKindOnly,
+    /// Nothing live for the id, or the tmux server could not be reached.
+    NothingLive,
+}
+
+pub(super) fn live_agent_seed_for_instance_id(instance_id: &str) -> AgentSeed {
+    let Some(live) = crate::tmux::probe_live_sessions() else {
+        return AgentSeed::NothingLive;
+    };
+    if let Some(name) = crate::tmux::live_agent_name_for_id(
+        crate::tmux::marked_names(&live),
+        instance_id,
+        crate::tmux::utils::is_pane_dead,
+    ) {
+        return AgentSeed::Agent(name);
+    }
+    if crate::tmux::live_any_kind_name_for_id(
+        crate::tmux::marked_names(&live),
         instance_id,
         crate::tmux::utils::is_pane_dead,
     )
+    .is_some()
+    {
+        return AgentSeed::OtherKindOnly;
+    }
+    AgentSeed::NothingLive
 }
 
 /// Find another session that owns the exact title and normalized path.
@@ -83,9 +96,10 @@ impl Instance {
     }
 
     /// [`Self::has_live_agent_pane_in`] as a fresh probe, answering with the
-    /// agent session's name.
-    pub(crate) fn live_agent_tmux_name(&self) -> Option<String> {
-        live_agent_name_for_instance_id(&self.id)
+    /// agent session's name and, failing that, whether anything else for this
+    /// row is still live.
+    pub(crate) fn live_agent_seed(&self) -> AgentSeed {
+        live_agent_seed_for_instance_id(&self.id)
     }
 
     /// [`Self::tmux_env_session_name`] answered from a snapshot the caller
@@ -224,10 +238,16 @@ mod tests {
 
         // A `tmux` that answers with one live session name, standing in for the
         // probe that succeeds after the snapshot's own `list-sessions` failed.
-        // The pane-liveness check reads the same output and parses it as "not
-        // dead", which is what the real probe does for any answer but `1`.
+        // The session scan's own format, so the shim exercises the parser the
+        // probe really uses. The pane-liveness check reads the same output and
+        // parses it as "not dead", which is what the real probe does for any
+        // answer but `1`.
         let shim = temp.path().join("tmux");
-        std::fs::write(&shim, format!("#!/bin/sh\necho '{live_name}'\n")).unwrap();
+        std::fs::write(
+            &shim,
+            format!("#!/bin/sh\necho '{live_name}|1789065184|agent'\n"),
+        )
+        .unwrap();
         std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
         let path = format!(
             "{}:{}",

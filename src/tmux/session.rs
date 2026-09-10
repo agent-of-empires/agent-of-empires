@@ -3162,41 +3162,66 @@ mod tests {
         assert_eq!(created_at_ms % 1000, 999);
     }
 
-    /// The marker has to survive the wiring, not just tmux: the option is
-    /// chained onto `new-session`, and a scan reads it back through the same
-    /// `-F` the session cache uses. A rename must not lose it, since that is
-    /// the case the marker exists for (smart rename is on by default).
+    /// The marker has to survive the wiring, not just tmux. Every kind is
+    /// created through its own production path and read back through the very
+    /// scan command and parser the session cache uses, so a typo in the `-F`
+    /// string or a missing chain on one kind fails here. A rename must not
+    /// lose the mark, since that is the case it exists for (smart rename is on
+    /// by default).
     #[test]
     #[serial_test::serial]
-    fn create_marks_the_agent_session_and_a_rename_keeps_the_mark() {
+    fn every_kind_is_marked_at_creation_and_keeps_its_mark_across_a_rename() {
         if !tmux_available() {
             eprintln!("Skipping test: tmux not available");
             return;
         }
         let temp = tempfile::tempdir().expect("tempdir");
-        let guard = TmuxTestSession::new("aoe_test_kind_marker");
-        let session = Session::from_name(guard.name());
-        session
-            .create(&temp.path().to_string_lossy(), Some("sleep 30"), "default")
+        let dir = temp.path().to_string_lossy().to_string();
+        // A distinct id per run so these names cannot collide with a parallel
+        // test's, and a title that sanitizes cleanly.
+        let id = format!("kindmark{}", std::process::id());
+        let title = "Vikings";
+
+        let agent = Session::new(&id, title).expect("agent session");
+        let _agent_guard = TmuxTestSession::from_name(agent.name());
+        agent
+            .create(&dir, Some("sleep 30"), "default")
             .expect("create the agent session");
 
-        let read_marker = |name: &str| -> String {
-            let out = crate::tmux::tmux_command()
-                .args(["display-message", "-p", "-t", name, "#{@aoe_kind}"])
-                .output()
-                .expect("tmux display-message");
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        };
-        assert_eq!(read_marker(guard.name()), "agent");
+        let terminal = crate::tmux::TerminalSession::new(&id, title).expect("terminal session");
+        let _terminal_guard = TmuxTestSession::from_name(terminal.name());
+        terminal
+            .create_with_size(&dir, Some("sleep 30"), None, "default")
+            .expect("create the paired terminal");
+
+        let tool = crate::tmux::ToolSession::new(&id, title, "lazygit");
+        let _tool_guard = TmuxTestSession::from_name(tool.session_name());
+        tool.create_with_size(&dir, "sleep 30", None, "default")
+            .expect("create the tool sub-session");
+
+        let scan = crate::tmux::probe_live_sessions().expect("the scan reaches tmux");
+        assert_eq!(
+            scan.get(agent.name()).and_then(|s| s.kind),
+            Some(crate::tmux::SessionKind::Agent),
+        );
+        assert_eq!(
+            scan.get(terminal.name()).and_then(|s| s.kind),
+            Some(crate::tmux::SessionKind::Terminal),
+        );
+        assert_eq!(
+            scan.get(tool.session_name()).and_then(|s| s.kind),
+            Some(crate::tmux::SessionKind::Tool),
+        );
 
         let renamed = TmuxTestSession::new("aoe_test_kind_renamed");
         crate::tmux::tmux_command()
-            .args(["rename-session", "-t", guard.name(), renamed.name()])
+            .args(["rename-session", "-t", agent.name(), renamed.name()])
             .output()
             .expect("tmux rename-session");
+        let scan = crate::tmux::probe_live_sessions().expect("the scan reaches tmux");
         assert_eq!(
-            read_marker(renamed.name()),
-            "agent",
+            scan.get(renamed.name()).and_then(|s| s.kind),
+            Some(crate::tmux::SessionKind::Agent),
             "the mark travels with the session, unlike its name"
         );
     }

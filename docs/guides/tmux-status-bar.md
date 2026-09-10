@@ -128,8 +128,13 @@ set -g status-right "#{@aoe_title} #{@aoe_branch} #{@aoe_sandbox} | %H:%M"
 `cterm` (container terminal), or `tool`. It is written when the session is
 created and survives renames, so it stays accurate where the session name
 cannot: a title such as `term notes` gives an agent session a name shaped like
-a paired terminal's. A session started by an earlier aoe carries no
-value until it is restarted.
+a paired terminal's. A session started by an earlier aoe carries no value until
+it is restarted.
+
+Read it, but do not set it. aoe sets it per session, and ignores any value it
+could have read from a global `set -g @aoe_kind` of yours, since a global one
+applies to every session on the server and would tell aoe that panes are
+something they are not.
 
 ```tmux
 # Only decorate the agent pane

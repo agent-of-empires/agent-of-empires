@@ -539,15 +539,72 @@ fn publish_session_cache(
     cache.outcome = outcome;
     outcome
 }
-/// Parse the `#{session_name}|#{session_activity}|#{@aoe_kind}` scan.
+/// One authoritative scan, parsed: the same command and parser the shared
+/// cache uses, for a caller that needs a fresh answer rather than the cache's.
+/// `None` when the tmux server could not be reached, which is not evidence
+/// that anything is absent.
+pub(crate) fn probe_live_sessions() -> Option<HashMap<String, LiveSession>> {
+    let output = run_tmux_command_with_timeout(&mut session_scan_command()).ok()?;
+    output
+        .status
+        .success()
+        .then(|| parse_session_scan(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// Every live session as `(name, kind marker)` pairs, the shape the id
+/// lookups take.
+pub(crate) fn marked_names(
+    sessions: &HashMap<String, LiveSession>,
+) -> impl Iterator<Item = (&str, Option<&str>)> {
+    sessions
+        .iter()
+        .map(|(name, session)| (name.as_str(), session.kind.map(SessionKind::as_marker)))
+}
+
+/// The one scan every kind-aware lookup reads: the global `@aoe_kind` (see
+/// [`parse_session_scan`]) followed by one line per live session.
+fn session_scan_command() -> Command {
+    let mut command = tmux_query_command();
+    command.args([
+        "show-options",
+        "-gqv",
+        session_kind::KIND_OPTION,
+        ";",
+        "list-sessions",
+        "-F",
+        SESSION_SCAN_FORMAT,
+    ]);
+    command
+}
+
+const SESSION_SCAN_FORMAT: &str = "#{session_name}|#{session_activity}|#{@aoe_kind}";
+
+/// Parse the [`session_scan_command`] output.
 ///
-/// The kind field is last and expands to the empty string for a session with
-/// no marker, so a line that is short or empty there is an unmarked session,
-/// not a parse failure. Session names are sanitized to `[A-Za-z0-9_-]`, so
-/// they never contain [`FIELD_SEP`] themselves.
+/// A session line is `<name>|<activity>|<kind marker>`, the marker empty for a
+/// session with no mark, so a line that is short or empty there is an unmarked
+/// session and not a parse failure.
+///
+/// The first line is the GLOBAL `@aoe_kind`, printed only when the user set
+/// one, and recognized by carrying no [`FIELD_SEP`] where a session line
+/// always has two. It has to be subtracted: `#{@aoe_kind}` falls through to
+/// the global value for every session that does not set its own, so a user who
+/// sets one would otherwise mark their whole server as agents. A session whose
+/// value merely equals the global is treated as unmarked, which is the
+/// name-shape fallback rather than a wrong answer.
+///
+/// aoe-created names are sanitized to `[A-Za-z0-9_-]`, but the shared server
+/// also carries foreign sessions, whose names tmux does allow `|` in. Such a
+/// name splits into a nonsense key that no `_<id8>` lookup can match, which is
+/// the same outcome it had before the kind field existed.
 fn parse_session_scan(stdout: &str) -> HashMap<String, LiveSession> {
+    let mut lines = stdout.lines().peekable();
+    let global = lines
+        .next_if(|line| !line.contains(FIELD_SEP))
+        .filter(|line| !line.is_empty());
+
     let mut map = HashMap::new();
-    for line in stdout.lines() {
+    for line in lines {
         let Some((name, rest)) = line.split_once(FIELD_SEP) else {
             continue;
         };
@@ -559,7 +616,9 @@ fn parse_session_scan(stdout: &str) -> HashMap<String, LiveSession> {
             name.to_string(),
             LiveSession {
                 activity: activity.parse().unwrap_or(0),
-                kind: marker.and_then(SessionKind::from_marker),
+                kind: marker
+                    .filter(|marker| Some(*marker) != global)
+                    .and_then(SessionKind::from_marker),
             },
         );
     }
@@ -569,12 +628,7 @@ fn parse_session_scan(stdout: &str) -> HashMap<String, LiveSession> {
 pub fn refresh_session_cache() -> SessionCacheRefresh {
     let refresh_id = next_refresh_id(&SESSION_REFRESH_ID);
     let start = Instant::now();
-    let mut command = tmux_query_command();
-    command.args([
-        "list-sessions",
-        "-F",
-        "#{session_name}|#{session_activity}|#{@aoe_kind}",
-    ]);
+    let mut command = session_scan_command();
     let output = run_tmux_command_with_timeout(&mut command);
     let (new_data, outcome) = match output {
         Ok(out) if out.status.success() => {
@@ -1031,16 +1085,6 @@ fn unmarked<'a>(
     names.into_iter().map(|name| (name, None))
 }
 
-/// Split one `#{session_name}|#{@aoe_kind}` scan line. A line with no
-/// separator is a name with no marker, which is what a `tmux` that predates
-/// the option (or a test shim printing names alone) emits.
-pub(crate) fn split_kind_marker(line: &str) -> (&str, Option<&str>) {
-    match line.split_once(FIELD_SEP) {
-        Some((name, marker)) => (name, Some(marker)),
-        None => (line, None),
-    }
-}
-
 /// The tmux session name to act on for one of a session's panes, resolved
 /// against `live_names` (any iterator of live tmux session names).
 ///
@@ -1086,31 +1130,21 @@ pub(crate) fn resolve_session_name<'a>(
     }
 }
 
-/// `resolve_session_name` for the agent pane, against names alone. A caller
-/// holding kind markers should use [`resolve_agent_session_name_marked`]: with
-/// no marker every name falls back to its shape, which cannot separate an
-/// agent titled `term Foo` from a paired terminal.
+/// `resolve_session_name` for the agent pane, against names alone: with no
+/// kind marker every name falls back to its shape, which cannot separate an
+/// agent titled `term Foo` from a paired terminal. Callers reading the shared
+/// scan resolve through `live_session_name`, which does have the markers.
 pub fn resolve_agent_session_name<'a>(
     live_names: impl IntoIterator<Item = &'a str>,
     session_id: &str,
     derived: &str,
 ) -> String {
-    resolve_agent_session_name_marked(
-        live_names.into_iter().map(|name| (name, None)),
-        session_id,
-        derived,
-    )
-}
-
-/// [`resolve_agent_session_name`] for a caller that also has each session's
-/// kind marker.
-pub(crate) fn resolve_agent_session_name_marked<'a>(
-    live: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
-    session_id: &str,
-    derived: &str,
-) -> String {
     let suffix = id_suffix(session_id);
-    resolve_session_name(live, derived, &NameShape::agent(&suffix))
+    resolve_session_name(
+        live_names.into_iter().map(|name| (name, None)),
+        derived,
+        &NameShape::agent(&suffix),
+    )
 }
 
 /// [`resolve_agent_session_name`] against a [`batch_pane_metadata`] snapshot
@@ -3672,6 +3706,47 @@ mod tests {
         assert!(!parsed.contains_key("garbage-with-no-separator"));
     }
 
+    /// `#{@aoe_kind}` falls through to the global option, so a user who sets
+    /// one would otherwise have every unmarked session on their server claim
+    /// that kind, which is how a paired terminal would pass as an agent pane
+    /// again. The scan prints the global first so it can be subtracted.
+    #[test]
+    fn a_global_kind_option_marks_nothing() {
+        let agent = format!("{P}Vikings{ID8}");
+        let terminal = format!("{TERMINAL_PREFIX}Vikings{ID8}");
+        let scan = format!(
+            "agent\n\
+             {agent}|1789065184|agent\n\
+             {terminal}|1789065184|agent\n\
+             {terminal}_t1|1789065184|term"
+        );
+
+        let parsed = parse_session_scan(&scan);
+        assert_eq!(
+            parsed.get(&terminal).unwrap().kind,
+            None,
+            "a value the global could have produced is not a mark"
+        );
+        assert_eq!(
+            parsed.get(&agent).unwrap().kind,
+            None,
+            "including on a session that really is an agent: unmarked falls \
+             back to the name shape, which is right for it"
+        );
+        assert_eq!(
+            parsed.get(&format!("{terminal}_t1")).unwrap().kind,
+            Some(SessionKind::Terminal),
+            "a value the global cannot explain is still a mark"
+        );
+
+        // Without a global line every mark stands.
+        let parsed = parse_session_scan(&format!("{terminal}|1789065184|agent"));
+        assert_eq!(
+            parsed.get(&terminal).unwrap().kind,
+            Some(SessionKind::Agent)
+        );
+    }
+
     /// The kind marker is what name shape cannot say, in both directions: an
     /// agent whose title sanitizes into a terminal's shape is still the agent
     /// pane (#3888), and a paired terminal is never one however its name
@@ -3739,13 +3814,13 @@ mod tests {
         let agent = format!("{P}Foo_{ID8}");
 
         assert_eq!(
-            resolve_agent_session_name_marked(
+            resolve_session_name(
                 [
                     (derived.as_str(), Some("term")),
                     (agent.as_str(), Some("agent")),
                 ],
-                ID,
-                &derived
+                &derived,
+                &NameShape::agent(&id_suffix(ID))
             ),
             agent,
             "the marked agent wins over a terminal wearing the derived name"

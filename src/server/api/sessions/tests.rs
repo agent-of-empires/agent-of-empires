@@ -3695,6 +3695,10 @@ fn resolve_hook_plan_inherits_trust_across_worktrees() {
     );
 }
 #[tokio::test]
+// Serial with the rest of the `list_sessions` callers: this one bumps
+// `LIST_SESSIONS_RESOLVER_MISSES`, which
+// `list_sessions_shares_config_resolution_across_overlays` resets and reads.
+#[serial_test::serial]
 async fn list_sessions_projects_pending_approvals_only_for_running_workers() {
     use crate::acp::permissions::build_approval;
     use crate::acp::state::ToolCall;

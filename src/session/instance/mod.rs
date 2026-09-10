@@ -76,7 +76,7 @@ pub use start::{LaunchSidOutcome, StartOutcome};
 pub(crate) use status::PassiveStatusPatch;
 pub use status::{Status, TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR};
 pub(crate) use tmux_session::{
-    duplicate_session_error, find_duplicate_session, is_duplicate_session,
+    duplicate_session_error, find_duplicate_session, is_duplicate_session, AgentSeed,
 };
 /// Why a session can never resume, decided from the registry alone and
 /// before any runtime probe. `Agent` covers both an unresolved tool and one
