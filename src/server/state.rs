@@ -142,6 +142,13 @@ pub struct AppState {
     /// the daemon has ever seen. See #3156.
     pub idempotency_locks:
         Arc<RwLock<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Disk config resolutions performed by `list_sessions`, one per unique
+    /// `(profile, project_path)` per request, accumulated monotonically.
+    /// Every cache a request opens reports here, so the shared-cache
+    /// invariant (#2603) still fails loudly if an overlay is given its own
+    /// cache. Scoped to one `AppState` rather than the process so a
+    /// concurrent test cannot leak counts into an assertion.
+    pub list_sessions_resolver_misses: std::sync::atomic::AtomicUsize,
     /// Session ids with an in-flight smart-rename one-shot, so a burst of rapid
     /// first prompts cannot spawn concurrent title generators for the same
     /// session. Synchronous mutex: critical sections are tiny and never span an

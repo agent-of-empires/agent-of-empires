@@ -324,6 +324,9 @@ fn parse_text(raw: &str) -> Result<Option<WsMessage>, WsError> {
             }
         }
     }
+    // No `kind` key (or not a JSON object): parse as a raw event frame. A
+    // genuinely malformed frame fails here and surfaces as WsError::Parse,
+    // which the consumer treats as a dropped socket.
     let frame: AcpBroadcastFrame = serde_json::from_str(raw).map_err(|e| {
         warn!(target: "acp.client.ws", error = %e, "ws frame parse failed");
         WsError::Parse(e.to_string())
@@ -424,17 +427,22 @@ mod tests {
         assert!(ws_url(&e, "s-1", 0, true).starts_with("wss://"));
     }
 
-    /// How each `{"kind":...}` sentinel the daemon can send must classify.
+    /// How each `{"kind":...}` frame the daemon can send must classify, and
+    /// how a `kind`-less object must classify.
     ///
-    /// The heartbeat row is the #3171 regression. The daemon emits
-    /// `{"kind":"heartbeat"}` every `PING_INTERVAL` (30s); before this it
-    /// fell through to the `AcpBroadcastFrame` parse, failed on the missing
-    /// `session_id` field, and surfaced as `WsError::Parse`, which
+    /// The heartbeat row is the #3171 regression: the daemon emits
+    /// `{"kind":"heartbeat"}` every `PING_INTERVAL` (30s); before it was
+    /// handled it fell through to the `AcpBroadcastFrame` parse, failed on a
+    /// missing field, and surfaced as `WsError::Parse`, which
     /// `tui::structured_view` treats as a dropped socket: an error toast plus
-    /// a full reconnect every 30 seconds on any quiet session. Asserted
-    /// against the server's literal wire bytes, kept stable by
-    /// `heartbeat_frame_shape_is_stable` in `src/server/acp_ws.rs`, so drift
-    /// on either side fails one of the two tests.
+    /// a full reconnect every 30 seconds on any quiet session.
+    ///
+    /// The `something_new` rows are the general case: a `frames=0` client
+    /// receives only `kind`-tagged control frames, so any `kind` this build
+    /// does not recognize (a newer daemon's sentinel) must be ignored rather
+    /// than fall through to the event-frame parse. That fall-through failed
+    /// with "missing field `event`" and drove acp.tui.ws into a tight
+    /// reconnect loop against the connect-snapshot control frame.
     #[derive(Debug)]
     enum Expect {
         Lagged,
@@ -458,6 +466,10 @@ mod tests {
                 Expect::Ignored,
             ),
             (r#"{"kind":null}"#, Expect::Ignored),
+            // A present `kind` of a non-string JSON type still marks a
+            // control frame: it must be ignored, never routed to the
+            // event parse.
+            (r#"{"kind":42}"#, Expect::Ignored),
             // No `kind` and no event shape: genuinely malformed.
             (r#"{"session_id":"s-1","seq":9}"#, Expect::ParseError),
         ];

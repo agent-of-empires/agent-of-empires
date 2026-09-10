@@ -57,7 +57,7 @@ impl ToolSession {
         let shape = crate::tmux::NameShape {
             prefix: &prefix,
             suffix: &suffix,
-            excluded_prefixes: &[],
+            kind: crate::tmux::SessionKind::Tool,
         };
         let name = if display_only {
             crate::tmux::session_name_for_display(&derived, &shape)
@@ -129,6 +129,11 @@ impl ToolSession {
         append_pane_base_index_args(&mut args, &self.name);
         append_window_size_args(&mut args, &self.name);
         append_tmux_setting_args(&mut args, &self.name, &config);
+        crate::tmux::append_session_kind_args(
+            &mut args,
+            &self.name,
+            crate::tmux::SessionKind::Tool,
+        );
 
         let output = crate::tmux::tmux_command().args(&args).output()?;
 

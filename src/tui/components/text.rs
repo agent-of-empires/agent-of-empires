@@ -120,10 +120,17 @@ pub fn truncate_to_width(text: &str, max_width: usize) -> String {
 /// dakuten/handakuten (U+FF9E, U+FF9F) to zero cells where the renderer
 /// spends one on each, so a string-width budget admits twice the text that
 /// fits for that script.
+///
+/// Clusters holding a control character are dropped first, as both renderer
+/// paths do: they paint nothing, and `CellWidth` debug-asserts when handed a
+/// lone ASCII control.
 pub fn rendered_width(text: &str) -> usize {
     use ratatui::buffer::CellWidth;
     use unicode_segmentation::UnicodeSegmentation;
-    text.graphemes(true).map(|g| g.cell_width() as usize).sum()
+    text.graphemes(true)
+        .filter(|g| !g.contains(char::is_control))
+        .map(|g| g.cell_width() as usize)
+        .sum()
 }
 
 /// The longest prefix of `text` that fits in `max_width` display cells, with
@@ -135,25 +142,51 @@ pub fn rendered_width(text: &str) -> usize {
 /// from [`rendered_width`], so a cluster whose scalars do not sum to what it
 /// paints ("\u{26a0}\u{fe0f}" is 2 cells where its chars sum to 1,
 /// "\u{1f91d}\u{1f3fd}" is 2 where they sum to 4) neither over- nor
-/// under-fills the budget.
+/// under-fills the budget. A cluster holding a control character costs
+/// nothing yet stays in the slice, so the result is still a borrowed prefix.
 pub fn prefix_within_width(text: &str, max_width: usize) -> &str {
     use ratatui::buffer::CellWidth;
     use unicode_segmentation::UnicodeSegmentation;
     let mut cells = 0usize;
     let mut end = 0;
     for (start, g) in text.grapheme_indices(true) {
-        cells += g.cell_width() as usize;
-        if cells > max_width {
-            break;
+        if !g.contains(char::is_control) {
+            cells += g.cell_width() as usize;
+            if cells > max_width {
+                break;
+            }
         }
         end = start + g.len();
     }
     &text[..end]
 }
 
+/// `text` fitted to a `max_width` column of a multi-span [`ratatui::text::Line`].
+///
+/// Cut and padded by different metrics, because ratatui lays a `Line` out with
+/// two that disagree: `Span::render` advances a cell per `CellWidth`, while
+/// `render_spans` starts the next span at `Span::width`, which is
+/// `UnicodeWidthStr`. They part only on halfwidth katakana
+/// dakuten/handakuten (U+FF9E, U+FF9F), where `CellWidth` charges the cell the
+/// terminal spends and `UnicodeWidthStr` scores zero.
+///
+/// So the cut uses [`truncate_to_width`], keeping painted glyphs inside the
+/// column, and the pad uses `UnicodeWidthStr`, landing the next span on the
+/// column boundary. Padding to `CellWidth` instead would start the next column
+/// one cell short per mark; a `{:<max_width$}` pad counts chars and leaves it
+/// short by one per wide glyph.
+pub fn fixed_width(text: &str, max_width: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let text = truncate_to_width(text, max_width);
+    let pad = max_width.saturating_sub(UnicodeWidthStr::width(text.as_str()));
+    format!("{text}{}", " ".repeat(pad))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{line_columns, prefix_within_width, rendered_width, truncate_to_width};
+    use super::{
+        fixed_width, line_columns, prefix_within_width, rendered_width, truncate_to_width,
+    };
 
     /// A wide grapheme occupies two columns and its continuation cell is reset
     /// by the renderer. Reading that back out of a buffer yields a phantom
@@ -216,6 +249,62 @@ mod tests {
         let out = truncate_to_width(&halfwidth, 24);
         assert!(rendered_width(&out) <= 24, "{out:?}");
         assert!(out.ends_with('\u{2026}'));
+    }
+
+    /// Control characters paint nothing, so charging cells for them ellipsizes
+    /// text that fits, and `CellWidth` debug-asserts when a lone ASCII control
+    /// reaches it. Plugin row-column text can carry internal tabs.
+    #[test]
+    fn control_characters_cost_no_cells() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::text::Line;
+
+        assert_eq!(rendered_width("a\tb"), 2);
+        assert_eq!(rendered_width("a\r\nb"), 2);
+        assert_eq!(prefix_within_width("a\tb", 2), "a\tb");
+        assert_eq!(truncate_to_width("a\tb", 2), "a\tb");
+        // Still budgeted correctly once the visible text does overflow.
+        assert_eq!(truncate_to_width("a\tbcdef", 3), "a\tb\u{2026}");
+
+        // The two cells ratatui actually paints for the passthrough case.
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 1));
+        let (x, _) = buffer.set_line(0, 0, &Line::raw(truncate_to_width("a\tb", 2)), 4);
+        assert_eq!(x, 2, "{buffer:?}");
+        assert_eq!(buffer[(0, 0)].symbol(), "a");
+        assert_eq!(buffer[(1, 0)].symbol(), "b");
+    }
+
+    /// Both halves of the column contract: the next span starts exactly
+    /// `max_width` on, and the painted glyphs stay inside that. A `{:<width$}`
+    /// pad breaks the first for wide glyphs; a `CellWidth` pad breaks it for
+    /// halfwidth katakana.
+    #[test]
+    fn fixed_width_fits_a_line_column() {
+        use unicode_width::UnicodeWidthStr;
+        let wide = "\u{754c}".repeat(40);
+        for (text, width) in [
+            ("agent", 8),
+            ("\u{65e5}\u{672c}\u{8a9e}", 8),
+            ("\u{ff8a}\u{ff9e}\u{ff8a}\u{ff9e}\u{ff8a}\u{ff9e}", 8),
+            ("a much longer title than fits", 8),
+            (wide.as_str(), 24),
+            ("a\tb", 4),
+            ("", 3),
+        ] {
+            let out = fixed_width(text, width);
+            assert_eq!(
+                UnicodeWidthStr::width(out.as_str()),
+                width,
+                "{text:?} at {width}: next span must start on the boundary"
+            );
+            assert!(
+                rendered_width(out.trim_end()) <= width,
+                "{text:?} at {width}: painted glyphs must stay inside the column"
+            );
+        }
+        assert_eq!(fixed_width("ab", 5), "ab   ");
+        assert_eq!(fixed_width("abcdef", 0), "");
     }
 
     #[test]

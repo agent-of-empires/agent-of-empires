@@ -13,7 +13,7 @@ use crate::daemon::{
     ContextResumeAvailability, ContextResumeIndeterminateReason, ContextResumeUnavailableReason,
 };
 use crate::plugin::ui_state::Tone;
-use crate::tui::components::truncate_to_width;
+use crate::tui::components::{fixed_width, truncate_to_width};
 use crate::tui::plugin_ui;
 use crate::tui::styles::{has_min_contrast, Theme};
 
@@ -203,12 +203,18 @@ Press r to refresh, q to quit.",
             };
             let mut spans = vec![
                 Span::styled(
-                    format!(" {:<24}  ", truncate(&s.title, 24)),
+                    format!(" {}  ", fixed_width(&s.title, 24)),
                     readable(title_style),
                 ),
-                Span::styled(format!("{:<10}  ", s.status), readable(status_style)),
                 Span::styled(
-                    format!("{:<11}  ", context_resume_summary(s.context_resume)),
+                    format!("{}  ", fixed_width(&s.status, 10)),
+                    readable(status_style),
+                ),
+                Span::styled(
+                    format!(
+                        "{}  ",
+                        fixed_width(context_resume_summary(s.context_resume), 11)
+                    ),
                     readable(status_style),
                 ),
             ];
@@ -275,16 +281,6 @@ fn render_footer(frame: &mut Frame, area: Rect, theme: &Theme, state: &RemoteHom
     let block = Block::default().borders(Borders::TOP);
     let para = Paragraph::new(Line::from(spans)).block(block);
     frame.render_widget(para, area);
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let take = max.saturating_sub(1);
-        let truncated: String = s.chars().take(take).collect();
-        format!("{truncated}…")
-    }
 }
 
 #[cfg(test)]
@@ -457,6 +453,51 @@ mod tests {
         }
         // The cap holds, so the path still renders and stays aligned.
         let painted = rows(&state);
+        assert_eq!(
+            column_of(&painted, "/tmp/s1"),
+            column_of(&painted, "/tmp/s2")
+        );
+    }
+
+    /// The title, status and context columns are fixed-width, so a pad that
+    /// counted chars left them short for wide scripts and pushed the path
+    /// right on that row alone.
+    #[test]
+    fn wide_column_text_keeps_the_path_aligned() {
+        let cases: [(&str, &str); 3] = [
+            // 8 chars, 16 cells: a char pad reserved 8 cells too few.
+            (
+                "\u{691c}\u{67fb}\u{5931}\u{6557}\u{691c}\u{67fb}\u{5931}\u{6557}",
+                "idle",
+            ),
+            // Halfwidth katakana: `CellWidth` charges a cell for the dakuten
+            // that `UnicodeWidthStr` scores as zero.
+            ("\u{ff8a}\u{ff9e}\u{ff8a}\u{ff9e}\u{ff8a}\u{ff9e}", "idle"),
+            // A wide status is the same bug one column to the right.
+            ("plain", "\u{5b9f}\u{884c}\u{4e2d}"),
+        ];
+        for (title, status) in cases {
+            let mut state = state_with(&["s1", "s2"], json!([]));
+            state.sessions[0].title = title.to_string();
+            state.sessions[0].status = status.to_string();
+            let painted = rows(&state);
+            assert_eq!(
+                column_of(&painted, "/tmp/s1"),
+                column_of(&painted, "/tmp/s2"),
+                "title {title:?} status {status:?}: {painted:?}"
+            );
+            assert_eq!(column_of(&painted, "/tmp/s1"), 54, "{painted:?}");
+        }
+    }
+
+    /// A title past its column is cut to the budget, not to a char count, so
+    /// the column still ends where every other row's does.
+    #[test]
+    fn an_overlong_wide_title_is_cut_to_its_column() {
+        let mut state = state_with(&["s1", "s2"], json!([]));
+        state.sessions[0].title = "\u{754c}".repeat(40);
+        let painted = rows(&state);
+        assert_eq!(column_of(&painted, "/tmp/s1"), 54, "{painted:?}");
         assert_eq!(
             column_of(&painted, "/tmp/s1"),
             column_of(&painted, "/tmp/s2")

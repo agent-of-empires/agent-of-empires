@@ -118,10 +118,32 @@ set -g status-right "#{?#{==:#(aoe tmux status),},,%#(aoe tmux status) | }%H:%M"
 
 ## tmux User Options
 
-aoe sets `@aoe_title`, `@aoe_branch` (worktree sessions), and `@aoe_sandbox` (sandboxed sessions) on each session, which you can reference in your own config:
+aoe sets `@aoe_title`, `@aoe_branch` (worktree sessions), `@aoe_sandbox` (sandboxed sessions), and `@aoe_kind` on each session, which you can reference in your own config:
 
 ```tmux
 set -g status-right "#{@aoe_title} #{@aoe_branch} #{@aoe_sandbox} | %H:%M"
+```
+
+`@aoe_kind` is what kind of session it is: `agent`, `term` (paired terminal),
+`cterm` (container terminal), or `tool`. It is written when the session is
+created and survives renames, so it stays accurate where the session name
+cannot: a title such as `term notes` gives an agent session a name shaped like
+a paired terminal's. A session started by an earlier aoe carries no value until
+it is restarted.
+
+Read it, but do not set it. A value of yours at server (`set -s`), window
+(`set -w`) or global-window (`set -gw`) scope does not sit behind the one aoe
+writes, it replaces it for every session on the server, and a global-session
+one (`set -g`) is read by every session that has no value of its own. aoe
+discards any value the server-wide scopes could have produced rather than
+believe a pane is something it is not, so setting one costs you the marker
+entirely: those sessions fall back to being classified by name, which is the
+ambiguity `@aoe_kind` exists to remove. Window and pane scope vary per pane
+and cannot be discarded this way at all.
+
+```tmux
+# Only decorate the agent pane
+set -g status-right "#{?#{==:#{@aoe_kind},agent},#{@aoe_title},} | %H:%M"
 ```
 
 ## Troubleshooting
