@@ -50,6 +50,7 @@ pub(crate) struct DaemonStatusUpdate {
     pub last_error: Option<String>,
     pub last_accessed_at: Option<chrono::DateTime<chrono::Utc>>,
     pub idle_entered_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub pending_approvals: Vec<crate::daemon::PendingApproval>,
 }
 
 /// Project the daemon's rows onto the structured sessions the TUI cares
@@ -71,6 +72,7 @@ pub(crate) fn structured_updates(rows: &[SessionResponse]) -> Vec<DaemonStatusUp
                 last_error: row.last_error.clone(),
                 last_accessed_at: parse_ts(row.last_accessed_at.as_deref()),
                 idle_entered_at: parse_ts(row.idle_entered_at.as_deref()),
+                pending_approvals: row.pending_approvals.clone(),
             })
         })
         .collect()

@@ -354,19 +354,36 @@ would fix only that container. So every Claude Code session mounts the one
 `sandbox-v2/.credentials.json` at its config path instead of keeping a copy in
 its store, and a refresh or login in any container is seen by the rest.
 
-Each start folds the freshest credential into that file: the Keychain entry on
-macOS, `~/.claude/.credentials.json` elsewhere, and any copy left in the
-session's store by an earlier layout, each taken only when its expiry is later
-than what the file holds. Logging in on the host and starting or restarting
-one sandboxed session re-authenticates all of them; a login made inside a
-container is never overwritten by a staler host copy. The host itself stays a
-separate chain: a refresh inside a sandbox still rotates the token the host
-holds, as it did before. A container created before this layout mounts only
-its store, so a stopped one is recreated at its next start, as it was for the
-store move, and a running one refuses to relaunch until it is stopped. Running
-`/logout` inside a sandbox revokes the token for every sandbox but cannot
-remove the mounted file, so the revoked token stays there until the next
-login.
+A file that holds no credential is seeded at the next start or TUI refresh
+from the freshest of the Keychain entry on macOS, `~/.claude/.credentials.json`
+elsewhere, and any copy left in the session's store by an earlier layout. A
+file that holds one is never replaced by the host's again: a token copied from
+the host is the host's own refresh token, so both sides hold it until the
+first of them refreshes and logs the other out, as it did before this layout.
+From that first refresh on the sandboxes are a chain of their own, and a login
+made inside any one of them re-authenticates all of them. A copy left in a
+session's store by an earlier layout is a sandbox chain too, and is folded in
+at that session's next start when it is fresher. To seed the sandboxes from a
+new host login instead, stop them, delete `sandbox-v2/.credentials.json` and
+start one.
+
+Claude Code writes the file itself, and empties `accessToken` and
+`refreshToken` in place when the credential it holds fails to authenticate.
+That reaches every sandbox at once, through the mount they share. A file whose
+tokens are both empty holds no credential, whatever expiry is left beside
+them, so it is seeded like any other at the next start or TUI refresh and the
+container that emptied it costs the rest of them nothing more than a seed.
+
+Two containers that refresh at the same moment off one token stay a hazard the
+shared file cannot remove: one refresh wins, the other is refused, and the
+container that lost empties the file. The token the winner obtained goes with
+it, and the sandboxes are seeded from the host at the next start or refresh.
+
+A container created before this layout mounts only its store, so a stopped
+one is recreated at its next start, as it was for the store move, and a
+running one refuses to relaunch until it is stopped. Running `/logout` inside
+a sandbox revokes the token for every sandbox but cannot remove the mounted
+file, so the revoked token stays there until the next login.
 
 ### Reclaiming stores
 

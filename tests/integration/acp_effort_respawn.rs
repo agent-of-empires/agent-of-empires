@@ -37,6 +37,7 @@ fn spawn_config(
         additional_dirs: vec![],
         provider_env: env,
         host_environment: vec![],
+        default_effort_explicit: default_effort.is_some(),
         default_effort,
         default_mode: None,
         socket_path: None,

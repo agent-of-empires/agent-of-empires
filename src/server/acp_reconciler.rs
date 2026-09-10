@@ -2047,7 +2047,10 @@ async fn build_spawn_request(
         additional_dirs: vec![],
         provider_env: vec![],
         model: target.model.clone(),
-        effort: acp_effort,
+        effort: acp_effort.clone(),
+        // `Instance.acp_effort` only holds a user-set effort, so its
+        // presence is the provenance the spawn needs.
+        effort_explicit: acp_effort.is_some(),
         stored_acp_session_id: target.stored_acp_session_id.clone(),
         fork_from,
         sandbox_info,

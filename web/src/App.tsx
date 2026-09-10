@@ -99,7 +99,11 @@ import { toastBus, reportError } from "./lib/toastBus";
 import { isAbsolutePath, resolveToRepoRelative, type FileRef } from "./lib/fileRef";
 import { OPEN_SESSION_EVENT } from "./lib/sessionRoute";
 import { dispatchFocusTerminal, requestSessionInputFocus, setPendingTerminalFocus } from "./lib/terminalFocus";
-import { clearMobileKeyboardProxyInput, deliverMobileKeyboardProxyInput } from "./lib/mobileKeyboardProxy";
+import {
+  clearMobileKeyboardProxyInput,
+  deliverMobileKeyboardProxyInput,
+  forwardTerminalBeforeInput,
+} from "./lib/mobileKeyboardProxy";
 import { hydrateWebUiStateFromServer, initWebUiSync } from "./lib/webUiSync";
 import { WorkspaceSidebar, SnoozeModal } from "./components/WorkspaceSidebar";
 import { DeleteSessionDialog } from "./components/DeleteSessionDialog";
@@ -878,6 +882,10 @@ function AppContent({
   const transitionKeyboardProxy = useCallback((nextSessionId: string | null) => {
     if (keyboardProxySessionIdRef.current === nextSessionId) return;
     keyboardProxySessionIdRef.current = nextSessionId;
+    // The retained syllable mirrors the old session's PTY edit, so carrying
+    // it over would let the next deleteContentBackward delete the new
+    // session's text before the replacement arrives.
+    if (keyboardProxyRef.current) keyboardProxyRef.current.value = "";
     clearMobileKeyboardProxyInput();
   }, []);
 
@@ -891,24 +899,7 @@ function AppContent({
   useEffect(() => {
     const proxy = keyboardProxy;
     if (!proxy) return;
-    const onBeforeInput = (e: InputEvent) => {
-      switch (e.inputType) {
-        case "insertText":
-        case "insertLineBreak":
-        case "insertParagraph":
-        case "deleteContentBackward":
-        case "insertFromPaste":
-          e.preventDefault();
-          deliverMobileKeyboardProxyInput({
-            inputType: e.inputType,
-            data: e.data,
-            isComposing: e.isComposing,
-          });
-          break;
-        default:
-          break;
-      }
-    };
+    const onBeforeInput = (e: InputEvent) => forwardTerminalBeforeInput(e, deliverMobileKeyboardProxyInput);
     proxy.addEventListener("beforeinput", onBeforeInput);
     return () => proxy.removeEventListener("beforeinput", onBeforeInput);
   }, [keyboardProxy]);
@@ -2409,6 +2400,13 @@ function AppContent({
           // This matches the live terminal's hidden input geometry.
           className="fixed bottom-0 left-0 w-px h-px opacity-0 pointer-events-none"
           style={{ caretColor: "transparent", color: "transparent" }}
+          // Typed text now stays in this textarea as IME context (see
+          // forwardTerminalBeforeInput), so keep the OS from rewriting it
+          // the way the live terminal's own hidden input already does.
+          autoCapitalize="off"
+          autoCorrect="off"
+          autoComplete="off"
+          spellCheck={false}
         />
       </div>
     </AcpPrefsProvider>

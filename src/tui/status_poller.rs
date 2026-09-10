@@ -176,8 +176,10 @@ pub(super) fn poll_statuses_once(
         false
     };
 
-    // Periodically re-sync sandbox credentials from the macOS Keychain
-    // so long-lived sessions don't lose auth mid-run.
+    // Periodically seed a shared credential file that holds no credential,
+    // and refresh the rest of each store. A file holding a credential is
+    // left to the containers' own rotation: pushing a fresher host token
+    // in would put every sandbox back on the host's chain mid-session.
     if has_sandboxed && state.last_credential_refresh.elapsed() >= state.credential_refresh_interval
     {
         state.last_credential_refresh = Instant::now();
@@ -186,11 +188,37 @@ pub(super) fn poll_statuses_once(
                 && inst.sandbox_store_generation
                     >= crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION
         }) {
+            // A running container built before its agent shared a credential
+            // file is still rotating the copy in its store; folding that in
+            // would log every sandbox on the shared file out.
+            let container = crate::containers::DockerContainer::from_session_id(&instance.id);
+            // An absent name is unknown, not stopped: the map is empty for a
+            // runtime that cannot list states and for a failed list. Only a
+            // container known to be stopped skips the check.
+            let stopped = state
+                .container_states
+                .get(&crate::containers::DockerContainer::generate_name(
+                    &instance.id,
+                ))
+                .copied()
+                == Some(false);
+            if !stopped {
+                match instance.predates_shared_credential(&container, &instance.detect_as) {
+                    Ok(false) => {}
+                    Ok(true) => continue,
+                    Err(error) => {
+                        tracing::warn!(target: "session.profile",
+                            "Skipping credential refresh for {}: {error:#}", instance.id);
+                        continue;
+                    }
+                }
+            }
             crate::session::config::container_config::refresh_agent_configs_for_instance(
                 &instance.effective_profile(),
                 &instance.id,
                 &instance.tool,
                 Some(&instance.detect_as),
+                crate::session::config::container_config::CredentialFold::SeedOnly,
             );
         }
     }

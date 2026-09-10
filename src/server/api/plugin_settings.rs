@@ -70,6 +70,23 @@ pub async fn resolve_option_source(
     match source {
         OptionSource::AcpAgents => Ok(acp_agent_options(&state.profile).await),
         OptionSource::AcpModels => {
+            // When the resolved profile pins the selected agent's model
+            // (`acp.acp_defaults.<agent>.pin_model`), the picker collapses to
+            // that one entry. Enforcement lives at creation (`sessions.create`
+            // refuses any other model; the spawn resolver applies the pin on
+            // every path), so this is presentation only: the wizard must not
+            // offer choices the create call will refuse. The catalog supplies
+            // the display label when it knows the pinned model.
+            if let Some(agent) = depends.first().filter(|a| !a.is_empty()) {
+                if let Some(model) = pinned_model_for_agent(&state.profile, agent).await {
+                    let label = catalog_options(Some(agent), CatalogCategory::Model)
+                        .into_iter()
+                        .find(|opt| opt.value == model)
+                        .map(|opt| opt.label)
+                        .unwrap_or_else(|| model.clone());
+                    return Ok(vec![SelectOption::new(&model, &label)]);
+                }
+            }
             Ok(catalog_options_probing(depends.first(), CatalogCategory::Model).await)
         }
         OptionSource::AcpModes => {
@@ -240,6 +257,25 @@ async fn group_options(state: &Arc<AppState>) -> Vec<SelectOption> {
     paths.iter().map(|p| SelectOption::new(p, p)).collect()
 }
 
+/// The model pinned under the profile for the agent `agent` spawns as, if
+/// any; see `pinned_model_for_tool`. A plain `model` without `pin_model` is a
+/// default an explicit request still beats at creation, so it yields `None`
+/// and the picker keeps the full catalog.
+async fn pinned_model_for_agent(profile: &str, agent: &str) -> Option<String> {
+    let profile = profile.to_string();
+    let agent = agent.to_string();
+    tokio::task::spawn_blocking(move || {
+        crate::acp::pinned_model_for_tool(
+            &crate::session::config::profile_config::resolve_config_or_warn(&profile),
+            &agent,
+            None,
+        )
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +346,40 @@ mod tests {
         let want_cmd = spec.command.clone();
         let picked = installed_agent_options(registry.list(), |cmd| cmd == want_cmd);
         assert!(picked.iter().any(|o| &o.value == name));
+    }
+
+    /// The picker collapses only on an explicit pin. A plain
+    /// `acp_defaults.<agent>.model` is a default (an explicit request still
+    /// wins at `sessions.create`), so it must keep the full catalog. The pin
+    /// is keyed by the agent a session spawns as: a wrapper mapped to a base
+    /// agent through `agent_detect_as` reads the base pin.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn picker_collapses_on_a_pin_but_not_on_a_default() {
+        use crate::session::test_support::isolate_app_dir;
+        let _tmp = isolate_app_dir();
+        let config_path = crate::session::get_app_dir()
+            .expect("isolated app dir")
+            .join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[session.agent_detect_as]\nmy-claude = \"claude\"\n\n\
+             [acp.acp_defaults.opencode]\nmodel = \"openai/gpt-5.5\"\n\n\
+             [acp.acp_defaults.claude]\nmodel = \"claude-pinned\"\npin_model = true\n",
+        )
+        .expect("write config");
+
+        assert_eq!(pinned_model_for_agent("default", "opencode").await, None);
+        assert_eq!(
+            pinned_model_for_agent("default", "claude").await.as_deref(),
+            Some("claude-pinned")
+        );
+        assert_eq!(
+            pinned_model_for_agent("default", "my-claude")
+                .await
+                .as_deref(),
+            Some("claude-pinned")
+        );
+        assert_eq!(pinned_model_for_agent("default", "gemini").await, None);
     }
 }

@@ -11,9 +11,9 @@ use thiserror::Error;
 
 pub use wire::{
     AcpWorkerState, CleanupDefaults, ContextResumeAvailability, ContextResumeIndeterminateReason,
-    ContextResumeUnavailableReason, ListSessionsQuery, PlanSummary, PromptAttachmentKind,
-    PromptAttachmentRef, QueuedPromptEntry, SessionResponse, SessionsEnvelope,
-    WorkspaceRepoSummary,
+    ContextResumeUnavailableReason, ListSessionsQuery, PendingApproval, PlanSummary,
+    PromptAttachmentKind, PromptAttachmentRef, QueuedPromptEntry, SessionResponse,
+    SessionsEnvelope, WorkspaceRepoSummary,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);

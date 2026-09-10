@@ -149,8 +149,10 @@ as a fallback.
 
 The TUI's agent preview and the web dashboard's agent terminal render
 through a persistent VT channel by default: `tmux pipe-pane` streams the
-agent's raw output into an in-process terminal grid, and your keystrokes
-travel back over the same socket. Compared to the polling path
+agent's raw output into an in-process terminal grid, and on tmux 3.8 or
+newer your keystrokes travel back over the same socket (older tmux crashes
+the whole server when that socket writes to a pane whose agent has just
+exited, so there keystrokes stay on `send-keys`). Compared to the polling path
 (`capture-pane` scrapes plus a `send-keys` fork per keystroke), typing
 echo and streaming output land with near-attach latency, agent copies
 (OSC 52) reach your clipboard, and a full-screen agent that brackets its
@@ -159,9 +161,11 @@ never mid-redraw.
 
 The channel needs tmux 3.4 or newer. A pane that cannot arm one, a pane
 whose grid could not be seeded, a grid still catching up with a resize,
-an older tmux, a split window, or a non-Unix host falls back to the
-polling path automatically; everything still works, with more latency
-and without the synchronized-output hold.
+an older tmux, or a non-Unix host falls back to the polling path
+automatically; everything still works, with more latency and without the
+synchronized-output hold. A split window is composited from
+`capture-pane` snapshots: the TUI preview keeps pane 0 on its VT grid
+and captures the other panes, and the web dashboard captures every pane.
 The paired host and container shells always use the polling path.
 
 To rule the VT transport in or out while troubleshooting, toggle "VT

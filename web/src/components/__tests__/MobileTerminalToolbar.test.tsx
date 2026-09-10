@@ -71,6 +71,55 @@ describe("MobileTerminalToolbar", () => {
     await waitFor(() => expect(sendData).toHaveBeenCalledWith("\x1b[200~line 1\nline 2\x1b[201~"));
   });
 
+  // Every toolbar send bypasses the textarea's beforeinput, so the retained
+  // syllable must be gone before the PTY sees the key, or the next Korean
+  // keystroke rewrites the stale value into the new line. See #3877.
+  it("drops the retained IME shadow before each out-of-band send", async () => {
+    vi.useFakeTimers();
+    try {
+      const proxy = document.createElement("textarea");
+      proxy.setAttribute("data-keyboard-proxy", "");
+      document.body.append(proxy);
+      const local = document.createElement("textarea");
+      const inputElRef = { current: local as HTMLTextAreaElement | null };
+      // Asserted inside the mock: an implementation that sent first and
+      // cleared afterwards would still pass a check made after the call.
+      const seen: Array<{ data: string; local: string; proxy: string }> = [];
+      const sendData = vi.fn((data: string) => {
+        seen.push({ data, local: local.value, proxy: proxy.value });
+      });
+      render(
+        <MobileTerminalToolbar
+          sendData={sendData}
+          inputElRef={inputElRef}
+          keyboardOpen={false}
+          ctrlActive={false}
+          onCtrlToggle={vi.fn()}
+        />,
+      );
+
+      for (const label of ["Tab", "Escape", "Ctrl+C interrupt"]) {
+        local.value = "\u314e";
+        proxy.value = "\u314e";
+        fireEvent.click(screen.getByLabelText(label));
+      }
+
+      // Drag-repeat arrows take the same out-of-band path as the buttons.
+      local.value = "\u314e";
+      proxy.value = "\u314e";
+      const up = screen.getByLabelText("Arrow up");
+      fireEvent.pointerDown(up, { pointerId: 1, clientX: 10, clientY: 10, isPrimary: true });
+      vi.advanceTimersByTime(400); // LONG_PRESS_DELAY 300 plus one repeat tick
+      fireEvent.pointerUp(up);
+
+      expect(seen.map((s) => s.data)).toEqual(["\t", "\x1b", "\x03", "\x1b[A"]);
+      expect(seen.every((s) => s.local === "" && s.proxy === "")).toBe(true);
+      proxy.remove();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("on a plain-HTTP origin pastes through execCommand into the focused input, else explains HTTPS", async () => {
     secureContext(false);
     const error = vi.fn();
