@@ -5,6 +5,7 @@ import {
   ansiToLines,
   clusterSpanAt,
   findCursorCharIndex,
+  isHttpUrl,
   lineText,
   splitCellRuns,
   splitUrls,
@@ -40,12 +41,71 @@ describe("ansiToLines", () => {
   });
 });
 
+describe("isHttpUrl", () => {
+  it("accepts only http(s) targets a browser should follow", () => {
+    const cases: [string, boolean][] = [
+      ["https://example.com/pull/8", true],
+      ["http://localhost:3000", true],
+      ["HTTPS://EXAMPLE.COM", true],
+      ["javascript:alert(1)", false],
+      ["vscode://file/etc/passwd", false],
+      ["ssh://host", false],
+      ["file:///etc/passwd", false],
+      ["mailto:a@b.c", false],
+      ["https://example.com/\u001b]8;;x", false],
+      ["https://", false],
+    ];
+    for (const [url, want] of cases) {
+      expect([url, isHttpUrl(url)]).toEqual([url, want]);
+    }
+  });
+});
+
+describe("hyperlinks across lines", () => {
+  const spanning = "\x1b]8;;https://example.com\x1b\\first\nsecond\x1b]8;;\x1b\\\nplain\n";
+  const expected = [
+    [{ text: "first", style: {}, url: "https://example.com" }],
+    [{ text: "second", style: {}, url: "https://example.com" }],
+    [{ text: "plain", style: {} }],
+  ];
+
+  it("carries a link target onto each line its text spans", () => {
+    expect(ansiToLines(spanning)).toEqual(expected);
+  });
+
+  // The live terminal renders through the cache, not ansiToLines, and the
+  // cache parses each line on its own: without the open link in its carried
+  // state the second line would render as plain text.
+  it("carries the target through the per-line cache the terminal uses", () => {
+    expect(new LineParseCache().lines(spanning)).toEqual(expected);
+  });
+
+  it("keys the cache on the open link, not just the style", () => {
+    // Three rows of byte-identical raw text, differing only in the link the
+    // rows between them left open. A cache keyed on style alone returns the
+    // first row's parse for all three.
+    const content = ["same", "\x1b]8;;https://example.com\x1b\\", "same", "\x1b]8;;\x1b\\", "same", ""].join("\n");
+    const rows = new LineParseCache().lines(content);
+    expect(rows[0]).toEqual([{ text: "same", style: {} }]);
+    expect(rows[2]).toEqual([{ text: "same", style: {}, url: "https://example.com" }]);
+    expect(rows[4]).toEqual([{ text: "same", style: {} }]);
+  });
+});
+
 describe("wrapLine", () => {
   const seg = (text: string, fg?: string) => ({ text, style: fg ? { fg } : {} });
 
   it("is the identity for lines within the column limit", () => {
     const line = [seg("hello world")];
     expect(wrapLine(line, 80)).toEqual([line]);
+  });
+
+  it("keeps a hyperlink target on every wrapped row", () => {
+    const link = { text: "aaaabbbb", style: {}, url: "https://example.com/long" };
+    expect(wrapLine([link], 4)).toEqual([
+      [{ text: "aaaa", style: {}, url: "https://example.com/long" }],
+      [{ text: "bbbb", style: {}, url: "https://example.com/long" }],
+    ]);
   });
 
   it("hard-wraps at the column boundary preserving styles", () => {
