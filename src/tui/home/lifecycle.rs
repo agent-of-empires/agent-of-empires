@@ -262,7 +262,7 @@ impl HomeView {
             tips_badge_hovered: false,
             send_message_dialog: None,
             permission_response_dialog: None,
-            pending_permission_response_session: None,
+            pending_permission_response: None,
             pending_send_session: None,
             pending_send_target: live_send::LiveSendTarget::Agent,
             pending_live_send_target: live_send::LiveSendTarget::Agent,
@@ -292,6 +292,7 @@ impl HomeView {
             passive_fleet_armed: None,
             preview_pane_pending: None,
             pending_paste: None,
+            pending_paste_for_structured_view: HashMap::new(),
             pending_attach_after_warning: None,
             pending_stop_session: None,
             pending_stop_terminal: None,
@@ -326,6 +327,9 @@ impl HomeView {
             system_health_discovered: user_config
                 .as_ref()
                 .is_some_and(|config| config.app_state.used_system_health),
+            structured_pending_approvals: HashMap::new(),
+            structured_approval_poller: crate::tui::approval_poller::StructuredApprovalPoller::new(
+            ),
             session_feed: crate::tui::session_feed::SessionFeed::new(),
             pending_session_feed: false,
             daemon_sidebar: resolved.session.daemon_sidebar,

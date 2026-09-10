@@ -2,7 +2,9 @@
 //! from the approval policy or by asking the user.
 
 use crate::acp::agent_profiles;
-use crate::acp::approvals::{ApprovalDecision, ApprovalOption, ApprovalOptionKind, Nonce};
+use crate::acp::approvals::{
+    is_choice_list, ApprovalDecision, ApprovalOption, ApprovalOptionKind, Nonce,
+};
 use crate::acp::elicitations::{parse_elicitation, ElicitationOutcome};
 use crate::acp::permissions::build_approval;
 use crate::acp::state::{Event, ToolCall};
@@ -201,7 +203,13 @@ pub(super) async fn handle_permission_request(
             tool_call: tool_call.clone(),
         })
         .await;
-    let approval = build_approval(tool_call, approval_options(&request.options));
+    let offered = approval_options(&request.options);
+    // A choice list (pi's `ask_user_question`: N same-kind options) must
+    // never be answered by kind: generic clients send no option id because
+    // they never rendered the labels, so by-kind selection would answer the
+    // agent's first option as if the user picked it. See #3741.
+    let choice_list = is_choice_list(&offered);
+    let approval = build_approval(tool_call, offered);
     let nonce = approval.nonce.clone();
 
     let (resolve_tx, resolve_rx) = oneshot::channel::<ApprovalResolutionMessage>();
@@ -254,8 +262,14 @@ pub(super) async fn handle_permission_request(
             decision,
             option_id: requested,
         }) => {
+            // A decision without a picked option id (the generic allow/deny
+            // dialogs) cannot answer a choice list: by-kind selection would
+            // send the agent's first option as the user's answer. Cancel so
+            // the user picks where the labels are rendered.
+            let choice_list_unanswered = requested.is_none() && choice_list;
             if let Some(option_id) =
                 pick_option_id(&request.options, decision, requested.as_deref())
+                    .filter(|_| !choice_list_unanswered)
             {
                 // An option the client named outranks the decision it sent
                 // with it: the option is what the user actually pressed.
@@ -286,6 +300,7 @@ pub(super) async fn handle_permission_request(
             } else {
                 warn!(
                     target: "acp.protocol",
+                    choice_list = choice_list_unanswered,
                     "no option matched (decision {decision:?}, requested {requested:?}); cancelling"
                 );
                 // No compatible option: the agent gets Cancelled, but the
@@ -471,6 +486,85 @@ mod tests {
         // the first allow_once, which is the bug the picker avoids.
         let fallback = pick_option_id(&options, ApprovalDecision::Allow, None).expect("fallback");
         assert_eq!(fallback.0.as_ref(), "choice-0");
+    }
+
+    /// A choice list answered through the generic flow (no option id) must
+    /// be cancelled, never answered with the agent's first option. The
+    /// guard lives in `handle_permission_request` because by-kind selection
+    /// happens there; this drives the whole handler. See #3741.
+    #[tokio::test]
+    async fn choice_list_with_no_picked_option_cancels_instead_of_picking_the_first() {
+        use agent_client_protocol::schema::v1::{
+            PermissionOption, PermissionOptionId, PermissionOptionKind, RequestPermissionOutcome,
+            RequestPermissionRequest, ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let pending: PendingResponders = Arc::new(Mutex::new(HashMap::new()));
+        let request = RequestPermissionRequest::new(
+            "s-choice",
+            ToolCallUpdate::new(ToolCallId::new("t1"), ToolCallUpdateFields::default()),
+            vec![
+                PermissionOption::new(
+                    PermissionOptionId::new("choice-0"),
+                    "First",
+                    PermissionOptionKind::AllowOnce,
+                ),
+                PermissionOption::new(
+                    PermissionOptionId::new("choice-1"),
+                    "Second",
+                    PermissionOptionKind::AllowOnce,
+                ),
+            ],
+        );
+        let profile = &crate::acp::agent_profiles::GEMINI;
+        let cache: crate::acp::acp_client::tool_context::ToolContextCache =
+            Arc::new(std::sync::Mutex::new(
+                crate::acp::acp_client::tool_context::ToolCallContextCache::default(),
+            ));
+        let handle = tokio::spawn(handle_permission_request(
+            request,
+            event_tx,
+            pending.clone(),
+            profile,
+            cache,
+        ));
+        // The nonce arrives with the ApprovalRequested event.
+        let nonce = loop {
+            match event_rx.recv().await.expect("events") {
+                Event::ApprovalRequested { approval } => break approval.nonce,
+                _ => continue,
+            }
+        };
+        // Generic answer: Allow with no option id, as the home dialog sends.
+        let PendingResponder { resolver } = pending.lock().await.remove(&nonce).expect("parked");
+        let PendingResolver::Approval(tx) = resolver else {
+            panic!("approval resolver expected");
+        };
+        tx.send(ApprovalResolutionMessage::Decision {
+            decision: ApprovalDecision::Allow,
+            option_id: None,
+        })
+        .map_err(|_| "resolver gone")
+        .unwrap();
+        let response = handle.await.expect("handler task").expect("handler ok");
+        assert!(
+            matches!(response.outcome, RequestPermissionOutcome::Cancelled),
+            "a choice list must not be answered by kind: {response:?}"
+        );
+        // The card closes on Cancelled, never on an Allow.
+        loop {
+            match event_rx.recv().await.expect("resolution event") {
+                Event::ApprovalResolved { decision, .. } => {
+                    assert_eq!(decision, ApprovalDecision::Cancelled);
+                    break;
+                }
+                _ => continue,
+            }
+        }
     }
 
     /// The card sends an allow-shaped decision beside the option id, so

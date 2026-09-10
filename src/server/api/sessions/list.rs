@@ -79,7 +79,7 @@ pub async fn list_sessions(
                 .get(&inst.id)
                 .copied()
                 .unwrap_or(crate::daemon::AcpWorkerState::Absent);
-            SessionResponse::from_instance_with_plan(
+            let mut session = SessionResponse::from_instance_with_plan(
                 inst,
                 claude_fullscreen,
                 plan_summary,
@@ -87,7 +87,31 @@ pub async fn list_sessions(
                 next_wakeup_at,
                 next_wakeup_reason,
                 active_monitor,
-            )
+            );
+            if structured_live && acp_worker_state == crate::daemon::AcpWorkerState::Running {
+                // Gate on a live worker: the invariant (supervisor.rs) is that
+                // a pending nonce only exists on a running worker, and
+                // `spawn`/`attach` sweep orphaned nonces out of the durable
+                // log. Projecting a non-running row would surface a phantom
+                // approval the resolver can only 404 on. Also skips the
+                // per-session SQLite scan for every non-running structured row.
+                session.pending_approvals = state
+                    .acp_event_store
+                    .pending_approval_requests(&inst.id)
+                    .into_iter()
+                    .map(|approval| PendingApproval {
+                        nonce: approval.nonce.0,
+                        target: crate::acp::approvals::summarize_target(
+                            &approval.tool_call.kind,
+                            &approval.tool_call.args_preview,
+                        ),
+                        tool_name: approval.tool_call.name,
+                        destructive: approval.destructive,
+                        choice: approval.choice,
+                    })
+                    .collect();
+            }
+            session
         })
         .collect();
 
@@ -587,6 +611,7 @@ mod workspace_ordering_tests {
             notify_on_idle: None,
             notify_on_error: None,
             view: crate::session::View::Terminal,
+            pending_approvals: Vec::new(),
             acp_worker_state: crate::daemon::AcpWorkerState::Absent,
             context_resume: Some(ContextResumeAvailability::Unavailable {
                 reason: ContextResumeUnavailableReason::NoTarget,

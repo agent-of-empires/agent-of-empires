@@ -122,6 +122,7 @@ impl SessionResponse {
                 q
             },
             acp_worker_state,
+            pending_approvals: Vec::new(),
             rate_limit: None,
             rate_limit_auto_resume: None,
             // Built-in ACP capability is resolved here from a process-wide

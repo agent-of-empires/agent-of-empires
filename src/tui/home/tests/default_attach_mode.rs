@@ -682,3 +682,82 @@ fn footer_hides_tab_hint_for_structured_sessions() {
         "structured rows keep the plain Enter attach label.\n{out}"
     );
 }
+
+#[test]
+#[serial]
+fn send_message_opens_structured_view() {
+    let (mut env, id) = structured_session_env();
+    let action = env.view.handle_key(key(KeyCode::Char('m')), None);
+    assert!(
+        matches!(&action, Some(Action::OpenStructuredView(returned_id)) if returned_id == &id),
+        "m must open the structured composer for the selected session, got {action:?}"
+    );
+}
+
+/// Pressing 'm' on a structured session drains buffered paste into
+/// `pending_paste_for_structured_view` so the async open path can
+/// forward it into the composer instead of losing it.
+#[test]
+#[serial]
+fn send_message_drains_pending_paste_for_structured_view() {
+    let (mut env, id) = structured_session_env();
+    env.view.pending_paste = Some("cached text".to_string());
+    env.view.handle_key(key(KeyCode::Char('m')), None);
+    assert_eq!(
+        env.view.pending_paste, None,
+        "pending_paste must be drained when routing to structured view"
+    );
+    assert_eq!(
+        env.view.pending_paste_for_structured_view.get(&id),
+        Some(&"cached text".to_string()),
+        "drained text must land in pending_paste_for_structured_view, bound to the selected session"
+    );
+}
+
+/// A second buffered paste captured for the same structured session must
+/// append to the earlier buffered text instead of silently replacing it:
+/// the earlier paste belongs to a failed activation still waiting to drain.
+#[test]
+#[serial]
+fn send_message_merges_buffered_paste_for_same_session() {
+    let (mut env, id) = structured_session_env();
+    env.view.pending_paste = Some("first ".to_string());
+    env.view.handle_key(key(KeyCode::Char('m')), None);
+    env.view.pending_paste = Some("second".to_string());
+    env.view.handle_key(key(KeyCode::Char('m')), None);
+    assert_eq!(
+        env.view.pending_paste_for_structured_view.get(&id),
+        Some(&"first second".to_string()),
+        "same-target paste must merge into the buffered text"
+    );
+}
+
+/// A paste captured for another structured session gets its own entry: the
+/// earlier target's unsent draft survives (returning to it still drains),
+/// and mixing the two texts would leak one session's draft into the other.
+#[test]
+#[serial]
+fn send_message_keeps_buffered_paste_per_session() {
+    let (mut env, id_a) = structured_session_env();
+    env.view.pending_paste = Some("session a draft".to_string());
+    env.view.handle_key(key(KeyCode::Char('m')), None);
+    let other = add_session(&mut env.view, "acp-two");
+    env.view.mutate_instance(&other, |inst| {
+        inst.view = crate::session::View::Structured;
+    });
+    env.view.flat_items = env.view.build_flat_items();
+    env.view.pending_paste = Some("session b draft".to_string());
+    // Select the other structured session and press 'm' again.
+    env.view.select_session_by_id(&other);
+    env.view.handle_key(key(KeyCode::Char('m')), None);
+    assert_eq!(
+        env.view.pending_paste_for_structured_view.get(&other),
+        Some(&"session b draft".to_string()),
+        "the new target owns its own draft"
+    );
+    assert_eq!(
+        env.view.pending_paste_for_structured_view.get(&id_a),
+        Some(&"session a draft".to_string()),
+        "the previous target's unsent draft must survive the switch"
+    );
+}

@@ -579,29 +579,17 @@ mod profile_listing_tests {
     use std::fs;
     use std::os::unix::fs::symlink;
 
-    fn make_temp_profiles_dir() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "aoe-profile-listing-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0),
-        ));
-        fs::create_dir_all(&dir).expect("create tempdir");
-        dir
-    }
-
     #[test]
     fn list_profile_names_skips_symlinks_to_real_profiles() {
-        let dir = make_temp_profiles_dir();
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let dir = tmp.path();
         fs::create_dir(dir.join("default")).unwrap();
         fs::create_dir(dir.join("personal")).unwrap();
         // The cs/cxa pattern: aliases are symlinks pointing at `default`.
         symlink("default", dir.join("forit-work")).unwrap();
         symlink("default", dir.join("wma-work")).unwrap();
 
-        let names = list_profile_names_in(&dir).expect("list");
+        let names = list_profile_names_in(dir).expect("list");
         assert_eq!(
             names,
             vec!["default".to_string(), "personal".to_string()],
@@ -610,33 +598,31 @@ mod profile_listing_tests {
              with duplicates of the linked profile's data (the original \
              three-of-every-folder bug)."
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn list_profile_names_includes_real_dirs_only() {
-        let dir = make_temp_profiles_dir();
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let dir = tmp.path();
         fs::create_dir(dir.join("default")).unwrap();
         fs::create_dir(dir.join("work")).unwrap();
         // A regular file in profiles/ should also be ignored.
         fs::write(dir.join("README"), "ignore me").unwrap();
 
-        let names = list_profile_names_in(&dir).expect("list");
+        let names = list_profile_names_in(dir).expect("list");
         assert_eq!(names, vec!["default".to_string(), "work".to_string()]);
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn list_profile_names_keeps_default_in_plain_order() {
         // Resolution input: "default" sorts like any other name here.
-        let dir = make_temp_profiles_dir();
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let dir = tmp.path();
         for name in ["default", "alpha", "beta", "zeta"] {
             fs::create_dir(dir.join(name)).unwrap();
         }
 
-        let names = list_profile_names_in(&dir).expect("list");
+        let names = list_profile_names_in(dir).expect("list");
         assert_eq!(
             names,
             vec![
@@ -646,8 +632,6 @@ mod profile_listing_tests {
                 "zeta".to_string(),
             ]
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

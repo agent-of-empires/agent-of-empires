@@ -48,6 +48,12 @@ pub struct SpawnConfig {
     /// (`session/new`, `session/fork`) and on a resumed one (`session/load`)
     /// alike, so a session's pinned effort survives a worker respawn.
     pub default_effort: Option<String>,
+    /// Whether `default_effort` came from an explicit per-session request
+    /// (persisted in `Instance.acp_effort`) rather than being inherited from
+    /// the profile defaults keyed to the model. A respawn that re-resolves a
+    /// changed model pin must only re-resolve inherited effort: an explicit
+    /// effort is a session pin and a changed model default does not touch it.
+    pub default_effort_explicit: bool,
     /// Optional default mode to apply on fresh ACP sessions through the
     /// adapter's `category:"mode"` config option. Applied strictly: a value
     /// the agent does not advertise no-ops with a warning.
@@ -541,6 +547,7 @@ mod tests {
             provider_env: vec![],
             host_environment: vec![],
             default_effort: None,
+            default_effort_explicit: false,
             default_mode: None,
             socket_path: None,
             stored_acp_session_id: None,
@@ -581,6 +588,7 @@ mod tests {
             provider_env: vec![],
             host_environment: vec![],
             default_effort: None,
+            default_effort_explicit: false,
             default_mode: None,
             socket_path: None,
             stored_acp_session_id: None,

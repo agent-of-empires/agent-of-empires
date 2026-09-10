@@ -1916,6 +1916,19 @@ pub(super) async fn run_connection_task<W, R>(
 
                         loop {
                             tokio::select! {
+                                // Send the prompt before a queued Cancel. A
+                                // notification delivered first is ignored by agents
+                                // that have not yet started the prompt it should stop.
+                                // Biased poll order: the prompt result
+                                // first (dispatch ordering), then user
+                                // cancellation and its escalation deadline
+                                // ahead of the lifecycle notifications, so a
+                                // sustained notification stream cannot delay a
+                                // Cancel/ForceStop past its poll iteration
+                                // (tokio's documented biased-fairness caveat).
+                                // The orphan timer and steering follow,
+                                // notifications last.
+                                biased;
                                 res = &mut prompt_fut, if !simulate_orphan => {
                                     match res {
                                         Ok(resp) => {
@@ -1999,237 +2012,6 @@ pub(super) async fn run_connection_task<W, R>(
                                         }
                                     }
                                     break;
-                                }
-                                env = lifecycle_signal_rx.recv() => {
-                                    if let Some(env) = env {
-                                        if env.epoch != this_prompt_epoch {
-                                            // Stale envelope from a prior
-                                            // prompt (handler was parked on
-                                            // a full channel and only
-                                            // unblocked after the next
-                                            // prompt began). Discard.
-                                            trace!(
-                                                target: "acp.protocol",
-                                                session = %session_label,
-                                                envelope_epoch = env.epoch,
-                                                current_epoch = this_prompt_epoch,
-                                                "discarding stale lifecycle envelope across prompt boundary"
-                                            );
-                                        } else {
-                                            watchdog.apply_signal(
-                                                env.signal,
-                                                tokio::time::Instant::now(),
-                                                chrono::Utc::now(),
-                                                watchdog_cfg,
-                                            );
-                                        }
-                                    }
-                                    // None means the notification handler dropped; the
-                                    // prompt_fut or cancel_grace arm will end the loop.
-                                }
-                                _ = &mut silent_orphan_check,
-                                    if silent_orphan_enabled && !orphan_cancel_sent =>
-                                {
-                                    let now = tokio::time::Instant::now();
-                                    let should_fire = watchdog.should_fire(now, watchdog_cfg);
-                                    if should_fire
-                                        && watchdog.cost_seen()
-                                        && watchdog.off_protocol_work_seen().is_none()
-                                    {
-                                        // The turn emitted its cost-populated
-                                        // end-of-turn UsageUpdate and then went
-                                        // silent with no in-flight tools and no
-                                        // off-protocol work: claude-agent-acp
-                                        // finished but never returned the
-                                        // PromptResponse. Cancelling and
-                                        // restarting the worker here (the orphan
-                                        // path below) restarts a turn that
-                                        // actually succeeded and shows the
-                                        // "Agent finished but didn't notify the
-                                        // daemon" banner. Treat the cost marker
-                                        // as authoritative and end the turn
-                                        // cleanly as prompt_complete; the
-                                        // connection task stays alive for the
-                                        // next prompt. The genuinely-wedged
-                                        // case (no cost marker) still falls
-                                        // through to the orphan path. See #2237;
-                                        // the off-protocol guard preserves the
-                                        // monitor / async-agent grace behavior
-                                        // of #1360 / #1401 / #1858.
-                                        info!(
-                                            target: "acp.protocol",
-                                            session = %session_label,
-                                            grace_secs = watchdog.effective_grace(watchdog_cfg).as_secs(),
-                                            "silent-orphan watchdog: turn wrapped up (cost-populated usage) without PromptResponse; ending cleanly as prompt_complete"
-                                        );
-                                        // Break with NO orphan/shutdown flag set so the
-                                        // terminal reason falls through to prompt_complete:
-                                        // a clean end, no worker restart, connection task
-                                        // survives for the next prompt. See #2237.
-                                        break;
-                                    }
-                                    if should_fire {
-                                        warn!(
-                                            target: "acp.protocol",
-                                            session = %session_label,
-                                            off_protocol_work = ?watchdog.off_protocol_work_seen(),
-                                            in_flight_tools = watchdog.tool_calls_in_flight_len(),
-                                            grace_secs = watchdog.effective_grace(watchdog_cfg).as_secs(),
-                                            "silent-orphan watchdog fired: no progress past grace and no in-flight tools; sending session/cancel"
-                                        );
-                                        // Best-effort cancel; reuse
-                                        // existing escalation path. If
-                                        // the adapter resolves within
-                                        // CANCEL_ESCALATION_GRACE the
-                                        // prompt_fut arm wins; if not,
-                                        // the cancel_grace arm fires
-                                        // and we synthesize Stopped
-                                        // with reason "prompt_orphaned".
-                                        if let Err(err) = send_session_cancel!() {
-                                            warn!(
-                                                target: "acp.protocol",
-                                                session = %session_label,
-                                                error = %err,
-                                                "silent-orphan: session/cancel send failed; escalating immediately"
-                                            );
-                                            prompt_orphaned = true;
-                                            shutdown = true;
-                                            break;
-                                        }
-                                        orphan_cancel_sent = true;
-                                        prompt_orphaned = true;
-                                        if !cancelling {
-                                            cancelling = true;
-                                            cancel_grace.as_mut().reset(
-                                                tokio::time::Instant::now()
-                                                    + CANCEL_ESCALATION_GRACE,
-                                            );
-                                        }
-                                    }
-                                    silent_orphan_check.as_mut().reset(
-                                        tokio::time::Instant::now()
-                                            + silent_orphan_check_period,
-                                    );
-                                }
-                                _ = &mut cancel_grace, if cancelling => {
-                                    warn!(
-                                        target: "acp.protocol",
-                                        session = %session_label,
-                                        grace_secs = CANCEL_ESCALATION_GRACE.as_secs(),
-                                        "agent ignored session/cancel past grace window; escalating to runner restart"
-                                    );
-                                    agent_unresponsive = true;
-                                    shutdown = true;
-                                    break;
-                                }
-                                (blocks, res) = async {
-                                    steer_fut.as_mut().expect("guarded by the arm condition").await
-                                }, if steer_fut.is_some() => {
-                                    steer_fut = None;
-                                    match res {
-                                        Ok(value) => match SteerOutcome::from_response(&value) {
-                                            SteerOutcome::Injected => {
-                                                info!(
-                                                    target: "acp.protocol",
-                                                    session = %session_label,
-                                                    "_session/steering injected into the running turn"
-                                                );
-                                                // No event: the prompt handler
-                                                // already published this text as
-                                                // `UserPromptSent` before it
-                                                // reached the daemon, and the
-                                                // running turn's own
-                                                // `PromptResponse` still owns the
-                                                // terminal Stopped.
-                                                //
-                                                // An accepted steer proves the
-                                                // agent is alive and took new
-                                                // work, so it counts as progress.
-                                                // Injection pre-empts the current
-                                                // generation, which can swallow an
-                                                // update the silent-orphan
-                                                // watchdog was waiting on; without
-                                                // this the watchdog could kill a
-                                                // healthy agent right after a
-                                                // successful course correction.
-                                                watchdog.apply_signal(
-                                                    LifecycleSignal::Progress,
-                                                    tokio::time::Instant::now(),
-                                                    chrono::Utc::now(),
-                                                    watchdog_cfg,
-                                                );
-                                            }
-                                            SteerOutcome::PromptRequired => {
-                                                // The turn settled in the race
-                                                // window. The adapter kept its
-                                                // hands off the content, so run it
-                                                // as an ordinary next turn. The
-                                                // in-flight turn is over in all but
-                                                // bookkeeping, so the outer loop
-                                                // picks this up as soon as
-                                                // `prompt_fut` resolves.
-                                                info!(
-                                                    target: "acp.protocol",
-                                                    session = %session_label,
-                                                    "_session/steering raced the turn's end; re-dispatching as a normal prompt"
-                                                );
-                                                pending_prompts.push_back(blocks);
-                                                // Anything still parked raced the
-                                                // same boundary, so it follows the
-                                                // same path, in order.
-                                                pending_prompts.extend(steer_backlog.drain(..));
-                                            }
-                                            outcome @ (SteerOutcome::StartedNewTurn
-                                            | SteerOutcome::Unknown) => {
-                                                // The adapter cleared the version
-                                                // gate yet ignored the
-                                                // `promptRequired` opt-in, so it
-                                                // consumed the content into a turn
-                                                // no request owns. Resending would
-                                                // duplicate the user's message, and
-                                                // `PromptRejected` would offer a
-                                                // Retry that does the same. Leave
-                                                // the already-published
-                                                // `UserPromptSent` standing and let
-                                                // the between-prompt idle watchdog
-                                                // synthesize the detached turn's
-                                                // terminal Stopped once this turn's
-                                                // own Stopped clears
-                                                // `prompt_in_flight`.
-                                                warn!(
-                                                    target: "acp.protocol",
-                                                    session = %session_label,
-                                                    ?outcome,
-                                                    "_session/steering returned an outcome that consumed the message without an owning request; the between-prompt watchdog will close the detached turn"
-                                                );
-                                            }
-                                        },
-                                        Err(e) => {
-                                            // Transport or agent error. Nothing
-                                            // proves the message landed, but
-                                            // nothing proves it did not either, so
-                                            // surface it as the same retryable
-                                            // rejection a non-steering agent gives
-                                            // and let the user decide.
-                                            warn!(
-                                                target: "acp.protocol",
-                                                session = %session_label,
-                                                error = %e,
-                                                "_session/steering failed; falling back to agent_busy rejection"
-                                            );
-                                            let _ = event_tx_for_block
-                                                .send(Event::PromptRejected {
-                                                    reason: "agent_busy".into(),
-                                                    text: first_text_block(&blocks),
-                                                })
-                                                .await;
-                                        }
-                                    }
-                                    // Start the next parked steer, if the
-                                    // outcome above left any parked.
-                                    if let Some(next) = steer_backlog.pop_front() {
-                                        steer_or_backlog!(next);
-                                    }
                                 }
                                 cmd = cmd_rx.recv() => {
                                     match cmd {
@@ -2440,6 +2222,237 @@ pub(super) async fn run_connection_task<W, R>(
                                             shutdown = true;
                                             break;
                                         }
+                                    }
+                                }
+                                _ = &mut cancel_grace, if cancelling => {
+                                    warn!(
+                                        target: "acp.protocol",
+                                        session = %session_label,
+                                        grace_secs = CANCEL_ESCALATION_GRACE.as_secs(),
+                                        "agent ignored session/cancel past grace window; escalating to runner restart"
+                                    );
+                                    agent_unresponsive = true;
+                                    shutdown = true;
+                                    break;
+                                }
+                                env = lifecycle_signal_rx.recv() => {
+                                    if let Some(env) = env {
+                                        if env.epoch != this_prompt_epoch {
+                                            // Stale envelope from a prior
+                                            // prompt (handler was parked on
+                                            // a full channel and only
+                                            // unblocked after the next
+                                            // prompt began). Discard.
+                                            trace!(
+                                                target: "acp.protocol",
+                                                session = %session_label,
+                                                envelope_epoch = env.epoch,
+                                                current_epoch = this_prompt_epoch,
+                                                "discarding stale lifecycle envelope across prompt boundary"
+                                            );
+                                        } else {
+                                            watchdog.apply_signal(
+                                                env.signal,
+                                                tokio::time::Instant::now(),
+                                                chrono::Utc::now(),
+                                                watchdog_cfg,
+                                            );
+                                        }
+                                    }
+                                    // None means the notification handler dropped; the
+                                    // prompt_fut or cancel_grace arm will end the loop.
+                                }
+                                _ = &mut silent_orphan_check,
+                                    if silent_orphan_enabled && !orphan_cancel_sent =>
+                                {
+                                    let now = tokio::time::Instant::now();
+                                    let should_fire = watchdog.should_fire(now, watchdog_cfg);
+                                    if should_fire
+                                        && watchdog.cost_seen()
+                                        && watchdog.off_protocol_work_seen().is_none()
+                                    {
+                                        // The turn emitted its cost-populated
+                                        // end-of-turn UsageUpdate and then went
+                                        // silent with no in-flight tools and no
+                                        // off-protocol work: claude-agent-acp
+                                        // finished but never returned the
+                                        // PromptResponse. Cancelling and
+                                        // restarting the worker here (the orphan
+                                        // path below) restarts a turn that
+                                        // actually succeeded and shows the
+                                        // "Agent finished but didn't notify the
+                                        // daemon" banner. Treat the cost marker
+                                        // as authoritative and end the turn
+                                        // cleanly as prompt_complete; the
+                                        // connection task stays alive for the
+                                        // next prompt. The genuinely-wedged
+                                        // case (no cost marker) still falls
+                                        // through to the orphan path. See #2237;
+                                        // the off-protocol guard preserves the
+                                        // monitor / async-agent grace behavior
+                                        // of #1360 / #1401 / #1858.
+                                        info!(
+                                            target: "acp.protocol",
+                                            session = %session_label,
+                                            grace_secs = watchdog.effective_grace(watchdog_cfg).as_secs(),
+                                            "silent-orphan watchdog: turn wrapped up (cost-populated usage) without PromptResponse; ending cleanly as prompt_complete"
+                                        );
+                                        // Break with NO orphan/shutdown flag set so the
+                                        // terminal reason falls through to prompt_complete:
+                                        // a clean end, no worker restart, connection task
+                                        // survives for the next prompt. See #2237.
+                                        break;
+                                    }
+                                    if should_fire {
+                                        warn!(
+                                            target: "acp.protocol",
+                                            session = %session_label,
+                                            off_protocol_work = ?watchdog.off_protocol_work_seen(),
+                                            in_flight_tools = watchdog.tool_calls_in_flight_len(),
+                                            grace_secs = watchdog.effective_grace(watchdog_cfg).as_secs(),
+                                            "silent-orphan watchdog fired: no progress past grace and no in-flight tools; sending session/cancel"
+                                        );
+                                        // Best-effort cancel; reuse
+                                        // existing escalation path. If
+                                        // the adapter resolves within
+                                        // CANCEL_ESCALATION_GRACE the
+                                        // prompt_fut arm wins; if not,
+                                        // the cancel_grace arm fires
+                                        // and we synthesize Stopped
+                                        // with reason "prompt_orphaned".
+                                        if let Err(err) = send_session_cancel!() {
+                                            warn!(
+                                                target: "acp.protocol",
+                                                session = %session_label,
+                                                error = %err,
+                                                "silent-orphan: session/cancel send failed; escalating immediately"
+                                            );
+                                            prompt_orphaned = true;
+                                            shutdown = true;
+                                            break;
+                                        }
+                                        orphan_cancel_sent = true;
+                                        prompt_orphaned = true;
+                                        if !cancelling {
+                                            cancelling = true;
+                                            cancel_grace.as_mut().reset(
+                                                tokio::time::Instant::now()
+                                                    + CANCEL_ESCALATION_GRACE,
+                                            );
+                                        }
+                                    }
+                                    silent_orphan_check.as_mut().reset(
+                                        tokio::time::Instant::now()
+                                            + silent_orphan_check_period,
+                                    );
+                                }
+                                (blocks, res) = async {
+                                    steer_fut.as_mut().expect("guarded by the arm condition").await
+                                }, if steer_fut.is_some() => {
+                                    steer_fut = None;
+                                    match res {
+                                        Ok(value) => match SteerOutcome::from_response(&value) {
+                                            SteerOutcome::Injected => {
+                                                info!(
+                                                    target: "acp.protocol",
+                                                    session = %session_label,
+                                                    "_session/steering injected into the running turn"
+                                                );
+                                                // No event: the prompt handler
+                                                // already published this text as
+                                                // `UserPromptSent` before it
+                                                // reached the daemon, and the
+                                                // running turn's own
+                                                // `PromptResponse` still owns the
+                                                // terminal Stopped.
+                                                //
+                                                // An accepted steer proves the
+                                                // agent is alive and took new
+                                                // work, so it counts as progress.
+                                                // Injection pre-empts the current
+                                                // generation, which can swallow an
+                                                // update the silent-orphan
+                                                // watchdog was waiting on; without
+                                                // this the watchdog could kill a
+                                                // healthy agent right after a
+                                                // successful course correction.
+                                                watchdog.apply_signal(
+                                                    LifecycleSignal::Progress,
+                                                    tokio::time::Instant::now(),
+                                                    chrono::Utc::now(),
+                                                    watchdog_cfg,
+                                                );
+                                            }
+                                            SteerOutcome::PromptRequired => {
+                                                // The turn settled in the race
+                                                // window. The adapter kept its
+                                                // hands off the content, so run it
+                                                // as an ordinary next turn. The
+                                                // in-flight turn is over in all but
+                                                // bookkeeping, so the outer loop
+                                                // picks this up as soon as
+                                                // `prompt_fut` resolves.
+                                                info!(
+                                                    target: "acp.protocol",
+                                                    session = %session_label,
+                                                    "_session/steering raced the turn's end; re-dispatching as a normal prompt"
+                                                );
+                                                pending_prompts.push_back(blocks);
+                                                // Anything still parked raced the
+                                                // same boundary, so it follows the
+                                                // same path, in order.
+                                                pending_prompts.extend(steer_backlog.drain(..));
+                                            }
+                                            outcome @ (SteerOutcome::StartedNewTurn
+                                            | SteerOutcome::Unknown) => {
+                                                // The adapter cleared the version
+                                                // gate yet ignored the
+                                                // `promptRequired` opt-in, so it
+                                                // consumed the content into a turn
+                                                // no request owns. Resending would
+                                                // duplicate the user's message, and
+                                                // `PromptRejected` would offer a
+                                                // Retry that does the same. Leave
+                                                // the already-published
+                                                // `UserPromptSent` standing and let
+                                                // the between-prompt idle watchdog
+                                                // synthesize the detached turn's
+                                                // terminal Stopped once this turn's
+                                                // own Stopped clears
+                                                // `prompt_in_flight`.
+                                                warn!(
+                                                    target: "acp.protocol",
+                                                    session = %session_label,
+                                                    ?outcome,
+                                                    "_session/steering returned an outcome that consumed the message without an owning request; the between-prompt watchdog will close the detached turn"
+                                                );
+                                            }
+                                        },
+                                        Err(e) => {
+                                            // Transport or agent error. Nothing
+                                            // proves the message landed, but
+                                            // nothing proves it did not either, so
+                                            // surface it as the same retryable
+                                            // rejection a non-steering agent gives
+                                            // and let the user decide.
+                                            warn!(
+                                                target: "acp.protocol",
+                                                session = %session_label,
+                                                error = %e,
+                                                "_session/steering failed; falling back to agent_busy rejection"
+                                            );
+                                            let _ = event_tx_for_block
+                                                .send(Event::PromptRejected {
+                                                    reason: "agent_busy".into(),
+                                                    text: first_text_block(&blocks),
+                                                })
+                                                .await;
+                                        }
+                                    }
+                                    // Start the next parked steer, if the
+                                    // outcome above left any parked.
+                                    if let Some(next) = steer_backlog.pop_front() {
+                                        steer_or_backlog!(next);
                                     }
                                 }
                             }
@@ -3049,5 +3062,205 @@ pub(super) async fn run_connection_task<W, R>(
         if let Some(path) = socket_path {
             let _ = tokio::fs::remove_file(path).await;
         }
+    }
+}
+
+/// Fairness of the in-flight-prompt `tokio::select!`: a user Cancel/ForceStop
+/// and the escalation deadline must not sit behind the lifecycle-notification
+/// arm, which a sustained agent update stream keeps permanently ready (tokio's
+/// documented biased-fairness caveat). The driver is a fake ACP agent over an
+/// in-memory duplex: it floods `agent_message_chunk` updates for as long as
+/// the turn runs and only ends it when the `session/cancel` request arrives,
+/// so the test observes the cancel actually reaching the agent while
+/// notifications remain queued.
+#[cfg(test)]
+mod cancel_fairness_tests {
+    use super::*;
+    use crate::acp::fs_handler::FsPolicy;
+    use crate::acp::terminal_handler::TerminalManager;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::sync::{mpsc, oneshot, Mutex};
+    use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+
+    type SharedWrite = Arc<Mutex<tokio::io::DuplexStream>>;
+
+    async fn write_line(w: &SharedWrite, line: &str) {
+        let mut guard = w.lock().await;
+        guard.write_all(line.as_bytes()).await.unwrap();
+        guard.write_all(b"\n").await.unwrap();
+        guard.flush().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_reaches_the_agent_while_notifications_remain_queued() {
+        let (daemon_write, agent_read) = tokio::io::duplex(1024 * 1024);
+        let (agent_write, daemon_read) = tokio::io::duplex(1024 * 1024);
+        let agent_write: SharedWrite = Arc::new(Mutex::new(agent_write));
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flooded = Arc::new(AtomicBool::new(false));
+
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<ClientCmd>(16);
+        let (ready_tx, ready_rx) = oneshot::channel::<Result<(), AcpError>>();
+
+        let cwd = std::env::temp_dir().join(format!("aoe-cancel-fair-{}", std::process::id()));
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let transport = ByteStreams::new(daemon_write.compat_write(), daemon_read.compat());
+        let resources = SessionResources {
+            fs_policy: Arc::new(FsPolicy::new(vec![cwd.clone()])),
+            terminals: TerminalManager::new(),
+            cwd: cwd.clone(),
+            label: "s-fair".to_string(),
+            sandbox: None,
+        };
+        tokio::spawn(run_connection_task(
+            transport,
+            event_tx,
+            cmd_rx,
+            cwd.clone(),
+            "s-fair".to_string(),
+            None,
+            Arc::new(Mutex::new(HashMap::new())),
+            resources,
+            None,
+            ConnectMode::Fresh {
+                stored_acp_session_id: None,
+                seed_history_replay: false,
+                fork_from: None,
+            },
+            Some(ready_tx),
+            &crate::acp::agent_profiles::GEMINI,
+            ExpectedAgent::Gemini,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+        ));
+
+        // Fake agent: handshake, then flood updates for as long as the turn
+        // runs; end the turn only on session/cancel.
+        let flood_flag = flooded.clone();
+        let cancel_flag = cancelled.clone();
+        let flood_write = agent_write.clone();
+        let agent = tokio::spawn(async move {
+            let mut reader = BufReader::new(agent_read);
+            let mut line = String::new();
+            let mut prompt_id: Option<serde_json::Value> = None;
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    break;
+                }
+                let msg: serde_json::Value = match serde_json::from_str(line.trim()) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                match msg.get("method").and_then(|m| m.as_str()) {
+                    Some("initialize") => {
+                        let id = &msg["id"];
+                        write_line(
+                            &agent_write,
+                            &format!(
+                                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"protocolVersion":1,"agentCapabilities":{{}}}}}}"#
+                            ),
+                        )
+                        .await;
+                    }
+                    Some("session/new") => {
+                        let id = &msg["id"];
+                        write_line(
+                            &agent_write,
+                            &format!(
+                                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"sessionId":"s-fair"}}}}"#
+                            ),
+                        )
+                        .await;
+                    }
+                    Some("session/prompt") => {
+                        prompt_id = Some(msg["id"].clone());
+                        flood_flag.store(true, Ordering::SeqCst);
+                    }
+                    Some("session/cancel") => {
+                        cancel_flag.store(true, Ordering::SeqCst);
+                        if let Some(id) = prompt_id.take() {
+                            write_line(
+                                &agent_write,
+                                &format!(
+                                    r#"{{"jsonrpc":"2.0","id":{id},"result":{{"stopReason":"cancelled"}}}}"#
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        // The flood runs beside the reader so the agent keeps reading
+        // `session/cancel` while streaming updates.
+        let flood_stop = cancelled.clone();
+        let flood_started = flooded.clone();
+        let flood = tokio::spawn(async move {
+            while !flood_started.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            let update = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s-fair","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"flood"}}}}"#;
+            while !flood_stop.load(Ordering::SeqCst) {
+                write_line(&flood_write, update).await;
+            }
+        });
+
+        ready_rx
+            .await
+            .expect("handshake completes")
+            .expect("handshake ok");
+
+        cmd_tx
+            .send(ClientCmd::Prompt(vec![ContentBlock::Text(
+                agent_client_protocol::schema::v1::TextContent::new("hi"),
+            )]))
+            .await
+            .unwrap();
+
+        // Wait until the agent is actually flooding before cancelling.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while !flooded.load(Ordering::SeqCst) {
+            tokio::time::timeout_at(deadline, tokio::time::sleep(Duration::from_millis(5)))
+                .await
+                .expect("flood never started");
+        }
+
+        cmd_tx.send(ClientCmd::Cancel).await.unwrap();
+
+        // The turn must end while the flood is still running: the Stopped
+        // event proves the prompt loop processed the cancel, and the
+        // cancelled flag proves session/cancel reached the agent before the
+        // flood ended (the fake agent only ends the turn on that request).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let stopped = loop {
+            let event = tokio::time::timeout_at(deadline, event_rx.recv())
+                .await
+                .expect("cancel must be processed under sustained notifications")
+                .expect("event channel open");
+            if let Event::Stopped { .. } = event {
+                break event;
+            }
+        };
+        assert!(
+            cancelled.load(Ordering::SeqCst),
+            "session/cancel must reach the agent while notifications are queued: {stopped:?}"
+        );
+
+        flood.abort();
+        agent.abort();
+        let _ = std::fs::remove_dir_all(&cwd);
     }
 }

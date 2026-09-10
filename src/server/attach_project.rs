@@ -353,6 +353,7 @@ async fn spawn_worker(state: &Arc<AppState>, id: &str) -> WorkerOutcome {
             provider_env: vec![],
             model: inst.agent_model.clone(),
             effort: None,
+            effort_explicit: false,
             // The whole point of taking the session down and bringing it back:
             // resume the same conversation.
             stored_acp_session_id: inst.acp_session_id.clone(),
