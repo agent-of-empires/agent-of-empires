@@ -118,7 +118,12 @@ pub async fn list_sessions(
     // Share resolved config between the ACP-capability and smart-rename
     // overlays, halving disk reads when a profile/project pair repeats in the
     // 3s sidebar poll. See #2603.
-    let mut session_cfg_cache = SessionCfgCache::default();
+    // Monotonic, so the delta below is this request's own count and no reset
+    // can race a concurrent request on the same state.
+    let misses_before = state
+        .list_sessions_resolver_misses
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let mut session_cfg_cache = SessionCfgCache::new(&state.list_sessions_resolver_misses);
 
     // Overlay custom-agent ACP capability (built-ins were resolved in the
     // constructor). Distinct `(profile, project_path)` pairs each resolve
@@ -254,10 +259,10 @@ pub async fn list_sessions(
     }
 
     // Both overlays have run, so the count is final for this request.
-    let resolver_misses = session_cfg_cache.misses();
-    state
+    let resolver_misses = state
         .list_sessions_resolver_misses
-        .store(resolver_misses, std::sync::atomic::Ordering::Relaxed);
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .saturating_sub(misses_before);
     tracing::debug!(
         target: "http.api.sessions",
         rows = sessions.len(),

@@ -313,32 +313,36 @@ pub(super) fn custom_agent_acp_capable(
 /// Per-request cache for `(profile, project_path)` config resolution, shared
 /// across the `list_sessions` overlays so a repo-local override is read from
 /// disk once per unique pair rather than once per row. See #2603.
-#[derive(Default)]
-pub(super) struct SessionCfgCache {
+pub(super) struct SessionCfgCache<'a> {
     entries: HashMap<(String, String), SessionConfig>,
-    misses: usize,
+    /// Where this cache reports its disk reads. The counter belongs to the
+    /// request, not to the cache, so every cache the request opens adds to
+    /// one total: splitting the shared cache per overlay then shows up as
+    /// extra resolutions instead of hiding behind a second private tally.
+    /// There is no counter-less constructor for the same reason.
+    misses: &'a std::sync::atomic::AtomicUsize,
 }
 
-impl SessionCfgCache {
+impl<'a> SessionCfgCache<'a> {
+    pub(super) fn new(misses: &'a std::sync::atomic::AtomicUsize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            misses,
+        }
+    }
+
     /// Resolve `(profile, project_path)`, reading from disk on first miss only.
     pub(super) fn resolve(&mut self, profile: &str, project_path: &str) -> &SessionConfig {
-        let misses = &mut self.misses;
+        let misses = self.misses;
         self.entries
             .entry((profile.to_string(), project_path.to_string()))
             .or_insert_with(|| {
-                *misses += 1;
+                misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 crate::session::config::repo_config::resolve_config_with_repo_or_warn(
                     profile,
                     std::path::Path::new(project_path),
                 )
                 .session
             })
-    }
-
-    /// Disk resolutions performed, i.e. unique pairs seen. `list_sessions`
-    /// publishes this on [`crate::server::AppState`] so the sharing invariant
-    /// is observable per request instead of through a process-global counter.
-    pub(super) fn misses(&self) -> usize {
-        self.misses
     }
 }
