@@ -2547,12 +2547,18 @@ pub(crate) fn is_binary_on_path(binary: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Cheap availability probe without a login shell. `Some(_)` is definitive:
-/// an explicit path either exists or it doesn't, and a direct `which` /
-/// version-run hit proves the agent is present. `None` means "not found on
-/// the inherited PATH", which is inconclusive because version-manager PATHs
-/// (NVM, etc.) only materialize inside a login shell; the caller decides
-/// whether to pay for that fallback.
+const AGENT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn agent_probe_output(command: &mut Command) -> Option<std::process::Output> {
+    crate::process::run_with_timeout_process_group(
+        command.stdin(std::process::Stdio::null()),
+        AGENT_PROBE_TIMEOUT,
+    )
+    .ok()
+    .flatten()
+}
+
+/// A direct miss or timeout permits a login-shell fallback; a missing explicit path does not.
 fn agent_available_direct(agent: &crate::agents::AgentDef) -> Option<bool> {
     use crate::agents::DetectionMethod;
     match &agent.detection {
@@ -2560,11 +2566,8 @@ fn agent_available_direct(agent: &crate::agents::AgentDef) -> Option<bool> {
             if binary.contains('/') || binary.contains('\\') {
                 return Some(std::path::Path::new(binary).exists());
             }
-            let found = Command::new("which")
-                .arg(binary)
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
+            let found = agent_probe_output(Command::new("which").arg(binary))
+                .is_some_and(|output| output.status.success());
             if found {
                 Some(true)
             } else {
@@ -2572,11 +2575,8 @@ fn agent_available_direct(agent: &crate::agents::AgentDef) -> Option<bool> {
             }
         }
         DetectionMethod::RunWithArg(binary, arg) => {
-            let ok = Command::new(binary)
-                .arg(arg)
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
+            let ok = agent_probe_output(Command::new(binary).arg(arg))
+                .is_some_and(|output| output.status.success());
             if ok {
                 Some(true)
             } else {
@@ -2625,73 +2625,38 @@ fn parse_login_shell_probe(stdout: &str) -> std::collections::HashSet<String> {
         .collect()
 }
 
-/// Probe every agent in `agents` inside ONE login shell, returning the agent
-/// names that resolved. The login shell itself is the expensive part (it
-/// re-runs the user's whole profile: nvm, rbenv, ...; 0.5-2.5s is common),
-/// so the cost must stay one shell per call regardless of how many agents
-/// need the fallback. Probing each missing agent in its own login shell made
-/// TUI startup hang for 5-10s once the built-in agent roster grew.
+/// Batch all unresolved agents into one login shell, with the same deadline as direct probes.
 fn login_shell_probe(agents: &[&crate::agents::AgentDef]) -> std::collections::HashSet<String> {
     if agents.is_empty() {
         return std::collections::HashSet::new();
     }
     let shell = crate::session::user_shell();
-    Command::new(&shell)
-        .args(["-lc", &login_shell_probe_script(agents)])
-        .output()
+    agent_probe_output(Command::new(&shell).args(["-lc", &login_shell_probe_script(agents)]))
         .map(|o| parse_login_shell_probe(&String::from_utf8_lossy(&o.stdout)))
         .unwrap_or_default()
 }
 
-/// Process-wide memo of agent availability, keyed by agent name with the
-/// publication instant. A probe costs a `which` fork and, when that misses, a
-/// share of a login shell (0.5-2.5s), so re-probing on every settings field
-/// rebuild made `Settings > Agents` and every keystroke in
-/// `Settings > Search` pay seconds. Startup's `AvailableTools::detect` warms
-/// every built-in agent, so later callers hit the memo. The Recheck action
-/// clears it via [`invalidate_agent_availability`].
-///
-/// Entries expire after [`AGENT_AVAILABILITY_TTL`]: only the TUI Recheck
-/// paths can clear the memo on demand, and a long-running daemon serves
-/// `/api/agents` from this same process-wide memo with no Recheck path at
-/// all, so a user who installs or removes an agent in another terminal would
-/// otherwise see the stale answer for the daemon's lifetime.
+/// Process-wide positive and negative availability cache. Startup warms it for
+/// settings and API callers; TTL expiry and Recheck refresh external installations.
 static AGENT_AVAILABILITY: RwLock<Option<HashMap<String, (bool, std::time::Instant)>>> =
     RwLock::new(None);
 
-/// How long a memoized availability answer stays authoritative. Long enough
-/// to absorb a settings keystroke storm without a second login shell; short
-/// enough that a daemon's `/api/agents` reflects an agent installed or
-/// removed elsewhere within a minute.
+/// Refresh external installations without charging every settings keystroke for a probe.
 const AGENT_AVAILABILITY_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Serializes cache population so a set of concurrent cold callers costs one
-/// login shell between them rather than one each. `GET /api/agents` runs
-/// `AvailableTools::detect` in `spawn_blocking`, so a dashboard with several
-/// tabs open can issue simultaneous probes; the TUI's settings rebuild can
-/// land in the same window. Held only around the probe, never around a read.
+/// Serialize population across concurrent cold callers, without blocking fresh cache hits.
 static AGENT_PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Number of per-agent availability resolutions actually attempted, for the
-/// contract test: the memo read, memo write, and post-lock re-read are all
-/// observable only through whether a probe ran.
 #[cfg(test)]
-static AGENT_PROBE_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static AGENT_PROBE_MISS_GATE: std::cell::RefCell<Option<(
+        std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>,
+    )>> = const { std::cell::RefCell::new(None) };
+}
 
-/// Drop the memoized availability results so the next probe re-runs. Called
-/// when the user explicitly asks for a recheck (they just installed an agent).
-///
-/// Takes `AGENT_PROBE_LOCK` first so an in-flight probe cannot republish its
-/// pre-install results after the clear. Without that, Recheck
-/// (`invalidate` then `detect`) could observe a probe that started before the
-/// install finish writing in between, find the memo populated, skip its own
-/// probe, and report the freshly installed agent as still unavailable, which
-/// is the one thing Recheck exists to prevent. The wait is bounded by the
-/// probe already running, and the caller is about to pay for a probe anyway.
-///
-/// Lock order matches `probe_agents_available` (probe lock, then the memo), so
-/// the two cannot deadlock.
-pub fn invalidate_agent_availability() {
+/// Clear the memo after any in-flight probe finishes, so it cannot republish stale results.
+/// Lock order matches population: probe lock, then memo.
+pub(crate) fn invalidate_agent_availability() {
     let _probe_guard = AGENT_PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
         *cache = None;
@@ -2732,10 +2697,13 @@ pub(crate) fn probe_agents_available(
         return found;
     }
 
-    // Serialize the probe itself, then re-read the memo: a caller that queued
-    // behind another's login shell wants that shell's answer, not a second
-    // shell of its own. A poisoned lock is not a reason to skip the probe, so
-    // take the guard either way.
+    #[cfg(test)]
+    if let Some((entered, resume)) = AGENT_PROBE_MISS_GATE.with(|gate| gate.borrow_mut().take()) {
+        let _ = entered.send(());
+        let _ = resume.recv();
+    }
+
+    // A queued caller must consume the preceding probe's publication before starting another.
     let _probe_guard = AGENT_PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (already_found, uncached) = partition_cached_agents(&uncached);
     found.extend(already_found);
@@ -2748,8 +2716,6 @@ pub(crate) fn probe_agents_available(
     let mut results: Vec<(&str, bool)> = Vec::new();
     let mut needs_shell: Vec<&crate::agents::AgentDef> = Vec::new();
     for agent in uncached {
-        #[cfg(test)]
-        AGENT_PROBE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match agent_available_direct(agent) {
             Some(ok) => results.push((agent.name, ok)),
             None => needs_shell.push(agent),
@@ -2892,38 +2858,109 @@ mod tests {
         );
     }
 
-    /// The memo re-read that makes queueing behind another caller's login
-    /// shell free. `probe_agents_available` partitions once before taking
-    /// `AGENT_PROBE_LOCK` and again after; without the second partition a
-    /// waiter would run its own shell for agents the holder just resolved.
-    #[test]
-    #[serial_test::serial]
-    fn partition_cached_agents_reads_the_memo_so_a_queued_prober_reprobes_nothing() {
-        // Two real built-ins, so the names line up with what the memo keys on.
-        let defs: Vec<&crate::agents::AgentDef> = crate::agents::AGENTS.iter().take(2).collect();
-        let (a, b) = (defs[0].name, defs[1].name);
+    // Unrelated tests can launch tools without holding EnvGuard's process-wide lock.
+    #[cfg(unix)]
+    fn run_probe_test_in_subprocess() -> bool {
+        const CHILD_ENV: &str = "AOE_AGENT_PROBE_TEST_CHILD";
+        let thread = std::thread::current();
+        let test = thread.name().expect("named test thread");
+        if std::env::var_os(CHILD_ENV).as_deref() == Some(std::ffi::OsStr::new(test)) {
+            return false;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", test, "--nocapture"])
+            .env_clear()
+            .env(CHILD_ENV, test)
+            .env("HOME", home.path())
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(std::process::Stdio::null());
+        let output = crate::process::run_with_timeout_process_group(
+            &mut command,
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap()
+        .expect("isolated probe test timed out");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
 
+    #[cfg(unix)]
+    fn probe_environment(home: &std::path::Path) -> crate::session::test_support::EnvGuard {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let log = shell_words::quote(home.join("probes").to_str().unwrap()).into_owned();
+        for (name, script) in [
+            (
+                "which",
+                format!("#!/bin/sh\nprintf 'which:%s\\n' \"$1\" >> {log}\n[ \"$1\" = claude ]\n"),
+            ),
+            (
+                "vibe",
+                format!("#!/bin/sh\nprintf 'version\\n' >> {log}\nexit 1\n"),
+            ),
+            (
+                "login-shell",
+                format!("#!/bin/sh\nprintf 'login\\n' >> {log}\nexit 0\n"),
+            ),
+        ] {
+            let path = bin.join(name);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        crate::session::test_support::EnvGuard::set(&[
+            ("HOME", home.to_path_buf()),
+            ("XDG_CONFIG_HOME", home.join(".config")),
+            ("XDG_DATA_HOME", home.join(".local/share")),
+            ("PATH", bin.clone()),
+            ("SHELL", bin.join("login-shell")),
+        ])
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn queued_agent_probe_reuses_results_published_after_its_cache_miss() {
+        if run_probe_test_in_subprocess() {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let _env = probe_environment(home.path());
         let memo = AgentAvailabilityGuard::capture();
         memo.clear();
-
-        // Empty memo: nothing is answered, everything needs a probe.
-        let (found, uncached) = partition_cached_agents(&defs);
-        assert!(found.is_empty());
-        assert_eq!(uncached.len(), 2);
-
-        // Stand in for the lock holder having just published its results, one
-        // available and one not, so both polarities are covered.
-        memo.seed(a, true);
-        memo.seed(b, false);
-
-        let (found, uncached) = partition_cached_agents(&defs);
-        assert!(
-            uncached.is_empty(),
-            "a memoized answer, either polarity, must not be re-probed"
-        );
-        assert_eq!(found.len(), 1);
-        assert!(found.contains(a), "an available agent is reported found");
-        assert!(!found.contains(b), "an absent agent is answered, not found");
+        let agents = [
+            crate::agents::get_agent("claude").unwrap(),
+            crate::agents::get_agent("vibe").unwrap(),
+        ];
+        std::thread::scope(|scope| {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let queued = scope.spawn(move || {
+                AGENT_PROBE_MISS_GATE
+                    .with(|gate| *gate.borrow_mut() = Some((entered_tx, resume_rx)));
+                probe_agents_available(&agents)
+            });
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let found = probe_agents_available(&agents);
+            assert_eq!(found, HashSet::from(["claude".to_owned()]));
+            let completed_probes = std::fs::read_to_string(home.path().join("probes")).unwrap();
+            drop(resume_tx);
+            assert_eq!(queued.join().unwrap(), found);
+            assert_eq!(
+                std::fs::read_to_string(home.path().join("probes")).unwrap(),
+                completed_probes,
+                "the queued caller must start no redundant external probes"
+            );
+        });
     }
 
     use super::test_helpers::TmuxTestSession;
@@ -2934,53 +2971,131 @@ mod tests {
     // test bodies cover both.
     const P: &str = SESSION_PREFIX;
 
-    /// The contract test the review asked for: it exercises
-    /// `probe_agents_available` itself, so removing the memo read (the warm
-    /// call would probe again), the memo write (the warm call would probe
-    /// again), or the post-lock re-read (a queued prober would probe what the
-    /// holder published) makes this fail. Agents are real built-ins; the
-    /// probe counter counts attempts, so runner-dependent outcomes do not
-    /// matter to the assertions.
     #[test]
+    #[cfg(unix)]
     #[serial_test::serial]
-    fn probe_agents_available_contract_is_mutation_sensitive() {
-        use std::sync::atomic::Ordering;
-
-        // Two real built-ins, so the names line up with what the memo keys on
-        // (same fixture as the partition test above). Outcomes on the runner
-        // do not matter to the assertions: the probe counter counts attempts.
-        let defs: Vec<&crate::agents::AgentDef> = crate::agents::AGENTS.iter().take(2).collect();
-
+    fn agent_availability_reuses_warm_results_and_expires_both_polarities() {
+        if run_probe_test_in_subprocess() {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let _env = probe_environment(home.path());
         let memo = AgentAvailabilityGuard::capture();
         memo.clear();
-        AGENT_PROBE_CALLS.store(0, Ordering::Relaxed);
-
-        // Cold: every agent is uncached, so each one is probed once and the
-        // results are published to the memo.
-        let _ = probe_agents_available(&defs);
-        let cold_probes = AGENT_PROBE_CALLS.load(Ordering::Relaxed);
-        assert_eq!(cold_probes, 2, "a cold caller probes each uncached agent");
-        assert!(memo.is_populated(), "results must be published to the memo");
-
-        // Warm: the memo read answers everything; no probe may run.
-        let _ = probe_agents_available(&defs);
+        let agents = [
+            crate::agents::get_agent("claude").unwrap(),
+            crate::agents::get_agent("vibe").unwrap(),
+        ];
+        let expected = HashSet::from(["claude".to_owned()]);
+        assert_eq!(probe_agents_available(&agents), expected);
+        let mut probes = std::fs::read_to_string(home.path().join("probes")).unwrap();
+        assert_eq!(probes, "which:claude\nversion\nlogin\n");
+        assert_eq!(probe_agents_available(&agents), expected);
         assert_eq!(
-            AGENT_PROBE_CALLS.load(Ordering::Relaxed),
-            cold_probes,
-            "a fully-cached call must be answered by the memo read alone"
+            std::fs::read_to_string(home.path().join("probes")).unwrap(),
+            probes
         );
+        for (name, added) in [("vibe", "version\nlogin\n"), ("claude", "which:claude\n")] {
+            memo.age_past_ttl(name);
+            assert_eq!(probe_agents_available(&agents), expected);
+            probes.push_str(added);
+            assert_eq!(
+                std::fs::read_to_string(home.path().join("probes")).unwrap(),
+                probes
+            );
+        }
+    }
 
-        // Aged past the TTL: the entry is as good as absent, so the caller
-        // re-probes and republishes.
-        memo.age_past_ttl(defs[0].name);
-        AGENT_PROBE_CALLS.store(0, Ordering::Relaxed);
-        let _ = probe_agents_available(&defs);
-        assert_eq!(
-            AGENT_PROBE_CALLS.load(Ordering::Relaxed),
-            1,
-            "an expired entry must be re-probed, not trusted"
-        );
-        assert!(memo.is_populated(), "the re-probe republishes");
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[serial_test::serial]
+    fn timed_out_agent_probes_release_waiters_and_invalidation() {
+        if run_probe_test_in_subprocess() {
+            return;
+        }
+        use std::time::{Duration, Instant};
+        struct ReleaseProbe(std::path::PathBuf);
+        impl Drop for ReleaseProbe {
+            fn drop(&mut self) {
+                let _ = std::fs::write(&self.0, "release");
+            }
+        }
+        for executable in ["vibe", "login-shell"] {
+            let home = tempfile::tempdir().unwrap();
+            let _env = probe_environment(home.path());
+            let memo = AgentAvailabilityGuard::capture();
+            memo.clear();
+            let release = home.path().join("release");
+            let ready = home.path().join("ready");
+            let wait = format!(
+                "while [ ! -e {} ]; do /bin/sleep 0.02; done",
+                shell_words::quote(release.to_str().unwrap())
+            );
+            let script = format!(
+                "#!/bin/sh\n/bin/sh -c {} &\nchild=$!\ntrap 'kill \"$child\" 2>/dev/null; wait \"$child\" 2>/dev/null; exit 1' TERM\nprintf '%s %s\\n' \"$$\" \"$child\" > {}\nwait \"$child\"\nexit 1\n",
+                shell_words::quote(&wait), shell_words::quote(ready.to_str().unwrap()),
+            );
+            std::fs::write(home.path().join("bin").join(executable), script).unwrap();
+            std::thread::scope(|scope| {
+                let _release = ReleaseProbe(release);
+                let (done_tx, done_rx) = std::sync::mpsc::channel();
+                let holder_tx = done_tx.clone();
+                scope.spawn(move || {
+                    let found =
+                        probe_agents_available(&[crate::agents::get_agent("vibe").unwrap()]);
+                    let _ = holder_tx.send(("holder", Some(found)));
+                });
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !ready.exists() {
+                    assert!(Instant::now() < deadline, "probe child never started");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let waiter_tx = done_tx.clone();
+                scope.spawn(move || {
+                    let found =
+                        probe_agents_available(&[crate::agents::get_agent("claude").unwrap()]);
+                    let _ = waiter_tx.send(("waiter", Some(found)));
+                });
+                scope.spawn(move || {
+                    invalidate_agent_availability();
+                    let _ = done_tx.send(("invalidator", None));
+                });
+                let deadline = Instant::now() + AGENT_PROBE_TIMEOUT * 2 + Duration::from_secs(2);
+                let mut completed = Vec::new();
+                for _ in 0..3 {
+                    let (name, found) = done_rx
+                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                        .expect("a hung probe must not indefinitely hold callers or Recheck");
+                    match name {
+                        "holder" => assert!(found.unwrap().is_empty()),
+                        "waiter" => {
+                            assert_eq!(found.unwrap(), HashSet::from(["claude".to_owned()]))
+                        }
+                        "invalidator" => {}
+                        _ => unreachable!(),
+                    }
+                    completed.push(name);
+                }
+                completed.sort_unstable();
+                assert_eq!(completed, ["holder", "invalidator", "waiter"]);
+                for (index, pid) in std::fs::read_to_string(&ready)
+                    .unwrap()
+                    .split_whitespace()
+                    .enumerate()
+                {
+                    let output = Command::new("/bin/ps")
+                        .args(["-o", "stat=", "-p", pid])
+                        .output()
+                        .unwrap();
+                    let state = String::from_utf8_lossy(&output.stdout);
+                    assert!(
+                        state.trim().is_empty()
+                            || (index > 0 && state.trim_start().starts_with('Z')),
+                        "probe process {pid} remains alive: {state}"
+                    );
+                }
+            });
+        }
     }
 
     #[test]
@@ -4662,36 +4777,29 @@ mod tests {
         );
     }
 
-    /// Regression guard for the 5-10s TUI startup hang: the login-shell
-    /// fallback for agent detection must batch every pending agent into a
-    /// single script (one login shell), not one shell per agent. A login
-    /// shell re-runs the user's whole profile (nvm etc., 0.5-2.5s), so the
-    /// per-launch cost has to stay O(1) in the number of missing agents.
     #[test]
-    fn login_shell_probe_script_batches_all_probes_into_one_script() {
-        let claude = crate::agents::get_agent("claude").unwrap();
-        let vibe = crate::agents::get_agent("vibe").unwrap();
-        assert!(
-            matches!(
-                vibe.detection,
-                crate::agents::DetectionMethod::RunWithArg(_, _)
-            ),
-            "test premise: vibe uses RunWithArg so both detection arms are covered"
-        );
-
-        let script = login_shell_probe_script(&[claude, vibe]);
-
-        assert!(script.contains("which claude"));
-        assert!(script.contains("vibe --version"));
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn login_shell_probe_batches_agents_and_continues_after_a_miss() {
+        if run_probe_test_in_subprocess() {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let _env = probe_environment(home.path());
+        let log = shell_words::quote(home.path().join("probes").to_str().unwrap()).into_owned();
+        std::fs::write(
+            home.path().join("bin/login-shell"),
+            format!("#!/bin/sh\nprintf 'login\\n' >> {log}\nexec /bin/sh -c \"$2\"\n"),
+        )
+        .unwrap();
+        let found = login_shell_probe(&[
+            crate::agents::get_agent("vibe").unwrap(),
+            crate::agents::get_agent("claude").unwrap(),
+        ]);
+        assert_eq!(found, HashSet::from(["claude".to_owned()]));
         assert_eq!(
-            script.matches(LOGIN_PROBE_MARKER).count(),
-            2,
-            "one marker echo per agent, all inside the one script: {script}"
-        );
-        // Chained with `;` so a failed probe never short-circuits the rest.
-        assert!(
-            script.contains("; "),
-            "probes must be `;`-chained: {script}"
+            std::fs::read_to_string(home.path().join("probes")).unwrap(),
+            "login\nversion\nwhich:claude\n"
         );
     }
 
