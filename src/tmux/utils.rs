@@ -1,5 +1,6 @@
 //! tmux utility functions
 
+use super::tmux_no_server_running;
 use crate::session::config::{
     resolve_tmux_setting, tmux_setting_writes, Config, TmuxOptionWrite, TmuxSetting,
 };
@@ -225,8 +226,6 @@ pub fn append_window_size_args(args: &mut Vec<String>, target: &str) {
 /// empty stdout, and nothing on stderr, so "the pane is alive and not dead"
 /// and "there is no such session" are only separable by looking at whether
 /// the format expanded to anything at all.
-use super::tmux_no_server_running;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PaneProbe {
     /// `#{pane_dead}` expanded to `0`.
@@ -241,7 +240,7 @@ pub(crate) enum PaneProbe {
     /// `Missing` is the precise "tmux resolved the target to nothing" signal,
     /// and only that: exit 0 with empty stdout (the name did not resolve), or
     /// a non-zero exit carrying the recognized no-server / dead-socket
-    /// (ENOENT) markers on stderr — there is no tmux server, so every session
+    /// (ENOENT) markers on stderr. There is no tmux server, so every session
     /// on it is gone too. Classifying those as `Unknown` would be worse, not
     /// safer: nothing ever terminates on `Unknown`, so a vanished server would
     /// leave every poller running against sessions that cannot come back
@@ -264,12 +263,22 @@ pub(crate) enum PaneProbe {
 }
 
 pub(crate) fn probe_pane(session_name: &str) -> PaneProbe {
+    // An empty name would make the target `:^.0`, which tmux resolves against
+    // whatever session is current: an unrelated live pane would then answer
+    // `Alive` and a poller seeded with no name would never terminate. Nothing
+    // resolved, so `Missing`.
+    if session_name.is_empty() {
+        return PaneProbe::Missing;
+    }
     // Use `^.0` to target the first window's first pane regardless of
     // base-index or which pane is active, so the check always hits the
     // agent's pane even when the user has created additional tmux windows
     // or split panes.  See #435, #488.
     let target = format!("{session_name}:^.0");
-    let Some(output) = crate::tmux::tmux_command()
+    // `tmux_query_command`, not `tmux_command`: `classify_pane_probe` matches
+    // the ENOENT marker in tmux's `error connecting to <socket> (<strerror>)`,
+    // and glibc localizes `strerror` by `LC_MESSAGES`.
+    let Some(output) = crate::tmux::tmux_query_command()
         .args(["display-message", "-t", &target, "-p", "#{pane_dead}"])
         .output()
         .ok()
@@ -1134,5 +1143,14 @@ mod pane_probe_tests {
         // lossy conversion probe_pane performs.
         assert!(from_utf8(no_server).is_ok());
         assert!(from_utf8(enoent).is_ok());
+    }
+
+    /// An empty name never reaches tmux: `:^.0` resolves against whatever
+    /// session is current, so an unrelated live pane would answer `Alive` and
+    /// a poller seeded with no name would hold its budget slot forever.
+    #[test]
+    fn probe_pane_rejects_an_empty_session_name() {
+        assert_eq!(probe_pane(""), PaneProbe::Missing);
+        assert!(!is_pane_dead(""));
     }
 }
