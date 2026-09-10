@@ -1621,7 +1621,7 @@ impl Drop for BlockedProbeWorker<'_> {
 /// later test and make it order-dependent. Pair with `#[serial_test::serial]`.
 #[cfg(test)]
 pub(crate) struct AgentAvailabilityGuard {
-    prev: Option<HashMap<String, bool>>,
+    prev: Option<HashMap<String, (bool, std::time::Instant)>>,
 }
 
 #[cfg(test)]
@@ -1640,7 +1640,21 @@ impl AgentAvailabilityGuard {
         if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
             cache
                 .get_or_insert_with(HashMap::new)
-                .insert(agent.to_string(), available);
+                .insert(agent.to_string(), (available, std::time::Instant::now()));
+        }
+    }
+
+    /// Backdate one entry past the TTL, as if it had been published long ago.
+    pub(crate) fn age_past_ttl(&self, agent: &str) {
+        use std::time::{Duration, Instant};
+        if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
+            if let Some(map) = cache.as_mut() {
+                if let Some(entry) = map.get_mut(agent) {
+                    entry.1 = Instant::now()
+                        .checked_sub(AGENT_AVAILABILITY_TTL + Duration::from_secs(1))
+                        .unwrap_or(Instant::now());
+                }
+            }
         }
     }
 
@@ -2363,14 +2377,27 @@ fn login_shell_probe(agents: &[&crate::agents::AgentDef]) -> std::collections::H
         .unwrap_or_default()
 }
 
-/// Process-wide memo of agent availability, keyed by agent name. A probe costs
-/// a `which` fork and, when that misses, a share of a login shell (0.5-2.5s),
-/// so re-probing on every settings field rebuild made `Settings > Agents` and
-/// every keystroke in `Settings > Search` pay seconds. Startup's
-/// `AvailableTools::detect` warms every built-in agent, so later callers hit
-/// the memo. The Recheck action clears it via
-/// [`invalidate_agent_availability`].
-static AGENT_AVAILABILITY: RwLock<Option<HashMap<String, bool>>> = RwLock::new(None);
+/// Process-wide memo of agent availability, keyed by agent name with the
+/// publication instant. A probe costs a `which` fork and, when that misses, a
+/// share of a login shell (0.5-2.5s), so re-probing on every settings field
+/// rebuild made `Settings > Agents` and every keystroke in
+/// `Settings > Search` pay seconds. Startup's `AvailableTools::detect` warms
+/// every built-in agent, so later callers hit the memo. The Recheck action
+/// clears it via [`invalidate_agent_availability`].
+///
+/// Entries expire after [`AGENT_AVAILABILITY_TTL`]: only the TUI Recheck
+/// paths can clear the memo on demand, and a long-running daemon serves
+/// `/api/agents` from this same process-wide memo with no Recheck path at
+/// all, so a user who installs or removes an agent in another terminal would
+/// otherwise see the stale answer for the daemon's lifetime.
+static AGENT_AVAILABILITY: RwLock<Option<HashMap<String, (bool, std::time::Instant)>>> =
+    RwLock::new(None);
+
+/// How long a memoized availability answer stays authoritative. Long enough
+/// to absorb a settings keystroke storm without a second login shell; short
+/// enough that a daemon's `/api/agents` reflects an agent installed or
+/// removed elsewhere within a minute.
+const AGENT_AVAILABILITY_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Serializes cache population so a set of concurrent cold callers costs one
 /// login shell between them rather than one each. `GET /api/agents` runs
@@ -2378,6 +2405,12 @@ static AGENT_AVAILABILITY: RwLock<Option<HashMap<String, bool>>> = RwLock::new(N
 /// tabs open can issue simultaneous probes; the TUI's settings rebuild can
 /// land in the same window. Held only around the probe, never around a read.
 static AGENT_PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Number of per-agent availability resolutions actually attempted, for the
+/// contract test: the memo read, memo write, and post-lock re-read are all
+/// observable only through whether a probe ran.
+#[cfg(test)]
+static AGENT_PROBE_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Drop the memoized availability results so the next probe re-runs. Called
 /// when the user explicitly asks for a recheck (they just installed an agent).
@@ -2410,11 +2443,13 @@ fn partition_cached_agents<'a>(
     let cached = cache.as_ref().and_then(|c| c.as_ref());
     for agent in agents {
         match cached.and_then(|c| c.get(agent.name)) {
-            Some(true) => {
+            // Expired entries are as good as absent: the next probe
+            // re-runs and republishes.
+            Some((true, at)) if at.elapsed() < AGENT_AVAILABILITY_TTL => {
                 found.insert(agent.name.to_string());
             }
-            Some(false) => {}
-            None => uncached.push(*agent),
+            Some((false, at)) if at.elapsed() < AGENT_AVAILABILITY_TTL => {}
+            _ => uncached.push(*agent),
         }
     }
     (found, uncached)
@@ -2447,6 +2482,8 @@ pub(crate) fn probe_agents_available(
     let mut results: Vec<(&str, bool)> = Vec::new();
     let mut needs_shell: Vec<&crate::agents::AgentDef> = Vec::new();
     for agent in uncached {
+        #[cfg(test)]
+        AGENT_PROBE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match agent_available_direct(agent) {
             Some(ok) => results.push((agent.name, ok)),
             None => needs_shell.push(agent),
@@ -2459,8 +2496,9 @@ pub(crate) fn probe_agents_available(
 
     if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
         let map = cache.get_or_insert_with(HashMap::new);
+        let now = std::time::Instant::now();
         for (name, ok) in &results {
-            map.insert((*name).to_string(), *ok);
+            map.insert((*name).to_string(), (*ok, now));
         }
     }
     for (name, ok) in results {
@@ -2629,6 +2667,55 @@ mod tests {
     // (`aoe_`) and debug (`aoe_dev_`) builds. Use the constant so the same
     // test bodies cover both.
     const P: &str = SESSION_PREFIX;
+
+    /// The contract test the review asked for: it exercises
+    /// `probe_agents_available` itself, so removing the memo read (the warm
+    /// call would probe again), the memo write (the warm call would probe
+    /// again), or the post-lock re-read (a queued prober would probe what the
+    /// holder published) makes this fail. Agents are real built-ins; the
+    /// probe counter counts attempts, so runner-dependent outcomes do not
+    /// matter to the assertions.
+    #[test]
+    #[serial_test::serial]
+    fn probe_agents_available_contract_is_mutation_sensitive() {
+        use std::sync::atomic::Ordering;
+
+        // Two real built-ins, so the names line up with what the memo keys on
+        // (same fixture as the partition test above). Outcomes on the runner
+        // do not matter to the assertions: the probe counter counts attempts.
+        let defs: Vec<&crate::agents::AgentDef> = crate::agents::AGENTS.iter().take(2).collect();
+
+        let memo = AgentAvailabilityGuard::capture();
+        memo.clear();
+        AGENT_PROBE_CALLS.store(0, Ordering::Relaxed);
+
+        // Cold: every agent is uncached, so each one is probed once and the
+        // results are published to the memo.
+        let _ = probe_agents_available(&defs);
+        let cold_probes = AGENT_PROBE_CALLS.load(Ordering::Relaxed);
+        assert_eq!(cold_probes, 2, "a cold caller probes each uncached agent");
+        assert!(memo.is_populated(), "results must be published to the memo");
+
+        // Warm: the memo read answers everything; no probe may run.
+        let _ = probe_agents_available(&defs);
+        assert_eq!(
+            AGENT_PROBE_CALLS.load(Ordering::Relaxed),
+            cold_probes,
+            "a fully-cached call must be answered by the memo read alone"
+        );
+
+        // Aged past the TTL: the entry is as good as absent, so the caller
+        // re-probes and republishes.
+        memo.age_past_ttl(defs[0].name);
+        AGENT_PROBE_CALLS.store(0, Ordering::Relaxed);
+        let _ = probe_agents_available(&defs);
+        assert_eq!(
+            AGENT_PROBE_CALLS.load(Ordering::Relaxed),
+            1,
+            "an expired entry must be re-probed, not trusted"
+        );
+        assert!(memo.is_populated(), "the re-probe republishes");
+    }
 
     #[test]
     #[serial_test::serial]
