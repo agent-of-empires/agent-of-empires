@@ -4878,7 +4878,7 @@ mod tests {
                 "-P",
                 "-F",
                 "#{pane_id}",
-                "sh -c 'read -r line'",
+                "/bin/bash --noprofile --norc -c 'read -r line'",
             ])
             .output()
             .expect("tmux split-window");
@@ -4906,7 +4906,7 @@ mod tests {
             .success());
         assert_eq!(pane_field(&session_name, "#{pane_id}"), split);
         wait_for_pane_command(&agent_pane, "sleep");
-        wait_for_pane_command(&split, "sh");
+        wait_for_pane_command(&split, "bash");
         assert!(
             !is_pane_running_shell(&session_name),
             "status must target the agent, not the active shell"
@@ -5241,8 +5241,6 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_protected_env_reaches_child_without_exposing_secret_in_ps() {
-        use crate::tmux::test_helpers::pane_field;
-
         if !tmux_available() {
             eprintln!("Skipping test: tmux not available");
             return;
@@ -5258,7 +5256,7 @@ mod tests {
             crate::session::environment::shell_escape(&output.to_string_lossy())
         );
         let command = format!(
-            "exec /bin/sh -c {}",
+            "exec /bin/bash --noprofile --norc -c {}",
             crate::session::environment::shell_escape(&script)
         );
 
@@ -5278,7 +5276,7 @@ mod tests {
         // read holds a known shell so this cannot take the non-shell fast path.
         wait_for_pane_text(&session, "protected-ready");
         let pane_id = only_pane_id(guard.name());
-        wait_for_pane_command(&pane_id, "sh");
+        wait_for_pane_command(&pane_id, "bash");
         assert_eq!(std::fs::read_to_string(output).unwrap(), secret_value);
         assert!(
             !session.is_pane_running_shell(),
@@ -5377,17 +5375,17 @@ mod tests {
                 "80",
                 "-y",
                 "24",
-                "sh",
+                "/bin/bash --noprofile --norc",
             ])
             .output()
             .expect("tmux new-session");
         assert!(output.status.success());
 
-        wait_for_pane_command(&only_pane_id(&session_name), "sh");
+        wait_for_pane_command(&only_pane_id(&session_name), "bash");
 
         assert!(
             is_pane_running_shell(&session_name),
-            "Session running sh should be detected as a shell"
+            "Session running bash should be detected as a shell"
         );
     }
 
