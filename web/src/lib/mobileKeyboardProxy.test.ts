@@ -49,6 +49,17 @@ describe("forwardTerminalBeforeInput", () => {
     expect(ta.value).toBe("");
   });
 
+  // The line-break branch runs for other targets too (the helper is
+  // target-agnostic); it must not throw on a non-textarea.
+  it("tolerates a non-textarea target on line breaks", () => {
+    const div = document.createElement("div");
+    const deliver = vi.fn(() => true);
+    const ev = new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertLineBreak" });
+    Object.defineProperty(ev, "target", { value: div });
+    expect(() => forwardTerminalBeforeInput(ev, deliver)).not.toThrow();
+    expect(ev.defaultPrevented).toBe(true);
+  });
+
   it("swallows pastes so they never enter the textarea", () => {
     const ta = document.createElement("textarea");
     const { ev, deliver } = beforeInput(ta, { inputType: "insertFromPaste", data: "a\nb" });
@@ -125,6 +136,71 @@ describe("mobile keyboard proxy", () => {
     expect(proxy.value).toBe("");
     unregister();
     document.body.innerHTML = "";
+  });
+
+  // A drained queue with an accepting receiver leaves the proxy alone.
+  it("keeps the proxy content when drained edits are accepted", () => {
+    document.body.innerHTML = '<textarea data-keyboard-proxy></textarea>';
+    const proxy = document.querySelector<HTMLTextAreaElement>("[data-keyboard-proxy]")!;
+    proxy.value = "ㅎ";
+    deliverMobileKeyboardProxyInput({ inputType: "insertText", data: "가", isComposing: false });
+    const receive = vi.fn(() => true);
+    const unregister = registerMobileKeyboardProxyReceiver(receive);
+    expect(receive).toHaveBeenCalled();
+    expect(proxy.value).toBe("ㅎ");
+    unregister();
+    document.body.innerHTML = "";
+  });
+
+  // Drain without a mounted proxy (unit callers, non-browser consumers):
+  // the refusal path must tolerate the missing element.
+  it("tolerates a missing proxy when a drained edit is refused", () => {
+    document.body.innerHTML = "";
+    deliverMobileKeyboardProxyInput({ inputType: "insertText", data: "ㅎ", isComposing: false });
+    const receive = vi.fn(() => false);
+    const unregister = registerMobileKeyboardProxyReceiver(receive);
+    expect(receive).toHaveBeenCalled();
+    unregister();
+  });
+
+  // Unregistering a receiver that is not the current one must not detach
+  // the live receiver.
+  it("keeps the current receiver when an older cleanup runs", () => {
+    const first = vi.fn(() => true);
+    const stop1 = registerMobileKeyboardProxyReceiver(first);
+    const second = vi.fn(() => true);
+    const stop2 = registerMobileKeyboardProxyReceiver(second);
+    stop1();
+    deliverMobileKeyboardProxyInput({ inputType: "insertText", data: "x", isComposing: false });
+    expect(second).toHaveBeenCalledWith({ inputType: "insertText", data: "x", isComposing: false });
+    expect(first).not.toHaveBeenCalledWith({ inputType: "insertText", data: "x", isComposing: false });
+    stop2();
+  });
+});
+
+// #3885: a refused edit clears the target when it is a textarea. The guard
+// must also tolerate a non-textarea target (the handler is wired per-input,
+// but nothing in the helper's contract guarantees it).
+describe("forwardTerminalBeforeInput refused-edit target guard", () => {
+  it("does not throw when the target is not a textarea", () => {
+    const div = document.createElement("div");
+    div.dispatchEvent = () => true; // not used directly; helper is called explicitly
+    const deliver = vi.fn(() => false);
+    const ev = new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertText", data: "c" });
+    Object.defineProperty(ev, "target", { value: div });
+    expect(() => forwardTerminalBeforeInput(ev, deliver)).not.toThrow();
+    expect(ev.defaultPrevented).toBe(true);
+  });
+
+  it("clears the target textarea when the pane refuses the edit", () => {
+    const ta = document.createElement("textarea");
+    ta.value = "한";
+    const deliver = vi.fn(() => false);
+    const ev = new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertText", data: "c" });
+    Object.defineProperty(ev, "target", { value: ta });
+    forwardTerminalBeforeInput(ev, deliver);
+    expect(ta.value).toBe("");
+    expect(ev.defaultPrevented).toBe(true);
   });
 });
 
