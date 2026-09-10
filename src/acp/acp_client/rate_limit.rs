@@ -53,13 +53,20 @@ pub(crate) fn classify_rate_limit_from_message(
 /// unrelated prompt failure still ends the turn as an ordinary error instead
 /// of being silently swallowed into a context reset.
 pub(crate) fn is_unsupported_session_error(err: &agent_client_protocol::Error) -> bool {
+    // Whole phrases, never independent words: "Unsupported content block in
+    // session/prompt" and "Method not found: session/prompt" are ordinary
+    // prompt failures, and word-matching would rewrite them into context
+    // resets that discard the agent's context.
+    const PHRASES: &[&str] = &[
+        "unsupported acp session",
+        "unsupported session",
+        "unknown session",
+        "session not found",
+        "no such session",
+        "session does not exist",
+    ];
     let msg = err.message.to_ascii_lowercase();
-    msg.contains("session")
-        && (msg.contains("unsupported")
-            || msg.contains("unknown")
-            || msg.contains("not found")
-            || msg.contains("no such")
-            || msg.contains("does not exist"))
+    PHRASES.iter().any(|phrase| msg.contains(phrase))
 }
 
 /// One observation of the SDK's rate-limit state, as forwarded by
@@ -339,11 +346,17 @@ mod tests {
             ("session not found", true),
             ("no such session: abc", true),
             ("Session does not exist", true),
-            // Unrelated failures must stay ordinary errors.
+            // Unrelated failures must stay ordinary errors. The last two
+            // contain a phrase word ("unsupported", "not found") next to
+            // "session", which independent-word matching turned into
+            // context resets discarding the agent's context.
             ("You've hit your limit", false),
             ("transport closed", false),
             ("permission denied", false),
             ("unsupported model", false),
+            ("unknown tool", false),
+            ("Unsupported content block in session/prompt", false),
+            ("Method not found: session/prompt", false),
         ];
         for (msg, expected) in cases {
             assert_eq!(classify(msg), expected, "{msg:?}");
