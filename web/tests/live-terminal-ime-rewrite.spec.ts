@@ -25,10 +25,18 @@ function textBytes(handle: MockHandle, start: number) {
 }
 
 const INPUT = 'textarea[aria-label="Live terminal input"]';
+// App's persistent proxy, which holds iOS focus authorized by a sidebar tap
+// and, unlike INPUT, survives a session switch.
+const PROXY = "textarea[data-keyboard-proxy]";
 
-// Emit one soft-keyboard edit on the live view's hidden input and apply the
+// Emit one soft-keyboard edit on a hidden terminal input and apply the
 // default action if the page did not preventDefault it.
-async function softKey(page: Page, inputType: "insertText" | "deleteContentBackward", data: string | null = null) {
+async function softKey(
+  page: Page,
+  inputType: "insertText" | "deleteContentBackward",
+  data: string | null = null,
+  selector = INPUT,
+) {
   await page.evaluate(
     ({ selector, inputType, data }) => {
       const ta = document.querySelector<HTMLTextAreaElement>(selector);
@@ -40,8 +48,12 @@ async function softKey(page: Page, inputType: "insertText" | "deleteContentBackw
       if (inputType === "insertText") ta.setRangeText(data ?? "", end, end, "end");
       else ta.setRangeText("", Math.max(0, end - 1), end, "end");
     },
-    { selector: INPUT, inputType, data },
+    { selector, inputType, data },
   );
+}
+
+function valueOf(page: Page, selector: string) {
+  return page.evaluate((s) => document.querySelector<HTMLTextAreaElement>(s)?.value ?? null, selector);
 }
 
 const { defaultBrowserType: _iphoneBrowser, ...iPhone13 } = devices["iPhone 13"];
@@ -87,5 +99,25 @@ test.describe("Live terminal IME syllable rewrite", () => {
 
     await expect(page.locator(INPUT)).toHaveValue("");
     await expect.poll(() => textBytes(handle, start), { timeout: 5_000 }).toBe("한\r");
+  });
+
+  // The proxy is the element under test, not INPUT: a session switch unmounts
+  // and remounts the live terminal, so INPUT is empty afterwards either way.
+  // The proxy persists across the switch, so only clearing it on the session
+  // boundary keeps the retained syllable out of the next session's PTY.
+  test("a session switch drops the syllable retained in the persistent proxy", async ({ page }) => {
+    const handle = await mockTerminalApis(page, { extraSessions: [{ id: "other", title: "other" }] });
+    await openSession(page, handle);
+
+    await softKey(page, "insertText", "ㅎ", PROXY);
+    expect(await valueOf(page, PROXY)).toBe("ㅎ");
+
+    await openMobileSidebar(page);
+    await clickSidebarSession(page, "other");
+    await page.locator("[data-live-terminal]").waitFor({ state: "visible", timeout: 10_000 });
+
+    // Without the clear this still holds "ㅎ", and the next Korean keystroke
+    // rewrites it as DEL + replacement into the newly selected session.
+    expect(await valueOf(page, PROXY)).toBe("");
   });
 });

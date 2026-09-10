@@ -882,6 +882,10 @@ function AppContent({
   const transitionKeyboardProxy = useCallback((nextSessionId: string | null) => {
     if (keyboardProxySessionIdRef.current === nextSessionId) return;
     keyboardProxySessionIdRef.current = nextSessionId;
+    // The retained syllable mirrors the old session's PTY edit, so carrying
+    // it over would let the next deleteContentBackward delete the new
+    // session's text before the replacement arrives.
+    if (keyboardProxyRef.current) keyboardProxyRef.current.value = "";
     clearMobileKeyboardProxyInput();
   }, []);
 

@@ -47,7 +47,13 @@ export function makeLiveFrame(opts: { rows?: number; history?: number; window?: 
 
 export async function mockTerminalApis(
   page: Page,
-  opts: { liveHistory?: number; delayLiveWindowShrinkMs?: number; tool?: string } = {},
+  opts: {
+    liveHistory?: number;
+    delayLiveWindowShrinkMs?: number;
+    tool?: string;
+    /** Extra sessions beyond pinch-test, for tests that switch between them. */
+    extraSessions?: Array<{ id: string; title: string }>;
+  } = {},
 ): Promise<MockHandle> {
   const liveSockets: Array<{ send: (data: string) => void }> = [];
   const handle: MockHandle = {
@@ -98,6 +104,24 @@ export async function mockTerminalApis(
             profile: "default",
             workspace_repos: [],
           },
+          ...(opts.extraSessions ?? []).map((session) => ({
+            id: session.id,
+            title: session.title,
+            project_path: `/tmp/${session.id}`,
+            group_path: "/tmp",
+            tool: opts.tool ?? "claude",
+            status: "Running",
+            yolo_mode: false,
+            created_at: new Date().toISOString(),
+            last_accessed_at: null,
+            last_error: null,
+            branch: null,
+            main_repo_path: null,
+            is_sandboxed: false,
+            has_terminal: true,
+            profile: "default",
+            workspace_repos: [],
+          })),
         ],
         workspace_ordering: [],
       },
