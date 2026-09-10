@@ -26,14 +26,21 @@ export function registerMobileKeyboardProxyReceiver(next: Receiver) {
   receiver = next;
   const queued = pending;
   pending = [];
+  let refused = false;
   for (const input of queued) {
     if (!next(input)) {
-      // A refused edit means the pane that just mounted rejected it; the
-      // shadow still holds the queued text, which the line does not show.
-      const proxy = document.querySelector<HTMLTextAreaElement>("[data-keyboard-proxy]");
-      if (proxy) proxy.value = "";
-      break;
+      refused = true;
+      continue;
     }
+  }
+  if (refused) {
+    // A refused edit must not survive in the shadow: the pane does not hold
+    // it, so the next rewrite would open with a delete against text the user
+    // did not type. Later queued edits stay deliverable — `false` can mean
+    // one edit was transformed (a Ctrl chord sent its control code) rather
+    // than that the receiver is wedged.
+    const proxy = document.querySelector<HTMLTextAreaElement>("[data-keyboard-proxy]");
+    if (proxy) proxy.value = "";
   }
   return () => {
     if (receiver === next) receiver = null;

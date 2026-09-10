@@ -2,6 +2,7 @@ import { test, expect } from "./helpers/mockedTest";
 import { devices, type Page } from "@playwright/test";
 import { mockTerminalApis, type MockHandle } from "./helpers/terminal-mocks";
 import { clickSidebarSession, openMobileSidebar } from "./helpers/sidebar";
+import { seedSettings } from "./helpers/terminal-mocks";
 
 // iOS WebKit fires no composition events for the Korean keyboard (WebKit bug
 // 274700). Every keystroke rewrites the trailing syllable through the plain
@@ -212,5 +213,61 @@ test.describe("Live terminal IME syllable rewrite", () => {
     await expect.poll(() => textBytes(handle, start), { timeout: 5_000 }).toContain("/tmp/paste");
     expect(await valueOf(page, INPUT)).toBe("");
     await expect.poll(() => valueOf(page, PROXY)).toBe("");
+  });
+
+  // #3885 review: the async upload's completion must not wipe the proxy's
+  // retained syllable of the FOREGROUND session. A late upload from a
+  // backgrounded session (still mounted in the stack) clears its own local
+  // textarea but leaves the shared proxy — which now belongs to the session
+  // the user switched to — untouched.
+  test("a late upload from a backgrounded session keeps the foreground proxy", async ({ page }) => {
+    const handle = await mockTerminalApis(page, {
+      pendingPaste: true,
+      extraSessions: [{ id: "other", title: "other" }],
+    });
+    // Keep both sessions mounted across the switch: the scenario is a late
+    // upload racing a foreground switch, not a session teardown.
+    await page.goto("/");
+    await seedSettings(page, { persistentTerminals: true });
+    await page.reload();
+    await openSession(page, handle);
+
+    // Session A: paste an image, hold the upload.
+    const start = handle.liveMessages.length;
+    await page.evaluate(() => {
+      const ta = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Live terminal input"]');
+      if (!ta) throw new Error("live terminal input not found");
+      ta.focus();
+      const dt = new DataTransfer();
+      dt.items.add(new File(["x"], "shot.png", { type: "image/png" }));
+      ta.dispatchEvent(new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true }));
+    });
+    // Switch to session B (A stays mounted, its upload still pending). The
+    // switch itself drops whatever A's proxy held.
+    await openMobileSidebar(page);
+    await clickSidebarSession(page, "other");
+    await page.locator(`[data-live-terminal]:visible`).waitFor({ state: "visible", timeout: 10_000 });
+
+    // Let the switch's layout-effect proxy clear land before typing (two
+    // animation frames), so the syllable below is unambiguously B's.
+    await page.evaluate(() =>
+      Promise.all([
+        new Promise((r) => requestAnimationFrame(() => r(null))),
+        new Promise((r) => requestAnimationFrame(() => r(null))),
+      ]),
+    );
+
+    // The foreground user (session B) retains a syllable in the shared proxy.
+    await softKey(page, "insertText", "ㅎ", PROXY);
+    expect(await valueOf(page, PROXY)).toBe("ㅎ");
+
+    await page.evaluate(() => {
+      const w = window as unknown as { releasePasteImage?: () => void };
+      w.releasePasteImage?.();
+    });
+    // A's continuation sends its path to A's PTY and clears only A's local
+    // textarea; B's retained proxy syllable survives.
+    await expect.poll(() => textBytes(handle, start), { timeout: 5_000 }).toContain("/tmp/paste");
+    expect(await valueOf(page, PROXY)).toBe("ㅎ");
   });
 });

@@ -1720,6 +1720,13 @@ export function MobileLiveTerminal({
     [sendData, ctrlActiveRef, clearCtrl],
   );
 
+  // Mirrors `active` for async continuations: a paste's upload completion
+  // must observe whether this session still owns the foreground AT THAT
+  // TIME, not at paste time (the handler's closure captures the paste-time
+  // value). See #3885 review.
+  const activeRef = useRef(active);
+  activeRef.current = active;
+
   // Native (not React-synthetic) beforeinput: React's onBeforeInput is
   // backed by keypress in Chromium and carries no inputType, so the
   // soft-keyboard input types below would never match through it.
@@ -1864,12 +1871,17 @@ export function MobileLiveTerminal({
         // user to type a syllable this insert would then displace. The
         // live terminal's own textarea must be named: with no target the
         // helper clears only the proxy, and the local shadow would keep
-        // the syllable the pasted path displaces. See #3885.
-        invalidateRetainedImeContext(inputRef.current);
+        // the syllable the pasted path displaces. The shared proxy is only
+        // cleared while this session still owns the foreground NOW (ref,
+        // not the paste-time closure): a late upload from a backgrounded
+        // session must not wipe the syllable the foreground session's
+        // proxy retained. See #3885.
+        if (activeRef.current) invalidateRetainedImeContext(inputRef.current);
+        else if (inputRef.current) inputRef.current.value = "";
         sendData(bracketedPaste(` ${parts.join(" ")} `));
       })();
     },
-    [inputRef, sendData, uploadPastedImage],
+    [active, inputRef, sendData, uploadPastedImage],
   );
 
   const handleCompositionStart = useCallback(() => {
