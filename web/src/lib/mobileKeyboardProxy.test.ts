@@ -140,7 +140,7 @@ describe("mobile keyboard proxy", () => {
 
   // A drained queue with an accepting receiver leaves the proxy alone.
   it("keeps the proxy content when drained edits are accepted", () => {
-    document.body.innerHTML = '<textarea data-keyboard-proxy></textarea>';
+    document.body.innerHTML = "<textarea data-keyboard-proxy></textarea>";
     const proxy = document.querySelector<HTMLTextAreaElement>("[data-keyboard-proxy]")!;
     proxy.value = "ㅎ";
     deliverMobileKeyboardProxyInput({ inputType: "insertText", data: "가", isComposing: false });
