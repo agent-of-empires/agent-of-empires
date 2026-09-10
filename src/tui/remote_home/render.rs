@@ -613,12 +613,31 @@ mod tests {
     }
 
     #[test]
-    fn cleared_and_icon_only_badges_reserve_no_width() {
-        // Both render nothing, so the path sits where it does with no entries.
-        for payload in [json!({"items": []}), json!({"icon": "git-pull-request"})] {
-            let state = state_with(&["s1"], json!([row_badge("s1", payload.clone())]));
-            assert_eq!(column_of(&rows(&state), "/tmp/s1"), 41, "{payload}");
-        }
+    fn cleared_badges_reserve_no_width() {
+        let state = state_with(&["s1"], json!([row_badge("s1", json!({"items": []}))]));
+        assert_eq!(column_of(&rows(&state), "/tmp/s1"), 41);
+    }
+
+    #[test]
+    fn icon_only_badge_renders_the_compact_marker() {
+        // The featured GitHub plugin's shape (icon, tone, tooltip, no text):
+        // the badge keeps its tone and shifts the row by its marker cell
+        // instead of vanishing.
+        let state = state_with(
+            &["s1"],
+            json!([row_badge(
+                "s1",
+                json!({
+                    "icon": "git-pull-request", "tone": "info", "tooltip": "t"
+                })
+            )]),
+        );
+        let painted = rows(&state);
+        assert_eq!(column_of(&painted, "/tmp/s1"), 44);
+        assert!(
+            painted.iter().any(|row| row.contains('\u{25CF}')),
+            "the compact marker must be painted"
+        );
     }
 
     #[test]

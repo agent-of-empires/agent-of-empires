@@ -81,10 +81,11 @@ pub fn row_column_cells(snapshot: &UiSnapshot, session_id: &str) -> Vec<(String,
 /// The presence of `items` selects the list form: the documented `items: []`
 /// clears the row rather than falling back to the entry's own `text`, and a
 /// malformed `items` clears it too rather than silently rendering the other
-/// form. A badge carrying only an `icon` yields nothing, since a lucide name
-/// has no terminal glyph and a generic stand-in would keep the badge's presence
-/// while dropping which state it meant. `tooltip` and `href` have no terminal
-/// surface either; opening the `href` is tracked as #2528.
+/// form. An icon-only badge renders as a compact tone-colored marker: the
+/// featured GitHub plugin emits every badge as `{icon, tone, tooltip}` with
+/// no `text`, and a lucide name has no terminal glyph — dropping the badge
+/// would hide the plugin's signal entirely. `tooltip` and `href` have no
+/// terminal surface; opening the `href` is tracked as #2528.
 pub fn row_badge_cells(snapshot: &UiSnapshot, session_id: &str) -> Vec<(String, Option<Tone>)> {
     session_entries(snapshot, UiSlot::RowBadge, session_id)
         .flat_map(|e| match e.payload.get("items") {
@@ -99,9 +100,21 @@ pub fn row_badge_cells(snapshot: &UiSnapshot, session_id: &str) -> Vec<(String, 
 
 /// One badge's renderable `(text, tone)`, from either a whole `row-badge`
 /// payload or one element of its `items` list: the two carry the same fields.
+/// Icon-only badges fall back to a compact marker carrying the tone, so the
+/// badge's presence and state stay visible (#2947, GitHub-plugin payload).
 fn badge_cell(badge: &Value) -> Option<(String, Option<Tone>)> {
-    Some((block_str(badge, "text")?.to_string(), block_tone(badge)))
+    match block_str(badge, "text") {
+        Some(text) => Some((text.to_string(), block_tone(badge))),
+        None if badge.get("icon").is_some_and(|icon| !icon.is_null()) => {
+            Some((ICON_ONLY_BADGE.to_string(), block_tone(badge)))
+        }
+        None => None,
+    }
 }
+
+/// Stand-in glyph for an icon-only badge. A lucide name has no terminal
+/// rendering; the tone carries the state the icon would have conveyed.
+const ICON_ONLY_BADGE: &str = "\u{25CF}";
 
 /// Map a tone to a foreground style against the active theme. `None` (no tone)
 /// renders neutral. Reuses existing theme status colors rather than inventing
@@ -966,7 +979,8 @@ mod tests {
     fn row_badge_cells_read_both_payload_forms() {
         // One badge payload and the cells it must yield. Covers the single
         // badge form, the `items` list, and every shape that renders nothing.
-        let cases: [(serde_json::Value, &[(&str, Option<Tone>)]); 9] = [
+        type BadgeCase<'a> = (serde_json::Value, &'a [(&'a str, Option<Tone>)]);
+        let cases: [BadgeCase; 9] = [
             // Single badge: text and tone kept, the web-only fields dropped.
             (
                 json!({"text": "open", "tone": "success", "icon": "git-pull-request",
@@ -990,12 +1004,26 @@ mod tests {
             // Malformed `items` clears the row rather than quietly rendering
             // the other form.
             (json!({"text": "stale", "items": 7}), &[]),
-            // A lucide name has no terminal glyph, so an icon-only badge
-            // yields nothing; its text-carrying neighbours still render.
-            (json!({"icon": "git-pull-request"}), &[]),
+            // The featured GitHub plugin's actual shape (icon, tone and
+            // tooltip, no text): renders as a compact tone-colored marker
+            // so the badge does not vanish from the row.
             (
-                json!({"items": [{"icon": "check"}, {"text": "kept"}, {"text": "  "}, {"text": 7}]}),
-                &[("kept", None)],
+                json!({"icon": "git-pull-request", "tone": "info",
+                       "tooltip": "Open pull requests", "href": "https://example.test/pr/9"}),
+                &[("\u{25CF}", Some(Tone::Info))],
+            ),
+            // Icon-only badges keep their tone and their position among
+            // text-carrying neighbours; a null icon (or no text at all) is
+            // not a badge.
+            (
+                json!({"items": [
+                    {"icon": "check", "tone": "success"},
+                    {"text": "kept"},
+                    {"icon": null},
+                    {"text": "  "},
+                    {"text": 7}
+                ]}),
+                &[("\u{25CF}", Some(Tone::Success)), ("kept", None)],
             ),
             // An unreadable tone degrades to neutral rather than dropping text.
             (
