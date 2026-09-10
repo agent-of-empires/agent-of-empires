@@ -674,9 +674,6 @@ fn branch_row_tag(inst: &crate::session::Instance) -> Option<RowTag> {
 
 fn workspace_branch_row_tag(branch: &str, repo_count: usize) -> Option<RowTag> {
     let suffix = format!("+{repo_count}");
-    // Reserve the suffix in cells, not characters: `RowTag::rendered` caps the
-    // whole tag in cells, so a character-sized reservation lets a wide branch
-    // fill the budget and lose the repository count off the end.
     let suffix_width = rendered_width(&suffix);
     if suffix_width >= BRANCH_TAG_WIDTH {
         return Some(RowTag {
@@ -697,6 +694,9 @@ fn workspace_branch_row_tag(branch: &str, repo_count: usize) -> Option<RowTag> {
 
 fn branch_tag_content(branch: &str, max_width: usize) -> Option<String> {
     let last = branch.rsplit('/').next().unwrap_or("");
+    // Cut in cells, not characters: `RowTag::rendered` caps the whole tag in
+    // cells, so a character-sized cut lets a wide branch fill that cap and
+    // push the workspace repository count off the end.
     let trimmed = prefix_within_width(last, max_width);
     if trimmed.is_empty() {
         None
