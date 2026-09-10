@@ -5,12 +5,10 @@
 //! substantially. New integration tests go here, not as loose files under
 //! `tests/`. Tests run as `cargo test --test integration [<module>::<test>]`.
 //!
-//! Per-test isolation still relies on `#[serial]` (see `serial_test`) for
-//! anything that touches process-global state (env vars, tmux sessions,
-//! `HOME`). `#[serial]` does not exclude unmarked tests, so a test whose
-//! seam poisons every concurrent subprocess spawn (for example clobbering
-//! `PATH`) cannot live in this binary; `tests/branch_exists_spawn_failure.rs`
-//! stays standalone for that reason.
+//! `#[serial]` does not exclude unmarked tests or other lock groups. Fixtures
+//! that poison concurrent consumers need separate processes:
+//! `branch_exists_spawn_failure.rs` isolates `PATH`, and
+//! `filewatch_degradation.rs` isolates `AOE_FILE_WATCH=off`.
 
 mod common;
 mod home_isolation;
@@ -59,7 +57,6 @@ mod build_cache_config;
 mod build_version_rerun;
 mod daemon_core_web_optional;
 mod filewatch_config_editor_burst;
-mod filewatch_degradation;
 mod filewatch_tui_adapter_lifetime;
 mod filewatch_tui_drop_then_abort;
 mod log_filter_watcher_migration;

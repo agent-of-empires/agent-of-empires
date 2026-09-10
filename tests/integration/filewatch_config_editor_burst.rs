@@ -64,7 +64,13 @@ async fn vim_style_save_burst_collapses_to_a_single_delivery() {
         "the seed write should match the spec's exact matcher"
     );
 
-    while timeout(POST_BURST_QUIET, rx.recv()).await.is_ok() {}
+    loop {
+        match timeout(POST_BURST_QUIET, rx.recv()).await {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("seed event channel closed"),
+            Err(_) => break,
+        }
+    }
 
     std::fs::write(&temp_path, b"theme = { idle_decay_minutes = 7 }\n")
         .expect("write tempfile (vim writebackup pattern)");
@@ -147,7 +153,13 @@ async fn vim_style_save_via_two_renames_collapses_to_a_single_delivery() {
         .await
         .expect("seed event arrives within 2.5s")
         .expect("seed event channel open");
-    while timeout(POST_BURST_QUIET, rx.recv()).await.is_ok() {}
+    loop {
+        match timeout(POST_BURST_QUIET, rx.recv()).await {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("seed event channel closed"),
+            Err(_) => break,
+        }
+    }
 
     std::fs::write(&temp_a, b"theme = { idle_decay_minutes = 7 }\n").expect("write temp_a");
     std::fs::rename(&temp_a, &final_path).expect("first rename onto final_path");

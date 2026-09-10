@@ -1,7 +1,7 @@
 //! Resolving an agent name to a command: PATH lookup, the bundled copy, and
 //! the version floor a PATH copy has to clear.
 
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use tracing::warn;
 
 /// Resolve a bare agent command name to an absolute path, scanning common
@@ -140,26 +140,19 @@ pub(super) fn path_copy_below_floor(command: &str, path: &std::path::Path) -> bo
     let Ok(min) = semver::Version::parse(gate.min_version) else {
         return false;
     };
-    let Some(raw) = probe_version_bounded(path) else {
+    let Some(raw) = probe_version_bounded(Command::new(path).arg("--version")) else {
         return false;
     };
     crate::acp::version_probe::whitespace_token_below_floor(&raw, min)
 }
 
-/// Run `<path> --version` with a deadline and return its stdout.
-///
-/// This runs on the synchronous spawn path, so it cannot reuse
-/// `version_probe`'s async `tokio::time::timeout`; it polls instead. The
-/// bound matters: an adapter that waits on stdin or a network login would
-/// otherwise block session spawn forever. It mirrors `version_probe`'s 2s
-/// budget; any failure or timeout yields `None` so the caller keeps the
-/// user's own copy.
-pub(super) fn probe_version_bounded(path: &std::path::Path) -> Option<String> {
+/// Run a version command with the synchronous spawn path's two-second budget.
+/// Failure keeps the user's own adapter rather than replacing it.
+fn probe_version_bounded(command: &mut Command) -> Option<String> {
     const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 
-    let mut child = std::process::Command::new(path)
-        .arg("--version")
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -183,7 +176,7 @@ pub(super) fn probe_version_bounded(path: &std::path::Path) -> Option<String> {
                     let _ = child.wait();
                     warn!(
                         target: "acp.adapters",
-                        path = %path.display(),
+                        path = %std::path::Path::new(command.get_program()).display(),
                         "version probe timed out; keeping the PATH copy"
                     );
                     return None;
@@ -287,20 +280,20 @@ mod tests {
         assert_eq!(resolved.prepend_paths.first(), Some(&bin_dir));
     }
 
-    /// A hanging adapter must not block session spawn: the probe has to give
-    /// up on its deadline and report nothing, so the caller keeps the user's
-    /// copy rather than waiting forever.
+    /// An entered, hanging adapter must not block the version probe.
     #[cfg(unix)]
     #[test]
     fn probe_version_bounded_gives_up_on_a_hanging_binary() {
         let dir = tempfile::TempDir::new().unwrap();
         let script = dir.path().join("hangs");
-        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let entered = dir.path().join("entered");
+        std::fs::write(&script, "printf entered > \"$1\"\nexec /bin/sleep 30\n").unwrap();
 
         let started = std::time::Instant::now();
-        assert!(probe_version_bounded(&script).is_none());
+        assert!(
+            probe_version_bounded(Command::new("/bin/sh").arg(&script).arg(&entered)).is_none()
+        );
+        assert_eq!(std::fs::read(&entered).unwrap(), b"entered");
         let elapsed = started.elapsed();
         assert!(
             elapsed < std::time::Duration::from_secs(10),
@@ -313,11 +306,15 @@ mod tests {
     fn probe_version_bounded_reads_version_output() {
         let dir = tempfile::TempDir::new().unwrap();
         let script = dir.path().join("prints");
-        std::fs::write(&script, "#!/bin/sh\necho 0.61.0\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(&script, "echo 0.61.0\n").unwrap();
+        // Reproduce a concurrent fork retaining the fixture writer.
+        let _writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&script)
+            .unwrap();
 
-        let out = probe_version_bounded(&script).expect("should capture stdout");
+        let out = probe_version_bounded(Command::new("/bin/sh").arg(&script))
+            .expect("should capture stdout");
         assert_eq!(out.trim(), "0.61.0");
     }
 
