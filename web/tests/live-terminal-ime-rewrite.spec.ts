@@ -160,4 +160,57 @@ test.describe("Live terminal IME syllable rewrite", () => {
     // rewrites it as DEL + replacement into the newly selected session.
     expect(await valueOf(page, PROXY)).toBe("");
   });
+
+  // #3885 case 1: the Ctrl latch's refusal must also clear a NON-empty
+  // shadow. The chord is transformed into a control code, so the retained
+  // syllable no longer mirrors anything the pane has; the next rewrite
+  // would open with a delete and eat a character the user did type.
+  test("a Ctrl chord over existing retained text drops it", async ({ page }) => {
+    const handle = await mockTerminalApis(page);
+    await openSession(page, handle);
+
+    const start = handle.liveMessages.length;
+    await softKey(page, "insertText", "한");
+    await page.locator('button[aria-label="Ctrl"]').click();
+    await softKey(page, "insertText", "c");
+    await expect.poll(() => textBytes(handle, start), { timeout: 5_000 }).toBe("한\x03");
+
+    // The chord consumed the shadow's job: no stale syllable may survive it.
+    expect(await valueOf(page, INPUT)).toBe("");
+    // The next rewrite re-arms from an empty line: no leading DEL.
+    await softKey(page, "insertText", "ㅎ");
+    await expect.poll(() => textBytes(handle, start), { timeout: 5_000 }).toBe("한\x03ㅎ");
+  });
+
+  // #3885 case 2: an async image upload's completion invalidates BOTH hidden
+  // inputs. The await leaves room for a syllable typed into the local
+  // textarea; inserting the paste path afterwards displaces it, so the
+  // shadow must not retain what the line will no longer show.
+  test("image upload completion drops a syllable typed during the upload", async ({ page }) => {
+    const handle = await mockTerminalApis(page, { pendingPaste: true });
+    await openSession(page, handle);
+
+    const start = handle.liveMessages.length;
+    // Paste an image while the upload is held, then type during the await.
+    await page.evaluate(() => {
+      const ta = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Live terminal input"]');
+      if (!ta) throw new Error("live terminal input not found");
+      ta.focus();
+      const dt = new DataTransfer();
+      dt.items.add(new File(["x"], "shot.png", { type: "image/png" }));
+      ta.dispatchEvent(new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true }));
+    });
+    await softKey(page, "insertText", "ㅎ");
+    await expect(page.locator(INPUT)).toHaveValue("ㅎ");
+
+    await page.evaluate(() => {
+      const w = window as unknown as { releasePasteImage?: () => void };
+      w.releasePasteImage?.();
+    });
+    // The pasted path is sent, and the syllable typed during the await is
+    // dropped from the shadow: the line shows the path, not the syllable.
+    await expect.poll(() => textBytes(handle, start), { timeout: 5_000 }).toContain("/tmp/paste");
+    expect(await valueOf(page, INPUT)).toBe("");
+    await expect.poll(() => valueOf(page, PROXY)).toBe("");
+  });
 });

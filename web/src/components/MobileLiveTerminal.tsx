@@ -1861,12 +1861,15 @@ export function MobileLiveTerminal({
         // Leading and trailing spaces keep the path from gluing onto queued
         // text or the user's next keystroke. No newline: never auto-submit.
         // Re-invalidated here too: the upload's await leaves room for the
-        // user to type a syllable this insert would then displace.
-        invalidateRetainedImeContext();
+        // user to type a syllable this insert would then displace. The
+        // live terminal's own textarea must be named: with no target the
+        // helper clears only the proxy, and the local shadow would keep
+        // the syllable the pasted path displaces. See #3885.
+        invalidateRetainedImeContext(inputRef.current);
         sendData(bracketedPaste(` ${parts.join(" ")} `));
       })();
     },
-    [sendData, uploadPastedImage],
+    [inputRef, sendData, uploadPastedImage],
   );
 
   const handleCompositionStart = useCallback(() => {

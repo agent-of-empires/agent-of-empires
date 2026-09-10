@@ -26,7 +26,15 @@ export function registerMobileKeyboardProxyReceiver(next: Receiver) {
   receiver = next;
   const queued = pending;
   pending = [];
-  for (const input of queued) next(input);
+  for (const input of queued) {
+    if (!next(input)) {
+      // A refused edit means the pane that just mounted rejected it; the
+      // shadow still holds the queued text, which the line does not show.
+      const proxy = document.querySelector<HTMLTextAreaElement>("[data-keyboard-proxy]");
+      if (proxy) proxy.value = "";
+      break;
+    }
+  }
   return () => {
     if (receiver === next) receiver = null;
   };
@@ -77,7 +85,16 @@ export function forwardTerminalBeforeInput(ev: InputEvent, deliver: Receiver) {
   switch (ev.inputType) {
     case "insertText":
     case "deleteContentBackward":
-      if (!deliver({ inputType: ev.inputType, data: ev.data, isComposing: ev.isComposing })) ev.preventDefault();
+      if (!deliver({ inputType: ev.inputType, data: ev.data, isComposing: ev.isComposing })) {
+        // The pane refused the edit (a Ctrl chord turned it into a control
+        // code; a read-only viewer dropped it), yet the shadow still holds
+        // the syllable it was mirroring. The chord consumed that shadow's
+        // job, so whatever it holds now no longer mirrors the line; keep
+        // it and the next rewrite opens with a delete against text the
+        // user did not type. See #3885.
+        if (ev.target instanceof HTMLTextAreaElement) ev.target.value = "";
+        ev.preventDefault();
+      }
       break;
     case "insertLineBreak":
     case "insertParagraph":

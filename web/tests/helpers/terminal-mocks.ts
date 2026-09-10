@@ -53,6 +53,9 @@ export async function mockTerminalApis(
     tool?: string;
     /** Extra sessions beyond pinch-test, for tests that switch between them. */
     extraSessions?: Array<{ id: string; title: string }>;
+    /** Hold every paste-image upload until the page dispatches
+     *  `release-paste-image`, so a test can type during the await. */
+    pendingPaste?: boolean;
   } = {},
 ): Promise<MockHandle> {
   const liveSockets: Array<{ send: (data: string) => void }> = [];
@@ -128,6 +131,19 @@ export async function mockTerminalApis(
     });
   });
   await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
+  if (opts.pendingPaste) {
+    // Hold the upload open until the page fires `release-paste-image`: the
+    // test types into the shadow during the await, then releases.
+    let release: (() => void) | null = null;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await page.exposeFunction("releasePasteImage", () => release?.());
+    await page.route("**/api/sessions/*/paste-image", async (r) => {
+      await gate;
+      await r.fulfill({ json: { path: "/tmp/paste/shot.png" } });
+    });
+  }
   // Matches the bare path plus the `?index=N` query (#2437) for POST ensure and
   // DELETE kill, and the container-terminal variant.
   await page.route("**/api/sessions/*/terminal*", (r) => r.fulfill({ status: 200, body: "" }));

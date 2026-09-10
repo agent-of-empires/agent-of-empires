@@ -97,6 +97,25 @@ describe("mobile keyboard proxy", () => {
     registerMobileKeyboardProxyReceiver(receive);
     expect(receive).not.toHaveBeenCalled();
   });
+
+  // #3885 case 3: a queued edit the receiver refuses must not survive in the
+  // proxy textarea. The drain replays the queue verbatim; when the pane
+  // refuses an edit, the shadow that holds it no longer mirrors the line.
+  it("clears the proxy when a drained queued edit is refused", () => {
+    document.body.innerHTML = "<textarea data-keyboard-proxy></textarea>";
+    const proxy = document.querySelector<HTMLTextAreaElement>("[data-keyboard-proxy]")!;
+    proxy.value = "ㅎ";
+    expect(proxy.value).toBe("ㅎ");
+    deliverMobileKeyboardProxyInput({ inputType: "insertText", data: "가", isComposing: false });
+
+    const receive = vi.fn(() => false);
+    const unregister = registerMobileKeyboardProxyReceiver(receive);
+    expect(receive).toHaveBeenCalledWith({ inputType: "insertText", data: "가", isComposing: false });
+    // The queued edit the pane refused must not leave the proxy holding "ㅎ".
+    expect(proxy.value).toBe("");
+    unregister();
+    document.body.innerHTML = "";
+  });
 });
 
 describe("invalidateRetainedImeContext", () => {
@@ -117,6 +136,23 @@ describe("invalidateRetainedImeContext", () => {
     invalidateRetainedImeContext(local);
 
     expect(local.value).toBe("");
+    expect(proxy.value).toBe("");
+  });
+
+  // #3885 case 2 shape: the no-argument call must not be relied on for the
+  // live terminal's own textarea. (The spec-level regression covers the
+  // upload completion; this pins the helper contract the fix rests on.)
+  it("clears only the proxy with no element passed", () => {
+    const proxy = document.createElement("textarea");
+    proxy.setAttribute("data-keyboard-proxy", "");
+    proxy.value = "ㅎ";
+    document.body.append(proxy);
+    const local = document.createElement("textarea");
+    local.value = "ㅎ";
+
+    invalidateRetainedImeContext();
+
+    expect(local.value).toBe("ㅎ");
     expect(proxy.value).toBe("");
   });
 
