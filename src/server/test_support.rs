@@ -97,6 +97,7 @@ fn build_test_app_state_impl(
         allowed_origins,
         instance_locks,
         idempotency_locks,
+        list_sessions_resolver_misses: std::sync::atomic::AtomicUsize::new(0),
         smart_rename_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
         smart_rename_attempted: std::sync::Mutex::new(std::collections::HashSet::new()),
         smart_rename_semaphore: tokio::sync::Semaphore::new(

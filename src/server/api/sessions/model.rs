@@ -310,34 +310,35 @@ pub(super) fn custom_agent_acp_capable(
         || crate::acp::inherited_acp_base(tool, &session.agent_detect_as).is_some()
 }
 
-/// Resolve the [`SessionConfig`] for `(profile, project_path)` through the
-/// caller-owned per-request cache, resolving from disk on first miss only.
-/// See the `session_cfg_cache` declaration in `list_sessions` for the
-/// sharing rationale. See #2603.
-pub(super) fn resolve_session_cfg<'a>(
-    cache: &'a mut HashMap<(String, String), SessionConfig>,
-    profile: &str,
-    project_path: &str,
-) -> &'a SessionConfig {
-    cache
-        .entry((profile.to_string(), project_path.to_string()))
-        .or_insert_with(|| {
-            #[cfg(test)]
-            LIST_SESSIONS_RESOLVER_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            crate::session::config::repo_config::resolve_config_with_repo_or_warn(
-                profile,
-                std::path::Path::new(project_path),
-            )
-            .session
-        })
+/// Per-request cache for `(profile, project_path)` config resolution, shared
+/// across the `list_sessions` overlays so a repo-local override is read from
+/// disk once per unique pair rather than once per row. See #2603.
+#[derive(Default)]
+pub(super) struct SessionCfgCache {
+    entries: HashMap<(String, String), SessionConfig>,
+    misses: usize,
 }
 
-/// Test seam for the shared per-request cache invariant (#2603): bumped
-/// exactly once per unique `(profile, project_path)` that resolves through
-/// [`resolve_session_cfg`]. Mirrors the module-static test seam pattern used
-/// by [`crate::session::FAIL_NEXT_LIST_PROFILES`]. Readers must hold
-/// `#[serial_test::serial]`: a concurrent `list_sessions` call between reset
-/// and load would leak bumps into the assertion.
-#[cfg(test)]
-pub(crate) static LIST_SESSIONS_RESOLVER_MISSES: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+impl SessionCfgCache {
+    /// Resolve `(profile, project_path)`, reading from disk on first miss only.
+    pub(super) fn resolve(&mut self, profile: &str, project_path: &str) -> &SessionConfig {
+        let misses = &mut self.misses;
+        self.entries
+            .entry((profile.to_string(), project_path.to_string()))
+            .or_insert_with(|| {
+                *misses += 1;
+                crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+                    profile,
+                    std::path::Path::new(project_path),
+                )
+                .session
+            })
+    }
+
+    /// Disk resolutions performed, i.e. unique pairs seen. `list_sessions`
+    /// publishes this on [`crate::server::AppState`] so the sharing invariant
+    /// is observable per request instead of through a process-global counter.
+    pub(super) fn misses(&self) -> usize {
+        self.misses
+    }
+}
