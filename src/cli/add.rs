@@ -738,7 +738,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     instance.agent_model = args.model.clone();
 
     let registry = crate::acp::agent_registry::AgentRegistry::with_defaults();
-    let agent_name = pick_acp_agent_name(
+    let agent_name = crate::acp::pick_acp_agent_name(
         &registry,
         &config.session,
         &config.acp,
@@ -1431,42 +1431,6 @@ fn cleanup_partial_session(
         if crate::session::scratch::is_scratch_path(scratch) {
             let _ = std::fs::remove_dir_all(scratch);
         }
-    }
-}
-
-/// Sync mirror of `Supervisor::pick_agent_for_tool` so add-time
-/// precondition checks can resolve the agent without spinning up the
-/// async supervisor. Precedence: explicit override → tool-keyed
-/// registry entry → custom agent with `agent_acp_cmd` → custom agent
-/// inheriting a registry-backed base via `agent_detect_as` (resolves to
-/// the base key) → `claude` for the claude tool, else `acp.default_agent`.
-fn pick_acp_agent_name(
-    registry: &crate::acp::agent_registry::AgentRegistry,
-    session: &crate::session::config::SessionConfig,
-    acp: &crate::session::config::AcpConfig,
-    tool: &str,
-    explicit_override: Option<&str>,
-) -> String {
-    if let Some(name) = explicit_override {
-        if !name.is_empty() {
-            return name.to_string();
-        }
-    }
-    if registry.get(tool).is_some() {
-        return tool.to_string();
-    }
-    if session.agent_acp_cmd.contains_key(tool) {
-        return tool.to_string();
-    }
-    // Custom agent inheriting a registry-backed base via `agent_detect_as`
-    // resolves to the base key so the built-in adapter path serves it.
-    if let Some(base) = crate::acp::inherited_acp_base(tool, &session.agent_detect_as) {
-        return base;
-    }
-    if tool == "claude" {
-        "claude".into()
-    } else {
-        acp.resolved_default_agent().to_string()
     }
 }
 

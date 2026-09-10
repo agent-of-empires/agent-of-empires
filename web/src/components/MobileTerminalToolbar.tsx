@@ -3,6 +3,7 @@ import type { RefObject } from "react";
 import { useLongPressDrag, type DragAxis } from "../hooks/useLongPressDrag";
 import { bracketedPaste, readClipboardText } from "../lib/clipboard";
 import { toastBus } from "../lib/toastBus";
+import { invalidateRetainedImeContext } from "../lib/mobileKeyboardProxy";
 
 function execCommandPaste(): boolean {
   try {
@@ -40,23 +41,34 @@ export function MobileTerminalToolbar({ sendData, keyboardOpen, ctrlActive, onCt
     if (keyboardOpen) inputElRef.current?.focus();
   }, [inputElRef, keyboardOpen]);
 
+  // Every toolbar key reaches the PTY without a `beforeinput` on either
+  // hidden input, so the retained IME syllable stops mirroring the line it
+  // shadowed. Drop it before the key lands. See #3877.
+  const sendOutOfBand = useCallback(
+    (data: string) => {
+      invalidateRetainedImeContext(inputElRef.current);
+      sendData(data);
+    },
+    [sendData, inputElRef],
+  );
+
   const send = useCallback(
     (data: string) => {
       haptic();
-      sendData(data);
+      sendOutOfBand(data);
       refocusTerminal();
     },
-    [sendData, refocusTerminal, haptic],
+    [sendOutOfBand, refocusTerminal, haptic],
   );
 
   const upHandlers = useLongPressDrag({
-    onRepeat: () => sendData(ARROW_UP),
-    onHorizontal: (dir) => sendData(dir === "left" ? ARROW_LEFT : ARROW_RIGHT),
+    onRepeat: () => sendOutOfBand(ARROW_UP),
+    onHorizontal: (dir) => sendOutOfBand(dir === "left" ? ARROW_LEFT : ARROW_RIGHT),
     onAxisChange: setUpAxis,
   });
   const downHandlers = useLongPressDrag({
-    onRepeat: () => sendData(ARROW_DOWN),
-    onHorizontal: (dir) => sendData(dir === "left" ? ARROW_LEFT : ARROW_RIGHT),
+    onRepeat: () => sendOutOfBand(ARROW_DOWN),
+    onHorizontal: (dir) => sendOutOfBand(dir === "left" ? ARROW_LEFT : ARROW_RIGHT),
     onAxisChange: setDownAxis,
   });
 
@@ -141,7 +153,7 @@ export function MobileTerminalToolbar({ sendData, keyboardOpen, ctrlActive, onCt
           }
           const text = await readClipboardText();
           if (text) {
-            sendData(bracketedPaste(text));
+            sendOutOfBand(bracketedPaste(text));
             return;
           }
           t?.error("Couldn't read clipboard. Try copying again, or open this dashboard in Safari.");

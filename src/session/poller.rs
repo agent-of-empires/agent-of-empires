@@ -221,6 +221,19 @@ impl Drop for PollerCountGuard {
     }
 }
 
+/// Whether a poller could be spawned right now. Advisory: the real acquire
+/// still happens in [`SessionPoller::start_observations`], and a racing spawn
+/// can consume the last slot between the two. Callers use it to skip the
+/// expensive spawn *setup* (a `sessions.json` load plus a `canonicalize` per
+/// stored peer, in `retroactive_capture_exclusion_set`) when the acquire is
+/// going to fail anyway. The TUI attempts a repair pass over every instance
+/// twice a second, so once the budget is full that setup was stalling the
+/// thread that also serves keystrokes for ~100ms per instance.
+pub(crate) fn session_id_poller_budget_available() -> bool {
+    let budget = current_budget();
+    budget.active() < budget.max()
+}
+
 const POLL_INITIAL_INTERVAL: Duration = Duration::from_secs(2);
 const POLL_MAX_INTERVAL: Duration = Duration::from_secs(60);
 const POLL_BACKOFF_FACTOR: f64 = 1.5;
@@ -358,28 +371,103 @@ enum PollCommand {
     RetryLast,
 }
 
-/// Resolve and observe one poll target. A dead name must remain the resolved
-/// target for two consecutive ticks before it terminates the poller: a tmux
-/// rename between resolution and the liveness probe makes the old name look
-/// absent for one tick, while the next tick can resolve the renamed pane.
+/// How long a poller tolerates a target tmux cannot resolve before treating it
+/// as gone, when it has never seen the pane alive. A poller is started
+/// alongside the tmux session, so the first probes can legitimately race the
+/// session's registration; a target that is still unresolvable after this
+/// window is a session that is never going to appear.
+const MISSING_TARGET_GRACE: Duration = Duration::from_secs(60);
+
+/// Tracks whether a poll target has become terminal for the poller.
+///
+/// A missing session must be terminal. `is_pane_dead` reports `false` for one
+/// (tmux answers a `display-message` it cannot resolve with exit 0 and an
+/// empty stdout), so a poller whose tmux session was killed never saw a stop
+/// condition and polled forever, holding one of the 50 budget slots for the
+/// life of the process. A daemon up for three days accumulated 32 such orphans
+/// and starved every live session of a poller.
+///
+/// Two guards keep that from tearing down a poller that should live:
+/// - a target only counts as terminal after it has held that state for two
+///   consecutive ticks, so a tmux rename between resolution and probe (which
+///   makes the old name look absent for one tick) is retried under the new
+///   name;
+/// - a *missing* target is only terminal once the pane has been seen alive, or
+///   once [`MISSING_TARGET_GRACE`] has passed, so a poller started microseconds
+///   before its tmux session registers is not reaped during that race.
+///
+/// Stopping is otherwise the safe direction: both the TUI and the daemon run a
+/// repair pass that restarts a poller for any instance with a live tmux pane,
+/// so a poller stopped in error comes back within a refresh cycle, while a
+/// leaked budget slot never comes back.
+struct TargetLiveness {
+    seen_alive: bool,
+    started_at: Instant,
+    gone_candidate: Option<String>,
+}
+
+impl TargetLiveness {
+    fn new(now: Instant) -> Self {
+        Self {
+            seen_alive: false,
+            started_at: now,
+            gone_candidate: None,
+        }
+    }
+
+    /// Fold one probe in, returning `(target_is_gone, should_stop)`. A gone
+    /// target skips observation even on the debounce tick: there is nothing
+    /// behind the name to read.
+    fn record(
+        &mut self,
+        target: &str,
+        probe: crate::tmux::utils::PaneProbe,
+        now: Instant,
+    ) -> (bool, bool) {
+        use crate::tmux::utils::PaneProbe;
+        let gone = match probe {
+            PaneProbe::Alive => {
+                self.seen_alive = true;
+                false
+            }
+            PaneProbe::Dead => true,
+            PaneProbe::Missing => {
+                self.seen_alive
+                    || now.saturating_duration_since(self.started_at) >= MISSING_TARGET_GRACE
+            }
+            // tmux itself could not be run, which says nothing about the pane.
+            PaneProbe::Unknown => false,
+        };
+        if !gone {
+            self.gone_candidate = None;
+            return (false, false);
+        }
+        let should_stop = self.gone_candidate.as_deref() == Some(target);
+        if !should_stop {
+            self.gone_candidate = Some(target.to_string());
+        }
+        (true, should_stop)
+    }
+}
+
+/// Resolve and observe one poll target, returning
+/// `(target, should_stop, observation)`. Termination policy lives in
+/// [`TargetLiveness`].
 fn poll_resolved_target<T>(
     instance_id: &str,
     initial_session_name: &str,
     resolve_target: impl FnOnce(&str, &str) -> String,
-    is_pane_dead: impl FnOnce(&str) -> bool,
+    probe_target: impl FnOnce(&str) -> crate::tmux::utils::PaneProbe,
     observe: impl FnOnce(&str) -> Option<T>,
-    dead_candidate: &mut Option<String>,
+    liveness: &mut TargetLiveness,
+    now: Instant,
 ) -> (String, bool, Option<T>) {
     let target = resolve_target(instance_id, initial_session_name);
-    if is_pane_dead(&target) {
-        let should_stop = dead_candidate.as_deref() == Some(target.as_str());
-        if !should_stop {
-            *dead_candidate = Some(target.clone());
-        }
+    let (gone, should_stop) = liveness.record(&target, probe_target(&target), now);
+    if gone {
         return (target, should_stop, None);
     }
 
-    *dead_candidate = None;
     let observation = observe(&target);
     (target, false, observation)
 }
@@ -528,22 +616,23 @@ impl SessionPoller {
                     }
                 };
 
-                let mut dead_candidate = None;
+                let mut liveness = TargetLiveness::new(Instant::now());
                 let mut poll_tick = || {
                     poll_resolved_target(
                         &instance_id,
                         &initial_session_name,
                         crate::tmux::live_agent_session_name,
-                        crate::tmux::utils::is_pane_dead,
+                        crate::tmux::utils::probe_pane,
                         |target| poll_fn(target),
-                        &mut dead_candidate,
+                        &mut liveness,
+                        Instant::now(),
                     )
                 };
 
                 // Immediate first poll (e.g. pre-existing sessions loaded from disk).
                 let (target, should_stop, observation) = poll_tick();
                 if should_stop {
-                    tracing::info!(target: "session.create", "Pane dead for {}, stopping poller", target);
+                    tracing::info!(target: "session.create", "Pane gone or dead for {}, stopping poller", target);
                     return;
                 }
                 report(observation, &mut last_known, &mut interval);
@@ -570,7 +659,7 @@ impl SessionPoller {
 
                     let (target, should_stop, observation) = poll_tick();
                     if should_stop {
-                        tracing::info!(target: "session.create", "Pane dead for {}, stopping poller", target);
+                        tracing::info!(target: "session.create", "Pane gone or dead for {}, stopping poller", target);
                         break;
                     }
 
@@ -1091,12 +1180,14 @@ mod tests {
 
     #[test]
     fn rename_between_resolution_and_liveness_retries_the_new_name() {
+        use crate::tmux::utils::PaneProbe;
         let initial = "aoe_Old_12345678";
         let renamed = "aoe_New_12345678";
         let current = std::cell::RefCell::new(initial.to_string());
         let resolution_count = std::cell::Cell::new(0);
         let observed = std::cell::RefCell::new(Vec::new());
-        let mut dead_candidate = None;
+        let now = Instant::now();
+        let mut liveness = TargetLiveness::new(now);
 
         let (target, should_stop, observation) = poll_resolved_target(
             "12345678abcdef",
@@ -1109,12 +1200,13 @@ mod tests {
             |target| {
                 assert_eq!(target, initial);
                 *current.borrow_mut() = renamed.to_string();
-                true
+                PaneProbe::Dead
             },
             |_| -> Option<&str> {
                 panic!("a name that became dead during the tick must not be observed")
             },
-            &mut dead_candidate,
+            &mut liveness,
+            now,
         );
         assert_eq!(target, initial);
         assert!(!should_stop, "one dead tick may be an in-flight rename");
@@ -1127,19 +1219,72 @@ mod tests {
                 resolution_count.set(resolution_count.get() + 1);
                 current.borrow().clone()
             },
-            |_| false,
+            |_| PaneProbe::Alive,
             |target| {
                 observed.borrow_mut().push(target.to_string());
                 Some("sid-after-rename")
             },
-            &mut dead_candidate,
+            &mut liveness,
+            now,
         );
         assert_eq!(target, renamed);
         assert!(!should_stop);
         assert_eq!(observation, Some("sid-after-rename"));
         assert_eq!(observed.into_inner(), vec![renamed.to_string()]);
         assert_eq!(resolution_count.get(), 2, "one resolution per tick");
-        assert!(dead_candidate.is_none());
+        assert!(liveness.gone_candidate.is_none());
+    }
+
+    /// The orphan case: once the pane has been seen alive, a target
+    /// tmux can no longer resolve terminates the poller, so its budget slot is
+    /// released instead of being held for the life of the process. Before the
+    /// startup grace expires, the same probe is tolerated: a poller can be
+    /// started microseconds before its tmux session registers.
+    #[test]
+    fn missing_target_is_terminal_only_after_the_pane_was_seen_or_the_grace_passed() {
+        use crate::tmux::utils::PaneProbe;
+        let name = "aoe_Gone_12345678";
+        let t0 = Instant::now();
+        let after_grace = t0 + MISSING_TARGET_GRACE;
+
+        // Never seen alive, inside the grace: keep polling.
+        let mut fresh = TargetLiveness::new(t0);
+        assert_eq!(fresh.record(name, PaneProbe::Missing, t0), (false, false));
+
+        // Never seen alive, past the grace: the session is never going to
+        // appear. Two consecutive ticks to stop.
+        let mut stale = TargetLiveness::new(t0);
+        assert_eq!(
+            stale.record(name, PaneProbe::Missing, after_grace),
+            (true, false)
+        );
+        assert_eq!(
+            stale.record(name, PaneProbe::Missing, after_grace),
+            (true, true)
+        );
+
+        // Seen alive, then killed: terminal immediately (still debounced).
+        let mut killed = TargetLiveness::new(t0);
+        assert_eq!(killed.record(name, PaneProbe::Alive, t0), (false, false));
+        assert_eq!(killed.record(name, PaneProbe::Missing, t0), (true, false));
+        assert_eq!(killed.record(name, PaneProbe::Missing, t0), (true, true));
+
+        // A probe that could not run says nothing about the pane, and must not
+        // reap a poller for a session that is alive.
+        let mut unknown = TargetLiveness::new(t0);
+        assert_eq!(unknown.record(name, PaneProbe::Alive, t0), (false, false));
+        assert_eq!(
+            unknown.record(name, PaneProbe::Unknown, after_grace),
+            (false, false)
+        );
+
+        // A recovered tick resets the debounce rather than carrying it, so an
+        // intermittently unresolvable target never accumulates toward a stop.
+        let mut flaky = TargetLiveness::new(t0);
+        assert_eq!(flaky.record(name, PaneProbe::Alive, t0), (false, false));
+        assert_eq!(flaky.record(name, PaneProbe::Missing, t0), (true, false));
+        assert_eq!(flaky.record(name, PaneProbe::Alive, t0), (false, false));
+        assert_eq!(flaky.record(name, PaneProbe::Missing, t0), (true, false));
     }
 
     #[test]
@@ -1186,10 +1331,24 @@ mod tests {
             Some("id-1".to_string()),
         );
 
-        // Wait for the adaptive interval (2s initial) to fire at least once.
-        std::thread::sleep(Duration::from_millis(2500));
+        // Wait for the change rather than for the 2s interval to elapse: each
+        // tick forks tmux, so a fixed sleep races that under load. Same reason
+        // `test_poller_starts_polling_immediately` polls.
+        let observed = |want: usize| {
+            for _ in 0..200 {
+                if lock_unpoisoned(&changed_ids).len() >= want {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            false
+        };
+        assert!(observed(1), "the poller must observe the changed id");
         poller.retry_last_observation();
-        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            observed(2),
+            "a retry must be able to re-emit the same observation"
+        );
         poller.stop();
 
         let ids = lock_unpoisoned(&changed_ids);
@@ -1206,7 +1365,7 @@ mod tests {
 
     #[test]
     fn test_thread_budget_cap() {
-        let _budget = test_support::IsolatedBudget::exhausted();
+        let budget = test_support::IsolatedBudget::exhausted();
 
         let mut poller = SessionPoller::new("test-session".to_string());
         let outcome = poller.start(
@@ -1224,6 +1383,19 @@ mod tests {
         assert!(
             poller.cmd_rx.is_some(),
             "cmd_rx should be returned when budget exhausted"
+        );
+        // The advisory pre-check callers use to skip spawn setup must agree
+        // with the acquire that just failed; a disagreement puts the ~100ms
+        // exclusion-set build back on the TUI's repair pass.
+        assert!(
+            !session_id_poller_budget_available(),
+            "pre-check must report the exhausted budget the acquire rejected"
+        );
+
+        budget.set_active(0);
+        assert!(
+            session_id_poller_budget_available(),
+            "one free slot must read as available"
         );
     }
 
@@ -1418,9 +1590,18 @@ mod tests {
         let mut poller = SessionPoller::new("test-session".to_string());
         poller.start("test-immediate".to_string(), poll_fn, on_change, None);
 
-        std::thread::sleep(Duration::from_millis(100));
-
-        let count = *lock_unpoisoned(&poll_count);
+        // Wait for the first poll rather than sleeping a fixed window: the
+        // tick forks tmux twice (name resolution, pane probe), and against a
+        // socket that is not there those forks can outlast a 100ms sleep,
+        // which made this assertion flake.
+        let mut count = 0;
+        for _ in 0..100 {
+            count = *lock_unpoisoned(&poll_count);
+            if count > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
         assert!(
             count > 0,
             "poller should have started polling immediately (count={})",

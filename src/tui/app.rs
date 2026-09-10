@@ -505,7 +505,9 @@ impl App {
             image_update_rx: None,
             image_pull_rx: None,
             dismissed_image_digest,
-            event_stream: Some(EventStream::new()),
+            // Crossterm's stream needs a live event reader, which a unit
+            // test runtime does not have; the TUI loop never runs in tests.
+            event_stream: (!cfg!(test)).then(EventStream::new),
             // Initial state matches whatever `tui::run` did at startup: capture
             // is requested by default, but Mosh suppresses the actual escape, so
             // `mouse_captured` (live state) also factors in `mosh_active`.
@@ -1867,6 +1869,10 @@ impl App {
                 refresh_needed = true;
                 needs_full_refresh = true;
             }
+            if self.home.apply_structured_approval_results() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
 
             if self.home.apply_deletion_results() {
                 refresh_needed = true;
@@ -3210,12 +3216,14 @@ impl App {
             .is_some_and(|v| v.session_id() == session_id)
         {
             self.activate_embedded();
+            self.drain_pending_paste_for_structured_view().await;
             return Ok(());
         }
         match require_daemon().await {
             Ok(endpoint) => {
                 self.connect_embedded_structured(endpoint, session_id).await;
                 self.activate_embedded();
+                self.drain_pending_paste_for_structured_view().await;
             }
             Err(ManagerError::NoDaemonRunning(_)) => {
                 self.home.prompt_start_daemon_for_structured(session_id);
@@ -3233,6 +3241,28 @@ impl App {
         self.home.exit_live_send_if_active();
         if let Some(v) = self.home.structured_preview.as_mut() {
             v.activate();
+        }
+    }
+
+    /// Drain buffered paste text into the structured composer after the view
+    /// activates. Drafts are keyed by their captured session: the mounted
+    /// view consumes its own entry on success, and entries for other targets
+    /// stay put, so a failed activation is recoverable by returning to that
+    /// session ('m' again).
+    async fn drain_pending_paste_for_structured_view(&mut self) {
+        let Some(mounted) = self
+            .home
+            .structured_preview
+            .as_ref()
+            .map(|v| v.session_id().to_string())
+        else {
+            return;
+        };
+        let Some(buf) = self.home.pending_paste_for_structured_view.remove(&mounted) else {
+            return;
+        };
+        if let Some(view) = self.home.structured_preview.as_mut() {
+            view.paste_text_with_file_load(&buf).await;
         }
     }
 
@@ -3285,6 +3315,11 @@ impl App {
                 self.update_status = None;
                 self.connect_embedded_structured(endpoint, session_id).await;
                 self.activate_embedded();
+                // Same target-checked handoff as the reachable-daemon
+                // activations: a paste captured before accepting the
+                // daemon startup must reach the composer now that the
+                // view is mounted.
+                self.drain_pending_paste_for_structured_view().await;
             }
             Err(e) => {
                 let first = e.lines().next().unwrap_or("unknown error");
@@ -4324,6 +4359,53 @@ mod tests {
             (SigHandler::Handler(f1), SigHandler::Handler(f2)) => f1 as usize == f2 as usize,
             _ => false,
         }
+    }
+
+    /// App-level consumption of the structured paste handoff: a mounted view
+    /// of the captured session takes the buffer into its composer and the
+    /// entry is consumed, while another target's draft stays put. The
+    /// daemon-start continuation and the reachable-daemon activations share
+    /// this same drain call, so the App-level behavior is defined once.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn drain_paste_forwards_to_the_mounted_view_and_keeps_other_targets() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let mut app = App::new(
+            "test",
+            crate::tmux::AvailableTools::with_tools(&["claude"]),
+            true,
+            false,
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .expect("app");
+        app.home
+            .pending_paste_for_structured_view
+            .insert("s-1".into(), "buffered draft".into());
+        app.home
+            .pending_paste_for_structured_view
+            .insert("s-2".into(), "other target".into());
+        app.home.structured_preview =
+            Some(crate::tui::structured_view::embedded::EmbeddedView::for_test("s-1"));
+
+        app.drain_pending_paste_for_structured_view().await;
+
+        let preview = app.home.structured_preview.as_ref().expect("mounted");
+        assert_eq!(
+            preview.composer_text(),
+            "buffered draft",
+            "the captured buffer must land in the mounted composer"
+        );
+        assert_eq!(
+            app.home.pending_paste_for_structured_view.get("s-1"),
+            None,
+            "a forwarded buffer must be consumed"
+        );
+        assert_eq!(
+            app.home.pending_paste_for_structured_view.get("s-2"),
+            Some(&"other target".to_string()),
+            "another target's unsent draft must survive the drain"
+        );
     }
 
     // Signal disposition is process-global state, so this must not run

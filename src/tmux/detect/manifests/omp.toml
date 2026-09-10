@@ -1,4 +1,8 @@
 id = "omp"
+prompt_marker = ['^\s*╭[─-]*\s+\S']
+
+[markers.composer_top]
+line_regex = ['^\s*╭[─-]*\s+\S']
 
 # omp stacks live markers, so priority-960 rules compete by screen position.
 # The lowest match is current.
@@ -51,6 +55,7 @@ all = [
   { region = "bottom_non_empty_lines(4)", any = [
     { line_regex = ['(?i)^\s*(?:⎋|\x{f12b7}|esc)\s+\S'] },
     { line_regex = ['(?i)^\s*\S+\s+working(?:…|\.\.\.)'] },
+    { line_regex = ['(?i)^\s*(?:[\x{2800}-\x{28FF}]|[-\\|/])\s+.*\(esc to cancel\)'] },
     { line_regex = ['(?i)^ {2}cancel\s+\S'] },
   ] },
 ]
@@ -60,13 +65,34 @@ not = [
   { line_regex = ['^\s*(?:(?:╭[─-]*|\+[=-]*)\s*)?(?:\x{e0b6}\s+)?\p{Ll}\s+(?:0|[1-9]\d*)[smh]\s+\p{Ll}'] },
 ]
 
-# The status line's leading spinner and turn timer: live chrome drawn only
-# while a turn runs, parked at the bottom in every composer shape that keeps
-# a separate status row (claude, rule, pi, borderless, field, rail) and as
-# the band shape's own status row. Idle parks the same slot on the static
-# logo glyph (`π`) or a clock icon, neither of which is a braille frame.
-# Paired with an interrupt row or compaction indicator in the composer stack
-# so that stale historical timers without an active turn are not detected.
+# A wrapped draft moves the band above the fixed bottom-line windows.
+[[rules]]
+id = "active_composer"
+state = "running"
+priority = 960
+positional = true
+region = "from_prompt_marker"
+visible = true
+line_regex = ['^\s*╭[─-]*\s*\S\s+(?:0|[1-9]\d*)[smh](?:\s+\S+\s+\S|\s*[─-]*╮\s*$)']
+all = [
+  { region = "above(composer_top, 2)", any = [
+    { line_regex = ['(?i)^\s*(?:⎋|\x{f12b7}|esc)\s+\S'] },
+    { line_regex = ['(?i)^\s*\S+\s+working(?:…|\.\.\.)'] },
+    { line_regex = ['(?i)^\s*(?:[\x{2800}-\x{28FF}]|[-\\|/])\s+.*\(esc to cancel\)'] },
+    { line_regex = ['(?i)^ {2}cancel\s+\S'] },
+  ] },
+  { region = "after(composer_top)", regex = ['\A(?:[^\S\n]*│[^\n]*│[^\S\n]*\n)+[^\S\n]*╰[─-][^\n]*╯[^\S\n]*\z'] },
+]
+not = [
+  { line_regex = ['^\s*╭[─-]*\s*(?:⏱|\x{f017}|◷|◴|⌛)\s+'] },
+  { line_regex = ['^\s*╭[─-]*\s*\p{Ll}\s+(?:0|[1-9]\d*)[smh]\s+\p{Ll}'] },
+]
+
+# Bottom status rows pair a braille turn timer with a nearby activity hint,
+# in every composer shape that parks one at the bottom. A band the fixed
+# bottom-line windows still reach is served here whether its frame is ascii or
+# Unicode; active_composer takes over once a wrapped draft pushes the band
+# above them.
 [[rules]]
 id = "active_statusline"
 state = "running"

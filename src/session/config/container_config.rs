@@ -652,21 +652,33 @@ fn copy_dir_recursive_inner(
     Ok(())
 }
 
-/// Parse the `expiresAt` timestamp from a Claude Code credential JSON string.
-/// Returns `None` if the JSON is malformed or the field is missing/wrong type.
-fn parse_credential_expires_at(content: &str) -> Option<u64> {
-    let value: serde_json::Value = serde_json::from_str(content).ok()?;
-    value.get("claudeAiOauth")?.get("expiresAt")?.as_u64()
-}
-
 /// The furthest `expiresAt` a real token carries. The shared file is writable
 /// from inside every sandbox, so a planted timestamp beyond this would
 /// otherwise outrank every later login for good.
 const CREDENTIAL_EXPIRY_HORIZON: std::time::Duration =
     std::time::Duration::from_secs(400 * 24 * 60 * 60);
 
+/// The `expiresAt` of a credential a container could use, or `None` when the
+/// content is not one.
+///
+/// A blanked token block is not one. Claude Code empties `accessToken` and
+/// `refreshToken` in place when its credential fails to authenticate and
+/// keeps the rest of the block, so what it leaves still parses and can still
+/// carry an expiry (#3860). Read as a credential, that shell mounts dead into
+/// every later container and blocks the seed that would repair it.
 fn plausible_credential_expires_at(content: &str, now_ms: u64) -> Option<u64> {
-    parse_credential_expires_at(content).filter(|expires_at| {
+    let value: serde_json::Value = serde_json::from_str(content).ok()?;
+    let oauth = value.get("claudeAiOauth")?;
+    let filled = |field| {
+        oauth
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|token| !token.trim().is_empty())
+    };
+    if !filled("accessToken") && !filled("refreshToken") {
+        return None;
+    }
+    oauth.get("expiresAt")?.as_u64().filter(|expires_at| {
         *expires_at <= now_ms.saturating_add(CREDENTIAL_EXPIRY_HORIZON.as_millis() as u64)
     })
 }
@@ -790,6 +802,25 @@ fn read_credential_candidate(dir: &Path, name: &str, follow: SymlinkPolicy) -> O
     })
 }
 
+/// Which candidates a fold may put over a credential the shared file holds.
+/// The host file and the Keychain only ever seed a file holding none: a token
+/// copied from the host is the host's own refresh token, and the first side
+/// to refresh would log the other out.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CredentialFold {
+    /// A come-up, create or start: a fresher copy left in the store by an
+    /// earlier layout, a sandbox chain of its own, replaces what the file
+    /// holds.
+    Freshest,
+    /// Off a come-up: nothing replaces what the file holds.
+    SeedOnly,
+}
+
+/// Whether `content` carries a credential a container could use.
+fn holds_credential(content: &str) -> bool {
+    plausible_credential_expires_at(content, now_ms()).is_some()
+}
+
 /// Fold the freshest credential into the file every store of this agent
 /// mounts. This is a come-up fold rather than a migration because a container
 /// built before the file was shared keeps refreshing its store copy while it
@@ -798,10 +829,9 @@ fn read_credential_candidate(dir: &Path, name: &str, follow: SymlinkPolicy) -> O
 /// once a container mounting the shared file exists.
 ///
 /// Candidates are the store's private copy (left by the v027 move or by a
-/// login before the file was shared), the host file and the macOS Keychain;
-/// each replaces the current content only when its `expiresAt` is newer, so a
-/// login made inside a container survives a stale host copy and a host
-/// re-login reaches every container at its next start. Only the winner's
+/// login before the file was shared), the host file and the macOS Keychain,
+/// the freshest by `expiresAt` winning among those `fold` admits; see
+/// [`CredentialFold`]. Only the winner's
 /// `claudeAiOauth` replaces the file's, so what the agent keeps beside it
 /// survives. The file is written in place: a rename would leave every running
 /// container's bind mount on the old inode. An absent file is created
@@ -811,6 +841,7 @@ fn sync_shared_credential(
     host_dir: &Path,
     sandbox_dir: &Path,
     name: &str,
+    fold: CredentialFold,
 ) -> Result<Option<PathBuf>> {
     let Some(shared) = shared_credential_path(sandbox_dir, name) else {
         return Ok(None);
@@ -820,23 +851,20 @@ fn sync_shared_credential(
     };
     std::fs::create_dir_all(root)?;
 
+    // Each candidate with whether it is a sandbox chain of its own.
     let mut candidates = Vec::new();
-    candidates.extend(read_credential_candidate(
-        sandbox_dir,
-        name,
-        SymlinkPolicy::Never,
-    ));
-    candidates.extend(read_credential_candidate(
-        host_dir,
-        name,
-        SymlinkPolicy::Follow,
-    ));
+    candidates.extend(
+        read_credential_candidate(sandbox_dir, name, SymlinkPolicy::Never).map(|c| (c, true)),
+    );
+    candidates.extend(
+        read_credential_candidate(host_dir, name, SymlinkPolicy::Follow).map(|c| (c, false)),
+    );
     if let Some((service, _)) = mount
         .keychain_credential
         .filter(|(_, filename)| *filename == name)
     {
         match read_keychain_credential(service) {
-            Ok(content) => candidates.extend(content),
+            Ok(content) => candidates.extend(content.map(|c| (c, false))),
             Err(e) => tracing::warn!(target: "session.profile",
                 "Failed to read keychain credential for {}: {}", mount.host_rel, e),
         }
@@ -847,8 +875,12 @@ fn sync_shared_credential(
     // so another come-up or a container's own refresh in between is seen.
     crate::hooks::with_config_lock_policy(&shared, "lock", SymlinkPolicy::Never, || {
         let existing = read_credential_file(root, name, SymlinkPolicy::Never)?;
+        let existing_usable = existing.as_deref().is_some_and(holds_credential);
         let mut winner: Option<&str> = None;
-        for candidate in &candidates {
+        for (candidate, sandbox_chain) in &candidates {
+            if existing_usable && !(*sandbox_chain && fold == CredentialFold::Freshest) {
+                continue;
+            }
             let current = winner.or(existing.as_deref());
             if current.is_none_or(|current| should_overwrite_credential(current, candidate)) {
                 winner = Some(candidate);
@@ -920,17 +952,30 @@ pub(crate) fn place_shadowed_credential_mountpoints(config: &ContainerConfig) {
         if Path::new(&store.host_path).parent() != Path::new(&shared.host_path).parent() {
             continue;
         }
-        let copy = Path::new(&store.host_path).join(name);
-        // Emptying the copy is only safe once the fold has landed a credential
-        // in the shared file; short of that (a failed fold, or the empty seed
-        // `sync_shared_credential` writes when it found none) the copy may be
-        // the only one left, and it already serves as the mountpoint.
-        let folded = std::fs::read_to_string(&shared.host_path)
-            .is_ok_and(|content| !matches!(content.trim(), "" | "{}"));
+        let store_dir = Path::new(&store.host_path);
+        let copy = store_dir.join(name);
+        let folded = Path::new(&shared.host_path)
+            .parent()
+            .zip(name.to_str())
+            .is_some_and(|(root, name)| shadowed_copy_is_folded(root, store_dir, name));
         if let Err(e) = place_credential_mountpoint(&copy, folded) {
             tracing::warn!(target: "session.profile",
                 "Failed to place credential mountpoint {}: {}", copy.display(), e);
         }
+    }
+}
+
+/// Whether the shared file holds a credential at least as fresh as the store's
+/// own copy, so the copy can be emptied. Read now rather than remembered from
+/// the fold: a fold that failed, or a copy it could not read, leaves the copy
+/// the only chain there is, and a plain file already serves as the
+/// mountpoint. Either side that cannot be read keeps the copy.
+fn shadowed_copy_is_folded(shared_root: &Path, store: &Path, name: &str) -> bool {
+    let shared = read_credential_file(shared_root, name, SymlinkPolicy::Never);
+    let copy = read_credential_file(store, name, SymlinkPolicy::Never);
+    match (shared, copy) {
+        (Ok(Some(shared)), Ok(Some(copy))) => !should_overwrite_credential(&shared, &copy),
+        _ => false,
     }
 }
 
@@ -1148,10 +1193,11 @@ fn prepare_sandbox_dir(
     mount: &AgentConfigMount,
     home: &Path,
     instance_id: Option<&str>,
+    fold: CredentialFold,
 ) -> Result<PathBuf> {
     let host_dir = home.join(mount.host_rel);
     let sandbox_dir = sandbox_dir_for(mount, home, instance_id)?;
-    prepare_sandbox_dir_from(mount, host_dir, sandbox_dir, home)
+    prepare_sandbox_dir_from(mount, host_dir, sandbox_dir, home, fold)
 }
 
 fn prepare_sandbox_dir_from(
@@ -1159,6 +1205,7 @@ fn prepare_sandbox_dir_from(
     host_dir: PathBuf,
     sandbox_dir: PathBuf,
     home: &Path,
+    fold: CredentialFold,
 ) -> Result<PathBuf> {
     // Remove stale files before syncing. This prevents leftovers from a previous
     // session (e.g. a SQLite database created by an older tool version) from
@@ -1247,7 +1294,7 @@ fn prepare_sandbox_dir_from(
     }
 
     for &name in mount.shared_credential_files {
-        if let Err(e) = sync_shared_credential(mount, &host_dir, &sandbox_dir, name) {
+        if let Err(e) = sync_shared_credential(mount, &host_dir, &sandbox_dir, name, fold) {
             tracing::warn!(target: "session.profile",
                 "Failed to sync shared credential {} for {}: {}", name, mount.host_rel, e);
         }
@@ -1567,12 +1614,31 @@ fn compute_workspace_volume_paths(
     Ok((volumes, ws_container))
 }
 
+/// Whether the agent `tool` resolves to under `profile` shares a credential
+/// file across its sandboxes.
+pub(crate) fn agent_shares_credential_file(
+    profile: &str,
+    tool: &str,
+    detect_as: Option<&str>,
+) -> bool {
+    let profile_config = super::profile_config::resolve_config_or_warn(profile);
+    resolve_active_agent(tool, detect_as, &profile_config.session)
+        .is_some_and(|agent| agent_mounts_share_credential_file(agent.name))
+}
+
+fn agent_mounts_share_credential_file(agent: &str) -> bool {
+    AGENT_CONFIG_MOUNTS
+        .iter()
+        .any(|mount| mount.tool_name == agent && !mount.shared_credential_files.is_empty())
+}
+
 /// Re-sync the current instance's physically isolated agent config.
 pub(crate) fn refresh_agent_configs_for_instance(
     profile: &str,
     instance_id: &str,
     tool: &str,
     detect_as: Option<&str>,
+    fold: CredentialFold,
 ) {
     let Some(home) = dirs::home_dir() else {
         return;
@@ -1592,8 +1658,9 @@ pub(crate) fn refresh_agent_configs_for_instance(
                 directory.clone(),
                 directory.join(SANDBOX_PRIVATE_SUBDIR).join(instance_id),
                 &home,
+                fold,
             ),
-            None => prepare_sandbox_dir(mount, &home, Some(instance_id)),
+            None => prepare_sandbox_dir(mount, &home, Some(instance_id), fold),
         };
         match result {
             Ok(sandbox_dir) => {
@@ -1857,6 +1924,8 @@ pub(crate) struct ContainerAgentSelection<'a> {
     /// running a user's own agent still reports status (Kiro has no global
     /// hooks). `None` for the default / no selection.
     selected_agent: Option<&'a str>,
+    /// How the launch treats the credential file the agent's sandboxes share.
+    credential_fold: CredentialFold,
 }
 
 impl<'a> ContainerAgentSelection<'a> {
@@ -1865,7 +1934,15 @@ impl<'a> ContainerAgentSelection<'a> {
             tool,
             detect_as,
             selected_agent: None,
+            credential_fold: CredentialFold::Freshest,
         }
+    }
+
+    /// Set how the launch treats the shared credential file (see
+    /// [`CredentialFold`]).
+    pub(crate) fn with_credential_fold(mut self, fold: CredentialFold) -> Self {
+        self.credential_fold = fold;
+        self
     }
 
     /// Set the user-selected agent name (see [`Self::selected_agent`]).
@@ -2294,8 +2371,14 @@ pub(crate) fn build_container_config(
                 directory.clone(),
                 directory.join(SANDBOX_PRIVATE_SUBDIR).join(instance_id),
                 &home,
+                agent_selection.credential_fold,
             ),
-            None => prepare_sandbox_dir(mount, &home, Some(instance_id)),
+            None => prepare_sandbox_dir(
+                mount,
+                &home,
+                Some(instance_id),
+                agent_selection.credential_fold,
+            ),
         };
         let sandbox_dir = match sandbox_dir {
             Ok(dir) => dir,
@@ -3411,7 +3494,8 @@ mod tests {
             .iter()
             .find(|m| m.tool_name == "hermes")
             .unwrap();
-        let sandbox = prepare_sandbox_dir(mount, dir.path(), None).unwrap();
+        let sandbox =
+            prepare_sandbox_dir(mount, dir.path(), None, CredentialFold::Freshest).unwrap();
 
         assert!(sandbox.join("config.yaml").exists());
         assert!(sandbox.join(".env").exists());
@@ -3486,7 +3570,7 @@ mod tests {
             .iter()
             .find(|m| m.tool_name == "opencode" && m.host_rel == ".local/share/opencode")
             .expect("opencode data-dir mount");
-        let out = prepare_sandbox_dir(mount, dir.path(), None).unwrap();
+        let out = prepare_sandbox_dir(mount, dir.path(), None, CredentialFold::Freshest).unwrap();
         assert_eq!(out, sandbox);
 
         assert!(
@@ -3885,7 +3969,8 @@ mod tests {
             .iter()
             .find(|m| m.tool_name == "prime-agent")
             .expect("prime-agent mount must exist");
-        let sandbox = prepare_sandbox_dir(prime_mount, home.path(), None).unwrap();
+        let sandbox =
+            prepare_sandbox_dir(prime_mount, home.path(), None, CredentialFold::Freshest).unwrap();
 
         assert_eq!(
             fs::read_to_string(sandbox.join("skills/reviewing/SKILL.md")).unwrap(),
@@ -4318,75 +4403,83 @@ mod tests {
 
     // --- credential freshness tests ---
 
-    #[test]
-    fn test_parse_credential_expires_at_valid() {
-        let json = r#"{"claudeAiOauth":{"expiresAt":1700000000}}"#;
-        assert_eq!(parse_credential_expires_at(json), Some(1700000000));
-    }
-
-    #[test]
-    fn test_parse_credential_expires_at_missing_key() {
-        // Missing claudeAiOauth entirely.
-        assert_eq!(parse_credential_expires_at(r#"{"other":"data"}"#), None);
-        // Missing expiresAt inside claudeAiOauth.
-        assert_eq!(
-            parse_credential_expires_at(r#"{"claudeAiOauth":{"token":"abc"}}"#),
-            None
-        );
-    }
-
-    #[test]
-    fn test_parse_credential_expires_at_invalid_json() {
-        assert_eq!(parse_credential_expires_at("not json at all"), None);
-        assert_eq!(parse_credential_expires_at(""), None);
-    }
-
-    #[test]
-    fn test_parse_credential_expires_at_wrong_type() {
-        // expiresAt is a string instead of a number.
-        let json = r#"{"claudeAiOauth":{"expiresAt":"1700000000"}}"#;
-        assert_eq!(parse_credential_expires_at(json), None);
-    }
-
-    #[test]
-    fn test_should_not_overwrite_with_stale_keychain() {
-        let sandbox = r#"{"claudeAiOauth":{"expiresAt":2000}}"#;
-        let keychain = r#"{"claudeAiOauth":{"expiresAt":1000}}"#;
-        assert!(!should_overwrite_credential(sandbox, keychain));
-    }
-
-    #[test]
-    fn test_should_overwrite_with_fresh_keychain() {
-        let sandbox = r#"{"claudeAiOauth":{"expiresAt":1000}}"#;
-        let keychain = r#"{"claudeAiOauth":{"expiresAt":2000}}"#;
-        assert!(should_overwrite_credential(sandbox, keychain));
-    }
-
-    #[test]
-    fn test_should_not_overwrite_equal_timestamps() {
-        let cred = r#"{"claudeAiOauth":{"expiresAt":1000}}"#;
-        assert!(!should_overwrite_credential(cred, cred));
-    }
-
-    #[test]
-    fn test_should_not_overwrite_when_keychain_unparseable() {
-        let sandbox = r#"{"claudeAiOauth":{"expiresAt":1000}}"#;
-        assert!(!should_overwrite_credential(sandbox, "not-json"));
-    }
-
-    #[test]
-    fn test_should_overwrite_when_both_unparseable() {
-        assert!(should_overwrite_credential("bad", "also-bad"));
-    }
-
-    #[test]
-    fn test_should_overwrite_when_only_keychain_parseable() {
-        let keychain = r#"{"claudeAiOauth":{"expiresAt":1000}}"#;
-        assert!(should_overwrite_credential("not-json", keychain));
-    }
-
+    /// Fields in the order `serde_json` writes them back, so a fold that
+    /// re-serializes a credential produces this string again.
     fn credential(expires_at: u64) -> String {
-        format!(r#"{{"claudeAiOauth":{{"expiresAt":{expires_at}}}}}"#)
+        format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"access-{expires_at}","expiresAt":{expires_at},"refreshToken":"refresh-{expires_at}"}}}}"#
+        )
+    }
+
+    /// What Claude Code leaves behind when its credential fails to
+    /// authenticate: both tokens emptied in place, the rest of the block kept.
+    fn blanked_credential(expires_at: u64) -> String {
+        format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"","expiresAt":{expires_at},"refreshToken":"","scopes":["user:inference"],"subscriptionType":"max"}}}}"#
+        )
+    }
+
+    #[test]
+    fn only_a_usable_credential_carries_an_expiry() {
+        let now = now_ms();
+        let horizon = CREDENTIAL_EXPIRY_HORIZON.as_millis() as u64;
+        let cases = [
+            (credential(1700000000), Some(1700000000)),
+            // Emptied tokens are not a credential, whatever expiry is left
+            // beside them (#3860).
+            (blanked_credential(1700000000), None),
+            (blanked_credential(0), None),
+            // Either token alone keeps a container going: an access token
+            // until it expires, a refresh token to get another.
+            (
+                r#"{"claudeAiOauth":{"accessToken":"a","expiresAt":10}}"#.into(),
+                Some(10),
+            ),
+            (
+                r#"{"claudeAiOauth":{"refreshToken":"r","expiresAt":10}}"#.into(),
+                Some(10),
+            ),
+            (r#"{"other":"data"}"#.into(), None),
+            (r#"{"claudeAiOauth":{"accessToken":"a"}}"#.into(), None),
+            (
+                r#"{"claudeAiOauth":{"accessToken":"a","expiresAt":"10"}}"#.into(),
+                None,
+            ),
+            ("not json at all".into(), None),
+            (String::new(), None),
+            // Planted from inside a sandbox to outrank every later login.
+            (credential(now + horizon + 1), None),
+        ];
+        for (content, expires_at) in cases {
+            assert_eq!(
+                plausible_credential_expires_at(&content, now),
+                expires_at,
+                "{content}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_freshest_credential_wins_an_overwrite() {
+        let cases = [
+            (credential(2000), credential(1000), false),
+            (credential(1000), credential(2000), true),
+            (credential(1000), credential(1000), false),
+            (credential(1000), "not-json".into(), false),
+            ("bad".into(), "also-bad".into(), true),
+            ("not-json".into(), credential(1000), true),
+            // A blanked file never outranks a credential however far its
+            // leftover expiry reaches, and a credential always replaces it.
+            (credential(1000), blanked_credential(9000), false),
+            (blanked_credential(9000), credential(1000), true),
+        ];
+        for (existing, incoming, overwrite) in cases {
+            assert_eq!(
+                should_overwrite_credential(&existing, &incoming),
+                overwrite,
+                "{existing} -> {incoming}"
+            );
+        }
     }
 
     #[test]
@@ -4400,8 +4493,16 @@ mod tests {
         fs::create_dir_all(&store).unwrap();
         // A failed sync is logged and the launch goes on; the file must be
         // left exactly as it was.
-        let prepare =
-            || prepare_sandbox_dir_from(&mount, host.clone(), store.clone(), home.path()).unwrap();
+        let prepare = || {
+            prepare_sandbox_dir_from(
+                &mount,
+                host.clone(),
+                store.clone(),
+                home.path(),
+                CredentialFold::Freshest,
+            )
+            .unwrap()
+        };
 
         // Root reads a write-only file regardless, so the case cannot fail there.
         if !nix::unistd::geteuid().is_root() {
@@ -4468,8 +4569,16 @@ mod tests {
         let store = root.join("aaaaaaaaaaaaaaaa");
         let shared = root.join(".credentials.json");
         let private = store.join(".credentials.json");
-        let prepare =
-            || prepare_sandbox_dir_from(&mount, host.clone(), store.clone(), home.path()).unwrap();
+        let prepare = || {
+            prepare_sandbox_dir_from(
+                &mount,
+                host.clone(),
+                store.clone(),
+                home.path(),
+                CredentialFold::Freshest,
+            )
+            .unwrap()
+        };
 
         // Nothing to seed: the mount source still has to exist.
         prepare();
@@ -4482,16 +4591,17 @@ mod tests {
         assert_eq!(fs::read_to_string(&shared).unwrap(), credential(100));
         assert!(!private.exists());
 
-        // A store with prior data still picks up a fresher host login.
+        // A fresher host login is the host's own chain: seeding it again
+        // would have the first side to refresh log the other out.
         fs::create_dir_all(store.join("projects")).unwrap();
         fs::write(host.join(".credentials.json"), credential(200)).unwrap();
         prepare();
-        assert_eq!(fs::read_to_string(&shared).unwrap(), credential(200));
+        assert_eq!(fs::read_to_string(&shared).unwrap(), credential(100));
 
-        // A stale host copy does not clobber a login made in a container.
-        fs::write(host.join(".credentials.json"), credential(150)).unwrap();
+        // Nor does a stale host copy clobber a login made in a container.
+        fs::write(host.join(".credentials.json"), credential(50)).unwrap();
         prepare();
-        assert_eq!(fs::read_to_string(&shared).unwrap(), credential(200));
+        assert_eq!(fs::read_to_string(&shared).unwrap(), credential(100));
 
         // A private copy left by the v027 move is folded in and left for a
         // container that still mounts only the store.
@@ -4504,6 +4614,87 @@ mod tests {
         fs::write(&private, "").unwrap();
         prepare();
         assert_eq!(fs::read_to_string(&shared).unwrap(), credential(300));
+    }
+
+    #[test]
+    fn off_a_come_up_the_fold_only_seeds() {
+        let home = TempDir::new().unwrap();
+        let host = home.path().join(".claude");
+        fs::create_dir_all(&host).unwrap();
+        let mount = claude_mount_without_keychain();
+        let root = host.join(SANDBOX_PRIVATE_SUBDIR);
+        let store = root.join("aaaaaaaaaaaaaaaa");
+        let shared = root.join(".credentials.json");
+        fs::create_dir_all(&store).unwrap();
+        let prepare = |fold| {
+            prepare_sandbox_dir_from(&mount, host.clone(), store.clone(), home.path(), fold)
+                .unwrap()
+        };
+
+        // A file holding no usable credential is seeded from the host.
+        fs::write(host.join(".credentials.json"), credential(100)).unwrap();
+        for unusable in ["", "{}", "not json"] {
+            fs::write(&shared, unusable).unwrap();
+            prepare(CredentialFold::SeedOnly);
+            assert_eq!(
+                fs::read_to_string(&shared).unwrap(),
+                credential(100),
+                "{unusable:?}"
+            );
+        }
+
+        // A fresher copy in the store, a sandbox chain of its own, waits for
+        // a come-up; a fresher host login never replaces what the file holds.
+        fs::write(host.join(".credentials.json"), credential(300)).unwrap();
+        fs::write(store.join(".credentials.json"), credential(200)).unwrap();
+        prepare(CredentialFold::SeedOnly);
+        assert_eq!(fs::read_to_string(&shared).unwrap(), credential(100));
+        prepare(CredentialFold::Freshest);
+        assert_eq!(fs::read_to_string(&shared).unwrap(), credential(200));
+    }
+
+    #[test]
+    fn an_emptied_shared_file_is_seeded_for_the_next_container() {
+        let home = TempDir::new().unwrap();
+        let host = home.path().join(".claude");
+        fs::create_dir_all(&host).unwrap();
+        let mount = claude_mount_without_keychain();
+        let root = host.join(SANDBOX_PRIVATE_SUBDIR);
+        let store = root.join("aaaaaaaaaaaaaaaa");
+        let shared = root.join(".credentials.json");
+        fs::create_dir_all(&store).unwrap();
+        let prepare = |fold| {
+            prepare_sandbox_dir_from(&mount, host.clone(), store.clone(), home.path(), fold)
+                .unwrap()
+        };
+
+        // A container whose credential fails to authenticate empties both
+        // tokens in place, through the mount every sandbox shares. The file
+        // it leaves keeps its expiry, and used to read as a credential no
+        // seed would replace: every container created afterwards came up on
+        // it and only deleting the file by hand got out (#3860). The next
+        // come-up seeds it now, and so does the poll, for the containers
+        // already running.
+        fs::write(host.join(".credentials.json"), credential(100)).unwrap();
+        for fold in [CredentialFold::SeedOnly, CredentialFold::Freshest] {
+            fs::write(&shared, blanked_credential(900)).unwrap();
+            prepare(fold);
+            let seeded = fs::read_to_string(&shared).unwrap();
+            assert!(holds_credential(&seeded), "{fold:?}");
+            assert_eq!(seeded, credential(100), "{fold:?}");
+        }
+
+        // The emptied file the container left is not a fresher credential
+        // than the one seeded over it, however far its leftover expiry
+        // reaches, so a second come-up does not put it back.
+        prepare(CredentialFold::Freshest);
+        assert_eq!(fs::read_to_string(&shared).unwrap(), credential(100));
+
+        // A copy a container emptied in a store is not a candidate either: it
+        // would otherwise outrank the login it is folded against.
+        fs::write(store.join(".credentials.json"), blanked_credential(900)).unwrap();
+        prepare(CredentialFold::Freshest);
+        assert_eq!(fs::read_to_string(&shared).unwrap(), credential(100));
     }
 
     #[test]
@@ -4582,7 +4773,7 @@ mod tests {
         let store = root.join("aaaaaaaaaaaaaaaa");
         let shared = root.join(".credentials.json");
         fs::create_dir_all(&store).unwrap();
-        fs::write(&shared, "shared").unwrap();
+        fs::write(&shared, credential(2)).unwrap();
         let config_for = |dir: &Path| ContainerConfig {
             shared_credential_mounts: vec!["/root/.claude/.credentials.json".to_string()],
             volumes: vec![
@@ -4603,22 +4794,34 @@ mod tests {
         // mount; its host copy is the user's own login, not a shadowed one.
         for (dir, emptied) in [(&store, true), (&host, false)] {
             let copy = dir.join(".credentials.json");
-            fs::write(&copy, "token").unwrap();
+            fs::write(&copy, credential(1)).unwrap();
             place_shadowed_credential_mountpoints(&config_for(dir));
-            let kept = fs::read_to_string(&copy).unwrap() == "token";
+            let kept = fs::read_to_string(&copy).unwrap() == credential(1);
             assert_eq!(!kept, emptied, "{}", dir.display());
         }
 
-        // A shared file the fold landed no credential in leaves the copy alone:
-        // it is still the only one, and already the mountpoint the mount needs.
+        // The copy is kept while it is the only chain there is: the shared
+        // file holds no credential, or one the copy is fresher than because
+        // the fold did not land it. A plain file is already the mountpoint.
         let copy = store.join(".credentials.json");
-        for unfolded in ["", "{}"] {
+        for (unfolded, copy_content) in [
+            ("", credential(1)),
+            ("{}", credential(1)),
+            (&credential(2), credential(3)),
+            // Blanked in place by a container that failed to authenticate:
+            // the copy is the only chain left, so it stays (#3860).
+            (&blanked_credential(9), credential(1)),
+        ] {
             fs::write(&shared, unfolded).unwrap();
-            fs::write(&copy, "token").unwrap();
+            fs::write(&copy, &copy_content).unwrap();
             place_shadowed_credential_mountpoints(&config_for(&store));
-            assert_eq!(fs::read_to_string(&copy).unwrap(), "token", "{unfolded:?}");
+            assert_eq!(
+                fs::read_to_string(&copy).unwrap(),
+                copy_content,
+                "{unfolded:?}"
+            );
         }
-        fs::write(&shared, "shared").unwrap();
+        fs::write(&shared, credential(2)).unwrap();
 
         // The store is container-writable, so a link planted at the mountpoint
         // is replaced rather than followed.
@@ -5775,6 +5978,7 @@ trust_level = "trusted"
             instance_id,
             "codex",
             None,
+            CredentialFold::Freshest,
         );
         let refreshed: toml::Value =
             toml::from_str(&fs::read_to_string(codex_sandbox.join("config.toml")).unwrap())
@@ -5826,6 +6030,7 @@ trust_level = "trusted"
             "gemini-yolo-refresh-test",
             "gemini",
             None,
+            CredentialFold::Freshest,
         );
         let refreshed: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(gemini_sandbox.join("settings.json")).unwrap(),
@@ -6524,6 +6729,7 @@ trusted_hash = "keep"
             instance_id,
             "codex",
             None,
+            CredentialFold::Freshest,
         );
 
         let config_text = fs::read_to_string(&sandbox_config_path).unwrap();
@@ -6641,7 +6847,13 @@ trusted_hash = "keep"
                 profile,
             )
             .unwrap();
-            refresh_agent_configs_for_instance(profile, instance_id, "codex", None);
+            refresh_agent_configs_for_instance(
+                profile,
+                instance_id,
+                "codex",
+                None,
+                CredentialFold::Freshest,
+            );
         }
 
         for (instance_id, _, expected_status) in instances {
@@ -7153,7 +7365,7 @@ volume_ignores = ["target"]
             clean_files: &["opencode.db", "opencode.db-wal", "opencode.db-shm"],
         };
 
-        prepare_sandbox_dir(&mount, home.path(), None).unwrap();
+        prepare_sandbox_dir(&mount, home.path(), None, CredentialFold::Freshest).unwrap();
 
         assert!(!sandbox_dir.join("opencode.db").exists());
         assert!(!sandbox_dir.join("opencode.db-wal").exists());
@@ -7191,7 +7403,7 @@ volume_ignores = ["target"]
             clean_files: &[],
         };
 
-        prepare_sandbox_dir(&mount, home.path(), None).unwrap();
+        prepare_sandbox_dir(&mount, home.path(), None, CredentialFold::Freshest).unwrap();
 
         assert!(
             !sandbox_dir.join("opencode.db").exists(),
@@ -7224,7 +7436,7 @@ volume_ignores = ["target"]
         };
 
         // Should not panic or error when files don't exist
-        prepare_sandbox_dir(&mount, home.path(), None).unwrap();
+        prepare_sandbox_dir(&mount, home.path(), None, CredentialFold::Freshest).unwrap();
     }
 
     // --- GCP credential mount tests ---

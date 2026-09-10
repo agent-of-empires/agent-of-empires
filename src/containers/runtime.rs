@@ -405,6 +405,21 @@ impl ContainerRuntime {
         ))
     }
 
+    /// Whether `name` carries the shared credential label at all, as every
+    /// container created since its agent shared a credential file does.
+    pub fn carries_shared_credential_label(&self, name: &str) -> Result<Option<bool>> {
+        if !self.base.supports_labels {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.inspect_container_label(
+                name,
+                crate::containers::container_interface::SHARED_CREDENTIAL_MOUNTS_LABEL,
+            )?
+            .is_some(),
+        ))
+    }
+
     pub fn mount_fingerprint_matches(&self, name: &str, expected: &str) -> Result<Option<bool>> {
         if !self.base.supports_labels {
             return Ok(None);

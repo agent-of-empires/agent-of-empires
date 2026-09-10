@@ -18,6 +18,7 @@
 mod harness;
 
 mod acp_focus_isolation_e2e;
+mod acp_home_approval_e2e;
 mod acp_host_environment_e2e;
 mod acp_option_list_approval_e2e;
 mod acp_orphan_runner_recovery_e2e;

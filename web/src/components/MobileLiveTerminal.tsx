@@ -12,12 +12,18 @@ import {
   type CellRun,
 } from "../lib/liveTermLines";
 import { cursorLineIndex, pointerPaneCell, wheelNotches } from "../lib/liveMouse";
-import { registerMobileKeyboardProxyReceiver, type MobileKeyboardProxyInput } from "../lib/mobileKeyboardProxy";
+import {
+  forwardTerminalBeforeInput,
+  invalidateRetainedImeContext,
+  registerMobileKeyboardProxyReceiver,
+  type MobileKeyboardProxyInput,
+} from "../lib/mobileKeyboardProxy";
 import { bracketedPaste, writeClipboard } from "../lib/clipboard";
 import type { LiveFrame, LiveStats } from "../hooks/useLiveTerminal";
 import { useWebSettings } from "../hooks/useWebSettings";
 import { useIsCoarsePointer } from "../hooks/useIsCoarsePointer";
 import { useTerminalGestureBoundary } from "../hooks/useTerminalGestureBoundary";
+import { useSelectionHold } from "../hooks/useSelectionHold";
 
 // Mobile rendering of a tmux agent pane, mirroring the TUI's live mode:
 // the server streams `capture-pane` snapshots (src/server/live_ws.rs)
@@ -457,6 +463,15 @@ function specialKeySequence(e: TerminalKeyLike): string | null {
   }
 }
 
+/** A frame's rows as raw strings. `lines` is authoritative when present (a
+ *  patched frame never re-splits its window); `content` carries a
+ *  terminating newline that is not a row. */
+function frameLines(frame: LiveFrame): string[] {
+  if (frame.lines) return frame.lines;
+  const content = frame.content.endsWith("\n") ? frame.content.slice(0, -1) : frame.content;
+  return content.split("\n");
+}
+
 export const Row = memo(function Row({
   segs,
   cursorCol,
@@ -591,7 +606,7 @@ export const Row = memo(function Row({
 });
 
 export function MobileLiveTerminal({
-  frame,
+  frame: streamFrame,
   liveStats,
   transport,
   armAgentClipboard,
@@ -644,6 +659,42 @@ export function MobileLiveTerminal({
     setFontSize(configuredFontSize);
   }
   const scrollerRef = useRef<HTMLDivElement>(null);
+  // A selection touching the grid pins the painted frame until the user lets
+  // go, so no row is rewritten out from under the range (see the hook).
+  // Everything below renders that held frame; only the stream
+  // acknowledgements read `streamFrame`.
+  // Dragging a selection upward past the top edge scrolls into scrollback,
+  // which asks the server for a wider capture window. Holding that response
+  // out would extend the drag into the blank history spacer instead of the
+  // text it just requested, so lines newly exposed ABOVE the held window are
+  // folded into the held frame. Folded in, not re-derived per frame: a capped
+  // VT scrollback evicts its oldest line on every append, which slides the
+  // exposed text under unchanged row keys, and re-deriving would rewrite the
+  // very rows the selection was extended onto. Keeping the held frame's
+  // `history` shrinks the spacer by exactly the folded count, so every row
+  // keeps its key and its pixel position; the fold settles because it leaves
+  // nothing older outstanding.
+  const absorbExposedHistory = useCallback(
+    (held: LiveFrame | null, next: LiveFrame | null) => {
+      // Reading mode is the only thing that widens the window, and the only
+      // state that mounts every row: outside it the debounced row count lags
+      // a sudden jump in height and virtualization would unmount the selected
+      // row, the collapse this whole change exists to prevent.
+      if (!reading || !held || !next) return null;
+      const heldLines = frameLines(held);
+      const nextLines = frameLines(next);
+      const older = held.history - heldLines.length - (next.history - nextLines.length);
+      // A frame too short to carry the whole exposed prefix would fold part of
+      // it and leave the rest outstanding, folding the same lines again on
+      // every following pass until React's re-render limit trips. The pane's
+      // scrollback collapsing mid-selection (a `clear`, or the window gaining
+      // a second pane, both of which report history 0) is what reaches this.
+      if (older <= 0 || older > nextLines.length) return null;
+      return { ...held, lines: nextLines.slice(0, older).concat(heldLines) };
+    },
+    [reading],
+  );
+  const { value: frame, held: selectionHeld } = useSelectionHold(streamFrame, scrollerRef, absorbExposedHistory);
   const measureRef = useRef<HTMLSpanElement>(null);
   const keyboardLayoutRef = useRef<KeyboardLayoutReader | null>(null);
   useEffect(() => {
@@ -697,8 +748,8 @@ export function MobileLiveTerminal({
   }, [remeasure]);
 
   // --- frame geometry -------------------------------------------------------
-  // `frame` always tracks the live stream; reading scrollback just widens
-  // the capture window (the hook owns that). Nothing is frozen.
+  // `frame` tracks the live stream except while a selection holds it; reading
+  // scrollback just widens the capture window (the hook owns that).
   const rowsRef = useRef(0);
   const readingRef = useRef(reading);
   useEffect(() => {
@@ -882,7 +933,19 @@ export function MobileLiveTerminal({
   const forwardMode = altScreen && (frame?.mouse ?? false);
   const mouseSgr = frame?.mouseSgr ?? false;
   const effectiveSpacerLines = forwardMode ? 0 : spacerLines;
-  const { forwardModeRef, mouseSgrRef } = useTerminalGestureBoundary({ scrollerRef, forwardMode, mouseSgr });
+  // Gesture forwarding, unlike the layout above, yields to a live selection.
+  // Forward mode owns every touch (touch-action: none plus a non-passive
+  // preventDefault) so a drag becomes wheel notches instead of a page pan;
+  // that is also what WebKit needs left alone to drag a selection's handles,
+  // so with it on the callout comes up and its handles will not move. The
+  // layout keeps using `forwardMode` on purpose: `effectiveSpacerLines` feeds
+  // the row keys, and flipping it mid-selection would remount every row.
+  const forwardGestures = forwardMode && !selectionHeld;
+  const { forwardModeRef, mouseSgrRef } = useTerminalGestureBoundary({
+    scrollerRef,
+    forwardMode: forwardGestures,
+    mouseSgr,
+  });
   // Sub-notch scroll remainder (px) carried across events, and the last
   // touch Y while forwarding a single-finger drag.
   const wheelAccumRef = useRef(0);
@@ -1072,6 +1135,9 @@ export function MobileLiveTerminal({
     const el = scrollerRef.current;
     if (el) el.scrollTop = liveScrollTarget(el);
     liveDetachedRef.current = false;
+    // Dropping the selection is what releases a held frame; a selection the
+    // user has stopped caring about would otherwise pin the view silently.
+    document.getSelection()?.removeAllRanges();
     returnToLive(rowsRef.current * LIVE_WINDOW_SCREENS);
   }, [returnToLive, liveScrollTarget]);
 
@@ -1167,8 +1233,8 @@ export function MobileLiveTerminal({
   // is a transport event, not derived state, so an effect is the right hook.
   useEffect(() => {
     // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler
-    if (frame) notchPacer.onFrame();
-  }, [frame, notchPacer]);
+    if (streamFrame) notchPacer.onFrame();
+  }, [streamFrame, notchPacer]);
 
   const onWheel = useCallback(
     (e: React.WheelEvent) => {
@@ -1605,8 +1671,8 @@ export function MobileLiveTerminal({
 
   const [frameTiming] = useState(() => new FrameTimingProbe());
   useLayoutEffect(() => {
-    if (LIVE_DEBUG && frame) frameTiming.record(performance.now(), frame.receivedAt);
-  }, [frame, frameTiming]);
+    if (LIVE_DEBUG && streamFrame) frameTiming.record(performance.now(), streamFrame.receivedAt);
+  }, [streamFrame, frameTiming]);
 
   // --- bottom pinning ---------------------------------------------------------
   useLayoutEffect(() => {
@@ -1658,56 +1724,44 @@ export function MobileLiveTerminal({
   // backed by keypress in Chromium and carries no inputType, so the
   // soft-keyboard input types below would never match through it.
   const handleMobileKeyboardProxyInput = useCallback(
-    (input: MobileKeyboardProxyInput) => {
-      if (composingRef.current || input.isComposing) return;
+    // The return value tells `forwardTerminalBeforeInput` whether the shadow
+    // textarea may keep this edit: false means the pane never got it.
+    (input: MobileKeyboardProxyInput): boolean => {
+      // The IME owns the textarea mid-composition; never cancel its edits.
+      if (composingRef.current || input.isComposing) return true;
       const run = typedWordRef.current;
       typedWordRef.current = "";
       switch (input.inputType) {
         case "insertText": {
           const data = input.data ?? "";
-          if (data && !sendKeys(data)) break;
+          if (data && !sendKeys(data)) return false;
           typedWordRef.current = plainRunAfter(run, data);
-          break;
+          return true;
         }
         case "insertLineBreak":
         case "insertParagraph":
-          sendKeys("\r");
-          break;
+          return sendKeys("\r");
         case "deleteContentBackward":
           // One character, so the IME's word loses its last one too;
           // `deleteWordBackward` is a separate input type and not forwarded.
-          if (!sendKeys("\x7f")) break;
+          if (!sendKeys("\x7f")) return false;
           typedWordRef.current = dropLastCodePoint(run);
-          break;
+          return true;
         case "insertFromPaste": {
+          // The paste lands on the line without passing through the
+          // textarea, so the retained syllable stops mirroring it.
+          invalidateRetainedImeContext();
           if (input.data) sendData(bracketedPaste(input.data));
-          break;
+          return true;
         }
         default:
-          break;
+          return true;
       }
     },
     [sendKeys, sendData, typedWordRef],
   );
   const handleBeforeInput = useCallback(
-    (ev: InputEvent) => {
-      switch (ev.inputType) {
-        case "insertText":
-        case "insertLineBreak":
-        case "insertParagraph":
-        case "deleteContentBackward":
-        case "insertFromPaste":
-          ev.preventDefault();
-          handleMobileKeyboardProxyInput({
-            inputType: ev.inputType,
-            data: ev.data,
-            isComposing: ev.isComposing,
-          });
-          break;
-        default:
-          break;
-      }
-    },
+    (ev: InputEvent) => forwardTerminalBeforeInput(ev, handleMobileKeyboardProxyInput),
     [handleMobileKeyboardProxyInput],
   );
   useEffect(() => {
@@ -1723,6 +1777,10 @@ export function MobileLiveTerminal({
       const seq = specialKeySequence(e);
       if (seq) {
         e.preventDefault();
+        // Typed text accumulates in the hidden textarea as IME context (see
+        // forwardTerminalBeforeInput). Enter submits the line and every other
+        // special key rewrites it, so neither leaves the shadow still valid.
+        invalidateRetainedImeContext(e.target instanceof HTMLTextAreaElement ? e.target : null);
         sendData(seq);
         return;
       }
@@ -1747,6 +1805,7 @@ export function MobileLiveTerminal({
         const code = e.key.toUpperCase().charCodeAt(0);
         if (code >= 65 && code <= 90) {
           e.preventDefault();
+          invalidateRetainedImeContext(e.target instanceof HTMLTextAreaElement ? e.target : null);
           sendData(String.fromCharCode(code - 64));
         }
       }
@@ -1765,6 +1824,7 @@ export function MobileLiveTerminal({
       if (!metaKey) return;
       e.preventDefault();
       e.stopPropagation();
+      invalidateRetainedImeContext(e.target instanceof HTMLTextAreaElement ? e.target : null);
       sendData(`\x1b${metaKey}`);
     },
     [sendData],
@@ -1781,6 +1841,8 @@ export function MobileLiveTerminal({
         .filter((f): f is File => f != null && f.type.startsWith("image/"));
 
       e.preventDefault();
+      // Pasted text lands on the line without passing through the textarea.
+      invalidateRetainedImeContext(e.target instanceof HTMLTextAreaElement ? e.target : null);
 
       if (imageFiles.length === 0) {
         if (text) sendData(bracketedPaste(text));
@@ -1798,6 +1860,9 @@ export function MobileLiveTerminal({
         if (parts.length === 0) return;
         // Leading and trailing spaces keep the path from gluing onto queued
         // text or the user's next keystroke. No newline: never auto-submit.
+        // Re-invalidated here too: the upload's await leaves room for the
+        // user to type a syllable this insert would then displace.
+        invalidateRetainedImeContext();
         sendData(bracketedPaste(` ${parts.join(" ")} `));
       })();
     },
@@ -1839,7 +1904,9 @@ export function MobileLiveTerminal({
       // result must not become a run for the next composition to strip.
       if (!rest) typedWordRef.current = run;
       else if (sendKeys(rest) && retroactive) typedWordRef.current = plainRunAfter(run, rest);
-      if (e.currentTarget instanceof HTMLTextAreaElement) e.currentTarget.value = "";
+      // Leave the committed text in the textarea: an IME that re-edits a
+      // committed syllable (delete + reinsert) needs it there for the delete
+      // to surface as a beforeinput. See forwardTerminalBeforeInput.
     },
     [sendKeys, typedWordRef],
   );
@@ -2010,7 +2077,7 @@ export function MobileLiveTerminal({
             // wheel scrolls the app, the double-scroll clunk. touch-action:
             // none stops the browser from starting any pan or zoom for
             // touches on the terminal; JS still receives every touch event.
-            touchAction: forwardMode ? "none" : undefined,
+            touchAction: forwardGestures ? "none" : undefined,
             // Do NOT set `-webkit-overflow-scrolling: touch` here. It promotes
             // this opaque scroll region to a composited layer that macOS/iOS
             // Safari rasterizes at 1x, making the DOM terminal text look
@@ -2092,7 +2159,7 @@ export function MobileLiveTerminal({
         </div>
       )}
 
-      {reading && (
+      {(reading || selectionHeld) && (
         <button
           type="button"
           onClick={jumpToLatest}

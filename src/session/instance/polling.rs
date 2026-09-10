@@ -239,13 +239,32 @@ impl Instance {
             return PollerStart::NotApplicable;
         }
         let prime_plan = if backend == crate::agents::SessionCaptureBackend::PrimeAgent {
-            let Some(plan) = self.prime_agent_capture_plan() else {
-                return PollerStart::NotApplicable;
-            };
-            Some(plan)
+            self.prime_agent_capture_plan()
         } else {
             None
         };
+        // Validate eligibility before reporting budget exhaustion; reuse Prime's plan below.
+        let exactly_eligible = match backend {
+            crate::agents::SessionCaptureBackend::Codex
+            | crate::agents::SessionCaptureBackend::Gemini
+            | crate::agents::SessionCaptureBackend::Hermes
+            | crate::agents::SessionCaptureBackend::Kimi => {
+                self.sandbox_capture_store_dir().is_some()
+            }
+            crate::agents::SessionCaptureBackend::PrimeAgent => prime_plan.is_some(),
+            crate::agents::SessionCaptureBackend::Omp => self.omp_capture_options().is_some(),
+            crate::agents::SessionCaptureBackend::Pi => self.pi_sidecar_source().is_some(),
+            crate::agents::SessionCaptureBackend::Claude
+            | crate::agents::SessionCaptureBackend::HookSidecar => true,
+            crate::agents::SessionCaptureBackend::OpenCode => false,
+        };
+        if !exactly_eligible {
+            return PollerStart::NotApplicable;
+        }
+        // Avoid lease and profile scans when no poller can be spawned.
+        if !crate::session::poller::session_id_poller_budget_available() {
+            return PollerStart::BudgetExhausted;
+        }
         let managed_lease = if context
             == crate::agents::SessionCaptureContext::ManagedExclusiveStore
         {
@@ -266,11 +285,11 @@ impl Instance {
                     match refusal {
                         LeaseRefusal::Contended => {
                             tracing::warn!(target: "session.capture", session = %self.id, ?backend,
-                                "Session capture deferred because another process owns this store");
+                            "Session capture deferred because another process owns this store");
                         }
                         LeaseRefusal::Unresolved => {
                             tracing::warn!(target: "session.capture", session = %self.id, ?backend,
-                                "Session capture deferred because this store's lease could not be resolved");
+                            "Session capture deferred because this store's lease could not be resolved");
                         }
                     }
                     return PollerStart::Deferred;
@@ -280,7 +299,7 @@ impl Instance {
                 self.session_id_poller_retry_after =
                     Some(std::time::Instant::now() + MANAGED_CAPTURE_RETRY_BACKOFF);
                 tracing::warn!(target: "session.capture", session = %self.id, ?backend,
-                    "Session capture deferred because store ownership is ambiguous");
+                "Session capture deferred because store ownership is ambiguous");
                 return PollerStart::Deferred;
             }
             Some(lease)
@@ -295,6 +314,7 @@ impl Instance {
                 self.tmux_session()
                     .ok()
                     .map(|session| session.name().to_string())
+                    .filter(|name| crate::tmux::agent_session_belongs_to(name, &self.id))
             })
             .unwrap_or_default();
         let omp_metadata = if backend == crate::agents::SessionCaptureBackend::Omp {
@@ -477,7 +497,9 @@ impl Instance {
             || self
                 .session_id_poller_retry_after
                 .is_some_and(|deadline| std::time::Instant::now() < deadline)
-            || !self.has_live_tmux_pane_in(snapshot)
+            // Agent pane, not any pane: a terminal outliving the agent is not
+            // something a session-id poller can follow.
+            || !self.has_live_agent_pane_in(snapshot)
         {
             return false;
         }
@@ -1026,5 +1048,34 @@ mod tests {
         super::try_acquire_managed_capture_lease(backend, store.path())
             .expect("the released store is claimable again");
         drop(distinct);
+    }
+
+    /// Repair declines when no live agent pane exists for the row: a terminal
+    /// outliving the agent is not something a session-id poller can follow.
+    /// Decline happens before the handle is cleared, so a later tick with a
+    /// live pane can still repair.
+    #[test]
+    fn repair_declines_without_a_live_agent_pane() {
+        let mut inst = Instance::new("repair-no-pane", "/tmp/repair-no-pane");
+        inst.tool = "claude".to_string();
+        assert!(
+            inst.supports_session_poller(),
+            "a host claude row resolves support, so the pane lookup is what declines"
+        );
+        let snapshot = crate::tmux::LiveSessionSnapshot::from_parts(
+            Some(vec![]),
+            Some(std::collections::HashMap::new()),
+        );
+        // Present but not running, so the running check does not
+        // short-circuit and the handle stays observable.
+        inst.session_id_poller = Some(std::sync::Arc::new(std::sync::Mutex::new(
+            crate::session::poller::SessionPoller::new("unstarted".to_string()),
+        )));
+
+        assert!(!inst.repair_session_id_poller_if_needed(&snapshot));
+        assert!(
+            inst.session_id_poller.is_some(),
+            "decline must happen before the handle is cleared"
+        );
     }
 }

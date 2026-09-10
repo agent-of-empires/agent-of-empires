@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::daemon::{
     CleanupDefaults, ContextResumeAvailability, ContextResumeIndeterminateReason,
-    ContextResumeUnavailableReason, ListSessionsQuery, PlanSummary, SessionResponse,
-    SessionsEnvelope, WorkspaceRepoSummary,
+    ContextResumeUnavailableReason, ListSessionsQuery, PendingApproval, PlanSummary,
+    SessionResponse, SessionsEnvelope, WorkspaceRepoSummary,
 };
 
 use crate::git::error::GitError;

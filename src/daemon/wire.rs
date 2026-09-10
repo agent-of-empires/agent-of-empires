@@ -143,6 +143,26 @@ pub enum ContextResumeAvailability {
     },
 }
 
+/// One unresolved structured (ACP) approval, projected for the home TUI's
+/// permission-response dialog. The TUI resolves the `nonce` through the ACP
+/// resolver and shows `tool_name` / `target` / `destructive` so the user
+/// sees what they are answering without entering the structured view. No
+/// dashboard surface renders this; the web client ignores the field.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct PendingApproval {
+    pub nonce: String,
+    pub tool_name: String,
+    pub target: String,
+    pub destructive: bool,
+    /// True when the options are a list of answers (`is_choice_list`), not
+    /// an allow/deny vocabulary. The home dialog must not answer these by
+    /// kind; the user picks from the labeled options in the structured
+    /// view. Defaults false for daemons that predate the field, matching
+    /// the pre-#3741 projection.
+    #[serde(default)]
+    pub choice: bool,
+}
+
 /// One session as `GET /api/sessions` reports it.
 ///
 /// Decoding requires only `id`: every other field defaults when absent, so an
@@ -339,6 +359,13 @@ pub struct SessionResponse {
     /// structured view. See #1088.
     #[serde(default)]
     pub acp_worker_state: AcpWorkerState,
+    /// Unresolved structured approvals in request order, projected only for
+    /// live (`running` worker) structured sessions. The TUI uses these to
+    /// route the existing permission-response dialog through the ACP
+    /// resolver and to show what is being approved; no dashboard surface
+    /// renders them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_approvals: Vec<PendingApproval>,
     /// The provider rate limit this session is parked on, read from the
     /// daemon's durable park rather than a browser-side mirror, so the
     /// sidebar badge clears when a resume lands with no tab open (#3514).

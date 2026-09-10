@@ -20,6 +20,16 @@ fn structured_row(env: &mut TestEnv, status: Status) -> String {
     id
 }
 
+fn pending_daemon_approvals() -> Vec<crate::daemon::PendingApproval> {
+    vec![crate::daemon::PendingApproval {
+        nonce: format!("nonce-{}", uuid::Uuid::new_v4()),
+        tool_name: "Bash".to_string(),
+        target: "echo hi".to_string(),
+        destructive: false,
+        choice: false,
+    }]
+}
+
 fn update(id: &str, status: Status) -> DaemonStatusUpdate {
     DaemonStatusUpdate {
         id: id.to_string(),
@@ -27,6 +37,7 @@ fn update(id: &str, status: Status) -> DaemonStatusUpdate {
         last_error: None,
         last_accessed_at: None,
         idle_entered_at: None,
+        pending_approvals: Vec::new(),
     }
 }
 
@@ -43,6 +54,13 @@ fn daemon_status_moves_a_structured_row_off_idle() {
         env.view.get_instance(&id).map(|i| i.status),
         Some(Status::Running),
         "a Running turn on the daemon must move the TUI's pill"
+    );
+    assert_eq!(
+        env.view
+            .get_instance(&id)
+            .and_then(|inst| inst.live_status_baseline),
+        Some(Status::Running),
+        "daemon status updates must carry the structured status baseline"
     );
 }
 
@@ -486,6 +504,42 @@ fn daemon_status_applies_to_a_snoozed_structured_row() {
         Some(Status::Running),
         "a snoozed row is live triage, not a sink; the daemon overlay must still drive its status (#3201)"
     );
+}
+
+/// The daemon refresh returns early for archived and trashed rows, so a
+/// stale cached approval must be dropped exactly when the row transitions
+/// there: pressing the permission action on such a row would open an
+/// approval the resolver can only 404 on.
+#[test]
+#[serial]
+fn daemon_update_clears_cached_approvals_when_a_row_is_sunk() {
+    for label in ["archived", "trashed"] {
+        let mut env = create_test_env_empty();
+        let id = structured_row(&mut env, Status::Waiting);
+        // Cache a pending approval the way the live-refresh path does.
+        env.view
+            .structured_pending_approvals
+            .insert(id.clone(), pending_daemon_approvals());
+        let now = chrono::Utc::now();
+        env.view.mutate_instance(&id, |inst| {
+            if label == "archived" {
+                inst.archived_at = Some(now);
+            } else {
+                inst.trashed_at = Some(now);
+            }
+        });
+
+        // Empty daemon update after the transition: the refresh path
+        // returns before touching the cache, so the transition itself
+        // must drop it.
+        env.view
+            .apply_daemon_status_update(update(&id, Status::Idle));
+
+        assert!(
+            !env.view.structured_pending_approvals.contains_key(&id),
+            "a {label} row must not keep cached approvals after the transition"
+        );
+    }
 }
 
 /// #3201, reintroducing the #1868 / #2206 guard on the daemon path:

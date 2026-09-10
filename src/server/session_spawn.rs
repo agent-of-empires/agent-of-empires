@@ -258,15 +258,19 @@ pub(crate) async fn spawn_structured_session(
                 instance.import_pending = Some(true);
             }
             instance.agent_name = agent_name;
-            let agent_key = instance
-                .agent_name
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .unwrap_or(instance.tool.as_str())
-                .to_string();
             let resolved_config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
                 &instance.source_profile,
                 std::path::Path::new(&instance.project_path),
+            );
+            let acp_registry = crate::acp::AgentRegistry::with_defaults();
+            // The defaults, and the pin, are keyed by the agent the spawn
+            // runs, resolved the way the supervisor resolves it.
+            let agent_key = crate::acp::pick_acp_agent_name(
+                &acp_registry,
+                &resolved_config.session,
+                &resolved_config.acp,
+                &instance.tool,
+                instance.agent_name.as_deref(),
             );
             let defaults = resolved_config.acp.acp_defaults_for(&agent_key);
             // Preserve the explicit request model separately (trimmed to match
@@ -278,10 +282,11 @@ pub(crate) async fn spawn_structured_session(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
-            // Explicit request wins, else the per-agent default; effort is keyed
-            // on the resolved model. Same single-source resolver the spawn path
-            // uses; persist the model here so the composer shows it and the
-            // session stays pinned to it. See resolve_spawn_model_effort.
+            // A profile pin wins, else the explicit request, else the per-agent
+            // default; effort is keyed on the resolved model. Same single-source
+            // resolver the spawn path uses; persist the model here so the
+            // composer shows it and the session stays on it. See
+            // resolve_spawn_model_effort.
             // Persist only an EXPLICIT effort, never the resolved default:
             // `acp_effort` is a pin, and `None` means "inherit whatever the
             // configured default resolves to at spawn time". Snapshotting the
@@ -306,18 +311,12 @@ pub(crate) async fn spawn_structured_session(
             // agent without an `agent_acp_cmd` (or any non-ACP tool)
             // falls back to tmux here rather than erroring at spawn time.
             if instance.is_structured() {
-                let acp_registry = crate::acp::AgentRegistry::with_defaults();
                 let resolved = instance
                     .agent_name
                     .as_deref()
                     .filter(|s| !s.is_empty())
                     .unwrap_or(instance.tool.as_str());
-                let resolved_session =
-                    crate::session::config::repo_config::resolve_config_with_repo_or_warn(
-                        &instance.source_profile,
-                        std::path::Path::new(&instance.project_path),
-                    )
-                    .session;
+                let resolved_session = &resolved_config.session;
                 // Check the resolved agent key AND the raw tool, the same pair
                 // `aoe add`'s precondition uses. Checking only `tool` for the
                 // `agent_acp_cmd` / inheritance legs downgraded a session that
@@ -448,6 +447,7 @@ pub(crate) async fn spawn_structured_session(
                     instance.agent_name.clone(),
                     instance.agent_model.clone(),
                     agent_effort,
+                    instance.acp_effort.is_some(),
                     instance.project_path.clone(),
                     instance.acp_session_id.clone(),
                     instance.source_profile.clone(),
@@ -491,6 +491,7 @@ pub(crate) async fn spawn_structured_session(
                 agent_override,
                 model,
                 effort,
+                effort_explicit,
                 project_path,
                 stored_acp_session_id,
                 source_profile,
@@ -555,6 +556,7 @@ pub(crate) async fn spawn_structured_session(
                             provider_env: vec![],
                             model,
                             effort,
+                            effort_explicit,
                             stored_acp_session_id,
                             fork_from,
                             sandbox_info,

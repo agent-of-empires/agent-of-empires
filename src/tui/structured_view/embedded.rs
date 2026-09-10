@@ -86,6 +86,39 @@ impl EmbeddedView {
         Ok(view)
     }
 
+    /// Test constructor: a mounted, non-activated view over a state that
+    /// never talks to a daemon. Lets App-level tests drive the paste-drain
+    /// handoff without a live connection.
+    #[cfg(test)]
+    pub(crate) fn for_test(session_id: &str) -> Self {
+        let endpoint = crate::acp::client::DaemonEndpoint::new(
+            "http://127.0.0.1:8080".into(),
+            None,
+            crate::acp::client::discovery::Source::Env,
+        );
+        let http =
+            crate::acp::client::HttpClient::new(endpoint.clone()).expect("fake endpoint client");
+        Self {
+            state: crate::tui::structured_view::StructuredViewState::new(
+                session_id.into(),
+                endpoint,
+                http,
+                None,
+            ),
+            toast_deadline: None,
+            plugin_rx: tokio::sync::mpsc::channel(1).1,
+            session_info_rx: tokio::sync::mpsc::channel(1).1,
+            active: false,
+        }
+    }
+
+    /// Composer content, joined on newlines: test read for the paste-drain
+    /// handoff.
+    #[cfg(test)]
+    pub(crate) fn composer_text(&self) -> String {
+        self.state.composer.lines().join("\n")
+    }
+
     /// The session this view is streaming.
     pub fn session_id(&self) -> &str {
         &self.state.session_id
@@ -225,5 +258,15 @@ impl EmbeddedView {
     /// theme keeps this callable without one.
     pub fn selection_text(&self, width: u16) -> ratatui::text::Text<'static> {
         render::wrapped_transcript(&self.state, &crate::tui::styles::Theme::default(), width)
+    }
+
+    /// Paste text into the composer, focusing it if needed, then load the
+    /// file index when the paste leaves an open `@`-mention. Mirrors the
+    /// interactive paste path (`CrosstermEvent::Paste`) so buffered paste
+    /// forwarded from the home view opens the mention picker in the same
+    /// state a direct paste would.
+    pub async fn paste_text_with_file_load(&mut self, text: &str) {
+        super::paste_into_composer(&mut self.state, text);
+        super::ensure_files_loaded(&mut self.state, &mut self.toast_deadline).await;
     }
 }

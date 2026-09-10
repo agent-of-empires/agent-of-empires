@@ -11,7 +11,7 @@ import {
 } from "react";
 import { Puzzle } from "lucide-react";
 import { useMatch, useNavigate, useSearchParams } from "react-router-dom";
-import { IDLE_DECAY_WINDOW_MS, isSessionActive } from "./lib/session";
+import { IDLE_DECAY_WINDOW_MS } from "./lib/session";
 import { diffSelectionStale } from "./lib/diffSelection";
 import { useSessions } from "./hooks/useSessions";
 import { useDashboardPresence } from "./hooks/useDashboardPresence";
@@ -91,7 +91,7 @@ import {
 import type { DeleteSessionOptions, ServerAbout } from "./lib/api";
 import { getClientCapabilities } from "./lib/clientCapabilities";
 import { normalizeProjectPathKey } from "./lib/registeredProjects";
-import { IdleDecayWindowContext, parseIdleDecayWindowMs, useIdleDecayWindowMs } from "./lib/idleDecay";
+import { IdleDecayWindowContext, parseIdleDecayWindowMs } from "./lib/idleDecay";
 import { parseUnreadIndicatorEnabled, UnreadIndicatorContext, useUnreadIndicatorEnabled } from "./lib/unreadIndicator";
 import { parseSessionRowTagMode, SessionRowTagContext, type SessionRowTagMode } from "./lib/sessionRowTag";
 import { parseSessionColorsEnabled, SessionColorsContext } from "./lib/sessionColors";
@@ -99,7 +99,11 @@ import { toastBus, reportError } from "./lib/toastBus";
 import { isAbsolutePath, resolveToRepoRelative, type FileRef } from "./lib/fileRef";
 import { OPEN_SESSION_EVENT } from "./lib/sessionRoute";
 import { dispatchFocusTerminal, requestSessionInputFocus, setPendingTerminalFocus } from "./lib/terminalFocus";
-import { clearMobileKeyboardProxyInput, deliverMobileKeyboardProxyInput } from "./lib/mobileKeyboardProxy";
+import {
+  clearMobileKeyboardProxyInput,
+  deliverMobileKeyboardProxyInput,
+  forwardTerminalBeforeInput,
+} from "./lib/mobileKeyboardProxy";
 import { hydrateWebUiStateFromServer, initWebUiSync } from "./lib/webUiSync";
 import { WorkspaceSidebar, SnoozeModal } from "./components/WorkspaceSidebar";
 import { DeleteSessionDialog } from "./components/DeleteSessionDialog";
@@ -320,7 +324,6 @@ function AppContent({
 
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
-  const idleDecayWindowMs = useIdleDecayWindowMs();
   const { settings: webSettings } = useWebSettings();
   const sessionMatch = useMatch("/session/:sessionId");
   const settingsRootMatch = useMatch("/settings");
@@ -878,6 +881,10 @@ function AppContent({
   const transitionKeyboardProxy = useCallback((nextSessionId: string | null) => {
     if (keyboardProxySessionIdRef.current === nextSessionId) return;
     keyboardProxySessionIdRef.current = nextSessionId;
+    // The retained syllable mirrors the old session's PTY edit, so carrying
+    // it over would let the next deleteContentBackward delete the new
+    // session's text before the replacement arrives.
+    if (keyboardProxyRef.current) keyboardProxyRef.current.value = "";
     clearMobileKeyboardProxyInput();
   }, []);
 
@@ -891,24 +898,7 @@ function AppContent({
   useEffect(() => {
     const proxy = keyboardProxy;
     if (!proxy) return;
-    const onBeforeInput = (e: InputEvent) => {
-      switch (e.inputType) {
-        case "insertText":
-        case "insertLineBreak":
-        case "insertParagraph":
-        case "deleteContentBackward":
-        case "insertFromPaste":
-          e.preventDefault();
-          deliverMobileKeyboardProxyInput({
-            inputType: e.inputType,
-            data: e.data,
-            isComposing: e.isComposing,
-          });
-          break;
-        default:
-          break;
-      }
-    };
+    const onBeforeInput = (e: InputEvent) => forwardTerminalBeforeInput(e, deliverMobileKeyboardProxyInput);
     proxy.addEventListener("beforeinput", onBeforeInput);
     return () => proxy.removeEventListener("beforeinput", onBeforeInput);
   }, [keyboardProxy]);
@@ -956,11 +946,10 @@ function AppContent({
     [navigate, workspaces, focusAgentInput, isCoarse, transitionKeyboardProxy, webSettings.autoOpenKeyboard],
   );
 
-  const handleSelectWorkspace = (workspaceId: string) => {
+  const handleSelectWorkspace = (workspaceId: string, sessionId: string | null) => {
     const ws = workspaces.find((w) => w.id === workspaceId);
     if (ws) {
-      const running = ws.sessions.find((s) => isSessionActive(s, idleDecayWindowMs));
-      const picked = running ?? ws.sessions[0] ?? null;
+      const picked = ws.sessions.find((s) => s.id === sessionId);
       if (picked) {
         transitionKeyboardProxy(picked.id);
         navigate(`/session/${encodeURIComponent(picked.id)}`);
@@ -2409,6 +2398,13 @@ function AppContent({
           // This matches the live terminal's hidden input geometry.
           className="fixed bottom-0 left-0 w-px h-px opacity-0 pointer-events-none"
           style={{ caretColor: "transparent", color: "transparent" }}
+          // Typed text now stays in this textarea as IME context (see
+          // forwardTerminalBeforeInput), so keep the OS from rewriting it
+          // the way the live terminal's own hidden input already does.
+          autoCapitalize="off"
+          autoCorrect="off"
+          autoComplete="off"
+          spellCheck={false}
         />
       </div>
     </AcpPrefsProvider>

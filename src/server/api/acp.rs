@@ -486,6 +486,7 @@ pub async fn spawn_acp(
             provider_env,
             model,
             effort,
+            effort_explicit: instance.acp_effort.is_some(),
             stored_acp_session_id,
             fork_from,
             sandbox_info,
@@ -1114,6 +1115,7 @@ pub async fn switch_acp_agent(
             // pick is meaningless here. The new agent starts on its configured
             // default and the persist below clears the stale value.
             effort: None,
+            effort_explicit: false,
             // Different ACP backend; the cached Claude session id would
             // be rejected by codex / opencode.
             stored_acp_session_id: None,
@@ -2207,6 +2209,7 @@ pub async fn acp_enable(
                 provider_env: vec![],
                 model,
                 effort,
+                effort_explicit: instance.acp_effort.is_some(),
                 stored_acp_session_id,
                 fork_from,
                 sandbox_info,

@@ -92,6 +92,18 @@
       "components": ["web/src/components/MobileLiveTerminal.tsx", "web/src/components/LiveTerminalView.tsx"]
     },
     {
+      "id": "terminal.mobile-ime-syllable-rewrite",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/live-terminal-ime-rewrite.spec.ts"],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/MobileLiveTerminal.tsx",
+        "web/src/components/MobileTerminalToolbar.tsx",
+        "web/src/lib/mobileKeyboardProxy.ts"
+      ]
+    },
+    {
       "id": "dashboard.summary-excludes-trash",
       "kind": "vitest",
       "risk": "medium",
@@ -224,6 +236,20 @@
         "web/src/hooks/useLiveTerminal.ts",
         "web/src/components/MobileLiveTerminal.tsx",
         "web/src/components/MobileTerminalToolbar.tsx"
+      ]
+    },
+    {
+      "id": "terminal.selection-hold",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": [
+        "src/components/__tests__/MobileLiveTerminal.selectionHold.test.tsx",
+        "tests/live-selection-hold.spec.ts"
+      ],
+      "components": [
+        "web/src/components/MobileLiveTerminal.tsx",
+        "web/src/hooks/useSelectionHold.ts",
+        "web/src/hooks/useTerminalGestureBoundary.ts"
       ]
     },
     {
@@ -1162,6 +1188,13 @@
       "risk": "medium",
       "specs": ["tests/sidebar-compact.spec.ts"],
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
+      "id": "sidebar.context-resume",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/sidebar-context-resume.spec.ts"],
+      "components": ["web/src/lib/types.ts", "web/src/components/WorkspaceSidebar.tsx", "web/src/App.tsx"]
     },
     {
       "id": "sessions.fork",

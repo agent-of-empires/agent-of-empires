@@ -89,13 +89,22 @@ impl Instance {
 
     /// Whether this instance has a live tmux pane, answered from a snapshot
     /// the caller already holds. `exists()` alone is insufficient: a pane can
-    /// exist while its agent has died. Used by peer exclusion, poller repair,
-    /// and TUI reload.
+    /// exist while its agent has died. Used by peer exclusion and TUI reload.
     pub(crate) fn has_live_tmux_pane_in(
         &self,
         snapshot: &crate::tmux::LiveSessionSnapshot,
     ) -> bool {
         self.tmux_env_session_name_in(snapshot).is_some()
+    }
+
+    /// Whether the AGENT pane specifically is live. Poller repair gates on
+    /// this: a paired terminal outliving the agent is not something a
+    /// session-id poller can follow.
+    pub(crate) fn has_live_agent_pane_in(
+        &self,
+        snapshot: &crate::tmux::LiveSessionSnapshot,
+    ) -> bool {
+        crate::tmux::live_agent_name_for_id_in(snapshot, &self.id).is_some()
     }
 
     pub(super) fn sandbox_display(&self) -> Option<crate::tmux::status_bar::SandboxDisplay> {
