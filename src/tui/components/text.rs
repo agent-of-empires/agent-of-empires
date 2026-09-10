@@ -100,11 +100,10 @@ pub(crate) fn line_columns(line: &ratatui::text::Line, width: u16) -> LineColumn
 /// "" when `max_width` is 0 (the text gets sacrificed entirely so
 /// whatever fixed content it competes with wins).
 pub fn truncate_to_width(text: &str, max_width: usize) -> String {
-    use unicode_width::UnicodeWidthStr;
     if max_width == 0 {
         return String::new();
     }
-    if UnicodeWidthStr::width(text) <= max_width {
+    if rendered_width(text) <= max_width {
         return text.to_string();
     }
     // Reserve one cell for the ellipsis.
@@ -113,32 +112,36 @@ pub fn truncate_to_width(text: &str, max_width: usize) -> String {
     out
 }
 
-/// The longest prefix of `text` that fits in `max_width` display cells,
-/// with no ellipsis. Steps by grapheme cluster and measures the accumulated
-/// prefix rather than summing per-piece widths. Both matter, for different
-/// reasons.
+/// Cells `text` occupies when the renderer paints it: the per-grapheme
+/// `CellWidth` metric that `Span::styled_graphemes` and `Buffer::set_stringn`
+/// apply, summed over clusters.
 ///
-/// Clusters, because a `char` is not a display unit: cutting mid-cluster
-/// leaves a dangling combining mark ("क्" out of "क्ष") or strips a VS16 so
-/// the base glyph flips from emoji to text presentation.
+/// Not `UnicodeWidthStr::width`, which resolves halfwidth katakana
+/// dakuten/handakuten (U+FF9E, U+FF9F) to zero cells where the renderer
+/// spends one on each, so a string-width budget admits twice the text that
+/// fits for that script.
+pub fn rendered_width(text: &str) -> usize {
+    use ratatui::buffer::CellWidth;
+    use unicode_segmentation::UnicodeSegmentation;
+    text.graphemes(true).map(|g| g.cell_width() as usize).sum()
+}
+
+/// The longest prefix of `text` that fits in `max_width` display cells, with
+/// no ellipsis.
 ///
-/// Accumulated measurement, because `UnicodeWidthStr::width` resolves those
-/// clusters, so "\u{26a0}\u{fe0f}" is 2 cells while its chars sum to 1 and
-/// "\u{1f91d}\u{1f3fd}" is 2 cells while its chars sum to 4. Summing
-/// over-admits the first (a string wider than the budget, which underflows
-/// any caller that subtracts the result from a remaining budget) and
-/// under-admits the second.
+/// Steps by grapheme cluster, because a `char` is not a display unit: cutting
+/// mid-cluster leaves a dangling combining mark ("क्" out of "क्ष") or strips a
+/// VS16 so the base glyph flips from emoji to text presentation. Cells come
+/// from [`rendered_width`], so a cluster whose scalars do not sum to what it
+/// paints ("\u{26a0}\u{fe0f}" is 2 cells where its chars sum to 1,
+/// "\u{1f91d}\u{1f3fd}" is 2 where they sum to 4) neither over- nor
+/// under-fills the budget.
 pub fn prefix_within_width(text: &str, max_width: usize) -> &str {
     use ratatui::buffer::CellWidth;
     use unicode_segmentation::UnicodeSegmentation;
     let mut cells = 0usize;
     let mut end = 0;
     for (start, g) in text.grapheme_indices(true) {
-        // The renderer's own per-grapheme metric (`CellWidth`, the same rule
-        // `Span::styled_graphemes` + `Buffer::set_stringn` apply), not
-        // `UnicodeWidthStr`: the latter resolves halfwidth katakana
-        // dakuten/handakuten to zero cells, while the renderer paints each of
-        // them into a cell, so a string-width budget would over-admit them.
         cells += g.cell_width() as usize;
         if cells > max_width {
             break;
@@ -150,7 +153,7 @@ pub fn prefix_within_width(text: &str, max_width: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{line_columns, prefix_within_width, truncate_to_width};
+    use super::{line_columns, prefix_within_width, rendered_width, truncate_to_width};
 
     /// A wide grapheme occupies two columns and its continuation cell is reset
     /// by the renderer. Reading that back out of a buffer yields a phantom
@@ -201,6 +204,18 @@ mod tests {
             prefix_within_width("\u{1f91d}\u{1f3fd}m", 4),
             "\u{1f91d}\u{1f3fd}m"
         );
+    }
+
+    /// The passthrough guard has to use the renderer's metric too: halfwidth
+    /// katakana dakuten scores zero in `UnicodeWidthStr`, so a string-width
+    /// guard hands back twice the budget untouched.
+    #[test]
+    fn truncate_to_width_guard_uses_the_rendered_metric() {
+        let halfwidth = "\u{ff8a}\u{ff9f}".repeat(20);
+        assert_eq!(rendered_width(&halfwidth), 40);
+        let out = truncate_to_width(&halfwidth, 24);
+        assert!(rendered_width(&out) <= 24, "{out:?}");
+        assert!(out.ends_with('\u{2026}'));
     }
 
     #[test]
