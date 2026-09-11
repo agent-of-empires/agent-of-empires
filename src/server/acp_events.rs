@@ -1018,14 +1018,16 @@ pub(crate) fn derive_acp_status(
         // main turn's own `Stopped` (if any) already applied the right
         // verdict; a live main turn keeps re-asserting `Running` through its
         // own `ThinkingStarted` / `AgentMessageChunk` / `ToolCallStarted`
-        // events regardless of this arm.
-        Event::BackgroundAgentCompleted { .. } => {
-            Some(StatusIntent::Set(if background_agent_active_after {
+        // events regardless of this arm. `SetUnlessWaiting` because a
+        // sibling agent finishing must not clobber a pending
+        // approval/elicitation on the main turn (#3900).
+        Event::BackgroundAgentCompleted { .. } => Some(StatusIntent::SetUnlessWaiting(
+            if background_agent_active_after {
                 Status::Running
             } else {
                 Status::Idle
-            }))
-        }
+            },
+        )),
         Event::AgentStartupError { .. } => Some(StatusIntent::Set(Status::Error)),
         // A successful session/new or session/load means the agent
         // is alive. Heal a sticky Error banner so the sidebar dot
@@ -1990,7 +1992,7 @@ mod tests {
                 },
                 true,
             ),
-            Some(StatusIntent::Set(Status::Running)),
+            Some(StatusIntent::SetUnlessWaiting(Status::Running)),
             "a sibling background agent is still active"
         );
         assert_eq!(
@@ -2005,7 +2007,7 @@ mod tests {
                 },
                 false,
             ),
-            Some(StatusIntent::Set(Status::Idle)),
+            Some(StatusIntent::SetUnlessWaiting(Status::Idle)),
             "the last background agent finished"
         );
         assert_eq!(
@@ -2257,6 +2259,29 @@ mod tests {
         inst.status = Status::Idle;
         apply(&mut inst, StatusIntent::SetUnlessWaiting(Status::Running));
         assert_eq!(inst.status, Status::Running);
+    }
+
+    /// #3900: a background agent finishing must not clobber a pending
+    /// approval/elicitation on the main turn either.
+    #[test]
+    fn background_agent_completed_does_not_clobber_waiting() {
+        use crate::acp::Event;
+        let mut inst = stopped_structured_instance();
+        inst.status = Status::Waiting;
+        let intent = derive_acp_status(
+            &Event::BackgroundAgentCompleted {
+                agent_id: "a-1".into(),
+                status: crate::acp::state::BackgroundAgentStatus::Completed,
+                tools: Vec::new(),
+                result: None,
+                warning: None,
+                ended_at: chrono::Utc::now(),
+            },
+            false,
+        )
+        .expect("BackgroundAgentCompleted derives an intent");
+        apply(&mut inst, intent);
+        assert_eq!(inst.status, Status::Waiting);
     }
 
     #[test]

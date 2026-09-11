@@ -1326,6 +1326,55 @@ describe("turnActive: daemon truth plus an optimistic overlay (#3417)", () => {
     expect(isVisiblyBusy({ turnActive: false, backgroundAgents: [backgroundAgent(null)] })).toBe(true);
   });
 
+  it("BackgroundAgentProgress(stalled) does not set endedAt, mirroring the Rust reducer (#3900)", () => {
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: {
+        BackgroundAgentLaunched: {
+          agent_id: "a1",
+          tool_call_id: "tc1",
+          description: "map backend",
+          prompt: "do the thing",
+          model: "claude-opus-4-8",
+          started_at: new Date().toISOString(),
+        },
+      },
+    });
+    expect(hasActiveBackgroundAgent(state)).toBe(true);
+
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: {
+        BackgroundAgentProgress: {
+          agent_id: "a1",
+          status: "stalled",
+          tool_count: 1,
+          at: new Date().toISOString(),
+        },
+      },
+    });
+    expect(state.backgroundAgents[0].endedAt).toBeNull();
+    expect(hasActiveBackgroundAgent(state)).toBe(true);
+
+    // A resumed running progress must still read null, not flip anything.
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 3,
+      event: {
+        BackgroundAgentProgress: {
+          agent_id: "a1",
+          status: "running",
+          tool_count: 2,
+          at: new Date().toISOString(),
+        },
+      },
+    });
+    expect(state.backgroundAgents[0].endedAt).toBeNull();
+    expect(hasActiveBackgroundAgent(state)).toBe(true);
+  });
+
   it("N prompts steered into one turn are all closed by its single Stopped", async () => {
     // The bug. A steering-capable agent gets follow-ups injected into the
     // running turn, and the daemon deliberately emits no extra terminal event
