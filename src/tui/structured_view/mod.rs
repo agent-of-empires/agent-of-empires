@@ -689,7 +689,9 @@ async fn handle_terminal_event(
                     Some(ChoicePurpose::OpenLink)
                 ),
                 has_modes: !state.transcript.available_modes.is_empty(),
-                agent_busy: state.transcript.turn_active || state.in_flight,
+                agent_busy: state.transcript.turn_active
+                    || state.transcript.background_agent_active
+                    || state.in_flight,
             };
             let intent = input::dispatch(state.focus, &key, ctx);
             // Plugin keybinds are a fallback: consult them only for a key the

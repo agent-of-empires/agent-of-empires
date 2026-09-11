@@ -73,6 +73,12 @@ pub struct AcpTranscript {
     /// Whether the agent is mid-turn. The composer reads it to decide whether
     /// Enter sends now or parks the prompt in the daemon's queue.
     pub turn_active: bool,
+    /// Whether a background sub-agent (async Task) is still outstanding.
+    /// Display-only: unlike `turn_active`, the composer must NOT gate
+    /// send-vs-park on this, since the main turn itself is genuinely idle
+    /// (#3900). Combine with `turn_active` only for the busy spinner /
+    /// Esc-to-cancel indicator.
+    pub background_agent_active: bool,
     /// Whether the agent accepts `_session/steering`. When true the composer
     /// sends a mid-turn prompt straight through instead of parking it: the
     /// daemon injects it into the running turn. Re-derived as `false` on a
@@ -208,6 +214,7 @@ impl AcpTranscript {
             cancelling: false,
             compacting: false,
             turn_active: false,
+            background_agent_active: false,
             usage: None,
             current_plan: Vec::new(),
             lagged: false,
@@ -294,6 +301,7 @@ impl AcpTranscript {
         }
         self.last_seq = seq;
 
+        self.background_agent_active = state.has_active_background_agent();
         self.agent_name = Some(state.agent.0);
         self.turn_active = state.turn_active;
         self.steering = state.steering;
@@ -628,6 +636,27 @@ mod tests {
         t.apply_reduced_state(3, reduced(&[]), &[]);
         assert!(t.available_commands.is_empty());
         assert!(t.available_modes.is_empty());
+    }
+
+    /// #3900: a live background sub-agent must reach the TUI's busy
+    /// signal via `apply_reduced_state`, distinct from `turn_active` (which
+    /// stays false since the main turn itself may be genuinely idle).
+    #[test]
+    fn apply_reduced_state_picks_up_a_live_background_agent() {
+        let mut t = AcpTranscript::new("s-1");
+        let state = reduced(&[Event::BackgroundAgentLaunched {
+            agent_id: "a1".into(),
+            tool_call_id: "tc1".into(),
+            description: "map backend".into(),
+            prompt: "do the thing".into(),
+            model: "claude-opus-4-8".into(),
+            output_file: "/tmp/a1.output".into(),
+            started_at: chrono::Utc::now(),
+        }]);
+        assert!(!state.turn_active, "fixture invariant: no main turn opened");
+        t.apply_reduced_state(1, state, &[]);
+        assert!(!t.turn_active);
+        assert!(t.background_agent_active);
     }
 
     /// A snapshot that races live deltas must not rewind the view.
