@@ -1,8 +1,6 @@
 import type { Page } from "@playwright/test";
 
-// Shared mocks so a running `aoe serve` + tmux aren't required. We stub the
-// REST API and route the PTY WebSocket so the xterm.js terminal mounts and the
-// gesture handlers in useTerminal.ts are exercised against the real frontend.
+// Shared REST and WebSocket mocks for terminal browser tests.
 
 export interface MockHandle {
   /** Raw bytes received from the page via WebSocket (PTY data + JSON messages). */
@@ -53,9 +51,9 @@ export async function mockTerminalApis(
     tool?: string;
     /** Extra sessions beyond pinch-test, for tests that switch between them. */
     extraSessions?: Array<{ id: string; title: string }>;
-    /** Hold every paste-image upload until the page dispatches
-     *  `release-paste-image`, so a test can type during the await. */
+    /** Hold image uploads until the page calls releasePasteImage. */
     pendingPaste?: boolean;
+    onLiveMessage?: (url: string, message: Buffer) => void;
   } = {},
 ): Promise<MockHandle> {
   const liveSockets: Array<{ send: (data: string) => void }> = [];
@@ -132,8 +130,7 @@ export async function mockTerminalApis(
   });
   await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
   if (opts.pendingPaste) {
-    // Hold the upload open until the page fires `release-paste-image`: the
-    // test types into the shadow during the await, then releases.
+    // Keep uploads pending while the test edits or switches surfaces.
     let release: (() => void) | null = null;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
@@ -185,11 +182,10 @@ export async function mockTerminalApis(
       }
     };
     ws.onMessage((msg) => {
-      if (Buffer.isBuffer(msg)) {
-        handle.liveMessages.push(msg);
-        return;
-      }
-      handle.liveMessages.push(Buffer.from(msg));
+      const message = Buffer.isBuffer(msg) ? msg : Buffer.from(msg);
+      handle.liveMessages.push(message);
+      opts.onLiveMessage?.(ws.url(), message);
+      if (Buffer.isBuffer(msg)) return;
       try {
         const control = JSON.parse(String(msg)) as { type?: string; rows?: number; lines?: number };
         if (control.type === "claim_if_vacant") {

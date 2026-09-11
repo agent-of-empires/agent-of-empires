@@ -1909,16 +1909,14 @@ export function MobileLiveTerminal({
       // Only a composition that took over the typed word may have its prefix
       // dropped; anything else is new text and goes to the pane whole.
       const rest = retroactive && data.startsWith(run) ? data.slice(run.length) : data;
-      // The typed word is still the one under the caret, so a second
-      // composition over it (a suggestion tap, then the space commit) has to
-      // be stripped against everything the pane has of that word. A
-      // composition that stood on its own leaves no typed word behind: its
-      // result must not become a run for the next composition to strip.
       if (!rest) typedWordRef.current = run;
-      else if (sendKeys(rest) && retroactive) typedWordRef.current = plainRunAfter(run, rest);
-      // Leave the committed text in the textarea: an IME that re-edits a
-      // committed syllable (delete + reinsert) needs it there for the delete
-      // to surface as a beforeinput. See forwardTerminalBeforeInput.
+      else if (!sendKeys(rest)) {
+        invalidateRetainedImeContext(e.target instanceof HTMLTextAreaElement ? e.target : null);
+      } else if (retroactive) {
+        // A later suggestion must strip the whole word already sent.
+        typedWordRef.current = plainRunAfter(run, rest);
+      }
+      // Only accepted text may remain as context for an IME delete + reinsert.
     },
     [sendKeys, typedWordRef],
   );

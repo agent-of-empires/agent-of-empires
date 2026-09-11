@@ -261,4 +261,102 @@ test.describe("Live terminal IME syllable rewrite", () => {
     await expect.poll(() => textBytes(handle, start), { timeout: 5_000 }).toContain("/tmp/paste");
     expect(await valueOf(page, PROXY)).toBe("ㅎ");
   });
+
+  test("refused composition commits cannot seed the next rewrite", async ({ page }) => {
+    const handle = await mockTerminalApis(page);
+    await openSession(page, handle);
+    for (const selector of [INPUT, PROXY]) {
+      const start = handle.liveMessages.length;
+      await page.locator('button[aria-label="Ctrl"]').click();
+      await page.locator(selector).evaluate((element) => {
+        const input = element as HTMLTextAreaElement;
+        input.focus();
+        input.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+        input.value = "c";
+        input.dispatchEvent(new CompositionEvent("compositionupdate", { data: "c", bubbles: true }));
+        input.dispatchEvent(new CompositionEvent("compositionend", { data: "c", bubbles: true }));
+      });
+      expect(await valueOf(page, selector)).toBe("");
+      await softKey(page, "deleteContentBackward", null, selector);
+      await softKey(page, "insertText", "ㅎ", selector);
+      await expect.poll(() => textBytes(handle, start)).toBe("\x03ㅎ");
+    }
+  });
+
+  test("only the visible mobile surface owns proxy input after a round trip", async ({ page }) => {
+    const writes: Array<{ url: string; text: string }> = [];
+    const handle = await mockTerminalApis(page, {
+      onLiveMessage: (url, message) => {
+        const text = message.toString("utf8");
+        if (!text.startsWith("{")) writes.push({ url, text });
+      },
+    });
+    await openSession(page, handle);
+    await softKey(page, "insertText", "ㅎ", PROXY);
+    await page.getByRole("button", { name: "Toggle panels", exact: true }).click();
+    await page.getByTestId("mobile-right-panel-pick-paired").click();
+    await expect(page.locator('[data-term="paired"]')).toBeVisible();
+    expect(await valueOf(page, PROXY)).toBe("");
+    await softKey(page, "deleteContentBackward", null, PROXY);
+    await softKey(page, "insertText", "ㅏ", PROXY);
+    await page.getByTestId("mobile-back-to-agent").click();
+    expect(await valueOf(page, PROXY)).toBe("");
+    await softKey(page, "deleteContentBackward", null, PROXY);
+    await softKey(page, "insertText", "ㄴ", PROXY);
+    await page.locator(PROXY).dispatchEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
+    await expect
+      .poll(() => writes.map(({ url, text }) => ({ path: new URL(url).pathname, text })))
+      .toEqual([
+        { path: "/sessions/pinch-test/live-ws", text: "ㅎ" },
+        { path: "/sessions/pinch-test/terminal/live-ws", text: "ㅏ" },
+        { path: "/sessions/pinch-test/live-ws", text: "ㄴ" },
+        { path: "/sessions/pinch-test/live-ws", text: "\r" },
+      ]);
+    await expect(page.locator('[data-term="paired"]')).toHaveCount(1);
+  });
+
+  test("a hidden paired terminal upload preserves the agent proxy", async ({ page }) => {
+    const writes: Array<{ url: string; text: string }> = [];
+    const handle = await mockTerminalApis(page, {
+      pendingPaste: true,
+      onLiveMessage: (url, message) => {
+        const text = message.toString("utf8");
+        if (!text.startsWith("{")) writes.push({ url, text });
+      },
+    });
+    await openSession(page, handle);
+    await page.getByRole("button", { name: "Toggle panels", exact: true }).click();
+    await page.getByTestId("mobile-right-panel-pick-paired").click();
+    await expect(page.locator('[data-term="paired"]')).toBeVisible();
+    const pairedInput = `[data-term="paired"] ${INPUT}`;
+    await page.locator(pairedInput).evaluate((element) => {
+      const clipboardData = new DataTransfer();
+      clipboardData.items.add(new File(["x"], "shot.png", { type: "image/png" }));
+      element.dispatchEvent(new ClipboardEvent("paste", { clipboardData, bubbles: true, cancelable: true }));
+    });
+    await softKey(page, "insertText", "ㄱ", pairedInput);
+    await page.getByTestId("mobile-back-to-agent").click();
+    await softKey(page, "insertText", "ㅎ", PROXY);
+    await page.evaluate(() => (window as unknown as { releasePasteImage: () => void }).releasePasteImage());
+    await expect
+      .poll(() =>
+        writes
+          .filter(({ url }) => new URL(url).pathname.endsWith("/terminal/live-ws"))
+          .map(({ text }) => text)
+          .join(""),
+      )
+      .toBe("ㄱ\x1b[200~ /tmp/paste/shot.png \x1b[201~");
+    expect(await valueOf(page, pairedInput)).toBe("");
+    expect(await valueOf(page, PROXY)).toBe("ㅎ");
+    await softKey(page, "deleteContentBackward", null, PROXY);
+    await softKey(page, "insertText", "하", PROXY);
+    await expect
+      .poll(() =>
+        writes
+          .filter(({ url }) => new URL(url).pathname === "/sessions/pinch-test/live-ws")
+          .map(({ text }) => text)
+          .join(""),
+      )
+      .toBe("ㅎ\x7f하");
+  });
 });

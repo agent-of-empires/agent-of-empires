@@ -52,11 +52,8 @@ function layerClass(active: boolean): string {
   return active ? base : `${base} invisible pointer-events-none`;
 }
 
-/** The single full-viewport pane shown below the `md` breakpoint (#1452).
- *  The picker promotes one of agent / diff / paired into it. The agent
- *  terminal and the paired shell (once first opened) stay mounted but
- *  hidden via `visibility` so their PTY, scrollback, and focus survive
- *  view switches; `display:none` would collapse xterm geometry to zero. */
+/** Keep terminal geometry and scrollback across switches; only the visible
+ *  surface owns keyboard input. */
 export function MobileMainPane({
   view,
   pluginPanes,
@@ -127,17 +124,13 @@ export function MobileMainPane({
               />
             </Suspense>
           ) : (
-            // Reserve the bottom home-indicator inset on this wrapper (the App
-            // root no longer does; see index.css .safe-area-inset) so the last
-            // terminal row clears it. Kept off the pane root itself, which owns
-            // the keyboard-open lift and must stay inset-free when closed (#1432).
-            // Collapses to 0 with the keyboard open (iOS reports the inset as 0)
-            // and on desktop.
+            // Clear the home indicator without changing the keyboard-open lift.
             <div
               className="flex-1 flex flex-col min-h-0 overflow-hidden"
               style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
             >
               <TerminalSessionStack
+                active={view === "agent"}
                 activeSessionId={activeSessionId!}
                 sessions={sessions.filter((session) => session.view !== "structured")}
                 persistent={webSettings.persistentTerminals}
@@ -148,19 +141,14 @@ export function MobileMainPane({
         </div>
 
         {pairedMounted && (
-          // Reserve the bottom home-indicator inset here too (the App root no
-          // longer does; see index.css .safe-area-inset), matching the agent
-          // terminal wrapper above. The paired shell is the same LiveTerminalView
-          // component, so it needs identical clearance; without it the last row
-          // and toolbar sat under the home indicator. Collapses to 0 with the
-          // keyboard open (iOS reports the inset as 0) and on desktop.
+          // Match the agent terminal’s home-indicator clearance.
           <div
             className={layerClass(view === "paired")}
             inert={view !== "paired"}
             data-testid="mobile-paired-layer"
             style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
           >
-            <PairedShellPane session={activeSession} sessionId={activeSessionId} />
+            <PairedShellPane session={activeSession} sessionId={activeSessionId} active={view === "paired"} />
           </div>
         )}
 

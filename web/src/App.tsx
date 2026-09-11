@@ -873,27 +873,22 @@ function AppContent({
     }
   };
 
-  // The keyboard proxy survives terminal mounts so iOS can retain the focus
-  // authorized by a sidebar tap. Drop its receiver only at a real session
-  // boundary: clearing it while reselecting the active session leaves that
-  // still-mounted terminal without anything to re-register it.
+  // Preserve the gesture-authorized proxy, but never carry its edits across
+  // sessions or mobile surfaces. Reselecting the same target keeps its receiver.
   const keyboardProxySessionIdRef = useRef(activeSessionId);
-  const transitionKeyboardProxy = useCallback((nextSessionId: string | null) => {
-    if (keyboardProxySessionIdRef.current === nextSessionId) return;
+  const keyboardProxyViewRef = useRef<RightPanelView>(singlePane ? rightPanelView : "agent");
+  const transitionKeyboardProxy = useCallback((nextSessionId: string | null, nextView: RightPanelView) => {
+    if (keyboardProxySessionIdRef.current === nextSessionId && keyboardProxyViewRef.current === nextView) return;
     keyboardProxySessionIdRef.current = nextSessionId;
-    // The retained syllable mirrors the old session's PTY edit, so carrying
-    // it over would let the next deleteContentBackward delete the new
-    // session's text before the replacement arrives.
+    keyboardProxyViewRef.current = nextView;
     if (keyboardProxyRef.current) keyboardProxyRef.current.value = "";
     clearMobileKeyboardProxyInput();
   }, []);
 
-  // Sidebar selection clears before the proxy can accept another edit. This
-  // also covers browser history and every other route change before the next
-  // input event, without clearing an unchanged session.
+  // Cover history and programmatic switches before the next input event.
   useLayoutEffect(() => {
-    transitionKeyboardProxy(activeSessionId);
-  }, [activeSessionId, transitionKeyboardProxy]);
+    transitionKeyboardProxy(activeSessionId, singlePane ? rightPanelView : "agent");
+  }, [activeSessionId, singlePane, rightPanelView, transitionKeyboardProxy]);
 
   useEffect(() => {
     const proxy = keyboardProxy;
@@ -918,7 +913,7 @@ function AppContent({
       const ws = workspaces.find((w) => w.sessions.some((s) => s.id === sessionId));
       if (ws) {
         const picked = ws.sessions.find((s) => s.id === sessionId);
-        transitionKeyboardProxy(sessionId);
+        transitionKeyboardProxy(sessionId, sessionId === activeSessionId && singlePane ? rightPanelView : "agent");
         navigate(`/session/${encodeURIComponent(sessionId)}`);
         // iOS does not permit a session's asynchronously mounted terminal
         // input to inherit this sidebar tap's keyboard authorization. The
@@ -943,7 +938,17 @@ function AppContent({
         if (window.innerWidth < 768) setSidebarOpen(false);
       }
     },
-    [navigate, workspaces, focusAgentInput, isCoarse, transitionKeyboardProxy, webSettings.autoOpenKeyboard],
+    [
+      navigate,
+      workspaces,
+      focusAgentInput,
+      isCoarse,
+      transitionKeyboardProxy,
+      webSettings.autoOpenKeyboard,
+      activeSessionId,
+      singlePane,
+      rightPanelView,
+    ],
   );
 
   const handleSelectWorkspace = (workspaceId: string, sessionId: string | null) => {
@@ -951,7 +956,7 @@ function AppContent({
     if (ws) {
       const picked = ws.sessions.find((s) => s.id === sessionId);
       if (picked) {
-        transitionKeyboardProxy(picked.id);
+        transitionKeyboardProxy(picked.id, picked.id === activeSessionId && singlePane ? rightPanelView : "agent");
         navigate(`/session/${encodeURIComponent(picked.id)}`);
         // See handleSelectSession: keep focus on the persistent keyboard input
         // until the selected surface can receive it.
@@ -967,7 +972,7 @@ function AppContent({
           focusAgentInput(picked);
         }
       } else {
-        transitionKeyboardProxy(null);
+        transitionKeyboardProxy(null, "agent");
         navigate("/");
       }
     }
@@ -1364,10 +1369,14 @@ function AppContent({
     }
   }, [isMdUp, rightDockCollapsed, setDockCollapsed, availableRightGroups.length, openTab]);
 
-  const handlePickView = useCallback((view: RightPanelView) => {
-    setRightPanelView(view);
-    setPickerOpen(false);
-  }, []);
+  const handlePickView = useCallback(
+    (view: RightPanelView) => {
+      transitionKeyboardProxy(activeSessionId, view);
+      setRightPanelView(view);
+      setPickerOpen(false);
+    },
+    [activeSessionId, transitionKeyboardProxy],
+  );
 
   const handleSelectFile = useCallback((path: string, repoName?: string, line?: number) => {
     setSelectedFile({ path, repoName, line });
@@ -1783,7 +1792,7 @@ function AppContent({
         <MobileMainPane
           view={rightPanelView}
           pluginPanes={pluginPanes}
-          onBackToAgent={() => setRightPanelView("agent")}
+          onBackToAgent={() => handlePickView("agent")}
           pairedMounted={pairedMounted}
           activeSession={activeSession ?? null}
           activeSessionId={activeSessionId}
