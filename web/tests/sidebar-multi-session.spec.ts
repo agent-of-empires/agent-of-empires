@@ -176,7 +176,11 @@ test.describe("Sidebar multi-session (#956)", () => {
     await page.mouse.up();
     await page.waitForTimeout(16);
 
-    expect(await row.getAttribute("class")).toContain("border-brand-600");
+    expect(await row.getAttribute("class")).toContain("ring-session-active");
+    // The frame has to paint, not just be requested: a `ring-session-active`
+    // utility with no matching `@theme` token drops out of the stylesheet
+    // silently and leaves the row as flat as its neighbours (#3912).
+    expect(await row.evaluate((el) => getComputedStyle(el).boxShadow)).not.toBe("none");
     await expect(page).toHaveURL(/\/session\/sess-a$/);
   });
 

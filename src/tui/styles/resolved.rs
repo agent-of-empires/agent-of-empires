@@ -229,6 +229,16 @@ fn web_projection(theme: &Theme, appearance: ThemeAppearance) -> CssVarProjectio
         hex(readable_on(brand_ramp[5])),
     );
 
+    // Frame around the open session's sidebar row. It is a hairline over
+    // the row fill, so it has to clear the WCAG 1.4.11 non-text floor
+    // against both that fill and the surrounding background. Most accents
+    // already do; the rest lift toward the appearance's readable pole
+    // until they clear it.
+    css.insert(
+        "--color-session-active".into(),
+        hex(active_frame(accent, bg, elevated_2, appearance)),
+    );
+
     // Accent ramp anchored on theme.terminal_border (the existing
     // teal-style anchor used by the TUI's accent surface), so secondary
     // affordances like branch chips still read as the theme's secondary
@@ -389,6 +399,27 @@ fn mix(a: Color, b: Color, t: f32) -> Color {
 fn rgba(c: Color, alpha: f32) -> String {
     let (r, g, b) = rgb_components(c);
     format!("rgba({r}, {g}, {b}, {:.2})", alpha.clamp(0.0, 1.0))
+}
+
+/// WCAG 1.4.11 floor for non-text UI indicators.
+const NON_TEXT_CONTRAST_RATIO: f32 = 3.0;
+
+/// The accent, lifted toward `appearance`'s readable pole only as far as
+/// it takes to clear [`NON_TEXT_CONTRAST_RATIO`] against both `bg` and
+/// `fill`. Falls back to the pole itself for a background no accent
+/// direction can separate from.
+fn active_frame(accent: Color, bg: Color, fill: Color, appearance: ThemeAppearance) -> Color {
+    let pole = match appearance {
+        ThemeAppearance::Dark => WHITE,
+        ThemeAppearance::Light => BLACK,
+    };
+    (0..=10)
+        .map(|step| mix(accent, pole, step as f32 / 10.0))
+        .find(|c| {
+            contrast_ratio(*c, bg) >= NON_TEXT_CONTRAST_RATIO
+                && contrast_ratio(*c, fill) >= NON_TEXT_CONTRAST_RATIO
+        })
+        .unwrap_or(pole)
 }
 
 fn readable_on(bg: Color) -> Color {
@@ -552,6 +583,41 @@ mod tests {
     }
 
     #[test]
+    fn session_active_frame_clears_non_text_contrast_for_all_builtins() {
+        for name in builtin_theme_names() {
+            let theme = resolve_theme(name);
+            let frame = color_from_hex(theme.web.css_vars.get("--color-session-active").unwrap());
+            for surface in ["--color-surface-900", "--color-surface-800"] {
+                let bg = color_from_hex(theme.web.css_vars.get(surface).unwrap());
+                let ratio = contrast_ratio(frame, bg);
+                assert!(
+                    ratio >= NON_TEXT_CONTRAST_RATIO,
+                    "{name}: session-active frame vs {surface} is {ratio:.2}, below the non-text floor"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn session_active_frame_keeps_the_accent_when_it_already_separates() {
+        // Only accents that cannot clear the floor on their own move, so a
+        // theme's active row stays recognisably its own accent color.
+        let empire = resolve_theme("empire");
+        assert_eq!(
+            empire.web.css_vars.get("--color-session-active").unwrap(),
+            empire.web.css_vars.get("--color-brand-500").unwrap()
+        );
+
+        // Latte's orange accent lands at 2.64:1 on its near-white
+        // background, so the light projection has to darken it.
+        let latte = resolve_theme("catppuccin-latte");
+        assert_ne!(
+            latte.web.css_vars.get("--color-session-active").unwrap(),
+            latte.web.css_vars.get("--color-brand-500").unwrap()
+        );
+    }
+
+    #[test]
     fn on_brand_token_keeps_contrast_for_all_builtins() {
         for name in builtin_theme_names() {
             let theme = resolve_theme(name);
@@ -708,6 +774,7 @@ mod tests {
                 "text-on-brand"
                     | "selection"
                     | "session-selection"
+                    | "session-active"
                     | "terminal-active"
                     | "branch"
                     | "sandbox"

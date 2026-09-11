@@ -3543,6 +3543,13 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.active-row-indicator",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/lib/__tests__/sessionRowChrome.test.ts", "tests/sidebar-multi-session.spec.ts"],
+      "components": ["web/src/lib/sessionRowChrome.ts", "web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
       "id": "sidebar.bulk-triage-live",
       "kind": "live-playwright",
       "risk": "high",
