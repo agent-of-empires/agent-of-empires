@@ -20,14 +20,13 @@ describe("sessionRowChromeClass", () => {
     expect(chrome).not.toContain("ring-session-active");
   });
 
-  it("offers hover only to rows with no state of their own", () => {
+  it("withholds hover from the open row so it cannot repaint over the frame", () => {
+    expect(sessionRowChromeClass(true, false)).not.toContain("hover:");
+    expect(sessionRowChromeClass(true, true)).not.toContain("hover:");
+  });
+
+  it("keeps hover on every row that is not the open one", () => {
     expect(sessionRowChromeClass(false, false)).toContain("hover:bg-surface-700/40");
-    for (const chrome of [
-      sessionRowChromeClass(true, false),
-      sessionRowChromeClass(true, true),
-      sessionRowChromeClass(false, true),
-    ]) {
-      expect(chrome).not.toContain("hover:");
-    }
+    expect(sessionRowChromeClass(false, true)).toContain("hover:bg-surface-700/40");
   });
 });

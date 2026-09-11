@@ -127,7 +127,7 @@
   --color-selection: #3f3f46;
   --color-session-selection: #52525b;
   /* Frame around the open session's sidebar row. Projected as the theme
-     accent lifted until it clears 3:1 against surface-900 and surface-800
+     accent lifted until it clears 3:1 against every surface it can sit on
      (see resolved.rs); zinc's accent already does, so this matches
      --color-brand-500. */
   --color-session-active: #f59e0b;

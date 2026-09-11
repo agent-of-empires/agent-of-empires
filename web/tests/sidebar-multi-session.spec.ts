@@ -177,10 +177,16 @@ test.describe("Sidebar multi-session (#956)", () => {
     await page.waitForTimeout(16);
 
     expect(await row.getAttribute("class")).toContain("ring-session-active");
-    // The frame has to paint, not just be requested: a `ring-session-active`
-    // utility with no matching `@theme` token drops out of the stylesheet
-    // silently and leaves the row as flat as its neighbours (#3912).
-    expect(await row.evaluate((el) => getComputedStyle(el).boxShadow)).not.toBe("none");
+    // The frame has to resolve to the projected token, not just be requested:
+    // `ring-session-active` with no matching `@theme` entry leaves
+    // `--tw-ring-color` invalid at computed-value time, and `ring-2` then
+    // paints in currentColor instead of the theme accent (#3912).
+    const ring = await row.evaluate((el) => ({
+      color: getComputedStyle(el).getPropertyValue("--tw-ring-color").trim(),
+      shadow: getComputedStyle(el).boxShadow,
+    }));
+    expect(ring.color).not.toBe("");
+    expect(ring.shadow).not.toBe("none");
     await expect(page).toHaveURL(/\/session\/sess-a$/);
   });
 
