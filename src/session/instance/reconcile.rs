@@ -49,6 +49,8 @@ impl Instance {
         disk.last_start_time = self.last_start_time;
         disk.session_id_poller = self.session_id_poller.take();
         disk.session_id_poller_retry_after = self.session_id_poller_retry_after;
+        // Preserve the serde-skipped backoff so reloads cannot trigger an early retry.
+        disk.poller_repair = self.poller_repair.clone();
         disk.retroactive_capture_excludes = std::mem::take(&mut self.retroactive_capture_excludes);
         disk.pane_dead_observed = self.pane_dead_observed;
         disk.force_fresh_next_launch = self.force_fresh_next_launch;
@@ -166,6 +168,34 @@ mod tests {
         assert_eq!(inst.agent_session_id.as_deref(), Some("old-sid"));
         inst.reconcile_from_disk();
         assert_eq!(inst.agent_session_id.as_deref(), Some("new-sid"));
+    }
+
+    #[test]
+    #[serial]
+    fn reconcile_from_disk_carries_poller_repair_backoff() {
+        let temp = tempdir().unwrap();
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+
+        let storage = crate::session::storage::Storage::new_unwatched("reconcile-test").unwrap();
+        let mut inst = Instance::new("title", "/tmp/x");
+        inst.source_profile = "reconcile-test".to_string();
+        storage
+            .update(|i, g| {
+                *i = vec![inst.clone()];
+                *g = crate::session::GroupTree::new_with_groups(std::slice::from_ref(&inst), &[])
+                    .get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+
+        let now = std::time::Instant::now();
+        inst.poller_repair.defer(now);
+        inst.poller_repair.defer(now);
+        assert!(!inst.poller_repair.due(now));
+
+        inst.reconcile_from_disk();
+
+        assert!(!inst.poller_repair.due(now));
     }
 
     #[test]

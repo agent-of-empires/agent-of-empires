@@ -100,7 +100,7 @@ fn agent_metrics_cell(agent: &AgentMetric) -> String {
 
 fn format_agent_title(title: &str, width: usize) -> String {
     let title = truncate_to_width(title, width);
-    let padding = width.saturating_sub(title.width());
+    let padding = width.saturating_sub(super::text::rendered_width(&title));
     format!("{title}{}", " ".repeat(padding))
 }
 
@@ -501,10 +501,21 @@ mod tests {
     }
 
     #[test]
-    fn agent_table_title_padding_uses_display_width() {
-        for title in ["agent", "日本語", "aaaaaaaé"] {
-            let formatted = format_agent_title(title, 8);
-            assert_eq!(formatted.width(), 8, "title {title:?}");
+    fn agent_table_title_padding_keeps_metrics_aligned() {
+        use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+
+        for title in ["agent", "日本語", "aaaaaaaé", "ｶﾞｷﾞｸﾞｹﾞ"] {
+            let agent = AgentMetric {
+                title: title.into(),
+                ..AgentMetric::default()
+            };
+            let mut spans = agent_name_spans(&agent, 8, &Theme::default());
+            spans.push(Span::raw("X"));
+            let area = Rect::new(0, 0, 24, 1);
+            let mut buffer = Buffer::empty(area);
+            Paragraph::new(Line::from(spans)).render(area, &mut buffer);
+            let metric_column = (0..24).find(|x| buffer[(*x, 0)].symbol() == "X");
+            assert_eq!(metric_column, Some(8), "title {title:?}");
         }
     }
 

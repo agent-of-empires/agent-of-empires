@@ -229,6 +229,16 @@ fn web_projection(theme: &Theme, appearance: ThemeAppearance) -> CssVarProjectio
         hex(readable_on(brand_ramp[5])),
     );
 
+    // Frame around the open session's sidebar row. It is a hairline over
+    // the row fill, so it has to clear the WCAG 1.4.11 non-text floor
+    // against that fill and the surrounding background. Most accents
+    // already do; the rest lift toward the background's readable pole
+    // until they clear it.
+    css.insert(
+        "--color-session-active".into(),
+        hex(active_frame(accent, bg, elevated_2)),
+    );
+
     // Accent ramp anchored on theme.terminal_border (the existing
     // teal-style anchor used by the TUI's accent surface), so secondary
     // affordances like branch chips still read as the theme's secondary
@@ -389,6 +399,42 @@ fn mix(a: Color, b: Color, t: f32) -> Color {
 fn rgba(c: Color, alpha: f32) -> String {
     let (r, g, b) = rgb_components(c);
     format!("rgba({r}, {g}, {b}, {:.2})", alpha.clamp(0.0, 1.0))
+}
+
+/// WCAG 1.4.11 floor for non-text UI indicators.
+const NON_TEXT_CONTRAST_RATIO: f32 = 3.0;
+
+/// Alpha of the multi-selection tint the sidebar lays under a row that is
+/// open and selected at once (`bg-brand-500/15` in
+/// `web/src/lib/sessionRowChrome.ts`). The tint is the accent itself, so it
+/// pulls the fill toward the frame and has to be part of the floor check.
+const SELECTION_TINT_ALPHA: f32 = 0.15;
+
+/// The accent, lifted toward `bg`'s readable pole only as far as it takes
+/// to clear [`NON_TEXT_CONTRAST_RATIO`] against every surface the frame can
+/// sit on: `bg`, `fill`, and `fill` under the selection tint. The pole is
+/// measured rather than taken from the declared appearance, so a theme whose
+/// `appearance` disagrees with its background still lifts the right way.
+fn active_frame(accent: Color, bg: Color, fill: Color) -> Color {
+    let pole = readable_on(bg);
+    let surfaces = [bg, fill, composite(accent, fill, SELECTION_TINT_ALPHA)];
+    (0..=10)
+        .map(|step| mix(accent, pole, step as f32 / 10.0))
+        .find(|c| {
+            surfaces
+                .iter()
+                .all(|s| contrast_ratio(*c, *s) >= NON_TEXT_CONTRAST_RATIO)
+        })
+        .unwrap_or(pole)
+}
+
+/// `fg` at `alpha` over an opaque `bg`, matching how the browser composites
+/// a Tailwind `/NN` opacity modifier.
+fn composite(fg: Color, bg: Color, alpha: f32) -> Color {
+    let (fr, fg_g, fb) = rgb_components(fg);
+    let (br, bg_g, bb) = rgb_components(bg);
+    let channel = |f: u8, b: u8| ((f as f32 * alpha) + (b as f32 * (1.0 - alpha))).round() as u8;
+    Color::Rgb(channel(fr, br), channel(fg_g, bg_g), channel(fb, bb))
 }
 
 fn readable_on(bg: Color) -> Color {
@@ -552,6 +598,77 @@ mod tests {
     }
 
     #[test]
+    fn session_active_frame_clears_non_text_contrast_for_all_builtins() {
+        for name in builtin_theme_names() {
+            let theme = resolve_theme(name);
+            let frame = color_from_hex(theme.web.css_vars.get("--color-session-active").unwrap());
+            let fill = color_from_hex(theme.web.css_vars.get("--color-surface-800").unwrap());
+            let accent = color_from_hex(theme.web.css_vars.get("--color-brand-500").unwrap());
+            // The third surface is the fill an open row takes while it is also
+            // multi-selected: `bg-brand-500/15` over the sidebar's surface-800.
+            let surfaces = [
+                (
+                    "surface-900",
+                    color_from_hex(theme.web.css_vars.get("--color-surface-900").unwrap()),
+                ),
+                ("surface-800", fill),
+                (
+                    "surface-800 + selection tint",
+                    composite(accent, fill, SELECTION_TINT_ALPHA),
+                ),
+            ];
+            for (label, bg) in surfaces {
+                let ratio = contrast_ratio(frame, bg);
+                assert!(
+                    ratio >= NON_TEXT_CONTRAST_RATIO,
+                    "{name}: session-active frame vs {label} is {ratio:.2}, below the non-text floor"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn session_active_frame_lifts_away_from_the_real_background() {
+        // A theme whose declared appearance disagrees with its background:
+        // the frame must still separate from the surfaces it paints on
+        // rather than lifting toward the pole the metadata names.
+        let theme = Theme {
+            background: Color::Rgb(0xff, 0xff, 0xff),
+            accent: Color::Rgb(0xff, 0xff, 0xff),
+            ..Theme::default()
+        };
+
+        let projection = web_projection(&theme, ThemeAppearance::Dark);
+        let frame = color_from_hex(projection.css_vars.get("--color-session-active").unwrap());
+        for surface in ["--color-surface-900", "--color-surface-800"] {
+            let bg = color_from_hex(projection.css_vars.get(surface).unwrap());
+            assert!(
+                contrast_ratio(frame, bg) >= NON_TEXT_CONTRAST_RATIO,
+                "white-background theme: session-active frame vs {surface} is below the non-text floor"
+            );
+        }
+    }
+
+    #[test]
+    fn session_active_frame_keeps_the_accent_when_it_already_separates() {
+        // Only accents that cannot clear the floor on their own move, so a
+        // theme's active row stays recognisably its own accent color.
+        let empire = resolve_theme("empire");
+        assert_eq!(
+            empire.web.css_vars.get("--color-session-active").unwrap(),
+            empire.web.css_vars.get("--color-brand-500").unwrap()
+        );
+
+        // Latte's orange accent lands at 2.64:1 on its near-white
+        // background, so the light projection has to darken it.
+        let latte = resolve_theme("catppuccin-latte");
+        assert_ne!(
+            latte.web.css_vars.get("--color-session-active").unwrap(),
+            latte.web.css_vars.get("--color-brand-500").unwrap()
+        );
+    }
+
+    #[test]
     fn on_brand_token_keeps_contrast_for_all_builtins() {
         for name in builtin_theme_names() {
             let theme = resolve_theme(name);
@@ -603,20 +720,6 @@ mod tests {
         let g = u8::from_str_radix(&s[2..4], 16).unwrap();
         let b = u8::from_str_radix(&s[4..6], 16).unwrap();
         Color::Rgb(r, g, b)
-    }
-
-    fn composite(fg: Color, bg: Color, alpha: f32) -> Color {
-        let (fr, fg_g, fb) = rgb_components(fg);
-        let (br, bg_g, bb) = rgb_components(bg);
-        Color::Rgb(
-            composite_channel(fr, br, alpha),
-            composite_channel(fg_g, bg_g, alpha),
-            composite_channel(fb, bb, alpha),
-        )
-    }
-
-    fn composite_channel(fg: u8, bg: u8, alpha: f32) -> u8 {
-        ((fg as f32 * alpha) + (bg as f32 * (1.0 - alpha))).round() as u8
     }
 
     fn web_semantic_color_vars_used_by_dashboard() -> BTreeSet<String> {
@@ -708,6 +811,7 @@ mod tests {
                 "text-on-brand"
                     | "selection"
                     | "session-selection"
+                    | "session-active"
                     | "terminal-active"
                     | "branch"
                     | "sandbox"

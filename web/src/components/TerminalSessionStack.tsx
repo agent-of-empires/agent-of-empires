@@ -4,6 +4,7 @@ import { DEFAULT_PERSISTENT_TERMINALS, normalizePersistentTerminalLimit } from "
 import { TerminalView } from "./TerminalView";
 
 interface Props {
+  active?: boolean;
   activeSessionId: string;
   sessions: SessionResponse[];
   persistent: boolean;
@@ -11,6 +12,7 @@ interface Props {
 }
 
 export function TerminalSessionStack({
+  active = true,
   activeSessionId,
   sessions,
   persistent,
@@ -55,18 +57,18 @@ export function TerminalSessionStack({
       {visibleIds.map((sessionId) => {
         const session = sessionsById.get(sessionId);
         if (!session) return null;
-        const active = sessionId === activeSessionId;
+        const selected = sessionId === activeSessionId;
         return (
           <div
             key={sessionId}
-            aria-hidden={!active}
+            aria-hidden={!selected}
             className={
-              active
+              selected
                 ? "absolute inset-0 flex flex-col min-h-0"
                 : "absolute inset-0 flex flex-col min-h-0 invisible pointer-events-none"
             }
           >
-            <TerminalView session={session} active={active} />
+            <TerminalView session={session} active={active && selected} />
           </div>
         );
       })}

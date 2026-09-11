@@ -26,7 +26,27 @@ export function registerMobileKeyboardProxyReceiver(next: Receiver) {
   receiver = next;
   const queued = pending;
   pending = [];
-  for (const input of queued) next(input);
+  let retained: string | null = null;
+  for (const input of queued) {
+    const accepted = next(input);
+    if (
+      !accepted ||
+      input.inputType === "insertLineBreak" ||
+      input.inputType === "insertParagraph" ||
+      input.inputType === "insertFromPaste"
+    ) {
+      retained = "";
+    } else if (retained !== null) {
+      if (input.inputType === "insertText") retained += input.data ?? "";
+      else if (input.inputType === "deleteContentBackward") retained = Array.from(retained).slice(0, -1).join("");
+    }
+  }
+  // Browser edits were already applied while buffered. Rebuild only the
+  // accepted suffix after an invalidation, without discarding later input.
+  if (retained !== null) {
+    const proxy = document.querySelector<HTMLTextAreaElement>("[data-keyboard-proxy]");
+    if (proxy) proxy.value = retained;
+  }
   return () => {
     if (receiver === next) receiver = null;
   };
@@ -77,7 +97,10 @@ export function forwardTerminalBeforeInput(ev: InputEvent, deliver: Receiver) {
   switch (ev.inputType) {
     case "insertText":
     case "deleteContentBackward":
-      if (!deliver({ inputType: ev.inputType, data: ev.data, isComposing: ev.isComposing })) ev.preventDefault();
+      if (!deliver({ inputType: ev.inputType, data: ev.data, isComposing: ev.isComposing })) {
+        if (ev.target instanceof HTMLTextAreaElement) ev.target.value = "";
+        ev.preventDefault();
+      }
       break;
     case "insertLineBreak":
     case "insertParagraph":

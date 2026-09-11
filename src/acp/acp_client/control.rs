@@ -1134,6 +1134,116 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn attached_session_only_resets_for_missing_session_errors() {
+        use crate::acp::acp_client::AcpClient;
+        use crate::acp::control_protocol::PromptOutcome;
+        use crate::acp::state::AcpSessionId;
+
+        for (message, should_reset) in [
+            ("Unsupported ACP session", true),
+            ("Unsupported session mode", false),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let socket = tmp.path().join("resume.sock");
+            let control = crate::process::worker::control_socket_sibling(&socket);
+            let listener = tokio::net::UnixListener::bind(control).unwrap();
+            let runner = async {
+                let (mut peer, _) = listener.accept().await.unwrap();
+                control_protocol::write_frame(
+                    &mut peer,
+                    &ControlBody::Hello {
+                        control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
+                        session_id: "resume".into(),
+                    },
+                )
+                .await
+                .unwrap();
+                while let Some(frame) = control_protocol::read_frame(&mut peer).await.unwrap() {
+                    let reply = match frame {
+                        ControlBody::Attach { .. } => continue,
+                        ControlBody::Initialize { .. } => ControlBody::Initialized {
+                            result: serde_json::json!({
+                                "protocolVersion": 1, "agentCapabilities": {}
+                            }),
+                        },
+                        ControlBody::ResumeSession => ControlBody::SessionReady {
+                            acp_session_id: "sid-stored".into(),
+                            result: serde_json::json!({}),
+                        },
+                        ControlBody::Prompt { request } => {
+                            assert_eq!(request["sessionId"], "sid-stored");
+                            control_protocol::write_frame(
+                                &mut peer,
+                                &ControlBody::PromptStarted { prompt_req_id: 1 },
+                            )
+                            .await
+                            .unwrap();
+                            ControlBody::PromptCompleted {
+                                prompt_req_id: 1,
+                                outcome: PromptOutcome::Error {
+                                    code: -32603,
+                                    message: message.into(),
+                                    data: None,
+                                },
+                            }
+                        }
+                        frame => panic!("unexpected resumed-session request: {frame:?}"),
+                    };
+                    control_protocol::write_frame(&mut peer, &reply)
+                        .await
+                        .unwrap();
+                }
+            };
+            let daemon = async {
+                let mut client = AcpClient::attach(
+                    socket,
+                    tmp.path().into(),
+                    vec![],
+                    "sid-stored".into(),
+                    false,
+                    AcpSessionId("resume".into()),
+                    None,
+                    "codex".into(),
+                    None,
+                )
+                .await
+                .unwrap();
+                client.send_prompt("continue", &[]).await.unwrap();
+                let mut recovery = Vec::new();
+                while let Some(event) = client.next_event().await {
+                    match event {
+                        Event::SessionContextReset { .. } => recovery.push("reset"),
+                        Event::Stopped { reason } => {
+                            assert_eq!(reason, "stored_session_rejected");
+                            recovery.push("stopped");
+                        }
+                        Event::AgentStartupError { message: error } => {
+                            assert!(error.contains(message), "{error}");
+                            recovery.push("error");
+                        }
+                        _ => {}
+                    }
+                }
+                assert_eq!(
+                    recovery,
+                    if should_reset {
+                        vec!["reset", "stopped"]
+                    } else {
+                        vec!["error"]
+                    },
+                    "{message}",
+                );
+                let _ = client.shutdown().await;
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(runner, daemon);
+            })
+            .await
+            .expect("attach recovery must finish and close its control socket");
+        }
+    }
+
     /// A waiterless completion for an adopted turn publishes its terminal
     /// event and disarms the resume-idle watchdog.
     #[tokio::test]

@@ -25,6 +25,7 @@ use super::reducer::{
     AcpTranscript, NoteKind, PendingApproval, ToolCallRow, ToolCompletion, ToolOutcome,
 };
 use super::state::{FileIndex, StructuredViewState, ViewLayout};
+use crate::acp::approvals::{tool_target, ToolTarget, CMD_KEYS, PATH_KEYS};
 use crate::acp::session_paths::{relative_display_path, SessionPathRoots};
 use crate::acp::state::{SessionUsage, ToolOutputBlock};
 use crate::acp::transcript::{TranscriptRow, TranscriptRowKind};
@@ -376,16 +377,18 @@ fn approval_actions_line(theme: &Theme, active: bool, choice: bool) -> Line<'sta
 
 fn approval_target(row: &PendingApproval, path_roots: Option<&SessionPathRoots>) -> String {
     let args = parse_args_object(&row.args);
-    match row.kind.as_str() {
-        "edit" | "write" | "read" | "delete" | "move" => pick_str(args.as_ref(), PATH_KEYS)
-            .map(|path| relative_display_path(path, path_roots))
-            .unwrap_or_default(),
-        "execute" => pick_str(args.as_ref(), CMD_KEYS)
-            .and_then(|command| command.lines().next())
-            .unwrap_or_default()
-            .to_string(),
-        _ => String::new(),
-    }
+    display_tool_target(&row.kind, args.as_ref(), path_roots).unwrap_or_default()
+}
+
+fn display_tool_target(
+    kind: &str,
+    args: Option<&serde_json::Map<String, serde_json::Value>>,
+    path_roots: Option<&SessionPathRoots>,
+) -> Option<String> {
+    Some(match tool_target(kind, args?)? {
+        ToolTarget::Path(path) => relative_display_path(path, path_roots),
+        ToolTarget::Command(command) => command.to_owned(),
+    })
 }
 
 /// Most picker rows visible at once before the list windows around the
@@ -1537,14 +1540,9 @@ fn truncate_chars(s: &str, max_chars: usize) -> Option<String> {
     }
 }
 
-/// Arg-name variants the agents use for a tool's primary path, command,
-/// and edit before/after text. Mirrors the web structured view's `pickStr` key
-/// lists in `web/src/components/acp/ToolCards.tsx` so the TUI and the
-/// dashboard surface the same field across agent versions.
-const PATH_KEYS: &[&str] = &["path", "file_path", "filePath", "filename"];
+/// Edit payload variants shared with the web tool cards.
 const OLD_KEYS: &[&str] = &["old_string", "oldString", "old_str"];
 const NEW_KEYS: &[&str] = &["new_string", "newString", "new_str", "content"];
-const CMD_KEYS: &[&str] = &["command", "cmd", "args"];
 
 /// +/- lines beyond this budget collapse into a "+N more" footer so a
 /// large Edit can't flood the transcript on a narrow terminal.
@@ -1615,14 +1613,7 @@ fn compact_tool_line(
     let target = if let Some(diff) = tool.diffs.first() {
         Some(relative_display_path(&diff.path, path_roots))
     } else {
-        match tool.kind.as_str() {
-            "edit" | "write" | "read" | "delete" | "move" => pick_str(args.as_ref(), PATH_KEYS)
-                .map(|path| relative_display_path(path, path_roots)),
-            "execute" => pick_str(args.as_ref(), CMD_KEYS)
-                .and_then(|command| command.lines().next())
-                .map(ToString::to_string),
-            _ => None,
-        }
+        display_tool_target(&tool.kind, args.as_ref(), path_roots)
     };
     let mut spans = vec![
         Span::styled("✓ ", Style::default().fg(theme.running)),

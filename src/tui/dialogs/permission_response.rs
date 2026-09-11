@@ -53,13 +53,9 @@ pub enum PermissionResponseChoice {
     Deny,
 }
 
-/// What a structured (ACP) approval is asking to do, shown in the dialog body
-/// so the user sees the tool and target without entering the structured view.
-/// `None` for the terminal keystroke path, whose prompt the user has already
-/// seen on the session pane.
 struct StructuredApprovalDetail {
-    /// One-line "tool: target" summary, or just the tool when no target.
-    summary: String,
+    tool_name: String,
+    target: String,
     destructive: bool,
 }
 
@@ -91,27 +87,19 @@ impl PermissionResponseDialog {
         Self::build(session_title, allow_always.is_some(), None)
     }
 
-    /// Construct the shared dialog for a structured (ACP) approval, which
-    /// always supports the protocol's AllowAlways decision. `tool_name` /
-    /// `target` / `destructive` come from the daemon's pending-approval
-    /// projection and are shown in the body so the user sees what they are
-    /// answering without opening the structured view.
+    /// Show the ACP tool, target and destructive flag before resolving its request.
     pub fn structured(
         session_title: &str,
         tool_name: &str,
         target: &str,
         destructive: bool,
     ) -> Self {
-        let summary = if target.is_empty() {
-            tool_name.to_string()
-        } else {
-            format!("{tool_name}: {target}")
-        };
         Self::build(
             session_title,
             true,
             Some(StructuredApprovalDetail {
-                summary,
+                tool_name: tool_name.to_owned(),
+                target: target.to_owned(),
                 destructive,
             }),
         )
@@ -186,40 +174,37 @@ impl PermissionResponseDialog {
             ])
             .split(inner);
 
-        let mut header_lines = vec![Line::from(Span::styled(
-            self.session_title.clone(),
+        use crate::tui::components::text::truncate_to_width;
+
+        let width = chunks[0].width as usize;
+        let mut header_lines = Vec::with_capacity(3);
+        header_lines.push(Line::from(Span::styled(
+            truncate_to_width(&self.session_title, width),
             Style::default().fg(theme.title).bold(),
-        ))];
+        )));
         match &self.detail {
-            // Structured (ACP) path: show what is being approved. Nothing is
-            // sent as keystrokes here, so the terminal guidance would be wrong.
             Some(detail) => {
-                let summary_color = if detail.destructive {
-                    theme.error
+                let warning = if detail.destructive {
+                    "destructive: "
                 } else {
-                    theme.text
+                    ""
                 };
-                let mut summary = detail.summary.clone();
-                if detail.destructive {
-                    summary.push_str("  · destructive");
-                }
+                header_lines.push(Line::from(vec![
+                    Span::styled(warning, Style::default().fg(theme.error).bold()),
+                    Span::styled(
+                        truncate_to_width(&detail.tool_name, width.saturating_sub(warning.len())),
+                        Style::default().fg(theme.text),
+                    ),
+                ]));
                 header_lines.push(Line::from(Span::styled(
-                    summary,
-                    Style::default().fg(summary_color),
-                )));
-                header_lines.push(Line::from(Span::styled(
-                    "Resolves the agent's pending permission request.",
-                    Style::default().fg(theme.dimmed),
-                )));
-            }
-            // Terminal path: the user has already seen the CLI prompt on the
-            // pane; AoE just replays the agent's keystrokes.
-            None => {
-                header_lines.push(Line::from(Span::styled(
-                    "AoE sends these as raw keystrokes; make sure the prompt is on screen.",
-                    Style::default().fg(theme.dimmed),
+                    truncate_to_width(&detail.target, width),
+                    Style::default().fg(theme.text),
                 )));
             }
+            None => header_lines.push(Line::from(Span::styled(
+                "AoE sends these as raw keystrokes; make sure the prompt is on screen.",
+                Style::default().fg(theme.dimmed),
+            ))),
         }
         let header = Paragraph::new(header_lines).wrap(Wrap { trim: false });
         frame.render_widget(header, chunks[0]);
@@ -402,37 +387,40 @@ mod tests {
     }
 
     #[test]
-    fn structured_dialog_shows_target_and_destructive_not_keystroke_hint() {
+    fn structured_dialog_keeps_approval_context_visible_with_long_labels() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
         let theme = crate::tui::styles::load_theme_with_mode("empire", false);
-        let mut dialog =
-            PermissionResponseDialog::structured("session-one", "Bash", "rm -rf build", true);
-        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
-        terminal
-            .draw(|f| dialog.render(f, f.area(), &theme))
-            .unwrap();
-        let out =
+        let long_title = "session-one ".repeat(30);
+        let long_tool = "Bash".repeat(30);
+        let long_target = format!("rm -rf build/{}", "deep/".repeat(40));
+        for (title, tool, target) in [
+            ("session-one", "Bash", "rm -rf build"),
+            (long_title.as_str(), "Bash", long_target.as_str()),
+            ("session-one", long_tool.as_str(), "rm -rf build"),
+        ] {
+            let mut dialog = PermissionResponseDialog::structured(title, tool, target, true);
+            let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
             terminal
-                .backend()
-                .buffer()
-                .content()
-                .iter()
-                .fold(String::new(), |mut acc, cell| {
+                .draw(|f| dialog.render(f, f.area(), &theme))
+                .unwrap();
+            let out = terminal.backend().buffer().content().iter().fold(
+                String::new(),
+                |mut acc, cell| {
                     acc.push_str(cell.symbol());
                     acc
-                });
-        // The body names the tool, the target, and the destructive flag, and
-        // drops the terminal-only "raw keystrokes" guidance that is wrong here.
-        assert!(out.contains("Bash: rm -rf build"), "target missing:\n{out}");
-        assert!(
-            out.contains("destructive"),
-            "destructive marker missing:\n{out}"
-        );
-        assert!(
-            !out.contains("raw keystrokes"),
-            "structured dialog must not show the keystroke guidance:\n{out}"
-        );
+                },
+            );
+            for context in [
+                "session-one",
+                "Bash",
+                "rm -rf build",
+                "destructive",
+                "[Allow]",
+            ] {
+                assert!(out.contains(context), "missing {context:?}:\n{out}");
+            }
+        }
     }
 }

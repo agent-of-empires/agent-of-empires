@@ -102,6 +102,25 @@ jobs:
             --test integration -- daemon_core_web_optional plugin_install
           cargo test --features web,e2e-tests --lib -- \
             server::assets:: tui::dialogs::serve::qr_seam
+      # macOS reaches its per-user temp root through a symlink, so a test that
+      # compares `TempDir::path()` against a path that has been through
+      # `canonicalize()` or a reported cwd passes on Linux and fails there.
+      # That asymmetry has broken main twice (#3535, #3919), and the macOS
+      # leg only runs post-merge, so nothing catches it on the PR. Pointing
+      # TMPDIR at a symlink reproduces the difference on the leg that runs the
+      # unit tests, where this class lives.
+      #
+      # Scoped to core-rest deliberately: lib + bins + integration were measured
+      # clean under a symlinked root, the e2e legs were not, and those are the
+      # ones binding sockets under `temp_dir()`. Keep the path short for the
+      # same reason (`sun_path` is 104 bytes on macOS, and src/tmux/vt.rs binds
+      # inside `temp_dir()`).
+      - name: Symlinked temp root
+        if: matrix.leg == 'core-rest'
+        run: |
+          mkdir -p /tmp/aoe-real
+          ln -sfn /tmp/aoe-real /tmp/aoe-link
+          echo "TMPDIR=/tmp/aoe-link" >> "$GITHUB_ENV"
       # core-rest: the full default-feature suite minus e2e (lib + bins +
       # the consolidated integration binary). The daemon is core, so this
       # leg covers it end to end with no dashboard bundle and no npm in the
@@ -109,7 +128,11 @@ jobs:
       # skipped here while every non-e2e test binary stays auto-discovered.
       - name: Cargo test (default features, everything except e2e)
         if: matrix.leg == 'core-rest'
-        run: cargo test
+        # Echo the temp root so a silently-dropped TMPDIR is visible in the log
+        # rather than passing as a green run with the guard gone.
+        run: |
+          echo "TMPDIR=${TMPDIR:-unset}"
+          cargo test
       # bare-core: the three no-default-features feature corners. `web` is not
       # a default feature, so these runs are also the dashboard-off compile
       # gate that keeps the `cfg(feature = "web")` sites from rotting.

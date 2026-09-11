@@ -11,20 +11,13 @@ pub(super) fn tmux_env_session_name_for_instance_id(instance_id: &str) -> Option
     )
 }
 
-/// What one live scan says about `instance_id`'s panes, for seeding a
-/// session-id poller.
-///
-/// [`tmux_env_session_name_for_instance_id`] answers "does this row have any
-/// live pane", which a terminal outliving its agent satisfies. A poller needs
-/// the agent pane specifically: seeded with a terminal it would probe that
-/// pane as alive forever (#3880). It also needs to tell "no agent yet" from
-/// "no agent any more", since only the first is a reason to fall back to the
-/// title-derived name.
+/// Live-scan result for seeding a session-id poller.
+/// Only an empty or unavailable scan permits a title-derived fallback.
 pub(crate) enum AgentSeed {
-    /// The live agent session for the id.
+    /// The unique live agent session for the id.
     Agent(String),
-    /// Panes are live for the id, none of them the agent.
-    OtherKindOnly,
+    /// Live panes exist, but no unique eligible agent can be selected.
+    NoUniqueAgent,
     /// Nothing live for the id, or the tmux server could not be reached.
     NothingLive,
 }
@@ -47,7 +40,7 @@ pub(super) fn live_agent_seed_for_instance_id(instance_id: &str) -> AgentSeed {
     )
     .is_some()
     {
-        return AgentSeed::OtherKindOnly;
+        return AgentSeed::NoUniqueAgent;
     }
     AgentSeed::NothingLive
 }
@@ -95,9 +88,7 @@ impl Instance {
         tmux_env_session_name_for_instance_id(&self.id)
     }
 
-    /// [`Self::has_live_agent_pane_in`] as a fresh probe, answering with the
-    /// agent session's name and, failing that, whether anything else for this
-    /// row is still live.
+    /// Fresh agent-seed classification, including live panes with no unique eligible agent.
     pub(crate) fn live_agent_seed(&self) -> AgentSeed {
         live_agent_seed_for_instance_id(&self.id)
     }

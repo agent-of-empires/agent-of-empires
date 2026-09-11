@@ -3,6 +3,9 @@ import { ensureThemeLoaded, getHighlighter, langImportForPath, type ThemedToken 
 import type { RichDiffHunk } from "../lib/types";
 import { useShikiTheme } from "./useShikiTheme";
 
+// Highlights on the main thread via `lib/highlighter`, not the diff pane's
+// worker pool. See #3913.
+
 /** A single token with content and an optional foreground color. */
 export interface SyntaxToken {
   content: string;

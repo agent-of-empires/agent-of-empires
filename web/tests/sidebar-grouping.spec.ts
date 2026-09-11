@@ -78,6 +78,19 @@ async function stubOwnerAvatars(page: Page) {
   await page.route("https://github.com/**", (r) => r.fulfill({ status: 404, body: "" }));
 }
 
+// A theme token as the browser reports it on a painted element, so a
+// computed `rgb(...)` can be compared against the projected hex.
+async function resolvedColor(page: Page, token: string): Promise<string> {
+  return await page.evaluate((name) => {
+    const probe = document.createElement("span");
+    probe.style.color = `var(${name})`;
+    document.body.append(probe);
+    const rgb = getComputedStyle(probe).color;
+    probe.remove();
+    return rgb;
+  }, token);
+}
+
 async function gotoDesktop(page: Page) {
   await page.setViewportSize({ width: 1280, height: 720 });
   await page.goto("/");
@@ -159,6 +172,32 @@ test.describe("sidebar repo groups (#1220)", () => {
     await expandBtn.click();
     await expect(expandBtn).toHaveAttribute("aria-expanded", "true");
     await expect(page.getByText("alpha-session")).toBeVisible();
+  });
+
+  test("a collapsed group marks that it holds the open session (#3912)", async ({ page }) => {
+    await installSidebarMocks(page, { sessions: twoRepoSessions() });
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.goto("/session/s-a");
+
+    const alphaHeader = page.locator(HEADER, { has: page.getByText("repo-alpha") });
+    const betaHeader = page.locator(HEADER, { has: page.getByText("repo-beta") });
+    const expandBtn = alphaHeader.locator("button[aria-expanded]");
+
+    // Expanded, the open session's own row carries the frame, so the
+    // header stays unmarked.
+    await expect(expandBtn).toHaveAttribute("aria-expanded", "true");
+    expect(await alphaHeader.getAttribute("class")).not.toContain("border-session-active");
+
+    // Collapsed, the header is the only remaining cue. It has to paint in
+    // the projected token: `border-brand-600` sits at 2.04:1 against the
+    // sidebar panel on catppuccin-latte, under the non-text floor.
+    await expandBtn.click();
+    await expect(page.getByText("alpha-session")).toBeHidden();
+    expect(await alphaHeader.getAttribute("class")).toContain("border-session-active");
+    expect(await betaHeader.getAttribute("class")).not.toContain("border-session-active");
+    // `toHaveCSS` polls, which matters here: the header transitions its
+    // colors, so a one-shot read lands mid-interpolation from currentColor.
+    await expect(alphaHeader).toHaveCSS("border-left-color", await resolvedColor(page, "--color-session-active"));
   });
 });
 

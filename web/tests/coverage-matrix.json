@@ -100,6 +100,9 @@
         "web/src/App.tsx",
         "web/src/components/MobileLiveTerminal.tsx",
         "web/src/components/MobileTerminalToolbar.tsx",
+        "web/src/components/MobileMainPane.tsx",
+        "web/src/components/PairedTerminal.tsx",
+        "web/src/components/TerminalSessionStack.tsx",
         "web/src/lib/mobileKeyboardProxy.ts"
       ]
     },
@@ -192,8 +195,19 @@
       "id": "terminal.live-clickable-urls",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/lib/liveTermLines.test.ts", "src/components/__tests__/MobileLiveTerminal.linkify.test.tsx"],
+      "specs": [
+        "src/lib/liveTermLines.test.ts",
+        "src/components/__tests__/MobileLiveTerminal.linkify.test.tsx",
+        "src/components/__tests__/MobileLiveTerminal.forward.test.tsx"
+      ],
       "components": ["web/src/components/MobileLiveTerminal.tsx"]
+    },
+    {
+      "id": "terminal.live-clickable-urls-e2e",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/live-link-click.spec.ts"],
+      "components": ["web/src/components/MobileLiveTerminal.tsx", "web/src/lib/liveTermLines.ts"]
     },
     {
       "id": "terminal.live-cursor-wide-chars",
@@ -3538,6 +3552,17 @@
       "risk": "high",
       "specs": ["tests/sidebar-multi-select.spec.ts"],
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
+      "id": "sidebar.active-row-indicator",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "src/lib/__tests__/sessionRowChrome.test.ts",
+        "tests/sidebar-multi-session.spec.ts",
+        "tests/sidebar-grouping.spec.ts"
+      ],
+      "components": ["web/src/lib/sessionRowChrome.ts", "web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "sidebar.bulk-triage-live",

@@ -434,3 +434,37 @@ describe("MobileLiveTerminal forward-mode flick momentum", () => {
     }
   });
 });
+
+describe("MobileLiveTerminal link clicks in forward mode", () => {
+  const linkFrame = () =>
+    frame({ content: "see https://example.com/x\n", altScreen: true, mouse: true, mouseSgr: true });
+
+  it("lets a primary press on a linkified URL reach the anchor", () => {
+    // Forwarding a press calls preventDefault and captures the pointer on the
+    // scroller, which retargets the click away from the anchor and leaves the
+    // link inert (#3918).
+    const { container, forwardButton } = renderTerm(linkFrame());
+    const anchor = container.querySelector("a[href='https://example.com/x']") as HTMLElement;
+    expect(anchor).not.toBeNull();
+    // A real press lands on one of the anchor's cell spans, not the anchor.
+    const target = anchor.querySelector("span") as HTMLElement;
+    expect(target).not.toBeNull();
+    const down = fireEvent.pointerDown(target, { pointerType: "mouse", button: 0, clientX: 10, clientY: 10 });
+    expect(down).toBe(true); // not defaultPrevented
+    fireEvent.pointerUp(anchor, { pointerType: "mouse", button: 0, clientX: 10, clientY: 10 });
+    expect(forwardButton).not.toHaveBeenCalled();
+  });
+
+  it("still forwards a press on plain output", () => {
+    const { scroller, forwardButton } = renderTerm(linkFrame());
+    fireEvent.pointerDown(scroller, { pointerType: "mouse", button: 0, clientX: 10, clientY: 10 });
+    expect(forwardButton).toHaveBeenCalled();
+  });
+
+  it("still forwards a right-click on a link so the app keeps its own menu", () => {
+    const { container, forwardButton } = renderTerm(linkFrame());
+    const anchor = container.querySelector("a[href='https://example.com/x']") as HTMLElement;
+    fireEvent.pointerDown(anchor, { pointerType: "mouse", button: 2, clientX: 10, clientY: 10 });
+    expect(forwardButton.mock.calls[0]![0]).toBe(2);
+  });
+});

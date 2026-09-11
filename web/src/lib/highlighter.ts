@@ -1,30 +1,19 @@
 import type { HighlighterCore, ThemedToken } from "shiki";
 import { createHighlighterCore } from "shiki/core";
 import { createOnigurumaEngine } from "shiki/engine/oniguruma";
+// Shiki's own registry of the themes it bundles, keyed by theme id, each entry
+// a lazy import that code-splits on demand. Reading it means any AoE theme,
+// builtin or user-authored, can name any theme shiki ships. The import costs
+// the id table, not the theme modules behind it.
+import { bundledThemes, type BundledTheme } from "shiki/themes";
 
 let instance: HighlighterCore | null = null;
 let loading: Promise<HighlighterCore> | null = null;
 
-/** Shiki theme module imports for every theme an AoE-resolved theme
- *  can name. Unknown values fall back to `DEFAULT_SHIKI_THEME`. Lazy
- *  imports so users on Empire don't pay for the Dracula/Tokyo Night
- *  modules they never see. */
-const SHIKI_THEME_IMPORTS: Record<string, () => Promise<unknown>> = {
-  "github-dark": () => import("shiki/themes/github-dark.mjs"),
-  "github-light": () => import("shiki/themes/github-light.mjs"),
-  "github-dark-dimmed": () => import("shiki/themes/github-dark-dimmed.mjs"),
-  "tokyo-night": () => import("shiki/themes/tokyo-night.mjs"),
-  "catppuccin-latte": () => import("shiki/themes/catppuccin-latte.mjs"),
-  dracula: () => import("shiki/themes/dracula.mjs"),
-  "rose-pine": () => import("shiki/themes/rose-pine.mjs"),
-  "material-theme-ocean": () => import("shiki/themes/material-theme-ocean.mjs"),
-};
-
-/** Fallback Shiki themes when the resolver names a theme this bundle
- *  doesn't carry (user-defined themes with arbitrary shiki_theme
- *  entries). Picked by appearance so a light AoE theme falling back
- *  doesn't end up rendering code on a light surface with a dark
- *  syntax theme. */
+/** Fallback Shiki themes for a `shiki_theme` value shiki doesn't ship
+ *  (a user-defined theme naming something arbitrary, or a typo). Picked
+ *  by appearance so a light AoE theme falling back doesn't end up
+ *  rendering code on a light surface with a dark syntax theme. */
 export const DEFAULT_SHIKI_THEME = "github-dark";
 export const DEFAULT_SHIKI_THEME_LIGHT = "github-light";
 
@@ -37,6 +26,10 @@ export function fallbackShikiTheme(appearance: "dark" | "light" | undefined): st
  * via `loadLanguage()` so the initial bundle stays small. The default
  * theme is bundled at construction time; switch to another bundled
  * theme via `ensureThemeLoaded`.
+ *
+ * This is the second highlighter in the dashboard: the diff pane runs
+ * `@pierre/diffs`' own shared instance in a worker. See #3913 for
+ * collapsing the two.
  */
 export async function getHighlighter(): Promise<HighlighterCore> {
   if (instance) return instance;
@@ -52,6 +45,22 @@ export async function getHighlighter(): Promise<HighlighterCore> {
   return loading;
 }
 
+/** `Object.hasOwn` rather than a truthy lookup so an arbitrary
+ *  `shiki_theme` string cannot reach an inherited property. */
+function isBundledTheme(name: string): name is BundledTheme {
+  return Object.hasOwn(bundledThemes, name);
+}
+
+const warnedUnknownThemes = new Set<string>();
+
+/** A theme naming a palette shiki doesn't ship is almost always a typo, and
+ *  the fallback is otherwise silent. Warn once per id, not per render. */
+function warnUnknownTheme(name: string): void {
+  if (warnedUnknownThemes.has(name)) return;
+  warnedUnknownThemes.add(name);
+  console.warn(`shiki_theme "${name}" is not a theme Shiki bundles; falling back.`);
+}
+
 /** Lazy-load a Shiki theme module and register it on the singleton
  *  highlighter. Returns the name the caller should pass to
  *  `codeToHtml` / `codeToTokens`: the requested name if it loaded
@@ -59,8 +68,11 @@ export async function getHighlighter(): Promise<HighlighterCore> {
  *  (`github-dark` / `github-light`) so a light AoE theme isn't
  *  rendered with a dark syntax palette. Idempotent. */
 export async function ensureThemeLoaded(name: string, appearance?: "dark" | "light"): Promise<string> {
-  const importer = SHIKI_THEME_IMPORTS[name];
-  if (!importer) return fallbackShikiTheme(appearance);
+  if (!isBundledTheme(name)) {
+    warnUnknownTheme(name);
+    return fallbackShikiTheme(appearance);
+  }
+  const importer = bundledThemes[name];
   const hl = await getHighlighter();
   if (hl.getLoadedThemes().includes(name)) return name;
   try {

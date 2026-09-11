@@ -88,6 +88,7 @@ import { useWebSettings } from "../hooks/useWebSettings";
 import { exceedsTouchSlop } from "../lib/longPress";
 import { useUnreadIndicatorEnabled } from "../lib/unreadIndicator";
 import { computeSessionRowTag, useSessionRowTagMode } from "../lib/sessionRowTag";
+import { sessionRowChromeClass } from "../lib/sessionRowChrome";
 import { useSessionColorsEnabled } from "../lib/sessionColors";
 import { SidebarCompactContext, useSidebarCompact } from "../lib/sidebarCompact";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
@@ -1595,13 +1596,7 @@ export const SessionRow = memo(function SessionRow({
         data-selected={isSelected || undefined}
         className={`block w-full text-left py-2 cursor-pointer select-none [-webkit-touch-callout:none] transition-colors duration-75 ${
           compact ? (indented ? "pl-3 pr-1" : "px-2") : indented ? "pl-6 pr-3" : "px-3"
-        } ${
-          isActive
-            ? "bg-surface-850 border-l-2 border-brand-600"
-            : "border-l-2 border-transparent hover:bg-surface-700/40"
-        } ${
-          isSelected ? "ring-1 ring-inset ring-brand-500/60 bg-brand-500/10" : ""
-        } ${isDeleting ? "opacity-50 pointer-events-none" : ""}`}
+        } ${sessionRowChromeClass(isActive, isSelected)} ${isDeleting ? "opacity-50 pointer-events-none" : ""}`}
       >
         {isSelected && <span className="sr-only">Selected</span>}
         <div className="flex items-center gap-2">
@@ -2863,7 +2858,7 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader({
         data-testid="sidebar-group-header"
         data-group-id={group.id}
         className={`flex items-center gap-2 px-3 py-2 transition-colors duration-75 text-text-secondary ${headerHoverClass} ${
-          hasActiveChild ? "border-l-2 border-brand-600" : ""
+          hasActiveChild ? "border-l-2 border-session-active" : ""
         }`}
         style={headerStyle}
       >
@@ -2907,7 +2902,7 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader({
         onKeyDown={hasMenu ? handleHeaderKeyDown : undefined}
         onClickCapture={suppressClickAfterDrag}
         className={`group flex items-center gap-2 ${compact ? "px-2" : "px-3"} py-2 transition-colors duration-75 text-text-secondary focus:outline-none focus:ring-2 focus:ring-brand-600 ${headerHoverClass} ${
-          hasActiveChild ? "border-l-2 border-brand-600" : ""
+          hasActiveChild ? "border-l-2 border-session-active" : ""
         }`}
         style={headerStyle}
         // The whole row is the drag activator (no grip). Mirrors SessionRow:

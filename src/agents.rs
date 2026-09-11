@@ -87,6 +87,21 @@ pub enum SessionCaptureBackend {
     PrimeAgent,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionIdentityPublisher {
+    Extension { root_only: bool },
+}
+
+impl SessionCaptureBackend {
+    pub(crate) const fn identity_publisher(self) -> Option<SessionIdentityPublisher> {
+        match self {
+            Self::Pi => Some(SessionIdentityPublisher::Extension { root_only: false }),
+            Self::PrimeAgent => Some(SessionIdentityPublisher::Extension { root_only: true }),
+            _ => None,
+        }
+    }
+}
+
 /// Authority available in one launch environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionCaptureContext {
@@ -1445,7 +1460,10 @@ pub const AGENTS: &[AgentDef] = &[
         instruction_flag: Some("--append-system-prompt {}"),
         set_default_command: false,
         detect_status: status_detection::detect_hook_only_status,
-        container_env: &[("PRIME_AGENT_CODING_AGENT_DIR", "/root/.prime/agent")],
+        container_env: &[(
+            "PRIME_AGENT_CODING_AGENT_DIR",
+            crate::session::config::container_config::PRIME_AGENT_DIR_IN_CONTAINER,
+        )],
         // Level 3 (hooks) is skipped by design: upstream has no hook system
         // at all (no Claude/Codex/Kiro-style config file to write), so status
         // stays on the stub below.

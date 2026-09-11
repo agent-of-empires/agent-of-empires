@@ -87,7 +87,7 @@ aoe theme list                      # show all available themes
 aoe theme dir                       # print the custom themes directory
 ```
 
-The schema is flat and every field is optional. Missing color fields fall back to the Empire baseline; an omitted `appearance` or `[syntax].shiki_theme` is derived from the theme's background luminance rather than copied from Empire. Color fields cover background, borders, text, status semantics, diff colors, branch/sandbox chips, and accent. `appearance = "dark" | "light"` and `[syntax].shiki_theme` control the web dashboard's surface ramp and code-block syntax theme.
+The schema is flat and every field is optional. Missing color fields fall back to the Empire baseline; an omitted `appearance` or `[syntax].shiki_theme` is derived from the theme's background luminance rather than copied from Empire. Color fields cover background, borders, text, status semantics, diff colors, branch/sandbox chips, and accent. `appearance = "dark" | "light"` and `[syntax].shiki_theme` control the web dashboard's surface ramp and code-block syntax theme. `shiki_theme` accepts any theme id [Shiki bundles](https://shiki.style/themes); a name it does not ship falls back to `github-dark` or `github-light` by appearance.
 
 ## Session
 
@@ -110,6 +110,7 @@ prevent_sleep_idle_grace_minutes = 15  # release once every session has been idl
 [acp.acp_defaults.opencode]
 model = "openai/gpt-5.5"
 # pin_model = true        # make `model` a pin: creation refuses any other model
+# Empty or whitespace-only model values are unset, including with pin_model.
 effort = "high"           # default thinking level
 mode = "plan"             # default mode, applied when the agent advertises one
 

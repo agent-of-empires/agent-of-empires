@@ -86,6 +86,10 @@ content. It is denser and quieter than the marketing site.
 - Use semantic theme tokens such as `bg-surface-900`,
   `text-status-running`, and `border-surface-700`.
 - All body text must meet WCAG AA contrast against its surface.
+- The open session's sidebar row must meet WCAG's 3:1 non-text contrast
+  against every surface its indicator can sit on. A surface-ramp step alone
+  does not reach it, so the row uses the `session-active` token, which the
+  projection lifts from the theme accent until it clears that floor.
 - Prefer instant state changes or `transition-colors`. Named motion is limited
   to existing fade, slide, and terminal-cursor behavior.
 - Fixed palette colors are allowed only when hue carries meaning, such as
