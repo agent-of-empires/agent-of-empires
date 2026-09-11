@@ -329,10 +329,11 @@ impl AcpTranscript {
             })
             .unwrap_or_default();
 
-        // The status banner only renders while a turn is running, so the
-        // phases that end one (stopped, startup / prompt errors) never reach
-        // the screen. Compaction outranks thinking: the adapter goes silent
-        // for 90 to 170 seconds there and the user needs to know why.
+        // The status banner only renders while a turn is running or a
+        // background sub-agent is active, so the phases that end one
+        // (stopped, startup / prompt errors) never reach the screen.
+        // Compaction outranks thinking: the adapter goes silent for 90 to
+        // 170 seconds there and the user needs to know why.
         self.status_text = if state.compacting {
             Some("compacting…".to_string())
         } else if state.thinking.is_some() {

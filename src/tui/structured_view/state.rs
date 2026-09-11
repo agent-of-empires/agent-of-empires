@@ -345,9 +345,6 @@ impl StructuredViewState {
         self.plugin_notify.pending.pop_front()
     }
 
-    /// Whether the agent is working, for display and for Esc-to-cancel.
-    /// Busy when the agent is mid-turn, a POST is in flight, or the
-    /// WebSocket is down (no handle).
     /// Whether the composer should treat Enter as send-vs-park and whether
     /// the empty-Enter queue resync should fire. Tracks only the main turn
     /// (and the connection/POST state), not a display-only background
