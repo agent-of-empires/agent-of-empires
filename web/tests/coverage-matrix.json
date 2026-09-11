@@ -1966,6 +1966,17 @@
       ]
     },
     {
+      "id": "acp.background-agent-composer",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/acp-background-agent-composer.spec.ts"],
+      "components": [
+        "web/src/components/acp/AcpRuntime.tsx",
+        "web/src/components/acp/Composer.tsx",
+        "web/src/lib/acpTypes.ts"
+      ]
+    },
+    {
       "id": "acp.memory-recall",
       "kind": "live-playwright",
       "risk": "medium",

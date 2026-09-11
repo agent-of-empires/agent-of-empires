@@ -373,7 +373,7 @@ describe("applyEvent / background agents", () => {
     expect(s.backgroundAgents[0]!.result).toBe("done");
   });
 
-  it("freezes the elapsed timer when an agent stalls and clears it if it resumes", () => {
+  it("a stall does not set endedAt (matches the Rust reducer, #3900): the elapsed timer keeps ticking rather than freezing", () => {
     let s = emptyAcpState();
     s = applyEvent(s, {
       session_id: "s-1",
@@ -398,7 +398,9 @@ describe("applyEvent / background agents", () => {
       },
     });
     expect(s.backgroundAgents[0]!.status).toBe("stalled");
-    expect(s.backgroundAgents[0]!.endedAt).toBe("2026-06-27T00:01:30Z");
+    // Only the terminal BackgroundAgentCompleted sets endedAt, never a
+    // non-terminal Progress; the tailer may still resolve this to Completed.
+    expect(s.backgroundAgents[0]!.endedAt).toBeNull();
     s = applyEvent(s, {
       session_id: "s-1",
       seq: 3,
