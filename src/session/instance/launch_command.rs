@@ -1002,9 +1002,12 @@ mod tests {
             "wrapped command failed: {}",
             String::from_utf8_lossy(&output.stderr),
         );
+        // `pwd` prints the logical path on BSD and the physical one under GNU
+        // coreutils, so compare the directories rather than their spellings.
+        let printed = String::from_utf8_lossy(&output.stdout);
         assert_eq!(
-            String::from_utf8_lossy(&output.stdout).trim(),
-            working_dir.to_string_lossy(),
+            std::path::Path::new(printed.trim()).canonicalize().unwrap(),
+            working_dir.canonicalize().unwrap(),
         );
     }
 
