@@ -1320,6 +1320,11 @@ export function MobileLiveTerminal({
       if (e.pointerType !== "mouse" || !forwardModeRef.current || e.shiftKey) return;
       const base = e.button === 1 ? 1 : e.button === 2 ? 2 : e.button === 0 ? 0 : -1;
       if (base < 0) return;
+      // A primary press that lands on a linkified URL belongs to the browser.
+      // The preventDefault and pointer capture below would retarget the click
+      // to this container, so the anchor would never navigate (#3918). Other
+      // buttons still reach the app, which keeps its context menu suppression.
+      if (base === 0 && (e.target as Element | null)?.closest?.("a[href]")) return;
       e.preventDefault();
       // Keep the hidden input focused so the physical keyboard still types
       // even though we suppressed the click's default focus.

@@ -195,7 +195,11 @@
       "id": "terminal.live-clickable-urls",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/lib/liveTermLines.test.ts", "src/components/__tests__/MobileLiveTerminal.linkify.test.tsx"],
+      "specs": [
+        "src/lib/liveTermLines.test.ts",
+        "src/components/__tests__/MobileLiveTerminal.linkify.test.tsx",
+        "src/components/__tests__/MobileLiveTerminal.forward.test.tsx"
+      ],
       "components": ["web/src/components/MobileLiveTerminal.tsx"]
     },
     {
