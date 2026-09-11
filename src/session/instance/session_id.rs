@@ -2288,9 +2288,16 @@ process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
             "custom-sessions/children/child.jsonl",
             "Pi default path publication changed"
         );
+        // The extension resolves a relative session file against the process cwd,
+        // which Node reports with symlinks resolved (/var -> /private/var on macOS).
         assert_eq!(
             published["rootOnly"]["path"],
-            store.join("custom-sessions/parent.jsonl").to_str().unwrap()
+            store
+                .canonicalize()
+                .unwrap()
+                .join("custom-sessions/parent.jsonl")
+                .to_str()
+                .unwrap()
         );
 
         publish_root(child_id, "child.jsonl");
