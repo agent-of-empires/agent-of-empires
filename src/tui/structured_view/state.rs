@@ -348,11 +348,14 @@ impl StructuredViewState {
     /// Whether the agent is working, for display and for Esc-to-cancel.
     /// Busy when the agent is mid-turn, a POST is in flight, or the
     /// WebSocket is down (no handle).
+    /// Whether the composer should treat Enter as send-vs-park and whether
+    /// the empty-Enter queue resync should fire. Tracks only the main turn
+    /// (and the connection/POST state), not a display-only background
+    /// sub-agent signal (see `AcpTranscript.background_agent_active`), or an
+    /// idle main turn would suppress the resync while a sub-agent runs
+    /// (#3900).
     pub fn is_busy(&self) -> bool {
-        self.transcript.turn_active
-            || self.transcript.background_agent_active
-            || self.in_flight
-            || self.ws.is_none()
+        self.transcript.turn_active || self.in_flight || self.ws.is_none()
     }
 
     /// Drain the composer's current text and clear it so the user can
@@ -627,17 +630,6 @@ mod tests {
     fn busy_while_turn_active() {
         let mut state = test_state(None);
         state.transcript.turn_active = true;
-        assert!(state.is_busy());
-    }
-
-    /// #3900: a running background sub-agent must keep the busy indicator
-    /// lit even while `turn_active` itself is false (the main turn genuinely
-    /// idle, handed off to the sub-agent).
-    #[test]
-    fn busy_while_background_agent_active() {
-        let mut state = test_state(None);
-        state.transcript.background_agent_active = true;
-        assert!(!state.transcript.turn_active);
         assert!(state.is_busy());
     }
 
