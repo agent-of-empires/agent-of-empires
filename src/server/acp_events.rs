@@ -326,8 +326,10 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
         // `publish_persisted` folds this event into the control cache before
         // broadcasting the frame, so the cached `turn_active` already
         // reflects it (#3900).
-        let turn_active_after = state.acp_control_cache.turn_active(&frame.session_id);
-        let status_intent = derive_acp_status(frame.event.as_ref(), turn_active_after);
+        let background_agent_active_after = state
+            .acp_control_cache
+            .has_active_background_agent(&frame.session_id);
+        let status_intent = derive_acp_status(frame.event.as_ref(), background_agent_active_after);
         let acp_change = derive_acp_session_change(frame.event.as_ref());
         let load_session_capability = match (frame.event.as_ref(), frame.worker_generation) {
             (
@@ -568,6 +570,15 @@ pub(crate) fn apply_status_intent(
             // Running -> (trailing stop) Idle would strand a deliberate
             // Stop on Idle.
             if inst.status == Status::Stopped {
+                return;
+            }
+            s
+        }
+        // A background sub-agent's own progress does not speak to whatever
+        // the main turn is blocked on; leave a pending approval/elicitation
+        // showing Waiting until the main turn's own event resolves it.
+        StatusIntent::SetUnlessWaiting(s) => {
+            if matches!(inst.status, Status::Stopped | Status::Waiting) {
                 return;
             }
             s
@@ -930,19 +941,27 @@ pub(super) fn derive_acp_session_change(event: &crate::acp::Event) -> Option<Acp
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum StatusIntent {
     Set(Status),
+    /// Like `Set`, but a no-op while the sidebar is currently `Waiting`: a
+    /// background sub-agent's own progress does not speak to whatever the
+    /// main turn is blocked on (an approval or elicitation), so it must not
+    /// clobber that yellow dot. Used only for `BackgroundAgentLaunched` /
+    /// `BackgroundAgentProgress`, which otherwise arrive every ~1.5s for the
+    /// life of the sub-agent (#3900).
+    SetUnlessWaiting(Status),
     HealError,
 }
 
-/// `turn_active_after` is the session's folded `AcpState::turn_active`
-/// (checked by the caller) right after this event was applied to it.
-/// `AcpState::apply_event` already keeps `turn_active` true across a
-/// `Stopped` while a background sub-agent the turn spawned is still
-/// running, so this is the one place that verdict needs a second input
-/// beyond the event itself: `Stopped` and `BackgroundAgentCompleted` both
-/// resolve to Idle only once it reads false. See #3900.
+/// `background_agent_active_after` is `AcpState::has_active_background_agent()`
+/// (checked by the caller against the session's folded control state) right
+/// after this event was applied to it. `turn_active` itself tracks only the
+/// main turn (it gates prompt dispatch and the queue drain, see
+/// `AcpState::turn_active`'s doc comment), so this is the one place the
+/// sidebar's verdict needs a second, background-agent-scoped input beyond the
+/// event itself: `Stopped` and `BackgroundAgentCompleted` both resolve to
+/// Idle only once it reads false. See #3900.
 pub(crate) fn derive_acp_status(
     event: &crate::acp::Event,
-    turn_active_after: bool,
+    background_agent_active_after: bool,
 ) -> Option<StatusIntent> {
     use crate::acp::Event;
     match event {
@@ -959,12 +978,16 @@ pub(crate) fn derive_acp_status(
         | Event::AgentMessageChunk { .. }
         | Event::ToolCallStarted { .. } => Some(StatusIntent::Set(Status::Running)),
         // A launched or still-working background sub-agent keeps the sidebar
-        // dot lit even while the main turn is between its own events.
-        Event::BackgroundAgentLaunched { .. } => Some(StatusIntent::Set(Status::Running)),
+        // dot lit even while the main turn is between its own events. Must
+        // not override a pending approval/elicitation's Waiting dot, which
+        // speaks to the main turn, not the sub-agent (#3900).
+        Event::BackgroundAgentLaunched { .. } => {
+            Some(StatusIntent::SetUnlessWaiting(Status::Running))
+        }
         Event::BackgroundAgentProgress {
             status: crate::acp::state::BackgroundAgentStatus::Running,
             ..
-        } => Some(StatusIntent::Set(Status::Running)),
+        } => Some(StatusIntent::SetUnlessWaiting(Status::Running)),
         // A pending approval or elicitation both block the turn on the
         // user, so the sidebar dot goes yellow either way.
         Event::ApprovalRequested { .. } | Event::ElicitationRequested { .. } => {
@@ -981,18 +1004,28 @@ pub(crate) fn derive_acp_status(
         // running: it keeps working past its parent's `Stopped`, and the
         // sidebar dot must stay lit until that agent's own
         // `BackgroundAgentCompleted` clears it (#3900).
-        Event::Stopped { .. } => Some(StatusIntent::Set(if turn_active_after {
+        Event::Stopped { .. } => Some(StatusIntent::Set(if background_agent_active_after {
             Status::Running
         } else {
             Status::Idle
         })),
         // The last outstanding background agent finished. Only drops to Idle
-        // once none remain; a still-running sibling keeps the dot lit.
-        Event::BackgroundAgentCompleted { .. } => Some(StatusIntent::Set(if turn_active_after {
-            Status::Running
-        } else {
-            Status::Idle
-        })),
+        // once none remain; a still-running sibling keeps the dot lit. Safe
+        // against a cold-cache-miss forcing Idle prematurely: `Stopped`
+        // above already resolved Idle-vs-Running correctly for the main
+        // turn using this same accessor, so by the time a
+        // `BackgroundAgentCompleted` can read a confirmed `false` here, the
+        // main turn's own `Stopped` (if any) already applied the right
+        // verdict; a live main turn keeps re-asserting `Running` through its
+        // own `ThinkingStarted` / `AgentMessageChunk` / `ToolCallStarted`
+        // events regardless of this arm.
+        Event::BackgroundAgentCompleted { .. } => {
+            Some(StatusIntent::Set(if background_agent_active_after {
+                Status::Running
+            } else {
+                Status::Idle
+            }))
+        }
         Event::AgentStartupError { .. } => Some(StatusIntent::Set(Status::Error)),
         // A successful session/new or session/load means the agent
         // is alive. Heal a sticky Error banner so the sidebar dot
@@ -1933,8 +1966,9 @@ mod tests {
             Some(StatusIntent::Set(Status::Idle))
         );
         // A background sub-agent the main turn spawned is still running
-        // (the caller's `turn_active_after` reads true): the dot must stay
-        // lit rather than drop to Idle with the main turn's Stopped. #3900.
+        // (the caller's `background_agent_active_after` reads true): the dot
+        // must stay lit rather than drop to Idle with the main turn's
+        // Stopped. #3900.
         assert_eq!(
             derive_acp_status(
                 &Event::Stopped {
@@ -1987,7 +2021,7 @@ mod tests {
                 },
                 false,
             ),
-            Some(StatusIntent::Set(Status::Running))
+            Some(StatusIntent::SetUnlessWaiting(Status::Running))
         );
         assert_eq!(
             derive_acp_status(
@@ -2002,7 +2036,7 @@ mod tests {
                 },
                 false,
             ),
-            Some(StatusIntent::Set(Status::Running))
+            Some(StatusIntent::SetUnlessWaiting(Status::Running))
         );
         // Rate-limit park: NOT an error; sidebar stays grey, the
         // dedicated RateLimit banner carries the reset time. See #1281.
@@ -2192,6 +2226,37 @@ mod tests {
         inst.status = Status::Error;
         apply(&mut inst, StatusIntent::HealError);
         assert_eq!(inst.status, Status::Idle);
+    }
+
+    /// #3900: a background sub-agent's progress must not clobber a pending
+    /// approval/elicitation's Waiting dot; the main turn's own
+    /// `ApprovalResolved`/`ElicitationResolved` (a plain `Set`) still
+    /// recovers it normally.
+    #[test]
+    fn set_unless_waiting_is_a_noop_while_waiting_but_plain_set_still_recovers() {
+        let mut inst = stopped_structured_instance();
+        inst.status = Status::Waiting;
+        apply(&mut inst, StatusIntent::SetUnlessWaiting(Status::Running));
+        assert_eq!(
+            inst.status,
+            Status::Waiting,
+            "a background agent's own progress does not resolve the main turn's approval"
+        );
+
+        apply(&mut inst, StatusIntent::Set(Status::Running));
+        assert_eq!(
+            inst.status,
+            Status::Running,
+            "the main turn's own ApprovalResolved/ElicitationResolved still recovers Waiting"
+        );
+    }
+
+    #[test]
+    fn set_unless_waiting_behaves_like_set_when_not_waiting() {
+        let mut inst = stopped_structured_instance();
+        inst.status = Status::Idle;
+        apply(&mut inst, StatusIntent::SetUnlessWaiting(Status::Running));
+        assert_eq!(inst.status, Status::Running);
     }
 
     #[test]
