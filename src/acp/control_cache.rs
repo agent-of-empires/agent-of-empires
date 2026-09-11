@@ -99,6 +99,21 @@ impl ControlStateCache {
         cached.last_seq = seq;
     }
 
+    /// The session's cached `turn_active`, or `false` if nothing has
+    /// hydrated it yet. Used right after `apply_if_cached` folds a `Stopped`
+    /// or `BackgroundAgentCompleted` event, to tell the sidebar status
+    /// derivation whether a background sub-agent is still keeping the turn
+    /// open (#3900). Deliberately does not hydrate on a miss: the caller
+    /// only asks this for a session whose own event was just folded in, so a
+    /// miss means the fold was dropped (a failed persist), and Idle is the
+    /// same conservative answer `derive_acp_status` fell back to before this
+    /// existed.
+    pub fn turn_active(&self, session_id: &str) -> bool {
+        let slot = self.slot(session_id);
+        let guard = lock(&slot);
+        guard.as_ref().is_some_and(|c| c.state.turn_active)
+    }
+
     /// Drop a session's fold. Used when the event log behind it is deleted and
     /// when a persist fails, since a projection of a log that is missing an
     /// event is not a projection of that log.

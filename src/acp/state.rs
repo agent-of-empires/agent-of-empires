@@ -528,6 +528,14 @@ pub struct AcpState {
     /// by `Stopped`, startup error, runtime error, or rejection.
     #[serde(default)]
     pub turn_active: bool,
+    /// Set when `Stopped` kept `turn_active` true solely because a
+    /// background agent was still outstanding (#3900), so the next
+    /// `BackgroundAgentCompleted` knows it may be the edge that ends the
+    /// busy indicator. Cleared the moment a genuine new turn opens, so a
+    /// background agent finishing during unrelated live work cannot clobber
+    /// it.
+    #[serde(default, skip_serializing)]
+    background_kept_turn_active: bool,
     /// Whether the running turn is steerable (a mid-turn prompt is injected
     /// rather than queued). Latest `PromptCapabilities.steering`.
     #[serde(default)]
@@ -585,6 +593,7 @@ impl AcpState {
             config_option_switch_failed: None,
             background_agents: Vec::new(),
             turn_active: false,
+            background_kept_turn_active: false,
             steering: false,
             cancelling: false,
             compacting: false,
@@ -1164,6 +1173,19 @@ pub enum Event {
 }
 
 impl AcpState {
+    /// Whether any background sub-agent is still non-terminal. `Stalled` and
+    /// `Running` both count: the tailer may still resolve a stalled record to
+    /// `Completed` at its idle timeout, so treating it as inactive early would
+    /// flicker the parent session's busy indicator back to idle prematurely.
+    pub fn has_active_background_agent(&self) -> bool {
+        self.background_agents.iter().any(|a| {
+            matches!(
+                a.status,
+                BackgroundAgentStatus::Running | BackgroundAgentStatus::Stalled
+            )
+        })
+    }
+
     /// Apply a single event. Returns the new `last_seq` on success.
     pub fn apply_event(&mut self, event: Event) -> Result<u64, StateError> {
         match event {
@@ -1276,6 +1298,7 @@ impl AcpState {
                 // deliberately does NOT clear `cancelling` (that would drop a
                 // pending stop the moment the agent emits its next thought).
                 self.turn_active = true;
+                self.background_kept_turn_active = false;
             }
             Event::ThinkingEnded => self.thinking = None,
             Event::RateLimit { info } => self.rate_limit = Some(info),
@@ -1360,7 +1383,13 @@ impl AcpState {
                 // and for an adapter that ends a turn without completing its
                 // tool call or emitting `ThinkingEnded`, either of which would
                 // otherwise leak a spinner into the next turn (#1213).
-                self.turn_active = false;
+                //
+                // A background sub-agent the main turn handed work off to
+                // keeps running past its parent's `Stopped`; the busy
+                // indicator has to stay lit until that agent's own
+                // `BackgroundAgentCompleted` clears it too (#3900).
+                self.turn_active = self.has_active_background_agent();
+                self.background_kept_turn_active = self.turn_active;
                 self.cancelling = false;
                 self.compacting = false;
                 self.in_flight_tool = None;
@@ -1385,6 +1414,7 @@ impl AcpState {
                 // clears it. Mirrors the TUI reducer's `is_steered_continuation`.
                 let steered = self.turn_active && self.steering;
                 self.turn_active = true;
+                self.background_kept_turn_active = false;
                 if !steered {
                     self.cancelling = false;
                 }
@@ -1394,6 +1424,7 @@ impl AcpState {
             Event::UserDiffCommentsPrompt { .. } => {
                 let steered = self.turn_active && self.steering;
                 self.turn_active = true;
+                self.background_kept_turn_active = false;
                 if !steered {
                     self.cancelling = false;
                 }
@@ -1612,6 +1643,13 @@ impl AcpState {
                     if warning.is_some() {
                         a.warning = warning;
                     }
+                }
+                // The last outstanding background agent finished, and the
+                // main turn's own `Stopped` already fired (nothing else keeps
+                // `turn_active` set): drop it now so the busy indicator ends.
+                if self.background_kept_turn_active && !self.has_active_background_agent() {
+                    self.turn_active = false;
+                    self.background_kept_turn_active = false;
                 }
             }
         }
@@ -1840,6 +1878,89 @@ mod tests {
             BackgroundAgentStatus::Completed
         );
         assert_eq!(s.background_agents[0].tool_count, 3, "must not overwrite");
+    }
+
+    /// #3900: the main turn's `Stopped` must not clear `turn_active` while a
+    /// background sub-agent it spawned is still running, and the busy
+    /// indicator must drop only once the last one completes.
+    #[test]
+    fn turn_active_stays_lit_across_stop_while_a_background_agent_runs() {
+        let mut s = fresh_state();
+        s.apply_event(Event::UserPromptSent {
+            prompt_id: None,
+            text: "go".into(),
+            attachments: Vec::new(),
+        })
+        .unwrap();
+        s.apply_event(Event::BackgroundAgentLaunched {
+            agent_id: "a1".into(),
+            tool_call_id: "tc1".into(),
+            description: "map backend".into(),
+            prompt: "do the thing".into(),
+            model: "claude-opus-4-8".into(),
+            output_file: "/tmp/a1.output".into(),
+            started_at: Utc::now(),
+        })
+        .unwrap();
+        s.apply_event(Event::Stopped {
+            reason: "prompt_complete".into(),
+        })
+        .unwrap();
+        assert!(
+            s.turn_active,
+            "the background agent is still running, so the turn must read active"
+        );
+
+        s.apply_event(Event::BackgroundAgentCompleted {
+            agent_id: "a1".into(),
+            status: BackgroundAgentStatus::Completed,
+            tools: vec![],
+            result: Some("done".into()),
+            warning: None,
+            ended_at: Utc::now(),
+        })
+        .unwrap();
+        assert!(
+            !s.turn_active,
+            "the last background agent finished, so the turn must end"
+        );
+    }
+
+    /// A background agent finishing while the main turn is still genuinely
+    /// producing output (its own `Stopped` has not fired yet) must not
+    /// clobber the live turn.
+    #[test]
+    fn background_agent_completion_does_not_clobber_a_live_turn() {
+        let mut s = fresh_state();
+        s.apply_event(Event::UserPromptSent {
+            prompt_id: None,
+            text: "go".into(),
+            attachments: Vec::new(),
+        })
+        .unwrap();
+        s.apply_event(Event::BackgroundAgentLaunched {
+            agent_id: "a1".into(),
+            tool_call_id: "tc1".into(),
+            description: "map backend".into(),
+            prompt: "do the thing".into(),
+            model: "claude-opus-4-8".into(),
+            output_file: "/tmp/a1.output".into(),
+            started_at: Utc::now(),
+        })
+        .unwrap();
+        s.apply_event(Event::BackgroundAgentCompleted {
+            agent_id: "a1".into(),
+            status: BackgroundAgentStatus::Completed,
+            tools: vec![],
+            result: Some("done".into()),
+            warning: None,
+            ended_at: Utc::now(),
+        })
+        .unwrap();
+        assert!(
+            s.turn_active,
+            "the main turn's own Stopped never fired, so it is still live"
+        );
     }
 
     #[test]

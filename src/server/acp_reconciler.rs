@@ -1727,7 +1727,11 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
                         if in_flight_turn {
                             if let Some(event) = state.acp_event_store.latest_seed_status_event(&id)
                             {
-                                if let Some(intent) = crate::server::derive_acp_status(&event) {
+                                // Cold control-state fold at reattach time,
+                                // same caveat as `seed_acp_statuses` (#3900).
+                                if let Some(intent) =
+                                    crate::server::derive_acp_status(&event, false)
+                                {
                                     let mut instances = state.instances.write().await;
                                     if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
                                         crate::server::apply_status_intent(
