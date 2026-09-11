@@ -54,12 +54,7 @@ const NON_SUFFIX_HOST_STATE: Record<string, string> = {
   TMUX_PANE: "%7",
 };
 
-/**
- * Variables `src/` reads that the daemon inherits on purpose, grouped by why.
- * A name that is neither here nor neutralized fails the contract test below,
- * which is the point: classifying a new variable stays a decision someone
- * makes, instead of one the suffix rule makes for them.
- */
+/** Every src/ environment read must be neutralized or explicitly safe to inherit. */
 const INHERITED_BY_CONTRACT = new Set([
   ...INHERITED_PATH_VARS,
   // Timing, tracing, and test switches. Their values are numbers or flags, so
@@ -87,6 +82,8 @@ const INHERITED_BY_CONTRACT = new Set([
   "AOE_TERMINAL_TRACE",
   "AOE_TEST_TOKEN_GRACE_SECS",
   "AOE_TEST_TOKEN_LIFETIME_SECS",
+  // Rust test-binary re-entry marker, compiled out of aoe serve.
+  "AOE_AGENT_PROBE_TEST_CHILD",
   // A marker `aoe` echoes into a pane to probe a login shell, not a variable
   // the daemon resolves anything from.
   "AOE_AGENT_OK",
