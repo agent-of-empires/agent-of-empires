@@ -725,8 +725,10 @@ impl Instance {
                     (
                         Path::new(PRIME_AGENT_DIR_IN_CONTAINER),
                         format!(
-                            " -e {}/extensions/aoe-session-id.js",
-                            shell_escape(PRIME_AGENT_DIR_IN_CONTAINER),
+                            " -e {}",
+                            shell_escape(&format!(
+                                "{PRIME_AGENT_DIR_IN_CONTAINER}/extensions/aoe-session-id.js"
+                            ))
                         ),
                     )
                 }
