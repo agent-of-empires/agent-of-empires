@@ -1047,10 +1047,6 @@ mod tests {
         );
     }
 
-    /// `aoe session capture` reads the pane title through this helper, and the
-    /// only test that covers that path runs an agent with no `osc_title`
-    /// rules: a wrong target here would silently restore the empty title
-    /// #3625 was about.
     #[test]
     #[serial_test::serial]
     fn pane_title_reads_the_panes_published_title() {
@@ -1059,7 +1055,8 @@ mod tests {
         }
         let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_pane_title");
         let name = guard.name();
-        let mut args: Vec<String> = ["new-session", "-d", "-s", name, "sleep 30"]
+        // Separate argv bypasses shell startup, which could overwrite the title.
+        let mut args: Vec<String> = ["new-session", "-d", "-s", name, "sleep", "30"]
             .iter()
             .map(|arg| arg.to_string())
             .collect();
