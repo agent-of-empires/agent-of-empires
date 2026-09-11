@@ -2548,14 +2548,28 @@ pub(crate) fn is_binary_on_path(binary: &str) -> bool {
 }
 
 const AGENT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const LOGIN_SHELL_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-fn agent_probe_output(command: &mut Command) -> Option<std::process::Output> {
-    crate::process::run_with_timeout_process_group(
+fn agent_probe_output(
+    command: &mut Command,
+    timeout: std::time::Duration,
+) -> Option<std::process::Output> {
+    match crate::process::run_with_timeout_process_group(
         command.stdin(std::process::Stdio::null()),
-        AGENT_PROBE_TIMEOUT,
-    )
-    .ok()
-    .flatten()
+        timeout,
+    ) {
+        Ok(output) => {
+            if output.is_none() {
+                tracing::warn!(
+                    program = ?command.get_program(),
+                    timeout_s = timeout.as_secs(),
+                    "agent availability probe timed out; process group terminated"
+                );
+            }
+            output
+        }
+        Err(_) => None,
+    }
 }
 
 /// A direct miss or timeout permits a login-shell fallback; a missing explicit path does not.
@@ -2566,7 +2580,7 @@ fn agent_available_direct(agent: &crate::agents::AgentDef) -> Option<bool> {
             if binary.contains('/') || binary.contains('\\') {
                 return Some(std::path::Path::new(binary).exists());
             }
-            let found = agent_probe_output(Command::new("which").arg(binary))
+            let found = agent_probe_output(Command::new("which").arg(binary), AGENT_PROBE_TIMEOUT)
                 .is_some_and(|output| output.status.success());
             if found {
                 Some(true)
@@ -2575,7 +2589,7 @@ fn agent_available_direct(agent: &crate::agents::AgentDef) -> Option<bool> {
             }
         }
         DetectionMethod::RunWithArg(binary, arg) => {
-            let ok = agent_probe_output(Command::new(binary).arg(arg))
+            let ok = agent_probe_output(Command::new(binary).arg(arg), AGENT_PROBE_TIMEOUT)
                 .is_some_and(|output| output.status.success());
             if ok {
                 Some(true)
@@ -2625,15 +2639,19 @@ fn parse_login_shell_probe(stdout: &str) -> std::collections::HashSet<String> {
         .collect()
 }
 
-/// Batch all unresolved agents into one login shell, with the same deadline as direct probes.
+/// One shell amortizes 0.5–2.5s profile startup, avoiding measured 5–10s startup stalls
+/// from per-agent shells. Its longer deadline accommodates slow profiles such as nvm.
 fn login_shell_probe(agents: &[&crate::agents::AgentDef]) -> std::collections::HashSet<String> {
     if agents.is_empty() {
         return std::collections::HashSet::new();
     }
     let shell = crate::session::user_shell();
-    agent_probe_output(Command::new(&shell).args(["-lc", &login_shell_probe_script(agents)]))
-        .map(|o| parse_login_shell_probe(&String::from_utf8_lossy(&o.stdout)))
-        .unwrap_or_default()
+    agent_probe_output(
+        Command::new(&shell).args(["-lc", &login_shell_probe_script(agents)]),
+        LOGIN_SHELL_PROBE_TIMEOUT,
+    )
+    .map(|o| parse_login_shell_probe(&String::from_utf8_lossy(&o.stdout)))
+    .unwrap_or_default()
 }
 
 /// Process-wide positive and negative availability cache. Startup warms it for
@@ -3014,13 +3032,24 @@ mod tests {
             return;
         }
         use std::time::{Duration, Instant};
+        let diagnostics = tempfile::tempdir().unwrap();
+        let diagnostics_path = diagnostics.path().join("timeouts.log");
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(std::fs::File::create(&diagnostics_path).unwrap())
+            .try_init()
+            .unwrap();
         struct ReleaseProbe(std::path::PathBuf);
         impl Drop for ReleaseProbe {
             fn drop(&mut self) {
                 let _ = std::fs::write(&self.0, "release");
             }
         }
-        for executable in ["vibe", "login-shell"] {
+        for (executable, timeout) in [
+            ("vibe", AGENT_PROBE_TIMEOUT),
+            ("login-shell", LOGIN_SHELL_PROBE_TIMEOUT),
+        ] {
             let home = tempfile::tempdir().unwrap();
             let _env = probe_environment(home.path());
             let memo = AgentAvailabilityGuard::capture();
@@ -3060,7 +3089,7 @@ mod tests {
                     invalidate_agent_availability();
                     let _ = done_tx.send(("invalidator", None));
                 });
-                let deadline = Instant::now() + AGENT_PROBE_TIMEOUT * 2 + Duration::from_secs(2);
+                let deadline = Instant::now() + timeout * 2 + Duration::from_secs(2);
                 let mut completed = Vec::new();
                 for _ in 0..3 {
                     let (name, found) = done_rx
@@ -3095,6 +3124,17 @@ mod tests {
                     );
                 }
             });
+        }
+        let diagnostics = std::fs::read_to_string(diagnostics_path).unwrap();
+        for timeout in [AGENT_PROBE_TIMEOUT, LOGIN_SHELL_PROBE_TIMEOUT] {
+            assert!(
+                diagnostics.lines().any(|line| {
+                    line.contains("WARN")
+                        && line.contains("program=")
+                        && line.contains(&format!("timeout_s={}", timeout.as_secs()))
+                }),
+                "missing timeout diagnostic: {diagnostics}"
+            );
         }
     }
 
@@ -4789,7 +4829,7 @@ mod tests {
         let log = shell_words::quote(home.path().join("probes").to_str().unwrap()).into_owned();
         std::fs::write(
             home.path().join("bin/login-shell"),
-            format!("#!/bin/sh\nprintf 'login\\n' >> {log}\nexec /bin/sh -c \"$2\"\n"),
+            format!("#!/bin/sh\nprintf 'login\n' >> {log}\n/bin/sleep 6\nexec /bin/sh -c \"$2\"\n"),
         )
         .unwrap();
         let found = login_shell_probe(&[
