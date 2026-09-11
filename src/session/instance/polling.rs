@@ -102,27 +102,9 @@ fn try_acquire_managed_capture_lease(
     Ok(ManagedCaptureLease(lease))
 }
 
-/// The tmux session name to seed a session-id poller with, or `None` when
-/// this instance has no agent pane for one to follow.
-///
-/// `live_agent` is the live agent session for the id, which a fresh scan
-/// classifies by the kind each session was stamped with at creation. It is
-/// decisive: a row whose agent pane is gone has nothing a session-id poller
-/// can follow, however many paired terminals outlived it. Seeded with one of
-/// those, a poller re-resolves to that same live name every tick, probes
-/// `Alive`, and so never terminates, holding a budget slot for an agent that
-/// is gone while reading session-id state off the wrong pane (#3880).
-///
-/// `derived` is the title-derived agent name, asked only when the scan found
-/// nothing live for the id: a poller started alongside its own tmux session
-/// still needs a target, and `MISSING_TARGET_GRACE` covers the race. It keeps
-/// the name-shape filter because there is no live session to read a kind
-/// marker from, so a title sanitizing under an auxiliary prefix fails closed
-/// there (see `tmux::session_kind`).
-///
-/// A scan that found panes for the id but no agent among them is not that
-/// case: the derived name would then be a session that is not running, and a
-/// poller on it burns a budget slot until `MISSING_TARGET_GRACE` expires.
+/// Use a unique live agent; paired-only or ambiguous live panes forbid fallback.
+/// An empty or unavailable scan may use the derived name during MISSING_TARGET_GRACE.
+/// Its name-shape check remains necessary because no live kind marker is available.
 fn poller_seed_name(
     live: AgentSeed,
     derived: impl FnOnce() -> Option<String>,
@@ -130,7 +112,7 @@ fn poller_seed_name(
 ) -> Option<String> {
     match live {
         AgentSeed::Agent(name) => Some(name),
-        AgentSeed::OtherKindOnly => None,
+        AgentSeed::NoUniqueAgent => None,
         AgentSeed::NothingLive => {
             derived().filter(|name| crate::tmux::agent_session_belongs_to(name, session_id))
         }
@@ -1095,7 +1077,7 @@ mod tests {
             ),
             (
                 "only a terminal outlived the agent",
-                super::AgentSeed::OtherKindOnly,
+                super::AgentSeed::NoUniqueAgent,
                 Some(&agent),
                 None,
             ),
