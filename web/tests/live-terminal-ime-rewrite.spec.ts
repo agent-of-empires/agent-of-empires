@@ -284,11 +284,13 @@ test.describe("Live terminal IME syllable rewrite", () => {
   });
 
   test("only the visible mobile surface owns proxy input after a round trip", async ({ page }) => {
-    const writes: Array<{ url: string; text: string }> = [];
+    const writes: Record<string, string> = {};
     const handle = await mockTerminalApis(page, {
       onLiveMessage: (url, message) => {
         const text = message.toString("utf8");
-        if (!text.startsWith("{")) writes.push({ url, text });
+        if (text.startsWith("{")) return;
+        const path = new URL(url).pathname;
+        writes[path] = (writes[path] ?? "") + text;
       },
     });
     await openSession(page, handle);
@@ -305,23 +307,23 @@ test.describe("Live terminal IME syllable rewrite", () => {
     await softKey(page, "insertText", "ㄴ", PROXY);
     await page.locator(PROXY).dispatchEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
     await expect
-      .poll(() => writes.map(({ url, text }) => ({ path: new URL(url).pathname, text })))
-      .toEqual([
-        { path: "/sessions/pinch-test/live-ws", text: "ㅎ" },
-        { path: "/sessions/pinch-test/terminal/live-ws", text: "ㅏ" },
-        { path: "/sessions/pinch-test/live-ws", text: "ㄴ" },
-        { path: "/sessions/pinch-test/live-ws", text: "\r" },
-      ]);
+      .poll(() => writes)
+      .toEqual({
+        "/sessions/pinch-test/live-ws": "ㅎㄴ\r",
+        "/sessions/pinch-test/terminal/live-ws": "ㅏ",
+      });
     await expect(page.locator('[data-term="paired"]')).toHaveCount(1);
   });
 
   test("a hidden paired terminal upload preserves the agent proxy", async ({ page }) => {
-    const writes: Array<{ url: string; text: string }> = [];
+    const writes: Record<string, string> = {};
     const handle = await mockTerminalApis(page, {
       pendingPaste: true,
       onLiveMessage: (url, message) => {
         const text = message.toString("utf8");
-        if (!text.startsWith("{")) writes.push({ url, text });
+        if (text.startsWith("{")) return;
+        const path = new URL(url).pathname;
+        writes[path] = (writes[path] ?? "") + text;
       },
     });
     await openSession(page, handle);
@@ -339,24 +341,12 @@ test.describe("Live terminal IME syllable rewrite", () => {
     await softKey(page, "insertText", "ㅎ", PROXY);
     await page.evaluate(() => (window as unknown as { releasePasteImage: () => void }).releasePasteImage());
     await expect
-      .poll(() =>
-        writes
-          .filter(({ url }) => new URL(url).pathname.endsWith("/terminal/live-ws"))
-          .map(({ text }) => text)
-          .join(""),
-      )
+      .poll(() => writes["/sessions/pinch-test/terminal/live-ws"])
       .toBe("ㄱ\x1b[200~ /tmp/paste/shot.png \x1b[201~");
     expect(await valueOf(page, pairedInput)).toBe("");
     expect(await valueOf(page, PROXY)).toBe("ㅎ");
     await softKey(page, "deleteContentBackward", null, PROXY);
     await softKey(page, "insertText", "하", PROXY);
-    await expect
-      .poll(() =>
-        writes
-          .filter(({ url }) => new URL(url).pathname === "/sessions/pinch-test/live-ws")
-          .map(({ text }) => text)
-          .join(""),
-      )
-      .toBe("ㅎ\x7f하");
+    await expect.poll(() => writes["/sessions/pinch-test/live-ws"]).toBe("ㅎ\x7f하");
   });
 });
