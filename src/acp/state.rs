@@ -525,17 +525,13 @@ pub struct AcpState {
 
     /// Whether a turn is in flight. Server-observed edges: opened by
     /// `UserPromptSent` / `UserDiffCommentsPrompt` / `ThinkingStarted`, closed
-    /// by `Stopped`, startup error, runtime error, or rejection.
+    /// by `Stopped`, startup error, runtime error, or rejection. Dispatch
+    /// (`acp::dispatch::decide`) and the queue drain
+    /// (`session_service::drain_queued_prompts_once`) gate on this directly,
+    /// so it must track only the main turn, never a background sub-agent's
+    /// lifecycle; use [`Self::is_visibly_busy`] for a display-only signal.
     #[serde(default)]
     pub turn_active: bool,
-    /// Set when `Stopped` kept `turn_active` true solely because a
-    /// background agent was still outstanding (#3900), so the next
-    /// `BackgroundAgentCompleted` knows it may be the edge that ends the
-    /// busy indicator. Cleared the moment a genuine new turn opens, so a
-    /// background agent finishing during unrelated live work cannot clobber
-    /// it.
-    #[serde(default, skip_serializing)]
-    background_kept_turn_active: bool,
     /// Whether the running turn is steerable (a mid-turn prompt is injected
     /// rather than queued). Latest `PromptCapabilities.steering`.
     #[serde(default)]
@@ -593,7 +589,6 @@ impl AcpState {
             config_option_switch_failed: None,
             background_agents: Vec::new(),
             turn_active: false,
-            background_kept_turn_active: false,
             steering: false,
             cancelling: false,
             compacting: false,
@@ -1173,17 +1168,21 @@ pub enum Event {
 }
 
 impl AcpState {
-    /// Whether any background sub-agent is still non-terminal. `Stalled` and
-    /// `Running` both count: the tailer may still resolve a stalled record to
-    /// `Completed` at its idle timeout, so treating it as inactive early would
-    /// flicker the parent session's busy indicator back to idle prematurely.
+    /// Whether any background sub-agent is still in flight. Keyed on
+    /// `ended_at` rather than `status`: the tailer's own terminal
+    /// `BackgroundAgentCompleted` can carry `status: Stalled` (its abort
+    /// timeout gives up without a clean `end_turn`), and that record must
+    /// count as done like any other terminal one, not wedge this on forever
+    /// (#3900).
     pub fn has_active_background_agent(&self) -> bool {
-        self.background_agents.iter().any(|a| {
-            matches!(
-                a.status,
-                BackgroundAgentStatus::Running | BackgroundAgentStatus::Stalled
-            )
-        })
+        self.background_agents.iter().any(|a| a.ended_at.is_none())
+    }
+
+    /// Display-only busy signal: the main turn or an outstanding background
+    /// sub-agent. Distinct from `turn_active`, which gates prompt dispatch
+    /// and the queue drain and must track only the main turn.
+    pub fn is_visibly_busy(&self) -> bool {
+        self.turn_active || self.has_active_background_agent()
     }
 
     /// Apply a single event. Returns the new `last_seq` on success.
@@ -1298,7 +1297,6 @@ impl AcpState {
                 // deliberately does NOT clear `cancelling` (that would drop a
                 // pending stop the moment the agent emits its next thought).
                 self.turn_active = true;
-                self.background_kept_turn_active = false;
             }
             Event::ThinkingEnded => self.thinking = None,
             Event::RateLimit { info } => self.rate_limit = Some(info),
@@ -1385,11 +1383,12 @@ impl AcpState {
                 // otherwise leak a spinner into the next turn (#1213).
                 //
                 // A background sub-agent the main turn handed work off to
-                // keeps running past its parent's `Stopped`; the busy
-                // indicator has to stay lit until that agent's own
-                // `BackgroundAgentCompleted` clears it too (#3900).
-                self.turn_active = self.has_active_background_agent();
-                self.background_kept_turn_active = self.turn_active;
+                // keeps running past its parent's `Stopped`, but `turn_active`
+                // gates prompt dispatch and the queue drain, not just display
+                // (#3900): it must clear unconditionally here. Use
+                // `is_visibly_busy` at display boundaries for the combined
+                // signal.
+                self.turn_active = false;
                 self.cancelling = false;
                 self.compacting = false;
                 self.in_flight_tool = None;
@@ -1414,7 +1413,6 @@ impl AcpState {
                 // clears it. Mirrors the TUI reducer's `is_steered_continuation`.
                 let steered = self.turn_active && self.steering;
                 self.turn_active = true;
-                self.background_kept_turn_active = false;
                 if !steered {
                     self.cancelling = false;
                 }
@@ -1424,7 +1422,6 @@ impl AcpState {
             Event::UserDiffCommentsPrompt { .. } => {
                 let steered = self.turn_active && self.steering;
                 self.turn_active = true;
-                self.background_kept_turn_active = false;
                 if !steered {
                     self.cancelling = false;
                 }
@@ -1643,13 +1640,6 @@ impl AcpState {
                     if warning.is_some() {
                         a.warning = warning;
                     }
-                }
-                // The last outstanding background agent finished, and the
-                // main turn's own `Stopped` already fired (nothing else keeps
-                // `turn_active` set): drop it now so the busy indicator ends.
-                if self.background_kept_turn_active && !self.has_active_background_agent() {
-                    self.turn_active = false;
-                    self.background_kept_turn_active = false;
                 }
             }
         }
@@ -1880,11 +1870,12 @@ mod tests {
         assert_eq!(s.background_agents[0].tool_count, 3, "must not overwrite");
     }
 
-    /// #3900: the main turn's `Stopped` must not clear `turn_active` while a
-    /// background sub-agent it spawned is still running, and the busy
-    /// indicator must drop only once the last one completes.
+    /// #3900: `Stopped` must clear `turn_active` unconditionally, even while
+    /// a background sub-agent it spawned is still running. `turn_active`
+    /// gates prompt dispatch and the queue drain, not just display; the busy
+    /// *display* signal is the separate `is_visibly_busy`.
     #[test]
-    fn turn_active_stays_lit_across_stop_while_a_background_agent_runs() {
+    fn stopped_clears_turn_active_regardless_of_a_running_background_agent() {
         let mut s = fresh_state();
         s.apply_event(Event::UserPromptSent {
             prompt_id: None,
@@ -1907,8 +1898,13 @@ mod tests {
         })
         .unwrap();
         assert!(
-            s.turn_active,
-            "the background agent is still running, so the turn must read active"
+            !s.turn_active,
+            "turn_active must clear on Stopped so dispatch sends the next prompt \
+             instead of queuing it behind a background agent"
+        );
+        assert!(
+            s.is_visibly_busy(),
+            "the background agent is still running, so the display signal stays busy"
         );
 
         s.apply_event(Event::BackgroundAgentCompleted {
@@ -1922,8 +1918,48 @@ mod tests {
         .unwrap();
         assert!(
             !s.turn_active,
-            "the last background agent finished, so the turn must end"
+            "BackgroundAgentCompleted must not touch turn_active"
         );
+        assert!(
+            !s.is_visibly_busy(),
+            "the last background agent finished, so the display signal goes idle"
+        );
+    }
+
+    /// A background agent that stalls out (the tailer's own abort timeout,
+    /// not a clean `end_turn`) still reaches `BackgroundAgentCompleted` with
+    /// `ended_at` set. `has_active_background_agent` must treat that as
+    /// terminal like any other completion, not wedge the busy signal on
+    /// forever (#3900 permanent-latch regression).
+    #[test]
+    fn a_stalled_terminal_record_does_not_wedge_the_busy_signal_on() {
+        let mut s = fresh_state();
+        s.apply_event(Event::BackgroundAgentLaunched {
+            agent_id: "a1".into(),
+            tool_call_id: "tc1".into(),
+            description: "map backend".into(),
+            prompt: "do the thing".into(),
+            model: "claude-opus-4-8".into(),
+            output_file: "/tmp/a1.output".into(),
+            started_at: Utc::now(),
+        })
+        .unwrap();
+        assert!(s.has_active_background_agent());
+
+        s.apply_event(Event::BackgroundAgentCompleted {
+            agent_id: "a1".into(),
+            status: BackgroundAgentStatus::Stalled,
+            tools: vec![],
+            result: None,
+            warning: Some("no transcript growth".into()),
+            ended_at: Utc::now(),
+        })
+        .unwrap();
+        assert!(
+            !s.has_active_background_agent(),
+            "a terminal Stalled completion (ended_at set) must not count as active"
+        );
+        assert!(!s.is_visibly_busy());
     }
 
     /// A background agent finishing while the main turn is still genuinely
