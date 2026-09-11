@@ -36,6 +36,7 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { useAcpSession } from "../../hooks/useAcpSession";
+import { isVisiblyBusy } from "../../lib/acpTypes";
 import type {
   ActivityRow,
   ApprovalDecision,
@@ -237,16 +238,17 @@ export function AcpRuntime({
   // useMemo, every parent re-render (e.g. WS heartbeat, hover state)
   // re-builds the transcript and assistant-ui treats every
   // message as changed. Memo on the inputs the function reads.
+  const visiblyBusy = isVisiblyBusy(acp.state);
   const messages = useMemo(
     () =>
       activityToThreadMessages(
         displayActivity,
-        acp.state.turnActive,
+        visiblyBusy,
         showClearedTurns,
         agentProfile.capabilities.todos,
         agentProfile,
       ),
-    [displayActivity, acp.state.turnActive, showClearedTurns, agentProfile],
+    [displayActivity, visiblyBusy, showClearedTurns, agentProfile],
   );
 
   // Read from the same rows as the fold, so the key and the truncation agree.
@@ -257,7 +259,7 @@ export function AcpRuntime({
 
   const adapter: ExternalStoreAdapter<ThreadMessageLike> = {
     messages,
-    isRunning: acp.state.turnActive,
+    isRunning: visiblyBusy,
     convertMessage: (m) => m,
     onNew: async (msg) => {
       // assistant-ui hands us an AppendMessage with mixed parts. Flatten

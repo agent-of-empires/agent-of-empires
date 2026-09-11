@@ -16,9 +16,12 @@ import {
   applyReducedState,
   deriveTurnActive,
   emptyAcpState,
+  hasActiveBackgroundAgent,
+  isVisiblyBusy,
   normaliseTurnState,
   type AcpFrame,
   type AcpState,
+  type BackgroundAgent,
   type ReducedState,
 } from "./acpTypes";
 
@@ -1294,6 +1297,33 @@ describe("turnActive: daemon truth plus an optimistic overlay (#3417)", () => {
     for (const [serverTurnActive, inflightPromptIds, expected] of cases) {
       expect(deriveTurnActive({ serverTurnActive, inflightPromptIds })).toBe(expected);
     }
+  });
+
+  it("isVisiblyBusy ORs turnActive with an outstanding background agent, hasActiveBackgroundAgent does not", () => {
+    const backgroundAgent = (endedAt: string | null): BackgroundAgent => ({
+      agentId: "a1",
+      toolCallId: "tc1",
+      description: "map backend",
+      prompt: "do the thing",
+      model: "claude-opus-4-8",
+      status: endedAt ? "completed" : "running",
+      startedAt: new Date().toISOString(),
+      endedAt,
+      toolCount: 0,
+      tools: [],
+      lastTool: null,
+      lastText: null,
+      result: null,
+      warning: null,
+    });
+
+    expect(hasActiveBackgroundAgent({ backgroundAgents: [] })).toBe(false);
+    expect(hasActiveBackgroundAgent({ backgroundAgents: [backgroundAgent(null)] })).toBe(true);
+    expect(hasActiveBackgroundAgent({ backgroundAgents: [backgroundAgent(new Date().toISOString())] })).toBe(false);
+
+    expect(isVisiblyBusy({ turnActive: false, backgroundAgents: [] })).toBe(false);
+    expect(isVisiblyBusy({ turnActive: true, backgroundAgents: [] })).toBe(true);
+    expect(isVisiblyBusy({ turnActive: false, backgroundAgents: [backgroundAgent(null)] })).toBe(true);
   });
 
   it("N prompts steered into one turn are all closed by its single Stopped", async () => {

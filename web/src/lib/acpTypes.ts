@@ -1926,6 +1926,22 @@ export function deriveTurnActive(state: Pick<AcpState, "serverTurnActive" | "inf
   return state.serverTurnActive || state.inflightPromptIds.length > 0;
 }
 
+/** Whether a background sub-agent (async Task) is still outstanding, mirroring
+ *  `AcpState::has_active_background_agent` (`src/acp/state.rs`): keyed on
+ *  `endedAt` rather than status, since a stalled agent's own terminal
+ *  completion must still count as done. */
+export function hasActiveBackgroundAgent(state: Pick<AcpState, "backgroundAgents">): boolean {
+  return state.backgroundAgents.some((a) => a.endedAt === null);
+}
+
+/** Display-only busy signal for the runtime spinner: the main turn or an
+ *  outstanding background sub-agent. Distinct from `turnActive`, which must
+ *  keep tracking only the main turn (send-vs-queue composer gating reads it
+ *  directly; see `src/acp/state.rs`'s `turn_active` doc comment for why). */
+export function isVisiblyBusy(state: Pick<AcpState, "turnActive" | "backgroundAgents">): boolean {
+  return state.turnActive || hasActiveBackgroundAgent(state);
+}
+
 /** Close the turn from a raw event, mirroring `AcpState::apply_event`'s own
  *  `turn_active = false` edges (`src/acp/state.rs`).
  *
