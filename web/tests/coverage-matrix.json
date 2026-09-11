@@ -3544,9 +3544,13 @@
     },
     {
       "id": "sidebar.active-row-indicator",
-      "kind": "vitest",
+      "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["src/lib/__tests__/sessionRowChrome.test.ts", "tests/sidebar-multi-session.spec.ts"],
+      "specs": [
+        "src/lib/__tests__/sessionRowChrome.test.ts",
+        "tests/sidebar-multi-session.spec.ts",
+        "tests/sidebar-grouping.spec.ts"
+      ],
       "components": ["web/src/lib/sessionRowChrome.ts", "web/src/components/WorkspaceSidebar.tsx"]
     },
     {
