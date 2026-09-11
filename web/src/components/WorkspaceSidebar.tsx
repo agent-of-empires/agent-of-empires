@@ -2858,7 +2858,7 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader({
         data-testid="sidebar-group-header"
         data-group-id={group.id}
         className={`flex items-center gap-2 px-3 py-2 transition-colors duration-75 text-text-secondary ${headerHoverClass} ${
-          hasActiveChild ? "border-l-2 border-brand-600" : ""
+          hasActiveChild ? "border-l-2 border-session-active" : ""
         }`}
         style={headerStyle}
       >
@@ -2902,7 +2902,7 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader({
         onKeyDown={hasMenu ? handleHeaderKeyDown : undefined}
         onClickCapture={suppressClickAfterDrag}
         className={`group flex items-center gap-2 ${compact ? "px-2" : "px-3"} py-2 transition-colors duration-75 text-text-secondary focus:outline-none focus:ring-2 focus:ring-brand-600 ${headerHoverClass} ${
-          hasActiveChild ? "border-l-2 border-brand-600" : ""
+          hasActiveChild ? "border-l-2 border-session-active" : ""
         }`}
         style={headerStyle}
         // The whole row is the drag activator (no grip). Mirrors SessionRow:

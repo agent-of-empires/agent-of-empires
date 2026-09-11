@@ -183,9 +183,11 @@ test.describe("Sidebar multi-session (#956)", () => {
     // paints in currentColor instead of the theme accent (#3912).
     const ring = await row.evaluate((el) => ({
       color: getComputedStyle(el).getPropertyValue("--tw-ring-color").trim(),
+      token: getComputedStyle(document.documentElement).getPropertyValue("--color-session-active").trim(),
       shadow: getComputedStyle(el).boxShadow,
     }));
     expect(ring.color).not.toBe("");
+    expect(ring.color).toBe(ring.token);
     expect(ring.shadow).not.toBe("none");
     await expect(page).toHaveURL(/\/session\/sess-a$/);
   });
