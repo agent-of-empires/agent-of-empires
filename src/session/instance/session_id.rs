@@ -9,7 +9,7 @@ const PRIME_AGENT_HOME: &str = "/root/.prime/agent";
 const PRIME_AGENT_DEFAULT_SESSION_DIR: &str = "/root/.prime/agent/sessions";
 
 #[derive(Default)]
-struct PrimeAgentLaunchOptions {
+pub(super) struct PrimeAgentLaunchOptions {
     cwd: Option<String>,
     session_dir: Option<String>,
     mode: Option<String>,
@@ -223,7 +223,7 @@ fn host_transcript_state(host_path: &Path) -> PiTranscriptState {
 }
 
 impl Instance {
-    pub(crate) fn prime_agent_capture_plan(&self) -> Option<PrimeAgentCapturePlan> {
+    pub(super) fn prime_agent_capture_options(&self) -> Option<PrimeAgentLaunchOptions> {
         if self.resolved_capture_backend() != Some(crate::agents::SessionCaptureBackend::PrimeAgent)
             || !self.is_sandboxed()
         {
@@ -233,9 +233,24 @@ impl Instance {
         if !self.launch_invokes_resolved_agent_directly(agent) {
             return None;
         }
-        let store = self.extension_config_bind_dir()?;
-        let config = self.build_container_config().ok()?;
-        self.prime_agent_capture_plan_with(&config, store)
+        let parsed = super::launch_command::parse_launch_command(self.get_tool_command())?;
+        let mut words = parsed.words;
+        words.extend(shell_words::split(&self.extra_args).ok()?);
+        let options = parse_prime_agent_launch_options(&words)?;
+        (!options.no_session && options.mode.as_deref() != Some("daemon")).then_some(options)
+    }
+
+    pub(super) fn prime_agent_capture_plan(
+        &self,
+        options: PrimeAgentLaunchOptions,
+    ) -> anyhow::Result<PrimeAgentCapturePlan> {
+        let store = self
+            .extension_config_bind_dir()
+            .context("managed Prime store is unavailable")?;
+        let config = self
+            .build_container_config()
+            .context("cannot build Prime container configuration")?;
+        self.resolve_prime_agent_capture_plan(&config, store, options)
     }
 
     fn prime_agent_capture_plan_with(
@@ -243,26 +258,35 @@ impl Instance {
         config: &crate::containers::ContainerConfig,
         store: PathBuf,
     ) -> Option<PrimeAgentCapturePlan> {
-        if !config.uses_default_container_home() {
-            return None;
-        }
+        let options = self.prime_agent_capture_options()?;
+        self.resolve_prime_agent_capture_plan(config, store, options)
+            .inspect_err(|error| {
+                tracing::debug!(target: "session.capture", session = %self.id, reason = %format_args!("{error:#}"),
+                    "Prime identity extension unavailable");
+            })
+            .ok()
+    }
 
-        let parsed = super::launch_command::parse_launch_command(self.get_tool_command())?;
-        let mut words = parsed.words;
-        words.extend(shell_words::split(&self.extra_args).ok()?);
-        let options = parse_prime_agent_launch_options(&words)?;
-        if options.no_session || options.mode.as_deref() == Some("daemon") {
-            return None;
-        }
+    fn resolve_prime_agent_capture_plan(
+        &self,
+        config: &crate::containers::ContainerConfig,
+        store: PathBuf,
+        options: PrimeAgentLaunchOptions,
+    ) -> anyhow::Result<PrimeAgentCapturePlan> {
+        anyhow::ensure!(
+            config.uses_default_container_home(),
+            "Prime capture requires the default container HOME"
+        );
 
         let launch_cwd = PathBuf::from(self.container_workdir());
         let container_cwd = options.cwd.as_deref().map_or_else(
             || launch_cwd.clone(),
             |cwd| resolve_prime_agent_path(cwd, &launch_cwd),
         );
-        if !container_cwd.is_absolute() {
-            return None;
-        }
+        anyhow::ensure!(
+            container_cwd.is_absolute(),
+            "Prime working directory is not absolute"
+        );
 
         let environment_value = |key: &str| {
             config
@@ -284,12 +308,24 @@ impl Instance {
         } else {
             let global_container_path = Path::new(PRIME_AGENT_HOME).join("settings.json");
             let project_container_path = container_cwd.join(".prime/agent/settings.json");
-            let global_host_path =
-                config.host_path_for_container_path(&global_container_path, false)?;
-            let project_host_path =
-                config.host_path_for_container_path(&project_container_path, false)?;
-            let global = read_prime_agent_settings(&global_host_path).ok()?;
-            let project = read_prime_agent_settings(&project_host_path).ok()?;
+            let global_host_path = config
+                .host_path_for_container_path(&global_container_path, false)
+                .context("global Prime settings are not mapped to a readable host path")?;
+            let project_host_path = config
+                .host_path_for_container_path(&project_container_path, false)
+                .context("project Prime settings are not mapped to a readable host path")?;
+            let global = read_prime_agent_settings(&global_host_path).with_context(|| {
+                format!(
+                    "cannot safely read Prime settings {}",
+                    global_host_path.display()
+                )
+            })?;
+            let project = read_prime_agent_settings(&project_host_path).with_context(|| {
+                format!(
+                    "cannot safely read Prime settings {}",
+                    project_host_path.display()
+                )
+            })?;
             match project
                 .as_ref()
                 .and_then(|settings| settings.get("sessionDir"))
@@ -300,25 +336,30 @@ impl Instance {
                 }) {
                 Some(serde_json::Value::String(value)) => value.clone(),
                 Some(serde_json::Value::Null) | None => PRIME_AGENT_DEFAULT_SESSION_DIR.to_string(),
-                Some(_) => return None,
+                Some(_) => anyhow::bail!("Prime sessionDir setting is neither a string nor null"),
             }
         };
 
         let container_session_dir = resolve_prime_agent_path(&session_dir_value, &container_cwd);
         let session_dir = container_session_dir
             .strip_prefix(Path::new(PRIME_AGENT_HOME))
-            .ok()?
+            .context("Prime session directory is outside the managed store")?
             .to_path_buf();
-        if config.host_path_for_container_path(&container_session_dir, true)?
-            != store.join(&session_dir)
-        {
-            return None;
-        }
-        Some(PrimeAgentCapturePlan {
+        let mapped = config
+            .host_path_for_container_path(&container_session_dir, true)
+            .context("Prime session directory is not mapped to a writable host path")?;
+        anyhow::ensure!(
+            mapped == store.join(&session_dir),
+            "Prime session directory is shadowed by another mount"
+        );
+        Ok(PrimeAgentCapturePlan {
             store,
             session_dir,
             container_session_dir,
-            container_cwd: container_cwd.to_str()?.to_string(),
+            container_cwd: container_cwd
+                .to_str()
+                .context("Prime working directory is not UTF-8")?
+                .to_string(),
         })
     }
     /// Acquire a pre-launch session ID for the agent.
@@ -952,7 +993,12 @@ impl Instance {
     }
 
     fn prime_root_publication(&self) -> Option<PrimeRootPublication> {
-        let plan = self.prime_agent_capture_plan()?;
+        let plan = self.prime_agent_capture_plan(self.prime_agent_capture_options()?)
+            .inspect_err(|error| {
+                tracing::debug!(target: "session.capture", session = %self.id, reason = %format_args!("{error:#}"),
+                    "Prime root publication cannot be attributed");
+            })
+            .ok()?;
         validated_prime_root_publication(&plan, &self.id)
     }
 
@@ -1768,6 +1814,32 @@ mod tests {
             .is_none());
         inst.extra_args.clear();
 
+        #[cfg(unix)]
+        {
+            let settings = store.join("settings.json");
+            std::fs::write(
+                store.join("linked-settings.json"),
+                r#"{"sessionDir":"/root/.prime/agent/custom"}"#,
+            )
+            .unwrap();
+            std::os::unix::fs::symlink("linked-settings.json", &settings).unwrap();
+            assert!(
+                inst.prime_agent_capture_plan_with(&config, store.clone())
+                    .is_none(),
+                "unknown settings must not select the default session directory"
+            );
+            inst.extra_args = "--session-dir /root/.prime/agent/explicit".to_string();
+            let plan = inst
+                .prime_agent_capture_plan_with(&config, store.clone())
+                .unwrap();
+            assert_eq!(plan.session_dir, Path::new("explicit"));
+            inst.extra_args = "--session-dir /tmp/outside".to_string();
+            assert!(inst
+                .prime_agent_capture_plan_with(&config, store.clone())
+                .is_none());
+            inst.extra_args.clear();
+            std::fs::remove_file(&settings).unwrap();
+        }
         std::fs::write(
             store.join("settings.json"),
             serde_json::json!({"sessionDir": "~/.prime/agent/global"}).to_string(),
@@ -1952,7 +2024,9 @@ mod tests {
             container_workdir: Some("/workspace/project".to_string()),
         });
         inst.build_launch_command().unwrap();
-        let plan = inst.prime_agent_capture_plan().unwrap();
+        let plan = inst
+            .prime_agent_capture_plan(inst.prime_agent_capture_options().unwrap())
+            .unwrap();
         let sessions = plan.store.join(&plan.session_dir);
         std::fs::create_dir_all(&sessions).unwrap();
         let old = "018f47a6-7b80-7cc3-98a2-37b5f486b2a1";

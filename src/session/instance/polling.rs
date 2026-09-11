@@ -20,8 +20,8 @@ pub enum PollerStart {
     Started,
     /// Nothing to poll for this session at the moment; not a failure.
     NotApplicable,
-    /// Another process owns the managed capture store; a retry is scheduled
-    /// on `session_id_poller_retry_after`.
+    /// Capture prerequisites are unresolved; a retry is scheduled on
+    /// `session_id_poller_retry_after`.
     Deferred,
     /// The process-wide poller-thread budget is spent.
     BudgetExhausted,
@@ -273,33 +273,48 @@ impl Instance {
         if !self.supports_session_poller() {
             return PollerStart::NotApplicable;
         }
-        let prime_plan = if backend == crate::agents::SessionCaptureBackend::PrimeAgent {
-            self.prime_agent_capture_plan()
+        let prime_options = if backend == crate::agents::SessionCaptureBackend::PrimeAgent {
+            self.prime_agent_capture_options()
         } else {
             None
         };
-        // Validate eligibility before reporting budget exhaustion; reuse Prime's plan below.
-        let exactly_eligible = match backend {
+        // Prime argv eligibility is in-memory; resolving its store/settings stays behind the budget gate.
+        let eligible = match backend {
             crate::agents::SessionCaptureBackend::Codex
             | crate::agents::SessionCaptureBackend::Gemini
             | crate::agents::SessionCaptureBackend::Hermes
             | crate::agents::SessionCaptureBackend::Kimi => {
                 self.sandbox_capture_store_dir().is_some()
             }
-            crate::agents::SessionCaptureBackend::PrimeAgent => prime_plan.is_some(),
+            crate::agents::SessionCaptureBackend::PrimeAgent => prime_options.is_some(),
             crate::agents::SessionCaptureBackend::Omp => self.omp_capture_options().is_some(),
             crate::agents::SessionCaptureBackend::Pi => self.pi_sidecar_source().is_some(),
             crate::agents::SessionCaptureBackend::Claude
             | crate::agents::SessionCaptureBackend::HookSidecar => true,
             crate::agents::SessionCaptureBackend::OpenCode => false,
         };
-        if !exactly_eligible {
+        if !eligible {
             return PollerStart::NotApplicable;
         }
-        // Avoid lease and profile scans when no poller can be spawned.
+        // Avoid configuration I/O, lease and profile scans when no poller can be spawned.
         if !crate::session::poller::session_id_poller_budget_available() {
             return PollerStart::BudgetExhausted;
         }
+        let prime_plan = if let Some(options) = prime_options {
+            match self.prime_agent_capture_plan(options) {
+                Ok(plan) => Some(plan),
+                Err(error) => {
+                    self.session_id_poller_retry_after =
+                        Some(std::time::Instant::now() + MANAGED_CAPTURE_RETRY_BACKOFF);
+                    tracing::warn!(target: "session.capture", session = %self.id,
+                        reason = %format_args!("{error:#}"), retry_after_secs = MANAGED_CAPTURE_RETRY_BACKOFF.as_secs(),
+                        "Prime session capture deferred because its configuration could not be resolved");
+                    return PollerStart::Deferred;
+                }
+            }
+        } else {
+            None
+        };
         let managed_lease = if context
             == crate::agents::SessionCaptureContext::ManagedExclusiveStore
         {
@@ -802,19 +817,25 @@ mod tests {
         assert!(inst.supports_session_poller());
         assert_eq!(inst.maybe_start_poller(), PollerStart::NotApplicable);
         assert!(!inst.repair_session_id_poller_if_needed(&live));
-        assert_eq!(inst.poller_repair.deferrals(), 0);
         assert!(inst.session_id_poller_retry_after.is_none());
         assert!(inst.session_id_poller.is_none());
 
         inst.extra_args.clear();
+        let settings = store.join("settings.json");
+        std::fs::create_dir(&settings).unwrap();
         assert_eq!(inst.maybe_start_poller(), PollerStart::BudgetExhausted);
         assert!(!inst.repair_session_id_poller_if_needed(&live));
-        assert_eq!(inst.poller_repair.deferrals(), 1);
+        assert!(!inst.poller_repair.due(std::time::Instant::now()));
         let lease = super::try_acquire_managed_capture_lease(backend, &store)
             .expect("budget rejection releases the store lease");
 
         budget.set_active(0);
         inst.poller_repair.expire();
+        assert_eq!(inst.maybe_start_poller(), PollerStart::Deferred);
+        assert!(inst.session_id_poller_retry_after.is_some());
+        std::fs::remove_dir(&settings).unwrap();
+        assert!(!inst.repair_session_id_poller_if_needed(&live));
+        inst.session_id_poller_retry_after = None;
         assert_eq!(inst.maybe_start_poller(), PollerStart::Deferred);
         assert!(inst.session_id_poller_retry_after.is_some());
         drop(lease);
@@ -823,7 +844,6 @@ mod tests {
 
         assert!(inst.repair_session_id_poller_if_needed(&live));
         assert!(inst.session_id_poller_is_running());
-        assert_eq!(inst.poller_repair.deferrals(), 0);
         assert_eq!(
             super::try_acquire_managed_capture_lease(backend, &store).unwrap_err(),
             super::LeaseRefusal::Contended
