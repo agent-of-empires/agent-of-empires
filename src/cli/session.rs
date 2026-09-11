@@ -2240,6 +2240,33 @@ mod rename_tests {
                 "refs/remotes/origin/olof/bemlo-123-task",
             ],
         );
+        for title in [Some("Updated title"), None, Some("olof/bemlo-123-task")] {
+            rename_session(
+                "branch-only",
+                RenameArgs {
+                    identifier: Some(id.clone()),
+                    title: title.map(str::to_owned),
+                    group: None,
+                    rename_branch: false,
+                    branch: Some("olof/bemlo-123-task".into()),
+                },
+            )
+            .await
+            .unwrap();
+            let current = storage.load().unwrap().pop().unwrap();
+            assert_eq!(current.title, title.unwrap_or("Updated title"));
+            assert_eq!(current.project_path, worktree.to_str().unwrap());
+            assert_eq!(current.worktree_info.unwrap().branch, "olof/bemlo-123-task");
+            assert_eq!(
+                git(&worktree, &["branch", "--show-current"]),
+                "olof/bemlo-123-task"
+            );
+            assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), head);
+            assert_eq!(
+                std::fs::read_to_string(worktree.join("uncommitted.txt")).unwrap(),
+                "keep me"
+            );
+        }
         let protected = rename_session(
             "branch-only",
             RenameArgs {

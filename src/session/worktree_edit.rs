@@ -484,14 +484,14 @@ pub fn rename_worktree_branch(
         GitWorktree::get_current_branch(path)? == info.branch,
         "Worktree branch changed; refresh session metadata before renaming"
     );
+    if branch == info.branch {
+        return Ok(false);
+    }
     let protected = git.protected_default_branch_names()?;
     anyhow::ensure!(
         !["main", "master"].contains(&info.branch.as_str()) && !protected.contains(&info.branch),
         "The default branch cannot be renamed as a task"
     );
-    if branch == info.branch {
-        return Ok(false);
-    }
     anyhow::ensure!(
         !worktrees.iter().any(|wt| {
             wt.branch.as_deref() == Some(&info.branch)
