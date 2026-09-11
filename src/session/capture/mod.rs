@@ -1266,29 +1266,6 @@ fn prime_agent_store_session_id(
     .and_then(validated_session_id)
 }
 
-#[cfg(test)]
-/// Poll the mounted Prime Agent store for a post-launch transcript whose CWD
-/// matches the effective container workspace.
-pub(crate) fn prime_agent_poll_fn_sandboxed_store(
-    store: PathBuf,
-    session_dir: PathBuf,
-    container_workdir: String,
-    instance_id: String,
-    launch_time_ms: f64,
-    extra_excludes: HashSet<String>,
-) -> impl Fn() -> Option<String> + Send + 'static {
-    move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
-        prime_agent_store_session_id(
-            &store,
-            &session_dir,
-            &container_workdir,
-            &exclusion,
-            launch_time_ms,
-        )
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PrimeRootPublication {
     Ready(String),
@@ -2639,7 +2616,8 @@ mod tests {
         std::fs::write(&child, format!("{child_header}\n")).unwrap();
         set_mtime_seconds(&child, 5_000);
 
-        let poll = prime_agent_poll_fn_sandboxed_store(
+        let poll = prime_agent_poll_fn_sandboxed(
+            Box::new(|| None),
             tmp.path().to_path_buf(),
             session_dir.clone(),
             "/workspace".to_string(),

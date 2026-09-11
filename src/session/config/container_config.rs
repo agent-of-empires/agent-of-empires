@@ -1390,8 +1390,6 @@ fn sync_managed_skills_into_sandbox(
 /// container that already exists, and reusing one is the normal path.
 pub(crate) const PI_SIDECAR_DIR_IN_CONTAINER: &str = "/root/.pi/aoe-session";
 pub(crate) const PRIME_AGENT_DIR_IN_CONTAINER: &str = "/root/.prime/agent";
-pub(crate) const PRIME_AGENT_EXTENSION_IN_CONTAINER: &str =
-    "/root/.prime/agent/extensions/aoe-session-id.js";
 
 fn install_session_extension_at(root: &Path, rel: &Path) -> Result<()> {
     let source = crate::session::instance::SESSION_IDENTITY_EXTENSION;

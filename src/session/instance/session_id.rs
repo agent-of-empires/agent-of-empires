@@ -1,12 +1,11 @@
 //! Acquiring the agent session id a launch resumes from.
 
 use super::*;
+use crate::session::config::container_config::PRIME_AGENT_DIR_IN_CONTAINER;
 
 const SESSION_SIDECAR_MAX_BYTES: usize = 4096;
 const PRIME_AGENT_HEADER_MAX_BYTES: u64 = 64 * 1024;
 const PRIME_AGENT_SETTINGS_MAX_BYTES: usize = 64 * 1024;
-const PRIME_AGENT_HOME: &str = "/root/.prime/agent";
-const PRIME_AGENT_DEFAULT_SESSION_DIR: &str = "/root/.prime/agent/sessions";
 
 #[derive(Default)]
 pub(super) struct PrimeAgentLaunchOptions {
@@ -306,7 +305,8 @@ impl Instance {
         let session_dir_value = if let Some(value) = configured_session_dir {
             value
         } else {
-            let global_container_path = Path::new(PRIME_AGENT_HOME).join("settings.json");
+            let global_container_path =
+                Path::new(PRIME_AGENT_DIR_IN_CONTAINER).join("settings.json");
             let project_container_path = container_cwd.join(".prime/agent/settings.json");
             let global_host_path = config
                 .host_path_for_container_path(&global_container_path, false)
@@ -335,14 +335,16 @@ impl Instance {
                         .and_then(|settings| settings.get("sessionDir"))
                 }) {
                 Some(serde_json::Value::String(value)) => value.clone(),
-                Some(serde_json::Value::Null) | None => PRIME_AGENT_DEFAULT_SESSION_DIR.to_string(),
+                Some(serde_json::Value::Null) | None => {
+                    format!("{PRIME_AGENT_DIR_IN_CONTAINER}/sessions")
+                }
                 Some(_) => anyhow::bail!("Prime sessionDir setting is neither a string nor null"),
             }
         };
 
         let container_session_dir = resolve_prime_agent_path(&session_dir_value, &container_cwd);
         let session_dir = container_session_dir
-            .strip_prefix(Path::new(PRIME_AGENT_HOME))
+            .strip_prefix(Path::new(PRIME_AGENT_DIR_IN_CONTAINER))
             .context("Prime session directory is outside the managed store")?
             .to_path_buf();
         let mapped = config
@@ -721,14 +723,10 @@ impl Instance {
                     )
                     .ok()?;
                     (
-                        Path::new(
-                            crate::session::config::container_config::PRIME_AGENT_DIR_IN_CONTAINER,
-                        ),
+                        Path::new(PRIME_AGENT_DIR_IN_CONTAINER),
                         format!(
-                            " -e {}",
-                            shell_escape(
-                                crate::session::config::container_config::PRIME_AGENT_EXTENSION_IN_CONTAINER
-                            )
+                            " -e {}/extensions/aoe-session-id.js",
+                            shell_escape(PRIME_AGENT_DIR_IN_CONTAINER),
                         ),
                     )
                 }
@@ -749,20 +747,21 @@ impl Instance {
             if container_known && container.mount_fingerprint_matches(&config).ok()? != Some(true) {
                 return None;
             }
-            let sidecar_root = match backend {
-                crate::agents::SessionCaptureBackend::Pi => {
-                    crate::session::config::container_config::PI_SIDECAR_DIR_IN_CONTAINER
-                }
+            let (sidecar_root, suffix) = match backend {
+                crate::agents::SessionCaptureBackend::Pi => (
+                    crate::session::config::container_config::PI_SIDECAR_DIR_IN_CONTAINER,
+                    "",
+                ),
                 crate::agents::SessionCaptureBackend::PrimeAgent => {
-                    "/root/.prime/agent/aoe-session"
+                    (PRIME_AGENT_DIR_IN_CONTAINER, "/aoe-session")
                 }
                 _ => return None,
             };
             return Some((
                 flag,
                 format!(
-                    "AOE_SESSION_ID_FILE={}/{}/session_id ",
-                    sidecar_root, self.id
+                    "AOE_SESSION_ID_FILE={}{}/{}/session_id ",
+                    sidecar_root, suffix, self.id
                 ),
             ));
         }

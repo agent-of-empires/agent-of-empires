@@ -475,9 +475,6 @@ impl Instance {
             let extension_configured = identity_extension.is_some();
             self.pi_extension_launched = extension_configured
                 && extension_backend == Some(crate::agents::SessionCaptureBackend::Pi);
-            if extension_backend == Some(crate::agents::SessionCaptureBackend::PrimeAgent) {
-                self.identity_publisher_launched = extension_configured;
-            }
             if let Some((ref flag, _)) = identity_extension {
                 tool_cmd.push_str(flag);
             }
