@@ -472,13 +472,12 @@ pub fn rename_worktree_branch(
         Path::new(&info.main_repo_path).canonicalize()? != canonical,
         "The main checkout cannot be renamed as a task"
     );
+    let worktrees = git.list_worktrees()?;
     anyhow::ensure!(
-        git.list_worktrees()?
-            .iter()
-            .any(
-                |wt| wt.path.canonicalize().ok().as_ref() == Some(&canonical)
-                    && wt.branch.as_deref() == Some(&info.branch)
-            ),
+        worktrees.iter().any(
+            |wt| wt.path.canonicalize().ok().as_ref() == Some(&canonical)
+                && wt.branch.as_deref() == Some(&info.branch)
+        ),
         "Worktree path or branch no longer matches session metadata"
     );
     anyhow::ensure!(
@@ -494,11 +493,33 @@ pub fn rename_worktree_branch(
         return Ok(false);
     }
     anyhow::ensure!(
+        !worktrees.iter().any(|wt| {
+            wt.branch.as_deref() == Some(&info.branch)
+                && wt.path.canonicalize().ok().as_ref() != Some(&canonical)
+        }),
+        "Source branch is shared by another Git worktree"
+    );
+    anyhow::ensure!(
         !git.branch_exists(branch)?,
         "Target branch already exists: {branch}"
     );
     git.rename_branch(&info.branch, branch)?;
     Ok(true)
+}
+
+/// Roll back a branch rename only while the worktree still uses the renamed branch.
+pub fn rollback_worktree_branch(
+    info: &WorktreeInfo,
+    path: &Path,
+    renamed_branch: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        GitWorktree::get_current_branch(path)? == renamed_branch,
+        "Worktree branch changed concurrently; refusing branch rollback"
+    );
+    GitWorktree::new(PathBuf::from(&info.main_repo_path))?
+        .rename_branch(renamed_branch, &info.branch)?;
+    Ok(())
 }
 
 #[cfg(test)]

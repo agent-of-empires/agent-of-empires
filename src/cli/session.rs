@@ -2011,10 +2011,13 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
                         .and_then(|row| row.worktree_info.as_ref())
                         .map(|wt| wt.branch.as_str());
                     if persisted_branch == Some(info.branch.as_str()) {
-                        let git = crate::git::GitWorktree::new(std::path::PathBuf::from(
-                            &info.main_repo_path,
-                        ))?;
-                        if let Err(rollback) = git.rename_branch(branch, &info.branch) {
+                        if let Err(rollback) =
+                            crate::session::worktree_edit::rollback_worktree_branch(
+                                info,
+                                std::path::Path::new(&inst.project_path),
+                                branch,
+                            )
+                        {
                             bail!("Session metadata failed: {error}; branch rollback also failed: {rollback}. The directory is unchanged; inspect Git and session metadata before continuing.");
                         }
                     } else if persisted_branch != Some(branch.as_str()) {
@@ -2140,6 +2143,53 @@ mod rename_tests {
                 Ok(())
             })
             .unwrap();
+        let external = dir.path().join("external");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--force",
+                external.to_str().unwrap(),
+                "agent-old",
+            ],
+        );
+        std::fs::write(external.join("external.txt"), "keep external").unwrap();
+        let before = serde_json::to_value(storage.load().unwrap()).unwrap();
+        let shared = rename_session(
+            "branch-only",
+            RenameArgs {
+                identifier: Some(id.clone()),
+                title: Some("Must not apply".into()),
+                group: None,
+                rename_branch: false,
+                branch: Some("blocked-shared".into()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(shared.to_string().contains("another Git worktree"));
+        assert_eq!(
+            serde_json::to_value(storage.load().unwrap()).unwrap(),
+            before
+        );
+        for path in [&worktree, &external] {
+            assert_eq!(git(path, &["branch", "--show-current"]), "agent-old");
+            assert_eq!(git(path, &["rev-parse", "HEAD"]), head);
+        }
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("uncommitted.txt")).unwrap(),
+            "keep me"
+        );
+        assert_eq!(
+            std::fs::read_to_string(external.join("external.txt")).unwrap(),
+            "keep external"
+        );
+        assert!(git(&repo, &["branch", "--list", "blocked-shared"]).is_empty());
+        git(
+            &repo,
+            &["worktree", "remove", "--force", external.to_str().unwrap()],
+        );
         for branch in ["olof/bemlo-123-task", "olof/bemlo-123-task"] {
             rename_session(
                 "branch-only",
@@ -2262,6 +2312,44 @@ mod rename_tests {
         assert_eq!(
             git(&worktree, &["branch", "--show-current"]),
             "olof/bemlo-123-task"
+        );
+
+        let info = storage.load().unwrap()[0].worktree_info.clone().unwrap();
+        git(&worktree, &["branch", "-m", "rollback-source"]);
+        git(&worktree, &["checkout", "-b", "external-checkout"]);
+        let refs = git(&repo, &["show-ref", "--heads"]);
+        let error = crate::session::worktree_edit::rollback_worktree_branch(
+            &info,
+            &worktree,
+            "rollback-source",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("changed concurrently"));
+        assert_eq!(git(&repo, &["show-ref", "--heads"]), refs);
+        assert_eq!(
+            git(&worktree, &["branch", "--show-current"]),
+            "external-checkout"
+        );
+        assert_eq!(
+            storage.load().unwrap()[0]
+                .worktree_info
+                .as_ref()
+                .unwrap()
+                .branch,
+            info.branch
+        );
+        git(&worktree, &["checkout", "rollback-source"]);
+        crate::session::worktree_edit::rollback_worktree_branch(
+            &info,
+            &worktree,
+            "rollback-source",
+        )
+        .unwrap();
+        assert_eq!(git(&worktree, &["branch", "--show-current"]), info.branch);
+        assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), head);
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("uncommitted.txt")).unwrap(),
+            "keep me"
         );
     }
 
