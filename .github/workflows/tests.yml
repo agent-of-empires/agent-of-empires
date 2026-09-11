@@ -128,7 +128,11 @@ jobs:
       # skipped here while every non-e2e test binary stays auto-discovered.
       - name: Cargo test (default features, everything except e2e)
         if: matrix.leg == 'core-rest'
-        run: cargo test
+        # Echo the temp root so a silently-dropped TMPDIR is visible in the log
+        # rather than passing as a green run with the guard gone.
+        run: |
+          echo "TMPDIR=${TMPDIR:-unset}"
+          cargo test
       # bare-core: the three no-default-features feature corners. `web` is not
       # a default feature, so these runs are also the dashboard-off compile
       # gate that keeps the `cfg(feature = "web")` sites from rotting.
