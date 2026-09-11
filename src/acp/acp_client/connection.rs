@@ -298,9 +298,7 @@ pub(super) async fn run_connection_task<W, R>(
     // hit twice. Stale entries are filtered by reset-in-the-future at read
     // time instead. #3028, #3152.
     let last_rate_limit_rejections = Arc::new(std::sync::Mutex::new(HashMap::<String, i64>::new()));
-    // Set when a rejected first prompt on a stored session already emitted
-    // `SessionContextReset`: the connection then ends on a soft stop that the
-    // respawn recovers from, not on a startup error (#3560).
+    // A stored-session rejection emits one reset, then a recoverable soft stop.
     let context_reset_emitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let context_reset_emitted_for_block = context_reset_emitted.clone();
     // In-flight tool calls for the between-prompt (agent-initiated) path,
@@ -928,13 +926,7 @@ pub(super) async fn run_connection_task<W, R>(
             // for a clear command must forward the same gated list.
             let mcp_servers_for_reset = mcp_servers.clone();
 
-            // Mutable: a driven conversation reset (#2979) swaps in the
-            // fresh id from its `session/new` so every later
-            // `session/prompt` / cancel / mode switch addresses the new
-            // conversation.
-            // Whether the session id in use came from storage (a mid-turn
-            // resume, or a `session/load` of the stored id): only then is a
-            // first-prompt rejection the agent having dropped that session.
+            // Resets replace this ID and clear its stored-session provenance.
             let mut session_from_storage = matches!(mode, ConnectMode::Resume { .. });
             let mut acp_session_id: SessionId = match mode {
                 ConnectMode::Resume {

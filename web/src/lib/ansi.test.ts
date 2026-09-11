@@ -93,3 +93,70 @@ describe("parseAnsi", () => {
     expect(segs[1].style).toEqual({});
   });
 });
+
+describe("OSC 8 hyperlinks and other OSC sequences", () => {
+  const link = (url: string, text: string, terminator = `${ESC}\\`) =>
+    `${ESC}]8;;${url}${terminator}${text}${ESC}]8;;${terminator}`;
+
+  it("tags the visible text with the link target, not a regex guess", () => {
+    const segs = parseAnsi(`Created PR ${link("https://github.com/x/y/pull/8", "here")}, done`);
+    expect(segs.map((s) => [s.text, s.url])).toEqual([
+      ["Created PR ", undefined],
+      ["here", "https://github.com/x/y/pull/8"],
+      [", done", undefined],
+    ]);
+  });
+
+  it("keeps SGR styling inside a link's visible text and still tags it", () => {
+    const styled = link("https://x.com", `${ESC}[31mred link${ESC}[0m`);
+    const segs = parseAnsi(styled);
+    expect(segs).toEqual([{ text: "red link", style: { fg: "#cd3131" }, url: "https://x.com" }]);
+  });
+
+  it("supports a BEL terminator instead of ST", () => {
+    const segs = parseAnsi(link("https://x.com", "click", "\x07"));
+    expect(segs).toEqual([{ text: "click", style: {}, url: "https://x.com" }]);
+  });
+
+  it("carries an id= parameter before the URL", () => {
+    const withId = `${ESC}]8;id=k16z3m;https://x.com/pull/8${ESC}\\click${ESC}]8;;${ESC}\\`;
+    const segs = parseAnsi(withId);
+    expect(segs).toEqual([{ text: "click", style: {}, url: "https://x.com/pull/8" }]);
+  });
+
+  it("runs an unterminated link to the end of the text instead of dropping it", () => {
+    const segs = parseAnsi(`${ESC}]8;;https://x.com${ESC}\\trailing text`);
+    expect(segs).toEqual([{ text: "trailing text", style: {}, url: "https://x.com" }]);
+  });
+
+  it("anchors the link to its own text when color opens before the link", () => {
+    // The shape `tmux capture-pane -e` emits: the SGR change lands BEFORE
+    // the OSC 8 opener, so counting escape bytes as visible text shifted
+    // the link right by the length of the color sequence.
+    const line = `Styled: ${ESC}[31m${ESC}]8;;https://example.com/red${ESC}\\red link${ESC}[39m${ESC}]8;;${ESC}\\`;
+    expect(parseAnsi(line)).toEqual([
+      { text: "Styled: ", style: {} },
+      { text: "red link", style: { fg: "#cd3131" }, url: "https://example.com/red" },
+    ]);
+  });
+
+  it("keeps the link off text that follows the closing sequence", () => {
+    const line = `${ESC}[32m${ESC}]8;;https://example.com${ESC}\\link${ESC}]8;;${ESC}\\ tail`;
+    expect(parseAnsi(line)).toEqual([
+      { text: "link", style: { fg: "#0dbc79" }, url: "https://example.com" },
+      { text: " tail", style: { fg: "#0dbc79" } },
+    ]);
+  });
+
+  it("detects output whose only escape sequence is a hyperlink", () => {
+    // Output with a link but no color must still reach this parser; the
+    // caller renders it as plain text otherwise and the bytes leak.
+    expect(hasAnsi(link("https://x.com", "click"))).toBe(true);
+    expect(hasAnsi(`${ESC}]0;title${ESC}\\`)).toBe(true);
+  });
+
+  it("drops non-hyperlink OSC sequences instead of leaking their escape bytes", () => {
+    const segs = parseAnsi(`${ESC}]0;window title${ESC}\\before${ESC}]52;c;aGk=\x07after`);
+    expect(segs.map((s) => s.text)).toEqual(["beforeafter"]);
+  });
+});

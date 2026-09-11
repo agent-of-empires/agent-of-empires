@@ -1,4 +1,4 @@
-import { parseAnsi, parseAnsiFrom, type AnsiSegment, type AnsiStyle } from "./ansi";
+import { parseAnsi, parseAnsiFrom, type AnsiSegment, type AnsiState } from "./ansi";
 
 // Frame helpers for the mobile live terminal: turn one `capture-pane -e`
 // snapshot into per-line styled segments the component can render as DOM
@@ -14,7 +14,7 @@ export function ansiToLines(content: string): AnsiSegment[][] {
     parts.forEach((part, i) => {
       if (i > 0) lines.push([]);
       if (part.length > 0) {
-        lines[lines.length - 1]!.push({ text: part, style: seg.style });
+        lines[lines.length - 1]!.push({ text: part, style: seg.style, url: seg.url });
       }
     });
   }
@@ -29,15 +29,16 @@ export function ansiToLines(content: string): AnsiSegment[][] {
 
 interface CachedLine {
   segs: AnsiSegment[];
-  /** SGR state left in effect after this line, threaded into the next. */
-  exit: AnsiStyle;
+  /** Escape state left in effect after this line, threaded into the next. */
+  exit: AnsiState;
 }
 
-/** Key for the SGR state a line is entered with. Two identical raw lines
- *  parsed under different carried styles are different render results, so
- *  the entry state is part of the cache key. */
-function styleKey(s: AnsiStyle): string {
-  return `${s.fg ?? ""}|${s.bg ?? ""}|${+!!s.bold}${+!!s.dim}${+!!s.italic}${+!!s.underline}${+!!s.inverse}`;
+/** Key for the escape state a line is entered with. Two identical raw lines
+ *  parsed under different carried styles, or one inside an open hyperlink
+ *  and one outside it, are different render results, so the entry state is
+ *  part of the cache key. */
+function styleKey({ style: s, url }: AnsiState): string {
+  return `${s.fg ?? ""}|${s.bg ?? ""}|${+!!s.bold}${+!!s.dim}${+!!s.italic}${+!!s.underline}${+!!s.inverse}|${url ?? ""}`;
 }
 
 /**
@@ -67,7 +68,7 @@ export class LineParseCache {
     this.live = new Map();
     const raw = typeof content === "string" ? content.split("\n") : content;
     const lines: AnsiSegment[][] = [];
-    let entry: AnsiStyle = {};
+    let entry: AnsiState = { style: {} };
     for (const r of raw) {
       // NUL separator: it appears in neither a style key (CSS color
       // strings) nor capture-pane text, so the key cannot be ambiguous.
@@ -103,6 +104,24 @@ export function lineText(line: AnsiSegment[]): string {
 // The match may run into glued non-ASCII glyphs; Row anchors whole parts,
 // so the href follows whatever this regex claims.
 const URL_RE = /https?:\/\/\S+/g;
+
+/** Whether a hyperlink target from pane output may become an href. Pane
+ *  output is agent-controlled, so a target only reaches the DOM when it is
+ *  the same http(s) the bare-URL matcher already accepts; the TUI's own OSC 8
+ *  scanner holds the same line. A rejected target renders as plain text. */
+export function isHttpUrl(url: string): boolean {
+  // A control byte in a target is never legitimate and would let pane output
+  // inject escapes into whatever re-emits it.
+  // eslint-disable-next-line no-control-regex
+  if (!/^https?:\/\//i.test(url) || /[\u0000-\u001f\u007f]/.test(url)) return false;
+  try {
+    // `https://` alone passes the prefix test but names no host, so it would
+    // render as an anchor that cannot navigate anywhere.
+    return new URL(url).hostname.length > 0;
+  } catch {
+    return false;
+  }
+}
 // Trailing punctuation that is usually sentence/wrapping syntax, not the URL
 // (e.g. `see https://x.com/a).`). Stripped from the match; re-emitted as text.
 const URL_TRAILING = /[.,;:!?)\]}'">]+$/;
@@ -397,7 +416,7 @@ export function wrapLine(line: AnsiSegment[], cols: number): AnsiSegment[][] {
     let chunk = "";
     const flushChunk = () => {
       if (chunk.length > 0) {
-        current.push({ text: chunk, style: seg.style });
+        current.push({ text: chunk, style: seg.style, url: seg.url });
         chunk = "";
       }
     };

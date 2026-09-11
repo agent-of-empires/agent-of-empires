@@ -729,11 +729,28 @@ function AnsiBlock({ text }: { text: string }) {
   const segments = useMemo(() => parseAnsi(text), [text]);
   return (
     <pre className="overflow-x-auto px-3 py-2 text-xs font-mono text-text-primary whitespace-pre">
-      {segments.map((seg, i) => (
-        <span key={i} style={ansiSegmentStyle(seg.style)}>
-          {seg.text}
-        </span>
-      ))}
+      {segments.map((seg, i) => {
+        // Tool output is agent-controlled, so a hyperlink target answers to
+        // the same scheme policy as every other link on this card; a rejected
+        // target keeps its visible text and loses only the anchor.
+        const href = seg.url ? safeUri(seg.url, SAFE_LINK_SCHEMES) : null;
+        return href ? (
+          <a
+            key={i}
+            href={href}
+            target="_blank"
+            rel="noopener noreferrer"
+            style={ansiSegmentStyle(seg.style)}
+            className="underline"
+          >
+            {seg.text}
+          </a>
+        ) : (
+          <span key={i} style={ansiSegmentStyle(seg.style)}>
+            {seg.text}
+          </span>
+        );
+      })}
     </pre>
   );
 }

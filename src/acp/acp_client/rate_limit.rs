@@ -41,21 +41,12 @@ pub(crate) fn classify_rate_limit_from_message(
     })
 }
 
-/// Recognize the agent's rejection of a stored/resumed ACP session id it no
-/// longer holds (e.g. OMP replying `Unsupported ACP session`). A resumed
-/// worker reuses the persisted `acp_session_id` without re-issuing
-/// `session/load`, so if the agent dropped that session across the
-/// interruption the first `session/prompt` fails with this class of error
-/// rather than a rate limit or a transport drop. The caller recovers via the
-/// established `SessionContextReset` path: the supervisor clears the stored
-/// id so the respawn opens a fresh `session/new`, while the SQLite transcript
-/// is preserved for replay. Deliberately narrow, a message fingerprint, so an
-/// unrelated prompt failure still ends the turn as an ordinary error instead
-/// of being silently swallowed into a context reset.
+/// Recognize missing stored session IDs, not unsupported session features.
+/// A storage-origin session may be lost before any prompt. The caller resets
+/// its identity while preserving the transcript for replay.
 pub(crate) fn is_unsupported_session_error(err: &agent_client_protocol::Error) -> bool {
     const PHRASES: &[&str] = &[
         "unsupported acp session",
-        "unsupported session",
         "unknown session",
         "session not found",
         "no such session",
@@ -343,6 +334,8 @@ mod tests {
             ("unknown tool", false),
             ("Unsupported content block in session/prompt", false),
             ("Method not found: session/prompt", false),
+            ("Unsupported session mode", false),
+            ("Unsupported session capability: fork", false),
         ];
         for (msg, expected) in cases {
             assert_eq!(classify(msg), expected, "{msg:?}");
