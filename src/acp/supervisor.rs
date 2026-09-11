@@ -4436,6 +4436,61 @@ mod tests {
         }
     }
 
+    /// `effort_explicit` crosses the spawn boundary as its own field rather
+    /// than being rederived from `effort`. The create path forwards a
+    /// daemon-resolved default while `Instance.acp_effort` is `None`, so a
+    /// nonempty effort is not a pin, and reading it as one makes a later pin
+    /// move refuse the new model's effort.
+    ///
+    /// Covers that boundary only. The resolution it feeds is covered by the
+    /// `respawn_` tests.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn spawn_does_not_rederive_effort_provenance_from_the_value() {
+        let _home = isolate_home();
+        let control = Arc::new(FakeProcessControl::default());
+        control.alive(4343);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let sup = Arc::new(
+            Supervisor::new(VecSink::new())
+                .with_process_control(control)
+                .with_launcher(gated_launcher(entered.clone(), gate.clone(), 4343)),
+        );
+
+        // What the create path sends: an effort resolved from the pinned
+        // model's defaults, with no user selection behind it.
+        let mut req = spawn_request("s-prov");
+        req.effort = Some("low".into());
+        req.effort_explicit = false;
+
+        // The launcher parks on the gate, so spawn runs beside this task the
+        // way the create path's detached spawn does.
+        let spawner = {
+            let sup = Arc::clone(&sup);
+            tokio::spawn(async move { sup.spawn(req).await })
+        };
+        entered.notified().await;
+        gate.notify_one();
+        spawner.await.unwrap().expect("spawn");
+
+        let explicit = sup
+            .workers
+            .lock()
+            .await
+            .get("s-prov")
+            .map(|handle| match &handle.kind {
+                WorkerKind::Runner { spawn_config } => spawn_config.default_effort_explicit,
+                _ => panic!("runner handle expected"),
+            })
+            .expect("worker installed");
+        assert!(
+            !explicit,
+            "a resolved default effort must not read as a session pin; \
+             the watchdog would refuse the new model's inherited effort"
+        );
+    }
+
     /// An explicit request effort is a session pin (persisted in
     /// `Instance.acp_effort`): a model pin that later moves re-resolves the
     /// model but must not overwrite the effort the user asked for.
