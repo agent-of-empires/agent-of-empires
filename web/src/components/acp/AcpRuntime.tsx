@@ -259,7 +259,13 @@ export function AcpRuntime({
 
   const adapter: ExternalStoreAdapter<ThreadMessageLike> = {
     messages,
-    isRunning: visiblyBusy,
+    // NOT visiblyBusy: assistant-ui's own ComposerInput swallows Enter
+    // outright when isRunning is true and the adapter has no queue
+    // capability (`if (threadState.isRunning && !hasQueue) return;`), so this
+    // has to track only the main turn, exactly like Composer.tsx's turnActive
+    // gate, or a background sub-agent with an idle main turn silently eats
+    // every keystroke.
+    isRunning: acp.state.turnActive,
     convertMessage: (m) => m,
     onNew: async (msg) => {
       // assistant-ui hands us an AppendMessage with mixed parts. Flatten
