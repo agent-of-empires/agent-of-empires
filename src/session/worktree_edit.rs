@@ -447,6 +447,60 @@ pub fn edit_worktree_workdir(
     })
 }
 
+/// Rename a managed branch without moving its directory or touching its files.
+/// The caller holds the session identity and lifecycle locks and persists the result.
+pub fn rename_worktree_branch(
+    info: &WorktreeInfo,
+    path: &Path,
+    branch: &str,
+) -> anyhow::Result<bool> {
+    anyhow::ensure!(
+        info.managed_by_aoe,
+        "Branch-only rename requires a managed worktree"
+    );
+    anyhow::ensure!(
+        !branch.is_empty() && branch.trim() == branch && !branch.starts_with('-'),
+        "Provide an exact Git branch name"
+    );
+    anyhow::ensure!(
+        git2::Reference::is_valid_name(&format!("refs/heads/{branch}")),
+        "Provide an exact valid Git branch name"
+    );
+    let git = GitWorktree::new(PathBuf::from(&info.main_repo_path))?;
+    let canonical = path.canonicalize()?;
+    anyhow::ensure!(
+        Path::new(&info.main_repo_path).canonicalize()? != canonical,
+        "The main checkout cannot be renamed as a task"
+    );
+    anyhow::ensure!(
+        git.list_worktrees()?
+            .iter()
+            .any(
+                |wt| wt.path.canonicalize().ok().as_ref() == Some(&canonical)
+                    && wt.branch.as_deref() == Some(&info.branch)
+            ),
+        "Worktree path or branch no longer matches session metadata"
+    );
+    anyhow::ensure!(
+        GitWorktree::get_current_branch(path)? == info.branch,
+        "Worktree branch changed; refresh session metadata before renaming"
+    );
+    let protected = git.protected_default_branch_names()?;
+    anyhow::ensure!(
+        !["main", "master"].contains(&info.branch.as_str()) && !protected.contains(&info.branch),
+        "The default branch cannot be renamed as a task"
+    );
+    if branch == info.branch {
+        return Ok(false);
+    }
+    anyhow::ensure!(
+        !git.branch_exists(branch)?,
+        "Target branch already exists: {branch}"
+    );
+    git.rename_branch(&info.branch, branch)?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
