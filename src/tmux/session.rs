@@ -40,7 +40,7 @@ impl PaneEnvMutation {
         Self::Unset { key }
     }
 
-    fn key(&self) -> &str {
+    pub(crate) fn key(&self) -> &str {
         match self {
             Self::Set { key, .. } | Self::Unset { key } => key,
         }

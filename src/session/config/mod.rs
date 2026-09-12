@@ -597,6 +597,48 @@ pub struct AcpConfig {
     )]
     pub allow_agent_install: bool,
 
+    /// One model gateway root serving every supported harness (claude,
+    /// codex, copilot). When set, spawn-env derivation points each
+    /// harness's own routing env vars at the gateway's provider-specific
+    /// routes (e.g. `ANTHROPIC_BASE_URL` → `<root>/anthropic`,
+    /// `OPENAI_BASE_URL` → `<root>/openai/v1`) and forwards the resolved
+    /// key — so one catalogue of models + one credential backs per-session
+    /// model switching across agents. Port of nodeterm's model gateway;
+    /// see `crate::acp::model_gateway`. Empty = the feature is off and
+    /// spawn env is untouched.
+    #[serde(default)]
+    #[setting(
+        label = "Model gateway URL",
+        widget = "text",
+        web = "local_only:the daemon resolves the gateway credential against its own environment"
+    )]
+    pub gateway_base_url: String,
+    /// The gateway credential: a literal key, one exact `${env:VAR}`
+    /// reference (resolved from the daemon's own environment at spawn and
+    /// discovery time), or `${secret:model-gateway-api-key}` (same, under
+    /// `MODEL_GATEWAY_API_KEY`). References keep the secret out of
+    /// config.toml; an unresolvable one fails closed — the spawn emits no
+    /// gateway env rather than a partial credential. Never logged.
+    #[serde(default)]
+    #[setting(
+        label = "Model gateway API key",
+        widget = "text",
+        web = "local_only:credential references resolve only on the daemon host"
+    )]
+    pub gateway_api_key: String,
+    /// Optional path appended to `gateway_base_url` for model discovery
+    /// when the gateway serves its catalogue somewhere other than the
+    /// conventional `/v1/models` (e.g. `/openai/v1/models`). A PATH
+    /// SUFFIX, never a full URL: it can never move the discovery request
+    /// — or the resolved key — off the saved host.
+    #[serde(default)]
+    #[setting(
+        label = "Model gateway discovery path",
+        widget = "text",
+        web = "local_only:appended to the daemon-side discovery fetch"
+    )]
+    pub gateway_discovery_path: String,
+
     /// Per-agent structured-view startup defaults, keyed by agent name
     /// (`{"<agent>": {"model": "...", "effort": "...", "mode": "...",
     /// "effort_by_model": {"<model>": "..."}}}`). `model` is forwarded at spawn;
@@ -647,6 +689,9 @@ impl Default for AcpConfig {
             auto_stop_idle_secs: default_acp_auto_stop_idle_secs(),
             rate_limit_auto_resume: false,
             allow_agent_install: false,
+            gateway_base_url: String::new(),
+            gateway_api_key: String::new(),
+            gateway_discovery_path: String::new(),
             acp_defaults: HashMap::new(),
         }
     }

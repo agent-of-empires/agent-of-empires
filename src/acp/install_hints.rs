@@ -70,9 +70,16 @@ pub fn env_allowlist_for(binary: &str) -> &'static [&'static str] {
         // Existing Claude adapter contract, previously supplied through
         // ALWAYS_FORWARD_ENV. Keep all four names on the Claude adapter while
         // stopping unrelated and custom adapters from receiving them.
+        // ANTHROPIC_BASE_URL is verified from the Claude Code CLI's documented
+        // environment variables (Claude Code settings docs, `env` section):
+        // the CLI resolves its API endpoint from ANTHROPIC_BASE_URL and its
+        // bearer from ANTHROPIC_AUTH_TOKEN — the pair the model gateway
+        // derives — so forwarding the base URL alone would still send the
+        // request to the gateway with the wrong (absent) credential story.
         "claude-agent-acp" => &[
             "ANTHROPIC_API_KEY",
             "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_BASE_URL",
             "CLAUDE_CODE_OAUTH_TOKEN",
             "CLAUDE_CONFIG_DIR",
         ],

@@ -31,6 +31,9 @@ pub mod event_store;
 pub mod fs_handler;
 pub mod install_hints;
 pub mod mcp_config;
+/// Model gateway: shared catalogue + derived credentials/env for
+/// claude/codex/copilot (port of nodeterm's model-gateway).
+pub mod model_gateway;
 pub mod node;
 /// Recall cache of per-agent ACP config options, consumed by the dashboard's
 /// defaults page.
