@@ -39,6 +39,7 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                     &state.instances,
                     &state.acp_event_store,
                     &state.instance_locks,
+                    &state.acp_control_cache,
                     state.file_watch.clone(),
                     &state.status_tx,
                 )
@@ -323,7 +324,18 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             });
         }
 
-        let status_intent = derive_acp_status(frame.event.as_ref());
+        // `publish_persisted` folds this event into the control cache before
+        // broadcasting the frame, so the cached `turn_active` already
+        // reflects it (#3900).
+        let turn_active_after = state.acp_control_cache.turn_active(&frame.session_id);
+        let background_agent_active_after = state
+            .acp_control_cache
+            .has_active_background_agent(&frame.session_id);
+        let status_intent = derive_acp_status(
+            frame.event.as_ref(),
+            turn_active_after,
+            background_agent_active_after,
+        );
         let acp_change = derive_acp_session_change(frame.event.as_ref());
         let load_session_capability = match (frame.event.as_ref(), frame.worker_generation) {
             (
@@ -513,7 +525,11 @@ pub(crate) async fn seed_acp_statuses(state: Arc<AppState>) {
         let Some(event) = state.acp_event_store.latest_seed_status_event(&id) else {
             continue;
         };
-        let Some(intent) = derive_acp_status(&event) else {
+        // No live control-state fold to consult at boot (the cache is
+        // cold), so a background sub-agent outstanding across a restart
+        // reads as Idle here same as before #3900; the reconciler and the
+        // next live event correct it once the tailer resumes.
+        let Some(intent) = derive_acp_status(&event, false, false) else {
             continue;
         };
         let mut instances = state.instances.write().await;
@@ -560,6 +576,21 @@ pub(crate) fn apply_status_intent(
             // Running -> (trailing stop) Idle would strand a deliberate
             // Stop on Idle.
             if inst.status == Status::Stopped {
+                return;
+            }
+            s
+        }
+        // Background sub-agent events must not speak for the main turn: they
+        // preserve its Waiting (a pending approval/elicitation) and Error (a
+        // dead connection the supervisor is still respawning), and Stopped
+        // likewise stays until the main turn's own lifecycle moves it. The
+        // main turn's own events (plain `Set`) resolve Waiting and Error;
+        // Error also heals on a fresh worker attach.
+        StatusIntent::SetUnlessWaiting(s) => {
+            if matches!(
+                inst.status,
+                Status::Stopped | Status::Waiting | Status::Error
+            ) {
                 return;
             }
             s
@@ -729,6 +760,7 @@ pub(super) async fn recover_structured_unread_after_lag(
     instances: &RwLock<Vec<Instance>>,
     event_store: &crate::acp::event_store::EventStore,
     instance_locks: &RwLock<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    control_cache: &crate::acp::control_cache::ControlStateCache,
     file_watch: Arc<crate::file_watch::FileWatchService>,
     status_tx: &broadcast::Sender<StatusChange>,
 ) -> usize {
@@ -745,7 +777,18 @@ pub(super) async fn recover_structured_unread_after_lag(
         let Some(event) = event_store.latest_seed_status_event(&id) else {
             continue;
         };
-        let Some(intent) = derive_acp_status(&event) else {
+        // Unlike boot's cold `(false, false)` seeding, this reads the live
+        // control cache (the boot-vs-lag contrast above): hydrated, it is
+        // at-or-ahead of this event's fold, so its activity flags are the
+        // best available verdict; a miss (never opened, evicted, or
+        // forgotten) degrades to boot's conservative verdict. The seed query
+        // excludes background events, so a `Stopped` under a still-running
+        // sub-agent needs this (#3900).
+        let turn_active_after = control_cache.turn_active(&id);
+        let background_agent_active_after = control_cache.has_active_background_agent(&id);
+        let Some(intent) =
+            derive_acp_status(&event, turn_active_after, background_agent_active_after)
+        else {
             continue;
         };
         // Same snapshot-around-apply as the live path, so "the transition that
@@ -921,10 +964,30 @@ pub(super) fn derive_acp_session_change(event: &crate::acp::Event) -> Option<Acp
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum StatusIntent {
     Set(Status),
+    /// Like `Set`, but a no-op while the sidebar sits on a status only the
+    /// main turn may resolve: `Waiting` (a pending approval/elicitation),
+    /// `Stopped` (a deliberate stop), or `Error` (a dead connection awaiting
+    /// respawn). Background sub-agent lifecycle events must not speak for
+    /// the main turn; its own events (plain `Set`) and `HealError` resolve
+    /// those. Used only by the `BackgroundAgent*` arms (#3900).
+    SetUnlessWaiting(Status),
     HealError,
 }
 
-pub(crate) fn derive_acp_status(event: &crate::acp::Event) -> Option<StatusIntent> {
+/// `turn_active_after` and `background_agent_active_after` are the session's
+/// post-event activity flags from the folded control state (`AcpState::
+/// turn_active` / `has_active_background_agent()`); misses read `false` and
+/// degrade to boot's conservative verdict. `turn_active` itself still gates
+/// prompt dispatch and the queue drain and tracks only the main turn. Both
+/// `Stopped` and `BackgroundAgentCompleted` resolve Idle only once neither
+/// flag is set; the former needs the flags because the cache can be ahead of
+/// a lagged frame (a newer turn already opened), the latter because a
+/// sub-agent can outlive its own completion event's ordering. See #3900.
+pub(crate) fn derive_acp_status(
+    event: &crate::acp::Event,
+    turn_active_after: bool,
+    background_agent_active_after: bool,
+) -> Option<StatusIntent> {
     use crate::acp::Event;
     match event {
         Event::UserPromptSent { .. }
@@ -939,6 +1002,17 @@ pub(crate) fn derive_acp_status(event: &crate::acp::Event) -> Option<StatusInten
         Event::ThinkingStarted
         | Event::AgentMessageChunk { .. }
         | Event::ToolCallStarted { .. } => Some(StatusIntent::Set(Status::Running)),
+        // A launched or still-working background sub-agent keeps the sidebar
+        // dot lit even while the main turn is between its own events. Must
+        // not override a pending approval/elicitation's Waiting dot, which
+        // speaks to the main turn, not the sub-agent (#3900).
+        Event::BackgroundAgentLaunched { .. } => {
+            Some(StatusIntent::SetUnlessWaiting(Status::Running))
+        }
+        Event::BackgroundAgentProgress {
+            status: crate::acp::state::BackgroundAgentStatus::Running,
+            ..
+        } => Some(StatusIntent::SetUnlessWaiting(Status::Running)),
         // A pending approval or elicitation both block the turn on the
         // user, so the sidebar dot goes yellow either way.
         Event::ApprovalRequested { .. } | Event::ElicitationRequested { .. } => {
@@ -950,7 +1024,33 @@ pub(crate) fn derive_acp_status(event: &crate::acp::Event) -> Option<StatusInten
         // (or for the user to switch to another ACP backend). The
         // dedicated RateLimit banner carries the reset time, so the
         // sidebar pill staying grey is the right signal. See #1281.
-        Event::Stopped { .. } => Some(StatusIntent::Set(Status::Idle)),
+        //
+        // Unless something is still busy after this `Stopped`: a background
+        // sub-agent keeps working past its parent (#3900), and the cache can
+        // be ahead of a lagged frame (a newer turn already opened), so the
+        // arm consults both activity flags. Live, the event itself folds
+        // `turn_active` false, so ahead-ness is the only source of `true`.
+        Event::Stopped { .. } => Some(StatusIntent::Set(
+            if turn_active_after || background_agent_active_after {
+                Status::Running
+            } else {
+                Status::Idle
+            },
+        )),
+        // The last outstanding background agent finished. Only drops to Idle
+        // once neither the main turn nor a sibling agent is still active
+        // (`turn_active_after` covers a sub-agent launched mid-turn that
+        // outlives its own completion event's ordering; the `Stopped` arm
+        // consults the same flags). `SetUnlessWaiting`
+        // because a sibling agent finishing must not clobber a pending
+        // approval/elicitation on the main turn (#3900).
+        Event::BackgroundAgentCompleted { .. } => Some(StatusIntent::SetUnlessWaiting(
+            if turn_active_after || background_agent_active_after {
+                Status::Running
+            } else {
+                Status::Idle
+            },
+        )),
         Event::AgentStartupError { .. } => Some(StatusIntent::Set(Status::Error)),
         // A successful session/new or session/load means the agent
         // is alive. Heal a sticky Error banner so the sidebar dot
@@ -1303,6 +1403,10 @@ mod tests {
                 )
                 .expect("record stopped");
         }
+        // A cold control cache for these sessions: never hydrated, so the
+        // reads miss and degrade to boot's conservative `(false, false)`
+        // verdict, the pre-#3900 Idle+unread behavior this test pins.
+        let control_cache = crate::acp::control_cache::ControlStateCache::new();
 
         let instances = RwLock::new(rows);
         let locks = RwLock::new(std::collections::HashMap::new());
@@ -1312,6 +1416,7 @@ mod tests {
             &instances,
             &store,
             &locks,
+            &control_cache,
             crate::file_watch::FileWatchService::noop(),
             &status_tx,
         )
@@ -1344,6 +1449,228 @@ mod tests {
             "a terminal row is left entirely to the tmux poller"
         );
         assert!(!row(&terminal_id).unread);
+    }
+
+    /// #3900: the lag-recovery replay must consult the live control cache.
+    /// The seed query excludes background events, so the latest status event
+    /// is the turn's `Stopped` even though a background sub-agent is still
+    /// running; deriving from hardcoded inactivity would resolve Idle under
+    /// the live `Running` memory status and mark an unfinished turn unread.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn recover_structured_unread_after_lag_keeps_running_for_a_live_background_agent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: serialized test; no other test mutates HOME concurrently.
+        unsafe { std::env::set_var("HOME", temp.path()) };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        }
+        crate::session::set_unread_enabled(true);
+
+        let profile = "acp-unread-lag-background";
+
+        // Same shape as the missed turn end: memory still says Running.
+        let mut live = Instance::new("acp-live-bg", "/tmp/acp");
+        live.view = crate::session::View::Structured;
+        live.source_profile = profile.to_string();
+        live.status = Status::Running;
+        let live_id = live.id.clone();
+        let rows = vec![live];
+        seed_profile_store(profile, rows.clone());
+
+        let db = temp.path().join("acp-events.db");
+        let store = crate::acp::event_store::EventStore::open(&db, 1000).expect("event store");
+        store
+            .record(
+                &live_id,
+                1,
+                &crate::acp::Event::UserPromptSent {
+                    text: "spawn and go".into(),
+                    attachments: Vec::new(),
+                    prompt_id: None,
+                },
+            )
+            .expect("record prompt");
+        store
+            .record(
+                &live_id,
+                2,
+                &crate::acp::Event::BackgroundAgentLaunched {
+                    agent_id: "bg-1".into(),
+                    tool_call_id: "tc-1".into(),
+                    description: "map backend".into(),
+                    prompt: "do it".into(),
+                    model: "claude-opus-4-8".into(),
+                    output_file: "/tmp/bg-1.output".into(),
+                    started_at: chrono::Utc::now(),
+                },
+            )
+            .expect("record launch");
+        store
+            .record(
+                &live_id,
+                3,
+                &crate::acp::Event::Stopped {
+                    reason: "prompt_complete".into(),
+                },
+            )
+            .expect("record stop");
+
+        // The daemon's control cache folded the same log, so it still sees
+        // the outstanding sub-agent even though the seed query does not.
+        let control_cache = crate::acp::control_cache::ControlStateCache::new();
+        control_cache.get_or_hydrate(&live_id, || {
+            let mut reduced = crate::acp::state::AcpState::new(
+                crate::acp::state::AcpSessionId(live_id.clone()),
+                crate::acp::state::AgentName("claude".into()),
+                None,
+            );
+            let mut last_seq = 0;
+            for (seq, event) in store.replay_from(&live_id, 0) {
+                let _ = reduced.apply_event(event);
+                last_seq = seq;
+            }
+            (reduced, last_seq)
+        });
+        assert!(
+            control_cache.has_active_background_agent(&live_id),
+            "precondition: the folded cache still sees the sub-agent"
+        );
+
+        let instances = RwLock::new(rows);
+        let locks = RwLock::new(std::collections::HashMap::new());
+        let (status_tx, _rx) = broadcast::channel(16);
+
+        let marked = recover_structured_unread_after_lag(
+            &instances,
+            &store,
+            &locks,
+            &control_cache,
+            crate::file_watch::FileWatchService::noop(),
+            &status_tx,
+        )
+        .await;
+
+        assert_eq!(marked, 0, "a live background sub-agent is not a turn end");
+
+        let guard = instances.read().await;
+        let inst = guard.iter().find(|i| i.id == live_id).expect("row");
+        assert_eq!(
+            inst.status,
+            Status::Running,
+            "the Stopped must not resolve Idle under the still-running sub-agent"
+        );
+        assert!(!inst.unread, "an unfinished turn must not be marked unread");
+    }
+
+    /// #3900: a `UserDiffCommentsPrompt` opens a turn in the control state
+    /// but is absent from the seed query, so during such a turn the latest
+    /// seed event is the previous turn's `Stopped`. Lag recovery must let
+    /// the cache's `turn_active` override that stale seed instead of
+    /// resolving Idle under the live turn and marking it unread.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn recover_structured_unread_after_lag_keeps_running_for_a_newer_turn_past_the_seed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: serialized test; no other test mutates HOME concurrently.
+        unsafe { std::env::set_var("HOME", temp.path()) };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        }
+        crate::session::set_unread_enabled(true);
+
+        let profile = "acp-unread-lag-newer-turn";
+
+        let mut live = Instance::new("acp-live-newer-turn", "/tmp/acp");
+        live.view = crate::session::View::Structured;
+        live.source_profile = profile.to_string();
+        live.status = Status::Running;
+        let live_id = live.id.clone();
+        let rows = vec![live];
+        seed_profile_store(profile, rows.clone());
+
+        let db = temp.path().join("acp-events.db");
+        let store = crate::acp::event_store::EventStore::open(&db, 1000).expect("event store");
+        store
+            .record(
+                &live_id,
+                1,
+                &crate::acp::Event::UserPromptSent {
+                    text: "first turn".into(),
+                    attachments: Vec::new(),
+                    prompt_id: None,
+                },
+            )
+            .expect("record prompt");
+        store
+            .record(
+                &live_id,
+                2,
+                &crate::acp::Event::Stopped {
+                    reason: "prompt_complete".into(),
+                },
+            )
+            .expect("record stop");
+        // The newer turn the seed query cannot see.
+        store
+            .record(
+                &live_id,
+                3,
+                &crate::acp::Event::UserDiffCommentsPrompt {
+                    intro: "intro".into(),
+                    outro: "outro".into(),
+                    is_multi_repo: false,
+                    comments: Vec::new(),
+                    assembled_markdown: "diff".into(),
+                },
+            )
+            .expect("record diff prompt");
+
+        let control_cache = crate::acp::control_cache::ControlStateCache::new();
+        control_cache.get_or_hydrate(&live_id, || {
+            let mut reduced = crate::acp::state::AcpState::new(
+                crate::acp::state::AcpSessionId(live_id.clone()),
+                crate::acp::state::AgentName("claude".into()),
+                None,
+            );
+            let mut last_seq = 0;
+            for (seq, event) in store.replay_from(&live_id, 0) {
+                let _ = reduced.apply_event(event);
+                last_seq = seq;
+            }
+            (reduced, last_seq)
+        });
+        assert!(
+            control_cache.turn_active(&live_id),
+            "precondition: the folded cache sees the newer turn"
+        );
+
+        let instances = RwLock::new(rows);
+        let locks = RwLock::new(std::collections::HashMap::new());
+        let (status_tx, _rx) = broadcast::channel(16);
+
+        let marked = recover_structured_unread_after_lag(
+            &instances,
+            &store,
+            &locks,
+            &control_cache,
+            crate::file_watch::FileWatchService::noop(),
+            &status_tx,
+        )
+        .await;
+
+        assert_eq!(marked, 0, "a live newer turn is not a turn end");
+
+        let guard = instances.read().await;
+        let inst = guard.iter().find(|i| i.id == live_id).expect("row");
+        assert_eq!(
+            inst.status,
+            Status::Running,
+            "the stale seed Stopped must not resolve Idle under the newer turn"
+        );
+        assert!(!inst.unread, "an unfinished turn must not be marked unread");
     }
 
     #[tokio::test]
@@ -1824,24 +2151,36 @@ mod tests {
             diffs: Vec::new(),
         };
         assert_eq!(
-            derive_acp_status(&Event::UserPromptSent {
-                prompt_id: None,
-                text: "hi".into(),
-                attachments: Vec::new(),
-            }),
+            derive_acp_status(
+                &Event::UserPromptSent {
+                    prompt_id: None,
+                    text: "hi".into(),
+                    attachments: Vec::new(),
+                },
+                false,
+                false
+            ),
             Some(StatusIntent::Set(Status::Running))
         );
         assert_eq!(
-            derive_acp_status(&Event::ApprovalRequested {
-                approval: build_approval(tool_call.clone(), Vec::new()),
-            }),
+            derive_acp_status(
+                &Event::ApprovalRequested {
+                    approval: build_approval(tool_call.clone(), Vec::new()),
+                },
+                false,
+                false
+            ),
             Some(StatusIntent::Set(Status::Waiting))
         );
         assert_eq!(
-            derive_acp_status(&Event::ApprovalResolved {
-                nonce: Nonce("x".into()),
-                decision: ApprovalDecision::Allow,
-            }),
+            derive_acp_status(
+                &Event::ApprovalResolved {
+                    nonce: Nonce("x".into()),
+                    decision: ApprovalDecision::Allow,
+                },
+                false,
+                false
+            ),
             Some(StatusIntent::Set(Status::Running))
         );
         // A pending elicitation blocks the turn on the user just like an
@@ -1858,53 +2197,175 @@ mod tests {
             resolved: None,
         };
         assert_eq!(
-            derive_acp_status(&Event::ElicitationRequested { elicitation }),
+            derive_acp_status(&Event::ElicitationRequested { elicitation }, false, false),
             Some(StatusIntent::Set(Status::Waiting))
         );
         assert_eq!(
-            derive_acp_status(&Event::ElicitationResolved {
-                nonce: Nonce("e-1".into()),
-                outcome: crate::acp::elicitations::ElicitationOutcome::Accepted,
-                answers: Vec::new(),
-            }),
+            derive_acp_status(
+                &Event::ElicitationResolved {
+                    nonce: Nonce("e-1".into()),
+                    outcome: crate::acp::elicitations::ElicitationOutcome::Accepted,
+                    answers: Vec::new(),
+                },
+                false,
+                false
+            ),
             Some(StatusIntent::Set(Status::Running))
         );
         assert_eq!(
-            derive_acp_status(&Event::Stopped {
-                reason: "prompt_complete".into()
-            }),
+            derive_acp_status(
+                &Event::Stopped {
+                    reason: "prompt_complete".into()
+                },
+                false,
+                false
+            ),
             Some(StatusIntent::Set(Status::Idle))
+        );
+        // A background sub-agent the main turn spawned is still running
+        // (the caller's `background_agent_active_after` reads true): the dot
+        // must stay lit rather than drop to Idle with the main turn's
+        // Stopped. #3900. `turn_active_after` is false here: live, the
+        // Stopped itself folds it; ahead-of-frame is covered by another test.
+        assert_eq!(
+            derive_acp_status(
+                &Event::Stopped {
+                    reason: "prompt_complete".into()
+                },
+                false,
+                true
+            ),
+            Some(StatusIntent::Set(Status::Running))
+        );
+        assert_eq!(
+            derive_acp_status(
+                &Event::BackgroundAgentCompleted {
+                    agent_id: "a-1".into(),
+                    status: crate::acp::state::BackgroundAgentStatus::Completed,
+                    tools: Vec::new(),
+                    result: None,
+                    warning: None,
+                    ended_at: chrono::Utc::now(),
+                },
+                false,
+                true,
+            ),
+            Some(StatusIntent::SetUnlessWaiting(Status::Running)),
+            "a sibling background agent is still active"
+        );
+        // The main turn that launched this agent is still going (it landed
+        // mid-turn, ahead of the eventual Stopped): must not drop to Idle
+        // under a live turn even with no sibling agents left. See #3925.
+        assert_eq!(
+            derive_acp_status(
+                &Event::BackgroundAgentCompleted {
+                    agent_id: "a-1".into(),
+                    status: crate::acp::state::BackgroundAgentStatus::Completed,
+                    tools: Vec::new(),
+                    result: None,
+                    warning: None,
+                    ended_at: chrono::Utc::now(),
+                },
+                true,
+                false,
+            ),
+            Some(StatusIntent::SetUnlessWaiting(Status::Running)),
+            "the main turn is still active"
+        );
+        assert_eq!(
+            derive_acp_status(
+                &Event::BackgroundAgentCompleted {
+                    agent_id: "a-1".into(),
+                    status: crate::acp::state::BackgroundAgentStatus::Completed,
+                    tools: Vec::new(),
+                    result: None,
+                    warning: None,
+                    ended_at: chrono::Utc::now(),
+                },
+                false,
+                false,
+            ),
+            Some(StatusIntent::SetUnlessWaiting(Status::Idle)),
+            "the last background agent finished and the main turn already stopped"
+        );
+        assert_eq!(
+            derive_acp_status(
+                &Event::BackgroundAgentLaunched {
+                    agent_id: "a-1".into(),
+                    tool_call_id: "t".into(),
+                    description: "desc".into(),
+                    prompt: "p".into(),
+                    model: "m".into(),
+                    output_file: "f".into(),
+                    started_at: chrono::Utc::now(),
+                },
+                false,
+                false,
+            ),
+            Some(StatusIntent::SetUnlessWaiting(Status::Running))
+        );
+        assert_eq!(
+            derive_acp_status(
+                &Event::BackgroundAgentProgress {
+                    agent_id: "a-1".into(),
+                    status: crate::acp::state::BackgroundAgentStatus::Running,
+                    tool_count: 1,
+                    tools: Vec::new(),
+                    last_tool: None,
+                    last_text: None,
+                    at: chrono::Utc::now(),
+                },
+                false,
+                false,
+            ),
+            Some(StatusIntent::SetUnlessWaiting(Status::Running))
         );
         // Rate-limit park: NOT an error; sidebar stays grey, the
         // dedicated RateLimit banner carries the reset time. See #1281.
         assert_eq!(
-            derive_acp_status(&Event::Stopped {
-                reason: "rate_limited".into()
-            }),
+            derive_acp_status(
+                &Event::Stopped {
+                    reason: "rate_limited".into()
+                },
+                false,
+                false
+            ),
             Some(StatusIntent::Set(Status::Idle))
         );
         assert_eq!(
-            derive_acp_status(&Event::AgentStartupError {
-                message: "boom".into()
-            }),
+            derive_acp_status(
+                &Event::AgentStartupError {
+                    message: "boom".into()
+                },
+                false,
+                false
+            ),
             Some(StatusIntent::Set(Status::Error))
         );
         // AcpSessionAssigned heals an Error banner only — never
         // clobbers an in-progress Running/Waiting turn.
         assert_eq!(
-            derive_acp_status(&Event::AcpSessionAssigned {
-                acp_session_id: "uuid".into()
-            }),
+            derive_acp_status(
+                &Event::AcpSessionAssigned {
+                    acp_session_id: "uuid".into()
+                },
+                false,
+                false
+            ),
             Some(StatusIntent::HealError)
         );
         // Rate-limit auto-resume breadcrumb heals like AcpSessionAssigned:
         // the worker is coming back, so clear a sticky error without
         // clobbering an in-progress turn. See #1722.
         assert_eq!(
-            derive_acp_status(&Event::RateLimitAutoResumed {
-                resets_at: chrono::Utc::now(),
-                manual: false,
-            }),
+            derive_acp_status(
+                &Event::RateLimitAutoResumed {
+                    resets_at: chrono::Utc::now(),
+                    manual: false,
+                },
+                false,
+                false
+            ),
             Some(StatusIntent::HealError)
         );
     }
@@ -1959,31 +2420,35 @@ mod tests {
         // TaskOutput notification) streams only these events, never a
         // UserPromptSent. They must drive Running so the sidebar dot recovers.
         assert_eq!(
-            derive_acp_status(&Event::AgentMessageChunk { text: "x".into() }),
+            derive_acp_status(&Event::AgentMessageChunk { text: "x".into() }, false, false),
             Some(StatusIntent::Set(Status::Running))
         );
         assert_eq!(
-            derive_acp_status(&Event::ThinkingStarted),
+            derive_acp_status(&Event::ThinkingStarted, false, false),
             Some(StatusIntent::Set(Status::Running))
         );
         assert_eq!(
-            derive_acp_status(&Event::ToolCallStarted {
-                tool_call: ToolCall {
-                    id: "t".into(),
-                    name: "shell".into(),
-                    kind: "execute".into(),
-                    args_preview: "{}".into(),
-                    started_at: chrono::Utc::now(),
-                    parent_tool_call_id: None,
-                    memory_recall: None,
-                    diffs: Vec::new(),
+            derive_acp_status(
+                &Event::ToolCallStarted {
+                    tool_call: ToolCall {
+                        id: "t".into(),
+                        name: "shell".into(),
+                        kind: "execute".into(),
+                        args_preview: "{}".into(),
+                        started_at: chrono::Utc::now(),
+                        parent_tool_call_id: None,
+                        memory_recall: None,
+                        diffs: Vec::new(),
+                    },
                 },
-            }),
+                false,
+                false
+            ),
             Some(StatusIntent::Set(Status::Running))
         );
         // ThinkingEnded is a sub-phase terminator, not a work signal; leaving
         // it None avoids needless intents (ThinkingStarted already set Running).
-        assert_eq!(derive_acp_status(&Event::ThinkingEnded), None);
+        assert_eq!(derive_acp_status(&Event::ThinkingEnded, false, false), None);
     }
 
     // --- #2248: a structured session must heal out of a stale Stopped ---
@@ -2048,6 +2513,222 @@ mod tests {
         inst.status = Status::Error;
         apply(&mut inst, StatusIntent::HealError);
         assert_eq!(inst.status, Status::Idle);
+    }
+
+    /// #3900: a background sub-agent's progress must not clobber a pending
+    /// approval/elicitation's Waiting dot; the main turn's own
+    /// `ApprovalResolved`/`ElicitationResolved` (a plain `Set`) still
+    /// recovers it normally.
+    #[test]
+    fn set_unless_waiting_is_a_noop_while_waiting_but_plain_set_still_recovers() {
+        let mut inst = stopped_structured_instance();
+        inst.status = Status::Waiting;
+        apply(&mut inst, StatusIntent::SetUnlessWaiting(Status::Running));
+        assert_eq!(
+            inst.status,
+            Status::Waiting,
+            "a background agent's own progress does not resolve the main turn's approval"
+        );
+
+        apply(&mut inst, StatusIntent::Set(Status::Running));
+        assert_eq!(
+            inst.status,
+            Status::Running,
+            "the main turn's own ApprovalResolved/ElicitationResolved still recovers Waiting"
+        );
+    }
+
+    #[test]
+    fn set_unless_waiting_behaves_like_set_when_not_waiting() {
+        let mut inst = stopped_structured_instance();
+        inst.status = Status::Idle;
+        apply(&mut inst, StatusIntent::SetUnlessWaiting(Status::Running));
+        assert_eq!(inst.status, Status::Running);
+    }
+
+    /// A background sub-agent's lifecycle must not clear the main
+    /// connection's Error banner: the tailer keeps draining on a cloned
+    /// sender while the supervisor evaluates a respawn, and only HealError
+    /// from a fresh worker attach resolves Error.
+    #[test]
+    fn set_unless_waiting_never_clears_a_main_agent_error() {
+        let mut inst = stopped_structured_instance();
+        inst.status = Status::Error;
+        apply(&mut inst, StatusIntent::SetUnlessWaiting(Status::Running));
+        assert_eq!(
+            inst.status,
+            Status::Error,
+            "a background sub-agent starting must not clear the main connection's error"
+        );
+
+        apply(&mut inst, StatusIntent::SetUnlessWaiting(Status::Idle));
+        assert_eq!(
+            inst.status,
+            Status::Error,
+            "a background sub-agent finishing must not clear it either"
+        );
+
+        apply(&mut inst, StatusIntent::HealError);
+        assert_eq!(
+            inst.status,
+            Status::Idle,
+            "a fresh worker attach still resolves it"
+        );
+    }
+
+    /// #3900: a background agent finishing must not clobber a pending
+    /// approval/elicitation on the main turn either.
+    #[test]
+    fn background_agent_completed_does_not_clobber_waiting() {
+        use crate::acp::Event;
+        let mut inst = stopped_structured_instance();
+        inst.status = Status::Waiting;
+        let intent = derive_acp_status(
+            &Event::BackgroundAgentCompleted {
+                agent_id: "a-1".into(),
+                status: crate::acp::state::BackgroundAgentStatus::Completed,
+                tools: Vec::new(),
+                result: None,
+                warning: None,
+                ended_at: chrono::Utc::now(),
+            },
+            false,
+            false,
+        )
+        .expect("BackgroundAgentCompleted derives an intent");
+        apply(&mut inst, intent);
+        assert_eq!(inst.status, Status::Waiting);
+    }
+
+    /// #3925: a sub-agent launched mid-turn can complete before its parent
+    /// turn's own `Stopped`. That completion must not drop the sidebar to
+    /// Idle (and, via `should_mark_acp_unread`'s Running->Idle edge, must not
+    /// mark the still-unfinished turn unread) just because it was the last
+    /// background agent outstanding.
+    #[test]
+    fn background_agent_completed_mid_turn_keeps_running_and_does_not_mark_unread() {
+        use crate::acp::Event;
+        let mut inst = stopped_structured_instance();
+        inst.status = Status::Idle;
+
+        // UserPromptSent: turn starts.
+        let intent = derive_acp_status(
+            &Event::UserPromptSent {
+                prompt_id: None,
+                text: "hi".into(),
+                attachments: Vec::new(),
+            },
+            true,
+            false,
+        )
+        .unwrap();
+        apply(&mut inst, intent);
+        assert_eq!(inst.status, Status::Running);
+
+        // BackgroundAgentLaunched: still running, no other agents yet.
+        let intent = derive_acp_status(
+            &Event::BackgroundAgentLaunched {
+                agent_id: "a-1".into(),
+                tool_call_id: "t".into(),
+                description: "desc".into(),
+                prompt: "p".into(),
+                model: "m".into(),
+                output_file: "f".into(),
+                started_at: chrono::Utc::now(),
+            },
+            true,
+            true,
+        )
+        .unwrap();
+        apply(&mut inst, intent);
+        assert_eq!(inst.status, Status::Running);
+
+        // BackgroundAgentCompleted lands before the main turn's Stopped: the
+        // main turn is still active and no sibling agent remains, so this
+        // must stay Running rather than derive Idle from
+        // background_agent_active_after alone.
+        let old_status = inst.status;
+        let intent = derive_acp_status(
+            &Event::BackgroundAgentCompleted {
+                agent_id: "a-1".into(),
+                status: crate::acp::state::BackgroundAgentStatus::Completed,
+                tools: Vec::new(),
+                result: None,
+                warning: None,
+                ended_at: chrono::Utc::now(),
+            },
+            true,
+            false,
+        )
+        .unwrap();
+        apply(&mut inst, intent);
+        assert_eq!(
+            inst.status,
+            Status::Running,
+            "the main turn is still active"
+        );
+        assert!(
+            !should_mark_acp_unread(&inst, old_status, true),
+            "a mid-turn completion must not mark an unfinished turn unread"
+        );
+
+        // The main turn's own Stopped, no agents left: this is the one real
+        // turn-end edge, and must still mark unread as before.
+        let old_status = inst.status;
+        let intent = derive_acp_status(
+            &Event::Stopped {
+                reason: "prompt_complete".into(),
+            },
+            false,
+            false,
+        )
+        .unwrap();
+        apply(&mut inst, intent);
+        assert_eq!(inst.status, Status::Idle);
+        assert!(should_mark_acp_unread(&inst, old_status, true));
+    }
+
+    /// #3900: `BackgroundAgentCompleted` arriving after the main turn's own
+    /// `Stopped` (the ordinary case) still resolves Idle once it is the last
+    /// agent outstanding — this must not regress from the mid-turn fix above.
+    #[test]
+    fn background_agent_completed_after_stopped_still_resolves_idle() {
+        use crate::acp::Event;
+        let mut inst = stopped_structured_instance();
+        inst.status = Status::Running;
+
+        let intent = derive_acp_status(
+            &Event::Stopped {
+                reason: "prompt_complete".into(),
+            },
+            false,
+            true,
+        )
+        .unwrap();
+        apply(&mut inst, intent);
+        assert_eq!(
+            inst.status,
+            Status::Running,
+            "a background agent outlives Stopped"
+        );
+
+        let old_status = inst.status;
+        let intent = derive_acp_status(
+            &Event::BackgroundAgentCompleted {
+                agent_id: "a-1".into(),
+                status: crate::acp::state::BackgroundAgentStatus::Completed,
+                tools: Vec::new(),
+                result: None,
+                warning: None,
+                ended_at: chrono::Utc::now(),
+            },
+            false,
+            false,
+        )
+        .unwrap();
+        apply(&mut inst, intent);
+        assert_eq!(inst.status, Status::Idle);
+        assert!(should_mark_acp_unread(&inst, old_status, true));
     }
 
     #[test]

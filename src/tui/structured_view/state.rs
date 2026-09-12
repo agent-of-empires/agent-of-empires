@@ -345,9 +345,12 @@ impl StructuredViewState {
         self.plugin_notify.pending.pop_front()
     }
 
-    /// Whether the agent is working, for display and for Esc-to-cancel.
-    /// Busy when the agent is mid-turn, a POST is in flight, or the
-    /// WebSocket is down (no handle).
+    /// Whether the composer should treat Enter as send-vs-park and whether
+    /// the empty-Enter queue resync should fire. Tracks only the main turn
+    /// (and the connection/POST state), not a display-only background
+    /// sub-agent signal (see `AcpTranscript.background_agent_active`), or an
+    /// idle main turn would suppress the resync while a sub-agent runs
+    /// (#3900).
     pub fn is_busy(&self) -> bool {
         self.transcript.turn_active || self.in_flight || self.ws.is_none()
     }

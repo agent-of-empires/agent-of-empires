@@ -689,6 +689,11 @@ async fn handle_terminal_event(
                     Some(ChoicePurpose::OpenLink)
                 ),
                 has_modes: !state.transcript.available_modes.is_empty(),
+                // Esc-to-cancel and other action gates read this: it must
+                // track only the main turn, not a display-only background
+                // sub-agent signal (see `AcpTranscript.background_agent_active`),
+                // or Esc stops being inert while the main turn is genuinely
+                // idle (#3900).
                 agent_busy: state.transcript.turn_active || state.in_flight,
             };
             let intent = input::dispatch(state.focus, &key, ctx);
