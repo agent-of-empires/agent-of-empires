@@ -66,7 +66,7 @@ describe("openArtifactInNewTab", () => {
       expect(fetch).toHaveBeenCalledWith(URL_ANY);
       expect(tab.location.href).toBe("");
     } finally {
-      resolveFetch(new Response(new Blob(["x"])));
+      resolveFetch(new Response("x"));
       await opening;
     }
     expect(tab.location.href).toBe("blob:mock-url");

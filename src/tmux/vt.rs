@@ -3759,43 +3759,77 @@ pub(crate) fn register_live_for_test(
     channel
 }
 
-#[cfg(all(test, feature = "web"))]
+#[cfg(test)]
 pub(crate) struct HeldVtDrain {
     drain: Arc<Mutex<DrainControl>>,
     original: Option<DrainControl>,
     peer: UnixStream,
+    probes: std::sync::mpsc::Receiver<()>,
+    reader: Option<std::thread::JoinHandle<std::io::Result<()>>>,
 }
 
-#[cfg(all(test, feature = "web"))]
+#[cfg(test)]
 impl HeldVtDrain {
     pub(crate) fn observed_probe(&mut self) -> bool {
-        self.peer
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        matches!(read_drain_frame(&mut self.peer), Ok((DRAIN_PROBE, _)))
+        self.probes.recv_timeout(Duration::from_secs(5)).is_ok()
     }
 
     pub(crate) fn acknowledge_next(&mut self) {
         use std::io::Write;
         let mut control = self.drain.lock().unwrap();
         control.next_now = Some(Instant::now());
-        self.peer
-            .write_all(&drain_frame(DRAIN_ACK, control.next_generation))
-            .expect("queue next native drain ACK before its deadline");
+        let queued = self
+            .peer
+            .write_all(&drain_frame(DRAIN_ACK, control.next_generation));
+        drop(control);
+        queued.expect("queue next native drain ACK before its deadline");
     }
 }
 
-#[cfg(all(test, feature = "web"))]
+#[cfg(test)]
 impl Drop for HeldVtDrain {
     fn drop(&mut self) {
+        // Wake the native reader before joining, including on assertion unwind.
+        let shutdown = self.peer.shutdown(std::net::Shutdown::Both);
+        let joined = self.reader.take().unwrap().join();
         *self.drain.lock().unwrap() = self.original.take().unwrap();
+        if !std::thread::panicking() {
+            shutdown.expect("shut down held drain socket");
+            joined
+                .expect("held drain reader exits")
+                .expect("read native drain probes");
+        }
     }
 }
 
-#[cfg(all(test, feature = "web"))]
+#[cfg(test)]
 impl VtChannel {
     pub(crate) fn hold_drain_for_test(&self) -> HeldVtDrain {
         let (stream, peer) = UnixStream::pair().expect("held native drain socket");
+        peer.set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("held drain ACK timeout");
+        let mut input = peer.try_clone().expect("held drain reader socket");
+        let (observed, probes) = std::sync::mpsc::channel();
+        // Withhold ACKs, not reads: otherwise repeated reseeds fill the control
+        // socket on platforms with smaller buffers and test write backpressure
+        // instead of the intended missing acknowledgement.
+        let reader = std::thread::spawn(move || loop {
+            match read_drain_frame(&mut input) {
+                Ok((DRAIN_PROBE, _)) => {
+                    if observed.send(()).is_err() {
+                        return Ok(());
+                    }
+                }
+                Ok(frame) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("unexpected held drain frame: {frame:?}"),
+                    ));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(err) => return Err(err),
+            }
+        });
         let original = std::mem::replace(
             &mut *self.drain.lock().unwrap(),
             DrainControl {
@@ -3807,6 +3841,8 @@ impl VtChannel {
             drain: self.drain.clone(),
             original: Some(original),
             peer,
+            probes,
+            reader: Some(reader),
         }
     }
 }
@@ -4927,83 +4963,89 @@ mod tests {
             grid_gen: Arc::new(AtomicU64::new(0)),
             signals: Arc::new(ViewerSignals::new()),
         };
-        let reader = std::thread::spawn(move || run_reader(listener, ctx, chunk_now_ms));
         let mut peer = UnixStream::connect(&sock).expect("connect");
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while VtLifecycle::load(&lifecycle) != VtLifecycle::Live {
-            assert!(Instant::now() < deadline, "reader never connected");
-            std::thread::sleep(Duration::from_millis(2));
-        }
-
-        let flags = unsafe {
-            libc::fcntl(
-                stream
-                    .lock()
-                    .expect("published stream")
-                    .as_ref()
-                    .expect("reader published input socket")
-                    .as_raw_fd(),
-                libc::F_GETFL,
-            )
-        };
-        assert_eq!(flags & libc::O_NONBLOCK, 0, "input socket must block");
-
-        // Saturate without changing the shared open-file description flags.
-        let mut prefilled = 0;
-        {
-            let mut published = stream.lock().expect("published stream");
-            let fd = published.as_ref().unwrap().as_raw_fd();
-            let fill = [b'p'; 4096];
-            loop {
-                let sent =
-                    unsafe { libc::send(fd, fill.as_ptr().cast(), fill.len(), libc::MSG_DONTWAIT) };
-                if sent < 0 {
-                    assert_eq!(
-                        std::io::Error::last_os_error().kind(),
-                        std::io::ErrorKind::WouldBlock
-                    );
-                    break;
-                }
-                assert!(sent > 0);
-                prefilled += sent as usize;
-            }
-            let input = published.as_mut().unwrap();
-            input
-                .set_write_timeout(Some(Duration::from_millis(20)))
-                .unwrap();
-            assert_eq!(
-                input.write(b"blocked").unwrap_err().kind(),
-                std::io::ErrorKind::WouldBlock
-            );
-            input.set_write_timeout(None).unwrap();
-        }
-        let payload = vec![b'x'; 1024 * 1024];
-        let writer_stream = stream.clone();
-        let writer_payload = payload.clone();
-        let writer = std::thread::spawn(move || {
-            writer_stream
-                .lock()
-                .expect("published stream")
-                .as_mut()
-                .expect("reader published input socket")
-                .write_all(&writer_payload)
-                .is_ok()
-        });
         peer.set_read_timeout(Some(Duration::from_secs(5)))
             .expect("read timeout");
-        let mut prefix = vec![0; prefilled];
-        peer.read_exact(&mut prefix)
-            .expect("drain saturated socket");
-        assert!(prefix.iter().all(|byte| *byte == b'p'));
-        let mut received = vec![0; payload.len()];
-        peer.read_exact(&mut received)
-            .expect("read complete input payload");
-        assert!(writer.join().expect("input writer exits"));
-        assert_eq!(received, payload, "input payload must arrive exactly once");
+        let reader = std::thread::spawn(move || run_reader(listener, ctx, chunk_now_ms));
+        let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while VtLifecycle::load(&lifecycle) != VtLifecycle::Live {
+                assert!(Instant::now() < deadline, "reader never connected");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+
+            let mut prefilled = 0;
+            {
+                let mut published = stream.lock().expect("published stream");
+                let input = published.as_mut().expect("reader published input socket");
+                let flags = unsafe { libc::fcntl(input.as_raw_fd(), libc::F_GETFL) };
+                assert!(flags >= 0, "read input socket flags");
+                assert_eq!(flags & libc::O_NONBLOCK, 0, "input socket must block");
+
+                // Darwin send(MSG_DONTWAIT) only avoids waiting for the socket
+                // buffer lock; it can still wait for buffer space. Saturate with
+                // bounded blocking writes instead, without changing O_NONBLOCK
+                // on the open-file description shared with the reader.
+                input
+                    .set_write_timeout(Some(Duration::from_millis(20)))
+                    .unwrap();
+                let fill = [b'p'; 4096];
+                loop {
+                    match input.write(&fill) {
+                        Ok(0) => panic!("saturating write made no progress"),
+                        Ok(sent) => prefilled += sent,
+                        Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(err) => {
+                            assert!(
+                                matches!(
+                                    err.kind(),
+                                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                                ),
+                                "saturating write failed: {err}"
+                            );
+                            break;
+                        }
+                    }
+                }
+                // A broken delivery must not strand the writer during teardown.
+                input
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+            }
+            let payload = vec![b'x'; 1024 * 1024];
+            let writer_stream = stream.clone();
+            let writer_payload = payload.clone();
+            let writer = std::thread::spawn(move || {
+                writer_stream
+                    .lock()
+                    .expect("published stream")
+                    .as_mut()
+                    .expect("reader published input socket")
+                    .write_all(&writer_payload)
+            });
+            let mut prefix = vec![0; prefilled];
+            let prefix_read = peer.read_exact(&mut prefix);
+            let mut received = vec![0; payload.len()];
+            let payload_read = peer.read_exact(&mut received);
+            let shutdown = peer.shutdown(std::net::Shutdown::Both);
+            let written = writer.join();
+            prefix_read.expect("drain saturated socket");
+            payload_read.expect("read complete input payload");
+            shutdown.expect("shut down native socket");
+            written
+                .expect("input writer exits")
+                .expect("write complete payload");
+            assert!(prefix.iter().all(|byte| *byte == b'p'));
+            assert_eq!(received, payload, "input payload must arrive exactly once");
+        }));
 
         stop.store(true, Ordering::Relaxed);
         drop(peer);
-        reader.join().expect("reader exits");
+        let joined = reader.join();
+        if let Err(panic) = checked {
+            std::panic::resume_unwind(panic);
+        }
+        joined.expect("reader exits");
     }
 
     #[test]

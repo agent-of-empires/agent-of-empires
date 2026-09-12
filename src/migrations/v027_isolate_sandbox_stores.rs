@@ -4184,6 +4184,11 @@ gemini = "{}"
         )
         .unwrap();
 
+        // Planning canonicalizes the source before choosing its cohort lock.
+        // Resolve it before publication removes it, including symlinked temp
+        // ancestors such as macOS /var -> /private/var.
+        let cohort_root = fs::canonicalize(home.join(".gemini/sandbox")).unwrap();
+
         std::thread::scope(|scope| {
             let holder = paused_pass(&app, &home);
             holder
@@ -4238,7 +4243,7 @@ gemini = "{}"
             scoped_result.unwrap().unwrap();
             assert_eq!(
                 contention.expect("scoped pass must reach the held cohort lock"),
-                app.join(cohort_lock_name(&home.join(".gemini/sandbox")))
+                app.join(cohort_lock_name(&cohort_root))
             );
             assert!(
                 !finished_while_held,

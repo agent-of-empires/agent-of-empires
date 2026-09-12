@@ -2314,6 +2314,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_resize_whose_reseed_missed_withholds_frames_until_it_lands() {
+        use futures_util::FutureExt;
+
         let home = crate::session::test_support::isolate_app_dir();
         let _socket = crate::session::test_support::EnvGuard::set(&[(
             "AOE_TMUX_SOCKET",
@@ -2334,13 +2336,13 @@ mod tests {
                 "40",
                 "-y",
                 "6",
-                "printf 'RESYNC-LANDED'; exec sleep 30",
+                "printf 'RESYNC-LANDED'; exec cat",
             ])
             .output()
             .expect("create resized pane");
         assert!(output.status.success());
         let target = crate::tmux::test_helpers::only_pane_id(pane.name());
-        crate::tmux::test_helpers::wait_for_pane_command(&target, "sleep");
+        crate::tmux::test_helpers::wait_for_pane_command(&target, "cat");
         let native_dir = tempfile::tempdir().unwrap();
         let channel =
             crate::tmux::vt::register_live_for_test(pane.name(), native_dir.path(), false, false);
@@ -2359,6 +2361,9 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
+            // One capture cycle may use three native command budgets.
+            let progress_timeout = crate::tmux::TMUX_COMMAND_TIMEOUT * 3;
+            let (closed_tx, mut closed_rx) = tokio::sync::mpsc::unbounded_channel();
             let shutdown = tokio_util::sync::CancellationToken::new();
             let route_shutdown = shutdown.clone();
             let name = pane.name().to_string();
@@ -2367,8 +2372,9 @@ mod tests {
                 axum::routing::get(move |ws: WebSocketUpgrade| {
                     let name = name.clone();
                     let shutdown = route_shutdown.clone();
+                    let closed_tx = closed_tx.clone();
                     async move {
-                        ws.on_upgrade(move |socket| {
+                        ws.on_upgrade(move |socket| async move {
                             handle_live_ws_inner(
                                 socket,
                                 name,
@@ -2377,6 +2383,8 @@ mod tests {
                                 LiveTransport::Grid,
                                 true,
                             )
+                            .await;
+                            let _ = closed_tx.send(());
                         })
                     }
                 }),
@@ -2393,59 +2401,77 @@ mod tests {
             let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{address}/live"))
                 .await
                 .unwrap();
-            let withheld = tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    let message = client
-                        .next()
-                        .await
-                        .expect("open websocket")
-                        .expect("websocket message");
-                    if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
-                        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-                        assert_ne!(
-                            value["type"], "frame",
-                            "stale grid escaped before its native resync"
-                        );
-                        assert_ne!(value["type"], "patch");
-                        if value["type"] == "test_cycle" {
-                            assert_eq!(
-                                value["grid"], true,
-                                "must exercise the grid publication path"
+            let checked = std::panic::AssertUnwindSafe(async {
+                let withheld = tokio::time::timeout(progress_timeout, async {
+                    loop {
+                        let message = client
+                            .next()
+                            .await
+                            .expect("open websocket")
+                            .expect("websocket message");
+                        if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                            assert_ne!(
+                                value["type"], "frame",
+                                "stale grid escaped before its native resync"
                             );
-                            if value["settled_seed"] == true {
+                            assert_ne!(value["type"], "patch");
+                            if value["type"] == "test_cycle" {
+                                assert_eq!(
+                                    value["grid"], true,
+                                    "must exercise the grid publication path"
+                                );
+                                if value["settled_seed"] == true {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                })
+                .await;
+                withheld.expect("completed withheld grid cycles");
+                assert!(channel.grid_resync_pending());
+                held.acknowledge_next();
+                let landed = tokio::time::timeout(progress_timeout, async {
+                    loop {
+                        let message = client
+                            .next()
+                            .await
+                            .expect("open websocket")
+                            .expect("websocket message");
+                        if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                            if value["type"] == "frame" {
+                                assert!(value["content"]
+                                    .as_str()
+                                    .unwrap()
+                                    .contains("RESYNC-LANDED"));
+                                assert_eq!(value["rows"], 6);
                                 break;
                             }
                         }
                     }
-                }
+                })
+                .await;
+                landed.expect("frame publishes after native ACK and real pane reseed");
+                assert!(!channel.grid_resync_pending());
             })
+            .catch_unwind()
             .await;
-            assert!(channel.grid_resync_pending());
-            held.acknowledge_next();
-            let landed = tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    let message = client
-                        .next()
-                        .await
-                        .expect("open websocket")
-                        .expect("websocket message");
-                    if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
-                        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-                        if value["type"] == "frame" {
-                            assert!(value["content"].as_str().unwrap().contains("RESYNC-LANDED"));
-                            assert_eq!(value["rows"], 6);
-                            break;
-                        }
-                    }
-                }
-            })
-            .await;
-            client.close(None).await.unwrap();
+            let close = tokio::time::timeout(progress_timeout, client.close(None)).await;
             shutdown.cancel();
-            server.await.unwrap();
-            withheld.expect("completed withheld grid cycles");
-            landed.expect("frame publishes after native ACK and real pane reseed");
-            assert!(!channel.grid_resync_pending());
+            let closed = tokio::time::timeout(progress_timeout, closed_rx.recv()).await;
+            let served = server.await;
+            if let Err(panic) = checked {
+                std::panic::resume_unwind(panic);
+            }
+            close
+                .expect("websocket close completes")
+                .expect("close websocket");
+            closed
+                .expect("upgraded handler exits")
+                .expect("handler completion witness");
+            served.expect("HTTP server exits");
         });
         drop(held);
         crate::tmux::vt::unregister_for_test(pane.name());

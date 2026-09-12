@@ -1,6 +1,6 @@
 // Live Playwright server: each handle owns a private HOME, tmux socket, and child.
 // Readiness requires the child's post-bind URL announcement and an HTTP response.
-// stop() waits for daemon and runner-group exit before deleting the fixture.
+// stop() waits for daemon, runner, and terminal groups before deleting the fixture.
 // Failed teardown retains HOME and registry evidence rather than reporting success.
 
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
@@ -340,25 +340,26 @@ export function appDirFor(home: string, xdg: string, binaryPath: string): string
   return xdg ? xdgDir : legacy;
 }
 
-interface RunnerProcess {
+interface ProcessSnapshot {
   pid: number;
+  parent: number;
   group: number;
   command: string;
 }
 
-function runnerProcesses(env: NodeJS.ProcessEnv): RunnerProcess[] {
-  const result = spawnSync("ps", ["-ww", "-axo", "pid=,pgid=,stat=,args="], {
+function processSnapshot(env: NodeJS.ProcessEnv): ProcessSnapshot[] {
+  const result = spawnSync("ps", ["-ww", "-axo", "pid=,ppid=,pgid=,stat=,args="], {
     env: { ...env, LC_ALL: "C" },
     encoding: "utf8",
     timeout: 2000,
   });
-  if (result.status !== 0) throw new Error(`cannot inspect runner processes: ${result.error ?? result.stderr}`);
+  if (result.status !== 0) throw new Error(`cannot inspect fixture processes: ${result.error ?? result.stderr}`);
   return result.stdout.split("\n").flatMap((line) => {
-    const match = line.match(/^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/);
+    const match = line.match(/^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/);
     if (!line.trim()) return [];
     if (!match) throw new Error(`unrecognized ps output: ${line}`);
-    if (match[3].startsWith("Z")) return [];
-    return [{ pid: Number(match[1]), group: Number(match[2]), command: match[4] }];
+    if (match[4].startsWith("Z")) return [];
+    return [{ pid: Number(match[1]), parent: Number(match[2]), group: Number(match[3]), command: match[5] }];
   });
 }
 
@@ -372,7 +373,7 @@ async function stopOrphanRunners(appDir: string, binary: string, env: NodeJS.Pro
   // A runner can unlink its record before exiting. Keep its observed group even
   // when enumeration, reading, or lease revocation races that normal transition.
   const groups = new Set(
-    runnerProcesses(env)
+    processSnapshot(env)
       .filter((p) => p.pid === p.group && p.command.startsWith(socketPrefix))
       .map((p) => p.group),
   );
@@ -400,7 +401,7 @@ async function stopOrphanRunners(appDir: string, binary: string, env: NodeJS.Pro
     ) {
       throw new Error(`invalid runner identity in ${name}; retaining ${appDir}`);
     }
-    const processes = runnerProcesses(env);
+    const processes = processSnapshot(env);
     const runner = processes.find((p) => p.pid === pid);
     const members = processes.filter((p) => p.group === pid);
     if (!runner && members.length === 0) continue;
@@ -423,14 +424,68 @@ async function stopOrphanRunners(appDir: string, binary: string, env: NodeJS.Pro
     }
     groups.add(pid);
   }
-  for (const process of runnerProcesses(env)) {
+  for (const process of processSnapshot(env)) {
     if (process.pid === process.group && process.command.startsWith(socketPrefix)) groups.add(process.group);
   }
   if (groups.size === 0) return;
   // Older binaries use two 10s watchdog polls, then a bounded 2s agent shutdown.
   const deadline = performance.now() + 25_000;
-  while (runnerProcesses(env).some((p) => groups.has(p.group))) {
+  while (processSnapshot(env).some((p) => groups.has(p.group))) {
     if (performance.now() >= deadline) throw new Error(`runner groups did not exit; retaining ${appDir}`);
+    await delay(50);
+  }
+}
+
+async function stopTerminalProcesses(
+  socket: string,
+  shimBin: string | undefined,
+  env: NodeJS.ProcessEnv,
+): Promise<void> {
+  if (!existsSync(socket) && shimBin === undefined) return;
+  const options = { env: { ...env, LC_ALL: "C" }, encoding: "utf8" as const, timeout: 2000 };
+  const owned = new Set<number>();
+  if (existsSync(socket)) {
+    const panes = spawnSync("tmux", ["-S", socket, "list-panes", "-a", "-F", "#{pid} #{pane_pid}"], options);
+    if (panes.status === 0) {
+      for (const value of panes.stdout.trim() ? panes.stdout.trim().split(/\s+/) : []) {
+        const pid = Number(value);
+        if (!Number.isSafeInteger(pid) || pid <= 1) throw new Error(`invalid private tmux process identity: ${value}`);
+        owned.add(pid);
+      }
+    } else if (panes.error || (existsSync(socket) && panes.stderr.trim() !== `no server running on ${socket}`)) {
+      throw new Error(`cannot inspect private tmux server: ${panes.error ?? panes.stderr}`);
+    }
+  }
+  const processes = processSnapshot(env);
+  if (shimBin !== undefined) {
+    for (const entry of processes) {
+      if (entry.command.startsWith(`${shimBin}/`)) owned.add(entry.pid);
+    }
+  }
+  let expanded = true;
+  while (expanded) {
+    expanded = false;
+    for (const entry of processes) {
+      if (owned.has(entry.parent) && !owned.has(entry.pid)) {
+        owned.add(entry.pid);
+        expanded = true;
+      }
+    }
+  }
+  const groups = new Set(processes.filter((entry) => owned.has(entry.pid)).map((entry) => entry.group));
+  if (existsSync(socket)) {
+    const killed = spawnSync("tmux", ["-S", socket, "kill-server"], options);
+    if (
+      killed.error ||
+      (killed.status !== 0 && existsSync(socket) && killed.stderr.trim() !== `no server running on ${socket}`)
+    ) {
+      throw new Error(`cannot stop private tmux server: ${killed.error ?? killed.stderr}`);
+    }
+  }
+  // kill-server acknowledges the command before terminal descendants finish exiting.
+  const deadline = performance.now() + 4000;
+  while (processSnapshot(env).some((entry) => groups.has(entry.group))) {
+    if (performance.now() >= deadline) throw new Error(`terminal groups did not exit; retaining ${socket}`);
     await delay(50);
   }
 }
@@ -564,9 +619,9 @@ function writeFakeAcpShim(
         : name === "codex-acp" || name === "codex"
           ? [...scriptLines, "export FAKE_ACP_IMPERSONATE=codex"]
           : scriptLines;
-    // The isolated home cannot initialize user-scoped Node version-manager shims.
-    const script = `#!/bin/bash\n${perName.join("\n")}\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(fakeAgentJs)} "$@"\n`;
+    // Keep orphaned agents attributable after their tmux pane disappears.
     const path = join(binDir, name);
+    const script = `#!/bin/bash\n${perName.join("\n")}\nexec -a ${JSON.stringify(path)} ${JSON.stringify(process.execPath)} ${JSON.stringify(fakeAgentJs)} "$@"\n`;
     writeFileSync(path, script);
     chmodSync(path, 0o755);
   }
@@ -822,12 +877,11 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
         errors.push(error);
       }
     }
-    const tmux = spawnSync("tmux", ["-S", tmuxSocketPath(home), "kill-server"], {
-      env: seedEnv,
-      stdio: "ignore",
-      timeout: 2000,
-    });
-    if (tmux.error && (tmux.error as NodeJS.ErrnoException).code !== "ENOENT") errors.push(tmux.error);
+    try {
+      await stopTerminalProcesses(tmuxSocketPath(home), opts.acp ? shimBin : undefined, seedEnv);
+    } catch (error) {
+      errors.push(error);
+    }
     if (errors.length) throw new AggregateError(errors, `teardown incomplete; retaining ${home}`);
     rmSync(home, { recursive: true, force: true });
   }
