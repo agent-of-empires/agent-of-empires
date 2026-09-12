@@ -1741,11 +1741,9 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
         status: e.status,
         toolCount: e.tool_count,
         tools: e.tools && e.tools.length > 0 ? e.tools : a.tools,
-        // Mirrors the Rust reducer: only the terminal BackgroundAgentCompleted
-        // sets endedAt. A non-terminal Progress{stalled} is not done yet (the
-        // tailer may still resolve it to Completed at its idle timeout), so it
-        // must not count as inactive here either (#3900).
-        endedAt: e.status === "running" ? null : a.endedAt,
+        // A Progress never ends an agent; only the terminal
+        // BackgroundAgentCompleted sets endedAt (#3900).
+        endedAt: null,
         lastTool: e.last_tool ?? a.lastTool,
         lastText: e.last_text ?? a.lastText,
       };
