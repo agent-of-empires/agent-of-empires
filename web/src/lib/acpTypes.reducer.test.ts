@@ -454,6 +454,56 @@ describe("applyEvent / background agents", () => {
     expect(s.backgroundAgents[0]!.status).toBe("completed");
     expect(s.backgroundAgents[0]!.toolCount).toBe(0);
   });
+
+  it("does not reopen a stalled-terminal agent on a late progress event (#3925)", () => {
+    // A terminal BackgroundAgentCompleted can carry status "stalled" (the
+    // tailer's own abort timeout gives up without a clean end_turn). It sets
+    // endedAt just like any other terminal record, so a late Progress must
+    // not reopen it either, not just for the completed/detached/error cases.
+    let s = emptyAcpState();
+    s = applyEvent(s, {
+      session_id: "s-1",
+      seq: 1,
+      event: {
+        BackgroundAgentLaunched: {
+          agent_id: "a1",
+          tool_call_id: "task-1",
+          description: "x",
+          prompt: "y",
+          model: "m",
+          started_at: "2026-06-27T00:00:00Z",
+        },
+      },
+    });
+    s = applyEvent(s, {
+      session_id: "s-1",
+      seq: 2,
+      event: {
+        BackgroundAgentCompleted: {
+          agent_id: "a1",
+          status: "stalled",
+          ended_at: "2026-06-27T00:00:10Z",
+        },
+      },
+    });
+    expect(s.backgroundAgents[0]!.status).toBe("stalled");
+    expect(s.backgroundAgents[0]!.endedAt).toBe("2026-06-27T00:00:10Z");
+    s = applyEvent(s, {
+      session_id: "s-1",
+      seq: 3,
+      event: {
+        BackgroundAgentProgress: {
+          agent_id: "a1",
+          status: "running",
+          tool_count: 99,
+          at: "2026-06-27T00:00:20Z",
+        },
+      },
+    });
+    expect(s.backgroundAgents[0]!.status).toBe("stalled");
+    expect(s.backgroundAgents[0]!.toolCount).toBe(0);
+    expect(s.backgroundAgents[0]!.endedAt).toBe("2026-06-27T00:00:10Z");
+  });
 });
 
 describe("transcriptRowToActivity (Tier 4 wire mapping)", () => {

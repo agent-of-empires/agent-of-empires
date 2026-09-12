@@ -1595,13 +1595,19 @@ impl AcpState {
                     .iter_mut()
                     .find(|a| a.agent_id == agent_id)
                 {
-                    // A terminal record never reopens to running.
-                    if !matches!(
-                        a.status,
-                        BackgroundAgentStatus::Completed
-                            | BackgroundAgentStatus::Detached
-                            | BackgroundAgentStatus::Error
-                    ) {
+                    // A terminal record never reopens to running. Guarded on
+                    // `ended_at` too: a terminal `Stalled` (the tailer's own
+                    // abort timeout, see `has_active_background_agent`'s doc
+                    // comment) also carries `ended_at`, and the status match
+                    // alone would let a late Progress reopen it.
+                    if a.ended_at.is_none()
+                        && !matches!(
+                            a.status,
+                            BackgroundAgentStatus::Completed
+                                | BackgroundAgentStatus::Detached
+                                | BackgroundAgentStatus::Error
+                        )
+                    {
                         a.status = status;
                         a.tool_count = tool_count;
                         if !tools.is_empty() {
@@ -1868,6 +1874,108 @@ mod tests {
             BackgroundAgentStatus::Completed
         );
         assert_eq!(s.background_agents[0].tool_count, 3, "must not overwrite");
+    }
+
+    /// #3925: a terminal `Stalled` record (the tailer's own abort timeout,
+    /// not one of the `status`-matched terminal variants) still carries
+    /// `ended_at`, so a late Progress must not reopen it either — the
+    /// progress guard has to key on `ended_at`, not just `status`, to match
+    /// `has_active_background_agent`'s own `ended_at`-keyed read.
+    #[test]
+    fn background_agent_progress_does_not_reopen_a_stalled_terminal_record() {
+        let mut s = fresh_state();
+        s.apply_event(Event::BackgroundAgentLaunched {
+            agent_id: "a1".into(),
+            tool_call_id: "tc1".into(),
+            description: "map backend".into(),
+            prompt: "do the thing".into(),
+            model: "claude-opus-4-8".into(),
+            output_file: "/tmp/a1.output".into(),
+            started_at: Utc::now(),
+        })
+        .unwrap();
+        s.apply_event(Event::BackgroundAgentCompleted {
+            agent_id: "a1".into(),
+            status: BackgroundAgentStatus::Stalled,
+            tools: vec![],
+            result: None,
+            warning: Some("idle timeout".into()),
+            ended_at: Utc::now(),
+        })
+        .unwrap();
+        assert_eq!(
+            s.background_agents[0].status,
+            BackgroundAgentStatus::Stalled
+        );
+        assert!(s.background_agents[0].ended_at.is_some());
+        assert!(!s.has_active_background_agent());
+
+        s.apply_event(Event::BackgroundAgentProgress {
+            agent_id: "a1".into(),
+            status: BackgroundAgentStatus::Running,
+            tool_count: 9,
+            tools: vec![],
+            last_tool: None,
+            last_text: None,
+            at: Utc::now(),
+        })
+        .unwrap();
+        assert_eq!(
+            s.background_agents[0].status,
+            BackgroundAgentStatus::Stalled,
+            "a terminal Stalled record must not reopen to Running"
+        );
+        assert!(s.background_agents[0].ended_at.is_some());
+        assert!(!s.has_active_background_agent());
+    }
+
+    /// A non-terminal `Progress{stalled}` (no `ended_at` yet, only the
+    /// eventual `BackgroundAgentCompleted` sets that) still resumes normally
+    /// on the next `Progress{running}`.
+    #[test]
+    fn background_agent_progress_stalled_without_ended_at_still_resumes() {
+        let mut s = fresh_state();
+        s.apply_event(Event::BackgroundAgentLaunched {
+            agent_id: "a1".into(),
+            tool_call_id: "tc1".into(),
+            description: "map backend".into(),
+            prompt: "do the thing".into(),
+            model: "claude-opus-4-8".into(),
+            output_file: "/tmp/a1.output".into(),
+            started_at: Utc::now(),
+        })
+        .unwrap();
+        s.apply_event(Event::BackgroundAgentProgress {
+            agent_id: "a1".into(),
+            status: BackgroundAgentStatus::Stalled,
+            tool_count: 4,
+            tools: vec![],
+            last_tool: None,
+            last_text: None,
+            at: Utc::now(),
+        })
+        .unwrap();
+        assert_eq!(
+            s.background_agents[0].status,
+            BackgroundAgentStatus::Stalled
+        );
+        assert!(s.background_agents[0].ended_at.is_none());
+        assert!(s.has_active_background_agent());
+
+        s.apply_event(Event::BackgroundAgentProgress {
+            agent_id: "a1".into(),
+            status: BackgroundAgentStatus::Running,
+            tool_count: 5,
+            tools: vec![],
+            last_tool: None,
+            last_text: None,
+            at: Utc::now(),
+        })
+        .unwrap();
+        assert_eq!(
+            s.background_agents[0].status,
+            BackgroundAgentStatus::Running
+        );
     }
 
     /// #3900: `Stopped` must clear `turn_active` unconditionally, even while

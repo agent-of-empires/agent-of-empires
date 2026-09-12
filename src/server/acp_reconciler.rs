@@ -1730,7 +1730,7 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
                                 // Cold control-state fold at reattach time,
                                 // same caveat as `seed_acp_statuses` (#3900).
                                 if let Some(intent) =
-                                    crate::server::derive_acp_status(&event, false)
+                                    crate::server::derive_acp_status(&event, false, false)
                                 {
                                     let mut instances = state.instances.write().await;
                                     if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {

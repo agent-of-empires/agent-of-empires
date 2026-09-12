@@ -116,6 +116,16 @@ impl ControlStateCache {
             .is_some_and(|c| c.state.has_active_background_agent())
     }
 
+    /// Whether the session's cached state has an active main turn, or `false`
+    /// if nothing has hydrated it yet. Same conservative-miss rationale as
+    /// `has_active_background_agent`: the caller only asks this right after
+    /// folding the session's own event, so a miss means the fold was dropped.
+    pub fn turn_active(&self, session_id: &str) -> bool {
+        let slot = self.slot(session_id);
+        let guard = lock(&slot);
+        guard.as_ref().is_some_and(|c| c.state.turn_active)
+    }
+
     /// Drop a session's fold. Used when the event log behind it is deleted and
     /// when a persist fails, since a projection of a log that is missing an
     /// event is not a projection of that log.

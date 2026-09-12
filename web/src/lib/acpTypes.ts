@@ -1731,8 +1731,11 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     const e = event.BackgroundAgentProgress;
     next.backgroundAgents = next.backgroundAgents.map((a) => {
       if (a.agentId !== e.agent_id) return a;
-      // A terminal record never reopens to running.
-      if (a.status === "completed" || a.status === "detached" || a.status === "error") return a;
+      // A terminal record never reopens to running. Also guarded on endedAt:
+      // a terminal Stalled record (the tailer's own abort timeout) carries
+      // endedAt too, and the status check alone would let a late Progress
+      // reopen it, contradicting hasActiveBackgroundAgent's endedAt-keyed read.
+      if (a.endedAt || a.status === "completed" || a.status === "detached" || a.status === "error") return a;
       return {
         ...a,
         status: e.status,

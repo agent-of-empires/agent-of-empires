@@ -326,10 +326,15 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
         // `publish_persisted` folds this event into the control cache before
         // broadcasting the frame, so the cached `turn_active` already
         // reflects it (#3900).
+        let turn_active_after = state.acp_control_cache.turn_active(&frame.session_id);
         let background_agent_active_after = state
             .acp_control_cache
             .has_active_background_agent(&frame.session_id);
-        let status_intent = derive_acp_status(frame.event.as_ref(), background_agent_active_after);
+        let status_intent = derive_acp_status(
+            frame.event.as_ref(),
+            turn_active_after,
+            background_agent_active_after,
+        );
         let acp_change = derive_acp_session_change(frame.event.as_ref());
         let load_session_capability = match (frame.event.as_ref(), frame.worker_generation) {
             (
@@ -523,7 +528,7 @@ pub(crate) async fn seed_acp_statuses(state: Arc<AppState>) {
         // cold), so a background sub-agent outstanding across a restart
         // reads as Idle here same as before #3900; the reconciler and the
         // next live event correct it once the tailer resumes.
-        let Some(intent) = derive_acp_status(&event, false) else {
+        let Some(intent) = derive_acp_status(&event, false, false) else {
             continue;
         };
         let mut instances = state.instances.write().await;
@@ -765,7 +770,7 @@ pub(super) async fn recover_structured_unread_after_lag(
             continue;
         };
         // Same cold-cache caveat as `seed_acp_statuses` (#3900).
-        let Some(intent) = derive_acp_status(&event, false) else {
+        let Some(intent) = derive_acp_status(&event, false, false) else {
             continue;
         };
         // Same snapshot-around-apply as the live path, so "the transition that
@@ -951,16 +956,18 @@ pub(crate) enum StatusIntent {
     HealError,
 }
 
-/// `background_agent_active_after` is `AcpState::has_active_background_agent()`
-/// (checked by the caller against the session's folded control state) right
-/// after this event was applied to it. `turn_active` itself tracks only the
-/// main turn (it gates prompt dispatch and the queue drain, see
-/// `AcpState::turn_active`'s doc comment), so this is the one place the
-/// sidebar's verdict needs a second, background-agent-scoped input beyond the
-/// event itself: `Stopped` and `BackgroundAgentCompleted` both resolve to
-/// Idle only once it reads false. See #3900.
+/// `turn_active_after` and `background_agent_active_after` are read from the
+/// session's folded control state right after this event was applied to it
+/// (`AcpState::turn_active` / `has_active_background_agent()`). `turn_active`
+/// itself still gates prompt dispatch and the queue drain and tracks only the
+/// main turn, but a `BackgroundAgentCompleted` can land while the main turn is
+/// still going (it was launched mid-turn), so that arm needs both inputs to
+/// avoid resolving Idle under a live turn. `Stopped` only needs
+/// `background_agent_active_after`: post-`Stopped`, `turn_active_after` is
+/// definitionally false. See #3900.
 pub(crate) fn derive_acp_status(
     event: &crate::acp::Event,
+    turn_active_after: bool,
     background_agent_active_after: bool,
 ) -> Option<StatusIntent> {
     use crate::acp::Event;
@@ -1010,19 +1017,14 @@ pub(crate) fn derive_acp_status(
             Status::Idle
         })),
         // The last outstanding background agent finished. Only drops to Idle
-        // once none remain; a still-running sibling keeps the dot lit. Safe
-        // against a cold-cache-miss forcing Idle prematurely: `Stopped`
-        // above already resolved Idle-vs-Running correctly for the main
-        // turn using this same accessor, so by the time a
-        // `BackgroundAgentCompleted` can read a confirmed `false` here, the
-        // main turn's own `Stopped` (if any) already applied the right
-        // verdict; a live main turn keeps re-asserting `Running` through its
-        // own `ThinkingStarted` / `AgentMessageChunk` / `ToolCallStarted`
-        // events regardless of this arm. `SetUnlessWaiting` because a
-        // sibling agent finishing must not clobber a pending
+        // once neither the main turn nor a sibling agent is still active
+        // (`turn_active_after` covers a sub-agent launched mid-turn that
+        // outlives its own completion event's ordering; `Stopped` already
+        // resolved the main-turn edge on its own arm). `SetUnlessWaiting`
+        // because a sibling agent finishing must not clobber a pending
         // approval/elicitation on the main turn (#3900).
         Event::BackgroundAgentCompleted { .. } => Some(StatusIntent::SetUnlessWaiting(
-            if background_agent_active_after {
+            if turn_active_after || background_agent_active_after {
                 Status::Running
             } else {
                 Status::Idle
@@ -1907,6 +1909,7 @@ mod tests {
                     text: "hi".into(),
                     attachments: Vec::new(),
                 },
+                false,
                 false
             ),
             Some(StatusIntent::Set(Status::Running))
@@ -1916,6 +1919,7 @@ mod tests {
                 &Event::ApprovalRequested {
                     approval: build_approval(tool_call.clone(), Vec::new()),
                 },
+                false,
                 false
             ),
             Some(StatusIntent::Set(Status::Waiting))
@@ -1926,6 +1930,7 @@ mod tests {
                     nonce: Nonce("x".into()),
                     decision: ApprovalDecision::Allow,
                 },
+                false,
                 false
             ),
             Some(StatusIntent::Set(Status::Running))
@@ -1944,7 +1949,7 @@ mod tests {
             resolved: None,
         };
         assert_eq!(
-            derive_acp_status(&Event::ElicitationRequested { elicitation }, false),
+            derive_acp_status(&Event::ElicitationRequested { elicitation }, false, false),
             Some(StatusIntent::Set(Status::Waiting))
         );
         assert_eq!(
@@ -1954,6 +1959,7 @@ mod tests {
                     outcome: crate::acp::elicitations::ElicitationOutcome::Accepted,
                     answers: Vec::new(),
                 },
+                false,
                 false
             ),
             Some(StatusIntent::Set(Status::Running))
@@ -1963,6 +1969,7 @@ mod tests {
                 &Event::Stopped {
                     reason: "prompt_complete".into()
                 },
+                false,
                 false
             ),
             Some(StatusIntent::Set(Status::Idle))
@@ -1970,12 +1977,13 @@ mod tests {
         // A background sub-agent the main turn spawned is still running
         // (the caller's `background_agent_active_after` reads true): the dot
         // must stay lit rather than drop to Idle with the main turn's
-        // Stopped. #3900.
+        // Stopped. #3900. Post-`Stopped`, `turn_active_after` is always false.
         assert_eq!(
             derive_acp_status(
                 &Event::Stopped {
                     reason: "prompt_complete".into()
                 },
+                false,
                 true
             ),
             Some(StatusIntent::Set(Status::Running))
@@ -1990,10 +1998,30 @@ mod tests {
                     warning: None,
                     ended_at: chrono::Utc::now(),
                 },
+                false,
                 true,
             ),
             Some(StatusIntent::SetUnlessWaiting(Status::Running)),
             "a sibling background agent is still active"
+        );
+        // The main turn that launched this agent is still going (it landed
+        // mid-turn, ahead of the eventual Stopped): must not drop to Idle
+        // under a live turn even with no sibling agents left. See #3925.
+        assert_eq!(
+            derive_acp_status(
+                &Event::BackgroundAgentCompleted {
+                    agent_id: "a-1".into(),
+                    status: crate::acp::state::BackgroundAgentStatus::Completed,
+                    tools: Vec::new(),
+                    result: None,
+                    warning: None,
+                    ended_at: chrono::Utc::now(),
+                },
+                true,
+                false,
+            ),
+            Some(StatusIntent::SetUnlessWaiting(Status::Running)),
+            "the main turn is still active"
         );
         assert_eq!(
             derive_acp_status(
@@ -2006,9 +2034,10 @@ mod tests {
                     ended_at: chrono::Utc::now(),
                 },
                 false,
+                false,
             ),
             Some(StatusIntent::SetUnlessWaiting(Status::Idle)),
-            "the last background agent finished"
+            "the last background agent finished and the main turn already stopped"
         );
         assert_eq!(
             derive_acp_status(
@@ -2021,6 +2050,7 @@ mod tests {
                     output_file: "f".into(),
                     started_at: chrono::Utc::now(),
                 },
+                false,
                 false,
             ),
             Some(StatusIntent::SetUnlessWaiting(Status::Running))
@@ -2037,6 +2067,7 @@ mod tests {
                     at: chrono::Utc::now(),
                 },
                 false,
+                false,
             ),
             Some(StatusIntent::SetUnlessWaiting(Status::Running))
         );
@@ -2047,6 +2078,7 @@ mod tests {
                 &Event::Stopped {
                     reason: "rate_limited".into()
                 },
+                false,
                 false
             ),
             Some(StatusIntent::Set(Status::Idle))
@@ -2056,6 +2088,7 @@ mod tests {
                 &Event::AgentStartupError {
                     message: "boom".into()
                 },
+                false,
                 false
             ),
             Some(StatusIntent::Set(Status::Error))
@@ -2067,6 +2100,7 @@ mod tests {
                 &Event::AcpSessionAssigned {
                     acp_session_id: "uuid".into()
                 },
+                false,
                 false
             ),
             Some(StatusIntent::HealError)
@@ -2080,6 +2114,7 @@ mod tests {
                     resets_at: chrono::Utc::now(),
                     manual: false,
                 },
+                false,
                 false
             ),
             Some(StatusIntent::HealError)
@@ -2136,11 +2171,11 @@ mod tests {
         // TaskOutput notification) streams only these events, never a
         // UserPromptSent. They must drive Running so the sidebar dot recovers.
         assert_eq!(
-            derive_acp_status(&Event::AgentMessageChunk { text: "x".into() }, false),
+            derive_acp_status(&Event::AgentMessageChunk { text: "x".into() }, false, false),
             Some(StatusIntent::Set(Status::Running))
         );
         assert_eq!(
-            derive_acp_status(&Event::ThinkingStarted, false),
+            derive_acp_status(&Event::ThinkingStarted, false, false),
             Some(StatusIntent::Set(Status::Running))
         );
         assert_eq!(
@@ -2157,13 +2192,14 @@ mod tests {
                         diffs: Vec::new(),
                     },
                 },
+                false,
                 false
             ),
             Some(StatusIntent::Set(Status::Running))
         );
         // ThinkingEnded is a sub-phase terminator, not a work signal; leaving
         // it None avoids needless intents (ThinkingStarted already set Running).
-        assert_eq!(derive_acp_status(&Event::ThinkingEnded, false), None);
+        assert_eq!(derive_acp_status(&Event::ThinkingEnded, false, false), None);
     }
 
     // --- #2248: a structured session must heal out of a stale Stopped ---
@@ -2278,10 +2314,142 @@ mod tests {
                 ended_at: chrono::Utc::now(),
             },
             false,
+            false,
         )
         .expect("BackgroundAgentCompleted derives an intent");
         apply(&mut inst, intent);
         assert_eq!(inst.status, Status::Waiting);
+    }
+
+    /// #3925: a sub-agent launched mid-turn can complete before its parent
+    /// turn's own `Stopped`. That completion must not drop the sidebar to
+    /// Idle (and, via `should_mark_acp_unread`'s Running->Idle edge, must not
+    /// mark the still-unfinished turn unread) just because it was the last
+    /// background agent outstanding.
+    #[test]
+    fn background_agent_completed_mid_turn_keeps_running_and_does_not_mark_unread() {
+        use crate::acp::Event;
+        let mut inst = stopped_structured_instance();
+        inst.status = Status::Idle;
+
+        // UserPromptSent: turn starts.
+        let intent = derive_acp_status(
+            &Event::UserPromptSent {
+                prompt_id: None,
+                text: "hi".into(),
+                attachments: Vec::new(),
+            },
+            true,
+            false,
+        )
+        .unwrap();
+        apply(&mut inst, intent);
+        assert_eq!(inst.status, Status::Running);
+
+        // BackgroundAgentLaunched: still running, no other agents yet.
+        let intent = derive_acp_status(
+            &Event::BackgroundAgentLaunched {
+                agent_id: "a-1".into(),
+                tool_call_id: "t".into(),
+                description: "desc".into(),
+                prompt: "p".into(),
+                model: "m".into(),
+                output_file: "f".into(),
+                started_at: chrono::Utc::now(),
+            },
+            true,
+            true,
+        )
+        .unwrap();
+        apply(&mut inst, intent);
+        assert_eq!(inst.status, Status::Running);
+
+        // BackgroundAgentCompleted lands before the main turn's Stopped: the
+        // main turn is still active and no sibling agent remains, so this
+        // must stay Running rather than derive Idle from
+        // background_agent_active_after alone.
+        let old_status = inst.status;
+        let intent = derive_acp_status(
+            &Event::BackgroundAgentCompleted {
+                agent_id: "a-1".into(),
+                status: crate::acp::state::BackgroundAgentStatus::Completed,
+                tools: Vec::new(),
+                result: None,
+                warning: None,
+                ended_at: chrono::Utc::now(),
+            },
+            true,
+            false,
+        )
+        .unwrap();
+        apply(&mut inst, intent);
+        assert_eq!(
+            inst.status,
+            Status::Running,
+            "the main turn is still active"
+        );
+        assert!(
+            !should_mark_acp_unread(&inst, old_status, true),
+            "a mid-turn completion must not mark an unfinished turn unread"
+        );
+
+        // The main turn's own Stopped, no agents left: this is the one real
+        // turn-end edge, and must still mark unread as before.
+        let old_status = inst.status;
+        let intent = derive_acp_status(
+            &Event::Stopped {
+                reason: "prompt_complete".into(),
+            },
+            false,
+            false,
+        )
+        .unwrap();
+        apply(&mut inst, intent);
+        assert_eq!(inst.status, Status::Idle);
+        assert!(should_mark_acp_unread(&inst, old_status, true));
+    }
+
+    /// #3900: `BackgroundAgentCompleted` arriving after the main turn's own
+    /// `Stopped` (the ordinary case) still resolves Idle once it is the last
+    /// agent outstanding — this must not regress from the mid-turn fix above.
+    #[test]
+    fn background_agent_completed_after_stopped_still_resolves_idle() {
+        use crate::acp::Event;
+        let mut inst = stopped_structured_instance();
+        inst.status = Status::Running;
+
+        let intent = derive_acp_status(
+            &Event::Stopped {
+                reason: "prompt_complete".into(),
+            },
+            false,
+            true,
+        )
+        .unwrap();
+        apply(&mut inst, intent);
+        assert_eq!(
+            inst.status,
+            Status::Running,
+            "a background agent outlives Stopped"
+        );
+
+        let old_status = inst.status;
+        let intent = derive_acp_status(
+            &Event::BackgroundAgentCompleted {
+                agent_id: "a-1".into(),
+                status: crate::acp::state::BackgroundAgentStatus::Completed,
+                tools: Vec::new(),
+                result: None,
+                warning: None,
+                ended_at: chrono::Utc::now(),
+            },
+            false,
+            false,
+        )
+        .unwrap();
+        apply(&mut inst, intent);
+        assert_eq!(inst.status, Status::Idle);
+        assert!(should_mark_acp_unread(&inst, old_status, true));
     }
 
     #[test]
