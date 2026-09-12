@@ -201,6 +201,32 @@ fn test_selected_session_updates_on_cursor_move() {
 
 #[test]
 #[serial]
+fn test_selected_session_title_tracks_cursor() {
+    let mut env = create_test_env_with_sessions(3);
+    let first = env.view.selected_session_title().map(str::to_string);
+    assert!(first.is_some());
+    env.view.handle_key(key(KeyCode::Down), None);
+    let second = env.view.selected_session_title().map(str::to_string);
+    assert_ne!(first, second);
+}
+
+#[test]
+#[serial]
+fn test_selected_session_title_none_on_group() {
+    let mut env = create_test_env_with_groups();
+    for i in 0..env.view.flat_items.len() {
+        env.view.cursor = i;
+        env.view.update_selected();
+        if env.view.selected_session.is_none() {
+            assert_eq!(env.view.selected_session_title(), None);
+            return;
+        }
+    }
+    panic!("No group found in flat_items");
+}
+
+#[test]
+#[serial]
 fn test_selected_group_set_when_on_group() {
     let mut env = create_test_env_with_groups();
     for i in 0..env.view.flat_items.len() {

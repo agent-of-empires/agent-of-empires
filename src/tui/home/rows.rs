@@ -37,6 +37,12 @@ impl HomeView {
         self.instances.get(id)
     }
 
+    /// Title of the currently selected session row, if the cursor is on one.
+    pub(in crate::tui) fn selected_session_title(&self) -> Option<&str> {
+        let id = self.selected_session.as_deref()?;
+        Some(self.get_instance(id)?.title.as_str())
+    }
+
     /// Materialize `self.instances` into a `Vec` for callsites that hand off
     /// a `&[Instance]` slice to a downstream API. Single seam so the day
     /// `HomeView` grows a cache, only this helper needs to change.

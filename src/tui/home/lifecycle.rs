@@ -133,6 +133,7 @@ impl HomeView {
             .unwrap_or_else(|| resolved.status_hooks.clone());
         let strict_hotkeys = resolved.session.strict_hotkeys;
         let confirm_before_quit = resolved.session.confirm_before_quit;
+        let host_tab_title = resolved.session.host_tab_title;
         let idle_decay_window =
             crate::tui::styles::idle_decay_window(resolved.theme.idle_decay_minutes);
         crate::session::set_unread_enabled(resolved.session.unread_indicator);
@@ -381,6 +382,7 @@ impl HomeView {
             status_hook_configs,
             strict_hotkeys,
             confirm_before_quit,
+            host_tab_title,
             active_tui_count: 1,
             idle_decay_window,
             settings_view: None,

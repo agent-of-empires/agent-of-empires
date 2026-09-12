@@ -12,6 +12,7 @@ mod deletion_poller;
 pub mod dialogs;
 pub mod diff;
 pub(crate) mod home;
+mod host_title;
 pub mod hyperlink;
 pub(crate) mod links;
 pub(crate) mod markdown;
@@ -58,7 +59,9 @@ use crossterm::{
         KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
+    },
 };
 use ratatui::prelude::*;
 use std::io::{self, IsTerminal};
@@ -183,8 +186,11 @@ impl Drop for TerminalGuard {
             stdout,
             LeaveAlternateScreen,
             DisableBracketedPaste,
-            crossterm::cursor::Show
+            crossterm::cursor::Show,
         );
+        if host_title::take_emitted() {
+            let _ = execute!(stdout, SetTitle(host_title::FALLBACK_TITLE));
+        }
     }
 }
 use crate::session::get_update_settings;

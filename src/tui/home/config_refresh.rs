@@ -95,6 +95,7 @@ impl HomeView {
         self.refresh_status_hook_config_cache();
         self.strict_hotkeys = config.session.strict_hotkeys;
         self.confirm_before_quit = config.session.confirm_before_quit;
+        self.host_tab_title = config.session.host_tab_title;
         self.row_tag_mode = config.session.row_tag;
         // Keep the strip in sync when the Settings UI or a config-file edit
         // flips the toggle from any settings surface.
