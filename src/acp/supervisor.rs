@@ -283,10 +283,12 @@ pub trait BroadcastSink: Send + Sync + 'static {
         Vec::new()
     }
     /// Agent ids of `BackgroundAgentLaunched` events on disk with no
-    /// matching `BackgroundAgentCompleted`. Used by
-    /// `Supervisor::shutdown_with_reason`'s teardown path to detach sub-
-    /// agents the dying worker's tailer will never report on again.
-    /// Default returns empty so test sinks without an event store opt out
+    /// matching `BackgroundAgentCompleted`: sub-agents a dead worker's
+    /// tailer will never report on again, whether the worker went down
+    /// gracefully (`Supervisor::shutdown_with_reason`) or the daemon
+    /// itself restarted without one (`Supervisor::spawn`/`attach`, which
+    /// see a fresh launch is never replayed to resume tracking). Default
+    /// returns empty so test sinks without an event store opt out
     /// cleanly, mirroring `unresolved_approval_nonces`.
     fn unresolved_background_agent_ids(&self, _session_id: &str) -> Vec<String> {
         Vec::new()
@@ -2044,6 +2046,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         // Retire the previous worker's requests before publishing this worker's events.
         self.cancel_orphaned_approvals(&session_id);
         self.cancel_orphaned_elicitations(&session_id);
+        self.detach_orphaned_background_agents(&session_id);
         let drain_task = self.start_drain_task(session_id.clone(), lease.clone(), inbound);
         let client_for_mode = (acp_mode_id.is_some() || yolo_mode).then(|| Arc::clone(&client));
         workers.insert(
@@ -3528,6 +3531,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         // in the log and the sweep can no longer tell them apart.
         self.cancel_orphaned_approvals(&session_id);
         self.cancel_orphaned_elicitations(&session_id);
+        self.detach_orphaned_background_agents(&session_id);
         let drain_task = self.start_drain_task(session_id.clone(), lease.clone(), inbound);
         workers.insert(
             session_id.clone(),
@@ -3593,6 +3597,12 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// No-op when there are no stale nonces.
     fn cancel_orphaned_elicitations(&self, session_id: &str) {
         cancel_orphaned_elicitations_on(&*self.sink, &self.next_seqs, session_id);
+    }
+
+    /// Detach background sub-agents that were left `Running`/`Stalled` by
+    /// the previous daemon. See [`detach_orphaned_background_agents_on`].
+    fn detach_orphaned_background_agents(&self, session_id: &str) {
+        detach_orphaned_background_agents_on(&*self.sink, &self.next_seqs, session_id);
     }
 
     /// Whether this session has a structured view worker up or coming up.
@@ -4143,6 +4153,47 @@ fn cancel_orphaned_elicitations_on<S: BroadcastSink>(
                 nonce,
                 outcome: ElicitationOutcome::Cancelled,
                 answers: Vec::new(),
+            },
+        );
+    }
+}
+
+/// Detach background sub-agents left `Running`/`Stalled` by a dead worker:
+/// its tailer died with the previous daemon, no fresh launch will be
+/// replayed for it, and nothing else will ever mark it terminal. Publish a
+/// synthetic `BackgroundAgentCompleted { status: Detached }` per orphaned
+/// agent id so the panel stops showing it as running forever. Shared by the
+/// spawn/attach paths, mirroring `cancel_orphaned_approvals_on`.
+fn detach_orphaned_background_agents_on<S: BroadcastSink>(
+    sink: &S,
+    next_seqs: &SeqMap,
+    session_id: &str,
+) {
+    let stale_ids = sink.unresolved_background_agent_ids(session_id);
+    if stale_ids.is_empty() {
+        return;
+    }
+    info!(
+        target: "acp.supervisor",
+        session = %session_id,
+        stale = stale_ids.len(),
+        "detaching background sub-agents orphaned by daemon restart"
+    );
+    for agent_id in stale_ids {
+        let seq = next_seq(next_seqs, session_id);
+        sink.publish(
+            session_id,
+            seq,
+            &Event::BackgroundAgentCompleted {
+                agent_id,
+                status: crate::acp::state::BackgroundAgentStatus::Detached,
+                tools: Vec::new(),
+                result: None,
+                warning: Some(
+                    "session reattached before this sub-agent finished; tracking stopped"
+                        .to_string(),
+                ),
+                ended_at: chrono::Utc::now(),
             },
         );
     }
@@ -8393,5 +8444,131 @@ cursor-acp-bridge = "agent acp"
             sink.frames.lock().unwrap().is_empty(),
             "no nonces means no published frames"
         );
+    }
+
+    /// Orphaned-background-agent sweep publishes a `BackgroundAgentCompleted
+    /// { status: Detached }` per stale agent id, so a sub-agent whose
+    /// tailer died with the previous daemon does not show as running
+    /// forever (`Detached` was defined but never constructed before this).
+    #[tokio::test]
+    async fn detach_orphaned_background_agents_publishes_completed_detached() {
+        let sink = VecSink::with_stale_background_agent_ids(vec!["a-1".into(), "a-2".into()]);
+        let sup = Supervisor::new(sink.clone());
+        sup.detach_orphaned_background_agents("s-attach");
+        let frames = sink.frames.lock().unwrap().clone();
+        assert_eq!(
+            frames.len(),
+            2,
+            "expected 2 BackgroundAgentCompleted, got {frames:?}"
+        );
+        for (frame, expected) in frames.iter().zip(["a-1", "a-2"]) {
+            match &frame.2 {
+                Event::BackgroundAgentCompleted {
+                    agent_id, status, ..
+                } => {
+                    assert_eq!(agent_id, expected);
+                    assert_eq!(*status, crate::acp::state::BackgroundAgentStatus::Detached);
+                }
+                other => panic!("expected BackgroundAgentCompleted, got {other:?}"),
+            }
+        }
+        assert!(frames[0].1 < frames[1].1, "seqs must be monotonic");
+    }
+
+    #[tokio::test]
+    async fn detach_orphaned_background_agents_noop_when_empty() {
+        let sink = VecSink::new();
+        let sup = Supervisor::new(sink.clone());
+        sup.detach_orphaned_background_agents("s-attach");
+        assert!(sink.frames.lock().unwrap().is_empty());
+    }
+
+    /// End-to-end through `spawn`: a session whose event log already has
+    /// a `BackgroundAgentLaunched` + `BackgroundAgentProgress(Running)`
+    /// with no matching `BackgroundAgentCompleted` (as a tailer that died
+    /// with the previous daemon would leave it) gets a synthetic
+    /// `Detached` completion the moment the fresh worker spawns, so the
+    /// panel does not show it running forever.
+    #[tokio::test]
+    async fn spawn_detaches_background_agent_orphaned_by_previous_daemon() {
+        use crate::acp::event_store::EventStore;
+        use crate::acp::state::BackgroundAgentStatus;
+
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::session::test_support::isolate_app_dir_at(home.path());
+        let store = Arc::new(EventStore::open(&home.path().join("acp.db"), 1000).unwrap());
+        let (tx, mut rx) = broadcast::channel(16);
+        let sink = Arc::new(ChannelSink {
+            tx,
+            event_store: store.clone(),
+            control_cache: Arc::new(crate::acp::control_cache::ControlStateCache::new()),
+        });
+        sink.publish(
+            "s-startup",
+            1,
+            &Event::BackgroundAgentLaunched {
+                agent_id: "sub-1".into(),
+                tool_call_id: "tc-1".into(),
+                description: "do a thing".into(),
+                prompt: "do a thing".into(),
+                model: "claude".into(),
+                output_file: "/tmp/nonexistent.jsonl".into(),
+                started_at: chrono::Utc::now(),
+            },
+        );
+        sink.publish(
+            "s-startup",
+            2,
+            &Event::BackgroundAgentProgress {
+                agent_id: "sub-1".into(),
+                status: BackgroundAgentStatus::Running,
+                tool_count: 1,
+                tools: Vec::new(),
+                last_tool: None,
+                last_text: None,
+                at: chrono::Utc::now(),
+            },
+        );
+        let launcher: Launcher = Arc::new(move |config, session_id| {
+            Box::pin(async move {
+                save_record(&session_id.0, 4345, config.generation);
+                let (client, _tx) = AcpClient::fake_for_test(session_id);
+                Ok(client.with_runner_pid(4345))
+            })
+        });
+        let control = Arc::new(FakeProcessControl::default());
+        control.alive(4345);
+        let sup = Supervisor::new(sink)
+            .with_process_control(control)
+            .with_launcher(launcher);
+        sup.hydrate_seqs(store.all_session_seqs());
+        sup.spawn(spawn_request("s-startup")).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while store
+                .unresolved_background_agent_ids("s-startup")
+                .contains(&"sub-1".to_string())
+            {
+                rx.recv().await.unwrap();
+            }
+        })
+        .await
+        .expect("stale background agent must be detached in the durable log");
+        assert!(store
+            .unresolved_background_agent_ids("s-startup")
+            .is_empty());
+        let mut state = crate::acp::state::AcpState::new(
+            crate::acp::state::AcpSessionId("s-startup".into()),
+            crate::acp::state::AgentName("claude".into()),
+            None,
+        );
+        for (_, event) in store.replay_from("s-startup", 0) {
+            state.apply_event(event).unwrap();
+        }
+        assert_eq!(state.background_agents.len(), 1);
+        assert_eq!(
+            state.background_agents[0].status,
+            BackgroundAgentStatus::Detached
+        );
+        sup.shutdown("s-startup").await.unwrap();
     }
 }
