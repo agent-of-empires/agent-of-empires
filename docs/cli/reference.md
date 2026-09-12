@@ -327,7 +327,7 @@ Remove a session
 * `--force` — Force worktree removal even with untracked/modified files
 * `--keep-container` — Keep container instead of deleting it (default: delete per config)
 * `--keep-scratch` — For scratch sessions, keep the scratch directory on disk instead of removing it. The session record is still deleted; the kept path is logged so you can find the files later. No effect on non-scratch sessions
-* `--purge` — Permanently delete instead of moving to trash. By default `rm` moves the session to the trash (when `session.delete_to_trash` is enabled, the default) so it can be restored; `--purge` forces the irreversible teardown (worktree/branch/container cleanup per the other flags, plus transcript removal)
+* `--purge` — Permanently delete instead of moving to trash. By default `rm` moves the session to the trash (when `session.delete_to_trash` is enabled, the default) so it can be restored; `--purge` forces the irreversible teardown (worktree/branch/container cleanup per the other flags) and removes the session's structured-view transcript. Removing the sandbox container also attempts to remove its private agent stores, including its config home; keeping the container keeps those stores. Host agent conversation history outside these stores is not removed
 
 
 
