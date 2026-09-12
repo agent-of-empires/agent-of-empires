@@ -582,9 +582,10 @@ pub(crate) fn apply_status_intent(
         }
         // Background sub-agent events must not speak for the main turn: they
         // preserve its Waiting (a pending approval/elicitation) and Error (a
-        // dead connection the supervisor is still respawning). The main
-        // turn's own events (plain `Set`) resolve both; Error also heals on
-        // a fresh worker attach.
+        // dead connection the supervisor is still respawning), and Stopped
+        // likewise stays until the main turn's own lifecycle moves it. The
+        // main turn's own events (plain `Set`) resolve Waiting and Error;
+        // Error also heals on a fresh worker attach.
         StatusIntent::SetUnlessWaiting(s) => {
             if matches!(
                 inst.status,
@@ -1404,7 +1405,7 @@ mod tests {
         }
         // A cold control cache for these sessions: never hydrated, so the
         // reads miss and degrade to boot's conservative `(false, false)`
-        // verdict — the pre-#3900 Idle+unread behavior this test pins.
+        // verdict, the pre-#3900 Idle+unread behavior this test pins.
         let control_cache = crate::acp::control_cache::ControlStateCache::new();
 
         let instances = RwLock::new(rows);
@@ -2224,7 +2225,8 @@ mod tests {
         // A background sub-agent the main turn spawned is still running
         // (the caller's `background_agent_active_after` reads true): the dot
         // must stay lit rather than drop to Idle with the main turn's
-        // Stopped. #3900. Post-`Stopped`, `turn_active_after` is always false.
+        // Stopped. #3900. `turn_active_after` is false here: live, the
+        // Stopped itself folds it; ahead-of-frame is covered by another test.
         assert_eq!(
             derive_acp_status(
                 &Event::Stopped {
