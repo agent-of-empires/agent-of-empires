@@ -384,12 +384,27 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         }
         // The child must fork the SAME agent as the parent: a captured id is
         // agent-shaped (a Claude UUID resumes only under Claude, etc.), so
-        // handing it to a different agent's `--resume` fails or resumes garbage.
-        // When the user did not explicitly choose a tool (`--tool`/`--cmd`),
-        // inherit the parent's; when they did and it differs, reject rather than
-        // launch a cross-agent fork.
+        // handing it to a different agent's `--resume` fails or resumes
+        // garbage. Compared on the built-in each name resolves to, so an
+        // `agent_detect_as` wrapper and its base are one agent. Without an
+        // explicit `--tool`/`--cmd` the parent's tool is inherited instead.
         let user_chose_tool = args.tool.is_some() || args.command.is_some();
-        if user_chose_tool && resolved_tool != source.tool {
+        let parent_agent = pinned_capture_agent(source);
+        // Authorization may not read the checked-out repo. `agent_detect_as`
+        // is `repo = "allow"`, so `.agent-of-empires/config.toml` can re-point
+        // an alias; the profile-only config is the user's own answer.
+        let profile_config =
+            crate::session::config::profile_config::resolve_config_or_warn(profile);
+        if user_chose_tool
+            && resolved_tool != source.tool
+            && fork_agent_for(
+                &resolved_tool,
+                parent_agent,
+                &profile_config.session,
+                &config.session,
+            )
+            .is_none()
+        {
             bail!(
                 "Cannot fork session '{}' (agent '{}') as agent '{}': a fork must use the parent's \
                  agent. Drop --tool/--cmd to inherit it, or fork a session created with '{}'.",
@@ -403,8 +418,18 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             resolved_tool = source.tool.clone();
         }
         let parent_agent_session_id = source.agent_session_id.clone();
-        let seed = crate::session::fork::terminal_fork_seed(
+        // The alias is resolved for the seed only where the row itself proves
+        // the child runs the parent's built-in. Without that proof the raw
+        // name goes through, which is the refusal this path had before.
+        let fork_agent = fork_agent_for(
             &resolved_tool,
+            parent_agent,
+            &profile_config.session,
+            &config.session,
+        )
+        .unwrap_or(resolved_tool.as_str());
+        let seed = crate::session::fork::terminal_fork_seed(
+            fork_agent,
             parent_agent_session_id.as_deref(),
             crate::session::capture::generate_session_uuid(),
         )
@@ -1551,6 +1576,75 @@ fn override_launch_binary(
     shell_words::split(&command).ok()?.into_iter().next()
 }
 
+/// The built-in a tool name being chosen now resolves to: the built-in itself,
+/// or the base a `session.agent_detect_as` wrapper declares. Reads the live
+/// map, which is also what the new session's own `detect_as` is written from.
+fn capture_agent_for_tool(
+    tool: &str,
+    session: &crate::session::config::SessionConfig,
+) -> Option<&'static str> {
+    crate::agents::get_agent(tool)
+        .or_else(|| {
+            session
+                .agent_detect_as
+                .get(tool)
+                .and_then(|base| crate::agents::get_agent(base))
+        })
+        .map(|agent| agent.name)
+}
+
+/// The built-in that captured a parent row's session id, from the row and the
+/// agent registry alone: its tool when that names a built-in (the registry
+/// wins there, as it does everywhere), else the `agent_detect_as` alias the
+/// row recorded.
+///
+/// Deliberately narrower than `Instance::resolved_agent`, which falls back to
+/// the live alias map when the stored value is empty: `effective_detect_as`
+/// returns the stored alias only when it is non-empty, and rows with an empty
+/// one keep being written (`add.rs` stores `unwrap_or_default()` for a tool
+/// with no entry). Such a row records no evidence of what shaped its id, and
+/// the live map may have been retargeted since, so `None` is the honest
+/// answer. The recorded alias is only as good as the map when it was written,
+/// which is session build or the `v024` backfill, not the capture itself.
+fn pinned_capture_agent(parent: &Instance) -> Option<&'static str> {
+    crate::agents::get_agent(&parent.tool)
+        .or_else(|| {
+            let pinned = parent.detect_as.trim();
+            (!pinned.is_empty())
+                .then(|| crate::agents::get_agent(pinned))
+                .flatten()
+        })
+        .map(|agent| agent.name)
+}
+
+/// The built-in a fork would run under, when the parent row proves the child
+/// resolves to that same one. `None` whenever the two sides cannot be shown to
+/// match, including when the row recorded nothing: the caller then falls back
+/// to the raw name, which is what this path did before the alias was resolved
+/// at all. So the permitted set only ever grows where the row itself is
+/// evidence.
+///
+/// `chosen` is resolved from `profile`, the user's own config, and the fork is
+/// refused outright when `merged` (the same config with the project repo's
+/// `.agent-of-empires/config.toml` layered on) resolves it differently. A
+/// repo-supplied `agent_detect_as` entry may steer status detection, which is
+/// what it was marked `repo = "allow"` for; it may not decide whose session id
+/// a fork hands to which agent, and it cannot be read only on the authorizing
+/// side because the row this call creates stores the merged alias and launches
+/// under it.
+fn fork_agent_for(
+    chosen: &str,
+    parent: Option<&'static str>,
+    profile: &crate::session::config::SessionConfig,
+    merged: &crate::session::config::SessionConfig,
+) -> Option<&'static str> {
+    let chosen_agent = capture_agent_for_tool(chosen, profile)?;
+    if capture_agent_for_tool(chosen, merged) != Some(chosen_agent) {
+        return None;
+    }
+    (Some(chosen_agent) == parent).then_some(chosen_agent)
+}
+
 enum NamedToolSelection {
     Custom(String),
     BuiltIn(String),
@@ -1656,7 +1750,9 @@ fn resolve_sandbox_image(
 
 #[cfg(test)]
 mod tests {
-    use super::{override_launch_binary, parse_repo_base, resolve_sandbox_image};
+    use super::{
+        capture_agent_for_tool, override_launch_binary, parse_repo_base, resolve_sandbox_image,
+    };
     use crate::session::config::SessionConfig;
 
     #[test]
@@ -1676,6 +1772,26 @@ mod tests {
         }
         for raw in ["api", "=develop", "api=", "  =  "] {
             assert!(parse_repo_base(raw).is_err(), "{raw:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn capture_agent_for_tool_resolves_detect_as_wrappers() {
+        let mut session = SessionConfig::default();
+        session
+            .agent_detect_as
+            .insert("claude-work".to_string(), "claude".to_string());
+
+        let cases = [
+            ("claude-work", Some("claude")),
+            ("claude", Some("claude")),
+            ("codex", Some("codex")),
+            // No entry, no built-in: the caller falls back to a literal
+            // comparison rather than guessing.
+            ("mystery-agent", None),
+        ];
+        for (tool, want) in cases {
+            assert_eq!(capture_agent_for_tool(tool, &session), want, "{tool:?}");
         }
     }
 
@@ -1754,19 +1870,19 @@ mod tests {
     }
 
     /// Argument-level coverage of the #148 guard on `add`.
-    mod profile_guard {
-        use crate::cli::{Cli, Commands};
+    fn dispatch_argv(argv: &[&str]) -> (String, super::AddArgs) {
         use clap::Parser;
-        use serial_test::serial;
-
-        fn dispatch_argv(argv: &[&str]) -> (String, super::super::AddArgs) {
-            let cli = Cli::try_parse_from(argv).expect("argv parses");
-            let profile = cli.profile.unwrap_or_default();
-            match cli.command {
-                Some(Commands::Add(args)) => (profile, *args),
-                _ => panic!("expected an add invocation"),
-            }
+        let cli = crate::cli::Cli::try_parse_from(argv).expect("argv parses");
+        let profile = cli.profile.unwrap_or_default();
+        match cli.command {
+            Some(crate::cli::Commands::Add(args)) => (profile, *args),
+            _ => panic!("expected an add invocation"),
         }
+    }
+
+    mod profile_guard {
+        use super::dispatch_argv;
+        use serial_test::serial;
 
         #[tokio::test]
         #[serial]
@@ -1816,6 +1932,243 @@ mod tests {
                 msg.contains("Path does not exist"),
                 "a known profile must reach path validation, got: {msg}"
             );
+        }
+    }
+
+    mod fork_gate {
+        use super::dispatch_argv;
+        use serial_test::serial;
+
+        /// An isolated app dir holding one profile and one parent row. The
+        /// parent has no captured id, so every case below stops at the gate or
+        /// at the seed and creates nothing.
+        fn set_up(app: &std::path::Path, claude_work_maps_to: &str, parent: (&str, &str)) {
+            std::fs::write(
+                app.join("config.toml"),
+                format!(
+                    "[session.custom_agents]\n\
+                     \"claude-work\" = \"claude-work\"\n\
+                     \"codex-work\" = \"codex-work\"\n\
+                     [session.agent_detect_as]\n\
+                     \"claude-work\" = \"{claude_work_maps_to}\"\n\
+                     \"codex-work\" = \"codex\"\n"
+                ),
+            )
+            .unwrap();
+            let profile = app.join("profiles").join("real");
+            std::fs::create_dir_all(&profile).unwrap();
+            let (tool, detect_as) = parent;
+            std::fs::write(
+                profile.join("sessions.json"),
+                format!(
+                    "[{{\"id\":\"ab00000000000001\",\"title\":\"parent\",\
+                     \"project_path\":\"/tmp\",\"group_path\":\"\",\"command\":\"\",\
+                     \"tool\":\"{tool}\",\"detect_as\":\"{detect_as}\",\"yolo_mode\":false,\
+                     \"status\":\"idle\",\"created_at\":\"2026-09-12T08:00:00Z\",\
+                     \"last_accessed_at\":\"2026-09-12T08:00:00Z\",\
+                     \"agent_session_id\":null,\"lifecycle_generation\":1}}]"
+                ),
+            )
+            .unwrap();
+        }
+
+        /// A project directory carrying a repo-scoped `agent_detect_as`.
+        fn repo_declaring(entry: &str) -> tempfile::TempDir {
+            let project = tempfile::tempdir().unwrap();
+            let dir = project.path().join(".agent-of-empires");
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(
+                dir.join("config.toml"),
+                format!("[session.agent_detect_as]\n{entry}\n"),
+            )
+            .unwrap();
+            project
+        }
+
+        async fn fork_as(project: &std::path::Path, tool: &str) -> String {
+            let (profile, args) = dispatch_argv(&[
+                "aoe",
+                "add",
+                project.to_str().unwrap(),
+                "-p",
+                "real",
+                "--fork-from",
+                "parent",
+                "--tool",
+                tool,
+            ]);
+            super::super::run(&profile, args)
+                .await
+                .expect_err("the parent has no captured id, so no case may succeed")
+                .to_string()
+        }
+
+        /// `--fork-from` with NO `--tool`: the gate is skipped entirely
+        /// (`user_chose_tool` is false), so this drives only the seed.
+        async fn fork_inheriting_tool(project: &std::path::Path) -> String {
+            let (profile, args) = dispatch_argv(&[
+                "aoe",
+                "add",
+                project.to_str().unwrap(),
+                "-p",
+                "real",
+                "--fork-from",
+                "parent",
+            ]);
+            super::super::run(&profile, args)
+                .await
+                .expect_err("the parent has no captured id, so no case may succeed")
+                .to_string()
+        }
+
+        const REFUSED: &str = "a fork must use the parent's agent";
+        const PASSED_THE_GATE: &str = "has no captured agent session yet";
+
+        /// A wrapper and the base it declares are one agent, a wrapper on a
+        /// different base is not, and a retargeted `agent_detect_as` entry does
+        /// not change what an existing row's captured id is shaped like.
+        #[tokio::test]
+        #[serial]
+        async fn fork_gate_reads_the_row_and_the_configured_alias() {
+            let project = tempfile::tempdir().unwrap();
+            // (claude-work maps to, parent row (tool, detect_as), fork as, want)
+            let cases = [
+                ("claude", ("claude", ""), "claude-work", PASSED_THE_GATE),
+                ("claude", ("claude", ""), "codex-work", REFUSED),
+                // The row was created while claude-work meant claude and its id
+                // is Claude-shaped; the entry now says codex.
+                ("codex", ("claude-work", "claude"), "codex-work", REFUSED),
+            ];
+            for (maps_to, parent, fork_as_tool, want) in cases {
+                let guard = crate::session::test_support::isolate_app_dir();
+                let app = crate::session::get_app_dir().unwrap();
+                set_up(&app, maps_to, parent);
+                let msg = fork_as(project.path(), fork_as_tool).await;
+                assert!(
+                    msg.contains(want),
+                    "claude-work->{maps_to}, parent {parent:?}, fork as {fork_as_tool}: \
+                     wanted {want:?}, got: {msg}"
+                );
+                drop(guard);
+            }
+        }
+
+        /// A row whose stored `detect_as` is EMPTY is pinned to nothing:
+        /// `effective_detect_as` answers it from the live map, and rows in that
+        /// state keep being written. So a retarget does reach such a parent,
+        /// which is the case the gate is documented to refuse.
+        #[tokio::test]
+        #[serial]
+        async fn fork_gate_refuses_a_parent_row_with_no_pinned_alias() {
+            let project = tempfile::tempdir().unwrap();
+            let guard = crate::session::test_support::isolate_app_dir();
+            let app = crate::session::get_app_dir().unwrap();
+            // claude-work now names codex; the row was created before the
+            // entry existed, so it stored no alias, and its captured id is
+            // whatever claude-work was when it ran.
+            set_up(&app, "codex", ("claude-work", ""));
+            let msg = fork_as(project.path(), "codex-work").await;
+            assert!(
+                msg.contains(REFUSED),
+                "empty-detect_as parent, claude-work retargeted to codex, \
+                 fork as codex-work: wanted a refusal, got: {msg}"
+            );
+            drop(guard);
+        }
+
+        /// Without `--tool` the gate never runs, so the seed is the only thing
+        /// standing between a retargeted entry and a parent id captured under
+        /// the old one. Stock refuses this with `AgentCannotFork`, because the
+        /// raw wrapper name is not a built-in, and so must this.
+        #[tokio::test]
+        #[serial]
+        async fn fork_seed_without_tool_ignores_the_rows_pinned_alias() {
+            let project = tempfile::tempdir().unwrap();
+            let guard = crate::session::test_support::isolate_app_dir();
+            let app = crate::session::get_app_dir().unwrap();
+            // The row pinned claude and its captured id is Claude-shaped; the
+            // entry now names codex.
+            set_up(&app, "codex", ("claude-work", "claude"));
+            let msg = fork_inheriting_tool(project.path()).await;
+            assert!(
+                msg.contains("does not support forking"),
+                "no --tool, row pins claude, entry retargeted to codex: the seed must not \
+                 resolve through the live map; got: {msg}"
+            );
+            drop(guard);
+        }
+
+        /// A project's `.agent-of-empires/config.toml` can carry
+        /// `agent_detect_as` (`repo = "allow"`). It may not decide a fork: the
+        /// chosen side is resolved from the user's own config, so a repo
+        /// claiming codex-work is claude does not make it one.
+        #[tokio::test]
+        #[serial]
+        async fn fork_gate_resolves_the_chosen_tool_from_the_users_own_config() {
+            let project = repo_declaring("\"codex-work\" = \"claude\"");
+            let guard = crate::session::test_support::isolate_app_dir();
+            let app = crate::session::get_app_dir().unwrap();
+            set_up(&app, "claude", ("claude", ""));
+            let msg = fork_as(project.path(), "codex-work").await;
+            assert!(
+                msg.contains(REFUSED),
+                "a repo alias must not authorize a cross-agent fork, got: {msg}"
+            );
+            drop(guard);
+        }
+
+        /// And the other direction: the repo may not re-point a tool the user
+        /// did name, because the row this creates stores the merged alias and
+        /// launches under it. Same setup as the allowed case, plus a repo file.
+        #[tokio::test]
+        #[serial]
+        async fn fork_gate_refuses_when_a_repo_repoints_the_chosen_tool() {
+            let project = repo_declaring("\"claude-work\" = \"codex\"");
+            let guard = crate::session::test_support::isolate_app_dir();
+            let app = crate::session::get_app_dir().unwrap();
+            set_up(&app, "claude", ("claude", ""));
+            let msg = fork_as(project.path(), "claude-work").await;
+            assert!(
+                msg.contains(REFUSED),
+                "a repo re-pointing the chosen tool must refuse, got: {msg}"
+            );
+            drop(guard);
+        }
+
+        /// The bail is guarded on the names differing, so nothing stock allowed
+        /// is newly refused: a row that records no alias still reaches the
+        /// seed, which refuses it by name exactly as before.
+        #[tokio::test]
+        #[serial]
+        async fn fork_gate_leaves_a_same_name_fork_to_the_seed() {
+            let project = tempfile::tempdir().unwrap();
+            let guard = crate::session::test_support::isolate_app_dir();
+            let app = crate::session::get_app_dir().unwrap();
+            set_up(&app, "claude", ("claude-work", ""));
+            let msg = fork_as(project.path(), "claude-work").await;
+            assert!(
+                msg.contains("does not support forking"),
+                "same name on both sides must not bail at the gate, got: {msg}"
+            );
+            drop(guard);
+        }
+
+        /// The alias is still resolved where the row proves it: same parent
+        /// row, entry NOT retargeted, so the inherited wrapper forks.
+        #[tokio::test]
+        #[serial]
+        async fn fork_seed_without_tool_resolves_a_pinned_alias_that_still_agrees() {
+            let project = tempfile::tempdir().unwrap();
+            let guard = crate::session::test_support::isolate_app_dir();
+            let app = crate::session::get_app_dir().unwrap();
+            set_up(&app, "claude", ("claude-work", "claude"));
+            let msg = fork_inheriting_tool(project.path()).await;
+            assert!(
+                msg.contains(PASSED_THE_GATE),
+                "no --tool, row pins claude, entry still claude: the fork must be allowed; \
+                 got: {msg}"
+            );
+            drop(guard);
         }
     }
 }
