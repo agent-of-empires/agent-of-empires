@@ -577,6 +577,55 @@ impl Instance {
                     &self.resolved_host_environment(),
                 ));
             }
+            // Model gateway (port of nodeterm's model-gateway): when a gateway
+            // root is configured, derive the harness's own routing env
+            // (ANTHROPIC_BASE_URL/AUTH_TOKEN, OPENAI_BASE_URL/KEY,
+            // COPILOT_PROVIDER_*) from one root + one resolved credential,
+            // appended with the same retain+push last-wins pattern as the
+            // ACP supervisor spawn path — AFTER the static profile env and
+            // hook-minted pairs, so the gateway's base-url/token pair can
+            // never be split by an older same-key entry pointing elsewhere.
+            // Fail-closed: an unresolvable credential, a missing stored
+            // secret, or an unsupported agent emits nothing, never a partial
+            // credential. Values ride pane env only — never argv — matching
+            // the sandboxed branch, which intentionally passes
+            // `pane: Vec::new()` (a container gets its env another way, and
+            // no pane env mutation should leak past its boundary).
+            if !self.is_sandboxed() {
+                let gw_config = crate::session::config::profile_config::resolve_config_or_warn(
+                    &self.effective_profile(),
+                );
+                if !gw_config.acp.gateway_base_url.trim().is_empty() {
+                    let gw_settings = crate::acp::model_gateway::ModelGatewaySettings {
+                        base_url: gw_config.acp.gateway_base_url.clone(),
+                        api_key: gw_config.acp.gateway_api_key.clone(),
+                        discovery_path: {
+                            let p = gw_config.acp.gateway_discovery_path.trim();
+                            (!p.is_empty()).then(|| p.to_string())
+                        },
+                    };
+                    let gw_agent = agent.map(|a| a.name).unwrap_or(&self.tool);
+                    let stored_secret =
+                        std::env::var(crate::acp::model_gateway::MODEL_GATEWAY_SECRET_ENV_NAME)
+                            .ok();
+                    let pairs = crate::acp::model_gateway::model_gateway_env(
+                        &gw_settings,
+                        gw_agent,
+                        // agent_model is ACP-only (see session_spawn.rs): a
+                        // terminal session carries no derived default, so the
+                        // gateway sees None here. Codex/claude route without a
+                        // model; a Copilot pane without an explicit model
+                        // stays on GitHub's own routing by design.
+                        None,
+                        &|name| std::env::var(name).ok(),
+                        stored_secret.as_deref(),
+                    );
+                    for (key, value) in pairs {
+                        env.retain(|m| m.key() != key);
+                        env.push(tmux::PaneEnvMutation::set(key, value));
+                    }
+                }
+            }
             (
                 result.0,
                 result.1,
